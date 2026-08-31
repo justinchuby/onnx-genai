@@ -1,0 +1,6 @@
+### 2026-08-19T06-47-56: Phase 5 process memory manager ownership boundaries
+**By:** Copilot
+**What:** Phase 5 process memory manager ownership boundaries
+**References:** #1186, PR #1349
+**Why:** Phase 5 embeds BindingRegistry as the sole registration/selection/allocation-generation ledger inside ProcessMemoryManager. The manager owns process quota, canonical authority/view mapping, holder identity, context transaction gates, loss broadcast, transaction observation, and settlement coordination. Governors retain budget policy, holders retain victim choice/reclaim, and EP contexts retain stream/copy/commit/decommit/fence/deferred-release ordering. ManagedAllocation keeps charge settlement attached through Phase-4 outcomes; quarantine never infers refund from allocation length, and confirmed context termination is the sole device-loss discharge boundary. Finite process limits use fixed per-authority delegation with stale-extent checks; UMA aliases share one canonical ProcessAuthorityId and physical identity. Native CUDA decoder/component/proposer sessions share the server/engine manager; compatibility adapters remain explicitly unattributed.
+<!-- Archived from the durable decision inbox by Scribe on 2026-08-27; original inbox content above is unchanged. -->

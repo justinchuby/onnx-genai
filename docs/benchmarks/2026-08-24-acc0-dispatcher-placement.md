@@ -270,3 +270,47 @@ python3 crates/onnx-runtime-ep-cpu/benches/acc0_w16_dispersion.py --replay pin_a
 Non-vacuity is checked by the harness itself: the `dispatcher …` row must read
 `PIN-OFF` on the control arm and `PIN-TOOK` on the test arm, and the dispersion
 scorer aborts if it does not.
+
+## Addendum, 2026-08-26: the knob had a concurrency cliff, and it is now fixed (#2177)
+
+This record's own "why the knob ships off" section lists the costs it could not
+see. A second one turned up when the sessions axis was finally measured, and it
+was much larger than anything above: **with the knob on, throughput collapsed to
+0.551x at two concurrent sessions and 0.321x at four**, 0/10 paired launches in
+both cells, at width 16 on the same 32-CPU host.
+
+Mechanism, from the code and then from a thread census rather than from either
+alone. The reserve frees **one** CPU; `bind_dispatcher_to_reserved_cpu` pins
+*every* dispatching thread to it, deliberately. The pool serves one dispatcher at
+a time, so a thread that loses `DispatchClaim::try_claim` runs `dispatch_inline`,
+which computes **every shard of the op** on the calling thread. Together: the
+losing session computed a whole op while confined to the CPU the winner was
+sitting on. Sampling `/proc/<pid>/task/*/stat` during a two-session run read both
+session threads on `cpu=30` in every sample with the knob on, and on distinct
+CPUs with it off; per-thread `utime` in the same samples was 168 vs 269 ticks
+pinned, against 183 vs 186 unpinned.
+
+The fix is that `dispatch_inline` releases the pin and restores the thread's
+previous affinity mask before computing anything, once per thread, Linux only
+(`set_current_thread_affinity` is a no-op elsewhere). Re-measured, same harness
+and protocol, 10 paired order-alternated launches per cell:
+
+| cell | before | after |
+|---|---:|---:|
+| 1 session, default width | 1.078 (9/10) | **1.074 (10/10)** |
+| `PROBE_SESSIONS=2` | **0.551 (0/10)** | **1.027 (7/10)** |
+| `PROBE_SESSIONS=4` | **0.321 (0/10)** | **1.019 (9/10)** |
+
+The width sweep at one session, same protocol, with each launch's own verdict
+checked: `THREADS=1` 1.003 (`PIN-UNRESERVED`, the null control), `THREADS=2`
+0.997, `THREADS=4` 1.017, `THREADS=8` 1.016, `THREADS=16` 1.331, default 1.078.
+The `PIN=0` arm's median is not stable at n=10 — two cells that both realized 16
+workers read 266.60 and 318.23 — so the 1.331 should be read as "somewhere
+between 1.08 and 1.33". The stable part is the asymmetry this record already
+names: the `PIN=1` arm's spread is 4% and the `PIN=0` arm's is 40%.
+
+**The REJECT verdict above stands**, and this addendum does not reopen it. What
+changed is that the knob is now safe to *turn on* in a process that decodes from
+more than one thread; before, opting in was a 1.8x-3.1x regression there with no
+diagnostic saying so. Prefill is still not in the matrix, so the default is still
+not a question this data can answer.

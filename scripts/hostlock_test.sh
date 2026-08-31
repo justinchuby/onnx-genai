@@ -40,6 +40,28 @@
 
 set -uo pipefail
 
+# A reviewer checking whether a cell is vacuous does it by reverting one
+# production change and re-running -- so the suite has to be pointable at a
+# COPY. It was not, and the failure was silent in the worst direction: `HL`
+# was assigned unconditionally below, and the `cd` here returns to the repo
+# root, so `HL=./copy.sh scripts/hostlock_test.sh` cheerfully tested the real
+# script and reported PASS for every revert. Two of my own verifications came
+# back "not covered" that way, and the honest conclusion would have been
+# "not measured".
+#
+# Resolved BEFORE the cd, because a relative override is relative to the
+# caller's directory, not this one. Unreadable is fatal rather than ignored:
+# falling back to the default is precisely the silent-vacuity behaviour.
+if [ -n "${HOSTLOCK_SCRIPT:-}" ]; then
+    case "$HOSTLOCK_SCRIPT" in
+        /*) HOSTLOCK_SCRIPT_ABS=$HOSTLOCK_SCRIPT ;;
+        *)  HOSTLOCK_SCRIPT_ABS=$PWD/$HOSTLOCK_SCRIPT ;;
+    esac
+    [ -r "$HOSTLOCK_SCRIPT_ABS" ] || {
+        echo "hostlock_test: HOSTLOCK_SCRIPT is not readable: $HOSTLOCK_SCRIPT_ABS" >&2
+        exit 1
+    }
+fi
 cd "$(dirname "$0")/.." || exit 1
 LOCK="$(pwd)/.hostlock-selftest"
 export HOSTLOCK_DIR="$LOCK"
@@ -55,12 +77,12 @@ export HOSTLOCK_DIR="$LOCK"
 # are asserted in the path-resolution section below -- with HOSTLOCK_PRIVATE_OK
 # unset for those cells, so this line cannot make them vacuous.
 export HOSTLOCK_PRIVATE_OK=1
-HL=scripts/hostlock.sh
+HL=${HOSTLOCK_SCRIPT_ABS:-scripts/hostlock.sh}
 
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".ctl "$LOCK".ctl2 "$LOCK".ctlr "$LOCK".ctlfw "$LOCK".ctlconf "$LOCK".ctlbox "$LOCK".ctlbox.legacy "$LOCK".ctllc "$LOCK".ctlcfg "$LOCK".pinconf "$LOCK".ctlprobe "$LOCK".ctlok "$LOCK".ctlu "$LOCK".len "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild "$LOCK".stubborn 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -361,16 +383,129 @@ chk "released after SIGTERM" "$(st state)" "FREE"
 chk "the wrapped command is really stopped, not left orphaned" \
     "$(alive "$wrapped_kid" && echo orphaned || echo stopped)" "stopped"
 
-# SIGKILL cannot be trapped, so the lock survives; the anchor is the runner's
-# own pid, so the next acquirer must reap it. This is the case the pid anchor
-# exists for.
+# ...and so is everything that command started. The assertion above stops at
+# the DIRECT child, which is the one depth this defect was never at. A harness
+# runs `cargo`; cargo runs the test binary; a teardown that signals cargo alone
+# leaves that binary spinning, reparented to init, while the line above prints
+# "released" and `status` reports the box FREE. Three such orphans were found
+# on this host at 36-91% CPU, forty to sixty-four minutes after the runs that
+# started them had been torn down, and the suite was green throughout.
+#
+# So the wrapped command backgrounds a grandchild and waits, which is the shape
+# of every real harness here. Its pid is captured BEFORE the signal for exactly
+# the reason the direct child's is: once the runner is gone an orphan is
+# reparented to pid 1, and asking afterwards answers the same either way.
+rm -f "$LOCK".grandchild
+$HL run --owner leon --reason "tree teardown" -- \
+    bash -c "sleep 300 & echo \$! > '$LOCK.grandchild'; wait" >/dev/null 2>&1 &
+runner=$!
+sleep 3
+grandchild=$(cat "$LOCK".grandchild 2>/dev/null)
+chk "the wrapped command really started a grandchild" \
+    "$([ -n "$grandchild" ] && alive "$grandchild" && echo yes || echo no)" "yes"
+sig "$runner" 15
+chk "the runner still terminates when a tree is under it" \
+    "$(wait_bounded "$runner" && echo yes || echo no)" "yes"
+sleep 2
+chk "the whole wrapped tree is stopped, not just its direct child" \
+    "$(alive "$grandchild" && echo orphaned || echo stopped)" "stopped"
+if [ -n "$grandchild" ] && alive "$grandchild"; then
+    sig "$grandchild" 9
+    wait "$grandchild" 2>/dev/null
+fi
+rm -f "$LOCK".grandchild
+
+# ...and a command that IGNORES SIGTERM is still stopped, within a bound.
+#
+# TERM alone is not a teardown: the payloads that leak are precisely the ones
+# that do not die on it. So the escalation is TERM, a bounded poll, then KILL
+# -- and the poll must never be a blocking `wait`. The first draft of this fix
+# reaped the child with a plain `wait` before polling, which hangs teardown
+# forever on a child that handles TERM and returns; that was not a thought
+# experiment, it happened here, to a mutation harness whose `trap ... TERM`
+# restored a file and carried on, and it held the lock indefinitely.
+rm -f "$LOCK".stubborn
+$HL run --owner leon --reason "ignores TERM" -- \
+    bash -c "trap '' TERM; echo \$\$ > '$LOCK.stubborn'; while :; do sleep 1; done" \
+    >/dev/null 2>&1 &
+runner=$!
+sleep 3
+stubborn=$(cat "$LOCK".stubborn 2>/dev/null)
+chk "the wrapped command that ignores SIGTERM is running" \
+    "$([ -n "$stubborn" ] && alive "$stubborn" && echo yes || echo no)" "yes"
+sig "$runner" 15
+chk "the runner terminates even though its command ignores SIGTERM" \
+    "$(wait_bounded "$runner" && echo yes || echo no)" "yes"
+sleep 1
+chk "and the escalation to a signal it cannot ignore actually stopped it" \
+    "$(alive "$stubborn" && echo surviving || echo stopped)" "stopped"
+chk "and the lock was released rather than held by a blocked teardown" "$(st state)" "FREE"
+if [ -n "$stubborn" ] && alive "$stubborn"; then sig "$stubborn" 9; fi
+rm -f "$LOCK".stubborn
+
+# ...and job control does not turn the spawn into a fire-and-forget.
+#
+# `setsid` execs in place when its caller is not a process-group leader and
+# FORKS when it is. Monitor mode puts every background job in a group of its
+# own, making it a leader -- so with `-m` on, `$!` is the short-lived setsid
+# parent, `wait` returns immediately, and the lock is released while the
+# command runs on. Measured before this guard existed: this exact invocation
+# reported `wall=0.010s` and released, with the sleep still on the box.
+#
+# `SHELLOPTS` is imported by bash from the environment, so this reaches the
+# defect without editing the script -- which is also why the guard is needed:
+# no caller has to opt in for it to happen.
+mon_out=$(env SHELLOPTS=monitor "$HL" run --owner leon --reason "monitor mode" -- \
+    sh -c 'sleep 2' 2>&1)
+mon_wall=$(printf '%s\n' "$mon_out" | sed -n 's/.*wall=\([0-9.]*\)s.*/\1/p' | head -1)
+chk "the run reported a wall time at all" \
+    "$([ -n "$mon_wall" ] && echo yes || echo no)" "yes"
+chk "job control does not make the run release while its command is still going" \
+    "$(awk -v w="${mon_wall:-0}" 'BEGIN { print (w + 0 >= 1.5) ? "waited" : "released-early" }')" \
+    "waited"
+
+# ...and none of that machinery cries wolf on an ordinary run. The liveness
+# check has to exclude ZOMBIES -- a reaped-but-not-yet-collected child is
+# still a member of its own process group -- and getting that wrong is silent
+# in the other direction: every clean teardown would escalate to KILL and
+# print "the host is NOT free" while the host was, in fact, free. A warning
+# that fires on success is a warning that gets ignored when it is real.
+clean_out=$($HL run --owner leon --reason "clean run" -- sh -c 'sleep 1' 2>&1)
+chk "a clean run warns about nothing" \
+    "$(printf '%s\n' "$clean_out" | grep -c WARNING)" "0"
+
+# SIGKILL cannot be trapped, so the lock survives -- and, more importantly,
+# the runner never reaps the tree it started, so `sleep 60` outlives it. The
+# anchor is the runner's own pid, so ANCHOR-ONLY liveness calls this box free
+# while the job still holds it. That is the wedge #1806 shipped with,
+# reproduced: holder gone, job alive, status "STALE ... next acquire will reap
+# it", and the next acquirer measures against a competitor it cannot see.
+#
+# The lock must stay HELD for as long as the JOB holds cores, and must become
+# reclaimable once it does not -- both halves, or the fix for one is a wedge
+# for the other.
 $HL run --owner leon --reason "hard kill" -- sleep 60 >/dev/null 2>&1 &
 runner=$!
 sleep 2
+kpgid=$(sed -n 's/^child_pgid=//p' "$LOCK/meta" 2>/dev/null | head -1)
 sig "$runner" 9
 wait_bounded "$runner" >/dev/null 2>&1
 sleep 1
-chk "SIGKILL leaves the lock behind" "$(st state)" "STALE"
+chk "the killed runner had published its job's process group" \
+    "$([ -n "$kpgid" ] && echo yes || echo no)" "yes"
+chk "SIGKILL with the job still running does not declare the box free" \
+    "$(st state)" "HELD"
+chk "and status names the surviving job instead of the dead anchor" \
+    "$($HL status 2>&1 | grep -c 'ORPHANED')" "1"
+$HL acquire --owner roy --ttl 600 >/dev/null 2>&1
+chk "and a peer cannot reap a lock whose job still holds cores" \
+    "$(st owner)" "leon"
+# The other half: this must not become a permanent wedge. Kill the job and the
+# lock goes stale exactly as before -- the anchor still bounds the claim, it
+# just no longer outranks the evidence.
+python3 -c 'import os,sys,signal; os.killpg(int(sys.argv[1]), signal.SIGKILL)' "$kpgid" 2>/dev/null
+sleep 1
+chk "SIGKILL leaves the lock behind, once the job is gone" "$(st state)" "STALE"
 $HL acquire --owner roy --ttl 600 >/dev/null 2>&1
 chk "next acquirer reaps the killed holder" "$(st owner)" "roy"
 cleanup
@@ -816,13 +951,13 @@ echo "== value-taking options require values =="
 # `${2:-default}` + a silently-failing `shift 2` spins this loop on one core
 # forever, on the box whose contention the script exists to control.
 for flag in --gate --gate-timeout --ttl --timeout --pid --owner --reason --on-gate-timeout --expect-runnable; do
-    rc=$(timeout 5 $HL acquire --owner leon "$flag" >/dev/null 2>&1; echo $?)
+    rc=$(timeout 5 "$HL" acquire --owner leon "$flag" >/dev/null 2>&1; echo $?)
     chk "$flag with no value fails fast" "$rc" "1"
 done
 chk "--gate rejects a non-integer" \
-    "$(timeout 5 $HL acquire --owner leon --gate abc >/dev/null 2>&1; echo $?)" "1"
+    "$(timeout 5 "$HL" acquire --owner leon --gate abc >/dev/null 2>&1; echo $?)" "1"
 chk "--gate-timeout rejects a non-integer" \
-    "$(timeout 5 $HL acquire --owner leon --gate 0 --gate-timeout abc >/dev/null 2>&1; echo $?)" "1"
+    "$(timeout 5 "$HL" acquire --owner leon --gate 0 --gate-timeout abc >/dev/null 2>&1; echo $?)" "1"
 cleanup
 
 echo "== provenance does not assert facts it does not have =="
@@ -955,7 +1090,7 @@ echo "-- R2: emitted rows carry identity, state and occupancy --"
 cleanup
 $HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
 row=$($HL provenance --oneline --expect-runnable 100000)
-for field in hostlock_state declared held_by held_uid held_pid held_secs takeover gate runnable_at_acquire runnable contended sampled_at; do
+for field in hostlock_state declared held_by held_owner_source held_uid held_pid held_secs takeover gate runnable_at_acquire runnable contended sampled_at; do
     chk "the row carries $field" \
         "$(echo "$row" | tr ' ' '\n' | grep -c "^${field}=")" "1"
 done
@@ -963,6 +1098,60 @@ chk "the row's state is the real state" \
     "$(echo "$row" | tr ' ' '\n' | sed -n 's/^hostlock_state=//p')" "HELD"
 chk "the row's owner is the real owner" \
     "$(echo "$row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "leon"
+# ...and it says HOW that name was obtained, which is what decides whether it
+# can be believed. `--owner` is a name somebody chose for THIS run; an
+# inherited $HOSTLOCK_OWNER may name whoever exported it, arbitrarily long ago,
+# because `run` exports it to the wrapped command and the export outlives the
+# run. That is not hypothetical: two archived benchmark datasets are stamped
+# `held_by=roy` while their kernel-read `worktree` and `cmd` fields name a
+# different agent's worktree and command line. Nothing in the row contradicted
+# the wrong name, since `declared=yes` holds for both and every agent here
+# shares one unix account, so `held_uid` corroborates either equally.
+chk "the row says the owner was declared on the command line" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^held_owner_source=//p')" "flag"
+cleanup
+# An INHERITED name must be reported as inherited. If this reported `flag` the
+# field would be worthless -- it exists only to separate these two cases.
+env_row=$(HOSTLOCK_OWNER=roy $HL acquire --ttl 600 --reason "inherited" >/dev/null 2>&1; \
+    $HL provenance --oneline --expect-runnable 100000)
+chk "an inherited HOSTLOCK_OWNER still names its holder" \
+    "$(echo "$env_row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "roy"
+chk "but the row marks that name as inherited, not chosen" \
+    "$(echo "$env_row" | tr ' ' '\n' | sed -n 's/^held_owner_source=//p')" "env"
+cleanup
+# The $USER fallback names a shared ACCOUNT, not an agent, so it is its own
+# case and must not masquerade as either of the two above.
+user_row=$(env -u HOSTLOCK_OWNER "$HL" acquire --ttl 600 --reason "default" >/dev/null 2>&1; \
+    env -u HOSTLOCK_OWNER "$HL" provenance --oneline --expect-runnable 100000)
+chk "an undeclared owner is reported as the account default" \
+    "$(echo "$user_row" | tr ' ' '\n' | sed -n 's/^held_owner_source=//p')" "user"
+chk "and it names the unix account it fell back to" \
+    "$(echo "$user_row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "${USER:-unknown}"
+# A lock written before this key existed must read `unknown`. Answering `user`
+# would assert the most trustworthy of the three provenances about a row whose
+# name may well have been inherited -- the exact mislabelling the key exists to
+# expose, moved out of the console and into the data.
+sed -i '/^owner_source=/d' "$LOCK/meta"
+chk "a lock predating the key reports unknown, not a guess" \
+    "$($HL provenance --oneline --expect-runnable 100000 | tr ' ' '\n' \
+        | sed -n 's/^held_owner_source=//p')" "unknown"
+chk "and dropping the key did not disturb the name itself" \
+    "$($HL provenance --oneline --expect-runnable 100000 | tr ' ' '\n' \
+        | sed -n 's/^held_by=//p')" "${USER:-unknown}"
+# `status --porcelain` re-emits the attribution set for machine consumers, so
+# it must carry the qualifier too -- `owner` alone is exactly the free-text
+# half that #2260 is about, and a porcelain reader would inherit the defect.
+chk "porcelain reports unknown for a lock predating the key" \
+    "$($HL status --porcelain | sed -n 's/^owner_source=//p')" "unknown"
+cleanup
+$HL acquire --owner leon --ttl 600 --reason "porcelain" >/dev/null 2>&1
+chk "and porcelain reports a declared owner as declared" \
+    "$($HL status --porcelain | sed -n 's/^owner_source=//p')" "flag"
+chk "alongside the name it qualifies" \
+    "$($HL status --porcelain | sed -n 's/^owner=//p')" "leon"
+cleanup
+$HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
+row=$($HL provenance --oneline --expect-runnable 100000)
 # `held_by` is self-declared free text: `--owner roy` from my shell produces a
 # row that says roy. The only identity the kernel vouches for is the anchor's
 # uid, so a published row must carry that too, and it must be the REAL uid --
@@ -1713,11 +1902,29 @@ cleanup
 # A `run` holds the host while its owner is elsewhere. The reason is the only
 # thing the lock can tell whoever it blocks, and unlike an announcement it
 # survives the announcer's death -- so an empty one must fail, not default.
+#
+# `env -u HOSTLOCK_REASON`, for the same reason the sibling variables are
+# scrubbed above: this is the one `run` in the file that deliberately passes no
+# reason, so it is the one assertion an ambient value can satisfy. The docs
+# tell people to "set it once" in automation, so the recommended usage is
+# exactly what makes these two assertions fail -- and in a lane that exports it
+# globally they instead pass green with the refusal path never exercised.
 rm -f "$LOCK.ran"
-out=$($HL run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
+out=$(env -u HOSTLOCK_REASON "$HL" run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
 chk "a run with no reason is a usage error" "$rc" "1"
 chk "and that run's command never ran" "$([ -e "$LOCK.ran" ] && echo ran || echo no)" "no"
 chk "and no lock was left behind" "$(st state)" "FREE"
+
+# The scrub above is load-bearing, so pin it rather than trusting the tester's
+# environment to be empty. Without this, deleting `env -u` leaves the suite
+# green for anyone who has not set the variable -- which is every CI run today,
+# and not the automation that follows the documented advice to set it once.
+rm -f "$LOCK.ran"
+out=$(HOSTLOCK_REASON="ambient value that must not satisfy the guard" \
+    env -u HOSTLOCK_REASON "$HL" run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
+chk "an ambient \$HOSTLOCK_REASON does not satisfy a run that passes none" "$rc" "1"
+chk "and that scrubbed run's command never ran either" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo no)" "no"
 rm -f "$LOCK.ran"
 out=$($HL run --owner leon --reason "   " -- touch "$LOCK.ran" 2>&1); rc=$?
 chk "a whitespace-only reason is refused too, not treated as text" "$rc" "1"
@@ -1777,10 +1984,37 @@ cleanup
 # not, because --timeout/GATE_TIMEOUT would swamp it.
 kills=$(sed -E '/^[[:space:]]*#/d' "$HL" \
     | grep -oEi '(p?kill(all)?|killpg|pthread_kill|fuser)|timeout[[:space:]]+(-[sk]|--signal|--kill-after)|\bxargs\b' | wc -l)
-chk "exactly one call in the kill family anywhere in the script" "$kills" "1"
+# Three OCCURRENCES on two lines, and the difference is worth stating because
+# this number is meant to be audited by eye: `kill -TERM "$target"` and
+# `kill -KILL "$target"` -- the second matching twice, once for the verb and
+# once for the signal name. Two calls, one per escalation step, both in
+# stop_wrapped_tree, and `target` is pinned by its own assertion below to hold
+# either the group the child leads or the child pid.
+#
+# It was one call until the teardown was found to stop only its DIRECT child,
+# leaving a wrapped `cargo`'s test binaries spinning while this lock reported
+# the host free. Raising an exact count is precisely the kind of change this
+# assertion exists to force someone to justify, which is why it is raised here
+# rather than relaxed to a threshold -- a threshold would have absorbed the
+# same lines in silence.
+chk "exactly three calls in the kill family anywhere in the script" "$kills" "3"
+# ...and every one of them targets the command this script started, or the
+# process group that command LEADS -- never a pid or a group from anywhere else.
+#
+# A ratio (targeted == total) rather than a fixed count, so a legitimate change
+# to the escalation is not blocked by arithmetic while a kill aimed at an
+# unrelated pid still fails. The floor below is what stops the ratio passing
+# vacuously: rename the variables and both counts fall to zero, and 0 == 0
+# would otherwise be green with every signal in the file pointing anywhere.
 # shellcheck disable=SC2016  # matching source text literally, not expanding it
-chk "and it targets the command the script itself started" \
-    "$(grep -c 'kill -TERM "\$child"' "$HL")" "1"
+kill_lines=$(sed -E '/^[[:space:]]*#/d' "$HL" | grep -cE '^[[:space:]]*kill[[:space:]]')
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+kill_targeted=$(sed -E '/^[[:space:]]*#/d' "$HL" \
+    | grep -cE '^[[:space:]]*kill[[:space:]]+-[A-Z0-9]+[[:space:]]+"\$target"')
+chk "every kill targets the started command or the group it leads" \
+    "$kill_targeted" "$kill_lines"
+chk "and there was at least one to check, so the ratio is not vacuous" \
+    "$([ "${kill_lines:-0}" -ge 2 ] && echo yes || echo no)" "yes"
 # ...and it verifies that pid before signalling. Pids on this box cycle at
 # ~1.5M in four days, so signalling on "the pid still exists" would let the
 # one place this script signals anything hit a process it never started.
@@ -1797,7 +2031,111 @@ teardown_body=$(awk '/^run_teardown\(\) \{/,/^\}/' "$HL" \
     | sed -E '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' | tr '\n' '|')
 # shellcheck disable=SC2016  # matching source text literally, not expanding it
 chk "and the teardown guard is exactly a start-time comparison" "$teardown_body" \
-'run_teardown() {|local child=$1 name=$2 code=$3|if [ -n "$child" ] && [ -n "$RUN_CHILD_START" ]; then|local now|now=$(proc_start_time "$child" 2>/dev/null || echo "")|if [ "$now" = "$RUN_CHILD_START" ]; then|kill -TERM "$child" 2>/dev/null|wait "$child" 2>/dev/null|fi|fi|remove_lock_if_mine|echo "hostlock: released (${name})" >&2|exit "$code"|}|'
+'run_teardown() {|local child=$1 name=$2 code=$3|if [ -n "$child" ] && [ -n "$RUN_CHILD_START" ]; then|local now|now=$(proc_start_time "$child" 2>/dev/null || echo "")|if [ "$now" = "$RUN_CHILD_START" ]; then|stop_wrapped_tree "$child"|fi|fi|remove_lock_if_mine|echo "hostlock: released (${name})" >&2|exit "$code"|}|'
+
+# The signalling itself now lives in stop_wrapped_tree, so the golden body that
+# used to cover it has to follow it there: without this, the teardown golden
+# above stays green while every actual `kill` sits in a function nothing pins.
+#
+# Compared line-by-line against a quoted heredoc rather than joined with `|`,
+# because this body contains both `'` and `"` and the joined form would need
+# them escaped into unreadability -- a golden nobody can read is a golden
+# nobody will correctly update.
+#
+# Two properties in here cannot be reached behaviourally, which is the whole
+# reason for a golden. The `[ "$pgid" = "$child" ]` leadership check is the
+# difference between signalling the wrapped tree and signalling THIS SCRIPT'S
+# OWN GROUP: with setsid missing the child leads no group, and `-$pgid` then
+# names the runner, its caller and the agent's shell. Reproducing that means
+# removing setsid from the box. And the reap at the end is guarded on the
+# child being gone or a zombie because a plain `wait` there hangs teardown
+# forever on a child that handles TERM and returns -- observed, on this box,
+# on a mutation harness whose `trap ... TERM` restored a file and carried on.
+# A bound that can itself block is not a bound, and that is the whole subject
+# of this fix.
+#
+# Note the scope: those two lines are the JUSTIFICATION, but the assertion is
+# the whole body, so a semantics-preserving refactor of any other line in the
+# function fails here too. That is a false FAIL, and deliberately the safe
+# direction for the one function in this file that sends signals -- but it
+# means the fix for such a failure is to update this golden, not to weaken it.
+stop_body=$(awk '/^stop_wrapped_tree\(\) \{/,/^\}/' "$HL" \
+    | sed -E '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d')
+stop_expected=$(cat <<'GOLDEN'
+stop_wrapped_tree() {
+local child=$1 pgid target tries survivors state
+pgid=$(proc_pgid "$child" 2>/dev/null || echo "")
+if [ -n "$pgid" ] && [ "$pgid" = "$child" ]; then
+target="-$pgid"
+else
+target="$child"
+fi
+kill -TERM "$target" 2>/dev/null
+tries=0
+while [ "$tries" -lt 20 ] && target_alive "$target"; do
+sleep 0.5
+tries=$((tries + 1))
+done
+if target_alive "$target"; then
+kill -KILL "$target" 2>/dev/null
+sleep 0.5
+if target_alive "$target"; then
+survivors=$(live_under "$target")
+echo "hostlock: WARNING the wrapped command (${target}) survived both signals: ${survivors:-unknown}. The lock is being released, but this load is still on the cores -- the host is NOT free." >&2
+fi
+fi
+state=$(proc_state_and_start "$child" 2>/dev/null | awk '{print $1}')
+if [ -z "$state" ] || [ "$state" = Z ]; then
+wait "$child" 2>/dev/null
+fi
+}
+GOLDEN
+)
+chk "the tree stop is exactly verify-leadership, TERM, bounded poll, KILL, warn, guarded reap" \
+    "$stop_body" "$stop_expected"
+
+# The two targets that golden can name are the only two it may name. The kill
+# ratio below matches `"$target"`, so what `target` is ALLOWED to hold is the
+# assertion that keeps that ratio meaningful.
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+chk "the signal target is the led group or the child pid, and nothing else" \
+    "$(grep -cE '^[[:space:]]*target="(-\$pgid|\$child)"$' "$HL")" "2"
+
+# ...and no wait in that function is unbounded. `wait` with no guard is how
+# the first draft of this fix hung, and it reads as harmless.
+# `wait\b`, not `wait `: a BARE `wait` -- wait for every child, the broadest
+# possible block -- has no trailing argument and would slip past a pattern
+# that requires a space.
+chk "the only wait in the tree stop is the guarded one" \
+    "$(awk '/^stop_wrapped_tree\(\) \{/,/^\}/' "$HL" | grep -cE '^[[:space:]]*wait\b')" "1"
+
+# Every /proc read here races the exits it is reading about -- the group scan
+# globs /proc and then opens each entry, so any pid that ends mid-pass fails
+# its open. That is expected and handled; what must not happen is the failure
+# being ANNOUNCED, because the lock's stderr is what a caller reads to decide
+# whether a teardown worked. bash applies redirections left to right and
+# reports a failed open on the stderr in force at that instant, so
+# `<file 2>/dev/null` prints the error and `2>/dev/null <file` does not. The
+# two orders look identical at a glance and only differ under the race, which
+# is the one condition no green test run reproduces on demand -- so pin the
+# order rather than hope a reviewer spots it. Exact count, not a floor: a new
+# unguarded read must fail here rather than be absorbed. Six today: three
+# pre-existing /proc/PID/stat readers that already had the order right --
+# which is what makes this a convention being restored rather than invented
+# -- plus the holder's cmdline read and the two liveness reads.
+chk "every /proc read silences its own failed open" \
+    "$(grep -cE '2>/dev/null[[:space:]]+<"' "$HL")" "6"
+chk "and none of them applies that guard too late to work" \
+    "$(grep -cE '<"[^"]*"[[:space:]]+2>/dev/null' "$HL")" "0"
+
+# ...and the group is only ever recorded when the child genuinely leads it.
+# Dropping this one line leaves every golden above byte-identical while
+# `-$RUN_CHILD_PGID` on the normal-exit path silently becomes this script's own
+# group. It is only asked a question there today, but it is one edit from being
+# sent a signal.
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+chk "the recorded pgid is discarded unless the child leads that group" \
+    "$(grep -cF '[ "$RUN_CHILD_PGID" = "$child" ] || RUN_CHILD_PGID=""' "$HL")" "1"
 
 # ...and the ORDER of that teardown's inputs is load-bearing, which the golden
 # body above cannot see: it is a body, not a position. Moving
@@ -1842,7 +2180,7 @@ chk "and the refusal names the process-tree remedy, so it is actionable" \
 # Controls. Without these, a change that rejected --ttl everywhere -- or one
 # that broke `run` outright -- passes all three assertions above. The refusal
 # has to be scoped to exactly `run`, and `run` itself has to still work.
-ttl_seen=$($HL run --reason "ttl default probe" -- $HL status --porcelain 2>/dev/null | sed -n 's/^ttl=//p')
+ttl_seen=$("$HL" run --reason "ttl default probe" -- "$HL" status --porcelain 2>/dev/null | sed -n 's/^ttl=//p')
 chk "run without --ttl still runs, and records ttl=0" "$ttl_seen" "0"
 $HL acquire --owner pris --ttl 600 >/dev/null 2>&1
 chk "acquire --ttl is still accepted" "$(st ttl)" "600"
@@ -1921,6 +2259,559 @@ chk "and its provenance row parses back to exactly one held_by" \
 chk "with the state field the row physically carries" \
     "$($HL provenance --oneline 2>/dev/null | awk '{for(i=1;i<=NF;i++){split($i,kv,"="); m[kv[1]]=kv[2]} print m["hostlock_state"]}')" "HELD"
 $HL release >/dev/null 2>&1
+cleanup
+
+# The token a rejected value is replaced with. Read from the script rather
+# than spelled out here, so this suite pins the PROPERTY (a real name can
+# never equal it) instead of one particular spelling of it -- and so the cell
+# below is what fails if the sentinel is ever moved back inside the name
+# class, rather than fifteen unrelated cells failing for a reason none of
+# their names mention.
+MALFORMED=$(sed -n "s/^FLAT_MALFORMED='\(.*\)'$/\1/p" "$HL")
+chk "the suite found the sentinel the script actually uses" \
+    "$([ -n "$MALFORMED" ] && echo found || echo missing)" "found"
+# The property, asserted directly: the sentinel is not a legal name, so no
+# accepted value can ever collide with it. A bare `malformed` fails this.
+chk "the malformed sentinel is outside the class it polices" \
+    "$(printf '%s' "$MALFORMED" | grep -Eq '^[A-Za-z0-9_.-]+$' && echo in-class || echo outside)" \
+    "outside"
+
+# THE FOREIGN WRITER -- every cell above goes through `acquire`, which now
+# refuses these strings. That is exactly why none of them covers the defect
+# that is still reachable.
+#
+# The lock lives at a fixed shared path. Every agent runs `hostlock.sh` out of
+# their own worktree, and those worktrees sit at different commits, so a peer
+# on a checkout predating the write-side gate writes an unvalidated owner into
+# the metadata that THIS version then reads back. Write-time validation cannot
+# reach that population, and the locks written before the gate existed are
+# already on disk. So the metadata is written directly here, which is the only
+# way to reproduce a writer we do not control.
+#
+# Same shape as every other defect this lane has found this week: the negative
+# controls were all on the path that already refuses, so a full set of them
+# passed while the reachable route was untested.
+cleanup
+$HL run --owner leon --reason foreign -- sleep 45 >/dev/null 2>&1 &
+fw_bg=$!
+for _ in $(seq 1 40); do [ -f "$LOCK/meta" ] && break; sleep 0.25; done
+sed -i 's|^owner=leon$|owner=gaff hostlock_state=FREE declared=no|' "$LOCK/meta"
+
+fw_row=$($HL provenance --oneline 2>/dev/null)
+chk "a foreign owner in the metadata is reported malformed, not published" \
+    "$(echo "$fw_row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "$MALFORMED"
+# The assertion that matters is on the PARSE, not on the string: the defect
+# was never that the text appeared, it was that a consumer's reading of the
+# row inverted. This row physically says HELD; before the fix it parsed FREE.
+chk "and the row still parses back to the state it physically carries" \
+    "$(echo "$fw_row" | awk '{for(i=1;i<=NF;i++){p=index($i,"="); m[substr($i,1,p-1)]=substr($i,p+1)} print m["hostlock_state"], m["declared"]}')" \
+    "HELD yes"
+# Categorical, and the strongest cell here: a forged row cannot be the same
+# width as a clean one. This is immune to any question about which field the
+# injection happened to target.
+fw_clean_nf=18
+chk "and the field count is unchanged by the injection" \
+    "$(echo "$fw_row" | awk '{print NF}')" "$fw_clean_nf"
+# Not destroyed -- relocated to where the newline is the delimiter. Whoever is
+# debugging a malformed row is exactly the person who needs the original.
+chk "the multi-line form still carries the original text" \
+    "$($HL provenance 2>/dev/null | sed -n 's/^held_by_raw=//p')" \
+    "gaff hostlock_state=FREE declared=no"
+
+# The benign spelling, which is the likelier one and fails toward a DIFFERENT
+# REAL AGENT rather than toward nonsense.
+sed -i 's|^owner=gaff.*$|owner=sebastian helper|' "$LOCK/meta"
+chk "a foreign multi-word owner is not truncated to another agent's name" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_by=//p')" "$MALFORMED"
+
+# The negative control for the guard itself. A guard that reports every owner
+# malformed would pass all four cells above and be useless, and this is the
+# cell that fails if the character class is ever widened to reject ordinary
+# names -- the false-positive direction, which is how a check gets deleted
+# rather than fixed.
+sed -i 's|^owner=sebastian helper$|owner=gaff-cpu.2|' "$LOCK/meta"
+fw_ok=$($HL provenance --oneline 2>/dev/null)
+chk "an ordinary owner read back from the file is NOT called malformed" \
+    "$(echo "$fw_ok" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "gaff-cpu.2"
+chk "and an unforged row carries no held_by_raw at all" \
+    "$($HL provenance 2>/dev/null | grep -c '^held_by_raw=')" "0"
+chk "so the clean field count the injection cell pins is the real one" \
+    "$(echo "$fw_ok" | awk '{print NF}')" "$fw_clean_nf"
+
+# An owner with no whitespace but an `=` in it forges nothing -- it truncates.
+# `held_by=a=b` reads back as `a` on the split the header recommends, which is
+# the silent-mislabelling half of the same bug, so the NAME fields get the
+# stricter class and not merely the no-whitespace one.
+sed -i 's|^owner=gaff-cpu.2$|owner=roy=2|' "$LOCK/meta"
+chk "an owner that would truncate rather than forge is malformed too" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_by=//p')" "$MALFORMED"
+sed -i 's|^owner=roy=2$|owner=gaff-cpu.2|' "$LOCK/meta"
+
+# A field this script always writes itself is still read back from a file a
+# foreign writer may have touched. `gate` is structured, so it gets the
+# no-whitespace rule rather than the name rule -- but it does get a rule.
+printf 'gate=satisfied:3 declared=no\n' >>"$LOCK/meta"
+sed -i '0,/^gate=/{/^gate=$/d}' "$LOCK/meta"
+chk "a foreign gate value with whitespace is malformed, not a new field" \
+    "$($HL provenance --oneline 2>/dev/null | awk '{print NF}')" "$fw_clean_nf"
+
+
+# EVERY GUARDED FIELD, NOT JUST THE ONE THAT WAS REPORTED.
+#
+# The comment on `prov_add` argues the guard has to cover `takeover`,
+# `held_uid`, `held_pid` and `runnable_at_acquire` as well as `owner`. Until
+# these cells existed that argument was undefended: an independent review
+# reverted each of those four guards to raw in turn and the suite passed
+# 440/0 every time. The guards were load-bearing -- each revert re-opens the
+# same HELD-reads-FREE inversion -- and nothing would have said so.
+#
+# That is this lane's own rule, broken in the change that was enforcing it:
+# a guard applied broadly and exercised narrowly is a guard that a later
+# refactor drops in silence. One cell per field, each with the injection in
+# that field and nowhere else.
+for fw_field in anchor_uid anchor_pid takeover runnable_at_acquire; do
+    sed -i "/^${fw_field}=/d" "$LOCK/meta"
+    printf '%s=1 hostlock_state=FREE declared=no\n' "$fw_field" >>"$LOCK/meta"
+    fw_r=$($HL provenance --oneline 2>/dev/null)
+    chk "a foreign ${fw_field} cannot add fields to the row" \
+        "$(echo "$fw_r" | awk '{print NF}')" "$fw_clean_nf"
+    # Self-consistency, not a fixed verdict. Injecting into `anchor_pid`
+    # legitimately moves the state to STALE -- the pid IS the liveness check,
+    # so a corrupted one means the holder cannot be found, and that is the
+    # row telling the truth rather than being forged. Pinning "HELD yes" here
+    # would have been pinning the verdict instead of the mechanism, which is
+    # the error this whole block exists to stop making. What must hold for
+    # every field is that the parse agrees with what the row physically says
+    # in its first position -- that is the inversion, stated categorically.
+    chk "and a foreign ${fw_field} cannot make the row parse as something else" \
+        "$(echo "$fw_r" | awk '{p=index($1,"="); phys=substr($1,p+1); for(i=1;i<=NF;i++){q=index($i,"="); m[substr($i,1,q-1)]=substr($i,q+1)} print (m["hostlock_state"]==phys ? "consistent" : "inverted")}')" \
+        "consistent"
+    chk "and the foreign ${fw_field} value itself is reported as rejected" \
+        "$($HL provenance 2>/dev/null | grep -c "^[a-z_]*_raw=1 hostlock_state=FREE declared=no$")" "1"
+    sed -i "/^${fw_field}=/d" "$LOCK/meta"
+done
+
+# `gate` was already covered for field count; this is the other half -- that
+# the guard REPLACES the value rather than merely refusing to widen the row.
+printf 'gate=satisfied:3 declared=no\n' >>"$LOCK/meta"
+chk "a rejected structured value is replaced by the sentinel, not passed through" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^gate=//p')" "$MALFORMED"
+chk "and a rejected structured value is recoverable in the multi-line form" \
+    "$($HL provenance 2>/dev/null | sed -n 's/^gate_raw=//p')" "satisfied:3 declared=no"
+sed -i '/^gate=satisfied:3 declared=no$/d' "$LOCK/meta"
+
+# The sentinel is in-band data: a foreign writer can store the literal
+# sentinel itself. If rejection were detected by comparing the guard's output
+# to its input -- which is the obvious implementation -- this value would
+# compare equal, look accepted, and print with no recovery line. It is
+# rejected on the guard's exit status instead, so it is reported AND
+# recoverable, and the reader can tell it apart from a genuine rejection by
+# reading the raw line.
+printf 'gate=%s\n' "$MALFORMED" >>"$LOCK/meta"
+chk "a stored sentinel is treated as rejected, not as an accepted value" \
+    "$($HL provenance 2>/dev/null | sed -n 's/^gate_raw=//p')" "$MALFORMED"
+sed -i "/^gate=${MALFORMED}\$/d" "$LOCK/meta"
+
+# `malformed` and `unknown` are different facts and must not collapse: absent
+# means this lock predates the field, malformed means the value cannot travel.
+sed -i '/^anchor_uid=/d' "$LOCK/meta"
+chk "an ABSENT field still reads unknown, not malformed" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_uid=//p')" "unknown"
+
+kill "$fw_bg" 2>/dev/null
+wait "$fw_bg" 2>/dev/null
+cleanup
+
+# `gate` is structured -- `satisfied:3<=10000` -- so the name class that is
+# right for an owner is wrong for it, and a guard that used one predicate for
+# every field would report a satisfied gate as malformed. A check that cries
+# wolf on ordinary input is a check somebody deletes.
+cleanup
+$HL acquire --owner leon --gate 10000 --ttl 600 >/dev/null 2>&1
+# Matched by SHAPE, not by sample: the runnable count in the field is
+# whatever the box had at that instant, and pinning it would make this cell
+# fail for a reason that has nothing to do with what it tests.
+chk "a structured gate value survives the flat-row guard intact" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^gate=//p' \
+        | grep -Eq '^satisfied:[0-9]+<=10000$' && echo shape || echo other)" "shape"
+# And the reason the header tells consumers to split on the FIRST `=`: the
+# naive split truncates this field and silently drops the bound the gate was
+# judged against.
+chk "splitting on the first = keeps the bound the gate was judged against" \
+    "$($HL provenance --oneline 2>/dev/null | awk '{for(i=1;i<=NF;i++){p=index($i,"="); m[substr($i,1,p-1)]=substr($i,p+1)} print m["gate"]}' \
+        | grep -Eq '<=10000$' && echo kept || echo truncated)" "kept"
+# The falsifier for the cell above: the naive split really does lose it, so
+# the header's advice is load-bearing rather than decorative.
+chk "and the naive split really does drop it, which is why the header says so" \
+    "$($HL provenance --oneline 2>/dev/null | awk '{for(i=1;i<=NF;i++){split($i,kv,"="); m[kv[1]]=kv[2]} print m["gate"]}' \
+        | grep -Eq '<=10000$' && echo kept || echo truncated)" "truncated"
+$HL release >/dev/null 2>&1
+cleanup
+
+# THE `trusted` CLASSIFICATION IS A CLAIM, SO IT GETS A CELL.
+#
+# `held_secs` is declared `trusted` on the grounds that it is arithmetic --
+# `lock_age` is `$((now - epoch))` after `num_or` has forced the operand -- and
+# arithmetic output has no whitespace to reject. That reasoning is correct
+# today and it is exactly the kind of reasoning that stops being correct after
+# a refactor nobody connected to this file. Drive the stored epoch with the
+# same hostile values the guarded fields get: if `lock_age` ever echoes what
+# it read instead of computing from it, `trusted` becomes wrong and this says
+# so, in the words of the property rather than the words of the bug.
+cleanup
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+for ep_v in '1 hostlock_state=FREE declared=no' 'abc' '' '99 x'; do
+    sed -i "s|^acquired_epoch=.*|acquired_epoch=${ep_v}|" "$LOCK/meta"
+    ep_row=$($HL provenance --oneline 2>/dev/null)
+    chk "a stored epoch of '${ep_v}' still yields a plain integer age" \
+        "$(echo "$ep_row" | tr ' ' '\n' | sed -n 's/^held_secs=//p' \
+            | grep -Eq '^-?[0-9]+$' && echo integer || echo other)" "integer"
+    chk "and a stored epoch of '${ep_v}' cannot widen the row" \
+        "$(echo "$ep_row" | awk '{print NF}')" "$fw_clean_nf"
+done
+# Two data-quality properties of the same column. Neither forges -- `num_or`
+# has already sent every non-digit to the default, so no injection is
+# reachable -- but `held_secs` is a column harnesses AGGREGATE, and a mean
+# taken over a wrong number is silently wrong rather than visibly wrong.
+#
+# A leading zero is the one shape `num_or` passes and `$(( ))` misreads:
+# it is all digits, so it is accepted, and then read as OCTAL.
+# `0100` rather than `010`: this cell reads the clock a second time and can
+# lose a race with the one inside `lock_age`, so it needs a tolerance -- and a
+# tolerance wide enough to absorb the race must still be narrower than the
+# defect. Decimal 100 against octal 64 is a gap of 36 against a slack of 3.
+# `010` gave a gap of 2, which the tolerance would have swallowed whole: the
+# cell would have passed either way.
+sed -i "s|^acquired_epoch=.*|acquired_epoch=0100|" "$LOCK/meta"
+oct_d=$(( $($HL provenance --oneline 2>/dev/null | tr ' ' '\n' \
+    | sed -n 's/^held_secs=//p') - $(date +%s) + 100 ))
+chk "a stored epoch with a leading zero is read as base 10, not octal" \
+    "$([ "${oct_d#-}" -le 3 ] && echo base10 || echo other)" "base10"
+# A lock stamped in the future reported a NEGATIVE age, which no consumer of
+# a duration column expects and which poisons a mean without tripping a
+# range check that only tests an upper bound.
+sed -i "s|^acquired_epoch=.*|acquired_epoch=$(( $(date +%s) + 3600 ))|" "$LOCK/meta"
+chk "a future epoch clamps to zero rather than reporting a negative age" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' \
+        | sed -n 's/^held_secs=//p')" "0"
+# The cry-wolf control: an ordinary epoch must still produce a real age, or
+# the clamp above could pass by pinning the whole column to zero.
+#
+# A RANGE, not equality. `lock_age` reads the clock again inside a freshly
+# spawned `provenance`, so the answer is `42 + elapsed` -- it is `>= 42` and
+# was never `== 42`. Under load this failed roughly 1 run in 20, and a flaky
+# cell here is far worse than it looks: this suite is the oracle for the
+# mutation battery, so an intermittent failure makes EVERY mutant look
+# caught. It did exactly that, and reported a guard as covered when the
+# guard had no cell at all.
+sed -i "s|^acquired_epoch=.*|acquired_epoch=$(( $(date +%s) - 42 ))|" "$LOCK/meta"
+age_ord=$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' \
+    | sed -n 's/^held_secs=//p')
+chk "and an ordinary epoch still reports the true elapsed age" \
+    "$([ "$age_ord" -ge 42 ] && [ "$age_ord" -le 90 ] && echo elapsed || echo "$age_ord")" "elapsed"
+$HL release >/dev/null 2>&1
+cleanup
+
+# A LEGACY PATH THAT CANNOT TRAVEL FLAT.
+#
+# `legacy_dir` is `$HOSTLOCK_LEGACY_DIR` when set, so it is operator-supplied
+# and reaches the row exactly like `lock_dir` does. It survived a mutation
+# that dropped its guard entirely, because every cell about the legacy path
+# used a path without spaces in it.
+hl_lg="$(pwd)/.hostlock-selftest-lg dir"
+lg_conf="$LOCK.lgconf"
+mkdir -p "$hl_lg"
+# `legacy_consult_path` only names a path when the lock dir came from a
+# CONFIG -- an env-set HOSTLOCK_DIR means the operator addressed this lock
+# directly and no consult applies. So the config route is the one that has to
+# be driven here; using the env route is why the first version of this cell
+# read `none` and would have passed against a guard that was not there.
+printf 'lock_dir=%s\n' "$LOCK.lgbox" >"$lg_conf"
+lg_run() { env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$hl_lg" \
+    HOSTLOCK_PRIVATE_OK=1 "$HL" "$@"; }
+lg_row=$(lg_run status --porcelain 2>/dev/null)
+chk "the legacy consult really is on the config route, not skipped" \
+    "$(echo "$lg_row" | grep -c '^legacy_dir=')" "1"
+# THE TWO EMITTERS HAVE DIFFERENT GRAMMARS AND SO DIFFERENT RULES, and this
+# pair is the cell that says so. `status --porcelain` is one key per LINE, so
+# a space forges nothing and the path must arrive INTACT -- guarding it there
+# would be the cry-wolf direction, and would break every consumer reading a
+# path with a space in it. The flat row is space-separated, so the same value
+# must be rejected. A single predicate for the whole file gets one of these
+# two wrong whichever way it is written.
+chk "a spaced legacy path arrives intact in the newline-delimited grammar" \
+    "$(echo "$lg_row" | sed -n 's/^legacy_dir=//p')" "$hl_lg"
+chk "and the porcelain does not gain a line from the space" \
+    "$(echo "$lg_row" | grep -c '=')" "$(echo "$lg_row" | wc -l)"
+lg_prow=$(lg_run provenance --oneline 2>/dev/null)
+chk "and the same value IS rejected in the space-separated grammar" \
+    "$(echo "$lg_prow" | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')" "$MALFORMED"
+chk "and does not widen the provenance row" \
+    "$(echo "$lg_prow" | awk '{print NF}')" "$fw_clean_nf"
+chk "and the multi-line form can still say which legacy path was consulted" \
+    "$(lg_run provenance 2>/dev/null | sed -n 's|^legacy_dir_raw=||p')" "$hl_lg"
+# The negative control, so this block cannot pass by the guard rejecting
+# every legacy path it is ever shown.
+lg_ok="$LOCK.lgplain"
+mkdir -p "$lg_ok"
+chk "an ordinary legacy path is NOT reported as rejected" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_ok" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_dir=//p')" "$lg_ok"
+
+# A NEWLINE, WHICH IS THE THING THAT DOES FORGE IN THIS GRAMMAR.
+#
+# `lock_dir` and `legacy_dir` come from `HOSTLOCK_DIR`, `HOSTLOCK_CONF` and
+# `HOSTLOCK_LEGACY_DIR` -- environment strings, not metadata, so `meta_get`'s
+# one-line read does not bound them and a newline really can arrive. Before
+# `flat_line` existed this emitted `legacy_dir=a` followed by an entire forged
+# `state=FREE` line, and the porcelain grew from 8 lines to 9.
+lg_nl=$(printf 'a\nstate=FREE')
+nl_row=$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_nl" \
+    HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null)
+chk "a newline in a legacy path cannot add a line to the porcelain" \
+    "$(echo "$nl_row" | grep -c '^state=')" "1"
+chk "and the offending value is reported as rejected" \
+    "$(echo "$nl_row" | sed -n 's/^legacy_dir=//p')" "$MALFORMED"
+# The negative control for `flat_line` specifically: it must reject ONLY the
+# newline, or it would break the spaced-path cell above.
+chk "and a space is still not a newline, so a spaced path is untouched" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$hl_lg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_dir=//p')" "$hl_lg"
+
+# THE RECOVERY LINE UNDID THE GUARD IT RECOVERS FROM, which is the defect
+# this block exists for and the one every cell above walked straight past.
+#
+# `flat_value` correctly rejected a newline-bearing `legacy_dir` and printed
+# `legacy_dir=@malformed` -- and then the `_raw` affordance, added so a
+# rejected value stays debuggable, printed the ORIGINAL text verbatim into
+# the newline-delimited multi-line form. The comment above it asserted the
+# raw text "cannot forge anything" there "where the newline is the
+# delimiter". That has the logic exactly backwards: the newline BEING the
+# delimiter is precisely why a newline forges there. Metadata-derived raws
+# were safe only because `meta_get`'s one-line read bounds them, which is a
+# property of those fields and not of the emitter.
+#
+# The cells above missed it because every existing `_raw` cell used a value
+# containing a SPACE -- the case the affordance was written for -- and the
+# field-injection block only drove metadata-derived fields, which cannot
+# carry a newline in the first place.
+#
+# A HELD lock is required or this whole block is vacuous: a forged
+# `hostlock_state=FREE` line on a box that is genuinely FREE agrees with the
+# truth and inverts nothing.
+# ACQUIRING THROUGH `lg_run` DOES NOT WORK, and the non-vacuity cell below is
+# how that was found rather than guessed. `$hl_lg` exists but has no `meta`,
+# so `legacy_holder` cannot parse it, falls through to the unparseable-mtime
+# grace, and reports `unknown ?` -- a freshly created empty directory reads as
+# a LIVE legacy holder, and `refuse_if_legacy_held` then refuses the acquire.
+# Every cell in this block would have run against a FREE lock, where a forged
+# `hostlock_state=FREE` line agrees with the truth and inverts nothing.
+#
+# So acquire with the legacy consult pointed at a path that does not exist,
+# and read provenance with it pointed wherever the cell needs. The HELD state
+# comes from the config lock dir; the legacy path only decorates the row.
+lg_take() { env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" \
+    HOSTLOCK_LEGACY_DIR="$LOCK.lg-absent" HOSTLOCK_PRIVATE_OK=1 "$HL" "$@"; }
+lg_take acquire --owner leon-nlraw --ttl 600 >/dev/null 2>&1
+chk "the raw-line block really is driving a HELD lock, not a free one" \
+    "$(lg_run provenance --oneline 2>/dev/null | tr ' ' '\n' \
+        | sed -n 's/^hostlock_state=//p')" "HELD"
+# A PAYLOAD IN THIS GRAMMAR'S OWN KEY. `$lg_nl` forges `state=FREE`, which is
+# the PORCELAIN key; the provenance key is `hostlock_state=`. Reusing it here
+# made the two last-wins cells below pass against the unfixed script -- they
+# counted a key the payload never wrote. The fix is protected either way by
+# the `legacy_dir_raw` cell, but a cell advertised as demonstrating the harm
+# has to actually demonstrate it.
+lg_nl_prov=$(printf 'a\nhostlock_state=FREE')
+nlraw=$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_nl_prov" \
+    HOSTLOCK_PRIVATE_OK=1 "$HL" provenance 2>/dev/null)
+chk "a newline in a legacy path cannot add a state line via the raw form" \
+    "$(printf '%s\n' "$nlraw" | grep -c '^hostlock_state=')" "1"
+# The cell that states the harm in the reader's own terms. Pre-fix this read
+# FREE against a lock that was physically held.
+chk "and a last-wins parse of the multi-line form still reads HELD" \
+    "$(printf '%s\n' "$nlraw" | awk -F= '/^hostlock_state=/{v=$2} END{print v}')" "HELD"
+# The raw line used to answer this case by throwing the value away entirely
+# (`legacy_dir_raw=@malformed`), and this cell asserted that. It now ENCODES
+# instead, which is a deliberate strengthening in both directions at once:
+# the forge is still dead -- the cell above proves no second `hostlock_state=`
+# line appears -- and the operator gets the value back, which is the entire
+# reason the raw affordance exists. Discarding it satisfied the guard by
+# defeating the feature.
+#
+# Asserted as an exact string rather than "does not contain a newline",
+# because the weaker form is satisfied by the old discard-everything
+# behaviour too and so cannot tell the two apart.
+chk "and the unrecoverable value is recovered inertly, not discarded" \
+    "$(printf '%s\n' "$nlraw" | sed -n 's/^legacy_dir_raw=//p')" \
+    "$(printf '%q' "$lg_nl_prov")"
+# Titled for what it actually checks. Phrased as "carries no literal
+# newline" it did not test that: a leaked newline produces a SECOND physical
+# line that does not match this prefix, so the count stays 1 either way. The
+# no-newline property is carried by the exact-string cell above; this one
+# pins that the raw appears exactly once.
+chk "and exactly one legacy_dir_raw line is emitted" \
+    "$(printf '%s\n' "$nlraw" | grep -c '^legacy_dir_raw=')" "1"
+# The negative control, under the SAME held-lock conditions as the cells
+# above, so the fix cannot pass by refusing every raw value it is shown.
+# This is the case the affordance exists for and it must still work.
+chk "a spaced legacy path still recovers intact through the raw line" \
+    "$(lg_run provenance 2>/dev/null | sed -n 's|^legacy_dir_raw=||p')" "$hl_lg"
+chk "and a spaced path adds no state line either" \
+    "$(lg_run provenance 2>/dev/null | grep -c '^hostlock_state=')" "1"
+lg_take release >/dev/null 2>&1
+
+# The first-word truncation, in the emitter where it was still live. The
+# provenance copy of this was fixed and the porcelain copy was not, which is
+# what "fix the reported symptom" looks like from the inside.
+lg_leg="$LOCK.lgbox.legacy"
+mkdir -p "$lg_leg"
+# Same fixture shape the legacy section uses: `start_time` is part of the
+# liveness identity, and a holder without it is judged dead and reads
+# `unknown` -- which would have made this cell pass for the wrong reason if
+# the truncation were still there.
+lg_leg_start=$(sed 's/.*) //' "/proc/$$/stat" | awk '{print $20}')
+printf 'owner=sebastian helper\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=0\n' \
+    "$$" "$lg_leg_start" "$(date +%s)" >"$lg_leg/meta"
+chk "a multi-word legacy owner is not renamed to another agent by the porcelain" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_leg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_held_by=//p')" "sebastian helper"
+# AND THE THIRD EMITTER, which had the identical truncation and no cell at
+# all. `status_lock_dir_note` is the HUMAN line, which is why it was missed
+# twice and why it matters most: a machine row that says `sebastian` gets
+# parsed, but a person who reads "still held by sebastian" walks over and
+# asks the wrong peer. Two emitters fixed and a third left live is the same
+# "fix the reported symptom" failure one layer out.
+chk "nor by the human status line, which is the third copy of this" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_leg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status 2>/dev/null \
+        | sed -n 's/.*is still held by \(.*\) (pid.*/\1/p')" "sebastian helper"
+# The negative control: the pid must still be the pid, so the cell above
+# cannot pass by the note simply printing the whole string.
+chk "and the human line still recovers the holder pid correctly" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_leg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status 2>/dev/null \
+        | sed -n 's/.*(pid \([0-9]*\)).*/\1/p')" "$$"
+rm -rf "$lg_leg"
+
+# NO CELL HERE FOR "flat_line rejects the literal sentinel", because that
+# guard was removed as unobservable -- see the comment on `flat_line`. Both
+# branches render `@malformed` for a sentinel input, so no cell can tell them
+# apart, and the one written here passed with the guard reverted. Recorded
+# rather than deleted silently: the next person to notice the asymmetry with
+# `flat_value` should find out why it is there before re-adding it.
+
+rm -rf "$hl_lg" "$lg_ok" "$lg_conf"
+cleanup
+
+# EVERY CALL SITE NAMES A KIND THAT EXISTS.
+#
+# `prov_add`'s `*)` arm calls `die`, and no cell can reach it: every call site
+# in the file names a valid kind, so the branch is unreachable through the
+# public interface and a mutation that replaces it with "publish unguarded"
+# cannot be caught behaviourally. Declared EQUIVALENT in the battery rather
+# than covered by a cell that does not exist.
+#
+# What CAN be checked is the property that keeps it unreachable -- that no
+# call site has drifted to a kind the dispatcher does not know. This one is
+# structural on purpose: the property is about the text of the call sites,
+# not about behaviour, so there is nothing to observe at runtime. That is the
+# opposite of a structural check standing in for a behavioural one.
+chk "every prov_add call site names a kind the dispatcher handles" \
+    "$(grep -oE '^ *prov_add [a-z]+' "$HL" | awk '{print $2}' \
+        | grep -vcE '^(name|value|trusted)$')" "0"
+# ... and the dispatcher handles no kind that nobody passes, which is the
+# other way the two can drift apart.
+chk "and the dispatcher handles no kind that no call site passes" \
+    "$(for k in name value trusted; do grep -qE "^ *prov_add $k " "$HL" || echo "$k"; done | wc -l)" "0"
+cleanup
+
+# A REAL AGENT NAMED LIKE THE SENTINEL.
+#
+# `malformed` is a legal owner: it is in the safe-name class, so `require_name`
+# accepts it and `flat_field` passes it through. If the sentinel were the bare
+# word, this row and a row whose owner was thrown away would be byte-identical
+# in the one-line form -- the machine-parsed one -- and no recovery line would
+# be emitted to tell them apart, because nothing was rejected. The sentinel
+# carrying a character the name class forbids is what makes these two rows
+# distinguishable at all.
+cleanup
+$HL acquire --owner malformed --ttl 600 >/dev/null 2>&1
+chk "an agent legitimately named like the sentinel is not mistaken for one" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_by=//p')" "malformed"
+chk "and is not equal to the sentinel a rejected value would print" \
+    "$([ "malformed" = "$MALFORMED" ] && echo collides || echo distinct)" "distinct"
+chk "and carries no recovery line, because nothing was rejected" \
+    "$($HL provenance 2>/dev/null | grep -c '^held_by_raw=')" "0"
+$HL release >/dev/null 2>&1
+cleanup
+
+# A PATH THAT CANNOT TRAVEL FLAT, WHICH NEEDS NO FOREIGN WRITER AT ALL.
+#
+# `lock_dir` is the field that makes `declared` checkable: `declared=yes` is a
+# claim about a host, and it can only be re-checked if the row says which
+# directory the claim was made in. A directory with a space in it is an
+# operator typing one, not an attack -- and before the recovery line existed
+# the row said `@malformed` with no way back, quietly destroying the one field
+# the header promises makes the rest verifiable.
+hl_sp="$(pwd)/.hostlock-selftest-sp dir"
+mkdir -p "$hl_sp"
+sp_row=$(HOSTLOCK_DIR="$hl_sp/lk" HOSTLOCK_PRIVATE_OK=1 sh -c \
+    "\"$HL\" acquire --owner leon --ttl 600 >/dev/null 2>&1; \"$HL\" provenance --oneline 2>/dev/null")
+chk "a lock path that cannot travel flat does not widen the row" \
+    "$(echo "$sp_row" | awk '{print NF}')" "$fw_clean_nf"
+chk "and is reported as rejected rather than silently truncated" \
+    "$(echo "$sp_row" | tr ' ' '\n' | sed -n 's/^lock_dir=//p')" "$MALFORMED"
+chk "and the multi-line form can still say which lock the row is about" \
+    "$(HOSTLOCK_DIR="$hl_sp/lk" HOSTLOCK_PRIVATE_OK=1 "$HL" provenance 2>/dev/null \
+        | sed -n 's|^lock_dir_raw=||p')" "$hl_sp/lk"
+HOSTLOCK_DIR="$hl_sp/lk" HOSTLOCK_PRIVATE_OK=1 "$HL" release >/dev/null 2>&1
+rm -rf "$hl_sp"
+cleanup
+
+# The write gate and the read gate must share one character class. If they
+# drift, the reader accepts something the writer refuses -- which is the whole
+# argument for validating at write time, running backwards.
+#
+# Asserted BEHAVIOURALLY. The previous form of this cell counted occurrences
+# of `name_is_safe` in the file, which passes on the string being present and
+# says nothing about it being called -- a review broke the delegation while
+# keeping the literal in a comment and the count held. Drive both gates with
+# the same strings instead and require them to agree on every one; that is
+# the property, and it cannot be satisfied by text.
+# The empty string is deliberately absent from this table. It is the one
+# input on which the two gates SHOULD disagree: the writer refuses it, and the
+# reader turns it into `none`, because an absent owner is a different fact
+# from an unprintable one -- the `malformed`/`unknown`/`none` distinction
+# pinned above. A table demanding agreement there would be demanding the
+# guard collapse them.
+for wr_s in leon gaff-cpu.2 roy_2 a.b-c_1 malformed "roy=2" "a b" "a	tab" "x;y"; do
+    cleanup
+    $HL acquire --owner "$wr_s" --ttl 600 >/dev/null 2>&1 && wr_w=accept || wr_w=reject
+    $HL release >/dev/null 2>&1
+    cleanup
+    # The read side, driven directly: hold the lock under a name the writer
+    # certainly accepts, then overwrite the stored owner with the string under
+    # test, which is exactly what a peer at an older commit does.
+    $HL run --owner leon --reason drift -- sleep 20 >/dev/null 2>&1 &
+    wr_bg=$!
+    for _ in $(seq 1 40); do [ -f "$LOCK/meta" ] && break; sleep 0.25; done
+    python3 - "$LOCK/meta" "$wr_s" <<'PYWR'
+import sys
+path, val = sys.argv[1], sys.argv[2]
+lines = [ln for ln in open(path).read().split("\n") if not ln.startswith("owner=")]
+lines.insert(0, "owner=" + val)
+open(path, "w").write("\n".join(lines))
+PYWR
+    wr_got=$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_by=//p')
+    [ "$wr_got" = "$MALFORMED" ] && wr_r=reject || wr_r=accept
+    kill "$wr_bg" 2>/dev/null
+    wait "$wr_bg" 2>/dev/null
+    chk "write and read gates agree on '$(printf '%s' "$wr_s" | cat -v)'" "$wr_r" "$wr_w"
+done
 cleanup
 
 echo "== which lock is this: path resolution, and saying so =="
@@ -2082,6 +2973,23 @@ chk "and the machine row says which path was consulted" \
     "$(hl_legacy "$CONF" status --porcelain 2>/dev/null | sed -n 's/^legacy_dir=//p')" "$LOCK.legacy"
 chk "and who was found there" \
     "$(hl_legacy "$CONF" status --porcelain 2>/dev/null | sed -n 's/^legacy_held_by=//p')" "roy"
+# The legacy metadata is by definition written by an older version of this
+# script, so it is the one owner field that is GUARANTEED to predate the
+# write-side gate. `legacy_holder` prints "<owner> <pid>", and taking the
+# first word rather than everything-but-the-last renamed "roy prefill sweep"
+# to "roy" -- and would rename "sebastian helper" to a different real agent.
+sed -i 's|^owner=roy$|owner=roy prefill sweep|' "$LOCK.legacy/meta"
+chk "a multi-word legacy owner is reported malformed, not renamed" \
+    "$(hl_legacy "$CONF" provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^legacy_held_by=//p')" \
+    "$MALFORMED"
+chk "and the multi-line form carries what was actually in the old file" \
+    "$(hl_legacy "$CONF" provenance 2>/dev/null | sed -n 's/^legacy_held_by_raw=//p')" \
+    "roy prefill sweep"
+sed -i 's|^owner=roy prefill sweep$|owner=roy|' "$LOCK.legacy/meta"
+chk "and an ordinary legacy owner still reads back intact" \
+    "$(hl_legacy "$CONF" provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^legacy_held_by=//p')" \
+    "roy"
+
 chk "run is refused for the same reason, since it acquires first" \
     "$(hl_legacy "$CONF" run --reason "legacy path refusal" -- touch "$LOCK.legacyran" >/dev/null 2>&1; echo $?)" "2"
 chk "and the wrapped command did not run" \
@@ -2522,13 +3430,693 @@ chk "and no lock directory was created by the refused acquire" \
 rm -rf "$shim"
 cleanup
 
+# --help must work, and must keep working. The header it prints is the only
+# documentation anyone reads, and `--help` answering "unknown subcommand" is
+# why four agents spent a night arguing to build a tool that already existed.
+#
+# The self-extracting form has one real failure mode, and it is this suite's
+# own recurring theme: if the sed range breaks -- someone renames the section
+# that bounds it -- help prints nothing at all, exits 0, and looks fine. So
+# these pin the CONTENT, not just the exit status.
+help_out=$("$HL" --help 2>/dev/null)
+"$HL" --help >/dev/null 2>&1; rc_help=$?
+"$HL" -h >/dev/null 2>&1; rc_h=$?
+"$HL" help >/dev/null 2>&1; rc_word=$?
+"$HL" not-a-subcommand >/dev/null 2>&1; rc_bogus=$?
+chk "--help exits 0" "$rc_help" "0"
+chk "-h is the same" "$rc_h" "0"
+chk "the bare help subcommand is the same" "$rc_word" "0"
+chk "help still refuses a genuinely unknown subcommand" "$rc_bogus" "1"
+chk "help prints the usage line" "$(echo "$help_out" | grep -c '^Usage:')" "1"
+# The self-extracting form has one real failure mode, and poisoning it taught
+# me I had guarded the wrong direction. If the sed range breaks -- someone
+# renames the section that bounds it -- sed does NOT print nothing. An
+# unmatched end address runs to end of file, so help prints 1964 lines,
+# including the script's own source, and exits 0. A lower bound alone passes
+# that happily. So bound it from ABOVE as well, and assert no source leaks.
+help_lines=$(echo "$help_out" | wc -l)
+chk "help is not silently empty -- the sed range still matches" \
+    "$([ "$help_lines" -gt 60 ] && echo wide || echo truncated)" "wide"
+chk "help does not run off the end of the file when the range breaks" \
+    "$([ "$help_lines" -lt 400 ] && echo bounded || echo ranaway)" "bounded"
+chk "help leaks no source -- no esac from the dispatch" \
+    "$(echo "$help_out" | grep -c -- 'esac')" "0"
+chk "help leaks no source -- no internal function names" \
+    "$(echo "$help_out" | grep -c -- 'warn_if_private')" "0"
+
+# Help must answer from a BROKEN environment, because that is the environment
+# someone is in when they reach for it. Both of these aborted with a validation
+# error before the help arm was hoisted above `require_name` and the anchor-pid
+# check -- so `--help` failed exactly for the misconfigured user it exists to
+# serve. Regression tests for that, not decoration.
+HOSTLOCK_OWNER="cpu team" "$HL" --help >/dev/null 2>&1; rc_badowner=$?
+"$HL" --help --pid 999999 >/dev/null 2>&1; rc_badpid=$?
+chk "help answers despite an owner name it would refuse to lock with" "$rc_badowner" "0"
+chk "help answers despite a dead --pid anchor" "$rc_badpid" "0"
+
+# Same idiom as the no-argument help test above, and for the same reason: a
+# line-count bound cannot notice that the header grew a flag the help never
+# mentions. Pin the flags people actually get wrong.
+for flag in --reason --wait --timeout --gate --on-gate-timeout; do
+    chk "--help mentions $flag" \
+        "$(echo "$help_out" | grep -c -- "$flag" | awk '{print ($1>0)?1:0}')" "1"
+done
+chk "help names --reason as REQUIRED, the flag that refuses run" \
+    "$(echo "$help_out" | grep -c 'REQUIRED')" "1"
+chk "help documents --wait, which is a bare flag people pass seconds to" \
+    "$(echo "$help_out" | grep -cE '^  --wait ')" "1"
+chk "help leaves the comment markers behind" "$(echo "$help_out" | grep -c '^# ')" "0"
+chk "asking for help takes no lock" \
+    "$([ -e "$LOCK" ] && echo created || echo none)" "none"
+
+# Help must outrank the two gates that run at LOAD time, before the dispatch
+# `case` is even reached. Neither is reachable from the suite's normal cells,
+# because this file exports HOSTLOCK_DIR -- which takes the `env` branch and
+# skips config resolution entirely -- so both were wholly untested.
+#
+# Each pair below asserts the gate is LIVE before asserting help survives it.
+# A cell that only checked `--help` returning 0 would pass just as happily if
+# the gate had been deleted, which tests nothing and is the vacuous-arm failure
+# this file's count pin exists to catch one level up.
+
+# Gate 1: a relative lock_dir. This is the mistake made by someone following
+# the header's own instructions for relocating the lock -- who then could not
+# read those instructions to find it, because every command including --help
+# died on the config first.
+mkdir -p "$LOCK.helpconf"
+printf 'lock_dir=relative/bad\n' >"$LOCK.helpconf/conf"
+hl_badconf() { env -u HOSTLOCK_DIR HOSTLOCK_CONF="$LOCK.helpconf/conf" scripts/hostlock.sh "$@"; }
+chk "a relative lock_dir is still a hard configuration error" \
+    "$(hl_badconf status >/dev/null 2>&1; echo $?)" "1"
+chk "help answers anyway, from the broken config that refuses every command" \
+    "$(hl_badconf --help >/dev/null 2>&1; echo $?)" "0"
+chk "and it is the real usage, not a truncated stub" \
+    "$(hl_badconf --help 2>/dev/null | grep -c '^Usage:')" "1"
+
+# Gate 2: an unsupported platform. `require_supported_platform` exits 8 on a
+# host without /proc -- macOS, native Windows, a stripped container. "What does
+# this tool need?" is the question those users have and the header is where it
+# is answered, so exiting 8 without printing it is precisely backwards. It
+# cannot be provoked on a Linux runner, so provoke it the way this workstream
+# proves any route claim: poison the gate in a copy and show the behaviour
+# moves. If the interception were below the call, help would exit 8 here.
+sed '/^require_supported_platform() {$/a\    exit 8' "$HL" >"$LOCK.helppoison"
+chmod +x "$LOCK.helppoison"
+chk "the poisoned copy really does refuse ordinary subcommands" \
+    "$("$LOCK.helppoison" status >/dev/null 2>&1; echo $?)" "8"
+chk "help answers from a host this script refuses to run on" \
+    "$("$LOCK.helppoison" --help >/dev/null 2>&1; echo $?)" "0"
+chk "and that help is the real usage too" \
+    "$("$LOCK.helppoison" --help 2>/dev/null | grep -c '^Usage:')" "1"
+
+# Pin the ORDER as well as the behaviour. The two cells above can only fail
+# once someone has already moved the interception; this fails on the diff that
+# moves it, and names which gate it fell behind.
+help_at=$(grep -n 'help|-h|--help) cmd_help' "$HL" | head -1 | cut -d: -f1)
+platform_at=$(grep -n '^require_supported_platform$' "$HL" | head -1 | cut -d: -f1)
+conf_die_at=$(grep -n 'lock_dir must be a non-empty absolute path' "$HL" | head -1 | cut -d: -f1)
+chk "the help interception precedes the platform gate" \
+    "$([ -n "$help_at" ] && [ -n "$platform_at" ] && [ "$help_at" -lt "$platform_at" ] && echo yes || echo no)" "yes"
+chk "the help interception precedes the lock_dir config gate" \
+    "$([ -n "$help_at" ] && [ -n "$conf_die_at" ] && [ "$help_at" -lt "$conf_die_at" ] && echo yes || echo no)" "yes"
+rm -rf "$LOCK.helpconf" "$LOCK.helppoison"
+echo "== --timeout is refused where it could only be ignored (#2109) =="
+# `--timeout` is read from exactly two wait loops. `cmd_acquire`'s deadline
+# check sits *after* the `DO_WAIT != 1` early return, so without `--wait` the
+# bound is parsed, range-checked by require_uint, and never compared: the
+# caller gets an instant BUSY and believes it waited. Refusing beats ignoring,
+# for the reason this script already gives for --expect-cores/--min-efficiency.
+cleanup
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+out=$($HL acquire --owner roy --timeout 10 2>&1)
+rc=$?
+chk "acquire --timeout without --wait is refused, not silently ignored" "$rc" "1"
+chk "and the refusal says the bound would be ignored" \
+    "$(echo "$out" | grep -c 'inert here')" "1"
+chk "and it names a form that does wait" \
+    "$(echo "$out" | grep -c -- '--wait --timeout')" "1"
+# CONTROLS. A blanket ban on --timeout passes all three checks above and is
+# still wrong, so every form that genuinely consults the bound is pinned here.
+# Without these, the guard could tighten into a refusal of the working paths
+# and this file would still be green -- the mutation that matters most.
+t0=$SECONDS
+$HL acquire --owner roy --wait --timeout 1 >/dev/null 2>&1
+rc=$?
+chk "acquire --wait --timeout still waits, then times out" "$rc" "3"
+chk "and it spent the bound rather than returning instantly" \
+    "$([ "$((SECONDS - t0))" -ge 1 ] && echo waited || echo instant)" "waited"
+t0=$SECONDS
+$HL wait --timeout 1 >/dev/null 2>&1
+rc=$?
+chk "wait --timeout is untouched by the guard" "$rc" "3"
+chk "and it too spent the bound" \
+    "$([ "$((SECONDS - t0))" -ge 1 ] && echo waited || echo instant)" "waited"
+chk "acquire without --timeout still fails fast rather than being refused" \
+    "$($HL acquire --owner roy >/dev/null 2>&1; echo $?)" "2"
+# A subcommand that never loops at all is refused too, but must NOT be told to
+# add --wait: that flag is equally inert on `status`, so the advice would
+# reproduce the defect one flag further along.
+out=$($HL status --timeout 10 2>&1)
+chk "status --timeout is refused as well" "$?" "1"
+chk "and it does not advise adding --wait, which would also be inert" \
+    "$(echo "$out" | grep -c -- '--wait --timeout')" "0"
+chk "and it names the three forms that do consult the bound" \
+    "$(echo "$out" | grep -c 'Only .wait., .run., and .acquire --wait.')" "1"
+chk "status without --timeout is unaffected" \
+    "$($HL status >/dev/null 2>&1; echo $?)" "0"
+# The exemption is `acquire --wait`, not `--wait`. Only cmd_acquire reads
+# DO_WAIT, so --wait is itself inert on status -- and a guard keyed off DO_WAIT
+# alone would let a second inert flag launder the first one past it.
+out=$($HL status --wait --timeout 10 2>&1)
+chk "status --wait --timeout is refused too, because --wait is inert there" \
+    "$?" "1"
+chk "and adding an inert --wait does not buy an exemption" \
+    "$(echo "$out" | grep -c -- '--wait --timeout')" "0"
+cleanup
+# `run` sets DO_WAIT itself rather than taking --wait, so its bound is live and
+# must not be swept up by a guard aimed at the subcommands that never wait.
+$HL run --owner leon --reason "timeout ok" --timeout 5 -- true >/dev/null 2>&1
+chk "run --timeout is not refused, because run always waits" "$?" "0"
+cleanup
+
+# ---------------------------------------------------------------------------
+# A `run` NESTED INSIDE ITS OWN `run` IS A CYCLE, NOT CONTENTION (#1977).
+#
+# `run` always sets DO_WAIT, so before this was fixed the inner acquire waited
+# on a holder that could not release until the inner command returned. It
+# printed nothing at all for the full --timeout -- 3600s by default -- and
+# then reported code 3, which claims a peer had the box. Three separate
+# failures in one: it hung, it was silent while hanging, and it blamed
+# somebody who did not exist.
+#
+# The immediacy cell is the one that pins the defect. Exit 9 alone could be
+# reached after an hour of waiting and still satisfy a code check, so the
+# elapsed time is asserted too: the old behaviour cannot produce a refusal in
+# under five seconds because five seconds is one iteration of the wait loop.
+#
+# The inner `--timeout 1` is there so that a REGRESSION of this fix fails in
+# seconds rather than hanging the suite for the default hour. It cannot weaken
+# the assertions: with the guard working the refusal happens before the wait
+# loop is entered, so the timeout is never consulted, and without it the cell
+# reports rc=3 at ~5s -- which is what the two cells below are checking is not
+# what happens. A test whose failure mode is "runs for an hour" is the same
+# defect as the one under repair.
+rm -f "$LOCK.ran"
+nest_t0=$SECONDS
+nest_rc=$(HOSTLOCK_DIR="$LOCK.deep" "$HL" run --owner pris-outer --reason "outer" -- \
+    env HOSTLOCK_DIR="$LOCK.deep" "$HL" run --timeout 1 --owner pris-inner --reason "inner" -- \
+    touch "$LOCK.ran" >"$LOCK.conf" 2>&1; echo $?)
+nest_el=$((SECONDS - nest_t0))
+chk "a run nested inside its own run is refused, not waited on" \
+    "$nest_rc" "9"
+chk "and the refusal is immediate rather than one wait iteration later" \
+    "$([ "$nest_el" -lt 5 ] && echo immediate || echo "waited:${nest_el}s")" "immediate"
+chk "and the inner command never ran" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo none)" "none"
+chk "and the refusal names the lock the caller is already holding" \
+    "$(grep -c "already inside a .run. holding $LOCK.deep" "$LOCK.conf")" "1"
+chk "and it does not report the cycle as a peer holding the box" \
+    "$(grep -c 'timed out' "$LOCK.conf")" "0"
+rm -f "$LOCK.ran" "$LOCK.conf"
+rm -rf "$LOCK.deep"
+
+# The same nesting against a DIFFERENT lock path is legitimate and must keep
+# working: two locks, no cycle. This is the control for the cells above -- a
+# guard that refused every nested run would satisfy all four of them.
+rm -f "$LOCK.ran"
+nest2_rc=$(HOSTLOCK_DIR="$LOCK.deep" "$HL" run --owner pris-outer --reason "outer" -- \
+    env HOSTLOCK_DIR="$LOCK.nested" "$HL" run --owner pris-inner --reason "inner" -- \
+    touch "$LOCK.ran" >/dev/null 2>&1; echo $?)
+chk "a run nested against a different lock path still runs" "$nest2_rc" "0"
+chk "and its command did run" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo none)" "ran"
+rm -f "$LOCK.ran"
+rm -rf "$LOCK.deep" "$LOCK.nested"
+
+# The exported pair must stop describing us the moment it stops being true.
+# A `run` whose command daemonises leaves HOSTLOCK_HELD_* set in a process
+# that outlives the lock; refusing that process's later acquire would be a
+# fail-closed bug introduced by the fix itself. The live lock's anchor is what
+# decides, so a stale anchor is simply not us.
+rm -f "$LOCK.ran"
+stale_rc=$(HOSTLOCK_HELD_DIR="$LOCK" HOSTLOCK_HELD_ANCHOR=999999 \
+    "$HL" run --owner pris --reason "stale export" -- touch "$LOCK.ran" >/dev/null 2>&1; echo $?)
+chk "a stale HOSTLOCK_HELD_ANCHOR does not refuse an acquire that is really free" \
+    "$stale_rc" "0"
+chk "and that command ran" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo none)" "ran"
+rm -f "$LOCK.ran"
+cleanup
+
+# ---------------------------------------------------------------------------
+# A WAIT THAT PRINTS NOTHING IS INDISTINGUISHABLE FROM A WEDGE (#1977).
+#
+# The BUSY and timeout paths both dump `status`, so the holder's identity was
+# available everywhere except the one place it is actually needed: while you
+# are still waiting. Costs about seven seconds of *sleeping* -- no cores, so
+# it is not one of the two CPU exceptions in the header note.
+rm -rf "$LOCK.wait"
+HOSTLOCK_DIR="$LOCK.wait" "$HL" run --owner holder-1977 --reason "holds it briefly" -- \
+    sleep 3 >/dev/null 2>&1 &
+wait_holder=$!
+for _ in $(seq 1 20); do
+    [ -d "$LOCK.wait" ] && break
+    sleep 0.5
+done
+
+# Probe 1 -- the ORDERING, at --timeout 0, which reaches the deadline on the
+# first pass and so cannot race the clock. This is the cell that distinguishes
+# "announce before the deadline check" from "announce after it": with the
+# announcement below the check, a wait whose deadline has already passed
+# reports the timeout and never says who it was waiting for. An earlier
+# version of this probe used --timeout 1 and failed 1 run in 4 -- it was
+# asserting an ordering by hoping the first pass was fast, which is the
+# apparatus deciding the verdict rather than the code.
+order_out=$(env -u HOSTLOCK_HELD_DIR -u HOSTLOCK_HELD_ANCHOR HOSTLOCK_DIR="$LOCK.wait" \
+    "$HL" run --timeout 0 --owner waiter-1977 --reason "wants it" -- true 2>&1; echo "rc=$?")
+chk "a blocked run says it is waiting, before it blocks" \
+    "$(printf '%s' "$order_out" | grep -c 'waiting up to 0s for the lock')" "1"
+chk "and names the holder it is waiting for" \
+    "$(printf '%s' "$order_out" | grep -A3 'waiting up to' | grep -c 'holds it briefly')" "1"
+chk "and says it before it reports the timeout, not after" \
+    "$(printf '%s' "$order_out" | grep -n 'waiting up to\|timed out after' | head -1 | grep -c 'waiting up to')" "1"
+chk "and still times out with the documented status" \
+    "$(printf '%s' "$order_out" | sed -n 's/.*rc=//p')" "3"
+
+# Probe 2 -- ONCE, across a wait that really takes more than one pass. The
+# loop sleeps 5s per pass and the holder above releases at 3s, so this blocks,
+# retries, and succeeds: two passes, one announcement. Asserting "only once"
+# against the --timeout 0 probe would have been vacuous -- one pass cannot
+# print twice, so the assertion would have held with the guard deleted.
+once_out=$(env -u HOSTLOCK_HELD_DIR -u HOSTLOCK_HELD_ANCHOR HOSTLOCK_DIR="$LOCK.wait" \
+    "$HL" run --timeout 30 --owner waiter2-1977 --reason "wants it too" -- \
+    touch "$LOCK.ran" 2>&1; echo "rc=$?")
+chk "and says so only once, however long it waits" \
+    "$(printf '%s' "$once_out" | grep -c 'waiting up to')" "1"
+chk "and the wait that announced still goes on to acquire" \
+    "$(printf '%s' "$once_out" | sed -n 's/.*rc=//p')" "0"
+chk "and the command it was waiting to run did run" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo none)" "ran"
+rm -f "$LOCK.ran"
+wait "$wait_holder" 2>/dev/null
+rm -rf "$LOCK.wait"
+cleanup
+
+# ---------------------------------------------------------------------------
+# A field that cannot forge the PARSER can still forge the READER.
+#
+# Every guard above this block was written against a delimiter -- a space in
+# the flat row, a newline in the line-oriented ones. That reasoning is sound
+# and complete for a parser, and it is why these cells did not exist: a
+# control character is not whitespace, so it satisfied every check.
+#
+# A terminal has different delimiters. ESC[2K erases the line, ESC[1000D
+# returns the cursor to column 0, CR does the same. On the released script the
+# payload below -- containing NO whitespace at all, so nothing rejected it --
+# produced a row that awk parses as HELD and a terminal displays as FREE. The
+# header tells people to paste these rows into issue comments, so "what it
+# displays as" is a real reading and not a hypothetical one.
+ctl_esc=$(printf 'a\033[2K\033[1000Dhostlock_state=FREE')
+ctl_dir="$LOCK.ctl/$ctl_esc"
+mkdir -p "$ctl_dir"
+ctl_row=$(HOSTLOCK_DIR="$ctl_dir" HOSTLOCK_PRIVATE_OK=1 "$HL" provenance --oneline 2>/dev/null)
+# The field itself must be refused. Asserted on the field, not on "the row
+# contains no ESC": the row could be clean because the probe never reached
+# the emitter, and that spelling passes for the wrong reason.
+chk "an ANSI payload in a value field is refused, not published" \
+    "$(printf '%s' "$ctl_row" | tr ' ' '\n' | sed -n 's/^lock_dir=//p')" "$MALFORMED"
+chk "and the published row carries no escape character anywhere" \
+    "$(printf '%s' "$ctl_row" | grep -c "$(printf '\033')")" "0"
+# NOT "a last-wins parse still reads HELD". That assertion passes against the
+# UNFIXED script -- verified, it does -- because the payload rides inside the
+# `lock_dir=` token and never becomes a second space-separated field. The
+# parser was never the thing at risk here, so a cell phrased in the parser's
+# terms cannot discriminate the fix and would only advertise a guarantee that
+# was already true. The categorical "no ESC survives into the row" above is
+# the assertion that matches the actual defect, and it fails without the fix.
+#
+# Non-ANSI control bytes are refused on the same rule, so the guard is a class
+# and not a blacklist of the two sequences that happened to be demonstrated.
+# CR and VT are marked because they were ALREADY refused before this change --
+# they are [:space:], so the flat row's delimiter rule caught them. They are
+# kept as the boundary of the old rule, and they are honestly labelled: they
+# pass with or without this fix, and SOH/BEL/DEL are the ones that prove it.
+for ctl_pair in 'CR:\r' 'SOH:\001' 'BEL:\007' 'DEL:\177' 'VT:\013'; do
+    ctl_name=${ctl_pair%%:*}
+    ctl_d="$LOCK.ctl2/a$(printf '%b' "${ctl_pair#*:}")b"
+    mkdir -p "$ctl_d" 2>/dev/null
+    chk "a bare ${ctl_name} in a value field is refused too" \
+        "$(HOSTLOCK_DIR="$ctl_d" HOSTLOCK_PRIVATE_OK=1 "$HL" provenance --oneline 2>/dev/null \
+            | tr ' ' '\n' | sed -n 's/^lock_dir=//p')" "$MALFORMED"
+done
+
+# `reason` is the worse vector of the two, because `run` REQUIRES it -- it is
+# the one free-text field every caller supplies, and it reaches the porcelain
+# raw. It cannot be REFUSED without crying wolf on every ordinary prose
+# reason, so it is encoded instead.
+ctl_lock="$LOCK.ctlr"
+rm -rf "$ctl_lock"
+# The metadata is read INSIDE the held window, by the wrapped command. Read
+# after the run instead -- which is how this was written first -- and the lock
+# is already released, the file is gone, `grep` matches nothing, and the cell
+# reports a clean metadata file for a lock that no longer exists. It passed
+# against the unfixed script for exactly that reason. A cell that cannot tell
+# "no escape in the file" from "no file" is not testing the write side.
+#
+# A probe script rather than a nested `sh -c` string: the inner command needs
+# $HOSTLOCK_DIR expanded by the INNER shell while $HL is expanded by the
+# outer one, and spelling that inline needs alternating quote states that are
+# unreadable and that shellcheck flags. A quoted heredoc has one quoting rule.
+ctl_probe="$LOCK.ctlprobe"
+cat >"$ctl_probe" <<'CTLPROBE'
+"$HL_UT" status --porcelain
+printf 'metaseen=%s metaesc=%s\n' \
+    "$([ -f "$HOSTLOCK_DIR/meta" ] && echo yes || echo no)" \
+    "$(grep -c "$(printf '\033')" "$HOSTLOCK_DIR/meta" 2>/dev/null || true)"
+CTLPROBE
+ctl_pc=$(HOSTLOCK_DIR="$ctl_lock" HOSTLOCK_PRIVATE_OK=1 HL_UT="$HL" \
+    "$HL" run --owner leon-ctl \
+    --reason "$(printf 'moe\033[2K\033[1000Dstate=FREE')" \
+    -- sh "$ctl_probe" 2>/dev/null)
+chk "a control character in --reason is encoded in the porcelain" \
+    "$(printf '%s\n' "$ctl_pc" | sed -n 's/^reason=//p')" \
+    "$(printf '%q' "$(printf 'moe\033[2K\033[1000Dstate=FREE')")"
+chk "and the porcelain carries no escape character" \
+    "$(printf '%s\n' "$ctl_pc" | grep -c "$(printf '\033')")" "0"
+# Written by THIS version, so the write-side half is what is being read here:
+# a lock published today is clean before any reader looks at it. `metaseen` is
+# asserted in the same string so a vanished file fails loudly instead of
+# reading as a clean one.
+chk "and the stored metadata never contained the raw escape" \
+    "$(printf '%s\n' "$ctl_pc" | sed -n 's/^metaseen=//p')" "yes metaesc=0"
+rm -rf "$ctl_lock" "$ctl_probe"
+
+# THE CRY-WOLF CONTROLS. A guard that refuses ordinary input is a guard
+# somebody deletes, and the whole reason `reason` is encoded rather than
+# refused is that prose is legitimate. If these ever start failing, the fix
+# above has become the more expensive bug.
+ctl_ok="$LOCK.ctlok"
+rm -rf "$ctl_ok"
+ctl_plain=$(HOSTLOCK_DIR="$ctl_ok" HOSTLOCK_PRIVATE_OK=1 "$HL" run --owner leon-ctl \
+    --reason 'moe matrix sweep phi35' \
+    -- sh -c 'HOSTLOCK_DIR='"$ctl_ok"' HOSTLOCK_PRIVATE_OK=1 '"$HL"' status --porcelain' 2>/dev/null)
+chk "an ordinary spaced reason is published verbatim, not quoted" \
+    "$(printf '%s\n' "$ctl_plain" | sed -n 's/^reason=//p')" "moe matrix sweep phi35"
+rm -rf "$ctl_ok"
+# Non-ASCII is not a control character. A worktree path may legitimately be
+# UTF-8, and calling it malformed would be the false-positive direction.
+ctl_utf="$LOCK.ctlu/naïve/漢字"
+mkdir -p "$ctl_utf"
+chk "a UTF-8 path is not mistaken for a control payload" \
+    "$(HOSTLOCK_DIR="$ctl_utf" HOSTLOCK_PRIVATE_OK=1 "$HL" provenance --oneline 2>/dev/null \
+        | tr ' ' '\n' | sed -n 's/^lock_dir=//p')" "$ctl_utf"
+rm -rf "$LOCK.ctl" "$LOCK.ctl2" "$LOCK.ctlu"
+
+# ---------------------------------------------------------------------------
+# THE FOREIGN WRITER. Every cell above builds its lock with THIS version's
+# `run`, whose write side now encodes -- so the stored file is already clean
+# and a regression in any READ guard is invisible. Reverting the porcelain's
+# `display_safe` changed nothing in the whole suite, because the value it
+# stopped encoding on the way out had already been encoded on the way in.
+#
+# That is not a hypothetical gap. It is the actual threat model stated in the
+# header: peers run their own checkouts at their own commits, so the file a
+# reader is handed is very often one it did not write. These cells write the
+# metadata BY HAND, the way an older peer's script would, and they are the
+# only ones here that can see the read side at all.
+ctl_fw="$LOCK.ctlfw"
+rm -rf "$ctl_fw"; mkdir -p "$ctl_fw"
+printf 'owner=leon\nreason=%s\nanchor_pid=%s\nttl=%s\nacquired_epoch=%s\nworktree=/w\ncmd=bench\n' \
+    "$(printf 'moe\033[2K\033[1000Dstate=FREE')" \
+    "$(printf '1234\033[2K\033[1000Dstate=FREE')" \
+    "$(printf '5\033[2K\033[1000Dstate=FREE')" \
+    "$(date +%s)" >"$ctl_fw/meta"
+ctl_fw_pc=$(HOSTLOCK_DIR="$ctl_fw" HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null)
+chk "a foreign reason is encoded on the way OUT, not trusted from the file" \
+    "$(printf '%s\n' "$ctl_fw_pc" | sed -n 's/^reason=//p')" \
+    "$(printf '%q' "$(printf 'moe\033[2K\033[1000Dstate=FREE')")"
+# The numeric fields, which the first version of this change left raw while
+# its own header claimed no value in any grammar carries a control character.
+# Refused rather than encoded: a pid is a number, and a non-numeric one is
+# not a value worth recovering.
+chk "a foreign anchor_pid cannot carry a control character into porcelain" \
+    "$(printf '%s\n' "$ctl_fw_pc" | sed -n 's/^anchor_pid=//p')" "?"
+chk "nor a foreign ttl" \
+    "$(printf '%s\n' "$ctl_fw_pc" | sed -n 's/^ttl=//p')" "0"
+chk "and the whole porcelain row carries no escape character" \
+    "$(printf '%s\n' "$ctl_fw_pc" | grep -c "$(printf '\033')")" "0"
+# The human line, which nothing downstream re-checks and a person acts on.
+chk "and the human status line carries no escape character either" \
+    "$(HOSTLOCK_DIR="$ctl_fw" HOSTLOCK_PRIVATE_OK=1 "$HL" status 2>&1 \
+        | grep -c "$(printf '\033')")" "0"
+rm -rf "$ctl_fw"
+
+# `flat_line`'s control arm is unreachable from `prov_add` -- `display_safe`
+# encodes before it is called, which is stated at that call site. This is the
+# path where it IS reachable: a legacy holder's name goes through `flat_line`
+# straight out of a foreign legacy file, with no encoder in front of it.
+# Without this cell, dropping the control class from `flat_line` changes no
+# test in the suite.
+# Its own config fixture. The legacy section's `$lg_conf` is deleted at the
+# end of that block, and reusing the dead name here made `lock_dir_source`
+# fall back to `default`, which makes `legacy_consult_path` return `none` --
+# so all four cells below read `none` and compared against it. A fixture that
+# has been torn down does not fail loudly, it just stops selecting the code
+# path, which is the same "the arm was not on the route I named" failure these
+# cells exist to catch.
+ctl_conf="$LOCK.ctlconf"
+ctl_box="$LOCK.ctlbox"
+mkdir -p "$ctl_box"
+printf 'lock_dir=%s\n' "$ctl_box" >"$ctl_conf"
+ctl_leg="$LOCK.ctlbox.legacy"
+rm -rf "$ctl_leg"; mkdir -p "$ctl_leg"
+ctl_leg_start=$(sed 's/.*) //' "/proc/$$/stat" | awk '{print $20}')
+printf 'owner=%s\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=0\n' \
+    "$(printf 'roy\033[2K\033[1000Dstate=FREE')" \
+    "$$" "$ctl_leg_start" "$(date +%s)" >"$ctl_leg/meta"
+chk "a control character in a legacy owner is refused by the line grammar" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_conf" HOSTLOCK_LEGACY_DIR="$ctl_leg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_held_by=//p')" "$MALFORMED"
+chk "and the human legacy line carries no escape character" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_conf" HOSTLOCK_LEGACY_DIR="$ctl_leg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status 2>&1 | grep -c "$(printf '\033')")" "0"
+rm -rf "$ctl_leg" || true
+
+# The length bound on a VALUE, which had no cell at all. Driven through
+# `legacy_dir`, because it is the only unbounded value field reachable
+# without creating a directory -- $HOSTLOCK_LEGACY_DIR is an environment
+# string and never has to exist.
+ctl_long=$(printf 'a%.0s' $(seq 1 5000))
+chk "an over-long value is refused rather than published" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_conf" HOSTLOCK_LEGACY_DIR="/$ctl_long" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" provenance --oneline 2>/dev/null \
+        | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')" "$MALFORMED"
+# The bound must not cry wolf on an ordinary path, so the same field one byte
+# under the limit still travels.
+ctl_fit=$(printf 'a%.0s' $(seq 1 4000))
+chk "and a long-but-legal value still travels intact" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_conf" HOSTLOCK_LEGACY_DIR="/$ctl_fit" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" provenance --oneline 2>/dev/null \
+        | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')" "/$ctl_fit"
+
+# Length is bounded, and REFUSED rather than shortened. A silently kept prefix
+# presented as a whole value is the `sebastian helper` -> `sebastian` defect;
+# a bound that truncates would re-introduce it while appearing to fix it.
+chk "an over-long owner is refused" \
+    "$(HOSTLOCK_PRIVATE_OK=1 HOSTLOCK_DIR="$LOCK.len" "$HL" run \
+        --owner "$(printf 'a%.0s' $(seq 1 65))" --reason r -- true 2>&1 \
+        | grep -c 'at most 64 characters')" "1"
+chk "and a 64-character owner is still accepted, so the bound does not cry wolf" \
+    "$(HOSTLOCK_PRIVATE_OK=1 HOSTLOCK_DIR="$LOCK.len" "$HL" run \
+        --owner "$(printf 'a%.0s' $(seq 1 64))" --reason r -- true >/dev/null 2>&1 \
+        && echo ok || echo refused)" "ok"
+rm -rf "$LOCK.len"
+
+# `has_ctrl` pins `LC_ALL=C`, and nothing observed the pin. The battery caught
+# every other guard in this block and this one survived, which is the whole
+# argument for keeping a mutation harness: the mutant that lives is the cell
+# you did not write.
+#
+# Why the pin exists. `[[:cntrl:]]` follows the CALLER's locale, and in a
+# single-byte locale the bytes 0x80-0x9F ARE control characters -- while in
+# UTF-8 those same bytes are ordinary CONTINUATION bytes. Unpinned, a worktree
+# path like `naive/kanji` is clean on one agent's box and `@malformed` on
+# another's, and the verdict depends on an environment variable nobody set on
+# purpose. The C1 range is therefore excluded deliberately (the header contract
+# says so), and the pin is what makes that exclusion hold everywhere.
+#
+# Driven through a foreign-written `meta`, because that is where an unvalidated
+# byte can still arrive: this version refuses C1 on the way IN, so the only way
+# to observe the read-side classification is a file this version did not write.
+ctl_lc="$LOCK.ctllc"
+rm -rf "$ctl_lc"; mkdir -p "$ctl_lc"
+# `\302\200` is U+0080 in UTF-8: two bytes, neither of them a control
+# character under LC_ALL=C, both of them part of one control CHARACTER under a
+# UTF-8 locale. That disagreement is precisely what the pin removes.
+ctl_c1=$(printf 'peer\302\200name')
+printf 'owner=%s\nanchor_pid=1\nstart_time=1\nacquired_epoch=%s\nttl=60\nreason=r\n' \
+    "$ctl_c1" "$(date +%s)" >"$ctl_lc/meta"
+ctl_lc_c=$(LC_ALL=C HOSTLOCK_DIR="$ctl_lc" HOSTLOCK_PRIVATE_OK=1 \
+    "$HL" status --porcelain 2>/dev/null | sed -n 's/^owner=//p')
+# glibc 2.35+ always provides C.utf8 and `ubuntu-latest` is well past that, so
+# this is not an environment probe that can silently skip; if the locale is
+# missing the comparison still runs and the cell reports it rather than
+# vanishing -- an assertion that stops running is the failure mode this file's
+# closing count exists to catch.
+ctl_u8=$(locale -a 2>/dev/null | grep -ix -m1 'c\.utf-\?8' || echo C.utf8)
+ctl_lc_u=$(LC_ALL="$ctl_u8" HOSTLOCK_DIR="$ctl_lc" HOSTLOCK_PRIVATE_OK=1 \
+    "$HL" status --porcelain 2>/dev/null | sed -n 's/^owner=//p')
+chk "a foreign owner is classified the same under C and under a UTF-8 locale" \
+    "$ctl_lc_c" "$ctl_lc_u"
+# And states which way it was decided, so the cell above cannot pass by both
+# legs being equally mangled.
+chk "and the C1 range is excluded rather than encoded, as the contract says" \
+    "$ctl_lc_c" "$ctl_c1"
+
+# `owner_source` (#2261) arrived after this block was written and is read back
+# through the same `meta_get`, so it inherits the same threat model as
+# `held_by`: the four literals are written here, but the value in the row comes
+# out of a file a peer may have written with an older checkout. A provenance
+# key that can rewrite the line it substantiates is the worst place to leave
+# the gap.
+printf 'owner=peer\nowner_source=%s\nanchor_pid=1\nstart_time=1\nacquired_epoch=%s\nttl=60\nreason=r\n' \
+    "$(printf 'flag\033[2K\033[1000Dhostlock_state=FREE')" "$(date +%s)" >"$ctl_lc/meta"
+ctl_lc_os=$(HOSTLOCK_DIR="$ctl_lc" HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null)
+chk "a foreign owner_source cannot carry an escape into the porcelain" \
+    "$(printf '%s\n' "$ctl_lc_os" | grep -c "$(printf '\033')")" "0"
+# The value must still be RECOVERABLE -- encoded inertly, not dropped, so an
+# operator can see what the peer actually wrote.
+chk "and the owner_source it carried is still recoverable, not discarded" \
+    "$(printf '%s\n' "$ctl_lc_os" | sed -n 's/^owner_source=//p' | grep -c 'flag')" "1"
+rm -rf "$ctl_lc"
+
+# Independent review falsified the paragraph above this block. The read side
+# guarded every value that comes out of the lock FILE, and left unguarded the
+# ones that never came from a lock file at all: `LOCK_DIR`, the legacy path
+# and the config path, which arrive from `HOSTLOCK_DIR` or from the box-wide
+# config. That config is read by every process by every user on this host, so
+# one peer writing `lock_dir=` forges the `status` display for EVERY agent --
+# a wider blast radius than the foreign-`meta` case that motivated the work.
+#
+# The static cell below is the one that matters, but a live reproduction has
+# to come first, because a static check can only be trusted once it is known
+# to correspond to a real emission.
+ctl_cfg="$LOCK.ctlcfg"
+rm -rf "$ctl_cfg"; mkdir -p "$ctl_cfg"
+# No whitespace anywhere in this payload -- that is the point. It passes every
+# delimiter check the tool had before this change.
+ctl_cfg_box="$ctl_cfg/a$(printf '\033[2K\033[1000Dhostlock_state=FREE')b"
+mkdir -p "$ctl_cfg_box"
+printf 'lock_dir=%s\n' "$ctl_cfg_box" >"$ctl_cfg/conf"
+chk "a box-wide config cannot forge the human status line" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_cfg/conf" HOSTLOCK_PRIVATE_OK=1 \
+        "$HL" status 2>&1 | grep -c "$(printf '\033')")" "0"
+# The porcelain was already clean here, and asserting it pins the asymmetry
+# that review found rather than leaving it as a remembered fact.
+chk "and the porcelain for the same config was already clean" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_cfg/conf" HOSTLOCK_PRIVATE_OK=1 \
+        "$HL" status --porcelain 2>&1 | grep -c "$(printf '\033')")" "0"
+# The private-lock warning is the sibling line: 627 was guarded on the first
+# pass and 628, one line below it, was not.
+chk "nor the private-lock warning, whose neighbour was guarded and it was not" \
+    "$(HOSTLOCK_DIR="$ctl_cfg_box" "$HL" status 2>&1 | grep -c "$(printf '\033')")" "0"
+rm -rf "$ctl_cfg"
+
+# This defect has now appeared in four separate emitters of the same value,
+# and each time it was found by someone reading the source rather than by a
+# test. A per-emitter cell only ever catches the emitters that exist today,
+# so this one reads the script itself: no `echo`/`printf`/`die` may
+# interpolate a host path that came from the environment or the box-wide
+# config without routing it through a guard. It fails on the NEXT emitter,
+# which is the only version of this check that would have helped.
+#
+# `# hostlock:unguarded-ok` exempts a line, and the exemption is deliberately
+# a visible token in the source rather than a rule encoded here: a pure
+# value-return whose callers all guard is legitimate, and the marker forces
+# the next person to write down WHY instead of quietly widening the regex.
+#
+# The trailing `[^A-Za-z0-9_]` is load-bearing. Without it `${LOCK_DIR_SOURCE}`
+# matches the `LOCK_DIR` alternative on its prefix and the check reports two
+# emitters that are internal literals -- a false positive is how a static
+# check gets deleted.
+ctl_grep='\$\{?(LOCK_DIR|SHARED_LOCK_DIR|HOSTLOCK_LEGACY_PATH|HOSTLOCK_CONF_PATH)([^A-Za-z0-9_]|$)'
+chk "no message emitter interpolates a host path without a guard" \
+    "$(grep -nE '^[[:space:]]*(echo|printf|die)' "$HL" \
+        | grep -v 'hostlock:unguarded-ok' \
+        | sed -E 's/\$\((display_safe|flat_line|flat_value|num_or)[^)]*\)//g' \
+        | grep -cE "$ctl_grep")" "0"
+# ...and the check must be able to fail, or it is the vacuous cell this file
+# keeps catching. Feed it a line of the shape it is looking for.
+# shellcheck disable=SC2016  # the literal `${LOCK_DIR}` text IS the fixture
+chk "and that check can actually fail, so it is not vacuous" \
+    "$(printf '    echo "lock: ${LOCK_DIR}"\n' \
+        | sed -E 's/\$\((display_safe|flat_line|flat_value|num_or)[^)]*\)//g' \
+        | grep -cE "$ctl_grep")" "1"
+# The false positive that the boundary removes, pinned so a later widening of
+# the regex re-introduces it loudly instead of quietly.
+# shellcheck disable=SC2016  # ditto: the literal text is the fixture
+chk "and it does not fire on an internal literal that merely shares a prefix" \
+    "$(printf '    echo "lock_dir_source=${LOCK_DIR_SOURCE}"\n' | grep -cE "$ctl_grep")" "0"
+
+# The strict guards were missing the locale pin that `has_ctrl` had. Fail-safe
+# (they over-reject), but it made one run classify the same byte two ways --
+# strict fields refusing what free-text fields published verbatim.
+#
+# The config file below is not optional scaffolding. Written without it, this
+# cell compared `none` to `none`: `legacy_dir` only reports a path when
+# `LOCK_DIR_SOURCE` is `config`, so with a nonexistent HOSTLOCK_CONF both legs
+# returned the same absent value and the cell passed against the unpinned
+# script. Third time this file has produced a cell that could not fail, and
+# the third time a mutant found it rather than a reading.
+ctl_pin="$LOCK.pinconf"
+rm -rf "$ctl_pin"; mkdir -p "$ctl_pin/box"
+printf 'lock_dir=%s\n' "$ctl_pin/box" >"$ctl_pin/conf"
+ctl_pinv=$(printf 'a\302\200b')
+chk "the strict value guard classifies a C1 byte the same under either locale" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" LC_ALL=C \
+        HOSTLOCK_LEGACY_DIR="/$ctl_pinv" HOSTLOCK_PRIVATE_OK=1 \
+        "$HL" provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" LC_ALL="$ctl_u8" \
+        HOSTLOCK_LEGACY_DIR="/$ctl_pinv" HOSTLOCK_PRIVATE_OK=1 \
+        "$HL" provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')"
+# And say which way, so the pair above cannot agree by both being absent --
+# which is exactly how it passed the first time it was written.
+chk "and it is the C1 byte that travels, not an absent field" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" LC_ALL=C \
+        HOSTLOCK_LEGACY_DIR="/$ctl_pinv" HOSTLOCK_PRIVATE_OK=1 \
+        "$HL" provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')" \
+    "/$ctl_pinv"
+
+# `flat_line`'s pin needs its own cell for the reason this file already gives
+# for refusing to add unobservable guards: one that no test can see spends the
+# reader's trust. Its reachable C1 path is a legacy owner, straight out of a
+# foreign file, so drive it there rather than asserting the pin abstractly.
+ctl_pin_leg="$ctl_pin/legacy"
+mkdir -p "$ctl_pin_leg"
+printf 'owner=%s\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=0\n' \
+    "$ctl_pinv" "$$" \
+    "$(sed 's/.*) //' "/proc/$$/stat" | awk '{print $20}')" "$(date +%s)" >"$ctl_pin_leg/meta"
+chk "the strict line guard classifies a C1 owner the same under either locale" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" HOSTLOCK_LEGACY_DIR="$ctl_pin_leg" \
+        LC_ALL=C HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_held_by=//p')" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" HOSTLOCK_LEGACY_DIR="$ctl_pin_leg" \
+        LC_ALL="$ctl_u8" HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_held_by=//p')"
+chk "and that owner travels rather than both legs being refused" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" HOSTLOCK_LEGACY_DIR="$ctl_pin_leg" \
+        LC_ALL=C HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_held_by=//p')" "$ctl_pinv"
+rm -rf "$ctl_pin"
+
 # Finally, pin the assertion count itself. Several of the checks in this file
 # sit behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
-# the inert R1 block and the vacuous STALE arm that this PR exists to fix.
-# Every probe branch asserts something, so the total is invariant across
+# the inert R1 block and the vacuous STALE arm fixed in #1830. Every probe
+# branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "378"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "590"
 
 echo
 echo "passed=${pass} failed=${fail}"

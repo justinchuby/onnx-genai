@@ -204,6 +204,37 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn schema_resolution_selects_latest_registered_since_version() {
+        let mut registry = OpRegistry::new();
+        registry.register(
+            OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+            Box::new(DummyFactory(1)),
+        );
+        registry.register(
+            OpKey::new("DsaIndexSelect", "pkg.nxrt", 3),
+            Box::new(DummyFactory(3)),
+        );
+
+        let resolved_v1 = registry
+            .lookup("DsaIndexSelect", "pkg.nxrt", 1)
+            .expect("opset 1 resolves schema v1");
+        let resolved_v2 = registry
+            .lookup("DsaIndexSelect", "pkg.nxrt", 2)
+            .expect("opset 2 still resolves schema v1");
+        let resolved_v3 = registry
+            .lookup("DsaIndexSelect", "pkg.nxrt", 3)
+            .expect("opset 3 resolves the newly registered schema");
+        let resolved_v4 = registry
+            .lookup("DsaIndexSelect", "pkg.nxrt", 4)
+            .expect("opset 4 keeps using the newest schema");
+
+        assert!(std::ptr::eq(resolved_v1, resolved_v2));
+        assert!(!std::ptr::eq(resolved_v1, resolved_v3));
+        assert!(std::ptr::eq(resolved_v3, resolved_v4));
+        assert!(registry.lookup("DsaIndexSelect", "pkg.nxrt", 0).is_none());
+    }
 }
 
 /// Ordered set of execution providers with a priority list (§4.6).

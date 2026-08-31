@@ -90,12 +90,18 @@ impl KernelFactory for DftFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let inverse = bool_attr(node, "inverse")?;
         let onesided = bool_attr(node, "onesided")?;
+        let default_axis = if node.local_opset().unwrap_or(17) >= 20 {
+            -2
+        } else {
+            1
+        };
         Ok(Box::new(DftKernel {
             runtime: self.runtime.clone(),
             plans: self.plans.clone(),
             inverse,
             onesided,
             axis_attr: node.attr("axis").and_then(|attribute| attribute.as_int()),
+            default_axis,
             prepared_plan: Mutex::new(None),
         }))
     }
@@ -192,6 +198,7 @@ struct DftKernel {
     inverse: bool,
     onesided: bool,
     axis_attr: Option<i64>,
+    default_axis: i64,
     prepared_plan: Mutex<Option<(CufftPlanKey, Arc<Mutex<CufftPlan>>)>>,
 }
 
@@ -219,7 +226,7 @@ impl DftKernel {
         let axis = if let Some(axis) = present_input(inputs, 2) {
             scalar_i64(&self.runtime, axis, "axis")?
         } else {
-            self.axis_attr.unwrap_or(-2)
+            self.axis_attr.unwrap_or(self.default_axis)
         };
         let normalized_axis = normalize_axis(axis, input.shape.len())?;
         let dft_length = if let Some(length) = present_input(inputs, 1) {
@@ -241,7 +248,7 @@ impl DftKernel {
         {
             return Ok(None);
         }
-        let axis = self.axis_attr.unwrap_or(-2);
+        let axis = self.axis_attr.unwrap_or(self.default_axis);
         let signal_length = input.shape[normalize_axis(axis, input.shape.len())?];
         let dft_length = i64::try_from(signal_length).map_err(|_| {
             EpError::KernelFailed("cuda_ep DFT: input signal length exceeds i64".into())
@@ -332,14 +339,10 @@ impl DftKernel {
         let metadata = metadata(&spec)?;
         let base = cuptr(workspace.ptr().0 as *const c_void);
         // The metadata prefix belongs to step-scoped workspace and may be
-        // reused by the next dispatch. Drain the non-blocking compute stream
-        // before the synchronous default-stream upload so it cannot overwrite
-        // metadata still consumed by a prior DFT. This host barrier is one
-        // reason capture remains explicitly unsupported.
-        self.runtime
-            .stream()
-            .synchronize()
-            .map_err(|error| driver_err("synchronizing before DFT metadata upload", error))?;
+        // reused by the next dispatch. The synchronous H2D helper drains compute
+        // before the default-stream copy, then waits for that copy, so a prior
+        // DFT retires before this overwrite. That host barrier is one reason
+        // capture remains explicitly unsupported.
         // SAFETY: workspace covers `layout.total_bytes`; the metadata prefix is
         // within that allocation and contains exactly `metadata.len()` bytes.
         unsafe {
@@ -644,6 +647,7 @@ fn launch_config(elements: usize) -> LaunchConfig {
 /// but dtype, known shape, attributes, and data layout fail closed here.
 pub(crate) fn unsupported_reason(
     node: &Node,
+    opset: u64,
     input_shapes: &[Shape],
     input_dtypes: &[DataType],
     input_layouts: &[TensorLayout],
@@ -717,7 +721,7 @@ pub(crate) fn unsupported_reason(
             let axis = node
                 .attr("axis")
                 .and_then(|attribute| attribute.as_int())
-                .unwrap_or(-2);
+                .unwrap_or(if opset >= 20 { -2 } else { 1 });
             normalize_axis(axis, shape.len()).map_err(|error| error.to_string())?;
         }
         Ok(())

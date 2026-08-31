@@ -705,7 +705,7 @@ fn apply_residency_plan_at_boundary_inner(
     // deterministic order (guaranteed since `eligible` was built by iterating
     // `plan.ordered_values()`).
     let mut progress: HashMap<ValueId, ValueProgress> = HashMap::new();
-    let mut fatal_hit = false;
+    let mut rollback_required = false;
     'outer: for e in &eligible {
         let value = e.value;
         outcome.hot_expert_count += e.hot_count;
@@ -769,12 +769,16 @@ fn apply_residency_plan_at_boundary_inner(
                     outcome
                         .per_value_fallbacks
                         .push((value, format!("transition rejected: {reason}")));
+                    rollback_required = true;
+                    break 'outer;
                 }
                 TransitionOutcome::RolledBack { fault } => {
                     outcome.failure_count += 1;
                     outcome
                         .per_value_fallbacks
                         .push((value, format!("transition rolled back: {fault:?}")));
+                    rollback_required = true;
+                    break 'outer;
                 }
                 TransitionOutcome::Fatal {
                     transition_fault,
@@ -790,7 +794,7 @@ fn apply_residency_plan_at_boundary_inner(
                     outcome
                         .per_value_fallbacks
                         .push((value, format!("fatal transition: {transition_fault:?}")));
-                    fatal_hit = true;
+                    rollback_required = true;
                     break 'outer;
                 }
             }
@@ -798,11 +802,11 @@ fn apply_residency_plan_at_boundary_inner(
     }
 
     // Every value that has at least one committed range and did NOT hit a
-    // fatal transition anywhere in the plan is provisionally touched. If a
-    // fatal occurred anywhere, ALL committed ranges (including this value's
-    // own already-committed ranges) go through the rollback loop below, which
-    // updates `committed_values`/`values_touched` precisely.
-    if !fatal_hit {
+    // failed transition anywhere in the plan is provisionally touched. Any
+    // rejected, locally rolled-back, or fatal member aborts the whole logical
+    // application and sends all earlier committed ranges through the one
+    // rollback path below.
+    if !rollback_required {
         for (value, prog) in &progress {
             if !prog.committed.is_empty() {
                 outcome.values_touched += 1;
@@ -811,17 +815,17 @@ fn apply_residency_plan_at_boundary_inner(
         }
     }
 
-    // 6. Rollback loop on any Fatal: revert every committed RANGE (not
-    // value) recorded in `progress`, across every value that has any —
-    // including the same value whose later range hit the Fatal, and
-    // including values earlier in plan order that already fully committed.
-    if fatal_hit {
+    // 6. Rollback loop on any member failure: revert every committed RANGE
+    // (not value) recorded in `progress`, across every value that has any.
+    // A logical expert group is therefore never left split merely because the
+    // failing member's own transition had no side effects.
+    if rollback_required {
         let recheck_sp = residency.resize_safe_point(device_count);
         let rollback_sp = match verify_safe_point(recheck_sp) {
             Ok(v) => v,
             Err(reason) => {
                 outcome.fallback_reason = Some(format!(
-                    "fatal transition + safe-point lost during rollback: {reason}"
+                    "transition failure + safe-point lost during rollback: {reason}"
                 ));
                 return outcome;
             }
@@ -921,7 +925,8 @@ fn apply_residency_plan_at_boundary_inner(
             }
         }
         if outcome.fallback_reason.is_none() {
-            outcome.fallback_reason = Some("fatal transition; rollback attempted".to_string());
+            outcome.fallback_reason =
+                Some("transition failure; atomic rollback attempted".to_string());
         }
     }
 

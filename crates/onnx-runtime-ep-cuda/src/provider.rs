@@ -39,23 +39,25 @@
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{
     BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, EpConfig, EpError,
     ExecutionProvider, ExecutionProviderCapabilities, ExecutorArtifactFinalization,
-    ExecutorInstanceId, ExpertWeightGroup, Fence, HostToDeviceCopier, Kernel, KernelMatch,
-    LazyWeight, OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny, structural_input_bytes,
+    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExpertWeightGroup,
+    Fence, HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result,
+    WorkspaceAllocation, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
 };
 use onnx_runtime_memory_governor::{
-    AllocationChargeMode, AllocationPublication, AllocationReleaseOutcome, AllocationRequest,
-    AllocationSettlementStatus, AllocationSettlementToken, AllocationSettlementWait,
-    AllocationStepError, AllocationTransactionError, BindingError, DeviceAllocator, MemoryRole,
-    OwningAllocation, ProcessMemoryManager, RegisteredMemoryAuthority, RegisteredMemoryContext,
-    RegisteredMemoryHolder, RegisteredMemoryMechanism, ScopedMemoryBinding, ScopedVirtualBacking,
+    AllocationChargeMode, AllocationIdentity, AllocationPublication, AllocationReleaseOutcome,
+    AllocationRequest, AllocationSettlementStatus, AllocationSettlementToken,
+    AllocationSettlementWait, AllocationStepError, AllocationTransactionError, BindingError,
+    DeviceAllocator, MemoryRole, OwningAllocation, ProcessMemoryManager, ProviderContextIdentity,
+    RegisteredMemoryAuthority, RegisteredMemoryContext, RegisteredMemoryHolder,
+    RegisteredMemoryMechanism, ScopedMemoryBinding, ScopedVirtualBacking,
 };
 
 use crate::deferred_release::{
@@ -74,6 +76,8 @@ use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy, PrefillRout
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteResidencyExecutorStatus {
     pub finalization_attempts: u64,
+    pub readiness_epoch: Option<ExecutorArtifactReadinessEpoch>,
+    pub pending: Option<ExecutorArtifactPending>,
     pub drain_calls: u64,
     pub drained: bool,
     pub outcome: Option<RouteResidencyInstallOutcome>,
@@ -84,12 +88,15 @@ pub struct RouteResidencyExecutorStatus {
 #[derive(Default)]
 struct ExecutorRouteResidencyState {
     finalization_attempts: u64,
+    readiness_epoch: Option<ExecutorArtifactReadinessEpoch>,
+    pending: Option<ExecutorArtifactPending>,
     drain_calls: u64,
     drained: bool,
     outcome: Option<RouteResidencyInstallOutcome>,
     boundaries: Vec<Arc<RouteResidencyBoundary>>,
     armed_sources: Vec<Arc<crate::kernels::qmoe::QMoERouteTelemetry>>,
     retained_artifacts: Option<Arc<Vec<ExpertWeightGroup>>>,
+    reservation_health: Option<Arc<crate::weight_paging::RouteReservationHealth>>,
 }
 
 /// The provider-owned mapped-attribution zone.
@@ -232,6 +239,121 @@ impl ReleaseObserver for ManagedCudaReleaseAccounting {
     }
 }
 
+/// One immutable CUDA allocation that can outlive its public admission handle.
+///
+/// The graph registry may strongly own this value, so it deliberately carries
+/// only weak links back to the runtime and release queue. This avoids a
+/// `runtime -> graph -> allocation -> runtime` cycle while preserving the exact
+/// generation-checked allocation owner until the final graph pin is released.
+pub(crate) struct CudaSealedAllocation {
+    buffer: Option<DeviceBuffer>,
+    runtime: Weak<CudaRuntime>,
+    release_queue: Weak<CudaDeferredReleaseQueue>,
+    identity: AllocationIdentity,
+    observer: Arc<dyn ReleaseObserver>,
+}
+
+impl CudaSealedAllocation {
+    pub(crate) fn launch_ptr(
+        &self,
+        _access: &crate::kernels::SealedLaunchAccess,
+    ) -> cudarc::driver::sys::CUdeviceptr {
+        cuptr(
+            self.buffer
+                .as_ref()
+                .expect("sealed CUDA allocation is taken only during drop")
+                .as_ptr(),
+        )
+    }
+
+    fn release(&mut self) -> Result<()> {
+        let Some(buffer) = self.buffer.take() else {
+            return Ok(());
+        };
+        let queue = self.release_queue.upgrade().ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: sealed allocation {:?} outlived its provider release queue; retaining \
+                 ownership rather than issuing an unordered free",
+                self.identity
+            ))
+        })?;
+        if let Some(runtime) = self.runtime.upgrade() {
+            runtime.invalidate_interleaved_for(cuptr(buffer.as_ptr()), buffer.len());
+        }
+        let ownership = buffer.into_bound_ownership().map_err(|foreign| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: sealed allocation at {:#x} lost binding-issued ownership; retaining it \
+                 rather than freeing by address",
+                cuptr(foreign.as_ptr())
+            ))
+        })?;
+        if ownership.owner().identity() != self.identity {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: sealed allocation identity changed from {:?} to {:?}; refusing a stale \
+                 release",
+                self.identity,
+                ownership.owner().identity()
+            )));
+        }
+        let (prepared, settlement, observer) = match ownership {
+            BoundBufferOwnership::Binding(owner) => {
+                let prepared = owner.prepare_release().map_err(|error| {
+                    let (error, _owner) = error.into_parts();
+                    binding_failure("cannot prepare a sealed CUDA allocation release", error)
+                })?;
+                (prepared, None, Some(Arc::clone(&self.observer)))
+            }
+            BoundBufferOwnership::Managed(owner) => {
+                let prepared = owner.prepare_release().map_err(|error| {
+                    let (error, _owner) = error.into_parts();
+                    manager_failure(
+                        "cannot prepare a managed sealed CUDA allocation release",
+                        AllocationTransactionError::Binding(error),
+                    )
+                })?;
+                // SAFETY: the request and settlement remain paired in the queue
+                // observer and in the enqueue-refusal branch below.
+                let (prepared, settlement) = unsafe { prepared.into_parts() };
+                let observer: Arc<dyn ReleaseObserver> = Arc::new(ManagedCudaReleaseAccounting {
+                    provider: Arc::clone(&self.observer),
+                    settlement: settlement.clone(),
+                });
+                (prepared, Some(settlement), Some(observer))
+            }
+        };
+        match queue.enqueue_prepared(prepared, observer) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let rejection = error.rejection();
+                let outcome = error.quarantine();
+                if let Some(settlement) = settlement {
+                    // SAFETY: this outcome came from the exact refused request
+                    // paired with the settlement token.
+                    unsafe { settlement.settle(&outcome) };
+                }
+                Err(EpError::KernelFailed(format!(
+                    "cuda_ep: the deferred release queue refused sealed allocation {:?} ({}); \
+                     ownership is quarantined ({}) and {} byte(s) remain charged",
+                    self.identity,
+                    rejection.name(),
+                    outcome.state(),
+                    outcome
+                        .residual()
+                        .map_or(0, |residual| residual.retained_bytes)
+                )))
+            }
+        }
+    }
+}
+
+impl Drop for CudaSealedAllocation {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            eprintln!("cuda_ep: WARNING: {error}");
+        }
+    }
+}
+
 /// One binding registration for this provider's selected allocator.
 struct CudaMemoryBinding {
     /// Dropped before registration handles so allocator/reservation teardown
@@ -303,6 +425,34 @@ pub const DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES: u64 = 4 << 30;
 /// scratch requests reuse committed memory. It bounds retained-but-unmapped
 /// physical memory, so it cannot leak without bound.
 pub const DEFAULT_STANDALONE_PHYSICAL_POOL_BYTES: usize = 256 << 20;
+
+/// Last structured release-queue state observed at an allocator lifecycle
+/// boundary. The CUDA plugin exports this for teardown conformance tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocatorReleaseObservation {
+    pub quarantined: u64,
+    pub retained: u64,
+}
+
+static LAST_ALLOCATOR_RELEASE_QUARANTINED: AtomicU64 = AtomicU64::new(0);
+static LAST_ALLOCATOR_RELEASE_RETAINED: AtomicU64 = AtomicU64::new(0);
+
+pub fn allocator_release_observation() -> AllocatorReleaseObservation {
+    AllocatorReleaseObservation {
+        quarantined: LAST_ALLOCATOR_RELEASE_QUARANTINED.load(Ordering::Acquire),
+        retained: LAST_ALLOCATOR_RELEASE_RETAINED.load(Ordering::Acquire),
+    }
+}
+
+pub fn reset_allocator_release_observation() {
+    LAST_ALLOCATOR_RELEASE_QUARANTINED.store(0, Ordering::Release);
+    LAST_ALLOCATOR_RELEASE_RETAINED.store(0, Ordering::Release);
+}
+
+fn record_allocator_release_observation(stats: crate::deferred_release::DeferredReleaseStats) {
+    LAST_ALLOCATOR_RELEASE_QUARANTINED.fetch_max(stats.quarantined, Ordering::AcqRel);
+    LAST_ALLOCATOR_RELEASE_RETAINED.fetch_max(stats.retained as u64, Ordering::AcqRel);
+}
 
 /// How many times the device's own VRAM the VMM arena reserves in address
 /// space.
@@ -1647,7 +1797,11 @@ impl CudaExecutionProvider {
                 op_type: op.op_type.clone(),
                 opset,
             })?;
-        factory.create(op, shapes)
+        let mut versioned = op.clone();
+        if versioned.version.is_none() {
+            versioned.version = i64::try_from(opset).ok();
+        }
+        factory.create(&versioned, shapes)
     }
 
     /// Borrow the shared CSA observability surface (§8). Every CSA kernel this
@@ -1748,6 +1902,8 @@ impl CudaExecutionProvider {
         let state = states.get(&executor);
         RouteResidencyExecutorStatus {
             finalization_attempts: state.map_or(0, |state| state.finalization_attempts),
+            readiness_epoch: state.and_then(|state| state.readiness_epoch),
+            pending: state.and_then(|state| state.pending.clone()),
             drain_calls: state.map_or(0, |state| state.drain_calls),
             drained: state.is_some_and(|state| state.drained),
             outcome: state.and_then(|state| state.outcome.clone()),
@@ -1780,17 +1936,20 @@ impl CudaExecutionProvider {
     /// Finalize one executor's real QMoE route-residency artifacts.
     ///
     /// `NoTelemetrySource` is readiness-dependent and returns `Pending` without
-    /// recording or latching a decline. Every structural outcome is terminal
-    /// and idempotent. The shipped default-off path returns before touching the
+    /// recording or latching a decline only for boundary kinds whose producer
+    /// can be published by a later resolved compilation. Unsupported producer
+    /// kinds are structural, terminal declines. Every structural outcome is
+    /// idempotent. The shipped default-off path returns before touching the
     /// executor-state map.
     pub fn finalize_route_residency_for_executor(
         &self,
         executor: ExecutorInstanceId,
         graph: &Graph,
+        readiness: ExecutorArtifactReadinessEpoch,
         finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
-    ) -> ExecutorArtifactFinalization {
+    ) -> Result<ExecutorArtifactFinalization> {
         if !crate::coarse_residency::coarse_residency_profile_enabled() {
-            return ExecutorArtifactFinalization::Complete;
+            return Ok(ExecutorArtifactFinalization::Complete);
         }
 
         let mut states = self
@@ -1799,15 +1958,25 @@ impl CudaExecutionProvider {
             .expect("cuda_ep route-residency executors poisoned");
         let state = states.entry(executor).or_default();
         if state.outcome.is_some() {
-            return ExecutorArtifactFinalization::Complete;
+            state.readiness_epoch = Some(readiness);
+            return Ok(ExecutorArtifactFinalization::Complete);
         }
+        if state
+            .readiness_epoch
+            .is_some_and(|attempted| attempted >= readiness)
+            && let Some(pending) = &state.pending
+        {
+            return Ok(ExecutorArtifactFinalization::Pending(pending.clone()));
+        }
+        state.readiness_epoch = Some(readiness);
+        state.pending = None;
         state.finalization_attempts += 1;
 
         let Some(residency) = self.residency.as_ref() else {
             self.route_diag
                 .record_decline("weight offload/coarse residency disabled");
             state.outcome = Some(RouteResidencyInstallOutcome::OffloadDisabled);
-            return ExecutorArtifactFinalization::Complete;
+            return Ok(ExecutorArtifactFinalization::Complete);
         };
 
         let discovered = onnx_runtime_ep_api::expert_weight_groups(graph);
@@ -1815,7 +1984,7 @@ impl CudaExecutionProvider {
             let reject = RouteResidencyBindingReject::NoExpertGroups;
             self.route_diag.record_decline(&reject.reason());
             state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-            return ExecutorArtifactFinalization::Complete;
+            return Ok(ExecutorArtifactFinalization::Complete);
         }
         if let Some(group) = discovered
             .iter()
@@ -1827,7 +1996,7 @@ impl CudaExecutionProvider {
             };
             self.route_diag.record_decline(&reject.reason());
             state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-            return ExecutorArtifactFinalization::Complete;
+            return Ok(ExecutorArtifactFinalization::Complete);
         }
 
         let sources = self.route_telemetry_sources(executor);
@@ -1838,13 +2007,15 @@ impl CudaExecutionProvider {
             |_value| true,
         ) {
             Ok(groups) => groups,
-            Err(RouteResidencyBindingReject::NoTelemetrySource { .. }) => {
-                return ExecutorArtifactFinalization::Pending;
+            Err(RouteResidencyBindingReject::NoTelemetrySource { node }) => {
+                let pending = ExecutorArtifactPending::ProducerUnavailable { node };
+                state.pending = Some(pending.clone());
+                return Ok(ExecutorArtifactFinalization::Pending(pending));
             }
             Err(reject) => {
                 self.route_diag.record_decline(&reject.reason());
                 state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return ExecutorArtifactFinalization::Complete;
+                return Ok(ExecutorArtifactFinalization::Complete);
             }
         };
 
@@ -1856,7 +2027,7 @@ impl CudaExecutionProvider {
                 };
                 self.route_diag.record_decline(&reject.reason());
                 state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return ExecutorArtifactFinalization::Complete;
+                return Ok(ExecutorArtifactFinalization::Complete);
             }
         };
         let authorities = match residency.install_route_bank_reservations(
@@ -1869,7 +2040,7 @@ impl CudaExecutionProvider {
                 let reject = RouteResidencyBindingReject::Reservation(error);
                 self.route_diag.record_decline(&reject.reason());
                 state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return ExecutorArtifactFinalization::Complete;
+                return Ok(ExecutorArtifactFinalization::Complete);
             }
         };
 
@@ -1881,7 +2052,9 @@ impl CudaExecutionProvider {
                     source.disarm_route_telemetry();
                 }
                 residency.remove_route_bank_reservations(executor);
-                return ExecutorArtifactFinalization::Pending;
+                let pending = ExecutorArtifactPending::ProducerUnavailable { node: group.node };
+                state.pending = Some(pending.clone());
+                return Ok(ExecutorArtifactFinalization::Pending(pending));
             };
             let experts = group
                 .members
@@ -1904,7 +2077,7 @@ impl CudaExecutionProvider {
                 };
                 self.route_diag.record_decline(&reject.reason());
                 state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return ExecutorArtifactFinalization::Complete;
+                return Ok(ExecutorArtifactFinalization::Complete);
             }
             armed_sources.push(source);
         }
@@ -1915,6 +2088,7 @@ impl CudaExecutionProvider {
             &sources,
             &authorities.catalogs,
             &authorities.allocators,
+            Arc::clone(&authorities.health),
             authorities.device_pool,
             authorities.host_pool,
             1,
@@ -1931,16 +2105,17 @@ impl CudaExecutionProvider {
                 residency.remove_route_bank_reservations(executor);
                 self.route_diag.record_decline(&reject.reason());
                 state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return ExecutorArtifactFinalization::Complete;
+                return Ok(ExecutorArtifactFinalization::Complete);
             }
         };
         let banks = groups.iter().map(|group| group.members.len()).sum();
         state.retained_artifacts = Some(Arc::new(groups));
         state.boundaries = boundaries.into_iter().map(Arc::new).collect();
         state.armed_sources = armed_sources;
+        state.reservation_health = Some(authorities.health);
         state.outcome = Some(RouteResidencyInstallOutcome::Installed { banks });
         self.route_diag.record_install(banks);
-        ExecutorArtifactFinalization::Complete
+        Ok(ExecutorArtifactFinalization::Complete)
     }
 
     /// Construct and install a production [`RouteResidencyBoundary`] from a
@@ -2007,6 +2182,7 @@ impl CudaExecutionProvider {
             sources,
             &catalogs,
             &allocators,
+            crate::weight_paging::RouteReservationHealth::new(),
             device_pool,
             host_pool,
             1,
@@ -2051,8 +2227,10 @@ impl CudaExecutionProvider {
             }
             state.drain_calls += 1;
             state.drained = true;
+            state.pending = None;
             let boundaries = std::mem::take(&mut state.boundaries);
             state.retained_artifacts = None;
+            state.reservation_health = None;
             (boundaries, std::mem::take(&mut state.armed_sources))
         };
         if !boundaries.is_empty() {
@@ -2109,9 +2287,11 @@ impl CudaExecutionProvider {
                 state.drain_calls += 1;
                 state.drained = true;
             }
+            state.pending = None;
             boundaries.append(&mut state.boundaries);
             armed_sources.append(&mut state.armed_sources);
             state.retained_artifacts = None;
+            state.reservation_health = None;
         }
         drop(states);
         if !boundaries.is_empty() {
@@ -2309,6 +2489,48 @@ impl CudaExecutionProvider {
         Arc::new(CudaReleaseAccounting {
             attribution: Arc::clone(&self.attribution),
             frees: Arc::clone(&self.ep_frees),
+        })
+    }
+
+    pub(crate) fn provider_context_identity(&self) -> ProviderContextIdentity {
+        self.memory_binding.context.identity()
+    }
+
+    pub(crate) fn upload_sealed(&self, bytes: &[u8], align: usize) -> Result<CudaSealedAllocation> {
+        if matches!(self.memory, CudaMemory::Injected(_)) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: sealed planar admission requires the provider-owned CUDA allocator; \
+                 an injected allocator remains externally controlled and cannot prove that \
+                 admitted content is immutable"
+                    .into(),
+            ));
+        }
+        let mut buffer = <Self as ExecutionProvider>::allocate(self, bytes.len(), align)?;
+        let identity = buffer
+            .bound_owner()
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: a fresh sealed allocation carries no binding-issued ownership".into(),
+                )
+            })?
+            .identity();
+        if let Err(upload_error) =
+            <Self as ExecutionProvider>::copy_from_host(self, bytes, &mut buffer)
+        {
+            return match <Self as ExecutionProvider>::deallocate(self, buffer) {
+                Ok(()) => Err(upload_error),
+                Err(release_error) => Err(EpError::KernelFailed(format!(
+                    "cuda_ep: sealed allocation upload failed ({upload_error}); releasing the \
+                     rejected allocation also failed ({release_error})"
+                ))),
+            };
+        }
+        Ok(CudaSealedAllocation {
+            buffer: Some(buffer),
+            runtime: Arc::downgrade(&self.runtime),
+            release_queue: Arc::downgrade(&self.release_queue),
+            identity,
+            observer: self.release_accounting(),
         })
     }
 
@@ -2639,9 +2861,11 @@ impl CudaExecutionProvider {
                 }
                 Err(
                     error @ AllocationTransactionError::Binding(
-                        BindingError::QuarantinedOwnership { .. },
+                        BindingError::QuarantinedOwnership { quarantined, .. },
                     ),
                 ) => {
+                    LAST_ALLOCATOR_RELEASE_QUARANTINED
+                        .fetch_max(quarantined as u64, Ordering::AcqRel);
                     eprintln!(
                         "cuda_ep: WARNING: CUDA memory mechanism teardown remains pinned by \
                          quarantined ownership: {error}"
@@ -3016,7 +3240,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         if op.op_type == "DFT"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
-                crate::kernels::dft::unsupported_reason(op, shapes, input_dtypes, layouts)
+                crate::kernels::dft::unsupported_reason(op, opset, shapes, input_dtypes, layouts)
         {
             return KernelMatch::unsupported(reason);
         }
@@ -3084,6 +3308,13 @@ impl ExecutionProvider for CudaExecutionProvider {
             && op.domain == "pkg.nxrt"
             && let Some(reason) =
                 crate::kernels::index_share::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "DsaIndexSelect"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::dsa_index_select::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
@@ -3748,6 +3979,32 @@ impl ExecutionProvider for CudaExecutionProvider {
         }
     }
 
+    fn wait_for_deferred_releases(&self) -> Result<()> {
+        // `deallocate` recorded completion events at both stream tails before
+        // enqueueing ownership. Wait on those structured fences; do not add an
+        // unrelated stream/device synchronization at teardown.
+        if !self
+            .release_queue
+            .wait_until_idle(std::time::Duration::from_secs(30))
+        {
+            let stats = self.release_queue.stats();
+            record_allocator_release_observation(stats);
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: timed out waiting for deferred allocator releases to settle: {stats:?}"
+            )));
+        }
+        let stats = self.release_queue.stats();
+        record_allocator_release_observation(stats);
+        if stats.quarantined != 0 || stats.retained != 0 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: deferred allocator release reached idle with {} quarantined release(s) \
+                 and {} retained ownership record(s); device memory remains owned",
+                stats.quarantined, stats.retained
+            )));
+        }
+        Ok(())
+    }
+
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()> {
         assert_eq!(
             src.device(),
@@ -4132,13 +4389,36 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         executor: ExecutorInstanceId,
         graph: &Graph,
+        readiness: ExecutorArtifactReadinessEpoch,
         finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
-    ) -> ExecutorArtifactFinalization {
-        self.finalize_route_residency_for_executor(executor, graph, finalized_banks)
+    ) -> Result<ExecutorArtifactFinalization> {
+        self.finalize_route_residency_for_executor(executor, graph, readiness, finalized_banks)
     }
 
     fn wants_finalized_route_residency_banks(&self) -> bool {
         crate::coarse_residency::coarse_residency_profile_enabled() && self.residency.is_some()
+    }
+
+    fn validate_executor_artifacts(&self, executor: ExecutorInstanceId) -> Result<()> {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            return Ok(());
+        }
+        let health = self
+            .route_executors
+            .lock()
+            .expect("cuda_ep route-residency executors poisoned")
+            .get(&executor)
+            .and_then(|state| state.reservation_health.clone());
+        match health {
+            Some(health) => health.ensure_usable().map_err(|reason| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} route-bank reservation is unusable: {reason}; tear down \
+                     and rebuild the executor before dispatch, capture, or replay",
+                    executor.get()
+                ))
+            }),
+            None => Ok(()),
+        }
     }
 
     fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {
@@ -4360,6 +4640,12 @@ impl Drop for CudaExecutionProvider {
     /// returns. Nothing here panics, synchronizes, or joins a thread.
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
+        // Graph executables are the final owners of any sealed allocations whose
+        // addresses they embedded. Destroy both slots while the release queue is
+        // still open so those owners can enqueue exactly-once, stream-ordered
+        // releases before provider teardown retires the allocator.
+        let _ = self.runtime.reset_graph();
+        let _ = self.runtime.reset_graph_in(DeviceGraphSlot::Verify);
         // Residency is retired first so its pages can still enqueue, then the
         // queue is closed: nothing else can reach this provider afterwards.
         self.retire_residency();
@@ -4381,6 +4667,7 @@ mod tests {
     };
     use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
 
+    use crate::error::driver_err;
     use crate::test_support::EnvVarGuard;
 
     #[test]
@@ -5343,9 +5630,10 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
     /// the plugin projects through `allocate`/`deallocate` — through the pooled
     /// VMM arena.
     ///
-    /// No environment variable is set here, and that is the point: before
-    /// Phase 7 this test had to opt in with `ONNX_GENAI_CUDA_VMM=1` or it would
-    /// have measured the eager `cuMemAlloc` path instead (#956).
+    /// No environment variable is set here, and that is the point. Before
+    /// Phase 7 this test had to opt in with the now-deleted
+    /// `ONNX_GENAI_CUDA_VMM=1` flag or it would have measured the eager
+    /// `cuMemAlloc` path instead (#956).
     #[cfg_attr(
         not(feature = "gpu-tests"),
         ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
@@ -5792,190 +6080,449 @@ extern "C" __global__ void copy_out(const float* in, float* out, unsigned long l
         ep.deallocate(out).unwrap();
     }
 
-    // Anti-regression lock for the async, fence-ordered weight page-in (#87 first
-    // increment). Both arms drive the transfer and compute streams through the
-    // *same* primitive chain `CudaWeightPage::upload_async` composes internally
-    // (`htod_async` + `record_copy_fence`), differing only in how the
-    // compute-stream consumer is ordered relative to the transfer:
-    //
-    //   * Positive (real page-in ordering): a spin-delay holds the H2D copy
-    //     pending on the transfer stream, then `compute_wait_fence` orders the
-    //     compute-stream consumer after it, so the consumer reads the fully
-    //     paged-in bytes. Deleting `compute_wait_fence` leaves the consumer to
-    //     read the pre-copy POISON, so the lock is non-vacuous.
-    //   * Negative (deterministic poison control): the transfer is event-ordered
-    //     strictly *after* the consumer (`record_compute_fence` + `copy_wait_fence`),
-    //     so with no `compute_wait_fence` the consumer provably reads pre-transfer
-    //     POISON. This proves the compute-side wait is load-bearing without a
-    //     wall-clock race — an earlier revision raced the consumer against a
-    //     spin-delayed copy, which the parallel, captured `cargo test` invocation
-    //     flaked whenever GPU contention delayed the consumer kernel past the copy.
-    //
-    // Every device/pinned allocation is hoisted out of the timing window, so no
-    // synchronizing `cuMemAlloc`/`cuMemHostAlloc` can drain the copy-stream
-    // spin-delay: the delay→async-copy→fence→consume window is the only thing the
-    // positive arm's ordering depends on. A trailing `upload_async` byte-parity
-    // check keeps the real allocate+stage+copy+fence entry point under test.
-    #[test]
-    fn async_pagein_fence_orders_weight_page_in_consumer() {
-        use cudarc::driver::{LaunchConfig, PushKernelArg};
-
-        const MODULE: &str = "cuda_ep_async_pagein_test";
-        const SOURCE: &str = r#"
-extern "C" __global__ void spin_delay(long long spin) {
-    long long start = clock64();
-    while (clock64() - start < spin) { }
+    const PAGE_IN_COPY_RELEASE: usize = 0;
+    const PAGE_IN_CONSUMER_DONE: usize = 1;
+    const PAGE_IN_GATE_WORDS: usize = 2;
+    const PAGE_IN_ELEMENTS: usize = 64;
+    const PAGE_IN_MODULE: &str = "cuda_ep_async_pagein_test_issue_1896";
+    const PAGE_IN_SOURCE: &str = r#"
+extern "C" __global__ void wait_for_release(const volatile unsigned int* release) {
+    while (*release == 0u) { }
+    __threadfence_system();
 }
-extern "C" __global__ void copy_out(const float* in, float* out, unsigned long long n) {
+extern "C" __global__ void copy_out(
+    const float* in,
+    float* out,
+    unsigned long long n,
+    volatile unsigned int* done
+) {
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = in[i];
+    if (i < n) out[i] = in[i];
+    __syncthreads();
+    if (blockIdx.x == 0u && threadIdx.x == 0u) {
+        __threadfence_system();
+        *done = 1u;
+        __threadfence_system();
+    }
 }
 "#;
-        let Ok(ep) = CudaExecutionProvider::initialized(0) else {
-            eprintln!("skipping async page-in fence test: CUDA EP unavailable");
-            return;
-        };
-        let runtime = ep.runtime().clone();
-        let spin_delay = runtime
-            .nvrtc_function(MODULE, SOURCE, "spin_delay")
-            .unwrap();
-        let copy_out = runtime.nvrtc_function(MODULE, SOURCE, "copy_out").unwrap();
 
-        let n = 4096usize;
-        let bytes = n * std::mem::size_of::<f32>();
-        let n_u64 = n as u64;
-        let payload: Vec<f32> = (0..n).map(|i| 5.0 + (i % 13) as f32).collect();
-        let payload_bytes =
-            unsafe { std::slice::from_raw_parts(payload.as_ptr().cast::<u8>(), bytes) };
+    struct PageInMappedGate {
+        host: *mut u32,
+        device: cudarc::driver::sys::CUdeviceptr,
+        runtime: Arc<CudaRuntime>,
+    }
 
-        // Hoist every device/pinned allocation OUT of the per-iteration timing
-        // window: a synchronizing `cuMemAlloc`/`cuMemHostAlloc` between the
-        // spin-delay and the consumer would drain the delay and let ordering lean
-        // on the alloc instead of the fence. All buffers are reused each iteration.
-        let poison = vec![-777.0f32; n];
-        let poison_bytes =
-            unsafe { std::slice::from_raw_parts(poison.as_ptr().cast::<u8>(), bytes) };
-        let pos_dst = ep.allocate(bytes, 256).unwrap();
-        let neg_dst = ep.allocate(bytes, 256).unwrap();
-        let out = ep.allocate(bytes, 256).unwrap();
-        let pos_dst_p = cuptr(pos_dst.as_ptr());
-        let neg_dst_p = cuptr(neg_dst.as_ptr());
-        let out_p = cuptr(out.as_ptr());
-        let mut staging = runtime.alloc_pinned(bytes).unwrap();
-        staging.as_mut_slice().copy_from_slice(payload_bytes);
-        let spin: i64 = 8_000_000;
+    impl PageInMappedGate {
+        fn new(runtime: Arc<CudaRuntime>) -> Result<Self> {
+            use std::ffi::c_void;
 
-        for _ in 0..8 {
-            // ── Positive: the real page-in ordering. Poison the destination, hold
-            // the H2D copy pending behind a spin-delay, then order the
-            // compute-stream consumer after the transfer with `compute_wait_fence`
-            // (the exact `htod_async` + `record_copy_fence` chain `upload_async`
-            // composes). With the fence the consumer reads the paged-in payload;
-            // delete the fence and it reads the poison below.
-            unsafe { runtime.htod(poison_bytes, pos_dst_p) }.unwrap();
-            runtime.synchronize().unwrap();
+            use cudarc::driver::{result, sys};
 
-            let mut delay = runtime.copy_stream().launch_builder(&spin_delay);
-            delay.arg(&spin);
-            unsafe { delay.launch(LaunchConfig::for_num_elems(1)).unwrap() };
-
-            unsafe { runtime.htod_async(staging.as_slice(), pos_dst_p) }.unwrap();
-            let fence = runtime.record_copy_fence().unwrap();
-            runtime.compute_wait_fence(fence).unwrap();
-
-            let mut consume = runtime.stream().launch_builder(&copy_out);
-            consume.arg(&pos_dst_p).arg(&out_p).arg(&n_u64);
-            unsafe {
-                consume
-                    .launch(LaunchConfig::for_num_elems(n as u32))
-                    .unwrap()
+            const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
+            let bytes = (PAGE_IN_GATE_WORDS + PAGE_IN_ELEMENTS) * std::mem::size_of::<u32>();
+            let host = unsafe { result::malloc_host(bytes, CU_MEMHOSTALLOC_DEVICEMAP) }
+                .map_err(|error| driver_err("cuMemHostAlloc(page-in test gate)", error))?
+                .cast::<u32>();
+            let mut device = 0;
+            // SAFETY: `host` is a live DEVICEMAP host allocation.
+            if let Err(error) = unsafe {
+                sys::cuMemHostGetDevicePointer_v2(&mut device, host.cast::<c_void>(), 0).result()
+            } {
+                // SAFETY: device mapping failed before any stream could use the allocation.
+                let _ = unsafe { result::free_host(host.cast::<c_void>()) };
+                return Err(driver_err(
+                    "cuMemHostGetDevicePointer(page-in test gate)",
+                    error,
+                ));
+            }
+            let gate = Self {
+                host,
+                device,
+                runtime,
             };
-            let mut got = vec![0.0f32; n];
-            let got_bytes =
-                unsafe { std::slice::from_raw_parts_mut(got.as_mut_ptr().cast::<u8>(), bytes) };
-            unsafe { runtime.dtoh(got_bytes, out_p) }.unwrap();
-            runtime.sync_copy_stream().unwrap();
-            assert_eq!(
-                got, payload,
-                "async page-in consumer read stale bytes — compute_wait_fence did \
-                 not order the transfer before the compute-stream read"
-            );
-
-            // ── Negative (deterministic poison control): event-order the transfer
-            // strictly AFTER the consumer, so with NO `compute_wait_fence` the
-            // consumer provably reads pre-transfer poison. The `copy_wait_fence`
-            // on a compute-stream fence removes all wall-clock racing — the
-            // outcome never depends on the consumer winning against a delayed copy.
-            unsafe { runtime.htod(poison_bytes, neg_dst_p) }.unwrap();
-            runtime.synchronize().unwrap();
-
-            let mut consume = runtime.stream().launch_builder(&copy_out);
-            consume.arg(&neg_dst_p).arg(&out_p).arg(&n_u64);
-            unsafe {
-                consume
-                    .launch(LaunchConfig::for_num_elems(n as u32))
-                    .unwrap()
-            };
-            // Hold the transfer until the consumer above has read `neg_dst`.
-            let consumer_fence = runtime.record_compute_fence().unwrap();
-            runtime.copy_wait_fence(consumer_fence).unwrap();
-            unsafe { runtime.htod_async(staging.as_slice(), neg_dst_p) }.unwrap();
-            let _unused_fence = runtime.record_copy_fence().unwrap();
-
-            let mut raced = vec![0.0f32; n];
-            let raced_bytes =
-                unsafe { std::slice::from_raw_parts_mut(raced.as_mut_ptr().cast::<u8>(), bytes) };
-            unsafe { runtime.dtoh(raced_bytes, out_p) }.unwrap();
-            // Drain the transfer (which lands after the consumer) before the next
-            // iteration reuses `neg_dst` / `staging`.
-            runtime.sync_copy_stream().unwrap();
-            assert_eq!(
-                raced, poison,
-                "un-ordered async page-in consumer did NOT read poison — the \
-                 compute-stream wait is not load-bearing, so this lock proves nothing"
-            );
-
-            // ── Real `upload_async` entry point: allocate + stage + async-copy +
-            // fence, then a fenced consumer must observe the byte-identical
-            // payload. Keeps the production API (not just its primitive chain)
-            // under regression cover.
-            let staging = runtime.alloc_pinned(payload_bytes.len()).unwrap();
-            let (page, page_fence, staging) =
-                crate::weight_paging::CudaWeightPage::upload_async_queued(
-                    &runtime,
-                    DataType::Float32,
-                    vec![n],
-                    payload_bytes,
-                    staging,
-                    Arc::clone(ep.release_queue()),
-                )
-                .unwrap();
-            runtime.compute_wait_fence(page_fence).unwrap();
-            drop(staging);
-            let page_p = cuptr(page.device_ptr());
-            let mut consume = runtime.stream().launch_builder(&copy_out);
-            consume.arg(&page_p).arg(&out_p).arg(&n_u64);
-            unsafe {
-                consume
-                    .launch(LaunchConfig::for_num_elems(n as u32))
-                    .unwrap()
-            };
-            let mut paged = vec![0.0f32; n];
-            let paged_bytes =
-                unsafe { std::slice::from_raw_parts_mut(paged.as_mut_ptr().cast::<u8>(), bytes) };
-            unsafe { runtime.dtoh(paged_bytes, out_p) }.unwrap();
-            assert_eq!(
-                paged, payload,
-                "upload_async page-in read stale bytes — the returned copy fence \
-                 did not order the transfer before the compute-stream read"
-            );
-            drop(page);
+            gate.reset();
+            Ok(gate)
         }
 
-        ep.deallocate(pos_dst).unwrap();
-        ep.deallocate(neg_dst).unwrap();
-        ep.deallocate(out).unwrap();
+        fn word(&self, index: usize) -> *mut u32 {
+            // SAFETY: callers use one of the two declared protocol-word indices.
+            unsafe { self.host.add(index) }
+        }
+
+        fn device_word(&self, index: usize) -> Result<cudarc::driver::sys::CUdeviceptr> {
+            self.device
+                .checked_add((index * std::mem::size_of::<u32>()) as u64)
+                .ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "cuda page-in mapped protocol pointer overflow at word {index}"
+                    ))
+                })
+        }
+
+        fn device_output(&self) -> Result<cudarc::driver::sys::CUdeviceptr> {
+            self.device_word(PAGE_IN_GATE_WORDS)
+        }
+
+        fn reset(&self) {
+            // Each reset follows explicit drains of both streams.
+            unsafe {
+                for index in 0..(PAGE_IN_GATE_WORDS + PAGE_IN_ELEMENTS) {
+                    std::ptr::write_volatile(self.word(index), 0);
+                }
+            }
+            std::sync::atomic::fence(Ordering::SeqCst);
+        }
+
+        fn release_copy(&self) {
+            // SAFETY: the host is the only writer of COPY_RELEASE.
+            unsafe { std::ptr::write_volatile(self.word(PAGE_IN_COPY_RELEASE), 1) };
+            std::sync::atomic::fence(Ordering::SeqCst);
+        }
+
+        fn consumer_done(&self) -> bool {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            // SAFETY: the mapped allocation remains live and the consumer is the writer.
+            unsafe { std::ptr::read_volatile(self.word(PAGE_IN_CONSUMER_DONE)) != 0 }
+        }
+
+        fn output(&self) -> Vec<f32> {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            (0..PAGE_IN_ELEMENTS)
+                .map(|index| {
+                    // SAFETY: the mapped output follows the protocol header and
+                    // DONE is read only after the consumer's system fence.
+                    unsafe {
+                        std::ptr::read_volatile(self.word(PAGE_IN_GATE_WORDS + index).cast::<f32>())
+                    }
+                })
+                .collect()
+        }
+
+        fn settle(&self) -> Result<()> {
+            self.release_copy();
+            let copy = self.runtime.sync_copy_stream();
+            let compute = self.runtime.drain_for_unmap();
+            match (copy, compute) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(copy), Ok(())) => Err(EpError::KernelFailed(format!(
+                    "cuda page-in test cleanup could not drain the transfer stream: {copy}"
+                ))),
+                (Ok(()), Err(compute)) => Err(EpError::KernelFailed(format!(
+                    "cuda page-in test cleanup could not drain the compute stream: {compute}"
+                ))),
+                (Err(copy), Err(compute)) => Err(EpError::KernelFailed(format!(
+                    "cuda page-in test cleanup could not drain either CUDA stream; \
+                     transfer: {copy}; compute: {compute}"
+                ))),
+            }
+        }
+
+        fn finish(mut self, primary: Result<()>) -> Result<()> {
+            use std::ffi::c_void;
+
+            let cleanup = self.settle().and_then(|()| {
+                let host = std::mem::replace(&mut self.host, std::ptr::null_mut());
+                // SAFETY: both streams are drained and this is the single free.
+                unsafe { cudarc::driver::result::free_host(host.cast::<c_void>()) }
+                    .map_err(|error| driver_err("cuMemFreeHost(page-in test gate)", error))
+            });
+            merge_page_in_results(primary, cleanup, "mapped-gate cleanup")
+        }
+    }
+
+    impl Drop for PageInMappedGate {
+        fn drop(&mut self) {
+            use std::ffi::c_void;
+
+            use cudarc::driver::sys;
+
+            if self.host.is_null() {
+                return;
+            }
+            self.release_copy();
+            // Drop must not format, log, allocate, assert, or panic. Raw calls
+            // prove both users retired before freeing; otherwise backing leaks.
+            let copy_done = unsafe {
+                sys::cuStreamSynchronize(self.runtime.copy_stream().cu_stream())
+                    == sys::CUresult::CUDA_SUCCESS
+            };
+            let compute_done = unsafe {
+                sys::cuStreamSynchronize(self.runtime.stream().cu_stream())
+                    == sys::CUresult::CUDA_SUCCESS
+            };
+            if copy_done && compute_done {
+                let host = std::mem::replace(&mut self.host, std::ptr::null_mut());
+                let _ = unsafe { sys::cuMemFreeHost(host.cast::<c_void>()) };
+            } else {
+                self.host = std::ptr::null_mut();
+            }
+        }
+    }
+
+    fn merge_page_in_results(
+        primary: Result<()>,
+        cleanup: Result<()>,
+        cleanup_name: &str,
+    ) -> Result<()> {
+        match (primary, cleanup) {
+            (Ok(()), cleanup) | (cleanup, Ok(())) => cleanup,
+            (Err(primary), Err(cleanup)) => Err(EpError::KernelFailed(format!(
+                "{primary}; additionally, CUDA page-in {cleanup_name} failed: {cleanup}"
+            ))),
+        }
+    }
+
+    struct PageInFenceFixture {
+        // Drop order is deliberate: the mapped gate releases/drains before
+        // pinned source or device destinations can be destroyed on unwind.
+        gate: PageInMappedGate,
+        staging: crate::runtime::PinnedStaging,
+        dst: DeviceBuffer,
+        ep: CudaExecutionProvider,
+        runtime: Arc<CudaRuntime>,
+        wait_for_release: cudarc::driver::CudaFunction,
+        copy_out: cudarc::driver::CudaFunction,
+        payload: Vec<f32>,
+        poison: Vec<f32>,
+        bytes: usize,
+        n: usize,
+    }
+
+    impl PageInFenceFixture {
+        fn new() -> Result<Self> {
+            let ep = CudaExecutionProvider::initialized(0).map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "CUDA page-in gpu-tests path did not run on CUDA:0: {error}"
+                ))
+            })?;
+            let runtime = ep.runtime().clone();
+            let wait_for_release =
+                runtime.nvrtc_function(PAGE_IN_MODULE, PAGE_IN_SOURCE, "wait_for_release")?;
+            let copy_out = runtime.nvrtc_function(PAGE_IN_MODULE, PAGE_IN_SOURCE, "copy_out")?;
+            let n = PAGE_IN_ELEMENTS;
+            let bytes = n * std::mem::size_of::<f32>();
+            let payload = (0..n)
+                .map(|index| 5.0 + (index % 13) as f32)
+                .collect::<Vec<_>>();
+            let poison = vec![-777.0f32; n];
+            let mut staging = runtime.alloc_pinned(bytes)?;
+            staging.as_mut_slice().copy_from_slice(unsafe {
+                std::slice::from_raw_parts(payload.as_ptr().cast::<u8>(), bytes)
+            });
+            let dst = ep.allocate(bytes, 256)?;
+            let gate = PageInMappedGate::new(runtime.clone())?;
+            Ok(Self {
+                gate,
+                staging,
+                dst,
+                ep,
+                runtime,
+                wait_for_release,
+                copy_out,
+                payload,
+                poison,
+                bytes,
+                n,
+            })
+        }
+
+        fn start_gated_h2d(&mut self) -> Result<Fence> {
+            use std::ffi::c_void;
+
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+            let poison_bytes = unsafe {
+                std::slice::from_raw_parts(self.poison.as_ptr().cast::<u8>(), self.bytes)
+            };
+            // The repaired synchronous-H2D contract constructs POISON before
+            // this arm and retires any prior use of the destination.
+            unsafe { self.runtime.htod(poison_bytes, cuptr(self.dst.as_ptr())) }?;
+            self.gate.reset();
+
+            let copy_release = self.gate.device_word(PAGE_IN_COPY_RELEASE)?;
+            let mut gate = self
+                .runtime
+                .copy_stream()
+                .launch_builder(&self.wait_for_release);
+            gate.arg(&copy_release);
+            // SAFETY: the mapped word remains live through explicit stream drains.
+            unsafe { gate.launch(LaunchConfig::for_num_elems(1)) }
+                .map_err(|error| driver_err("launch page-in transfer gate", error))?;
+
+            // SAFETY: staging outlives the borrowed handle and every async copy.
+            let src = unsafe {
+                DeviceBuffer::from_borrowed_parts(
+                    self.staging.as_slice().as_ptr() as *mut c_void,
+                    DeviceId::cpu(),
+                    self.bytes,
+                    1,
+                )
+            };
+            let fence = self.ep.copy_async(&src, &mut self.dst, self.bytes)?;
+            if fence.is_signalled() {
+                return Err(EpError::KernelFailed(
+                    "cuda page-in copy_async returned fence zero for a real transfer".into(),
+                ));
+            }
+            Ok(fence)
+        }
+
+        fn enqueue_consumer(&self) -> Result<()> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+            let dst = cuptr(self.dst.as_ptr());
+            let out = self.gate.device_output()?;
+            let n = self.n as u64;
+            let done = self.gate.device_word(PAGE_IN_CONSUMER_DONE)?;
+            let mut consume = self.runtime.stream().launch_builder(&self.copy_out);
+            consume.arg(&dst).arg(&out).arg(&n).arg(&done);
+            // SAFETY: buffers cover `n` f32 values and the mapped word stays live.
+            unsafe {
+                consume.launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (self.n as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map(|_| ())
+            .map_err(|error| driver_err("launch page-in consumer", error))
+        }
+
+        fn read_buffer(&self, buffer: &DeviceBuffer) -> Result<Vec<f32>> {
+            let mut values = vec![0.0f32; self.n];
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), self.bytes)
+            };
+            unsafe { self.runtime.dtoh(bytes, cuptr(buffer.as_ptr())) }?;
+            Ok(values)
+        }
+
+        fn finish(self, primary: Result<()>) -> Result<()> {
+            let Self {
+                gate,
+                staging,
+                dst,
+                ep,
+                runtime: _,
+                wait_for_release: _,
+                copy_out: _,
+                payload: _,
+                poison: _,
+                bytes: _,
+                n: _,
+            } = self;
+            let after_gate = gate.finish(primary);
+            drop(staging);
+            let buffer_cleanup = ep.deallocate(dst).map_err(|error| {
+                EpError::KernelFailed(format!("could not deallocate destination: {error}"))
+            });
+            merge_page_in_results(after_gate, buffer_cleanup, "device-buffer cleanup")
+        }
+    }
+
+    /// Positive CUDA integration contract for production page-in ordering.
+    ///
+    /// The H2D and its event, the real EP `wait_fence`, and the consumer are
+    /// all enqueued while the transfer gate is held. Releasing H2D then makes
+    /// the consumer observe PAYLOAD. This proves the normal path works and the
+    /// fresh fence is consumed; it deliberately does not claim that deleting
+    /// the wait must make this identical schedule observe POISON.
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn async_pagein_fence_orders_weight_page_in_consumer() -> Result<()> {
+        let mut fixture = PageInFenceFixture::new()?;
+        let primary = (|| -> Result<()> {
+            let fence = fixture.start_gated_h2d()?;
+            assert!(
+                fixture.runtime.fence_is_registered(fence.id),
+                "copy_async must register its fresh nonzero fence"
+            );
+            fixture.ep.wait_fence(&fence)?;
+            assert!(
+                !fixture.runtime.fence_is_registered(fence.id),
+                "production wait_fence must consume the fresh fence exactly once"
+            );
+            fixture.enqueue_consumer()?;
+
+            fixture.gate.release_copy();
+            fixture.runtime.sync_copy_stream()?;
+            fixture.runtime.drain_for_unmap()?;
+            assert!(
+                fixture.gate.consumer_done(),
+                "consumer must publish DONE after the gated H2D is released"
+            );
+            assert_eq!(
+                fixture.gate.output(),
+                fixture.payload,
+                "production wait did not order H2D before the consumer"
+            );
+            assert_eq!(
+                fixture.read_buffer(&fixture.dst)?,
+                fixture.payload,
+                "gated H2D did not eventually land"
+            );
+            Ok(())
+        })();
+        fixture.finish(primary)
+    }
+
+    /// Negative apparatus validation, not a production-wait mutation test.
+    ///
+    /// With no wait before the consumer, compute is drained to DONE while H2D
+    /// remains held, so the read must be POISON. After H2D release the
+    /// destination must become PAYLOAD. The converse control releases/drains
+    /// H2D before the same no-wait consumer and must read PAYLOAD.
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn async_pagein_no_wait_apparatus_validates_poison_and_early_copy_control() -> Result<()> {
+        let mut fixture = PageInFenceFixture::new()?;
+        let primary = (|| -> Result<()> {
+            let held_fence = fixture.start_gated_h2d()?;
+            fixture.enqueue_consumer()?;
+            fixture.runtime.drain_for_unmap()?;
+            assert!(
+                fixture.gate.consumer_done(),
+                "no-wait consumer must reach DONE while H2D remains held"
+            );
+            assert_eq!(
+                fixture.gate.output(),
+                fixture.poison,
+                "apparatus did not force the no-wait consumer to read POISON"
+            );
+
+            fixture.gate.release_copy();
+            fixture.runtime.sync_copy_stream()?;
+            assert_eq!(
+                fixture.read_buffer(&fixture.dst)?,
+                fixture.payload,
+                "held H2D did not land after release"
+            );
+            // Post-observation cleanup only: the consumer has already read and
+            // the transfer has already completed, so this cannot cause POISON.
+            fixture.ep.wait_fence(&held_fence)?;
+
+            let early_fence = fixture.start_gated_h2d()?;
+            fixture.gate.release_copy();
+            fixture.runtime.sync_copy_stream()?;
+            fixture.enqueue_consumer()?;
+            fixture.runtime.drain_for_unmap()?;
+            assert!(fixture.gate.consumer_done());
+            assert_eq!(
+                fixture.gate.output(),
+                fixture.payload,
+                "early-copy converse control must expose PAYLOAD to the no-wait consumer"
+            );
+            fixture.ep.wait_fence(&early_fence)?;
+            Ok(())
+        })();
+        fixture.finish(primary)
     }
 
     /// Regression for the MTP dual-slot graph-replay crash: a kernel-variant

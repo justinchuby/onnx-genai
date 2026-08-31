@@ -426,13 +426,14 @@ impl GroupedVisionPreprocessor {
                     ),
                 });
             }
-            if contract.rank != 1 {
+            if contract.rank() != 1 {
                 return Err(EncoderBatchingError::UnsupportedExecution {
                     component: self.component.clone(),
                     detail: format!(
                         "structural output '{}' has rank {}, but this grouped preprocessing slice \
                          emits rank-1 ownership companions and one valid length per physical part",
-                        output.name, contract.rank
+                        output.name,
+                        contract.rank()
                     ),
                 });
             }
@@ -533,16 +534,7 @@ impl GroupedVisionPreprocessor {
                         ),
                     }
                 })?;
-                let shape =
-                    contract
-                        .shape
-                        .as_ref()
-                        .ok_or_else(|| EncoderBatchingError::Preprocessing {
-                            detail: format!(
-                                "padded output '{}' requires a declared shape",
-                                output.name
-                            ),
-                        })?;
+                let shape = &contract.shape;
                 let axis = shape
                     .iter()
                     .position(|dimension| {
@@ -693,16 +685,7 @@ impl GroupedVisionPreprocessor {
                         output.name
                     ),
                 })?;
-        let declared_shape =
-            contract
-                .shape
-                .as_ref()
-                .ok_or_else(|| EncoderBatchingError::Preprocessing {
-                    detail: format!(
-                        "empty grouped output '{}' requires a declared shape",
-                        output.name
-                    ),
-                })?;
+        let declared_shape = &contract.shape;
         let shape = declared_shape
             .iter()
             .enumerate()
@@ -740,6 +723,7 @@ impl GroupedVisionPreprocessor {
                     }
                     _ => self.empty_inner_extent(output, contract, dimension),
                 },
+                TensorDimension::Any => self.empty_inner_extent(output, contract, dimension),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let elements = shape.iter().try_fold(1usize, |total, extent| {
@@ -777,7 +761,14 @@ impl GroupedVisionPreprocessor {
         dimension: &TensorDimension,
     ) -> Result<i64, EncoderBatchingError> {
         let TensorDimension::Symbol(symbol) = dimension else {
-            unreachable!("empty inner extent is called only for symbolic dimensions");
+            return Err(EncoderBatchingError::UnsupportedExecution {
+                component: self.component.clone(),
+                detail: format!(
+                    "empty output '{}' has unconstrained dimension Any with no runtime value; \
+                     provide a fixed or processor-derived symbolic extent",
+                    output.name
+                ),
+            });
         };
         if contract
             .padding

@@ -6,8 +6,8 @@
 //! so the fact under test is the only thing that varies.
 
 use onnx_genai_metadata::{
-    InferenceMetadata, WorkflowOutputRole, cache_dependencies, semantic_identity_of_str,
-    validate_metadata,
+    InferenceMetadata, LiteralValue, ScalarValue, WorkflowOutputRole, cache_dependencies,
+    parse_metadata, semantic_identity_of_str, validate_metadata,
 };
 
 fn parse(document: &str) -> InferenceMetadata {
@@ -131,49 +131,47 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.parameter-overlay: "1" }
-      capabilities: [workflow_ssa, linear_effects, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.adapter_segments:
-        contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_segments }
         source: { kind: request }
       request.adapter_counts:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_counts }
         source: { kind: request }
       request.adapter_scales:
-        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_scales }
         source: { kind: request }
       vision.embeddings:
-        contract: { dtype: float32, rank: 3, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: vision.embeddings }
         externally_suppliable: true
       image_features:
         contract:
           dtype: float32
-          rank: 2
           shape: [items, hidden]
           batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: image_offsets, owner: image_owner }] }
         role: { kind: opaque }
         source: { kind: application, name: image_features }
         externally_suppliable: true
       image_offsets:
-        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: image_offsets }
       image_owner:
-        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: image_owner }
       prompt:
-        contract: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: prompt }
     outputs:
       tokens:
-        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tokens
         stage: pre_adapter
     effects:
@@ -185,17 +183,17 @@ pipeline:
         implementation: { kind: onnx, artifact: splice.onnx }
         ports:
           inputs:
-            prompt: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
-            embeddings: { dtype: float32, rank: 3, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            prompt: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+            embeddings: { dtype: float32, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            spliced: { dtype: float32, rank: 3, shape: [batch, sequence, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            spliced: { dtype: float32, shape: [batch, sequence, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
       decoder:
         implementation: { kind: onnx, artifact: decoder.onnx }
         ports:
           inputs:
-            hidden: { dtype: float32, rank: 3, shape: [batch, sequence, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            hidden: { dtype: float32, shape: [batch, sequence, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            token: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
       grammar:
         implementation: { kind: binding }
         row_scope: { axis: 0, stateful: true }
@@ -203,9 +201,9 @@ pipeline:
         cache_affects_state: [grammar.parser_table]
         ports:
           inputs:
-            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            token: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            guided: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            guided: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
     steps:
       - kind: invoke
         component: splice
@@ -328,32 +326,27 @@ fn serving_workflow(
     effects: &str,
     speculative: &str,
 ) -> String {
-    let linear_effects = if effects.is_empty() {
-        ""
-    } else {
-        ", linear_effects"
-    };
     format!(
         r#"
+schema_version: v1.6
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, serving_service_contract{linear_effects}]
+    manifest: {{}}
     inputs:
       active:
-        contract: {{ dtype: bool, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: bool, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: active }}
       done:
-        contract: {{ dtype: bool, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: bool, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: done }}
       accepted_len:
-        contract: {{ dtype: int64, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: int64, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: accepted_len }}
       empty_cache:
-        contract: {{ dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: empty_cache }}
     components:
@@ -363,10 +356,15 @@ pipeline:
 {effects}
       verifier:
         implementation: {{ kind: onnx, artifact: verifier.onnx }}
-        ports: {{}}
+        ports:
+          inputs:
+            past_key_values: {{ dtype: float16, shape: [batch, heads, sequence, head_dim], optional: true, batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+          outputs:
+            present_key_values: {{ dtype: float16, shape: [batch, heads, sequence, head_dim], optional: true, batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+            verification: {{ dtype: float32, shape: [batch, sequence, vocabulary], optional: true, batch_layout: {{ kind: request_aligned, axis: 0 }} }}
     state:
       cache:
-        contract: {{ dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         class: semantic
         scope: invocation
         initializer: empty_cache
@@ -412,13 +410,18 @@ fn speculative_block(width: usize) -> String {
     format!(
         r#"
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: proposer
   target: verifier
   vocabulary: {{ kind: identical }}
   max_proposal_width: {width}
-  shared_state: [cache]
+  shared_state: [decoder_cache]
   shared_weights: []
   distribution_preserving: true
+  verification:
+    target_output: {{ component: verifier, output: verification }}
+    accepted_path: {{ kind: runtime, binding: accepted_prefix }}
   rollback_state: [cache]
 "#
     )
@@ -506,6 +509,8 @@ fn chained_proposer_requires_typed_ports_and_rollbackable_recurrence() {
         "",
         r#"
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: proposer
   target: verifier
   proposal_execution:
@@ -517,6 +522,9 @@ speculative:
   vocabulary: { kind: mapped, artifact: draft_to_target.npy }
   max_proposal_width: 4
   distribution_preserving: true
+  verification:
+    target_output: { component: verifier, output: verification }
+    accepted_path: { kind: runtime, binding: accepted_prefix }
   rollback_state: [cache]
 "#,
     )
@@ -524,11 +532,11 @@ speculative:
         "        ports: {}",
         r#"        ports:
           inputs:
-            inputs_embeds: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
-            past_state: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+            inputs_embeds: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+            past_state: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            draft_logits: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
-            next_state: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }"#,
+            draft_logits: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+            next_state: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }"#,
         1,
     )
     .replacen(
@@ -721,11 +729,10 @@ generation:
     temperature: { input: request.temperature }
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {}
     inputs:
       request.temperature:
-        contract: { dtype: float32, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: sampling_temperature }
         source: { kind: request }
     components:
@@ -766,16 +773,19 @@ pipeline:
 #[test]
 fn constraint_dialect_and_tokenizer_artifact_are_representable() {
     let document = r#"
+schema_version: v1.2
 package:
   tokenizer:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
+    special_tokens:
+      pad_token_id: 0
+      bos_token_id: 1
+      eos_token_id: [2]
+      audio_token_id: 32001
     artifacts:
       - location: tokenizer.json
-    special_tokens:
-      bos: { id: 1, content: "<s>" }
-      eos: { id: 2, content: "</s>" }
   constraint_languages:
     - dialect: gbnf
       version: "1"
@@ -784,7 +794,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
-      capabilities: [workflow_ssa, grammar_guidance_adapter]
     inputs: {}
     components:
       grammar:
@@ -798,10 +807,25 @@ pipeline:
     validate_metadata(&metadata).expect("package facts are valid");
     let package = metadata.package.as_ref().expect("package facts");
     let tokenizer = package.tokenizer.as_ref().expect("tokenizer facts");
-    assert_eq!(tokenizer.vocab_size, 32000);
+    assert_eq!(tokenizer.vocab_size, Some(32000));
     assert!(tokenizer.byte_level);
     assert_eq!(tokenizer.artifacts[0].location, "tokenizer.json");
-    assert_eq!(tokenizer.special_tokens["eos"].content, "</s>");
+    assert_eq!(
+        tokenizer
+            .special_tokens
+            .as_ref()
+            .expect("numeric token facts")
+            .eos_token_id,
+        vec![2]
+    );
+    assert_eq!(
+        tokenizer
+            .special_tokens
+            .as_ref()
+            .expect("numeric token facts")
+            .audio_token_id,
+        Some(32001)
+    );
     assert_eq!(package.constraint_languages[0].dialect, "gbnf");
 
     // The dialect must name a component that actually parses it.
@@ -811,6 +835,130 @@ pipeline:
         reported.iter().any(|error| error.contains("absent")),
         "{reported:?}"
     );
+}
+
+#[test]
+fn retired_top_level_tokens_have_an_actionable_migration() {
+    let error = parse_metadata(
+        r#"
+tokens:
+  eos_token_id: [2]
+"#,
+        Some("yaml"),
+    )
+    .expect_err("top-level token authority is retired")
+    .to_string();
+    assert!(
+        error.contains("package.tokenizer.special_tokens"),
+        "{error}"
+    );
+    assert!(error.contains("tokenizer.json"), "{error}");
+}
+
+#[test]
+fn generation_requires_one_token_authority_and_an_executable_stop_policy() {
+    let document = include_str!(
+        "../../../tests/fixtures/onnx_genai_workflows/decoder/inference_metadata.yaml"
+    );
+    let metadata = parse(document);
+    validate_metadata(&metadata).expect("the canonical generation fixture is valid");
+
+    let mut no_tokens = metadata.clone();
+    no_tokens
+        .package
+        .as_mut()
+        .and_then(|package| package.tokenizer.as_mut())
+        .expect("tokenizer facts")
+        .special_tokens = None;
+    let reported = validate_metadata(&no_tokens).expect_err("generation needs package EOS facts");
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("package.tokenizer.special_tokens.eos_token_id")),
+        "{reported:?}"
+    );
+
+    let mut no_policy = metadata.clone();
+    no_policy
+        .pipeline
+        .as_mut()
+        .expect("pipeline")
+        .workflow
+        .components
+        .get_mut("termination")
+        .expect("termination component")
+        .contract = None;
+    let reported = validate_metadata(&no_policy).expect_err("generation needs stop semantics");
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("must invoke a component")),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn eos_authority_rejects_duplicates_and_workflow_literals() {
+    let document = include_str!(
+        "../../../tests/fixtures/onnx_genai_workflows/decoder/inference_metadata.yaml"
+    );
+    let mut metadata = parse(document);
+    metadata
+        .package
+        .as_mut()
+        .and_then(|package| package.tokenizer.as_mut())
+        .and_then(|tokenizer| tokenizer.special_tokens.as_mut())
+        .expect("special token facts")
+        .eos_token_id
+        .push(127);
+    let reported = validate_metadata(&metadata).expect_err("duplicate EOS ids are ambiguous");
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("repeats id 127")),
+        "{reported:?}"
+    );
+
+    let mut metadata = parse(document);
+    let workflow = &mut metadata.pipeline.as_mut().expect("pipeline").workflow;
+    workflow
+        .inputs
+        .get_mut("request.eos_ids")
+        .expect("runtime EOS input")
+        .default = Some(LiteralValue::Elements(vec![ScalarValue::Integer(127)]));
+    let duplicate = workflow
+        .inputs
+        .get("request.eos_ids")
+        .expect("runtime EOS input")
+        .clone();
+    workflow
+        .inputs
+        .insert("package.eos_ids".to_string(), duplicate);
+    let reported =
+        validate_metadata(&metadata).expect_err("workflow literals cannot own package EOS ids");
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("retired duplicate")),
+        "{reported:?}"
+    );
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("request EOS override")),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn numeric_token_facts_reject_non_numeric_or_negative_ids() {
+    for document in [
+        "schema_version: v1.2\ntokens:\n  eos_token_id: [-1]\n",
+        "schema_version: v1.2\ntokens:\n  eos_token_id: [eos]\n",
+    ] {
+        parse_metadata(document, Some("yaml"))
+            .expect_err("token ids must be non-negative integers");
+    }
 }
 
 #[test]
@@ -883,28 +1031,27 @@ fn session_scope_and_release_boundaries_remain_normative() {
     let document = r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, session_state, session_state_lease, serving_service_contract]
+    manifest: {}
     inputs:
       seed_state:
-        contract: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: seed_state }
       active:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: active }
       done:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: done }
       accepted_len:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: accepted_len }
     state:
       conversation:
-        contract: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
         class: semantic
         scope: session
         initializer: seed_state
@@ -917,9 +1064,9 @@ pipeline:
         implementation: { kind: onnx, artifact: decoder.onnx }
         ports:
           inputs:
-            past_state: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            past_state: { dtype: float32, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            next_state: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            next_state: { dtype: float32, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
     serving:
       active: active
       done: done
@@ -1165,9 +1312,14 @@ fn portable_checkpoints_are_distinct_from_private_state_transfer() {
     // is a declared property, not an emergent one.
     let exported = private.replace(
         "    state:\n      cache:",
-        "    outputs:\n      cache:\n        contract: { dtype: float16, rank: 4, shape: [batch, \
-         heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }\n        \
-         role: tensor\n        stage: pre_adapter\n    state:\n      cache:",
+        r#"    outputs:
+      cache:
+        contract: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: tensor
+        family: { kind: materialized }
+        stage: pre_adapter
+    state:
+      cache:"#,
     );
     let failures = errors(&exported);
     assert!(
@@ -1177,13 +1329,21 @@ fn portable_checkpoints_are_distinct_from_private_state_transfer() {
         "{failures:?}"
     );
 
-    // Declaring the versioned adapter is what makes the export legal.
+    // A standardized declaration is still not execution support. The exact
+    // pair remains typed, but this build refuses it until the portable adapter
+    // named by the registry exists.
     let portable = exported.replace(
         "            capabilities:",
         "            checkpoint: { adapter: onnx-genai.kv-checkpoint, version: \"1\" }\n            \
          capabilities:",
     );
-    validate_metadata(&parse(&portable)).expect("a declared checkpoint adapter permits export");
+    let failures = errors(&portable);
+    assert!(
+        failures.iter().any(|error| {
+            error.contains("onnx-genai.kv-checkpoint@1") && error.contains("known, but unavailable")
+        }),
+        "{failures:?}"
+    );
     let checkpoint = group(&portable).checkpoint.expect("checkpoint");
     assert_eq!(checkpoint.adapter, "onnx-genai.kv-checkpoint");
     assert_eq!(checkpoint.version, "1");
@@ -1198,9 +1358,9 @@ fn the_speculative_region_covers_every_component_in_the_loop_body() {
     let workflow = serving_workflow("permitted", SOUND_CAPABILITIES, "", &speculative_block(4));
     let with_sidecar = workflow
         .replace(
-            "capabilities: [workflow_ssa, serving_service_contract]",
-            "capabilities: [workflow_ssa, serving_service_contract, linear_effects, \
-             nested_control_flow]",
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation]",
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, \
+             linear_effects, nested_control_flow]",
         )
         .replace(
             r#"      verifier:
@@ -1233,11 +1393,11 @@ fn the_speculative_region_covers_every_component_in_the_loop_body() {
         .replace(
             "      empty_cache:",
             r#"      more:
-        contract: { dtype: bool, rank: 0, shape: [] }
+        contract: { dtype: bool, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: more }
       budget:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: budget }
       empty_cache:"#,
@@ -1273,18 +1433,18 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
     // has to read the emitted value.
     let aliased = serving_workflow("permitted", SOUND_CAPABILITIES, "", "")
         .replace(
-            "capabilities: [workflow_ssa, serving_service_contract]",
-            "capabilities: [workflow_ssa, serving_service_contract, linear_effects, \
-             nested_control_flow, typed_emit]",
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation]",
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, \
+             linear_effects, nested_control_flow, typed_emit]",
         )
         .replace(
             "      empty_cache:",
             r#"      more:
-        contract: { dtype: bool, rank: 0, shape: [] }
+        contract: { dtype: bool, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: more }
       budget:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: budget }
       empty_cache:"#,
@@ -1297,16 +1457,17 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
         implementation: { kind: onnx, artifact: verifier.onnx }
         ports:
           inputs:
-            past_key_values: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+            past_key_values: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            present_key_values: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }"#,
+            present_key_values: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }"#,
         )
         .replace(
             "    state:\n      cache:",
             r#"    outputs:
       cache_dump:
-        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
     state:
       cache:"#,
@@ -1343,13 +1504,19 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
         "exporting runtime-owned state under an alias must be rejected: {reported:?}"
     );
 
-    // Declaring the versioned adapter is what makes the aliased export legal.
+    // Declaring a known pair cannot bypass its unavailable registry status.
     let portable = aliased.replace(
         "            capabilities:",
         "            checkpoint: { adapter: onnx-genai.kv-checkpoint, version: \"1\" }\n            \
          capabilities:",
     );
-    validate_metadata(&parse(&portable)).expect("a declared checkpoint adapter permits export");
+    let failures = errors(&portable);
+    assert!(
+        failures.iter().any(|error| {
+            error.contains("onnx-genai.kv-checkpoint@1") && error.contains("known, but unavailable")
+        }),
+        "{failures:?}"
+    );
 }
 
 #[test]
@@ -1420,22 +1587,20 @@ preprocessing:
         dtype: float32
         contract:
           dtype: float32
-          rank: 3
           shape: [batch, 80, audio_seq_len]
           batch_layout: { kind: request_aligned, axis: 0 }
 pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.audio-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit, audio_preprocessing_program]
     inputs:
       request.audio:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: opaque }
         source: { kind: application, name: audio }
     outputs:
       encoder_states:
-        contract: { dtype: float32, rank: 3, shape: [batch, 1500, 384], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, 1500, 384], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tensor
         stage: pre_adapter
     components:
@@ -1443,16 +1608,16 @@ pipeline:
         implementation: { kind: adapter, abi: onnx-genai.audio-preprocess, version: "1" }
         ports:
           inputs:
-            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            encoded: { dtype: uint8, shape: [encoded_bytes] }
           outputs:
-            input_features: { dtype: float32, rank: 3, shape: [batch, 80, audio_seq_len], batch_layout: { kind: request_aligned, axis: 0 } }
+            input_features: { dtype: float32, shape: [batch, 80, audio_seq_len], batch_layout: { kind: request_aligned, axis: 0 } }
       encoder:
         implementation: { kind: onnx, artifact: encoder.onnx }
         ports:
           inputs:
-            input_features: { dtype: float32, rank: 3, shape: [batch, 80, audio_seq_len], batch_layout: { kind: request_aligned, axis: 0 } }
+            input_features: { dtype: float32, shape: [batch, 80, audio_seq_len], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            encoder_hidden_states: { dtype: float32, rank: 3, shape: [batch, 1500, 384], batch_layout: { kind: request_aligned, axis: 0 } }
+            encoder_hidden_states: { dtype: float32, shape: [batch, 1500, 384], batch_layout: { kind: request_aligned, axis: 0 } }
     steps:
       - kind: invoke
         component: audio_preprocess
@@ -1495,7 +1660,7 @@ fn an_audio_adapter_without_a_program_is_rejected() {
 #[test]
 fn an_audio_output_without_a_contract_is_rejected() {
     let document = AUDIO_PREPROCESSING_WORKFLOW.replace(
-        "        contract:\n          dtype: float32\n          rank: 3\n          shape: \
+        "        contract:\n          dtype: float32\n          shape: \
          [batch, 80, audio_seq_len]\n          batch_layout: { kind: request_aligned, axis: 0 }\n",
         "",
     );

@@ -731,6 +731,43 @@ pub extern "C" fn nxrt_dispatch_probe_phase_name(index: usize) -> *const std::os
     }
 }
 
+/// Exported name of an event counter, or null past the end.
+///
+/// Exists for the same reason [`nxrt_dispatch_probe_phase_name`] does, and
+/// because the lesson that export encodes was not applied to events at the
+/// time. The `plugin_ort_e2e` harness carried its own hard-coded
+/// `PROBE_EVENTS` list, which drifted from [`Event`] and mislabelled three of
+/// the five counters: `StatusCreated` was printed as "NodeExecuted",
+/// `ComputeExecute` -- the per-`Run` divisor -- as "ShapeInferred", and the
+/// real `NodeExecuted` as "OutputMaterialized". Two of those names name no
+/// event at all.
+///
+/// The drift was invisible because the harness guarded *arity* and not
+/// identity: it asserted the snapshot wrote as many `u64`s as it expected, and
+/// a pure reordering keeps the count at five. Its failure message claimed to
+/// detect "PROBE_EVENTS is out of sync with dispatch_probe", which is the one
+/// thing it could not do.
+///
+/// # Safety
+///
+/// The returned pointer is to a `'static` NUL-terminated string and must not be
+/// freed. It stays valid for the lifetime of the library.
+#[cfg(feature = "dispatch_probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_dispatch_probe_event_name(index: usize) -> *const std::os::raw::c_char {
+    const NAMES: [&core::ffi::CStr; Event::COUNT] = [
+        c"ort_ffi_call",
+        c"dispatch_alloc",
+        c"status_created",
+        c"compute_execute",
+        c"node_executed",
+    ];
+    match NAMES.get(index) {
+        Some(n) => n.as_ptr(),
+        None => core::ptr::null(),
+    }
+}
+
 /// Number of `u64`s [`nxrt_dispatch_probe_snapshot`] writes.
 ///
 /// Exported so the cdylib harness sizes its buffer from the same expression the
@@ -994,6 +1031,32 @@ mod tests {
         assert!(nxrt_dispatch_probe_phase_name(ALLOC_BUCKETS).is_null());
     }
 
+    /// The exported event names must match `Event::name`, in order.
+    ///
+    /// The analog of `exported_phase_names_match_the_enum`, absent until the
+    /// harness's hard-coded list had drifted far enough to mislabel three of
+    /// five counters. Ordering is the whole assertion: the defect was never a
+    /// missing name, it was correct names against the wrong indices, which an
+    /// arity check cannot see.
+    #[cfg(feature = "dispatch_probe")]
+    #[test]
+    fn exported_event_names_match_the_enum() {
+        for e in Event::ALL.into_iter() {
+            let ptr = nxrt_dispatch_probe_event_name(e as usize);
+            assert!(!ptr.is_null(), "{} has no exported name", e.name());
+            // SAFETY: the export returns a 'static NUL-terminated string.
+            let got = unsafe { core::ffi::CStr::from_ptr(ptr) };
+            assert_eq!(
+                got.to_str().unwrap(),
+                e.name(),
+                "event {} exports the wrong name at index {}",
+                e.name(),
+                e as usize
+            );
+        }
+        assert!(nxrt_dispatch_probe_event_name(Event::COUNT).is_null());
+    }
+
     /// The C entry point is what the cdylib harness uses; it must refuse a
     /// buffer it would overrun rather than writing past the end.
     #[cfg(feature = "dispatch_probe")]
@@ -1047,7 +1110,7 @@ mod ffi_coverage {
     /// account for it.
     const EXPECTED: &[(&str, &str, usize, usize)] = &[
         ("compute.rs", include_str!("compute.rs"), 9, 9),
-        ("kernel_ctx.rs", include_str!("kernel_ctx.rs"), 12, 12),
+        ("kernel_ctx.rs", include_str!("kernel_ctx.rs"), 15, 16),
         ("status.rs", include_str!("status.rs"), 1, 1),
         ("host_pool.rs", include_str!("host_pool.rs"), 2, 2),
     ];

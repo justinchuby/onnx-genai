@@ -98,8 +98,8 @@ use std::time::{Duration, Instant};
 use onnx_runtime_cuda_memory::virtual_memory::{PhysicalHandlePool, PhysicalLocation};
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_ep_api::{
-    ExpertWeightGroup, LazyWeightBoundary, ResidencyPlan, Result, StaticProfileResidencyPolicy,
-    expert_weight_groups, plan_residency,
+    EpError, ExpertWeightGroup, LazyWeightBoundary, ResidencyPlan, Result,
+    StaticProfileResidencyPolicy, expert_weight_groups, plan_residency,
 };
 use onnx_runtime_ir::{Graph, NodeId, ValueId};
 use onnx_runtime_loader::WeightRegionCatalog;
@@ -108,7 +108,7 @@ use crate::coarse_residency::{BoundaryApplicationOutcome, coarse_residency_profi
 use crate::kernels::expert_route_telemetry::{
     RouteDecision, TelemetrySnapshot, consume_and_validate,
 };
-use crate::weight_paging::CudaWeightResidency;
+use crate::weight_paging::{CudaWeightResidency, RouteReservationHealth};
 
 /// Outcome of consuming one completed coarse-boundary route-telemetry window.
 ///
@@ -458,6 +458,7 @@ pub struct RouteResidencyBoundary {
     /// that failed to advance (an older epoch) is caught as stale.
     expected_epoch: AtomicU32,
     expert_groups: Vec<ExpertWeightGroup>,
+    reservation_health: Arc<RouteReservationHealth>,
     /// The first non-vacuous coarse placement is stable for this executor.
     /// Later route windows remain real telemetry windows but are observation
     /// only until a future bidirectional promotion policy exists.
@@ -468,6 +469,7 @@ pub struct RouteResidencyBoundary {
 struct StableTransitionState {
     installed: bool,
     host_ranges: HashMap<ValueId, Vec<(usize, usize)>>,
+    poisoned: Option<String>,
 }
 
 impl RouteResidencyBoundary {
@@ -490,6 +492,7 @@ impl RouteResidencyBoundary {
         expected_device: u32,
         initial_epoch: u32,
         expert_groups: Vec<ExpertWeightGroup>,
+        reservation_health: Arc<RouteReservationHealth>,
     ) -> Self {
         Self {
             source,
@@ -506,6 +509,7 @@ impl RouteResidencyBoundary {
             expected_device,
             expected_epoch: AtomicU32::new(initial_epoch),
             expert_groups,
+            reservation_health,
             transition_state: Mutex::new(StableTransitionState::default()),
         }
     }
@@ -554,6 +558,50 @@ impl RouteResidencyBoundary {
             }
         }
         state.installed = !state.host_ranges.is_empty();
+    }
+
+    fn poison_after_incomplete_group(
+        &self,
+        state: &mut StableTransitionState,
+        outcome: &RouteWindowConsumeOutcome,
+    ) -> Option<String> {
+        let RouteWindowConsumeOutcome::Applied { outcome, .. } = outcome else {
+            return None;
+        };
+        let quarantined_blocks = outcome
+            .quarantined
+            .iter()
+            .map(|(_, blocks)| blocks.len())
+            .sum::<usize>();
+        let reason = if quarantined_blocks > 0 {
+            Some(format!(
+                "{quarantined_blocks} route-bank physical mapping(s) are quarantined"
+            ))
+        } else if !outcome.rollback_failures.is_empty() {
+            Some(format!(
+                "{} route-bank rollback(s) failed to restore device residency",
+                outcome.rollback_failures.len()
+            ))
+        } else if outcome.values_touched > 0
+            && (outcome.failure_count > 0 || !outcome.per_value_fallbacks.is_empty())
+        {
+            Some(format!(
+                "logical expert group transitioned only {} value(s) while {} member transition(s) \
+                 failed or fell back",
+                outcome.values_touched,
+                outcome.failure_count.max(outcome.per_value_fallbacks.len())
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            state.poisoned = Some(reason.clone());
+            state.installed = false;
+            self.reservation_health.mark_unusable(reason.clone());
+            Some(reason)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn restore_host_ranges_to_device(
@@ -665,10 +713,18 @@ pub enum RouteResidencyBindingReject {
     /// or non-MoE graphs land here; there is nothing to tier.
     NoExpertGroups,
     /// The discovered group's node has no armed route-telemetry producer source
-    /// (its kernel never surfaced a window source to the EP). Without a producer
-    /// there is no window to consume, so no binding is installed.
+    /// yet, but its boundary publishes one during resolved kernel compilation.
+    /// Without a producer there is no window to consume, so no binding is
+    /// installed until a later readiness epoch.
     NoTelemetrySource {
         node: NodeId,
+    },
+    /// This boundary has no executor-scoped route-telemetry producer
+    /// publication path. Waiting for another readiness epoch cannot change that,
+    /// so the binding is terminally declined rather than left pending forever.
+    TelemetryProducerUnsupported {
+        node: NodeId,
+        boundary: LazyWeightBoundary,
     },
     /// A group member weight has no region catalog — it was not classified/
     /// loaded, so the boundary consumer could not map its regions.
@@ -703,6 +759,12 @@ impl RouteResidencyBindingReject {
             }
             RouteResidencyBindingReject::NoTelemetrySource { node } => {
                 format!("expert group node {node:?} has no armed telemetry source")
+            }
+            RouteResidencyBindingReject::TelemetryProducerUnsupported { node, boundary } => {
+                format!(
+                    "expert group node {node:?} at {boundary:?} has no supported executor-scoped \
+                     route-telemetry producer"
+                )
             }
             RouteResidencyBindingReject::MissingCatalog { value } => {
                 format!("bank value {value:?} has no region catalog")
@@ -761,7 +823,19 @@ pub(crate) fn validate_route_residency_bindings(
     }
     for group in &groups {
         if !has_source(group.node) {
-            return Err(RouteResidencyBindingReject::NoTelemetrySource { node: group.node });
+            return Err(
+                if group
+                    .boundary
+                    .route_telemetry_producer_may_appear_after_compilation()
+                {
+                    RouteResidencyBindingReject::NoTelemetrySource { node: group.node }
+                } else {
+                    RouteResidencyBindingReject::TelemetryProducerUnsupported {
+                        node: group.node,
+                        boundary: group.boundary,
+                    }
+                },
+            );
         }
         for member in &group.members {
             if !has_catalog(*member) {
@@ -787,6 +861,7 @@ pub fn build_route_residency_boundaries(
     sources: &HashMap<NodeId, Arc<dyn RouteTelemetrySource>>,
     catalogs: &HashMap<ValueId, WeightRegionCatalog>,
     allocators: &HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    reservation_health: Arc<RouteReservationHealth>,
     device_pool: Arc<PhysicalHandlePool>,
     host_pool: Arc<PhysicalHandlePool>,
     device_count: usize,
@@ -829,6 +904,7 @@ pub fn build_route_residency_boundaries(
                 expected_device,
                 initial_epoch,
                 vec![group],
+                Arc::clone(&reservation_health),
             )
         })
         .collect())
@@ -1096,6 +1172,12 @@ pub fn run_route_residency_boundary(
         .transition_state
         .lock()
         .expect("route-residency transition state poisoned");
+    if let Some(reason) = &transition_state.poisoned {
+        return Err(EpError::KernelFailed(format!(
+            "route-residency boundary is unusable after an earlier atomic transition failure: \
+             {reason}; tear down and rebuild the executor"
+        )));
+    }
     let outcome = if transition_state.installed {
         observe_route_window_without_transition(binding, &snapshot)
     } else {
@@ -1117,6 +1199,14 @@ pub fn run_route_residency_boundary(
         )
     };
     binding.record_host_ranges(&mut transition_state, &outcome);
+    if let Some(reason) = binding.poison_after_incomplete_group(&mut transition_state, &outcome) {
+        diag.record_outcome(&outcome);
+        diag.record_boundary_host_time(started.elapsed());
+        return Err(EpError::KernelFailed(format!(
+            "route-residency invalidated the executor-scoped bank reservation: {reason}; no \
+             dispatch, capture, or replay may use this executor until it is rebuilt"
+        )));
+    }
 
     if window_was_consumed(&outcome) {
         binding.source.reset_route_telemetry_boundary()?;
@@ -1163,6 +1253,12 @@ pub fn run_route_residency_boundary_with_phase8_faults(
         .transition_state
         .lock()
         .expect("route-residency transition state poisoned");
+    if let Some(reason) = &transition_state.poisoned {
+        return Err(EpError::KernelFailed(format!(
+            "route-residency boundary is unusable after an earlier atomic transition failure: \
+             {reason}; tear down and rebuild the executor"
+        )));
+    }
     let outcome = if transition_state.installed {
         observe_route_window_without_transition(binding, &snapshot)
     } else {
@@ -1186,6 +1282,14 @@ pub fn run_route_residency_boundary_with_phase8_faults(
         )
     };
     binding.record_host_ranges(&mut transition_state, &outcome);
+    if let Some(reason) = binding.poison_after_incomplete_group(&mut transition_state, &outcome) {
+        diag.record_outcome(&outcome);
+        diag.record_boundary_host_time(started.elapsed());
+        return Err(EpError::KernelFailed(format!(
+            "route-residency invalidated the executor-scoped bank reservation: {reason}; no \
+             dispatch, capture, or replay may use this executor until it is rebuilt"
+        )));
+    }
 
     if window_was_consumed(&outcome) {
         binding.source.reset_route_telemetry_boundary()?;
@@ -1274,6 +1378,20 @@ mod binding_tests {
         )
     }
 
+    fn block_quantized_moe_node(graph: &mut Graph) -> (NodeId, ValueId) {
+        let input = graph.create_named_value("input", DataType::Float32, shape1(4));
+        let weight = inline_initializer(graph, "experts");
+        let output = graph.create_named_value("output", DataType::Float32, shape1(4));
+        let mut node = onnx_runtime_ir::Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            vec![Some(input), Some(weight)],
+            vec![output],
+        );
+        node.domain = "pkg.nxrt".to_string();
+        (graph.insert_node(node), weight)
+    }
+
     fn always(_: NodeId) -> bool {
         true
     }
@@ -1332,6 +1450,26 @@ mod binding_tests {
         let err = validate_route_residency_bindings(&graph, |_| false, always_v, always_v)
             .expect_err("no source");
         assert_eq!(err, RouteResidencyBindingReject::NoTelemetrySource { node });
+    }
+
+    #[test]
+    fn missing_block_quantized_moe_producer_is_terminally_unsupported() {
+        let mut graph = Graph::new();
+        let (node, _) = block_quantized_moe_node(&mut graph);
+        let err = validate_route_residency_bindings(&graph, |_| false, always_v, always_v)
+            .expect_err("BlockQuantizedMoE has no deferred producer");
+        assert_eq!(
+            err,
+            RouteResidencyBindingReject::TelemetryProducerUnsupported {
+                node,
+                boundary: LazyWeightBoundary::BlockQuantizedMoe,
+            }
+        );
+        let reason = err.reason();
+        assert!(
+            reason.contains("BlockQuantizedMoe") && reason.contains("no supported"),
+            "terminal reason names the unsupported boundary capability: {reason}"
+        );
     }
 
     #[test]

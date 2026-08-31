@@ -47,8 +47,9 @@ impl ImagePipelineSpec {
             guidance_scale: binding(spec, RuntimeInputRole::GuidanceScale),
             width: binding(spec, RuntimeInputRole::Width),
             height: binding(spec, RuntimeInputRole::Height),
-            media: binding(spec, RuntimeInputRole::Media)
-                .filter(|binding| binding.contract.dtype == "uint8" && binding.contract.rank == 1),
+            media: binding(spec, RuntimeInputRole::Media).filter(|binding| {
+                binding.contract.dtype == "uint8" && binding.contract.rank() == 1
+            }),
             denoising_strength: binding(spec, RuntimeInputRole::DenoisingStrength),
             application_inputs: spec
                 .workflow
@@ -293,7 +294,7 @@ pub(crate) fn token_input(
         .iter()
         .map(|token| i64::from(*token))
         .collect::<Vec<_>>();
-    let shape = match binding.contract.rank {
+    let shape = match binding.contract.rank() {
         1 => vec![values.len() as i64],
         2 => vec![1, values.len() as i64],
         rank => anyhow::bail!("prompt token binding must have rank 1 or 2, got rank {rank}"),
@@ -338,7 +339,7 @@ fn push_optional_default_f32(
 }
 
 fn scalar_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
-    match contract.rank {
+    match contract.rank() {
         0 => Ok(Vec::new()),
         1 => Ok(vec![1]),
         rank => anyhow::bail!("image API scalar binding requires rank 0 or 1, got rank {rank}"),

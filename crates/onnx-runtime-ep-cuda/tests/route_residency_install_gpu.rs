@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
-    ExecutionProvider, ExecutorArtifactFinalization, ExecutorInstanceId, ExternalMmapRegion,
-    FinalizedExpertBank, FinalizedExpertWeight, LazyWeight, LazyWeightBoundary, ResidentWeight,
-    expert_weight_groups,
+    ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
+    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExternalMmapRegion, FinalizedExpertBank,
+    FinalizedExpertWeight, LazyWeight, LazyWeightBoundary, ResidentWeight, expert_weight_groups,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
@@ -204,11 +204,25 @@ fn real_producer_installs_executor_scoped_banks_once() {
     let _second_kernel = compile_real_qmoe(&provider, second, &graph, node);
 
     assert_eq!(
-        provider.finalize_executor_artifacts(first, &graph, std::slice::from_ref(&bank)),
+        provider
+            .finalize_executor_artifacts(
+                first,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(1),
+                std::slice::from_ref(&bank),
+            )
+            .expect("finalize first executor"),
         ExecutorArtifactFinalization::Complete
     );
     assert_eq!(
-        provider.finalize_executor_artifacts(second, &graph, std::slice::from_ref(&bank)),
+        provider
+            .finalize_executor_artifacts(
+                second,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(1),
+                std::slice::from_ref(&bank),
+            )
+            .expect("finalize second executor"),
         ExecutorArtifactFinalization::Complete
     );
     for executor in [first, second] {
@@ -263,7 +277,14 @@ fn real_producer_installs_executor_scoped_banks_once() {
         .get_kernel_for_executor(first, graph.node(node), &[vec![2, 4]], 1)
         .expect("dynamic specialization");
     assert_eq!(
-        provider.finalize_executor_artifacts(first, &graph, std::slice::from_ref(&bank)),
+        provider
+            .finalize_executor_artifacts(
+                first,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(2),
+                std::slice::from_ref(&bank),
+            )
+            .expect("finalize later specialization"),
         ExecutorArtifactFinalization::Complete
     );
     assert_eq!(
@@ -300,8 +321,16 @@ fn readiness_absence_is_pending_and_concurrent_finalize_is_idempotent() {
     let declines = provider.route_residency_diagnostics().declines();
     assert_eq!(
         provider
-            .finalize_executor_artifacts(executor, &graph, std::slice::from_ref(bank.as_ref()),),
-        ExecutorArtifactFinalization::Pending
+            .finalize_executor_artifacts(
+                executor,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(1),
+                std::slice::from_ref(bank.as_ref()),
+            )
+            .expect("missing producer is pending"),
+        ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProducerUnavailable {
+            node
+        })
     );
     assert_eq!(provider.route_residency_diagnostics().declines(), declines);
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
@@ -314,11 +343,14 @@ fn readiness_absence_is_pending_and_concurrent_finalize_is_idempotent() {
             let bank = Arc::clone(&bank);
             scope.spawn(move || {
                 assert_eq!(
-                    provider.finalize_executor_artifacts(
-                        executor,
-                        &graph,
-                        std::slice::from_ref(bank.as_ref()),
-                    ),
+                    provider
+                        .finalize_executor_artifacts(
+                            executor,
+                            &graph,
+                            ExecutorArtifactReadinessEpoch::new(2),
+                            std::slice::from_ref(bank.as_ref()),
+                        )
+                        .expect("concurrent finalization"),
                     ExecutorArtifactFinalization::Complete
                 );
             });
@@ -348,7 +380,14 @@ fn default_off_retains_allocates_and_registers_nothing() {
     let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
     assert!(!provider.wants_finalized_route_residency_banks());
     assert_eq!(
-        provider.finalize_executor_artifacts(executor, &graph, &[bank]),
+        provider
+            .finalize_executor_artifacts(
+                executor,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(1),
+                &[bank],
+            )
+            .expect("default-off finalization"),
         ExecutorArtifactFinalization::Complete
     );
     assert_eq!(provider.route_residency_diagnostics().installs(), 0);
@@ -373,7 +412,14 @@ fn bqmoe_without_real_telemetry_and_catalog_contract_typed_declines() {
     let executor = ExecutorInstanceId::fresh();
 
     assert_eq!(
-        provider.finalize_executor_artifacts(executor, &graph, &[bank]),
+        provider
+            .finalize_executor_artifacts(
+                executor,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(1),
+                &[bank],
+            )
+            .expect("BQMoE finalization"),
         ExecutorArtifactFinalization::Complete
     );
     let outcome = provider.route_residency_executor_status(executor).outcome;
@@ -407,7 +453,14 @@ fn overlapping_external_bank_properties_decline_before_reservation() {
     let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
 
     assert_eq!(
-        provider.finalize_executor_artifacts(executor, &graph, &[bank]),
+        provider
+            .finalize_executor_artifacts(
+                executor,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(1),
+                &[bank],
+            )
+            .expect("overlap finalization"),
         ExecutorArtifactFinalization::Complete
     );
     assert!(matches!(

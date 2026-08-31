@@ -49,6 +49,10 @@ fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
                     onnx_runtime_ep_cpu::kernels::input_dtype_constraints_for_op(
                         &d.op_type, &d.domain,
                     ),
+                output_dtype_constraints:
+                    onnx_runtime_ep_cpu::kernels::output_dtype_constraints_for_op(
+                        &d.op_type, &d.domain,
+                    ),
             }
         })
         .collect()
@@ -245,6 +249,18 @@ pub extern "C" fn nxrt_ep_reset_constant_weight_inputs() {
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_ep_reset_compiled_node_count() {
     onnx_runtime_ep_plugin::ep::reset_compiled_node_count()
+}
+
+/// Number of times ORT entered this EP's C-ABI `GetCapability` callback.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_get_capability_call_count() -> usize {
+    onnx_runtime_ep_plugin::ep::get_capability_call_count()
+}
+
+/// Resets the C-ABI `GetCapability` callback counter.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_get_capability_call_count() {
+    onnx_runtime_ep_plugin::ep::reset_get_capability_call_count()
 }
 
 /// Number of node kernels this EP has **executed** since the last reset.

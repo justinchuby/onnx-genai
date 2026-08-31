@@ -1042,7 +1042,7 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
-            provider_artifacts_finalized: false,
+            provider_artifact_readiness: ProviderArtifactReadiness::default(),
             persistent_workspace: None,
             step_workspace: None,
             pin_step_workspace: false,
@@ -1058,11 +1058,7 @@ impl Executor {
             let mut span = trace_span("session.static_materialize", "session");
             let empty = HashMap::new();
             let resolved = exec.resolve_all(&empty)?;
-            let finalized = exec.finalize_provider_artifacts_if_ready(&resolved)?;
-            debug_assert!(
-                finalized,
-                "fully static executor must finalize provider artifacts during build"
-            );
+            exec.ensure_provider_artifacts_ready(&resolved)?;
             exec.size_buffers(&resolved)?;
             if let Some(span) = span.as_mut() {
                 span.set_args(
@@ -2235,55 +2231,42 @@ impl Executor {
             .collect()
     }
 
-    /// Compile every leaf kernel whose inputs are fully resolved, then invoke
-    /// the single provider-artifact finalization transition.
+    /// Advance the executor's pre-execution provider-artifact state machine.
     ///
-    /// Static build and symbolic first-run compilation both use this path. A
-    /// genuinely data-dependent graph may not have every input shape before its
-    /// first eager execution; in that case this returns `false` without
-    /// invoking the provider and the post-execution resolved epoch retries the
-    /// same transition. Once the provider reports `Complete`, later shape
-    /// specializations compile normally but do not reinstall executor-scoped
-    /// artifacts.
-    pub(super) fn finalize_provider_artifacts_if_ready(
+    /// Every currently-resolved leaf kernel is compiled first, publishing any
+    /// executor-scoped producer handles. The provider then receives the
+    /// resulting readiness epoch and must report either an honest terminal
+    /// outcome or a typed pending state. Pending and failed epochs are cached:
+    /// another run with no newly compiled specialization returns the same typed
+    /// error without calling the provider again. No caller may execute or enter
+    /// capture until this method succeeds.
+    pub(super) fn ensure_provider_artifacts_ready(
         &mut self,
         resolved: &HashMap<ValueId, Vec<usize>>,
-    ) -> Result<bool> {
-        if self.provider_artifacts_finalized {
-            return Ok(true);
-        }
-        let all_leaf_inputs_resolved = self.plan.iter().all(|plan| {
-            let node = self.graph.node(plan.node_id);
-            is_control_flow_op(&node.op_type, &node.domain)
-                || is_sequence_op(&node.op_type, &node.domain)
-                || plan
-                    .inputs
-                    .iter()
-                    .all(|input| input.is_none_or(|value| resolved.contains_key(&value)))
-        });
-        if !all_leaf_inputs_resolved {
-            return Ok(false);
-        }
-
-        self.compile_all(resolved)?;
-        if self.ep.finalize_executor_artifacts(
+    ) -> Result<()> {
+        self.compile_ready_kernels(resolved)?;
+        self.provider_artifact_readiness.finalize_if_needed(
+            self.ep.as_ref(),
             self.instance_id,
             &self.graph,
             &self.finalized_expert_banks,
-        ) == ExecutorArtifactFinalization::Complete
-        {
-            self.provider_artifacts_finalized = true;
-        }
-        Ok(self.provider_artifacts_finalized)
+        )
     }
 
-    /// Populate the kernel cache for the compiled plan against `resolved` shapes.
-    pub(super) fn compile_all(&mut self, resolved: &HashMap<ValueId, Vec<usize>>) -> Result<()> {
+    /// Compile every leaf kernel whose inputs are currently resolved.
+    ///
+    /// Unresolved leaves are deliberately skipped rather than guessed. A
+    /// provider that needs one of them observes its missing producer and
+    /// returns typed `Pending`, which blocks the plan until a later input
+    /// specialization creates a concrete kernel and advances the readiness
+    /// epoch.
+    fn compile_ready_kernels(&mut self, resolved: &HashMap<ValueId, Vec<usize>>) -> Result<()> {
         let mut span = trace_span("session.kernel_compile_plan", "session");
         let cache_entries_before = self.cache.stats().entries;
         let mut compiled_nodes = 0_u64;
         let mut skipped_control_flow = 0_u64;
         let mut skipped_sequence = 0_u64;
+        let mut skipped_unresolved = 0_u64;
         for i in 0..self.plan.len() {
             let node_id = self.plan[i].node_id;
             let node = self.graph.node(node_id);
@@ -2303,6 +2286,30 @@ impl Executor {
                 if span.is_some() {
                     skipped_sequence += 1;
                 }
+                continue;
+            }
+            if !self.plan[i]
+                .inputs
+                .iter()
+                .all(|input| input.is_none_or(|value| resolved.contains_key(&value)))
+            {
+                if span.is_some() {
+                    skipped_unresolved += 1;
+                }
+                continue;
+            }
+            if self.kernel_bindings[i].as_ref().is_some_and(|binding| {
+                self.cache.contains(binding)
+                    && binding.shapes.len() == self.plan[i].inputs.len()
+                    && binding.shapes.iter().zip(&self.plan[i].inputs).all(
+                        |(bound_shape, input)| match input {
+                            Some(value) => resolved
+                                .get(value)
+                                .is_some_and(|shape| shape == bound_shape),
+                            None => bound_shape.is_empty(),
+                        },
+                    )
+            }) {
                 continue;
             }
             if span.is_some() {
@@ -2328,6 +2335,7 @@ impl Executor {
                 opset,
                 seq_independent,
                 self.instance_id,
+                &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
             )?;
             // Pre-populate the kernel binding so the first decode step already
@@ -2341,6 +2349,7 @@ impl Executor {
                     .with("compiled_nodes", compiled_nodes)
                     .with("skipped_control_flow", skipped_control_flow)
                     .with("skipped_sequence", skipped_sequence)
+                    .with("skipped_unresolved", skipped_unresolved)
                     .with("cache_entries_before", cache_entries_before as u64)
                     .with("cache_entries_after", self.cache.stats().entries as u64),
             );
@@ -2730,7 +2739,6 @@ impl Executor {
         }
         let empty = HashMap::new();
         let resolved = self.resolve_all(&empty)?;
-        self.finalize_provider_artifacts_if_ready(&resolved)
-            .map(|_| ())
+        self.ensure_provider_artifacts_ready(&resolved)
     }
 }

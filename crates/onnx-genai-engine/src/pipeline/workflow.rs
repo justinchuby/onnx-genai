@@ -2,7 +2,11 @@
 
 use std::collections::BTreeMap;
 
+use super::output::OutputPublicationJournal;
 use super::runtime_state::{GraphCaptureId, PassId};
+use super::turn_transaction::{
+    TurnAbortReason, TurnPublicationMode, TurnStateBaseline, TurnTransaction,
+};
 use super::*;
 use crate::decode::clone_value;
 use onnx_genai_metadata::{StateAliasing, StatePortAccess};
@@ -263,12 +267,14 @@ pub(crate) struct WorkflowPerformanceCounters {
 pub struct WorkflowExecutionPlan<'a> {
     engine: &'a WorkflowRuntime,
     values: PipelineTensors,
-    input_names: Vec<String>,
     input_aliases: HashMap<String, String>,
     initial_symbols: HashMap<String, i64>,
     dynamic_symbols: std::collections::HashSet<String>,
     request_count: usize,
     session_id: Option<String>,
+    /// Version of the committed baseline used while binding the continuation.
+    /// Execution rejects a stale prepared plan after acquiring its lease.
+    session_turn_version: Option<u64>,
     component_overrides: HashMap<String, String>,
     max_iterations_only: bool,
     /// Tokens this pass's prompt input carries, when a declared continuation
@@ -300,6 +306,9 @@ pub(crate) struct WorkflowRunTelemetry {
     stage_runs: BTreeMap<String, u64>,
     stage_elapsed_ns: BTreeMap<String, u128>,
     row_outputs: BTreeMap<String, Vec<String>>,
+    /// Publications in the transaction working set, keyed by declared output
+    /// identity rather than incidental event/value names.
+    output_publications: BTreeMap<String, u64>,
 }
 
 impl WorkflowRunTelemetry {
@@ -321,6 +330,13 @@ impl WorkflowRunTelemetry {
         let name = name.into();
         *self.stage_runs.entry(name.clone()).or_default() += 1;
         *self.stage_elapsed_ns.entry(name).or_default() += elapsed_ns;
+    }
+
+    fn record_output_publication(&mut self, output: &str) {
+        *self
+            .output_publications
+            .entry(output.to_string())
+            .or_default() += 1;
     }
 }
 
@@ -563,20 +579,27 @@ fn session_state_value_name(cell: &str) -> String {
 /// Validation admits at most one, so this returns the first rather than
 /// choosing between two: a package with two conversations was refused before it
 /// ever loaded.
-pub(crate) fn workflow_prompt_continuation(
-    workflow: &WorkflowSpec,
-) -> Option<(&str, &str, &str, &onnx_genai_metadata::WorkflowStateCell)> {
-    workflow.state.iter().find_map(|(cell, state)| {
-        let onnx_genai_metadata::SessionContinuation::PromptPrefix {
+pub(crate) fn workflow_prompt_continuation<'a>(
+    state_plan: &'a onnx_genai_metadata::ResolvedStatePlan,
+    workflow: &'a WorkflowSpec,
+) -> Option<(
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a onnx_genai_metadata::WorkflowStateCell,
+)> {
+    state_plan.session_cells().find_map(|(cell, state)| {
+        let onnx_genai_metadata::StateFinalWriter::Continuation {
             prompt_input,
-            tokens_output,
-        } = state.session.as_ref()?.continuation.as_ref()?;
-        Some((
-            cell.as_str(),
-            prompt_input.as_str(),
-            tokens_output.as_str(),
-            state,
-        ))
+            output,
+        } = state.final_writer.as_ref()?
+        else {
+            return None;
+        };
+        workflow
+            .state
+            .get(cell)
+            .map(|declaration| (cell, prompt_input.as_str(), output.as_str(), declaration))
     })
 }
 
@@ -645,7 +668,7 @@ impl<'a> SessionLeaseGuard<'a> {
     ) -> anyhow::Result<Self> {
         if !leases.borrow_mut().insert(session.to_string()) {
             return Err(
-                crate::engine::PackageCapabilityError::ExclusiveLeaseConflict {
+                crate::engine::PackageExecutionError::ExclusiveLeaseConflict {
                     session: session.to_string(),
                 }
                 .into(),
@@ -662,124 +685,6 @@ impl Drop for SessionLeaseGuard<'_> {
     fn drop(&mut self) {
         self.leases.borrow_mut().remove(&self.session);
     }
-}
-
-/// The SSA value a step binds to one component port.
-///
-/// The lease is written to that value, and not to a name only one of the ways a
-/// component can be invoked would consult: a component may run generically, be
-/// fused into an execution island, be implemented by a host contract, or be
-/// redirected by a component override, and all four resolve their inputs from
-/// the SSA value the step named. Validation refuses a document where a step
-/// could then overwrite it, so writing it before the pass is sound.
-fn session_group_port_binding<'a>(
-    steps: &'a [onnx_genai_metadata::WorkflowStep],
-    component: &str,
-    port: &str,
-) -> Option<&'a str> {
-    fn walk<'a>(
-        step: &'a onnx_genai_metadata::WorkflowStep,
-        component: &str,
-        port: &str,
-    ) -> Option<&'a str> {
-        use onnx_genai_metadata::WorkflowStep as Step;
-        match step {
-            Step::Sequence { steps } => steps.iter().find_map(|step| walk(step, component, port)),
-            Step::Invoke {
-                component: invoked,
-                inputs,
-                ..
-            } => (invoked == component)
-                .then(|| inputs.get(port).map(String::as_str))
-                .flatten(),
-            Step::Loop { setup, steps, .. } => setup
-                .iter()
-                .chain(steps)
-                .find_map(|step| walk(step, component, port)),
-            Step::Branch { cases, default, .. } => cases
-                .values()
-                .find_map(|step| walk(step, component, port))
-                .or_else(|| {
-                    default
-                        .as_ref()
-                        .and_then(|step| walk(step, component, port))
-                }),
-            Step::Emit { .. } => None,
-        }
-    }
-    steps.iter().find_map(|step| walk(step, component, port))
-}
-
-/// The SSA value a pass left in a group-backed session cell.
-///
-/// The group's alias names the `output` port that advances the state; the step
-/// that invoked the component names the value that port was bound to. Reading
-/// the port through the step is what keeps this independent of how any
-/// particular package spells its values.
-///
-/// The last binding wins: a component invoked several times in one pass has
-/// advanced the state each time, and the lease keeps where it ended.
-fn session_group_output_value(
-    workflow: &WorkflowSpec,
-    cell: &str,
-    values: &PipelineTensors,
-) -> Option<String> {
-    fn walk(
-        step: &onnx_genai_metadata::WorkflowStep,
-        component: &str,
-        port: &str,
-        values: &PipelineTensors,
-        found: &mut Option<String>,
-    ) {
-        use onnx_genai_metadata::WorkflowStep as Step;
-        match step {
-            Step::Sequence { steps } => {
-                steps
-                    .iter()
-                    .for_each(|step| walk(step, component, port, values, found));
-            }
-            Step::Invoke {
-                component: invoked,
-                outputs,
-                ..
-            } => {
-                if invoked == component
-                    && let Some(value) = outputs.get(port)
-                    && values.contains_key(value)
-                {
-                    *found = Some(value.clone());
-                }
-            }
-            Step::Loop { setup, steps, .. } => {
-                setup
-                    .iter()
-                    .chain(steps)
-                    .for_each(|step| walk(step, component, port, values, found));
-            }
-            Step::Branch { cases, default, .. } => {
-                cases
-                    .values()
-                    .for_each(|step| walk(step, component, port, values, found));
-                if let Some(default) = default {
-                    walk(default, component, port, values, found);
-                }
-            }
-            Step::Emit { .. } => {}
-        }
-    }
-    for (component, alias) in onnx_genai_metadata::session_group_aliases(workflow, cell) {
-        let Some(port) = alias.output.as_deref() else {
-            continue;
-        };
-        let mut found = None;
-        for step in &workflow.steps {
-            walk(step, component, port, values, &mut found);
-        }
-        if found.is_some() {
-            return found;
-        }
-    }
-    None
 }
 
 /// Tokens a pass published to one declared output.
@@ -814,14 +719,15 @@ fn published_conversation_tokens(
     }
 }
 
-/// Whether this workflow declares state a session can actually carry.
+/// Whether this workflow declares semantic state a session can carry.
 ///
-/// Answered by [`onnx_genai_metadata::classify_session_state`], which is also
-/// what the validator reads, so a package the document blesses and a package
-/// this runtime will open a session for are the same set. Computing it twice is
-/// how they came to disagree about state service groups.
+/// Session admission asks the same resolved plan the executor consumes.  It
+/// must not recreate a specialized carrier classification, because that could
+/// admit a state set different from the set the turn snapshots and commits.
 pub fn workflow_carries_session_state(workflow: &WorkflowSpec) -> bool {
-    onnx_genai_metadata::classify_session_state(workflow).carries_any()
+    onnx_genai_metadata::resolve_state_plan(workflow)
+        .session_cells()
+        .any(|(_, state)| state.transaction.required)
 }
 
 impl WorkflowRuntime {
@@ -890,7 +796,8 @@ impl WorkflowRuntime {
         &self,
         mut values: PipelineTensors,
         row_outputs: BTreeMap<String, Vec<String>>,
-    ) -> anyhow::Result<PipelineOutputs> {
+        publications: Vec<WorkflowOutputPublication>,
+    ) -> PipelineOutputs {
         let mut outputs = PipelineTensors::new();
         for output in self.plan.workflow.outputs.keys() {
             let row_prefix = format!("{output}.row.");
@@ -908,19 +815,16 @@ impl WorkflowRuntime {
                 .cloned()
                 .collect::<Vec<_>>();
             for name in names {
-                self.materialize_workflow_value(&mut values, &name)?;
-                outputs.insert(
-                    name.clone(),
-                    values
-                        .remove(&name)
-                        .with_context(|| format!("workflow package output '{name}' disappeared"))?,
-                );
+                if let Some(value) = values.remove(&name) {
+                    outputs.insert(name, value);
+                }
             }
         }
-        Ok(PipelineOutputs {
+        PipelineOutputs {
             tensors: outputs,
             rows: row_outputs,
-        })
+            publications,
+        }
     }
     /// Why the last generation stopped.
     ///
@@ -934,6 +838,13 @@ impl WorkflowRuntime {
             .workflow_performance
             .borrow()
             .last_loop_ended_by_predicate
+    }
+
+    /// Mint the same transaction identity used by generic workflow turns.
+    /// Specialized decoder participants consume this rather than establishing a
+    /// parallel transaction namespace.
+    pub(crate) fn next_turn_transaction_id(&self) -> TurnTransactionId {
+        self.worker.next_turn_transaction_id()
     }
 
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
@@ -985,37 +896,16 @@ impl WorkflowRuntime {
     ) -> anyhow::Result<PipelineTensors> {
         let mut plan = WorkflowExecutionPlan::new(self, request)?;
         let (mut values, _) = plan.execute_retained()?;
-        // `execute_retained` parks the pass's inputs back on the plan for replay.
-        // A retained run has no replay — the caller wanted the whole value map —
-        // so fold them back in; a proposal chain binds the proposer's borrowed
-        // shared KV and masks straight from these request values.
+        // The plan retains canonical inputs for replay. A retained run returns
+        // the complete execution view, so fold the unchanged source bindings
+        // in beside values produced by the pass.
         for (name, value) in std::mem::take(&mut plan.values) {
             values.entry(name).or_insert(value);
         }
-        // Declared package outputs read the same here as they do from
-        // `run_pipeline`: host-resident. Internal SSA values are deliberately
-        // left where the backend produced them, so a native-CUDA proposal chain
-        // keeps its carry and borrowed KV device-resident instead of paying a
-        // host round-trip to be observed.
-        for output in self.plan.workflow.outputs.keys() {
-            let row_prefix = format!("{output}.row.");
-            let event_prefix = format!("{output}.");
-            let names = values
-                .keys()
-                .filter(|name| {
-                    *name == output
-                        || name.starts_with(&row_prefix)
-                        || (name.starts_with(&event_prefix)
-                            && name[event_prefix.len()..]
-                                .chars()
-                                .all(|character| character.is_ascii_digit()))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            for name in names {
-                self.materialize_workflow_value(&mut values, &name)?;
-            }
-        }
+        // Declared package outputs were materialized before the transaction
+        // committed. Internal SSA values remain where their backend produced
+        // them, so a native-CUDA proposal chain keeps its carries and borrowed
+        // shared-KV device-resident.
         Ok(values)
     }
 }
@@ -1033,7 +923,10 @@ impl WorkflowRuntime {
         request: GenerateRequest,
         session_id: Option<&str>,
     ) -> anyhow::Result<(GenerateRequest, Option<Vec<i64>>)> {
-        let Some((cell, _, _, _)) = workflow_prompt_continuation(&self.plan.workflow) else {
+        let Some((cell, _, _, _)) = workflow_prompt_continuation(
+            &self.plan.compiled_workflow.state_plan,
+            &self.plan.workflow,
+        ) else {
             return Ok((request, None));
         };
         let Some(session_id) = session_id else {
@@ -1089,7 +982,34 @@ impl<'a> WorkflowExecutionPlan<'a> {
         engine: &'a WorkflowRuntime,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<Self> {
+        engine.reject_candidate_tree_raw_execution("WorkflowExecutionPlan::new")?;
+        engine.reject_dflash_raw_execution("WorkflowExecutionPlan::new")?;
         Self::new_hosted(engine, request, &[])
+    }
+
+    pub(super) fn new_candidate_tree_driver(
+        engine: &'a WorkflowRuntime,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<Self> {
+        engine.require_execution_admitted()?;
+        Self::new_hosted(engine, request, &[])
+    }
+
+    pub(super) fn new_dflash_driver(
+        engine: &'a WorkflowRuntime,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<Self> {
+        engine.require_execution_admitted()?;
+        Self::new_hosted(engine, request, &[])
+    }
+
+    /// Consume a prepared request before execution and return exactly the
+    /// package inputs it resolved.  Runtime-owned execution constructs use
+    /// this to run their component sessions directly; exposing a pre-bound
+    /// map avoids a first generic pass whose effects would already be
+    /// committed before the construct's transaction is admitted.
+    pub(crate) fn into_bound_values(self) -> (PipelineTensors, Option<String>) {
+        (self.values, self.session_id)
     }
 
     /// Prepare a pass in which `hosted` contracts are executed by the caller.
@@ -1105,13 +1025,24 @@ impl<'a> WorkflowExecutionPlan<'a> {
         request: PipelineGenerateRequest,
         hosted: &[&str],
     ) -> anyhow::Result<Self> {
+        engine.require_execution_admitted()?;
         let PipelineGenerateRequest {
             request,
             inputs,
             session_id,
             component_overrides,
+            ..
         } = request;
         let workflow = &engine.plan.workflow;
+        let session_turn_version = session_id.as_ref().map(|session| {
+            engine
+                .worker
+                .session_turn_versions
+                .borrow()
+                .get(session)
+                .copied()
+                .unwrap_or_default()
+        });
         validate_component_overrides(workflow, &component_overrides)?;
         // A conversation the package declares as a prompt prefix rejoins here,
         // before anything is bound: every input derived from the prompt — the
@@ -1144,11 +1075,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 | onnx_genai_metadata::ShapeRecurrence::Bounded { axis, .. } => state
                     .contract
                     .shape
-                    .as_ref()
-                    .and_then(|shape| shape.get(*axis))
+                    .get(*axis)
                     .and_then(|dimension| match dimension {
                         TensorDimension::Symbol(symbol) => Some(symbol.clone()),
-                        TensorDimension::Fixed(_) => None,
+                        TensorDimension::Fixed(_) | TensorDimension::Any => None,
                     }),
                 onnx_genai_metadata::ShapeRecurrence::Invariant => None,
             })
@@ -1199,7 +1129,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             )?;
         }
         let request_count = super::batching::validate_workflow_batch_inputs(workflow, &values)?;
-        let input_names = values.keys().cloned().collect::<Vec<_>>();
+        validate_workflow_padding_values(workflow, &values)?;
         // The bound the continuation cell declares is the package's own context
         // limit, and this is the only place it can be checked: a continuation is
         // deliberately not loop-carried, so it never reaches the carry path's
@@ -1210,14 +1140,15 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // turn whose work and whose stream are thrown away. Admission is the
         // last moment at which refusing costs nothing.
         if let Some(conversation) = continued_prompt.as_deref()
-            && let Some((cell, _, _, state)) = workflow_prompt_continuation(workflow)
+            && let Some((cell, _, _, state)) =
+                workflow_prompt_continuation(&engine.plan.compiled_workflow.state_plan, workflow)
         {
             let bound = continuation_bound(cell, state, &values)?;
             let budget = request.options.max_new_tokens;
             let requested = conversation.len().saturating_add(budget);
             if requested > bound {
                 return Err(
-                    crate::engine::PackageCapabilityError::ConversationOverBound {
+                    crate::engine::PackageExecutionError::ConversationOverBound {
                         cell: cell.to_string(),
                         requested,
                         bound,
@@ -1245,12 +1176,12 @@ impl<'a> WorkflowExecutionPlan<'a> {
         Ok(Self {
             engine,
             values,
-            input_names,
             input_aliases,
             initial_symbols,
             dynamic_symbols,
             request_count,
             session_id,
+            session_turn_version,
             component_overrides,
             max_iterations_only: !request.options.stop_on_eos,
             continued_prompt,
@@ -1303,20 +1234,24 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 self.request_count
             );
         }
-        if !self.input_names.contains(package_name) {
-            self.input_names.push(package_name.clone());
-        }
         Ok(())
     }
 
     /// Execute the already-bound workflow and retain its input slots for replay.
     pub fn execute(&mut self) -> anyhow::Result<PipelineTensors> {
-        self.execute_outputs().map(PipelineOutputs::into_tensors)
+        let outputs = self.execute_outputs()?;
+        let (tensors, publications) = outputs.into_tensors_and_publications();
+        *self.engine.worker.last_output_publications.borrow_mut() = publications;
+        Ok(tensors)
     }
 
     pub fn execute_outputs(&mut self) -> anyhow::Result<PipelineOutputs> {
         let (values, row_outputs) = self.execute_retained()?;
-        self.engine.package_outputs(values, row_outputs)
+        let publications =
+            std::mem::take(&mut *self.engine.worker.last_output_publications.borrow_mut());
+        Ok(self
+            .engine
+            .package_outputs(values, row_outputs, publications))
     }
 
     /// Execute the workflow and keep every SSA value the pass produced.
@@ -1343,7 +1278,24 @@ impl<'a> WorkflowExecutionPlan<'a> {
         &mut self,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
+        self.execute_retained_with_host_before_commit(host, |_, _, _| Ok(()))
+    }
+
+    /// Execute a pass and run its fallible consumer validation while its
+    /// transaction is still open.  A public surface that needs to inspect or
+    /// transform an output uses this rather than discovering a bad output after
+    /// the state/effect/output write set has committed.
+    pub(crate) fn execute_retained_with_host_before_commit(
+        &mut self,
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
+        before_commit: impl FnOnce(
+            &PipelineTensors,
+            &BTreeMap<String, Vec<String>>,
+            bool,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
         let engine = self.engine;
+        engine.worker.last_output_publications.borrow_mut().clear();
         // One named owner for everything this pass alone holds (§3.3): its id
         // and the telemetry it accumulates. Both end with the pass.
         let mut pass = engine.begin_pass(self.max_iterations_only);
@@ -1351,7 +1303,50 @@ impl<'a> WorkflowExecutionPlan<'a> {
             island.begin_execution(pass.id);
         }
         let workflow = &engine.plan.workflow;
-        let mut values = std::mem::take(&mut self.values);
+        if matches!(
+            workflow.publication_mode,
+            onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions
+        ) && let Some(host) = host.as_deref()
+            && !host.supports_provisional_output_publications()
+        {
+            anyhow::bail!(
+                "pipeline.workflow.publication_mode is provisional_revisions, but this execution \
+                 host has no typed revision/commit/abort transport; select commit_only or use \
+                 a host that preserves transaction lineage before mutation"
+            );
+        }
+        // A prepared plan names its canonical request rows. Selection is an
+        // execution-local view over that domain: retaining selected bindings
+        // would make a replay apply the same positional plan to an already
+        // selected batch.
+        let mut values = clone_pipeline_tensors(&self.values)?;
+        let row_selection_name = workflow_row_selection_name(workflow);
+        let row_plan = workflow_row_selection(workflow, &values)?
+            .map(|selection| super::RowPlan::select(self.request_count, selection))
+            .transpose()?;
+        let execution_request_count = row_plan
+            .as_ref()
+            .map_or(self.request_count, |plan| plan.selected_rows().len());
+        if let Some(plan) = &row_plan {
+            let mut replacements = Vec::new();
+            for (name, input) in &workflow.inputs {
+                if Some(name.as_str()) == row_selection_name || !values.contains_key(name) {
+                    continue;
+                }
+                let selected = super::row_state::gather_value_rows(
+                    values
+                        .get(name)
+                        .expect("the value was checked immediately above"),
+                    &input.contract.batch_layout,
+                    plan,
+                )
+                .with_context(|| format!("apply row plan to workflow input '{name}'"))?;
+                replacements.push((name.clone(), selected));
+            }
+            for (name, selected) in replacements {
+                values.insert(name, selected);
+            }
+        }
         let prepare_adapters = (|| -> anyhow::Result<()> {
             if let Some(service) = &engine.plan.adapter_service {
                 if !service.portable_fallback {
@@ -1393,23 +1388,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     &active_rows,
                 )?;
                 *engine.worker.active_adapter_context.borrow_mut() = Some(context);
-                // A runtime-minted row selection expands or compacts the batch
-                // (beam search, speculative row cloning). It carries source
-                // positions within the current batch, never scheduler IDs, so
-                // every row-scoped component follows through the same ABI.
-                if let Some(selection) = workflow_row_selection(workflow, &values)?
-                    && let Some(context) =
-                        engine.worker.active_adapter_context.borrow_mut().as_mut()
-                {
-                    context.compact(&selection)?;
-                }
             }
             Ok(())
         })();
-        if let Err(error) = prepare_adapters {
-            self.retain_inputs(&mut values);
-            return Err(error);
-        }
+        prepare_adapters?;
         let _adapter_context_guard =
             ActiveAdapterContextGuard(&engine.worker.active_adapter_context);
         // A package may declare session state and still be asked for a single
@@ -1418,73 +1400,167 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // no lease to read, so each cell starts from the initializer it
         // declares; refusing here would make declaring a conversation cost a
         // package the ability to answer one question.
+        let state_plan = &engine.plan.compiled_workflow.state_plan;
         let session_state = onnx_genai_metadata::classify_session_state(workflow);
+        let has_semantic_session_state = state_plan
+            .session_cells()
+            .any(|(_, state)| state.transaction.required);
         // Taken before the lease is read and released when the pass ends,
         // whichever way it ends. Declared session contracts validate as
         // exclusive, and cells without one use the schema's exclusive default,
-        // so every carried session cell requires this guard.
-        let _session_lease = match (self.session_id.as_deref(), session_state.carries_any()) {
+        // so every semantic session cell requires this guard.
+        let _session_lease = match (self.session_id.as_deref(), has_semantic_session_state) {
             (Some(session_id), true) => {
                 match SessionLeaseGuard::acquire(&engine.worker.session_leases, session_id) {
                     Ok(guard) => Some(guard),
                     Err(error) => {
-                        self.retain_inputs(&mut values);
                         return Err(error);
                     }
                 }
             }
             _ => None,
         };
+        if has_semantic_session_state
+            && let (Some(session), Some(expected)) =
+                (self.session_id.clone(), self.session_turn_version)
+        {
+            let actual = engine
+                .worker
+                .session_turn_versions
+                .borrow()
+                .get(&session)
+                .copied()
+                .unwrap_or_default();
+            if actual != expected {
+                anyhow::bail!(
+                    "prepared workflow turn for session '{session}' is stale: it bound \
+                     committed baseline version {expected}, but version {actual} is current. \
+                     Rebuild the execution plan after the earlier turn completes."
+                );
+            }
+        }
+        // Admission snapshots the complete canonical plan before any state,
+        // effect, or output publication can advance. The lease is deliberately
+        // separate: a rejected lease has no transaction to abort.
+        let publication_mode = TurnPublicationMode::from(workflow.publication_mode);
+        let transaction = {
+            let committed_state = engine.worker.session_state.borrow();
+            let session_effects = engine.worker.session_effects.borrow();
+            let session_outputs = engine.worker.session_outputs.borrow();
+            TurnTransaction::admit(
+                engine.worker.next_turn_transaction_id(),
+                self.session_id.as_deref(),
+                state_plan,
+                engine
+                    .plan
+                    .compiled_workflow
+                    .initial_effects
+                    .keys()
+                    .cloned(),
+                workflow.outputs.keys().cloned(),
+                &committed_state,
+                &session_effects,
+                &session_outputs,
+                publication_mode,
+            )
+        };
+        let mut transaction = transaction?;
+        let output_baselines = transaction.output_baselines()?;
+        let mut publication_journal = Some(OutputPublicationJournal::new_with_publication_mode(
+            transaction.id(),
+            workflow,
+            output_baselines,
+            transaction.publication_mode(),
+        )?);
+        let begin_error = host
+            .as_deref_mut()
+            .and_then(|host| host.begin_turn(&transaction).err());
+        if let Some(error) = begin_error {
+            let outcome = abort_workflow_turn(
+                &mut publication_journal,
+                &mut transaction,
+                TurnAbortReason::ExecutionFailure,
+            )
+            .context("failed to resolve the workflow turn after begin_turn failed")?;
+            publish_terminal_transaction_outcome(host, &outcome);
+            if let Some(host) = host.as_deref_mut() {
+                host.turn_aborted(outcome);
+            }
+            return Err(error);
+        }
         if let Some(session_id) = self.session_id.as_ref() {
             for (cell, carrier) in session_state.carried() {
-                let Some(value) = engine
-                    .worker
-                    .session_state
-                    .borrow()
-                    .get(&(session_id.to_string(), cell.to_string()))
-                    .map(clone_value)
-                    .transpose()?
-                else {
-                    continue;
+                let resolved = state_plan.cell(cell).with_context(|| {
+                    format!("resolved state plan has no session state '{cell}'")
+                })?;
+                let value = if resolved.transaction.required {
+                    let Some(TurnStateBaseline::Present(value)) = transaction.baseline_state(cell)
+                    else {
+                        continue;
+                    };
+                    clone_value(value)?
+                } else {
+                    let Some(value) = engine
+                        .worker
+                        .session_state
+                        .borrow()
+                        .get(&(session_id.to_string(), cell.to_string()))
+                        .map(clone_value)
+                        .transpose()?
+                    else {
+                        continue;
+                    };
+                    value
+                };
+                let value = if let Some(plan) = &row_plan {
+                    let state = workflow
+                        .state
+                        .get(cell)
+                        .expect("a classified state cell is declared");
+                    super::row_state::gather_value_rows(&value, &state.contract.batch_layout, plan)
+                        .with_context(|| format!("apply row plan to session state '{cell}'"))?
+                } else {
+                    value
                 };
                 match carrier {
-                    // A loop reads its lease where it seeds the carry.
                     onnx_genai_metadata::SessionStateCarrier::LoopCarry => {
                         values.insert(session_state_value_name(cell), value);
                     }
-                    // A group holds the storage, and the graph reaches it
-                    // through the `input` port its alias declares. The lease is
-                    // bound at that port rather than written over the SSA value
-                    // the cell's initializer names: that value may be produced
-                    // by a step — which would overwrite the lease and restart
-                    // the session with no error — and may be read by consumers
-                    // the group has nothing to do with.
                     onnx_genai_metadata::SessionStateCarrier::StateServiceGroup => {
-                        for (component, alias) in
-                            onnx_genai_metadata::session_group_aliases(workflow, cell)
-                        {
-                            let bound = session_group_port_binding(
-                                &workflow.steps,
-                                component,
-                                &alias.input,
-                            )
-                            .with_context(|| {
-                                format!(
-                                    "session state '{cell}' is held by a state service group \
-                                     whose alias reads component '{component}' port '{}', but no \
-                                     step binds it",
-                                    alias.input
-                                )
-                            })?;
-                            values.insert(bound.to_string(), clone_value(&value)?);
+                        for reader in &resolved.readers {
+                            let onnx_genai_metadata::StateReader::ComponentPort { binding, .. } =
+                                reader
+                            else {
+                                continue;
+                            };
+                            values.insert(binding.clone(), clone_value(&value)?);
                         }
                     }
-                    // Bound into the prompt before this plan was built.
                     onnx_genai_metadata::SessionStateCarrier::PromptContinuation => {}
                 }
             }
         }
-        let mut symbols = self.initial_symbols.clone();
+        // Request-aligned values now have the selected extent, not the
+        // canonical extent recorded during preparation. Rebind symbols from
+        // this transient execution view so a shrinking selection cannot keep
+        // the source batch size pinned in component/output validation.
+        let mut symbols = if row_plan.is_some() {
+            let mut symbols = HashMap::new();
+            for (name, input) in &workflow.inputs {
+                if let Some(value) = values.get(name) {
+                    validate_workflow_value(
+                        name,
+                        value,
+                        &input.contract,
+                        &mut symbols,
+                        &self.dynamic_symbols,
+                    )?;
+                }
+            }
+            symbols
+        } else {
+            self.initial_symbols.clone()
+        };
         let mut emit_counts = HashMap::new();
         let mut final_state_refs = HashMap::new();
         let result = engine.run_workflow_node(
@@ -1493,148 +1569,242 @@ impl<'a> WorkflowExecutionPlan<'a> {
             &mut values,
             &mut symbols,
             &self.dynamic_symbols,
-            self.request_count,
+            execution_request_count,
             &mut emit_counts,
             &mut final_state_refs,
             &self.component_overrides,
+            &mut publication_journal,
             &mut pass.telemetry,
             host,
         );
         if let Err(error) = result {
-            self.retain_inputs(&mut values);
+            let outcome = abort_workflow_turn(
+                &mut publication_journal,
+                &mut transaction,
+                TurnAbortReason::ExecutionFailure,
+            )
+            .context("failed to resolve the workflow turn after execution failed")?;
+            if let Some(host) = host.as_deref_mut() {
+                publish_terminal_transaction_outcome_to_host(host, &outcome);
+                host.turn_aborted(outcome);
+            }
             return Err(error);
         }
-        for output in workflow_emitted_outputs(&engine.plan.compiled_workflow.graph) {
-            let Some(value) = values.get(&output) else {
-                continue;
-            };
-            let contract = &workflow
-                .outputs
-                .get(&output)
-                .with_context(|| format!("workflow emitted undeclared output '{output}'"))?
-                .contract;
-            validate_workflow_value(
-                &output,
-                value,
-                contract,
-                &mut symbols,
-                &self.dynamic_symbols,
-            )?;
-        }
-        if let Some(session_id) = &self.session_id {
-            let continuation = workflow_prompt_continuation(workflow)
-                .map(|(cell, _, tokens_output, _)| (cell.to_string(), tokens_output.to_string()));
-            let mut updates = Vec::new();
-            for (cell, carrier) in session_state.carried() {
-                let state = workflow
-                    .state
-                    .get(cell)
-                    .expect("a classified cell is declared");
-                // The conversation this pass leaves behind is the prompt it ran
-                // — which already carried every earlier turn — followed by what
-                // it published. Reading it off the emitted stream alone would
-                // drop everything before this turn; reading it off the cell's
-                // final SSA value would drop the turn, because no step in the
-                // workflow writes the conversation.
-                if let Some((continued_cell, tokens_output)) = &continuation
-                    && continued_cell == cell
-                {
-                    let prompt = self.continued_prompt.as_deref().unwrap_or_default();
-                    let mut conversation = prompt.to_vec();
-                    conversation.extend(published_conversation_tokens(
-                        &values,
-                        &pass.telemetry.row_outputs,
-                        tokens_output,
-                    )?);
-                    let length = conversation.len() as i64;
-                    // Admission already refused a turn whose conversation plus
-                    // budget exceeds the bound, so reaching this means the pass
-                    // published more tokens than it was admitted for. Storing it
-                    // would leave the session in a state its own declaration
-                    // forbids and every later turn would fail the same way with
-                    // no way back, so this refuses — and names the package,
-                    // because a caller cannot cause it.
-                    let bound = continuation_bound(cell, state, &values)?;
-                    if conversation.len() > bound {
-                        return Err(
-                            crate::engine::PackageCapabilityError::ConversationOverBound {
-                                cell: cell.to_string(),
-                                requested: conversation.len(),
-                                bound,
-                            }
-                            .into(),
-                        );
-                    }
-                    let shape = match state.contract.rank {
-                        1 => vec![length],
-                        2 => vec![1, length],
-                        rank => anyhow::bail!(
-                            "session continuation state '{cell}' must have rank 1 or 2, got {rank}"
-                        ),
-                    };
-                    updates.push((
-                        (session_id.clone(), cell.to_string()),
-                        Value::from_slice_i64(&conversation, &shape)?,
-                    ));
+        let staged_commit = (|| -> anyhow::Result<TurnTransactionOutcome> {
+            for output in workflow_emitted_outputs(&engine.plan.compiled_workflow.graph) {
+                let Some(value) = values.get(&output) else {
                     continue;
+                };
+                let contract = &workflow
+                    .outputs
+                    .get(&output)
+                    .with_context(|| format!("workflow emitted undeclared output '{output}'"))?
+                    .contract;
+                validate_workflow_value(
+                    &output,
+                    value,
+                    contract,
+                    &mut symbols,
+                    &self.dynamic_symbols,
+                )?;
+            }
+            // Materialization is a fallible publication boundary.  Do it in
+            // the working set before state/effect/output heads are committed,
+            // so a device transfer failure follows the same abort path as an
+            // execution failure and cannot strand an advanced session.
+            for output in workflow.outputs.keys() {
+                let row_prefix = format!("{output}.row.");
+                let event_prefix = format!("{output}.");
+                let names = values
+                    .keys()
+                    .filter(|name| {
+                        *name == output
+                            || name.starts_with(&row_prefix)
+                            || (name.starts_with(&event_prefix)
+                                && name[event_prefix.len()..]
+                                    .chars()
+                                    .all(|character| character.is_ascii_digit()))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for name in names {
+                    engine.materialize_workflow_value(&mut values, &name)?;
                 }
-                // What the next lease holds is what this pass left in the
-                // cell. A loop carry records that in `final_state_refs`. A
-                // group-backed cell is advanced by the graph writing the
-                // alias's `output` port, so the value bound to that port is the
-                // one to keep — reading the initializer instead would store the
-                // value the pass *started* from and replay it forever.
-                let group_output =
-                    if carrier == onnx_genai_metadata::SessionStateCarrier::StateServiceGroup {
-                        // Fail closed. Falling back to the initializer here would
-                        // store the value the pass *started* from, so the next turn
-                        // would replay this one — a wrong answer that looks like a
-                        // working session. A group cell advanced inside a branch is
-                        // the shape that reaches this.
-                        Some(session_group_output_value(workflow, cell, &values).with_context(|| {
-                        format!(
-                            "session state '{cell}' is held by a state service group, but this \
-                             pass bound no value to the group's output port for it, so the lease \
-                             could only be stored as the value the turn started from"
-                        )
-                    })?)
-                    } else {
-                        None
-                    };
-                let value_ref = group_output.as_deref().unwrap_or_else(|| {
-                    final_state_refs
-                        .get(cell)
-                        .map(String::as_str)
-                        .unwrap_or(&state.initializer)
-                });
-                let value = values.get(value_ref).with_context(|| {
-                    format!(
-                        "session-scoped workflow state '{cell}' has no final value '{value_ref}'"
-                    )
+            }
+            before_commit(
+                &values,
+                &pass.telemetry.row_outputs,
+                pass.telemetry.loop_ended_by_predicate,
+            )?;
+            if let Some(host) = host.as_deref_mut() {
+                host.before_turn_commit(&transaction)?;
+            }
+            // Every semantic session cell in the canonical plan is staged when
+            // this pass names a session, including one whose current turn did
+            // not change its value. A stateless tensor pass owns no conversation
+            // to update.
+            for (cell, resolved) in self
+                .session_id
+                .iter()
+                .flat_map(|_| state_plan.session_cells())
+                .filter(|(_, state)| state.transaction.required)
+            {
+                let state = workflow.state.get(cell).with_context(|| {
+                    format!("resolved state plan references undeclared session state '{cell}'")
                 })?;
-                updates.push(((session_id.clone(), cell.to_string()), clone_value(value)?));
+                let value = match resolved.final_writer.as_ref().with_context(|| {
+                    format!("semantic session state '{cell}' has no resolved final writer")
+                })? {
+                    onnx_genai_metadata::StateFinalWriter::Continuation { output, .. } => {
+                        let prompt = self.continued_prompt.as_deref().unwrap_or_default();
+                        let mut conversation = prompt.to_vec();
+                        conversation.extend(published_conversation_tokens(
+                            &values,
+                            &pass.telemetry.row_outputs,
+                            output,
+                        )?);
+                        let bound = continuation_bound(cell, state, &values)?;
+                        if conversation.len() > bound {
+                            return Err(
+                                crate::engine::PackageExecutionError::ConversationOverBound {
+                                    cell: cell.to_string(),
+                                    requested: conversation.len(),
+                                    bound,
+                                }
+                                .into(),
+                            );
+                        }
+                        let length = i64::try_from(conversation.len())
+                            .context("conversation length does not fit an int64 state tensor")?;
+                        let shape = match state.contract.rank() {
+                            1 => vec![length],
+                            2 => vec![1, length],
+                            rank => anyhow::bail!(
+                                "session continuation state '{cell}' must have rank 1 or 2, got {rank}"
+                            ),
+                        };
+                        Value::from_slice_i64(&conversation, &shape)?
+                    }
+                    onnx_genai_metadata::StateFinalWriter::Writer(writer) => {
+                        let value_ref = if values.contains_key(&writer.binding) {
+                            writer.binding.as_str()
+                        } else {
+                            final_state_refs
+                                .get(cell)
+                                .map(String::as_str)
+                                .with_context(|| {
+                                    format!(
+                                        "session-scoped workflow state '{cell}' has no final \
+                                         value '{}'",
+                                        writer.binding
+                                    )
+                                })?
+                        };
+                        clone_value(values.get(value_ref).with_context(|| {
+                            format!(
+                                "session-scoped workflow state '{cell}' has no final value \
+                                 '{value_ref}'"
+                            )
+                        })?)?
+                    }
+                };
+                transaction.stage_state(resolved.identity.clone(), value)?;
+            }
+            let mut advisory_updates = Vec::new();
+            if let Some(session_id) = self.session_id.as_ref() {
+                for (cell, resolved) in state_plan
+                    .session_cells()
+                    .filter(|(_, state)| !state.transaction.required)
+                {
+                    let onnx_genai_metadata::StateFinalWriter::Writer(writer) =
+                        resolved.final_writer.as_ref().with_context(|| {
+                            format!("advisory session state '{cell}' has no resolved final writer")
+                        })?
+                    else {
+                        anyhow::bail!(
+                            "advisory session state '{cell}' cannot own prompt continuation"
+                        );
+                    };
+                    let value_ref = if values.contains_key(&writer.binding) {
+                        writer.binding.as_str()
+                    } else {
+                        final_state_refs
+                            .get(cell)
+                            .map(String::as_str)
+                            .with_context(|| {
+                                format!(
+                                    "advisory session state '{cell}' has no final value '{}'",
+                                    writer.binding
+                                )
+                            })?
+                    };
+                    advisory_updates.push((
+                        (session_id.clone(), cell.to_string()),
+                        clone_value(values.get(value_ref).with_context(|| {
+                            format!(
+                                "advisory session state '{cell}' has no final value '{value_ref}'"
+                            )
+                        })?)?,
+                    ));
+                }
+            }
+            transaction.stage_effects()?;
+            if publication_journal.is_some() {
+                let journal = publication_journal
+                    .as_mut()
+                    .expect("checked the publication journal exists");
+                journal.finalize_on_commit()?;
+                publish_pending_provisional_publications(&mut publication_journal, host)?;
+                let journal = publication_journal
+                    .as_ref()
+                    .expect("publication delivery keeps the journal");
+                transaction.stage_outputs(journal.committed_states()?)?;
             }
             let mut session_state = engine.worker.session_state.borrow_mut();
-            for (key, value) in updates {
-                session_state.insert(key, value);
+            let mut session_effects = engine.worker.session_effects.borrow_mut();
+            let mut session_outputs = engine.worker.session_outputs.borrow_mut();
+            let outcome = transaction.commit(
+                &mut session_state,
+                &mut session_effects,
+                &mut session_outputs,
+            )?;
+            session_state.extend(advisory_updates);
+            Ok(outcome)
+        })();
+        let commit_outcome = match staged_commit {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let outcome = abort_workflow_turn(
+                    &mut publication_journal,
+                    &mut transaction,
+                    TurnAbortReason::CommitFailure,
+                )
+                .context("failed to resolve the workflow turn after commit preparation failed")?;
+                if let Some(host) = host.as_deref_mut() {
+                    publish_terminal_transaction_outcome_to_host(host, &outcome);
+                    host.turn_aborted(outcome);
+                }
+                return Err(error);
             }
+        };
+        if has_semantic_session_state && let Some(session) = self.session_id.as_deref() {
+            let mut versions = engine.worker.session_turn_versions.borrow_mut();
+            let version = versions.entry(session.to_string()).or_default();
+            *version = version.saturating_add(1);
         }
         let row_outputs = std::mem::take(&mut pass.telemetry.row_outputs);
+        if let Some(journal) = publication_journal.as_mut() {
+            journal.record_commit(&commit_outcome)?;
+        }
+        publish_terminal_transaction_outcome(host, &commit_outcome);
+        *engine.worker.last_output_publications.borrow_mut() = publication_journal
+            .map(OutputPublicationJournal::take)
+            .unwrap_or_default();
+        if let Some(host) = host.as_deref_mut() {
+            host.turn_committed(commit_outcome.clone());
+        }
         engine.publish_workflow_telemetry(pass.telemetry);
-        let inputs = self.take_inputs(&mut values);
-        self.values = inputs;
         Ok((values, row_outputs))
-    }
-
-    fn retain_inputs(&mut self, values: &mut PipelineTensors) {
-        self.values = self.take_inputs(values);
-    }
-
-    fn take_inputs(&self, values: &mut PipelineTensors) -> PipelineTensors {
-        self.input_names
-            .iter()
-            .filter_map(|name| values.remove(name).map(|value| (name.clone(), value)))
-            .collect()
     }
 }
 
@@ -1690,6 +1860,18 @@ pub(crate) fn runtime_contract_registry() -> &'static std::collections::HashSet<
     &REGISTRY
 }
 
+/// The host's contribution to the generic loop's next-iteration decision.
+///
+/// A host may stop only after it staged the current body normally. The
+/// interpreter consumes this before it begins a later body, preserving the
+/// authored loop as the sole control-flow authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum WorkflowLoopHostOutcome {
+    #[default]
+    Continue,
+    Stop(super::GenerationStopReason),
+}
+
 /// A runtime-supplied executor for a workflow node the package does not ship a
 /// graph for.
 ///
@@ -1715,6 +1897,79 @@ pub(crate) trait WorkflowNodeHost {
     /// package inputs are the host's business.
     fn hosted_contracts(&self) -> &'static [&'static str];
 
+    /// Select one exact authored invocation independently of a component
+    /// contract. Typed workflow constructs use this only after construction
+    /// proved the invocation's identity, bindings, and control-flow location.
+    fn hosts_invocation(
+        &self,
+        _component: &str,
+        _inputs: &BTreeMap<String, String>,
+        _outputs: &BTreeMap<String, String>,
+    ) -> bool {
+        false
+    }
+
+    /// Observe the admitted generic workflow transaction before execution.
+    fn begin_turn(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Observe an authored control boundary while the generic transaction is
+    /// still provisional.
+    fn observe_boundary(&mut self, _boundary: GenerationBoundary) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Final fallible hook before the generic state/effect/output write set is
+    /// staged and committed.
+    fn before_turn_commit(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether this host can preserve revision envelopes and typed terminal
+    /// transaction outcomes while a turn remains uncommitted.
+    fn supports_provisional_output_publications(&self) -> bool {
+        false
+    }
+
+    /// Publish already validated provisional records in authored order.
+    fn publish_provisional_output_publications(
+        &mut self,
+        _publications: &[WorkflowOutputPublication],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "this workflow host has no typed provisional revision transport; use \
+             publication_mode: commit_only or install a transaction-aware output transport"
+        )
+    }
+
+    /// Notify a transport of a durable transaction outcome. Errors here are
+    /// delivery-only: the semantic transaction cannot be rolled back.
+    fn publish_transaction_outcome(
+        &mut self,
+        _publication: &WorkflowOutputPublication,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn turn_committed(&mut self, _outcome: TurnTransactionOutcome) {}
+
+    fn turn_aborted(&mut self, _outcome: TurnTransactionOutcome) {}
+
+    /// Report a committed request-level terminal condition before the
+    /// interpreter evaluates another authored loop body.
+    fn loop_host_outcome(&self) -> WorkflowLoopHostOutcome {
+        WorkflowLoopHostOutcome::Continue
+    }
+
+    /// Observe newly staged generated token output without publishing it.
+    fn observe_staged_generation_tokens(
+        &mut self,
+        _tokens: &[crate::TokenId],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Execute one node bound to `contract`.
     ///
     /// Returns `Ok(false)` when this host does not implement the contract, so
@@ -1722,6 +1977,61 @@ pub(crate) trait WorkflowNodeHost {
     /// silently doing nothing — a declared step that no one runs is the failure
     /// mode this signature exists to prevent.
     fn execute_contract_node(&mut self, request: WorkflowNodeRequest<'_>) -> anyhow::Result<bool>;
+}
+
+/// Move a journal's newly created provisional envelopes across a host boundary
+/// without making the host a second output authority.
+fn publish_pending_provisional_publications(
+    journal: &mut Option<OutputPublicationJournal>,
+    host: &mut Option<&mut dyn WorkflowNodeHost>,
+) -> anyhow::Result<()> {
+    let Some(host) = host.as_deref_mut() else {
+        return Ok(());
+    };
+    let Some(journal) = journal.as_mut() else {
+        return Ok(());
+    };
+    let publications = journal.take_pending_provisionals()?;
+    if publications.is_empty() {
+        return Ok(());
+    }
+    host.publish_provisional_output_publications(&publications)
+}
+
+fn abort_workflow_turn(
+    journal: &mut Option<OutputPublicationJournal>,
+    transaction: &mut TurnTransaction,
+    reason: TurnAbortReason,
+) -> anyhow::Result<TurnTransactionOutcome> {
+    match journal.as_mut() {
+        Some(journal) => journal.abort_outcome(transaction, reason),
+        None => Ok(transaction.abort(reason)?),
+    }
+}
+
+/// A terminal delivery failure cannot change the transaction decision already
+/// made. Keep it diagnostic-only rather than accidentally reporting rollback.
+fn publish_terminal_transaction_outcome(
+    host: &mut Option<&mut dyn WorkflowNodeHost>,
+    outcome: &TurnTransactionOutcome,
+) {
+    let Some(host) = host.as_deref_mut() else {
+        return;
+    };
+    publish_terminal_transaction_outcome_to_host(host, outcome);
+}
+
+fn publish_terminal_transaction_outcome_to_host(
+    host: &mut dyn WorkflowNodeHost,
+    outcome: &TurnTransactionOutcome,
+) {
+    let publication = WorkflowOutputPublication::from_transaction_outcome(outcome);
+    if let Err(error) = host.publish_transaction_outcome(&publication) {
+        tracing::warn!(
+            error = %error,
+            "workflow transaction outcome delivery failed after its semantic decision"
+        );
+    }
 }
 
 /// Everything a host needs to advance one declared node.
@@ -1742,6 +2052,8 @@ pub(crate) struct WorkflowNodeRequest<'a> {
     pub(crate) outputs: &'a BTreeMap<String, String>,
     /// The invocation's value environment.
     pub(crate) values: &'a mut PipelineTensors,
+    /// The ordinary S4 journal owned by the enclosing generic turn.
+    pub(crate) publication_journal: &'a mut Option<OutputPublicationJournal>,
 }
 
 impl WorkflowRuntime {
@@ -1758,6 +2070,7 @@ impl WorkflowRuntime {
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
+        publication_journal: &mut Option<OutputPublicationJournal>,
         telemetry: &mut WorkflowRunTelemetry,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<()> {
@@ -1774,6 +2087,7 @@ impl WorkflowRuntime {
                         emit_counts,
                         final_state_refs,
                         component_overrides,
+                        publication_journal,
                         telemetry,
                         host,
                     )?;
@@ -1805,13 +2119,21 @@ impl WorkflowRuntime {
                         // The hosted executor is selected before generic ONNX
                         // resolution, but admission still validates every
                         // invocation-bound input before the executor can run.
-                        if let Some(contract) = declaration
+                        let contract = declaration
                             .contract
                             .as_ref()
-                            .map(|contract| contract.id.as_str())
-                            && let Some(host) = host.as_deref_mut()
-                            && host.hosted_contracts().contains(&contract)
-                        {
+                            .map(|contract| contract.id.as_str());
+                        let hosted_by_invocation = host
+                            .as_deref()
+                            .is_some_and(|host| host.hosts_invocation(component, inputs, outputs));
+                        let hosted_by_contract = contract.is_some_and(|contract| {
+                            host.as_deref()
+                                .is_some_and(|host| host.hosted_contracts().contains(&contract))
+                        });
+                        if hosted_by_invocation || hosted_by_contract {
+                            let host = host
+                                .as_deref_mut()
+                                .expect("a hosted invocation has a workflow host");
                             let prepared = prepare_hosted_component_batch_inputs(
                                 component,
                                 declaration,
@@ -1823,11 +2145,12 @@ impl WorkflowRuntime {
                             let request_count = prepared.request_count;
                             drop(prepared.resolved);
                             let handled = match host.execute_contract_node(WorkflowNodeRequest {
-                                contract,
+                                contract: contract.unwrap_or(""),
                                 component,
                                 inputs,
                                 outputs,
                                 values,
+                                publication_journal,
                             }) {
                                 Ok(handled) => handled,
                                 Err(error) => {
@@ -1837,6 +2160,7 @@ impl WorkflowRuntime {
                             };
                             if !handled {
                                 clear_bound_component_outputs(outputs, values);
+                                let contract = contract.unwrap_or("<typed invocation>");
                                 anyhow::bail!(
                                     "workflow component '{component}' declares contract \
                                      '{contract}', which the running host lists as implemented but \
@@ -1856,7 +2180,9 @@ impl WorkflowRuntime {
                                 &std::collections::HashSet::new(),
                                 request_count,
                             )?;
-                            self.record_contract_execution(contract);
+                            if let Some(contract) = contract {
+                                self.record_contract_execution(contract);
+                            }
                             telemetry.record_stage(
                                 component.clone(),
                                 stage_started.elapsed().as_nanos(),
@@ -1969,6 +2295,7 @@ impl WorkflowRuntime {
                                         inputs,
                                         outputs,
                                         values,
+                                        publication_journal,
                                     }) {
                                         Ok(handled) => handled,
                                         Err(error) => {
@@ -2133,9 +2460,13 @@ impl WorkflowRuntime {
                     emit_counts,
                     final_state_refs,
                     component_overrides,
+                    publication_journal,
                     telemetry,
                     host,
                 )?;
+                if let Some(host) = host.as_deref_mut() {
+                    host.observe_boundary(GenerationBoundary::AfterLoopSetup)?;
+                }
                 for index in 0..limit {
                     if !self.advance_workflow_loop(
                         &plan,
@@ -2148,6 +2479,7 @@ impl WorkflowRuntime {
                         emit_counts,
                         final_state_refs,
                         component_overrides,
+                        publication_journal,
                         telemetry,
                         host,
                     )? {
@@ -2194,6 +2526,7 @@ impl WorkflowRuntime {
                     emit_counts,
                     &mut branch_state_refs,
                     component_overrides,
+                    publication_journal,
                     telemetry,
                     host,
                 )?;
@@ -2257,17 +2590,55 @@ impl WorkflowRuntime {
                         }
                     }
                 }
+                if let Some(host) = host.as_deref_mut() {
+                    host.observe_boundary(GenerationBoundary::AfterBranch)?;
+                }
             }
             WorkflowNode::Emit {
                 value,
                 when,
                 valid_length,
                 output,
+                stream,
                 mode,
                 axis,
                 ..
             } => {
                 let emit_started = std::time::Instant::now();
+                if let Some(journal) = publication_journal.as_ref() {
+                    journal
+                        .validate_emit(output, stream.as_deref(), mode)
+                        .with_context(|| {
+                            format!(
+                                "workflow emit {mode:?} at output '{output}' cannot enter its \
+                             declared output protocol"
+                            )
+                        })?;
+                }
+                if matches!(mode, WorkflowEmitMode::Retract | WorkflowEmitMode::Finalize) {
+                    anyhow::ensure!(
+                        value.is_empty(),
+                        "workflow emit {mode:?} at output '{output}' stream '{}' names value \
+                         '{value}', but this operation is payloadless; remove the value before \
+                         execution",
+                        stream.as_deref().unwrap_or(output)
+                    );
+                    if let Some(journal) = publication_journal.as_mut() {
+                        journal
+                            .publish(output, stream.as_deref(), mode, None)
+                            .with_context(|| {
+                                format!(
+                                    "workflow emit {mode:?} at output '{output}' cannot publish \
+                                     its typed revision envelope"
+                                )
+                            })?;
+                    }
+                    publish_pending_provisional_publications(publication_journal, host)?;
+                    telemetry.emit_events += 1;
+                    telemetry.record_output_publication(output);
+                    telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
+                    return Ok(());
+                }
                 if let Some(when) = when {
                     self.materialize_workflow_value(values, when)?;
                 }
@@ -2278,7 +2649,24 @@ impl WorkflowRuntime {
                     let source = values
                         .get(value)
                         .with_context(|| format!("workflow emit value '{value}' is unavailable"))?;
-                    if source.is_host_resident()? && self.plan.movable_emit_values.contains(value) {
+                    let is_final_state_writer = self
+                        .plan
+                        .compiled_workflow
+                        .state_plan
+                        .cells()
+                        .map(|(_, state)| state)
+                        .filter_map(|state| state.final_writer.as_ref())
+                        .any(|writer| {
+                            matches!(
+                                writer,
+                                onnx_genai_metadata::StateFinalWriter::Writer(writer)
+                                    if writer.binding == *value
+                            )
+                        });
+                    if source.is_host_resident()?
+                        && self.plan.movable_emit_values.contains(value)
+                        && !is_final_state_writer
+                    {
                         values.remove(value).with_context(|| {
                             format!("workflow emit value '{value}' is unavailable")
                         })?
@@ -2309,7 +2697,7 @@ impl WorkflowRuntime {
                         .request_axis()
                         .is_some()
                 {
-                    emit_workflow_rows(
+                    let staged_generation_tokens = emit_workflow_rows_with_publications(
                         values,
                         &tensor,
                         value,
@@ -2320,10 +2708,19 @@ impl WorkflowRuntime {
                         lengths.as_deref(),
                         *axis,
                         emit_counts,
+                        stream.as_deref(),
+                        publication_journal,
                         telemetry,
                         symbols,
                         dynamic_symbols,
+                        output_contract.role == onnx_genai_metadata::WorkflowOutputRole::Tokens,
                     )?;
+                    publish_pending_provisional_publications(publication_journal, host)?;
+                    if let Some(host) = host.as_deref_mut() {
+                        for tokens in staged_generation_tokens {
+                            host.observe_staged_generation_tokens(&tokens)?;
+                        }
+                    }
                     telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
                     return Ok(());
                 }
@@ -2353,6 +2750,7 @@ impl WorkflowRuntime {
                 }
                 telemetry.emit_events += 1;
                 telemetry.emitted_elements += emitted.numel() as u64;
+                telemetry.record_output_publication(output);
                 let validation_contract =
                     if valid_length.is_some() || matches!(mode, WorkflowEmitMode::Append) {
                         emit_chunk_contract(&output_contract.contract, &emitted, *axis)?
@@ -2366,6 +2764,35 @@ impl WorkflowRuntime {
                     symbols,
                     dynamic_symbols,
                 )?;
+                if let Some(journal) = publication_journal.as_mut() {
+                    journal
+                        .publish(
+                            output,
+                            stream.as_deref(),
+                            mode,
+                            Some(clone_value(&emitted)?),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "workflow emit {mode:?} at output '{output}' cannot publish its \
+                                 output envelope"
+                            )
+                        })?;
+                }
+                publish_pending_provisional_publications(publication_journal, host)?;
+                let staged_generation_tokens = (output_contract.role
+                    == onnx_genai_metadata::WorkflowOutputRole::Tokens)
+                    .then(|| {
+                        emitted
+                            .to_vec_i64()?
+                            .into_iter()
+                            .map(|token| {
+                                u32::try_from(token)
+                                    .context("the workflow emitted a token outside uint32")
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()
+                    })
+                    .transpose()?;
                 match mode {
                     WorkflowEmitMode::Replace => {
                         values.insert(output.clone(), emitted);
@@ -2384,6 +2811,14 @@ impl WorkflowRuntime {
                         *index += 1;
                         values.insert(output.clone(), emitted);
                     }
+                    WorkflowEmitMode::Retract | WorkflowEmitMode::Finalize => {
+                        unreachable!("control publication returned before reading a payload")
+                    }
+                }
+                if let Some(tokens) = staged_generation_tokens
+                    && let Some(host) = host.as_deref_mut()
+                {
+                    host.observe_staged_generation_tokens(&tokens)?;
                 }
                 telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
             }
@@ -2418,6 +2853,7 @@ impl WorkflowRuntime {
                         emit_counts,
                         final_state_refs,
                         component_overrides,
+                        publication_journal,
                         telemetry,
                         host,
                     )?;
@@ -3751,7 +4187,9 @@ impl WorkflowRuntime {
                 match &input.source {
                     WorkflowInputSource::Request => match &input.role {
                         onnx_genai_metadata::SemanticInputRole::Runtime { role, .. } => {
-                            workflow_request_value(role, request, &input.contract)?
+                            workflow_request_value(role, request, &input.contract).with_context(
+                                || format!("binding workflow request input '{name}'"),
+                            )?
                         }
                         onnx_genai_metadata::SemanticInputRole::Opaque => {
                             anyhow::bail!(
@@ -3894,7 +4332,7 @@ fn workflow_request_value(
                     .iter()
                     .map(|token| i64::from(*token))
                     .collect::<Vec<_>>();
-                let shape = match contract.rank {
+                let shape = match contract.rank() {
                     1 => vec![data.len() as i64],
                     2 => vec![1, data.len() as i64],
                     rank => anyhow::bail!(
@@ -3905,14 +4343,16 @@ fn workflow_request_value(
             }
             GeneratePrompt::TokenRows(rows) => {
                 anyhow::ensure!(
-                    contract.rank == 2,
+                    contract.rank() == 2,
                     "multi-row prompt token workflow input must have rank 2"
                 );
                 anyhow::ensure!(!rows.is_empty(), "multi-row prompt must not be empty");
                 let columns = rows[0].len();
                 anyhow::ensure!(
                     rows.iter().all(|row| row.len() == columns),
-                    "multi-row prompt token rows must have equal lengths"
+                    "multi-row prompt token rows must have equal lengths; padded or ragged prompt \
+                     execution requires a rectangular token tensor plus an explicit \
+                     padding.valid_lengths companion"
                 );
                 let data = rows
                     .iter()
@@ -3940,13 +4380,61 @@ fn workflow_request_value(
         RuntimeInputRole::MaxIterations | RuntimeInputRole::MaxOutputTokens => {
             scalar_i64(request.options.max_new_tokens as i64).map(Some)
         }
-        // A request may narrow the package's EOS set; when it says nothing the
-        // package's own declared literal stands, which is why this yields
-        // `None` rather than an empty tensor that would mean "nothing stops".
-        RuntimeInputRole::EosTokenIds => match request.options.eos_token_id {
-            Some(id) => Ok(Some(Value::from_slice_i64(&[i64::from(id)], &[1])?)),
-            None => Ok(None),
-        },
+        RuntimeInputRole::EosTokenIds => {
+            let ids = if request.options.eos_token_ids.is_empty() {
+                request.options.eos_token_id.into_iter().collect::<Vec<_>>()
+            } else {
+                request.options.eos_token_ids.clone()
+            };
+            if ids.is_empty() {
+                return Ok(None);
+            }
+            let rows = match &request.prompt {
+                GeneratePrompt::TokenRows(rows) => rows.len(),
+                GeneratePrompt::Text(_) | GeneratePrompt::TokenIds(_) => 1,
+            };
+            let ids = ids.into_iter().map(i64::from).collect::<Vec<_>>();
+            match contract.rank() {
+                1 => Ok(Some(Value::from_slice_i64(
+                    &ids,
+                    &[i64::try_from(ids.len())?],
+                )?)),
+                2 => {
+                    let data = (0..rows)
+                        .flat_map(|_| ids.iter().copied())
+                        .collect::<Vec<_>>();
+                    Ok(Some(Value::from_slice_i64(
+                        &data,
+                        &[i64::try_from(rows)?, i64::try_from(ids.len())?],
+                    )?))
+                }
+                rank => {
+                    anyhow::bail!("EOS token-id workflow input must have rank 1 or 2, got {rank}")
+                }
+            }
+        }
+        RuntimeInputRole::EosTokenLengths => {
+            let count = if !request.options.stop_on_eos {
+                0
+            } else if request.options.eos_token_ids.is_empty() {
+                usize::from(request.options.eos_token_id.is_some())
+            } else {
+                request.options.eos_token_ids.len()
+            };
+            let rows = match &request.prompt {
+                GeneratePrompt::TokenRows(rows) => rows.len(),
+                GeneratePrompt::Text(_) | GeneratePrompt::TokenIds(_) => 1,
+            };
+            anyhow::ensure!(
+                contract.rank() == 1,
+                "EOS length workflow input must have rank 1, got {}",
+                contract.rank()
+            );
+            Ok(Some(Value::from_slice_i64(
+                &vec![i64::try_from(count)?; rows],
+                &[i64::try_from(rows)?],
+            )?))
+        }
         RuntimeInputRole::Seed => {
             scalar_i64(request.options.seed.unwrap_or_default() as i64).map(Some)
         }
@@ -4095,7 +4583,7 @@ fn workflow_literal_value_with_shape(
 }
 
 fn scalar_or_batch_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
-    match contract.rank {
+    match contract.rank() {
         0 => Ok(Vec::new()),
         1 => Ok(vec![1]),
         rank => anyhow::bail!("request scalar binding requires rank 0 or 1, got {rank}"),
@@ -4176,11 +4664,8 @@ fn resolve_workflow_shape(
     contract: &TensorContract,
     symbols: &HashMap<String, i64>,
 ) -> anyhow::Result<Vec<i64>> {
-    let shape = contract
+    contract
         .shape
-        .as_ref()
-        .context("workflow adapter output requires a declared shape")?;
-    shape
         .iter()
         .map(|dimension| match dimension {
             TensorDimension::Fixed(value) => Ok(*value),
@@ -4189,6 +4674,10 @@ fn resolve_workflow_shape(
                     "workflow adapter output requires unresolved dimension '{symbol}' for allocation"
                 )
             }),
+            TensorDimension::Any => anyhow::bail!(
+                "workflow adapter output shape contains Any, whose extent is unconstrained; \
+                 bind a concrete input-derived symbol or fixed extent before allocation"
+            ),
         })
         .collect()
 }
@@ -4197,11 +4686,8 @@ fn resolve_workflow_adapter_shape(
     contract: &TensorContract,
     _symbols: &HashMap<String, i64>,
 ) -> anyhow::Result<Vec<i64>> {
-    let shape = contract
+    contract
         .shape
-        .as_ref()
-        .context("workflow adapter output requires a declared shape")?;
-    shape
         .iter()
         .map(|dimension| match dimension {
             TensorDimension::Fixed(value) => Ok(*value),
@@ -4211,6 +4697,7 @@ fn resolve_workflow_adapter_shape(
             // (for example a source image and generated latent that both call
             // their private axes "height").
             TensorDimension::Symbol(_) => Ok(-1),
+            TensorDimension::Any => Ok(-1),
         })
         .collect()
 }
@@ -4227,7 +4714,7 @@ fn workflow_iteration_value(
         );
     }
     let index = i64::try_from(index).context("workflow loop iteration exceeds int64")?;
-    match contract.rank {
+    match contract.rank() {
         0 => Value::from_slice_i64(&[index], &[]).map_err(Into::into),
         1 => {
             let shape = resolve_workflow_shape(contract, symbols)?;
@@ -4304,25 +4791,20 @@ fn typed_image_bytes<T, const N: usize>(
 /// unbound axis the split is genuinely ambiguous, so the singleton guess stands
 /// and the caller gets the element-count error, which names the real problem.
 fn literal_shape(literal: &LiteralValue, contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
-    let Some(shape) = &contract.shape else {
-        if contract.rank == 0 {
-            return Ok(Vec::new());
-        }
-        anyhow::bail!("literal workflow input requires a fully declared shape");
-    };
-    let symbolic_axes = shape
+    let shape = &contract.shape;
+    let unresolved_axes = shape
         .iter()
-        .filter(|dimension| matches!(dimension, TensorDimension::Symbol(_)))
+        .filter(|dimension| matches!(dimension, TensorDimension::Symbol(_) | TensorDimension::Any))
         .count();
     let fixed_extent: i64 = shape
         .iter()
         .filter_map(|dimension| match dimension {
             TensorDimension::Fixed(value) => Some(*value),
-            TensorDimension::Symbol(_) => None,
+            TensorDimension::Symbol(_) | TensorDimension::Any => None,
         })
         .product();
-    let symbolic_extent = match literal {
-        LiteralValue::Elements(elements) if symbolic_axes == 1 && fixed_extent > 0 => {
+    let unresolved_extent = match literal {
+        LiteralValue::Elements(elements) if unresolved_axes == 1 && fixed_extent > 0 => {
             let elements = elements.len() as i64;
             anyhow::ensure!(
                 elements % fixed_extent == 0,
@@ -4337,7 +4819,7 @@ fn literal_shape(literal: &LiteralValue, contract: &TensorContract) -> anyhow::R
         .iter()
         .map(|dimension| match dimension {
             TensorDimension::Fixed(value) => *value,
-            TensorDimension::Symbol(_) => symbolic_extent,
+            TensorDimension::Symbol(_) | TensorDimension::Any => unresolved_extent,
         })
         .collect())
 }
@@ -4373,9 +4855,7 @@ fn resolve_component_output_shapes(
         let Some(contract) = declaration.ports.outputs.get(port) else {
             continue;
         };
-        let Some(shape) = &contract.shape else {
-            continue;
-        };
+        let shape = &contract.shape;
         let mut dims = Vec::with_capacity(shape.len());
         let mut fully_known = true;
         for dim in shape {
@@ -4438,47 +4918,91 @@ pub(super) fn validate_workflow_value(
             contract.dtype
         );
     }
-    if value.shape().len() != contract.rank {
+    if value.shape().len() != contract.rank() {
         anyhow::bail!(
-            "workflow value '{name}' has rank {}, expected {}",
+            "workflow value '{name}' has rank {}, but required shape {:?} has rank {}",
             value.shape().len(),
-            contract.rank
+            contract.shape,
+            contract.rank()
         );
     }
-    if let Some(shape) = &contract.shape {
-        for (axis, (declared, actual)) in shape.iter().zip(value.shape()).enumerate() {
-            let symbolic_actual = if contract.batch_layout.request_axis() == Some(axis) {
-                let factor = i64::try_from(contract.batch_layout.request_expansion_factor())?;
-                anyhow::ensure!(
-                    factor > 0,
-                    "workflow value '{name}' has a zero request expansion factor"
-                );
-                if actual % factor != 0 {
-                    anyhow::bail!(
-                        "workflow value '{name}' axis {axis} is {actual}, which is not divisible \
+    for (axis, (declared, actual)) in contract.shape.iter().zip(value.shape()).enumerate() {
+        let symbolic_actual = if contract.batch_layout.request_axis() == Some(axis) {
+            let factor = i64::try_from(contract.batch_layout.request_expansion_factor())?;
+            anyhow::ensure!(
+                factor > 0,
+                "workflow value '{name}' has a zero request expansion factor"
+            );
+            if actual % factor != 0 {
+                anyhow::bail!(
+                    "workflow value '{name}' axis {axis} is {actual}, which is not divisible \
                          by its request expansion factor {factor}"
-                    );
-                }
-                actual / factor
-            } else {
-                *actual
-            };
-            match declared {
-                TensorDimension::Fixed(expected) if expected != actual => anyhow::bail!(
-                    "workflow value '{name}' axis {axis} is {actual}, expected {expected}"
-                ),
-                TensorDimension::Symbol(symbol) if dynamic_symbols.contains(symbol) => {}
-                TensorDimension::Symbol(symbol) => match symbols.get(symbol) {
-                    Some(expected) if *expected != symbolic_actual => anyhow::bail!(
-                        "workflow value '{name}' axis {axis} binds symbol '{symbol}' to \
+                );
+            }
+            actual / factor
+        } else {
+            *actual
+        };
+        match declared {
+            TensorDimension::Fixed(expected) if expected != actual => anyhow::bail!(
+                "workflow value '{name}' axis {axis} is {actual}, expected {expected}"
+            ),
+            TensorDimension::Symbol(symbol) if dynamic_symbols.contains(symbol) => {}
+            TensorDimension::Symbol(symbol) => match symbols.get(symbol) {
+                Some(expected) if *expected != symbolic_actual => anyhow::bail!(
+                    "workflow value '{name}' axis {axis} binds symbol '{symbol}' to \
                          {symbolic_actual}, but it was already {expected}"
-                    ),
-                    Some(_) => {}
-                    None => {
-                        symbols.insert(symbol.clone(), symbolic_actual);
-                    }
-                },
-                TensorDimension::Fixed(_) => {}
+                ),
+                Some(_) => {}
+                None => {
+                    symbols.insert(symbol.clone(), symbolic_actual);
+                }
+            },
+            TensorDimension::Fixed(_) => {}
+            TensorDimension::Any => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_workflow_padding_values(
+    workflow: &WorkflowSpec,
+    values: &PipelineTensors,
+) -> anyhow::Result<()> {
+    for (name, input) in &workflow.inputs {
+        let Some(value) = values.get(name) else {
+            continue;
+        };
+        for padding in &input.contract.padding {
+            let axis = input
+                .contract
+                .shape
+                .iter()
+                .position(|dimension| {
+                    dimension == &TensorDimension::Symbol(padding.dimension.clone())
+                })
+                .with_context(|| {
+                    format!(
+                        "workflow input '{name}' padding dimension '{}' is not present in its shape",
+                        padding.dimension
+                    )
+                })?;
+            let extent = value.shape()[axis];
+            let lengths = values.get(&padding.valid_lengths).with_context(|| {
+                format!(
+                    "workflow input '{name}' requires padding.valid_lengths companion '{}'",
+                    padding.valid_lengths
+                )
+            })?;
+            for (row, length) in lengths.to_vec_i64()?.into_iter().enumerate() {
+                anyhow::ensure!(
+                    (0..=extent).contains(&length),
+                    "workflow input '{name}' padding.valid_lengths companion '{}' row {row} is \
+                     {length}, expected an explicit logical extent in 0..={extent} for padded \
+                     dimension '{}'",
+                    padding.valid_lengths,
+                    padding.dimension
+                );
             }
         }
     }
@@ -5066,14 +5590,13 @@ fn emit_chunk_contract(
     axis: Option<usize>,
 ) -> anyhow::Result<onnx_genai_metadata::TensorContract> {
     let mut contract = output.clone();
-    if let Some(shape) = &mut contract.shape {
-        let index = axis.unwrap_or(shape.len().saturating_sub(1));
-        anyhow::ensure!(
-            index < shape.len() && index < emitted.shape().len(),
-            "workflow prefix/append emit axis {index} exceeds the value rank"
-        );
-        shape[index] = TensorDimension::Fixed(emitted.shape()[index]);
-    }
+    let shape = &mut contract.shape;
+    let index = axis.unwrap_or(shape.len().saturating_sub(1));
+    anyhow::ensure!(
+        index < shape.len() && index < emitted.shape().len(),
+        "workflow prefix/append emit axis {index} exceeds the value rank"
+    );
+    shape[index] = TensorDimension::Fixed(emitted.shape()[index]);
     Ok(contract)
 }
 
@@ -5129,6 +5652,7 @@ fn slice_workflow_prefix(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn emit_workflow_rows(
     values: &mut PipelineTensors,
     tensor: &Value,
@@ -5144,6 +5668,46 @@ fn emit_workflow_rows(
     symbols: &HashMap<String, i64>,
     dynamic_symbols: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
+    emit_workflow_rows_with_publications(
+        values,
+        tensor,
+        value_name,
+        output,
+        output_contract,
+        mode,
+        guards,
+        lengths,
+        axis,
+        emit_counts,
+        None,
+        &mut None,
+        telemetry,
+        symbols,
+        dynamic_symbols,
+        false,
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_workflow_rows_with_publications(
+    values: &mut PipelineTensors,
+    tensor: &Value,
+    value_name: &str,
+    output: &str,
+    output_contract: &onnx_genai_metadata::TensorContract,
+    mode: &WorkflowEmitMode,
+    guards: Option<&[bool]>,
+    lengths: Option<&[usize]>,
+    axis: Option<usize>,
+    emit_counts: &mut HashMap<String, usize>,
+    stream: Option<&str>,
+    publication_journal: &mut Option<OutputPublicationJournal>,
+    telemetry: &mut WorkflowRunTelemetry,
+    symbols: &HashMap<String, i64>,
+    dynamic_symbols: &std::collections::HashSet<String>,
+    observe_generation_tokens: bool,
+) -> anyhow::Result<Vec<Vec<crate::TokenId>>> {
     let rows = tensor
         .shape()
         .first()
@@ -5160,6 +5724,7 @@ fn emit_workflow_rows(
         );
     }
     let mut row_names = vec![String::new(); rows];
+    let mut staged_generation_tokens = Vec::new();
     for row in 0..rows {
         let active = guards.is_none_or(|values| values[if values.len() == 1 { 0 } else { row }]);
         if !active {
@@ -5173,11 +5738,7 @@ fn emit_workflow_rows(
             output_contract.clone()
         };
         let mut row_symbols = symbols.clone();
-        if let Some(TensorDimension::Symbol(batch)) = validation_contract
-            .shape
-            .as_ref()
-            .and_then(|shape| shape.first())
-        {
+        if let Some(TensorDimension::Symbol(batch)) = validation_contract.shape.first() {
             row_symbols.insert(batch.clone(), 1);
         }
         validate_workflow_value(
@@ -5187,6 +5748,27 @@ fn emit_workflow_rows(
             &mut row_symbols,
             dynamic_symbols,
         )?;
+        if observe_generation_tokens {
+            staged_generation_tokens.push(
+                emitted
+                    .to_vec_i64()?
+                    .into_iter()
+                    .map(|token| {
+                        u32::try_from(token).context("the workflow emitted a token outside uint32")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            );
+        }
+        if let Some(journal) = publication_journal.as_mut() {
+            journal
+                .publish(output, stream, mode, Some(clone_value(&emitted)?))
+                .with_context(|| {
+                    format!(
+                        "workflow row {row} emit {mode:?} at output '{output}' cannot publish \
+                         its output envelope"
+                    )
+                })?;
+        }
         if telemetry.first_emit_ns.is_none() {
             telemetry.first_emit_ns = telemetry
                 .started
@@ -5194,6 +5776,7 @@ fn emit_workflow_rows(
         }
         telemetry.emit_events += 1;
         telemetry.emitted_elements += emitted.numel() as u64;
+        telemetry.record_output_publication(output);
         let row_output = format!("{output}.row.{row}");
         row_names[row] = row_output.clone();
         match mode {
@@ -5214,6 +5797,9 @@ fn emit_workflow_rows(
                 *index += 1;
                 values.insert(row_output, emitted);
             }
+            WorkflowEmitMode::Retract | WorkflowEmitMode::Finalize => {
+                unreachable!("control publication does not emit rows")
+            }
         }
     }
     // Row names are positional, so an inactive row keeps its slot and the
@@ -5230,7 +5816,7 @@ fn emit_workflow_rows(
             entry[row] = name;
         }
     }
-    Ok(())
+    Ok(staged_generation_tokens)
 }
 
 fn slice_workflow_row(
@@ -5473,18 +6059,7 @@ fn workflow_row_selection(
     workflow: &onnx_genai_metadata::WorkflowSpec,
     values: &PipelineTensors,
 ) -> anyhow::Result<Option<Vec<usize>>> {
-    let Some(name) = workflow
-        .inputs
-        .iter()
-        .find(|(_, input)| {
-            matches!(
-                &input.role,
-                onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
-                    if *role == RuntimeInputRole::RowSelection
-            )
-        })
-        .map(|(name, _)| name.as_str())
-    else {
+    let Some(name) = workflow_row_selection_name(workflow) else {
         return Ok(None);
     };
     let Some(value) = values.get(name) else {
@@ -5501,6 +6076,20 @@ fn workflow_row_selection(
         })
         .collect::<anyhow::Result<Vec<_>>>()
         .map(Some)
+}
+
+fn workflow_row_selection_name(workflow: &onnx_genai_metadata::WorkflowSpec) -> Option<&str> {
+    workflow
+        .inputs
+        .iter()
+        .find(|(_, input)| {
+            matches!(
+                &input.role,
+                onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
+                    if *role == RuntimeInputRole::RowSelection
+            )
+        })
+        .map(|(name, _)| name.as_str())
 }
 
 /// Component invocations reachable from a node, in order.
@@ -5629,7 +6218,7 @@ mod workflow_scalar_tests {
         let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
         let next = Value::from_slice_i64(&[10, 20, 30, 40], &[2, 2]).expect("next");
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
-            "contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: \
+            "contract: { dtype: int64, shape: [batch, 2], batch_layout: { kind: \
              request_aligned, axis: 0 } }\nscope: invocation\ninitializer: initial\nrecurrence: { \
              kind: invariant }",
         )
@@ -5644,7 +6233,7 @@ mod workflow_scalar_tests {
         let current = Value::from_slice_i64(&[1, 2, 3, 4, 5, 6, 7, 8], &[4, 2]).expect("current");
         let next = Value::from_slice_i64(&[10, 20, 30, 40, 50, 60, 70, 80], &[4, 2]).expect("next");
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
-            "contract: { dtype: int64, rank: 2, shape: [guidance_rows, 2], batch_layout: { \
+            "contract: { dtype: int64, shape: [guidance_rows, 2], batch_layout: { \
              kind: request_expanded, axis: 0, factor: 2 } }\nscope: invocation\ninitializer: \
              initial\nrecurrence: { kind: invariant }",
         )
@@ -5662,7 +6251,7 @@ mod workflow_scalar_tests {
         let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
         let next = Value::from_slice_i64(&[10, 20, 30, 40, 50, 60], &[2, 3]).expect("next");
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
-            "contract: { dtype: int64, rank: 2, shape: [batch, context], batch_layout: { kind: \
+            "contract: { dtype: int64, shape: [batch, context], batch_layout: { kind: \
              request_aligned, axis: 0 } }\nscope: invocation\ninitializer: initial\nrecurrence: { \
              kind: growing, axis: 1, increment: one, max: limit }",
         )
@@ -5680,7 +6269,7 @@ mod workflow_scalar_tests {
         let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
         let next = Value::from_slice_i64(&[10, 20, 30, 40], &[2, 2]).expect("next");
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
-            "contract: { dtype: int64, rank: 2, shape: [features, batch], batch_layout: { kind: \
+            "contract: { dtype: int64, shape: [features, batch], batch_layout: { kind: \
              request_aligned, axis: 1 } }\nscope: invocation\ninitializer: initial\nrecurrence: { \
              kind: invariant }",
         )
@@ -5718,8 +6307,7 @@ mod workflow_scalar_tests {
         let mut counts = HashMap::new();
         let mut telemetry = WorkflowRunTelemetry::default();
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
-                .expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, sequence] }").expect("contract");
         emit_workflow_rows(
             &mut values,
             &tensor,
@@ -5754,8 +6342,7 @@ mod workflow_scalar_tests {
         let mut counts = HashMap::new();
         let mut telemetry = WorkflowRunTelemetry::default();
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
-                .expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, sequence] }").expect("contract");
         emit_workflow_rows(
             &mut values,
             &tensor,
@@ -5783,7 +6370,7 @@ mod workflow_scalar_tests {
     fn row_replace_without_ragged_length_preserves_declared_extent_validation() {
         let tensor = Value::from_slice_i64(&[10, 11, 12], &[1, 3]).expect("row tensor");
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, 4] }").expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, 4] }").expect("contract");
         let error = emit_workflow_rows(
             &mut PipelineTensors::new(),
             &tensor,
@@ -5808,8 +6395,7 @@ mod workflow_scalar_tests {
     fn row_emit_keeps_every_active_row_in_its_own_positional_slot() {
         let tensor = Value::from_slice_i64(&[10, 20], &[2, 1]).expect("row tensor");
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
-                .expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, sequence] }").expect("contract");
         let mut values = PipelineTensors::new();
         let mut telemetry = WorkflowRunTelemetry::default();
         emit_workflow_rows(
@@ -5843,8 +6429,7 @@ mod workflow_scalar_tests {
     fn true_zero_length_row_emits_an_empty_value() {
         let tensor = Value::from_slice_i64(&[10], &[1, 1]).expect("row tensor");
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
-                .expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, sequence] }").expect("contract");
         let mut values = PipelineTensors::new();
         let mut telemetry = WorkflowRunTelemetry::default();
         emit_workflow_rows(
@@ -5873,8 +6458,7 @@ mod workflow_scalar_tests {
     #[test]
     fn growing_state_uses_recurrence_instead_of_freezing_its_symbol() {
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
-                .expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, sequence] }").expect("contract");
         let mut symbols = HashMap::new();
         let dynamic_symbols = std::collections::HashSet::from(["sequence".to_string()]);
         let current = Value::from_slice_i64(&[1, 2], &[1, 2]).expect("current");
@@ -5892,7 +6476,7 @@ mod workflow_scalar_tests {
 
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
             r#"
-contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+contract: { dtype: int64, shape: [batch, sequence] }
 scope: invocation
 initializer: initial
 recurrence: { kind: growing, axis: 1, increment: accepted, max: max_context }
@@ -5921,7 +6505,7 @@ recurrence: { kind: growing, axis: 1, increment: accepted, max: max_context }
     fn kv_service_accepts_per_row_growth_controls() {
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
             r#"
-contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+contract: { dtype: int64, shape: [batch, sequence] }
 scope: invocation
 initializer: initial
 recurrence: { kind: growing, axis: 1, increment: accepted, max: max_context }
@@ -5947,7 +6531,7 @@ service_group: decoder_cache
     #[test]
     fn literals_and_append_support_declared_runtime_dtypes() {
         let int_contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int16, rank: 1, shape: [2] }").expect("contract");
+            serde_yaml::from_str("{ dtype: int16, shape: [2] }").expect("contract");
         let integer = workflow_literal_value(
             &LiteralValue::Scalar(ScalarValue::Integer(7)),
             &int_contract,
@@ -5956,7 +6540,7 @@ service_group: decoder_cache
         assert_eq!(integer.dtype(), DataType::Int16);
 
         let half_contract: TensorContract =
-            serde_yaml::from_str("{ dtype: float16, rank: 1, shape: [2] }").expect("contract");
+            serde_yaml::from_str("{ dtype: float16, shape: [2] }").expect("contract");
         let left = workflow_literal_value(
             &LiteralValue::Scalar(ScalarValue::Float(1.0)),
             &half_contract,
@@ -5977,7 +6561,7 @@ service_group: decoder_cache
         // Interleaved full-duplex models publish a per-stream delay pattern; it
         // is a tensor constant, not a broadcast scalar.
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 1, shape: [5] }").expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [5] }").expect("contract");
         let delays = LiteralValue::Elements(vec![
             ScalarValue::Integer(0),
             ScalarValue::Integer(0),
@@ -6086,8 +6670,7 @@ mod workflow_sampling_binding_tests {
         request.prompt = GeneratePrompt::TokenRows(vec![vec![1, 2, 3], vec![4, 5, 6]]);
         let contract = TensorContract {
             dtype: "int64".to_string(),
-            rank: 2,
-            shape: None,
+            shape: vec![TensorDimension::Any; 2],
             optional: false,
             batch_layout: BatchLayout::default(),
             padding: Vec::new(),
@@ -6109,8 +6692,7 @@ mod workflow_sampling_binding_tests {
         request.prompt = GeneratePrompt::TokenRows(vec![vec![1, 2], vec![3]]);
         let contract = TensorContract {
             dtype: "int64".to_string(),
-            rank: 2,
-            shape: None,
+            shape: vec![TensorDimension::Any; 2],
             optional: false,
             batch_layout: BatchLayout::default(),
             padding: Vec::new(),
@@ -6121,7 +6703,62 @@ mod workflow_sampling_binding_tests {
                 Ok(_) => panic!("ragged rows must fail"),
                 Err(error) => error,
             };
-        assert!(error.to_string().contains("equal lengths"));
+        let message = error.to_string();
+        assert!(message.contains("equal lengths"), "{message}");
+        assert!(message.contains("padding.valid_lengths"), "{message}");
+    }
+
+    #[test]
+    fn eos_roles_materialize_one_effective_set_for_policy_graphs() {
+        let mut request = request(|options| {
+            options.eos_token_ids = vec![2, 3];
+        });
+        request.prompt = GeneratePrompt::TokenRows(vec![vec![1], vec![4]]);
+        let rank_two = TensorContract {
+            dtype: "int64".to_string(),
+            shape: vec![TensorDimension::Any; 2],
+            optional: false,
+            batch_layout: BatchLayout::default(),
+            padding: Vec::new(),
+        };
+        let ids = workflow_request_value(&RuntimeInputRole::EosTokenIds, &request, &rank_two)
+            .expect("EOS binding")
+            .expect("EOS ids");
+        assert_eq!(ids.shape(), &[2, 2]);
+        assert_eq!(ids.to_vec_i64().expect("EOS rows"), [2, 3, 2, 3]);
+
+        let lengths_contract = TensorContract {
+            shape: vec![TensorDimension::Any],
+            ..rank_two.clone()
+        };
+        let lengths = workflow_request_value(
+            &RuntimeInputRole::EosTokenLengths,
+            &request,
+            &lengths_contract,
+        )
+        .expect("EOS-length binding")
+        .expect("EOS lengths");
+        assert_eq!(lengths.to_vec_i64().expect("EOS lengths"), [2, 2]);
+
+        request.options.stop_on_eos = false;
+        let lengths = workflow_request_value(
+            &RuntimeInputRole::EosTokenLengths,
+            &request,
+            &lengths_contract,
+        )
+        .expect("disabled EOS binding")
+        .expect("disabled EOS lengths");
+        assert_eq!(lengths.to_vec_i64().expect("EOS lengths"), [0, 0]);
+
+        let rank_one = TensorContract {
+            shape: vec![TensorDimension::Any],
+            ..rank_two
+        };
+        let ids = workflow_request_value(&RuntimeInputRole::EosTokenIds, &request, &rank_one)
+            .expect("shared EOS binding")
+            .expect("shared EOS ids");
+        assert_eq!(ids.shape(), &[2]);
+        assert_eq!(ids.to_vec_i64().expect("EOS ids"), [2, 3]);
     }
 
     #[test]
@@ -6132,8 +6769,7 @@ mod workflow_sampling_binding_tests {
         });
         let contract = TensorContract {
             dtype: "int64".to_string(),
-            rank: 1,
-            shape: Some(vec![TensorDimension::Fixed(1)]),
+            shape: vec![TensorDimension::Fixed(1)],
             optional: false,
             batch_layout: BatchLayout::default(),
             padding: Vec::new(),
@@ -6174,7 +6810,6 @@ components:
       inputs:
         payload:
           dtype: int64
-          rank: 1
           shape: [items]
           batch_layout:
             kind: token_packed
@@ -6183,12 +6818,10 @@ components:
               - {{ offsets: offsets, owner: owner }}
         offsets:
           dtype: int64
-          rank: 1
           shape: [offset_rows]
           batch_layout: {{ kind: shared }}
         owner:
           dtype: int64
-          rank: 1
           shape: [owner_rows]
           batch_layout: {{ kind: shared }}
       outputs: {{}}
@@ -6207,7 +6840,6 @@ inputs:
   rows:
     contract:
       dtype: int64
-      rank: 2
       shape: [batch, hidden]
       batch_layout: { kind: request_aligned, axis: 0 }
     role: { kind: opaque }
@@ -6221,7 +6853,6 @@ components:
       inputs:
         rows:
           dtype: int64
-          rank: 2
           shape: [batch, hidden]
           batch_layout: { kind: request_aligned, axis: 0 }
       outputs: {}
@@ -6240,7 +6871,6 @@ inputs:
   rows:
     contract:
       dtype: int64
-      rank: 2
       shape: [batch, hidden]
       batch_layout: { kind: request_aligned, axis: 0 }
     role: { kind: opaque }
@@ -6248,7 +6878,6 @@ inputs:
   seed:
     contract:
       dtype: int64
-      rank: 1
       shape: [seed_items]
       batch_layout: { kind: shared }
     role: { kind: opaque }
@@ -6256,7 +6885,6 @@ inputs:
   choose:
     contract:
       dtype: int64
-      rank: 1
       shape: [one]
       batch_layout: { kind: shared }
     role: { kind: opaque }
@@ -6271,13 +6899,11 @@ components:
       inputs:
         seed:
           dtype: int64
-          rank: 1
           shape: [seed_items]
           batch_layout: { kind: shared }
       outputs:
         packed:
           dtype: int64
-          rank: 1
           shape: [items]
           batch_layout:
             kind: token_packed
@@ -6286,12 +6912,10 @@ components:
               - { offsets: packed_offsets, owner: packed_owner }
         packed_offsets:
           dtype: int64
-          rank: 1
           shape: [offset_rows]
           batch_layout: { kind: shared }
         packed_owner:
           dtype: int64
-          rank: 1
           shape: [owner_rows]
           batch_layout: { kind: shared }
 state: {}
@@ -6310,6 +6934,78 @@ steps:
 "#,
         )
         .expect("shared branch workflow")
+    }
+
+    fn lifecycle_workflow() -> WorkflowSpec {
+        serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  seed:
+    contract: { dtype: int64, shape: [1] }
+    role: { kind: opaque }
+    source: { kind: application, name: seed }
+  active:
+    contract: { dtype: bool, shape: [] }
+    role: { kind: opaque }
+    source: { kind: application, name: active }
+  limit:
+    contract: { dtype: int64, shape: [] }
+    role: { kind: opaque }
+    source: { kind: application, name: limit }
+outputs: {}
+components:
+  setup:
+    implementation: { kind: binding }
+    contract: { id: test.loop.lifecycle, version: "1" }
+    ports:
+      inputs:
+        value: { dtype: int64, shape: [1] }
+      outputs:
+        value: { dtype: int64, shape: [1] }
+  body:
+    implementation: { kind: binding }
+    contract: { id: test.loop.lifecycle, version: "1" }
+    ports:
+      inputs:
+        value: { dtype: int64, shape: [1] }
+      outputs:
+        value: { dtype: int64, shape: [1] }
+state: {}
+steps:
+  - kind: loop
+    setup:
+      - kind: invoke
+        component: setup
+        inputs: { value: seed }
+        outputs: { value: setup.value }
+    steps:
+      - kind: invoke
+        component: body
+        inputs: { value: setup.value }
+        outputs: { value: body.value }
+    continue_when: active
+    max_iterations: limit
+"#,
+        )
+        .expect("loop lifecycle workflow")
+    }
+
+    fn lifecycle_request(active: i64, limit: i64) -> PipelineGenerateRequest {
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(Vec::new())))
+            .with_input(
+                "seed",
+                Value::from_slice_i64(&[7], &[1]).expect("seed value"),
+            )
+            .with_input(
+                "active",
+                Value::from_raw_bytes(vec![u8::from(active != 0)], &[], DataType::Bool)
+                    .expect("active value"),
+            )
+            .with_input(
+                "limit",
+                Value::from_slice_i64(&[limit], &[]).expect("limit value"),
+            )
     }
 
     fn over_budget_values() -> PipelineTensors {
@@ -6392,6 +7088,7 @@ steps:
             &mut HashMap::new(),
             &mut HashMap::new(),
             &HashMap::new(),
+            &mut None,
             &mut WorkflowRunTelemetry::default(),
             host,
         )
@@ -6407,6 +7104,182 @@ steps:
 
     struct WrongCardinalityHost {
         seen: usize,
+    }
+
+    struct StateAdvanceHost;
+
+    #[derive(Default)]
+    struct LifecycleHost {
+        prefix_runs: usize,
+        setup_runs: usize,
+        body_runs: usize,
+        supports_publication: bool,
+        fail_before_commit: bool,
+        provisional: Vec<(String, String, OutputFinality)>,
+        terminal: Vec<&'static str>,
+        abort_streams: Vec<OutputStreamBaseline>,
+    }
+
+    impl WorkflowNodeHost for LifecycleHost {
+        fn hosted_contracts(&self) -> &'static [&'static str] {
+            &["test.loop.lifecycle"]
+        }
+
+        fn before_turn_commit(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !self.fail_before_commit,
+                "injected lifecycle pre-commit failure"
+            );
+            Ok(())
+        }
+
+        fn supports_provisional_output_publications(&self) -> bool {
+            self.supports_publication
+        }
+
+        fn publish_provisional_output_publications(
+            &mut self,
+            publications: &[WorkflowOutputPublication],
+        ) -> anyhow::Result<()> {
+            for publication in publications {
+                let WorkflowOutputPublication::Revision(envelope) = publication else {
+                    anyhow::bail!(
+                        "lifecycle provisional transport received a non-revision publication"
+                    );
+                };
+                self.provisional.push((
+                    envelope.output.clone(),
+                    envelope.stream.0.clone(),
+                    envelope.finality,
+                ));
+            }
+            Ok(())
+        }
+
+        fn publish_transaction_outcome(
+            &mut self,
+            publication: &WorkflowOutputPublication,
+        ) -> anyhow::Result<()> {
+            match publication {
+                WorkflowOutputPublication::TransactionCommitted { .. } => {
+                    self.terminal.push("commit")
+                }
+                WorkflowOutputPublication::AbortToBaseline { streams, .. } => {
+                    self.terminal.push("abort");
+                    self.abort_streams = streams.clone();
+                }
+                _ => anyhow::bail!("lifecycle transport received a non-terminal outcome"),
+            }
+            Ok(())
+        }
+
+        fn execute_contract_node(
+            &mut self,
+            request: WorkflowNodeRequest<'_>,
+        ) -> anyhow::Result<bool> {
+            if request.contract != "test.loop.lifecycle" {
+                return Ok(false);
+            }
+            match request.component {
+                "prefix" => self.prefix_runs += 1,
+                "setup" => self.setup_runs += 1,
+                "body" => self.body_runs += 1,
+                component => anyhow::bail!("unexpected lifecycle component '{component}'"),
+            }
+            let input = request
+                .inputs
+                .get("value")
+                .context("lifecycle input is bound")?;
+            let output = request
+                .outputs
+                .get("value")
+                .context("lifecycle output is bound")?;
+            let value = request
+                .values
+                .get(input)
+                .context("lifecycle input is available")?
+                .to_vec_i64()?;
+            request
+                .values
+                .insert(output.clone(), Value::from_slice_i64(&value, &[1])?);
+            Ok(true)
+        }
+    }
+
+    impl WorkflowNodeHost for StateAdvanceHost {
+        fn hosted_contracts(&self) -> &'static [&'static str] {
+            &["test.state.advance"]
+        }
+
+        fn execute_contract_node(
+            &mut self,
+            request: WorkflowNodeRequest<'_>,
+        ) -> anyhow::Result<bool> {
+            if request.contract != "test.state.advance" {
+                return Ok(false);
+            }
+            let input = request
+                .inputs
+                .get("state")
+                .context("state advance input is bound")?;
+            let current = request
+                .values
+                .get(input)
+                .context("state advance input is available")?
+                .to_vec_i64()?[0];
+            let increment = match request.component {
+                "prefill" => 1,
+                "decode" => 10,
+                component => anyhow::bail!("unexpected state advance component '{component}'"),
+            };
+            let output = request
+                .outputs
+                .get("state")
+                .context("state advance output is bound")?;
+            request.values.insert(
+                output.clone(),
+                Value::from_slice_i64(&[current + increment], &[1])?,
+            );
+            Ok(true)
+        }
+    }
+
+    struct BranchStateAdvanceHost;
+
+    impl WorkflowNodeHost for BranchStateAdvanceHost {
+        fn hosted_contracts(&self) -> &'static [&'static str] {
+            &["test.state.branch_advance"]
+        }
+
+        fn execute_contract_node(
+            &mut self,
+            request: WorkflowNodeRequest<'_>,
+        ) -> anyhow::Result<bool> {
+            if request.contract != "test.state.branch_advance" {
+                return Ok(false);
+            }
+            let state = request
+                .inputs
+                .get("state")
+                .and_then(|input| request.values.get(input))
+                .context("branch writer state is available")?
+                .to_vec_i64()?[0];
+            let increment = request
+                .inputs
+                .get("increment")
+                .and_then(|input| request.values.get(input))
+                .context("branch writer increment is available")?
+                .to_vec_i64()?[0];
+            let output = request
+                .outputs
+                .get("state")
+                .context("branch writer state output is bound")?;
+            request.values.insert(
+                output.clone(),
+                Value::from_slice_i64(&[state + increment], &[1])?,
+            );
+            Ok(true)
+        }
     }
 
     impl WorkflowNodeHost for WrongCardinalityHost {
@@ -6499,12 +7372,14 @@ steps:
             contract: "vendor.something-else".to_string(),
             seen: Vec::new(),
         };
+        let mut publication_journal = None;
         let request = WorkflowNodeRequest {
             contract: "onnx-genai.token-policy",
             component: "token_policy",
             inputs: &BTreeMap::new(),
             outputs: &BTreeMap::new(),
             values: &mut PipelineTensors::default(),
+            publication_journal: &mut publication_journal,
         };
         assert!(
             !host.execute_contract_node(request).expect("no error"),
@@ -6527,6 +7402,7 @@ steps:
             contract: "onnx-genai.token-policy".to_string(),
             seen: Vec::new(),
         };
+        let mut publication_journal = None;
 
         let handled = host
             .execute_contract_node(WorkflowNodeRequest {
@@ -6535,6 +7411,7 @@ steps:
                 inputs: &inputs,
                 outputs: &outputs,
                 values: &mut values,
+                publication_journal: &mut publication_journal,
             })
             .expect("the host runs");
 
@@ -6679,6 +7556,699 @@ steps:
         assert!(!plan.values.contains_key("branch.packed_offsets"));
         assert!(!plan.values.contains_key("branch.packed_owner"));
     }
+
+    #[test]
+    fn generic_loop_runs_non_empty_setup_once_for_zero_trip() -> anyhow::Result<()> {
+        let workflow = lifecycle_workflow();
+        let runtime = test_runtime(workflow);
+        let mut plan = WorkflowExecutionPlan::new_hosted(
+            &runtime,
+            lifecycle_request(0, 3),
+            &["test.loop.lifecycle"],
+        )?;
+        let mut lifecycle = LifecycleHost::default();
+        {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            plan.execute_retained_with_host(&mut host)?;
+        }
+
+        assert_eq!(lifecycle.setup_runs, 1);
+        assert_eq!(lifecycle.body_runs, 0);
+        Ok(())
+    }
+
+    fn provisional_lifecycle_workflow() -> WorkflowSpec {
+        let mut workflow = lifecycle_workflow();
+        workflow.publication_mode =
+            onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions;
+        workflow.publication_mode_authored = true;
+        workflow.outputs.insert(
+            "answer".to_string(),
+            onnx_genai_metadata::WorkflowOutput {
+                contract: serde_yaml::from_str("{ dtype: int64, shape: [sequence] }")
+                    .expect("revision contract"),
+                role: onnx_genai_metadata::WorkflowOutputRole::Tensor,
+                family: onnx_genai_metadata::WorkflowOutputFamily::Revisions {
+                    version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
+                },
+                family_authored: true,
+                value_range: None,
+                stage: onnx_genai_metadata::OutputStage::PreAdapter,
+                media: None,
+            },
+        );
+        let onnx_genai_metadata::WorkflowStep::Loop { steps, .. } = &mut workflow.steps[0] else {
+            unreachable!("lifecycle workflow has one loop");
+        };
+        steps.push(onnx_genai_metadata::WorkflowStep::Emit {
+            value: "body.value".to_string(),
+            when: None,
+            valid_length: None,
+            output: "answer".to_string(),
+            stream: Some("main".to_string()),
+            mode: WorkflowEmitMode::Append,
+            axis: None,
+        });
+        workflow
+    }
+
+    #[test]
+    fn generic_provisional_transport_observes_revisions_then_exact_terminal_outcome()
+    -> anyhow::Result<()> {
+        let runtime = test_runtime(provisional_lifecycle_workflow());
+        let mut plan = WorkflowExecutionPlan::new_hosted(
+            &runtime,
+            lifecycle_request(1, 2),
+            &["test.loop.lifecycle"],
+        )?;
+        let mut lifecycle = LifecycleHost {
+            supports_publication: true,
+            ..Default::default()
+        };
+        {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            plan.execute_retained_with_host(&mut host)?;
+        }
+        assert_eq!(lifecycle.provisional.len(), 3);
+        assert!(
+            lifecycle
+                .provisional
+                .iter()
+                .all(|(output, stream, finality)| {
+                    output == "answer"
+                        && stream == "main"
+                        && *finality == OutputFinality::Provisional
+                }),
+            "the transport receives only typed provisional revisions before commit"
+        );
+        assert_eq!(lifecycle.terminal, ["commit"]);
+
+        let mut failing_plan = WorkflowExecutionPlan::new_hosted(
+            &runtime,
+            lifecycle_request(1, 1),
+            &["test.loop.lifecycle"],
+        )?;
+        lifecycle.provisional.clear();
+        lifecycle.terminal.clear();
+        lifecycle.abort_streams.clear();
+        lifecycle.fail_before_commit = true;
+        {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            let error = match failing_plan.execute_retained_with_host(&mut host) {
+                Ok(_) => panic!("pre-commit failure must abort provisional output"),
+                Err(error) => error,
+            };
+            assert!(format!("{error:#}").contains("injected lifecycle pre-commit failure"));
+        }
+        assert_eq!(lifecycle.provisional.len(), 1);
+        assert_eq!(lifecycle.terminal, ["abort"]);
+        assert_eq!(
+            lifecycle.abort_streams,
+            vec![OutputStreamBaseline {
+                output: "answer".to_string(),
+                stream: OutputStreamId("main".to_string()),
+                head: 0,
+                sequence: 0,
+                lineage: 0,
+                closed: false,
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn per_token_cursor_runs_setup_once_before_multiple_iterations() -> anyhow::Result<()> {
+        let workflow = lifecycle_workflow();
+        let runtime = test_runtime(workflow);
+        let mut lifecycle = LifecycleHost::default();
+        let mut cursor = {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            WorkflowGenerationCursor::start(
+                &runtime,
+                lifecycle_request(1, 2),
+                &["test.loop.lifecycle"],
+                &mut host,
+            )?
+        };
+        assert_eq!(lifecycle.setup_runs, 1);
+        assert_eq!(lifecycle.body_runs, 0);
+        {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            assert!(cursor.advance(&runtime, &mut host)?);
+            assert!(cursor.advance(&runtime, &mut host)?);
+            assert!(!cursor.advance(&runtime, &mut host)?);
+        }
+        assert_eq!(lifecycle.setup_runs, 1);
+        assert_eq!(lifecycle.body_runs, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn per_token_cursor_declines_typed_revisions_before_starting_a_turn() {
+        let mut workflow = lifecycle_workflow();
+        workflow.outputs.insert(
+            "answer".to_string(),
+            onnx_genai_metadata::WorkflowOutput {
+                contract: serde_yaml::from_str("{ dtype: int64, shape: [sequence] }")
+                    .expect("revision output contract"),
+                role: onnx_genai_metadata::WorkflowOutputRole::Tensor,
+                family: onnx_genai_metadata::WorkflowOutputFamily::Revisions {
+                    version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
+                },
+                family_authored: true,
+                value_range: None,
+                stage: onnx_genai_metadata::OutputStage::PreAdapter,
+                media: None,
+            },
+        );
+        let runtime = test_runtime(workflow);
+        let error = match WorkflowGenerationCursor::start(
+            &runtime,
+            lifecycle_request(1, 2),
+            &["test.loop.lifecycle"],
+            &mut None,
+        ) {
+            Ok(_) => panic!("the specialized cursor must decline typed revision publication"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("typed revision output publication needs the generic turn transaction"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn generic_path_executes_workflow_when_cursor_declines_topology() -> anyhow::Result<()> {
+        let mut workflow = lifecycle_workflow();
+        let prefix = workflow
+            .components
+            .get("setup")
+            .expect("fixture declares setup")
+            .clone();
+        workflow.components.insert("prefix".to_string(), prefix);
+        workflow.steps.insert(
+            0,
+            onnx_genai_metadata::WorkflowStep::Invoke {
+                component: "prefix".to_string(),
+                inputs: BTreeMap::from([("value".to_string(), "seed".to_string())]),
+                outputs: BTreeMap::from([("value".to_string(), "prefix.value".to_string())]),
+            },
+        );
+        let onnx_genai_metadata::WorkflowStep::Loop { setup, .. } =
+            workflow.steps.get_mut(1).expect("fixture loop remains")
+        else {
+            panic!("second step is the lifecycle loop");
+        };
+        let onnx_genai_metadata::WorkflowStep::Invoke { inputs, .. } =
+            setup.first_mut().expect("fixture setup remains")
+        else {
+            panic!("setup step is an invocation");
+        };
+        inputs.insert("value".to_string(), "prefix.value".to_string());
+
+        let runtime = test_runtime(workflow);
+        let error = match WorkflowGenerationCursor::start(
+            &runtime,
+            lifecycle_request(0, 3),
+            &["test.loop.lifecycle"],
+            &mut None,
+        ) {
+            Ok(_) => panic!("the per-token cursor must decline a multi-step root"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("one generation loop"),
+            "{error:#}"
+        );
+        assert!(
+            error.downcast_ref::<PerTokenCursorIneligible>().is_some(),
+            "a valid topology decline must remain distinct from package validation failure: {error:#}"
+        );
+
+        let mut plan = WorkflowExecutionPlan::new_hosted(
+            &runtime,
+            lifecycle_request(0, 3),
+            &["test.loop.lifecycle"],
+        )?;
+        let mut lifecycle = LifecycleHost::default();
+        {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            plan.execute_retained_with_host(&mut host)?;
+        }
+
+        assert_eq!(lifecycle.prefix_runs, 1);
+        assert_eq!(lifecycle.setup_runs, 1);
+        assert_eq!(lifecycle.body_runs, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn two_turn_split_state_commits_the_true_final_writer() -> anyhow::Result<()> {
+        let workflow: WorkflowSpec = serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  seed:
+    contract: { dtype: int64, shape: [1] }
+    role: { kind: opaque }
+    source: { kind: application, name: seed }
+  keep_running:
+    contract: { dtype: bool, shape: [] }
+    role: { kind: opaque }
+    source: { kind: literal }
+    required: false
+    default: true
+  one_iteration:
+    contract: { dtype: int64, shape: [] }
+    role: { kind: opaque }
+    source: { kind: literal }
+    required: false
+    default: 1
+outputs: {}
+components:
+  prefill:
+    implementation: { kind: binding }
+    contract: { id: test.state.advance, version: "1" }
+    ports:
+      inputs:
+        state: { dtype: int64, shape: [1] }
+      outputs:
+        state: { dtype: int64, shape: [1] }
+  decode:
+    implementation: { kind: binding }
+    contract: { id: test.state.advance, version: "1" }
+    ports:
+      inputs:
+        state: { dtype: int64, shape: [1] }
+      outputs:
+        state: { dtype: int64, shape: [1] }
+state:
+  accumulator:
+    contract: { dtype: int64, shape: [1] }
+    scope: session
+    initializer: seed
+    recurrence: { kind: invariant }
+    management: runtime
+    release_boundary: session
+steps:
+  - kind: loop
+    steps:
+      - kind: invoke
+        component: prefill
+        inputs: { state: accumulator }
+        outputs: { state: prefill.next }
+    continue_when: keep_running
+    max_iterations: one_iteration
+    carried:
+      - { cell: accumulator, next: prefill.next }
+  - kind: loop
+    steps:
+      - kind: invoke
+        component: decode
+        inputs: { state: accumulator }
+        outputs: { state: decode.next }
+    continue_when: keep_running
+    max_iterations: one_iteration
+    carried:
+      - { cell: accumulator, next: decode.next }
+"#,
+        )?;
+        let runtime = test_runtime(workflow);
+        let WorkflowNode::Sequence { nodes } = &runtime.plan.compiled_workflow.graph else {
+            panic!("workflow lowers to a sequence");
+        };
+        let WorkflowNode::Loop {
+            carried: prefill, ..
+        } = &nodes[0]
+        else {
+            panic!("first phase lowers to a loop");
+        };
+        let WorkflowNode::Loop {
+            carried: decode, ..
+        } = &nodes[1]
+        else {
+            panic!("second phase lowers to a loop");
+        };
+        assert_eq!(prefill[0].current, "seed");
+        assert_eq!(
+            prefill[0].current_source,
+            onnx_genai_metadata::WorkflowLoopCarrySource::Initializer
+        );
+        assert_eq!(decode[0].current, "accumulator");
+        assert_eq!(
+            decode[0].current_source,
+            onnx_genai_metadata::WorkflowLoopCarrySource::PriorState
+        );
+
+        let request = PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(
+            Vec::new(),
+        )))
+        .with_input(
+            "seed",
+            Value::from_slice_i64(&[0], &[1]).expect("external seed"),
+        )
+        .with_session_id("two-phase");
+        let mut plan =
+            WorkflowExecutionPlan::new_hosted(&runtime, request, &["test.state.advance"])?;
+        let mut host = StateAdvanceHost;
+        let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+        plan.execute_retained_with_host(&mut hosted)?;
+
+        let state = runtime.worker.session_state.borrow();
+        let committed = state
+            .get(&("two-phase".to_string(), "accumulator".to_string()))
+            .context("session state was committed")?;
+        assert_eq!(
+            committed.to_vec_i64()?,
+            vec![11],
+            "the decode loop advances the prefill result and owns the committed final value"
+        );
+        drop(state);
+
+        let request = PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(
+            Vec::new(),
+        )))
+        .with_input(
+            "seed",
+            Value::from_slice_i64(&[100], &[1]).expect("new external seed"),
+        )
+        .with_session_id("two-phase");
+        let mut plan =
+            WorkflowExecutionPlan::new_hosted(&runtime, request, &["test.state.advance"])?;
+        let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+        plan.execute_retained_with_host(&mut hosted)?;
+        let state = runtime.worker.session_state.borrow();
+        let committed = state
+            .get(&("two-phase".to_string(), "accumulator".to_string()))
+            .context("continued session state was committed")?;
+        assert_eq!(
+            committed.to_vec_i64()?,
+            vec![22],
+            "the next turn restores once, then each sequential loop carries the preceding update"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_turn_conversion_restores_the_persisted_state_representation() -> anyhow::Result<()> {
+        let workflow: WorkflowSpec = serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  seed:
+    contract: { dtype: float32, shape: [1] }
+    role: { kind: opaque }
+    source: { kind: application, name: seed }
+outputs: {}
+components:
+  prefill:
+    implementation: { kind: binding }
+    contract: { id: test.state.f32, version: "1" }
+    ports:
+      inputs: { state: { dtype: float32, shape: [1] } }
+      outputs: { state: { dtype: float32, shape: [1] } }
+  compact:
+    implementation: { kind: binding }
+    contract: { id: test.state.f32-to-f16, version: "1" }
+    ports:
+      inputs: { state: { dtype: float32, shape: [1] } }
+      outputs: { state: { dtype: float16, shape: [1] } }
+  decode:
+    implementation: { kind: binding }
+    contract: { id: test.state.f16, version: "1" }
+    ports:
+      inputs: { state: { dtype: float16, shape: [1] } }
+      outputs: { state: { dtype: float16, shape: [1] } }
+  restore:
+    implementation: { kind: binding }
+    contract: { id: test.state.f16-to-f32, version: "1" }
+    ports:
+      inputs: { state: { dtype: float16, shape: [1] } }
+      outputs: { state: { dtype: float32, shape: [1] } }
+state:
+  memory:
+    contract: { dtype: float32, shape: [1] }
+    scope: session
+    initializer: seed
+    recurrence: { kind: invariant }
+    management: runtime
+    release_boundary: session
+    service_group: memory
+serving:
+  active: active
+  done: done
+  state_service:
+    groups:
+      memory:
+        kind: recurrent
+        layout: scalar
+        update: { kind: replace }
+        ports:
+          prefill: { memory: { input: state, output: state } }
+          compact: { memory: { input: state, output: state } }
+          decode: { memory: { input: state, output: state } }
+          restore: { memory: { input: state, output: state } }
+steps:
+  - kind: invoke
+    component: prefill
+    inputs: { state: seed }
+    outputs: { state: prefill.next }
+  - kind: invoke
+    component: compact
+    inputs: { state: prefill.next }
+    outputs: { state: compact.next }
+  - kind: invoke
+    component: decode
+    inputs: { state: compact.next }
+    outputs: { state: decode.next }
+  - kind: invoke
+    component: restore
+    inputs: { state: decode.next }
+    outputs: { state: restore.next }
+"#,
+        )?;
+        let runtime = test_runtime(workflow);
+
+        #[derive(Default)]
+        struct ConversionHost {
+            prefill_inputs: Vec<onnx_genai_ort::DataType>,
+            decode_inputs: Vec<onnx_genai_ort::DataType>,
+        }
+
+        impl WorkflowNodeHost for ConversionHost {
+            fn hosted_contracts(&self) -> &'static [&'static str] {
+                &[
+                    "test.state.f32",
+                    "test.state.f32-to-f16",
+                    "test.state.f16",
+                    "test.state.f16-to-f32",
+                ]
+            }
+
+            fn execute_contract_node(
+                &mut self,
+                request: WorkflowNodeRequest<'_>,
+            ) -> anyhow::Result<bool> {
+                let input = request
+                    .inputs
+                    .get("state")
+                    .context("conversion state input is bound")?;
+                let value = request
+                    .values
+                    .get(input)
+                    .context("conversion state input is available")?;
+                let output = request
+                    .outputs
+                    .get("state")
+                    .context("conversion state output is bound")?;
+                let next = match request.component {
+                    "prefill" => {
+                        self.prefill_inputs.push(value.dtype());
+                        Value::from_slice_f32(&[value.to_vec_f32()?[0] + 1.0], &[1])?
+                    }
+                    "compact" => {
+                        let bits = match value.to_vec_f32()?[0] as i64 {
+                            2 => 0x4000,
+                            3 => 0x4200,
+                            other => anyhow::bail!("unexpected compact input {other}"),
+                        };
+                        Value::from_vec_f16_bits(vec![bits], &[1])?
+                    }
+                    "decode" => {
+                        self.decode_inputs.push(value.dtype());
+                        Value::from_vec_f16_bits(value.to_vec_f16_bits()?, &[1])?
+                    }
+                    "restore" => {
+                        let value = match value.to_vec_f16_bits()?[0] {
+                            0x4000 => 2.0,
+                            0x4200 => 3.0,
+                            other => anyhow::bail!("unexpected restore input {other:#x}"),
+                        };
+                        Value::from_slice_f32(&[value], &[1])?
+                    }
+                    component => anyhow::bail!("unexpected conversion component '{component}'"),
+                };
+                request.values.insert(output.clone(), next);
+                Ok(true)
+            }
+        }
+
+        let mut host = ConversionHost::default();
+        for (seed, expected) in [(1.0, 2.0), (99.0, 3.0)] {
+            let request = PipelineGenerateRequest::new(GenerateRequest::new(
+                GeneratePrompt::TokenIds(Vec::new()),
+            ))
+            .with_input("seed", Value::from_slice_f32(&[seed], &[1])?)
+            .with_session_id("conversion-session");
+            let mut plan =
+                WorkflowExecutionPlan::new_hosted(&runtime, request, host.hosted_contracts())?;
+            let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+            plan.execute_retained_with_host(&mut hosted)?;
+            let state = runtime.worker.session_state.borrow();
+            let committed = state
+                .get(&("conversion-session".to_string(), "memory".to_string()))
+                .context("converted session state commits")?;
+            assert_eq!(committed.dtype(), onnx_genai_ort::DataType::Float32);
+            assert_eq!(committed.to_vec_f32()?, vec![expected]);
+        }
+        assert_eq!(
+            host.prefill_inputs,
+            vec![
+                onnx_genai_ort::DataType::Float32,
+                onnx_genai_ort::DataType::Float32
+            ]
+        );
+        assert_eq!(
+            host.decode_inputs,
+            vec![
+                onnx_genai_ort::DataType::Float16,
+                onnx_genai_ort::DataType::Float16
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn branch_phi_commits_the_selected_same_writer_value() -> anyhow::Result<()> {
+        let workflow: WorkflowSpec = serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  state:
+    contract: { dtype: int64, shape: [1] }
+    role: { kind: opaque }
+    source: { kind: application, name: state }
+  choose:
+    contract: { dtype: int64, shape: [] }
+    role: { kind: opaque }
+    source: { kind: application, name: choose }
+  add_zero:
+    contract: { dtype: int64, shape: [] }
+    role: { kind: opaque }
+    source: { kind: application, name: add_zero }
+  add_ten:
+    contract: { dtype: int64, shape: [] }
+    role: { kind: opaque }
+    source: { kind: application, name: add_ten }
+  active:
+    contract: { dtype: bool, shape: [] }
+    role: { kind: opaque }
+    source: { kind: literal }
+    required: false
+    default: true
+  done:
+    contract: { dtype: bool, shape: [] }
+    role: { kind: opaque }
+    source: { kind: literal }
+    required: false
+    default: false
+outputs: {}
+components:
+  writer:
+    implementation: { kind: binding }
+    contract: { id: test.state.branch_advance, version: "1" }
+    ports:
+      inputs:
+        state: { dtype: int64, shape: [1] }
+        increment: { dtype: int64, shape: [] }
+      outputs:
+        state: { dtype: int64, shape: [1] }
+state:
+  accumulator:
+    contract: { dtype: int64, shape: [1] }
+    scope: session
+    initializer: state
+    recurrence: { kind: invariant }
+    service_group: memory
+    management: runtime
+    release_boundary: session
+serving:
+  active: active
+  done: done
+  state_service:
+    groups:
+      memory:
+        kind: recurrent
+        layout: scalar
+        update: { kind: replace }
+        ports:
+          writer:
+            accumulator: { input: state, output: state }
+steps:
+  - kind: branch
+    predicate: choose
+    cases:
+      "0":
+        kind: invoke
+        component: writer
+        inputs: { state: state, increment: add_zero }
+        outputs: { state: branch.next }
+      "1":
+        kind: invoke
+        component: writer
+        inputs: { state: state, increment: add_ten }
+        outputs: { state: branch.next }
+    outputs:
+      joined.accumulator:
+        cases: { "0": branch.next, "1": branch.next }
+"#,
+        )?;
+        let runtime = test_runtime(workflow);
+        let request = PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(
+            Vec::new(),
+        )))
+        .with_input(
+            "state",
+            Value::from_slice_i64(&[5], &[1]).expect("initial state"),
+        )
+        .with_input(
+            "choose",
+            Value::from_slice_i64(&[1], &[]).expect("selected branch"),
+        )
+        .with_input(
+            "add_zero",
+            Value::from_slice_i64(&[0], &[]).expect("zero increment"),
+        )
+        .with_input(
+            "add_ten",
+            Value::from_slice_i64(&[10], &[]).expect("selected increment"),
+        )
+        .with_session_id("branch-phi");
+        let mut plan =
+            WorkflowExecutionPlan::new_hosted(&runtime, request, &["test.state.branch_advance"])?;
+        let mut host = BranchStateAdvanceHost;
+        let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+        plan.execute_retained_with_host(&mut hosted)?;
+
+        let state = runtime.worker.session_state.borrow();
+        let committed = state
+            .get(&("branch-phi".to_string(), "accumulator".to_string()))
+            .context("selected branch value was committed through its phi")?;
+        assert_eq!(committed.to_vec_i64()?, vec![15]);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -6694,12 +8264,10 @@ ports:
   outputs:
     good:
       dtype: int64
-      rank: 1
       shape: [batch]
       batch_layout: { kind: request_aligned, axis: 0 }
     packed:
       dtype: int64
-      rank: 1
       shape: [items]
       batch_layout:
         kind: token_packed
@@ -6708,12 +8276,10 @@ ports:
           - { offsets: packed_offsets, owner: packed_owner }
     packed_offsets:
       dtype: int64
-      rank: 1
       shape: [offset_rows]
       batch_layout: { kind: shared }
     packed_owner:
       dtype: int64
-      rank: 1
       shape: [owner_rows]
       batch_layout: { kind: shared }
 "#,
@@ -6914,6 +8480,7 @@ impl WorkflowRuntime {
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
+        publication_journal: &mut Option<OutputPublicationJournal>,
         telemetry: &mut WorkflowRunTelemetry,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<usize> {
@@ -6935,6 +8502,7 @@ impl WorkflowRuntime {
             emit_counts,
             final_state_refs,
             component_overrides,
+            publication_journal,
             telemetry,
             host,
         )?;
@@ -6943,14 +8511,34 @@ impl WorkflowRuntime {
             let state = workflow.state.get(&carry.cell).with_context(|| {
                 format!("workflow loop carries undeclared state '{}'", carry.cell)
             })?;
-            let seeded = values
-                .get(&session_state_value_name(&carry.cell))
-                .or_else(|| values.get(&carry.current));
-            // A runtime-managed cell whose seed the package never materializes
-            // is the service's buffer, not an SSA value. Recording the
-            // reference is what the interpreter owes it; inventing a tensor
-            // would be a second answer about where that buffer lives.
-            if seeded.is_none() && state.management == onnx_genai_metadata::StateManagement::Runtime
+            let restored = values.get(&session_state_value_name(&carry.cell));
+            let current = values.get(&carry.current);
+            let setup_value = values.get(&carry.body_input);
+            let seeded = match carry.current_source {
+                onnx_genai_metadata::WorkflowLoopCarrySource::PriorState => current.or(setup_value),
+                onnx_genai_metadata::WorkflowLoopCarrySource::Initializer
+                | onnx_genai_metadata::WorkflowLoopCarrySource::Explicit => {
+                    restored.or(current).or(setup_value)
+                }
+            };
+            // A state whose resolved readers include a component port is
+            // supplied by the service at that port when it has no materialized
+            // source.  Storage policy is irrelevant: the binding plan is the
+            // only authority for this decision.
+            if seeded.is_none()
+                && self
+                    .plan
+                    .compiled_workflow
+                    .state_plan
+                    .cell(&carry.cell)
+                    .is_some_and(|cell| {
+                        cell.readers.iter().any(|reader| {
+                            matches!(
+                                reader,
+                                onnx_genai_metadata::StateReader::ComponentPort { .. }
+                            )
+                        })
+                    })
             {
                 final_state_refs.insert(carry.cell.clone(), carry.next.clone());
                 continue;
@@ -7002,6 +8590,7 @@ impl WorkflowRuntime {
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
+        publication_journal: &mut Option<OutputPublicationJournal>,
         telemetry: &mut WorkflowRunTelemetry,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<bool> {
@@ -7015,6 +8604,11 @@ impl WorkflowRuntime {
         } = plan;
         let carried = *carried;
         let emits_generation_tokens = loop_emits_generation_tokens(body, workflow);
+        if host.as_deref_mut().is_some_and(|host| {
+            !matches!(host.loop_host_outcome(), WorkflowLoopHostOutcome::Continue)
+        }) {
+            return Ok(false);
+        }
         // Skipping the liveness read is an optimization for a predicate the
         // caller said it does not care about: with `stop_on_eos` off, an
         // in-graph EOS predicate cannot end the loop, so reading it every step
@@ -7075,6 +8669,7 @@ impl WorkflowRuntime {
             emit_counts,
             final_state_refs,
             component_overrides,
+            publication_journal,
             telemetry,
             host,
         )?;
@@ -7161,49 +8756,83 @@ pub(crate) struct WorkflowGenerationCursor {
     emit_counts: HashMap<String, usize>,
     final_state_refs: HashMap<String, String>,
     component_overrides: HashMap<String, String>,
+    publication_journal: Option<OutputPublicationJournal>,
     telemetry: WorkflowRunTelemetry,
     limit: usize,
     index: usize,
 }
 
+/// A valid workflow that cannot use the optimized suspend-after-one-token
+/// cursor. This is distinct from an invalid package: callers execute it with
+/// the complete generic workflow interpreter instead.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the prioritized per-token cursor is ineligible: {reason}; execute the package through \
+     the generic workflow path"
+)]
+pub(crate) struct PerTokenCursorIneligible {
+    reason: &'static str,
+}
+
+impl PerTokenCursorIneligible {
+    pub(crate) fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+}
+
 impl WorkflowGenerationCursor {
-    /// Bind a request and run the loop's setup, stopping before its first
-    /// iteration.
+    /// Check the structural restrictions of the optimized cursor before an
+    /// engine mutates a session for prefill. A decline is safe to reroute.
+    pub(crate) fn validate_per_token_capability(
+        runtime: &WorkflowRuntime,
+    ) -> Result<(), PerTokenCursorIneligible> {
+        if runtime.plan.adapter_service.is_some() {
+            return Err(PerTokenCursorIneligible::new(
+                "adapter selection is prepared once for a complete pass",
+            ));
+        }
+        if !runtime.backend.execution_islands.is_empty() {
+            return Err(PerTokenCursorIneligible::new(
+                "fused execution islands establish whole-pass bindings",
+            ));
+        }
+        if runtime
+            .plan
+            .workflow
+            .state
+            .values()
+            .any(|cell| cell.scope == onnx_genai_metadata::WorkflowStateScope::Session)
+        {
+            return Err(PerTokenCursorIneligible::new(
+                "session-scoped workflow state is published when a pass completes",
+            ));
+        }
+        if runtime.plan.workflow.outputs.values().any(|output| {
+            matches!(
+                output.family,
+                onnx_genai_metadata::WorkflowOutputFamily::Revisions { .. }
+            )
+        }) {
+            return Err(PerTokenCursorIneligible::new(
+                "typed revision output publication needs the generic turn transaction",
+            ));
+        }
+        let loop_node = sole_generation_loop(&runtime.plan.compiled_workflow.graph)
+            .map_err(|_| PerTokenCursorIneligible::new("the root is not one generation loop"))?;
+        validate_per_token_suspend_boundaries(loop_node, &runtime.plan.workflow)?;
+        Ok(())
+    }
+
+    /// Bind a request and run the loop's authored setup exactly once, stopping
+    /// before its first iteration.
     pub(crate) fn start(
         runtime: &WorkflowRuntime,
         request: PipelineGenerateRequest,
         hosted: &[&str],
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            runtime.plan.adapter_service.is_none(),
-            "the per-token drive cannot advance a package that selects adapters per request; \
-             adapter selection is prepared once for a whole pass"
-        );
-        anyhow::ensure!(
-            runtime.backend.execution_islands.is_empty(),
-            "the per-token drive cannot advance a package with fused execution islands, whose \
-             bindings are established for a whole pass"
-        );
-        anyhow::ensure!(
-            !runtime
-                .plan
-                .workflow
-                .state
-                .values()
-                .any(|cell| cell.scope == onnx_genai_metadata::WorkflowStateScope::Session),
-            "the per-token drive cannot advance a package with session-scoped workflow state, \
-             which is published when a pass completes"
-        );
+        Self::validate_per_token_capability(runtime)?;
         let loop_node = sole_generation_loop(&runtime.plan.compiled_workflow.graph)?;
-        anyhow::ensure!(
-            matches!(
-                loop_plan(loop_node)?.setup,
-                WorkflowNode::Sequence { nodes } if nodes.is_empty()
-            ),
-            "the per-token drive cannot advance a loop with setup steps: setup runs once per \
-             pass, and a drive that hands out one iteration at a time has no pass to run it in"
-        );
         let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
         let mut telemetry = WorkflowRunTelemetry::started(plan.max_iterations_only);
         let mut values = std::mem::take(&mut plan.values);
@@ -7224,6 +8853,7 @@ impl WorkflowGenerationCursor {
             &mut emit_counts,
             &mut final_state_refs,
             &component_overrides,
+            &mut None,
             &mut telemetry,
             host,
         )?;
@@ -7235,6 +8865,7 @@ impl WorkflowGenerationCursor {
             emit_counts,
             final_state_refs,
             component_overrides,
+            publication_journal: None,
             telemetry,
             limit,
             index: 0,
@@ -7263,6 +8894,7 @@ impl WorkflowGenerationCursor {
             &mut self.emit_counts,
             &mut self.final_state_refs,
             &self.component_overrides,
+            &mut self.publication_journal,
             &mut self.telemetry,
             host,
         )?;
@@ -7303,7 +8935,8 @@ impl WorkflowGenerationCursor {
             return Ok(Vec::new());
         };
         let values = clone_pipeline_tensors(&self.values)?;
-        let outputs = runtime.package_outputs(values, self.telemetry.row_outputs.clone())?;
+        let outputs =
+            runtime.package_outputs(values, self.telemetry.row_outputs.clone(), Vec::new());
         let rows = outputs.rows(&output);
         let Some(value) = outputs
             .aggregate(&output)
@@ -7337,7 +8970,8 @@ impl WorkflowGenerationCursor {
             return Ok(Vec::new());
         };
         let values = clone_pipeline_tensors(&self.values)?;
-        let outputs = runtime.package_outputs(values, self.telemetry.row_outputs.clone())?;
+        let outputs =
+            runtime.package_outputs(values, self.telemetry.row_outputs.clone(), Vec::new());
         let rows = outputs.rows(&output);
         if rows.is_empty() {
             return Ok(outputs
@@ -7352,6 +8986,182 @@ impl WorkflowGenerationCursor {
             emitted[row] = value.to_vec_i64()?;
         }
         Ok(emitted)
+    }
+
+    /// Restore one row's staged token output to the committed head captured
+    /// when that row was admitted. The continuous-batch host calls this only
+    /// after the current interpreter iteration returns, so the host never
+    /// reaches into a cursor while that cursor is executing.
+    pub(crate) fn restore_emitted_token_row(
+        &mut self,
+        runtime: &WorkflowRuntime,
+        row: usize,
+        committed_head: usize,
+    ) -> anyhow::Result<()> {
+        let output = runtime
+            .plan
+            .workflow
+            .outputs
+            .iter()
+            .find(|(_, output)| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens)
+            .map(|(name, _)| name)
+            .context("continuous-batch rollback requires one tokens workflow output")?;
+        let Some(row_output) = self
+            .telemetry
+            .row_outputs
+            .get(output)
+            .and_then(|rows| rows.get(row))
+            .cloned()
+        else {
+            anyhow::ensure!(
+                committed_head == 0,
+                "cannot restore continuous output row {row} to committed head {committed_head}: \
+                 the authored output has no row journal"
+            );
+            return Ok(());
+        };
+        if committed_head == 0 {
+            self.values.remove(&row_output);
+            return Ok(());
+        }
+        let mut tokens = self
+            .values
+            .get(&row_output)
+            .with_context(|| {
+                format!(
+                    "cannot restore continuous output row {row}: journal value '{row_output}' \
+                     is missing"
+                )
+            })?
+            .to_vec_i64()
+            .with_context(|| {
+                format!(
+                    "cannot restore continuous output row {row}: journal value '{row_output}' \
+                     is not host int64"
+                )
+            })?;
+        anyhow::ensure!(
+            committed_head <= tokens.len(),
+            "cannot restore continuous output row {row} to committed head {committed_head}: \
+             journal contains only {} tokens",
+            tokens.len()
+        );
+        tokens.truncate(committed_head);
+        let committed_head = i64::try_from(committed_head)
+            .context("continuous output committed head exceeds int64")?;
+        self.values.insert(
+            row_output,
+            Value::from_slice_i64(&tokens, &[committed_head])?,
+        );
+        Ok(())
+    }
+}
+
+/// A cursor gives the scheduler control only between complete decode-policy
+/// pairs. Check that boundary structurally before setup can issue a decoder
+/// forward pass, rather than discovering an unsuspendable host mid-turn.
+fn validate_per_token_suspend_boundaries(
+    loop_node: &WorkflowNode,
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+) -> Result<(), PerTokenCursorIneligible> {
+    let WorkflowNode::Loop { setup, body, .. } = loop_node else {
+        return Err(PerTokenCursorIneligible::new(
+            "the root is not one generation loop",
+        ));
+    };
+    if contains_decode_core_contract(setup, workflow) {
+        return Err(PerTokenCursorIneligible::new(
+            "loop setup contains a decode or token-policy step and cannot suspend before its first iteration",
+        ));
+    }
+    let WorkflowNode::Sequence { nodes } = body.as_ref() else {
+        return Err(PerTokenCursorIneligible::new(
+            "the generation-loop body is not a flat decode-policy sequence",
+        ));
+    };
+
+    let mut decoder_pending = false;
+    for node in nodes {
+        match node {
+            WorkflowNode::Invoke { component, .. } => {
+                let contract = workflow
+                    .components
+                    .get(component)
+                    .and_then(|component| component.contract.as_ref())
+                    .map(|contract| contract.id.as_str());
+                match contract {
+                    Some(onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT) => {
+                        if decoder_pending {
+                            return Err(PerTokenCursorIneligible::new(
+                                "the generation loop issues another decoder step before its token policy",
+                            ));
+                        }
+                        decoder_pending = true;
+                    }
+                    Some(onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT) => {
+                        if !decoder_pending {
+                            return Err(PerTokenCursorIneligible::new(
+                                "the generation loop applies a token policy without a preceding decoder step",
+                            ));
+                        }
+                        decoder_pending = false;
+                    }
+                    _ => {}
+                }
+            }
+            WorkflowNode::Emit { .. } | WorkflowNode::Transfer { .. } => {}
+            WorkflowNode::Sequence { .. }
+            | WorkflowNode::Loop { .. }
+            | WorkflowNode::Branch { .. }
+            | WorkflowNode::ExecutionIsland { .. } => {
+                return Err(PerTokenCursorIneligible::new(
+                    "the generation-loop body has nested control flow between scheduler boundaries",
+                ));
+            }
+        }
+    }
+    if decoder_pending {
+        return Err(PerTokenCursorIneligible::new(
+            "the generation-loop body ends with a decoder step whose token policy is deferred",
+        ));
+    }
+    Ok(())
+}
+
+fn contains_decode_core_contract(
+    node: &WorkflowNode,
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+) -> bool {
+    match node {
+        WorkflowNode::Sequence { nodes } => nodes
+            .iter()
+            .any(|node| contains_decode_core_contract(node, workflow)),
+        WorkflowNode::Invoke { component, .. } => workflow
+            .components
+            .get(component)
+            .and_then(|component| component.contract.as_ref())
+            .is_some_and(|contract| {
+                matches!(
+                    contract.id.as_str(),
+                    onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT
+                        | onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT
+                )
+            }),
+        WorkflowNode::Loop { setup, body, .. } => {
+            contains_decode_core_contract(setup, workflow)
+                || contains_decode_core_contract(body, workflow)
+        }
+        WorkflowNode::Branch { cases, default, .. } => {
+            cases
+                .values()
+                .any(|case| contains_decode_core_contract(case, workflow))
+                || default
+                    .as_deref()
+                    .is_some_and(|node| contains_decode_core_contract(node, workflow))
+        }
+        WorkflowNode::Emit { .. }
+        | WorkflowNode::Transfer { .. }
+        | WorkflowNode::ExecutionIsland { .. } => false,
     }
 }
 

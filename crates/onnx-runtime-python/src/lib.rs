@@ -44,6 +44,8 @@ mod dlpack;
 mod eager;
 #[cfg(feature = "genai")]
 mod genai;
+#[cfg(feature = "genai")]
+mod thread_owned;
 
 use std::sync::Mutex;
 
@@ -63,12 +65,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// first. CUDA is a runtime fact: it requires a loadable driver and wheel/system
 /// libraries plus a usable device.
 fn available_providers() -> Vec<&'static str> {
-    let mut providers = Vec::new();
     #[cfg(feature = "cuda")]
-    if cuda_runtime_available() {
-        providers.push("CUDAExecutionProvider");
-    }
-    providers.push("CPUExecutionProvider");
+    let providers = if cuda_runtime_available() {
+        vec!["CUDAExecutionProvider", "CPUExecutionProvider"]
+    } else {
+        vec!["CPUExecutionProvider"]
+    };
+    #[cfg(not(feature = "cuda"))]
+    let providers = vec!["CPUExecutionProvider"];
     providers
 }
 

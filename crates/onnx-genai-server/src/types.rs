@@ -495,7 +495,7 @@ pub struct AudioTranscriptionResponse {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ChatMessageToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -503,7 +503,7 @@ pub struct ChatMessageToolCall {
     pub function: ChatMessageToolCallFunction,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ChatMessageToolCallFunction {
     pub name: String,
     pub arguments: String,
@@ -604,6 +604,8 @@ pub struct ChatCompletionResponse {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_token_count: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub workflow_outputs: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -649,6 +651,8 @@ pub struct CompletionResponse {
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     pub usage: Usage,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub workflow_outputs: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

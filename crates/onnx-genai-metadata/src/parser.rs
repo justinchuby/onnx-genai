@@ -82,9 +82,14 @@ impl SpeculatorDescriptor {
                 SpeculatorProposerStatus::NotYetSupported(SpeculatorProposerKind::PEagle)
             }
             ProposalType::Mtp => Self::resolve_mtp(model_dir, &config),
-            ProposalType::DFlash => {
-                SpeculatorProposerStatus::NotYetSupported(SpeculatorProposerKind::DFlash)
-            }
+            ProposalType::DFlash => SpeculatorProposerStatus::Unknown(
+                "legacy `proposal_type: dflash` is not an executable authority. Re-export one \
+                 canonical `speculative.proposal_execution: { kind: dflash_flat_block, version: \
+                 \"1\" | \"2\", ... }` contract with explicit target-hidden provenance, block \
+                 layout, probabilities, shared initializers, verifier outputs, and accepted-prefix \
+                 state participants"
+                    .into(),
+            ),
             // A legacy `shared_kv` speculator no longer selects a runtime path.
             // Borrowed-KV drafting is declared by the package's
             // `speculative.proposal_execution: {kind: chained}` contract and
@@ -272,10 +277,12 @@ fn preparse(content: &str) -> Result<(), crate::MetadataError> {
 
 fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
     reject_retired_model_io(document)?;
+    reject_retired_top_level_tokens(document)?;
+    reject_invalid_tensor_contract_shapes(document, String::new())?;
     let declared = crate::version::declared_in(document).map_err(crate::MetadataError::Parse)?;
-    crate::version::gate(declared)
-        .map(|_| ())
-        .map_err(crate::MetadataError::Parse)?;
+    let version = crate::version::gate(declared).map_err(crate::MetadataError::Parse)?;
+    gate_output_protocol_features(document, version)?;
+    reject_retired_streaming_emit(document)?;
     // After the version, deliberately. The flat packed spelling is a reshape
     // within the v1 line, so refusing it presumes the document belongs to that
     // line. A document from a version this build does not support is refused for
@@ -289,6 +296,280 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     // retired spelling is only ever found by recognizing its shape.
     reject_flat_token_packed(document, String::new())
         .and_then(|_| reject_retired_batching_hints(document))
+        .and_then(|_| reject_retired_capability_declarations(document))
+}
+
+/// Refuse the retired capability lists with their true migration path.
+///
+/// Core schema conformance is selected by `schema_version`, and optional
+/// semantic modules already name their exact identity/version at the typed
+/// declaration that owns them. Keeping a second list would allow those two
+/// answers to disagree and would incorrectly make runtime optimizations look
+/// package-required.
+fn reject_retired_capability_declarations(
+    document: &serde_yaml::Value,
+) -> Result<(), crate::MetadataError> {
+    if document.get("required_capabilities").is_some() {
+        return Err(crate::MetadataError::Parse(
+            "`required_capabilities` is retired. Core SSA, shape, state, output, and validation \
+             semantics are selected by `schema_version`, not negotiated flags. Declare an \
+             optional semantic module only at its typed identity/version surface (for example \
+             `package.tool_protocol`, a component contract/adapter ABI, or `speculative`). \
+             Runtime optimizations such as batching are never package requirements."
+                .to_string(),
+        ));
+    }
+    if document
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("workflow"))
+        .and_then(|workflow| workflow.get("manifest"))
+        .and_then(|manifest| manifest.get("capabilities"))
+        .is_some()
+    {
+        return Err(crate::MetadataError::Parse(
+            "`pipeline.workflow.manifest.capabilities` is retired. The typed workflow itself \
+             defines core conformance; remove this duplicate list. Declare optional semantic \
+             extensions at their owning identity/version field, never as a workflow flag."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply the canonical output-protocol version gate to the untyped document.
+///
+/// This runs before deserialization so authored presence is still observable:
+/// a legacy output without `family` defaults to materialized, while an explicit
+/// family, stream, retract, or finalize cannot smuggle v1.5 semantics into an
+/// older version.
+fn gate_output_protocol_features(
+    document: &serde_yaml::Value,
+    version: crate::version::SchemaVersion,
+) -> Result<(), crate::MetadataError> {
+    let workflow = document
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("workflow"));
+    if let Some(workflow) = workflow {
+        let publication_mode = workflow.get("publication_mode");
+        crate::version::gate_feature_field(
+            version,
+            crate::version::SchemaFeature::PublicationMode,
+            "pipeline.workflow.publication_mode",
+            publication_mode.is_some_and(|mode| !mode.is_null()),
+        )
+        .map_err(crate::MetadataError::Parse)?;
+    }
+    if let Some(outputs) = document
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("workflow"))
+        .and_then(|workflow| workflow.get("outputs"))
+        .and_then(serde_yaml::Value::as_mapping)
+    {
+        for (name, output) in outputs {
+            let name = name.as_str().unwrap_or("?");
+            let family = output.get("family");
+            let authored = if version < crate::version::OUTPUT_PROTOCOL_SCHEMA_VERSION {
+                family.is_some()
+            } else {
+                family.is_some_and(|family| !family.is_null())
+            };
+            crate::version::gate_feature_field(
+                version,
+                crate::version::SchemaFeature::OutputProtocols,
+                &format!("pipeline.workflow.outputs.{name}.family"),
+                authored,
+            )
+            .map_err(crate::MetadataError::Parse)?;
+        }
+    }
+
+    fn walk_emits(
+        value: &serde_yaml::Value,
+        version: crate::version::SchemaVersion,
+        path: &str,
+    ) -> Result<(), crate::MetadataError> {
+        match value {
+            serde_yaml::Value::Mapping(mapping) => {
+                let is_emit = mapping
+                    .get(serde_yaml::Value::from("kind"))
+                    .and_then(serde_yaml::Value::as_str)
+                    == Some("emit");
+                if is_emit {
+                    if mapping.contains_key(serde_yaml::Value::from("stream")) {
+                        crate::version::gate_feature_use(
+                            version,
+                            crate::version::SchemaFeature::OutputProtocols,
+                            &format!("{path}.stream"),
+                        )
+                        .map_err(crate::MetadataError::Parse)?;
+                    }
+                    if mapping
+                        .get(serde_yaml::Value::from("mode"))
+                        .and_then(serde_yaml::Value::as_str)
+                        .is_some_and(|mode| matches!(mode, "retract" | "finalize"))
+                    {
+                        crate::version::gate_feature_use(
+                            version,
+                            crate::version::SchemaFeature::OutputProtocols,
+                            &format!("{path}.mode"),
+                        )
+                        .map_err(crate::MetadataError::Parse)?;
+                    }
+                }
+                for (key, child) in mapping {
+                    let key = key.as_str().unwrap_or("?");
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk_emits(child, version, &child_path)?;
+                }
+            }
+            serde_yaml::Value::Sequence(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    walk_emits(child, version, &format!("{path}[{index}]"))?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    if let Some(steps) = document
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("workflow"))
+        .and_then(|workflow| workflow.get("steps"))
+    {
+        walk_emits(steps, version, "pipeline.workflow.steps")?;
+    }
+    Ok(())
+}
+
+/// `streaming_emit` was a redundant capability spelling: the output family
+/// alone decides whether a publication is an event or a revision. Refuse it
+/// before typed parsing so a producer gets a migration rather than a generic
+/// unsupported-capability error.
+fn reject_retired_streaming_emit(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
+    fn walk(value: &serde_yaml::Value, path: String) -> Option<String> {
+        match value {
+            serde_yaml::Value::Mapping(mapping) => {
+                for (key, child) in mapping {
+                    let key = key.as_str().unwrap_or("?");
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if key == "capabilities"
+                        && child.as_sequence().is_some_and(|items| {
+                            items
+                                .iter()
+                                .any(|item| item.as_str() == Some("streaming_emit"))
+                        })
+                    {
+                        return Some(child_path);
+                    }
+                    if let Some(found) = walk(child, child_path) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_yaml::Value::Sequence(items) => items
+                .iter()
+                .enumerate()
+                .find_map(|(index, child)| walk(child, format!("{path}[{index}]"))),
+            _ => None,
+        }
+    }
+
+    let Some(path) = walk(document, String::new()) else {
+        return Ok(());
+    };
+    Err(crate::MetadataError::Parse(format!(
+        "`{path}` declares retired capability `streaming_emit`. Remove it and select the \
+         workflow output's canonical `family`: `events` for ordered occurrences or \
+         `revisions` with an exact protocol version for replaceable output. `typed_emit` \
+         remains the capability for workflow output publication."
+    )))
+}
+
+/// Refuse tensor contracts that retain the duplicate rank authority or omit
+/// their sole shape authority.
+///
+/// This is a diagnostic recognizer, not a compatibility reader: it never
+/// rewrites the document. Typed deserialization would reject both forms, but it
+/// cannot reliably name the nested tensor/port path in YAML.
+fn reject_invalid_tensor_contract_shapes(
+    document: &serde_yaml::Value,
+    path: String,
+) -> Result<(), crate::MetadataError> {
+    match document {
+        serde_yaml::Value::Mapping(mapping) => {
+            let has_dtype = mapping.contains_key(serde_yaml::Value::from("dtype"));
+            let contract_fields = ["dtype", "shape", "optional", "batch_layout", "padding"];
+            let looks_like_contract = has_dtype
+                && mapping.keys().all(|key| {
+                    key.as_str()
+                        .is_some_and(|key| contract_fields.contains(&key) || key == "rank")
+                });
+            if looks_like_contract {
+                let at = if path.is_empty() { "<root>" } else { &path };
+                if mapping.contains_key(serde_yaml::Value::from("rank")) {
+                    return Err(crate::MetadataError::Parse(format!(
+                        "tensor contract at `{at}` declares retired field `rank`; remove it and \
+                         provide required `shape` explicitly. The tensor rank is `shape.len()`, \
+                         `shape: []` is scalar, and use `Any` for each independently unconstrained \
+                         dimension"
+                    )));
+                }
+                if !mapping.contains_key(serde_yaml::Value::from("shape")) {
+                    return Err(crate::MetadataError::Parse(format!(
+                        "tensor contract at `{at}` is missing required `shape`; provide the complete \
+                         shape because its length is the tensor rank. Use `shape: []` for a scalar \
+                         or `Any` for each independently unconstrained dimension"
+                    )));
+                }
+            }
+
+            for (key, value) in mapping {
+                let segment = key.as_str().unwrap_or("?");
+                let child = if path.is_empty() {
+                    segment.to_string()
+                } else {
+                    format!("{path}.{segment}")
+                };
+                reject_invalid_tensor_contract_shapes(value, child)?;
+            }
+            Ok(())
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for (index, item) in items.iter().enumerate() {
+                reject_invalid_tensor_contract_shapes(item, format!("{path}[{index}]"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuse the short-lived top-level spelling before typed parsing obscures the
+/// migration with a generic unknown-field error.
+fn reject_retired_top_level_tokens(
+    document: &serde_yaml::Value,
+) -> Result<(), crate::MetadataError> {
+    if document.get("tokens").is_none() {
+        return Ok(());
+    }
+    Err(crate::MetadataError::Parse(
+        "top-level `tokens` is retired. Put numeric package/model ids in \
+         `package.tokenizer.special_tokens` (`eos_token_id` is a list); keep token strings, \
+         added-token mappings, and chat templates only in tokenizer.json/tokenizer_config.json. \
+         A workflow termination component consumes the resolved numeric values but does not own \
+         them."
+            .to_string(),
+    ))
 }
 
 /// Refuse a document that still declares the retired `model.io` block.
@@ -648,21 +929,35 @@ pub fn load_pipeline_spec(path: &Path) -> Result<PipelineSpec, crate::MetadataEr
     Ok(spec)
 }
 
-/// Detect a legacy HuggingFace speculator package from `config.json`.
+/// Inspect a legacy HuggingFace speculator sidecar at the explicit migration
+/// boundary.
 ///
-/// Detection is best-effort so malformed or unrelated external configuration
-/// does not change normal model-directory loading behavior.
-pub fn detect_speculator(model_dir: &Path) -> Option<SpeculatorDescriptor> {
+/// This function is deliberately not a runtime discovery hook. A caller may
+/// use its result to construct a complete workflow-native declaration, or to
+/// report precisely why the legacy sidecar lacks facts the canonical contract
+/// requires. No execution path consumes this descriptor.
+pub fn inspect_legacy_speculator_for_migration(
+    model_dir: &Path,
+) -> Result<Option<SpeculatorDescriptor>, crate::MetadataError> {
     let config_path = model_dir.join("config.json");
-    let content = std::fs::read_to_string(config_path).ok()?;
-    let config = serde_json::from_str::<HuggingFaceModelConfig>(&content)
-        .ok()?
-        .speculator_config?;
-    Some(SpeculatorDescriptor::from_config(
+    if !config_path.is_file() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&config_path).map_err(crate::MetadataError::Io)?;
+    let parsed = serde_json::from_str::<HuggingFaceModelConfig>(&content).map_err(|error| {
+        crate::MetadataError::Parse(format!(
+            "legacy config '{}' cannot be read for speculative migration: {error}",
+            config_path.display()
+        ))
+    })?;
+    let Some(config) = parsed.speculator_config else {
+        return Ok(None);
+    };
+    Ok(Some(SpeculatorDescriptor::from_config(
         model_dir,
         config,
         SpeculatorConfigSource::HuggingFaceConfig,
-    ))
+    )))
 }
 
 #[derive(serde::Deserialize)]
@@ -742,6 +1037,59 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn tensor_contract_rank_is_rejected_with_its_full_path_and_required_shape() {
+        let document: serde_yaml::Value = serde_yaml::from_str(
+            "\
+pipeline:
+  workflow:
+    components:
+      decoder:
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+",
+        )
+        .expect("test document parses");
+
+        let error = gate_document(&document).expect_err("retired tensor rank must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("pipeline.workflow.components.decoder.ports.inputs.input_ids")
+                && message.contains("retired field `rank`")
+                && message.contains("provide required `shape` explicitly")
+                && message.contains("shape.len()"),
+            "unexpected diagnostic: {message}"
+        );
+    }
+
+    #[test]
+    fn tensor_contract_without_shape_is_rejected_with_its_full_path() {
+        let document: serde_yaml::Value = serde_yaml::from_str(
+            "\
+pipeline:
+  workflow:
+    inputs:
+      request.input_ids:
+        contract:
+          dtype: int64
+",
+        )
+        .expect("test document parses");
+
+        let error = gate_document(&document).expect_err("missing tensor shape must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("pipeline.workflow.inputs.request.input_ids.contract")
+                && message.contains("missing required `shape`")
+                && message.contains("shape: []")
+                && message.contains("independently unconstrained"),
+            "unexpected diagnostic: {message}"
+        );
+    }
+
     const SHARED_KV_YAML: &str = "\
 speculative:
   proposal_type: shared_kv
@@ -783,6 +1131,45 @@ speculative:
         assert!(
             reason.contains("proposal_execution") && reason.contains("chained"),
             "the diagnostic must point at the workflow contract: {reason}"
+        );
+    }
+
+    #[test]
+    fn legacy_dflash_is_migration_input_not_parallel_runtime_authority() {
+        let descriptor = SpeculatorDescriptor::from_config(
+            Path::new("/models/dflash"),
+            SpeculatorConfig {
+                proposal_type: ProposalType::DFlash,
+                num_speculative_tokens: 8,
+                verifier: None,
+                model: None,
+                io: None,
+                backbone_hidden_size: None,
+                vocab_size: None,
+                projected_state_output: None,
+                logits_output: None,
+                input_embedding: None,
+                shared_kv: Vec::new(),
+                target_hidden_output: None,
+                target_hidden_layout: None,
+                target_hidden_size: None,
+                hc_mult: None,
+                mtp_hidden_output: None,
+                mtp_state_output: None,
+                kv_mode: None,
+                embedding: None,
+                lm_head: None,
+            },
+            SpeculatorConfigSource::HuggingFaceConfig,
+        );
+        let SpeculatorProposerStatus::Unknown(reason) = descriptor.proposer else {
+            panic!("legacy DFlash must not resolve beside the canonical workflow contract");
+        };
+        assert!(
+            reason.contains("dflash_flat_block")
+                && reason.contains("target-hidden provenance")
+                && reason.contains("accepted-prefix"),
+            "{reason}"
         );
     }
 

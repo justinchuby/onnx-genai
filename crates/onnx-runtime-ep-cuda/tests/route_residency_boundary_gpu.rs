@@ -61,7 +61,9 @@ use onnx_runtime_ep_cuda::route_residency::{
     RouteResidencyBoundary, RouteResidencyInstallOutcome, RouteTelemetrySource,
     build_route_residency_boundaries,
 };
-use onnx_runtime_ep_cuda::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
+use onnx_runtime_ep_cuda::weight_paging::{
+    CudaWeightResidency, DeviceOffloadPolicy, RouteReservationHealth,
+};
 use onnx_runtime_ir::{DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape};
 use onnx_runtime_loader::{
     ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog,
@@ -415,6 +417,7 @@ fn boundary_disabled_gate_is_structural_no_op() {
         runtime.ordinal(),
         1,
         Vec::new(),
+        RouteReservationHealth::new(),
     );
     provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -546,6 +549,7 @@ fn boundary_applies_group_hot_set_and_advances_window() {
         runtime.ordinal(),
         1,
         groups,
+        RouteReservationHealth::new(),
     );
     provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -675,6 +679,7 @@ fn boundary_unsafe_point_rejects_before_consume_and_reset() {
             runtime.ordinal(),
             1,
             Vec::new(),
+            RouteReservationHealth::new(),
         );
         provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -730,6 +735,7 @@ fn boundary_unsafe_point_rejects_before_consume_and_reset() {
             runtime.ordinal(),
             1,
             Vec::new(),
+            RouteReservationHealth::new(),
         );
         provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -858,6 +864,7 @@ fn boundary_defective_windows_fail_closed() {
             device,
             initial_epoch,
             Vec::new(),
+            RouteReservationHealth::new(),
         );
         provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -978,6 +985,7 @@ fn boundary_injected_fault_rolls_back_through_caller() {
         runtime.ordinal(),
         1,
         Vec::new(),
+        RouteReservationHealth::new(),
     );
     provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -1215,6 +1223,7 @@ fn builder_assembles_firing_binding_from_graph_banks() {
         &sources,
         &catalogs,
         &allocators,
+        RouteReservationHealth::new(),
         Arc::clone(&pools.device_pool),
         Arc::clone(&pools.host_pool),
         1,
@@ -1530,6 +1539,7 @@ fn boundary_host_overhead_on_vs_off() {
         &sources,
         &catalogs,
         &allocators,
+        RouteReservationHealth::new(),
         Arc::clone(&pools.device_pool),
         Arc::clone(&pools.host_pool),
         1,

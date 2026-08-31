@@ -100,6 +100,9 @@ use std::time::{Duration, Instant};
 
 use crate::decode_affinity::{NodeShard, NumaTopology};
 use crate::kernels::matmul_nbits::output_chunk_len_for;
+use crate::persistent_pool_width::{
+    DEFAULT_SERVICE_CPUS_PER_NUMA_NODE, PoolLayoutInputs, resolve_pool_layout,
+};
 
 /// Environment switch selecting the persistent SPMD decode pool policy:
 /// **unset (the default) or `=1`** uses the persistent SPMD pool deterministically
@@ -165,14 +168,58 @@ pub const CHUNK_PERMUTATION_ENV: &str = "ONNX_GENAI_CPU_DECODE_CHUNK_PERMUTATION
 /// on a futex once genuinely idle for longer than the window. This is the gold
 /// standard for exactly this OMP-style fine-grained fork/join HPC workload.
 ///
+/// The window's *first-order* claim is measured and holds: it eliminates
+/// parking during a generation. At width 16 the average worker parks a median
+/// of **0.533** times per launch at the shipped 500 us, and **345.9** times
+/// with the window removed (`--blocktime 0`), per
+/// `benches/acc0_w16_worker_split.py`, 7 trusted launches per arm.
+///
+/// Its *second-order* claim did not survive measurement and has been removed.
+/// This comment used to say parking on every barrier would "tank throughput".
+/// Parking on essentially every barrier -- those 345.9 parks -- costs **2.2% of
+/// the window** in wake latency at width 16, with a profiler exposing it
+/// (`wake_frac` 0.022 at blocktime 0, 0.014 at 500 us), and the pre-registered
+/// `WAKE-BOUND` verdict does **not** fire at either blocktime.
+///
+/// Nor is the throughput half a cliff. `docs/performance/CPU_MATMUL_ASSIGNMENT.md`
+/// already records removing the ramp as throughput-neutral at t=16 -- ratio
+/// 0.9960 against a **5.24% A/A null**, which is the control that makes it a
+/// result -- and my own unprofiled paired A/B agrees at t=2 (0.996, range
+/// [0.960, 1.013] over 7 paired reps). At t=8 and t=16 my ratios straddle 1.0
+/// and I ran no A/A null in that batch, so they resolve nothing either way.
+///
+/// What is genuinely unmeasured is the case the window exists for. Every
+/// result above is a **zero-gap** decode loop, exactly where parking looks
+/// falsely free because the next op is always already there. The window's
+/// justification is inter-token gaps, and no measurement here has any.
+///
+/// So the window is retained on the evidence that exists -- it costs ~5-8% of
+/// pool width in permanently-occupied cores (~1.3 cores at width 16, #2071)
+/// and buys a wake term that is small but real -- and **not** on a throughput
+/// cliff, which the zero-gap evidence positively contradicts. Changing
+/// [`DEFAULT_BLOCKTIME`] needs the gap-distribution and concurrent-session arms
+/// of #2071 and #1395's gap-aware harness; a reader reaching for this comment
+/// as a reason not to re-measure should not find one. Corrected data and
+/// method: #2245, and
+/// `docs/benchmarks/2026-08-26-acc0-w16-baseline-correction.md` once it lands.
+///
+/// The behavioural half is asserted mechanically, without timing, by
+/// `an_idle_gap_far_longer_than_the_blocktime_parks_the_workers` and the
+/// `spin_hits + parks == dispatches * workers` identity on [`SpmdCounters`].
+/// The complementary direction -- back-to-back dispatches never park -- is
+/// deliberately *not* a test, because a descheduled worker's window expires
+/// off-CPU and it would fail on a loaded runner. The 0.533 above is the
+/// out-of-band substitute for it, and it is a median over launches of a mean
+/// over workers, not a bound.
+///
 /// The window is **load-bearing, not a bad habit**: decode fires ~400 fork/join
 /// barriers per token, microseconds apart, so a worker must catch the next
-/// barrier while spinning. Parking inside the active path would pay a futex wake
-/// (~1-5 us) on every barrier and tank throughput. The window is sized to span
-/// the inter-op / inter-token gaps of tight decode (so workers effectively never
-/// park mid-generation) yet expire quickly once a generation ends, so idle CPU
-/// returns to ~0 between requests -- the spin is bounded to genuinely-active
-/// decode, not "unconditional". Tunable via [`decode_blocktime`].
+/// barrier while spinning. The window is sized to span the inter-op /
+/// inter-token gaps of tight decode (so workers effectively never park
+/// mid-generation -- the 0.533 above) yet expire quickly once a generation
+/// ends, so idle CPU returns to ~0 between requests -- the spin is bounded to
+/// genuinely-active decode, not "unconditional". Tunable via
+/// [`decode_blocktime`].
 ///
 /// Default 500 us: comfortably longer than the ~microsecond inter-op gap and the
 /// serial dispatcher glue between barriers, and shorter than any human-scale idle
@@ -528,13 +575,37 @@ fn dispatcher_yields_before_park() -> u32 {
     })
 }
 
-/// Default number of dynamic tiles per resident worker in work-stealing mode.
+/// Default dynamic tiles per resident worker when the **MLAS** work-stealing
+/// pool is the executor.
+///
 /// One tile per worker preserves the coarse MLAS QNBit shard size that made
 /// fixed-SPMD fast, while Deckard's pool can still steal a not-yet-claimed tile
 /// from a delayed worker. Finer 2x/3x tiling improved theoretical steal
 /// opportunities but split Qwen3 projection shards too narrowly and regressed
-/// measured throughput.
-const DEFAULT_STEAL_TILES_PER_WORKER: usize = 1;
+/// measured throughput. That result was measured on this executor and is
+/// preserved here; it does not transfer to the native cursor below, which
+/// dispatches through our own pinned SPMD pool rather than MLAS's.
+#[cfg(feature = "mlas")]
+const DEFAULT_STEAL_TILES_PER_WORKER_MLAS: usize = 1;
+/// Default dynamic tiles per resident worker when the **native** atomic cursor
+/// is the executor (every build without `--features mlas`).
+///
+/// Deliberately not one. With one tile per worker `target <= total_workers`, so
+/// [`SpmdDecodePools::work_stealing_segments_aligned`] returns the fixed split
+/// and every lane claims exactly one tile -- the cursor runs but can never
+/// rebalance, because there is no unclaimed tile for an early lane to take.
+/// `steal` was therefore *numerically identical* to `fixed` on this executor: a
+/// knob that reported a schedule it did not implement.
+///
+/// Four is measured, not assumed (#2017, 20 paired launches at width 16 on a
+/// 16-core host, interleaved with an A/A null of 0.998): 1.293x throughput at
+/// 0.789x CPU against the fixed split, bit-identical outputs, and no effect
+/// outside the noise band at widths 2/4/8 on either llama or qwen shapes. Two
+/// tiles per worker measured 1.00x -- with a straggler at ~1.67x a lane's share,
+/// coarse tiles let the slow lane claim a second one and overshoot, so the grain
+/// has to be finer than the imbalance to absorb it. Eight measured 1.17x, below
+/// four, as per-tile cursor traffic starts to cost more than it recovers.
+const DEFAULT_STEAL_TILES_PER_WORKER_NATIVE: usize = 4;
 /// Minimum output columns in one dynamic tile. Keeps MLAS/KAI/hand GEMV calls
 /// coarse enough that the extra atomic `fetch_add` scheduling is amortized.
 const MIN_STEAL_OUTPUTS_PER_TASK: usize = 32;
@@ -1836,28 +1907,73 @@ fn chunk_permutation() -> ChunkPermutation {
     chunk_permutation_from_raw(std::env::var(CHUNK_PERMUTATION_ENV).ok().as_deref())
 }
 
-fn decode_schedule_from_raw(raw: Option<&str>) -> DecodeSchedule {
+fn decode_schedule_from_raw(raw: Option<&str>) -> Option<DecodeSchedule> {
     match raw.map(str::trim) {
-        Some(value) if value.eq_ignore_ascii_case("fixed") => DecodeSchedule::Fixed,
-        Some(value) if value.eq_ignore_ascii_case("spmd") => DecodeSchedule::Fixed,
-        Some(value) if value.eq_ignore_ascii_case("steal") => DecodeSchedule::Steal,
-        Some(value) if value.eq_ignore_ascii_case("work-stealing") => DecodeSchedule::Steal,
-        _ => DecodeSchedule::Fixed,
+        Some(value) if value.eq_ignore_ascii_case("fixed") => Some(DecodeSchedule::Fixed),
+        Some(value) if value.eq_ignore_ascii_case("spmd") => Some(DecodeSchedule::Fixed),
+        Some(value) if value.eq_ignore_ascii_case("steal") => Some(DecodeSchedule::Steal),
+        Some(value) if value.eq_ignore_ascii_case("work-stealing") => Some(DecodeSchedule::Steal),
+        _ => None,
     }
 }
 
-fn decode_schedule() -> DecodeSchedule {
-    decode_schedule_from_raw(std::env::var(DECODE_SCHEDULE_ENV).ok().as_deref())
+/// The schedule to build with: an explicit [`DECODE_SCHEDULE_ENV`] value if it
+/// names one, else the default for this executor and topology.
+///
+/// The default is the dynamic cursor on a **single-node native** pool, and the
+/// fixed split everywhere else. Both exclusions are deliberate:
+///
+/// - **Not a confirmed single node.** [`SpmdDecodePools::place_rows`]
+///   first-touches each lane's row range on that lane's node, so under a fixed
+///   split a lane only ever streams node-local weights. A dynamic cursor breaks
+///   that pairing: a lane can claim a tile another node first-touched and read
+///   it across the interconnect. That argument is vacuous only when there is
+///   genuinely no remote memory to reach, so the guard is *positive*: one
+///   worker shard **and** [`decode_affinity::host_is_single_numa_node`]
+///   affirming it. One shard alone is not evidence -- `node_shards_with` also
+///   builds a single shard when the topology could not be read at all, which is
+///   exactly what a container with an unmounted `/sys/devices/system/node` and a
+///   cpuset spanning two sockets looks like. Unknown resolves to `Fixed`.
+/// - **`--features mlas`.** There, `Steal` does not tile our pool at all -- it
+///   substitutes MLAS's own executor, which spawns and places its own threads,
+///   has no dispatcher shard, no pinning of ours and no barrier counters. That
+///   is a different change with a different risk profile, and none of the
+///   evidence for this default was collected on it.
+///
+/// An explicit value keeps its exact current meaning in every configuration, so
+/// `=fixed` is a complete escape hatch and `=steal` still selects MLAS's pool
+/// where that is what it selects today.
+fn resolve_decode_schedule(raw: Option<&str>, single_node: bool) -> DecodeSchedule {
+    if let Some(explicit) = decode_schedule_from_raw(raw) {
+        return explicit;
+    }
+    if cfg!(feature = "mlas") || !single_node {
+        return DecodeSchedule::Fixed;
+    }
+    DecodeSchedule::Steal
 }
 
-fn steal_tiles_per_worker() -> usize {
-    static TILES: OnceLock<usize> = OnceLock::new();
+/// Whether the pool spans one worker shard *and* the host affirmatively reports
+/// a single NUMA node over the CPUs this process may use. See
+/// [`resolve_decode_schedule`] for why one shard on its own is not enough.
+fn on_confirmed_single_node(node_count: usize) -> bool {
+    node_count == 1 && crate::decode_affinity::host_is_single_numa_node()
+}
+
+fn decode_schedule(node_count: usize) -> DecodeSchedule {
+    resolve_decode_schedule(
+        std::env::var(DECODE_SCHEDULE_ENV).ok().as_deref(),
+        on_confirmed_single_node(node_count),
+    )
+}
+
+fn steal_tiles_per_worker_override() -> Option<usize> {
+    static TILES: OnceLock<Option<usize>> = OnceLock::new();
     *TILES.get_or_init(|| {
         std::env::var("ONNX_GENAI_CPU_DECODE_STEAL_TILES_PER_WORKER")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|&value| value > 0)
-            .unwrap_or(DEFAULT_STEAL_TILES_PER_WORKER)
     })
 }
 
@@ -1869,7 +1985,7 @@ impl SpmdDecodePools {
     /// `dispatcher_shard` adds one compute shard, owned by the dispatcher rather
     /// than by a spawned thread. See [`SpmdDecodePools::dispatcher_shard`].
     fn build(shards: &[NodeShard], dispatcher_shard: bool) -> Self {
-        Self::build_with_schedule(shards, decode_schedule(), dispatcher_shard)
+        Self::build_with_schedule(shards, decode_schedule(shards.len()), dispatcher_shard)
     }
 
     fn build_with_schedule(
@@ -2518,6 +2634,34 @@ impl SpmdDecodePools {
         self.schedule == DecodeSchedule::Steal
     }
 
+    /// Whether `Steal` is served by MLAS's own thread pool rather than by the
+    /// cursor over our tiles. Distinct executors, distinct grain, distinct
+    /// threads -- so a reader that only knows "stealing" knows very little.
+    fn work_stealing_executor_is_foreign(&self) -> bool {
+        #[cfg(feature = "mlas")]
+        {
+            self.work_stealing_pool.is_some()
+        }
+        #[cfg(not(feature = "mlas"))]
+        {
+            false
+        }
+    }
+
+    /// Tiles per worker to cut the output into when no explicit override is set.
+    ///
+    /// Keyed off the executor that will actually run the tiles rather than off
+    /// the `mlas` feature, because the two are not the same question: a build
+    /// with the feature on still runs the native cursor whenever the MLAS pool
+    /// was not the one constructed.
+    fn default_steal_tiles_per_worker(&self) -> usize {
+        #[cfg(feature = "mlas")]
+        if self.work_stealing_pool.is_some() {
+            return DEFAULT_STEAL_TILES_PER_WORKER_MLAS;
+        }
+        DEFAULT_STEAL_TILES_PER_WORKER_NATIVE
+    }
+
     /// Signal every worker to stop and **join** them. Idempotent: the join
     /// handles are drained on the first call, so a second call (e.g. `Drop`
     /// after an explicit [`shutdown_pools`]) is a no-op.
@@ -2665,10 +2809,22 @@ impl SpmdDecodePools {
     /// by global worker index, so running all of them on one thread is exactly
     /// the same computation as broadcasting them -- only serial. This is the
     /// fallback when the pool's single publish/wait slot is already claimed.
+    ///
+    /// Releases the dispatcher pin first, and that is not a detail: the
+    /// reserved CPU is one CPU, sized for a thread that publishes and then
+    /// *waits*. A thread on this path computes the whole op instead, so
+    /// leaving it pinned confines an entire op's arithmetic to a single CPU
+    /// that another session's dispatcher is also sitting on. Measured at
+    /// `PROBE_SESSIONS=2`: 0.551x against the unpinned arm, 0/10 paired runs,
+    /// and 0.321x at 4 sessions -- the loss tracks 1/sessions, which is what
+    /// serializing every loser onto one CPU predicts. A thread-placement
+    /// census showed both session threads reading `cpu=30` in every sample
+    /// with the knob on, and distinct CPUs with it off.
     fn dispatch_inline<F>(&self, job: &F)
     where
         F: Fn(usize) + Sync,
     {
+        release_dispatcher_pin();
         for global_index in 0..self.total_workers {
             job(global_index);
         }
@@ -2716,7 +2872,10 @@ impl SpmdDecodePools {
         // First dispatcher wins the identity slot: it is the one whose
         // placement is sampled from here on. Later dispatching threads still
         // take the reserved CPU below -- the point of the reserve is that
-        // whoever is dispatching sits there -- they just do not report.
+        // whoever is dispatching sits there -- they just do not report. They
+        // hand it back the moment one of them has to run an op inline, which is
+        // when "whoever is dispatching" stops being true of all of them; see
+        // `dispatch_inline`.
         let recorded = match current_thread_os_id() {
             Some(tid) => self
                 .dispatcher_tid
@@ -2744,15 +2903,7 @@ impl SpmdDecodePools {
         if cfg!(miri) {
             return;
         }
-        match crate::decode_affinity::pin_current_thread_to_cpu(cpu) {
-            Ok(()) => report_dispatcher_pin(&format!(
-                "{DISPATCHER_PIN_ENV} on: dispatcher pinned to reserved cpu {cpu}"
-            )),
-            Err(message) => report_dispatcher_pin(&format!(
-                "{DISPATCHER_PIN_ENV} on, but pinning the dispatcher to reserved cpu \
-                 {cpu} failed: {message}; dispatcher left unpinned"
-            )),
-        }
+        acquire_dispatcher_pin(cpu);
         // After the pin, never before: the first sample is the baseline every
         // later one is compared against, so taking it pre-pin would score the
         // pin itself as a migration and a successfully pinned dispatcher could
@@ -2989,6 +3140,24 @@ impl SpmdDecodePools {
     }
 
     fn work_stealing_segments_aligned(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
+        let tiles_per_worker = steal_tiles_per_worker_override()
+            .unwrap_or_else(|| self.default_steal_tiles_per_worker());
+        self.work_stealing_segments_with_tiles(n, align, tiles_per_worker)
+    }
+
+    /// The tile table for `tiles_per_worker` tiles per lane.
+    ///
+    /// Split out from [`Self::work_stealing_segments_aligned`] so the grain is
+    /// reachable as an argument: the process-global `OnceLock` behind the
+    /// override latches on first read, so a test that wants a specific grain
+    /// cannot get one through the env and would otherwise have to re-implement
+    /// the arithmetic it is meant to be checking.
+    fn work_stealing_segments_with_tiles(
+        &self,
+        n: usize,
+        align: usize,
+        tiles_per_worker: usize,
+    ) -> Vec<(usize, usize)> {
         if n == 0 {
             return vec![(0, 0)];
         }
@@ -2997,10 +3166,14 @@ impl SpmdDecodePools {
         let max_by_size = n.div_ceil(min_tile).max(1);
         let target = self
             .total_workers
-            .saturating_mul(steal_tiles_per_worker())
+            .saturating_mul(tiles_per_worker)
             .max(1)
             .min(max_by_size)
             .min(n);
+        // A shortcut, not a semantic: at `target <= total_workers` the loop
+        // below reproduces the fixed split anyway (mutation-checked). It is kept
+        // because it also preserves the chunk permutation the fixed split
+        // applies, which the loop does not.
         if target <= self.total_workers {
             return self.worker_row_segments_aligned(n, align);
         }
@@ -3605,6 +3778,38 @@ pub fn decode_path_label() -> &'static str {
     DECODE_PATH_LABEL.get().copied().unwrap_or("unresolved")
 }
 
+/// How the built pool actually splits rows, and at what grain -- e.g.
+/// `"steal-native:4"`, `"steal-mlas:1"`, `"fixed"`, `"unresolved"`.
+///
+/// Space-free on purpose: this is printed as one whitespace-delimited field in
+/// benchmark output.
+///
+/// [`decode_path_label`] deliberately names the *executor*, so a native pool
+/// reports `spmd-pool` whether it tiles dynamically or not. That leaves the
+/// schedule -- which is a default, and so changes underneath a benchmark
+/// without anyone typing anything -- with no runtime read at all. A results
+/// table would then say which pool ran and stay silent about the thing being
+/// compared. This is that read: it is taken from the pool `POOLS` holds, not
+/// from the environment, so it reports what ran rather than what was asked for.
+///
+/// Returns `"unresolved"` before the first decode builds the pool.
+pub fn decode_schedule_label() -> String {
+    let Some(pool) = POOLS.get().and_then(|p| p.as_ref()) else {
+        return "unresolved".to_string();
+    };
+    if !pool.uses_work_stealing() {
+        return "fixed".to_string();
+    }
+    let tiles =
+        steal_tiles_per_worker_override().unwrap_or_else(|| pool.default_steal_tiles_per_worker());
+    let executor = if pool.work_stealing_executor_is_foreign() {
+        "steal-mlas"
+    } else {
+        "steal-native"
+    };
+    format!("{executor}:{tiles}")
+}
+
 /// The width a decode request asked for, what it actually got, and which path
 /// served it.
 ///
@@ -3993,6 +4198,15 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     // 32 workers on `taskset -c 0-31` vs ~29 tok/s once one CPU is spare). If the
     // whole allowed cpuset is a single CPU there is no core to reserve, so the
     // pool cannot run without starving itself -- fall back to the flat path.
+    //
+    // This guard reads the *mask*, not the budget, and that is deliberate: a
+    // 1-CPU quota looks like the same starvation shape (#2185) but does not
+    // behave like one. Measured under `cpu.max=100000 100000` on this 32-CPU
+    // host, one pinned worker sharing a CPU's worth of quota with the spinning
+    // dispatcher runs at 28.74 tok/s while the flat path runs 28.52 -- 0/6
+    // paired launches favoured the fallback, a consistent ~1% loss. Extending
+    // the fallback to quota would trade a measured regression for a starvation
+    // that does not occur, so the quota fix stops at the headroom reserve.
     if let Some(allowed) = crate::decode_affinity::allowed_cpus()
         && allowed.len() == 1
     {
@@ -4118,6 +4332,7 @@ fn explicit_affinity_shards(total: usize) -> Option<Vec<NodeShard>> {
     explicit_affinity_shards_for(
         request,
         total,
+        host_parallelism(),
         || match crate::decode_affinity::plan_decode_affinity(total) {
             Ok(plan) => {
                 if let Some(message) = plan.log {
@@ -4146,9 +4361,16 @@ fn explicit_affinity_shards(total: usize) -> Option<Vec<NodeShard>> {
 /// [`parse_decode_blocktime`]: the env read is the only impure part, so keeping
 /// it out means the precedence can be tested exhaustively without `set_var` and
 /// without depending on the test host's NUMA layout.
+///
+/// `parallelism` is that same seam for the CPU *quota* -- the one limit that is
+/// not visible in `allowed_cpus` (see [`effective_cpu_budget`]). It is passed
+/// in rather than read from the host so a synthetic 16-CPU allowed set stays a
+/// synthetic 16-CPU host on a 2-vCPU CI runner. `0` means "unknown", which is
+/// what a test that is not describing a quota should pass.
 fn explicit_affinity_shards_for(
     request: ExplicitAffinity,
     total: usize,
+    parallelism: usize,
     planned_cpus: impl FnOnce() -> Option<Vec<usize>>,
     allowed_cpus: impl FnOnce() -> Option<Vec<usize>>,
 ) -> Option<Vec<NodeShard>> {
@@ -4170,9 +4392,11 @@ fn explicit_affinity_shards_for(
         // the allowed set is the whole machine.
         ExplicitAffinity::Unpinned => {
             let allowed = allowed_cpus().unwrap_or_default();
+            let budget = effective_cpu_budget(allowed.len(), parallelism);
             let core_count = crate::core_topology::host()
-                .map_or(0, |cores| cores.leaders_within(&allowed).len());
-            let workers = reserve_single_group_headroom(total, allowed.len(), core_count);
+                .map_or(0, |cores| cores.leaders_within(&allowed).len())
+                .min(budget);
+            let workers = reserve_single_group_headroom(total, budget, core_count);
             Some(vec![NodeShard {
                 index: 0,
                 cpus: Vec::new(),
@@ -4193,8 +4417,11 @@ fn explicit_affinity_shards_for(
             // defaults to spread.
             let cores = crate::core_topology::host();
             let cpus = crate::decode_affinity::order_pin_targets(&cpus, cores);
-            let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
-            let workers = reserve_single_group_headroom(total, cpus.len(), core_count);
+            let budget = effective_cpu_budget(cpus.len(), parallelism);
+            let core_count = cores
+                .map_or(0, |cores| cores.leaders_within(&cpus).len())
+                .min(budget);
+            let workers = reserve_single_group_headroom(total, budget, core_count);
             Some(vec![NodeShard {
                 index: 0,
                 cpus,
@@ -4218,7 +4445,7 @@ fn explicit_affinity_shards_for(
 /// [`explicit_affinity_shards`]); it selects the CPU *set*, and the worker
 /// count is still capped by the same reservation.
 fn node_shards(total: usize) -> Vec<NodeShard> {
-    node_shards_with(total, explicit_affinity_shards)
+    node_shards_with(total, host_parallelism(), explicit_affinity_shards)
 }
 
 /// [`node_shards`] with the explicit-request lookup injected.
@@ -4229,6 +4456,7 @@ fn node_shards(total: usize) -> Vec<NodeShard> {
 /// passes. Deleting the early return has to fail something.
 fn node_shards_with(
     total: usize,
+    parallelism: usize,
     explicit: impl FnOnce(usize) -> Option<Vec<NodeShard>>,
 ) -> Vec<NodeShard> {
     // An explicit request wins over the default placement. Without this the
@@ -4238,30 +4466,19 @@ fn node_shards_with(
     }
     let allowed = crate::decode_affinity::allowed_cpus();
     let cores = crate::core_topology::host();
-    if let Some(topology) = NumaTopology::detect() {
-        let topology = topology.restrict_to_allowed(allowed.as_deref());
-        if let Some(mut shards) = topology.split_workers(total) {
-            // Reserve a dispatcher core on every node so the engine thread has a
-            // free core on whichever socket the scheduler places it, and each
-            // node's completion counter can be read without contending with a
-            // pinned spinning worker.
-            reserve_split_headroom(&mut shards);
-            for shard in shards.iter_mut() {
-                shard.cpus = crate::decode_affinity::order_pin_targets(&shard.cpus, cores);
-            }
-            return shards;
-        }
+    let numa = NumaTopology::detect();
+    let mut layout = resolve_pool_layout(PoolLayoutInputs {
+        requested_workers: total,
+        allowed_cpus: allowed.as_deref(),
+        core_topology: cores,
+        numa_topology: numa.as_ref(),
+        available_parallelism: parallelism,
+        service_cpus_per_numa_node: DISPATCHER_RESERVED_CPUS,
+    });
+    for shard in &mut layout.shards {
+        shard.cpus = crate::decode_affinity::order_pin_targets(&shard.cpus, cores);
     }
-    // Single-node / non-NUMA / no-pinning fallback: one group. Pin to the
-    // process's allowed CPUs when known (best-effort), else leave unpinned.
-    let cpus = crate::decode_affinity::order_pin_targets(&allowed.unwrap_or_default(), cores);
-    let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
-    let workers = reserve_single_group_headroom(total, cpus.len(), core_count);
-    vec![NodeShard {
-        index: 0,
-        cpus,
-        workers,
-    }]
+    layout.shards
 }
 
 /// Allowed CPUs kept free for the inline dispatcher per pinned worker group.
@@ -4280,7 +4497,7 @@ fn node_shards_with(
 /// per allowed physical core: on a non-SMT host the pool is now deliberately
 /// wide enough that this reserve is what keeps it from being *fully*
 /// subscribed.
-const DISPATCHER_RESERVED_CPUS: usize = 1;
+const DISPATCHER_RESERVED_CPUS: usize = DEFAULT_SERVICE_CPUS_PER_NUMA_NODE;
 
 /// Opt-in: bind the inline dispatcher to the CPU [`DISPATCHER_RESERVED_CPUS`]
 /// reserved for it (`1`/`on`/`true`/`yes`). Default off.
@@ -4318,6 +4535,22 @@ const DISPATCHER_RESERVED_CPUS: usize = 1;
 /// one-CPU-wide. Turning this into a default needs evidence that covers prefill
 /// as well as decode, and that evidence does not exist yet. The knob is here so
 /// the decode half can be measured at all.
+///
+/// The third was measured after the first two were written, and it is the
+/// reason [`SpmdDecodePools::dispatch_inline`] gives the CPU back. The reserve
+/// frees **one** CPU and every dispatching thread pins to it, while the pool
+/// serves one dispatcher at a time -- so with the knob on, a second session's
+/// dispatcher used to compute an entire op's shards inline while confined to
+/// the CPU the first one was already sitting on. At width 16 on a 32-CPU host,
+/// paired and order-alternated: **0.551x** of the unpinned arm at 2 sessions
+/// (0/10) and **0.321x** at 4 (0/10), a loss that tracks `1/sessions`. With the
+/// release in place the same cells read 1.027 and 1.019 and the single-session
+/// gain is unchanged (1.074 against 1.078).
+///
+/// The release is Linux-only, because
+/// [`crate::decode_affinity::set_current_thread_affinity`] is: on Windows the
+/// pin is taken and reported but cannot be handed back, so the multi-session
+/// cost above still applies there. That is one more reason this stays opt-in.
 pub const DISPATCHER_PIN_ENV: &str = "ONNX_GENAI_CPU_DECODE_DISPATCHER_PIN";
 
 /// Whether [`DISPATCHER_PIN_ENV`] asks for the dispatcher to be pinned.
@@ -4362,6 +4595,20 @@ thread_local! {
     /// retry loop would put a failing syscall on the hot path forever on any
     /// host that refuses the pin.
     static DISPATCHER_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Whether this thread currently holds the reserved CPU.
+    ///
+    /// Set by [`acquire_dispatcher_pin`], cleared by [`release_dispatcher_pin`].
+    /// It gates the restore so that the common path -- a thread that never runs
+    /// inline -- pays one `Cell` read per inline dispatch and no syscall ever.
+    static DISPATCHER_PIN_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The affinity mask this thread had before it took the reserved CPU.
+    ///
+    /// Captured *before* pinning, because that is the only moment it still
+    /// exists: after `sched_setaffinity` the old mask is unrecoverable, and
+    /// "restore" would have to mean "guess", which on a cpuset-confined process
+    /// would hand the thread CPUs it was never allowed to use.
+    static DISPATCHER_PREPIN_CPUS: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
     /// Whether this thread is the one whose id the pool recorded.
     ///
     /// A process can dispatch from more than one thread over its life -- a
@@ -4373,6 +4620,134 @@ thread_local! {
     /// could only ever have made one -- the samples were coming from different
     /// threads.
     static DISPATCHER_IS_RECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take the reserved CPU for this thread, remembering the mask it replaces.
+///
+/// Refuses when the pre-pin mask cannot be read, because a thread that pinned
+/// without a saved mask would be stuck on one CPU for the rest of its life the
+/// first time it had to compute an op inline, and a host that cannot report a
+/// thread's affinity is exactly a host where that would go unnoticed.
+///
+/// **Readable is not the same as restorable, and only Linux is both.**
+/// [`crate::decode_affinity::set_current_thread_affinity`] is a documented
+/// no-op off Linux while `observe_current_thread_cpus` answers on Windows too,
+/// so on Windows this check passes and the pin is still unrecoverable. The
+/// release says so when it fails; see [`DISPATCHER_PIN_ENV`] for why that is
+/// left as a platform limitation of an opt-in knob rather than papered over by
+/// refusing to pin at all -- there is no Windows measurement either way, and
+/// silently disabling a knob on one platform is its own kind of dishonesty.
+///
+/// Never re-pins a thread that already holds the reserve. That is not
+/// defensive: [`DISPATCHER_TICK`] is a `u32` incremented with `wrapping_add`,
+/// so a long-lived dispatcher re-enters the first-dispatch branch every 2^32
+/// dispatches -- about 8 hours of continuous decode at ~140k dispatches a
+/// second, which is a server uptime, not a hypothetical. Without this guard
+/// that re-entry would re-read the mask *while pinned*, save the reserved CPU
+/// itself as the "previous" mask, and turn every later release into a no-op
+/// that leaves the thread confined for life.
+fn acquire_dispatcher_pin(cpu: usize) {
+    if DISPATCHER_PIN_HELD.with(std::cell::Cell::get) {
+        return;
+    }
+    let saved = match crate::decode_affinity::observe_current_thread_cpus() {
+        crate::decode_affinity::ObservedAffinity::Cpus(cpus) if !cpus.is_empty() => cpus,
+        other => {
+            report_dispatcher_pin(&format!(
+                "{DISPATCHER_PIN_ENV} on, but this thread's affinity mask could not be read \
+                 ({other:?}), so the reserved cpu {cpu} could not be given back later; \
+                 dispatcher left unpinned"
+            ));
+            return;
+        }
+    };
+    match crate::decode_affinity::pin_current_thread_to_cpu(cpu) {
+        Ok(()) => {
+            DISPATCHER_PREPIN_CPUS.with(|slot| *slot.borrow_mut() = Some(saved));
+            DISPATCHER_PIN_HELD.with(|held| held.set(true));
+            report_dispatcher_pin(&format!(
+                "{DISPATCHER_PIN_ENV} on: dispatcher pinned to reserved cpu {cpu}"
+            ));
+        }
+        Err(message) => report_dispatcher_pin(&format!(
+            "{DISPATCHER_PIN_ENV} on, but pinning the dispatcher to reserved cpu \
+             {cpu} failed: {message}; dispatcher left unpinned"
+        )),
+    }
+}
+
+/// Give the reserved CPU back, restoring the mask this thread had before it was
+/// pinned. No-op unless this thread is holding the pin.
+///
+/// Once given back it is not taken again: the pin is attempted at a thread's
+/// first dispatch and nowhere else, so a thread that has run inline stays
+/// unpinned for the rest of its life. That is deliberate. Re-pinning on the
+/// next win would put a `sched_setaffinity` pair on the hot path of exactly the
+/// contended case -- two sessions trading the claim would pay two syscalls per
+/// op against a ~7us op -- and the case where a thread runs inline at all is
+/// the case where the pin is harmful.
+fn release_dispatcher_pin() {
+    if !DISPATCHER_PIN_HELD.with(std::cell::Cell::get) {
+        return;
+    }
+    let saved = DISPATCHER_PREPIN_CPUS.with(|slot| slot.borrow_mut().take());
+    let Some(saved) = saved else {
+        // Unreachable by construction -- `acquire_dispatcher_pin` only sets the
+        // held flag after storing the mask -- but restoring nothing is the safe
+        // reading, and leaving the flag set would retry it every inline op.
+        DISPATCHER_PIN_HELD.with(|held| held.set(false));
+        return;
+    };
+    match crate::decode_affinity::set_current_thread_affinity(&saved) {
+        Ok(()) => report_dispatcher_unpin(&format!(
+            "{DISPATCHER_PIN_ENV} on, but this dispatch runs every shard inline: reserved cpu \
+             released back to {} cpus for the life of this thread",
+            saved.len()
+        )),
+        Err(message) => report_dispatcher_unpin(&format!(
+            "{DISPATCHER_PIN_ENV} on, but restoring this thread's affinity before an inline \
+             dispatch failed: {message}; it stays on the reserved cpu"
+        )),
+    }
+    DISPATCHER_PIN_HELD.with(|held| held.set(false));
+}
+
+/// The number of CPUs this process can actually keep busy: the affinity mask,
+/// clamped by the cgroup CPU quota.
+///
+/// The two are different limits and only one of them is a set of CPUs. A cpuset
+/// (`taskset`, `cpuset.cpus`, a pinned k8s guaranteed pod) narrows the mask, so
+/// counting the mask is right. A *quota* (`docker --cpus`, `cpu.max`, the
+/// default k8s CPU limit) narrows nothing: the mask still names every CPU on
+/// the machine and the kernel simply stops scheduling the group once it has
+/// spent its share of each period.
+///
+/// `available_parallelism` already accounts for both -- on Linux it returns
+/// `min(CPU_COUNT(affinity), cgroup quota)` -- and the requested width is
+/// clamped to it. The headroom reserve was not: it compared the width against
+/// the *mask*, so under a quota the width was always strictly below the number
+/// of usable CPUs the reserve was checking and the reserve was a permanent
+/// no-op. The result on a quota-limited container is the exact configuration
+/// the reserve exists to prevent: a worker for every CPU of the budget, all of
+/// them spinning, plus a dispatcher thread that can only publish the next op by
+/// preempting one of them.
+///
+/// `mask_len == 0` means the allowed set is unknown, and that answer is
+/// preserved rather than replaced by the quota: it is what
+/// [`reserve_single_group_headroom`] reads as "workers are unpinned, so they
+/// cannot occupy a CPU the dispatcher needs", and turning it into a live budget
+/// would silently start reserving on every platform that cannot report an
+/// affinity mask (macOS, a seccomp-filtered container). `parallelism == 0`
+/// means the platform could not report *that*, so the mask stands alone.
+fn effective_cpu_budget(mask_len: usize, parallelism: usize) -> usize {
+    crate::persistent_pool_width::effective_cpu_budget(mask_len, parallelism)
+}
+
+/// CPUs this process may run on at once, as the platform reports it, or 0 when
+/// it cannot. Injected into the shard helpers rather than read inside them so
+/// their unit tests keep describing a synthetic host instead of this one.
+fn host_parallelism() -> usize {
+    std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get)
 }
 
 /// Cap a single pinned worker group so at least [`DISPATCHER_RESERVED_CPUS`]
@@ -4388,29 +4763,12 @@ thread_local! {
 /// workers (never zero); the single-CPU case is handled earlier by falling back
 /// to the flat path in [`build_from_env`].
 fn reserve_single_group_headroom(total: usize, allowed_count: usize, core_count: usize) -> usize {
-    if allowed_count == 0 {
-        return total;
-    }
-    // Within the physical-core budget the pool runs one worker per core, so the
-    // inline dispatcher has nowhere to go but some worker's SMT sibling -- and
-    // that worker becomes a straggler the whole barrier waits for on every op.
-    // Measured on qwen int4 `accuracy_level=0` decode, 16 physical cores, no
-    // cpuset: 16 workers 4.41 ms/token against 15 workers 2.81 ms/token (1.57x).
-    // Past the core budget the workers already share cores because the user asked
-    // for more threads than there are cores, so the historical logical-CPU
-    // reserve applies instead -- reserving cores there is a 1.28x regression
-    // (8-logical/4-core cpuset: 7 workers 10.58 ms against 3 workers 13.56 ms).
-    if core_count > 0 && total <= core_count {
-        return total
-            .min(core_count.saturating_sub(DISPATCHER_RESERVED_CPUS))
-            .max(1);
-    }
-    if total < allowed_count {
-        return total;
-    }
-    allowed_count
-        .saturating_sub(DISPATCHER_RESERVED_CPUS)
-        .max(1)
+    crate::persistent_pool_width::reserve_single_group_headroom(
+        total,
+        allowed_count,
+        core_count,
+        DISPATCHER_RESERVED_CPUS,
+    )
 }
 
 /// Cap each NUMA-split shard so at least [`DISPATCHER_RESERVED_CPUS`] CPU of that
@@ -4418,15 +4776,17 @@ fn reserve_single_group_headroom(total: usize, allowed_count: usize, core_count:
 /// subscribed (`workers == node CPUs`) are reduced; a node that already has a
 /// spare core is left untouched, so this is a no-op wherever headroom exists.
 /// Each shard keeps at least one worker.
+///
+/// Note: this reserve compares against each node's *CPU list*, so like its
+/// single-group sibling it cannot see a CPU quota (#2185). It is deliberately
+/// left alone here: a quota is one global limit with no per-node share to
+/// compare against, and unlike the single-group path a worker taken here is
+/// *not* handed back -- `dispatcher_owns_a_shard` is false whenever there is
+/// more than one shard -- so guessing a per-node budget would cost compute
+/// width on hosts this change cannot measure. Tracked as #2195.
+#[cfg(test)]
 fn reserve_split_headroom(shards: &mut [NodeShard]) {
-    for shard in shards.iter_mut() {
-        let cap = shard
-            .cpus
-            .len()
-            .saturating_sub(DISPATCHER_RESERVED_CPUS)
-            .max(1);
-        shard.workers = shard.workers.min(cap);
-    }
+    crate::persistent_pool_width::reserve_split_headroom(shards, DISPATCHER_RESERVED_CPUS);
 }
 
 /// The calling thread's OS thread id, or `None` where the platform exposes no
@@ -4479,6 +4839,25 @@ fn report_dispatcher_pin(message: &str) {
     if REPORTED.set(()).is_ok() {
         #[cfg(feature = "tracing")]
         tracing_crate::debug!(dispatcher_pin = %message, "cpu decode dispatcher pin");
+        #[cfg(not(feature = "tracing"))]
+        if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
+            eprintln!("onnx-genai: {message}");
+        }
+    }
+}
+
+/// Report, once, that the dispatcher gave the reserved CPU back.
+///
+/// Its own static rather than [`report_dispatcher_pin`]'s, for the reason that
+/// function already gives for not sharing one: the pin message fires first by
+/// construction, so a shared one-shot would mean the release -- the interesting
+/// half, because it says the pool is contended and the knob has stopped
+/// applying -- could never be printed.
+fn report_dispatcher_unpin(message: &str) {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    if REPORTED.set(()).is_ok() {
+        #[cfg(feature = "tracing")]
+        tracing_crate::debug!(dispatcher_pin = %message, "cpu decode dispatcher pin released");
         #[cfg(not(feature = "tracing"))]
         if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
             eprintln!("onnx-genai: {message}");
@@ -4543,7 +4922,19 @@ fn report_spmd_fallback(message: &str) {
 /// otherwise. See `docs/architecture/ERROR_AND_LOGGING_CONVENTIONS.md` for level guidance.
 fn report_pool_built(mode: PersistenceMode) {
     let label = match mode {
-        PersistenceMode::On if decode_schedule() == DecodeSchedule::Steal => "work-stealing-pool",
+        // Names the *executor*, not the schedule. Only the MLAS build swaps the
+        // pool out for a foreign one; the native dynamic cursor is still this
+        // pool, with our threads, our pinning and our barrier, so it must keep
+        // reporting `spmd-pool`. Keying this off the schedule alone would
+        // relabel every default single-node native build and break the callers
+        // that assert an exact path.
+        PersistenceMode::On
+            if cfg!(feature = "mlas")
+                && decode_schedule_from_raw(std::env::var(DECODE_SCHEDULE_ENV).ok().as_deref())
+                    == Some(DecodeSchedule::Steal) =>
+        {
+            "work-stealing-pool"
+        }
         PersistenceMode::On => "spmd-pool",
         PersistenceMode::Adaptive => "adaptive",
         PersistenceMode::Off => "flat",
@@ -5131,11 +5522,11 @@ mod tests {
 
     #[test]
     fn decode_schedule_parses_env_values() {
-        assert_eq!(decode_schedule_from_raw(None), DecodeSchedule::Fixed);
-        assert_eq!(decode_schedule_from_raw(Some("")), DecodeSchedule::Fixed);
+        assert_eq!(decode_schedule_from_raw(None), None);
+        assert_eq!(decode_schedule_from_raw(Some("")), None);
         assert_eq!(
             decode_schedule_from_raw(Some("fixed")),
-            DecodeSchedule::Fixed
+            Some(DecodeSchedule::Fixed)
         );
         // The scheduling *policy* has no MLAS dependency -- the dynamic claim is
         // an atomic cursor over the tile table dispatched on the native SPMD
@@ -5145,16 +5536,160 @@ mod tests {
         // is what let the selector go inert in production unnoticed.
         assert_eq!(
             decode_schedule_from_raw(Some("steal")),
-            DecodeSchedule::Steal
+            Some(DecodeSchedule::Steal)
         );
         assert_eq!(
             decode_schedule_from_raw(Some(" work-stealing ")),
-            DecodeSchedule::Steal
+            Some(DecodeSchedule::Steal)
         );
+        assert_eq!(decode_schedule_from_raw(Some("bogus")), None);
+    }
+
+    /// An unrecognised value must be indistinguishable from an unset one, so a
+    /// typo takes the default rather than silently selecting the other schedule.
+    #[test]
+    fn an_unset_or_unparseable_schedule_takes_the_same_default() {
+        for raw in [None, Some(""), Some("   "), Some("bogus"), Some("stealing")] {
+            assert_eq!(
+                resolve_decode_schedule(raw, true),
+                resolve_decode_schedule(None, true),
+                "{raw:?} must resolve exactly like an unset variable"
+            );
+            assert_eq!(
+                resolve_decode_schedule(raw, false),
+                resolve_decode_schedule(None, false)
+            );
+        }
+    }
+
+    /// The default is topology- and executor-dependent, and both exclusions are
+    /// load-bearing rather than conservative decoration: a multi-node pool would
+    /// break the `place_rows` first-touch pairing a fixed split guarantees, and
+    /// an MLAS build would substitute a foreign executor instead of tiling ours.
+    #[test]
+    fn the_default_schedule_steals_only_on_a_single_node_native_pool() {
+        let single = resolve_decode_schedule(None, true);
+        if cfg!(feature = "mlas") {
+            assert_eq!(single, DecodeSchedule::Fixed);
+        } else {
+            assert_eq!(single, DecodeSchedule::Steal);
+        }
         assert_eq!(
-            decode_schedule_from_raw(Some("bogus")),
-            DecodeSchedule::Fixed
+            resolve_decode_schedule(None, false),
+            DecodeSchedule::Fixed,
+            "anything but a confirmed single node keeps the node-local fixed split"
         );
+        // An explicit value still means exactly what it means today, in every
+        // configuration -- this is the escape hatch, so it must not be topology
+        // dependent.
+        for single_node in [true, false] {
+            assert_eq!(
+                resolve_decode_schedule(Some("fixed"), single_node),
+                DecodeSchedule::Fixed
+            );
+            assert_eq!(
+                resolve_decode_schedule(Some("steal"), single_node),
+                DecodeSchedule::Steal
+            );
+        }
+    }
+
+    /// The guard is *positive*, which is the whole point of it: a single worker
+    /// shard is not evidence of a single node, because `node_shards_with` also
+    /// builds one shard when the topology could not be read. A host that cannot
+    /// answer must therefore fall to `Fixed` even at `node_count == 1`.
+    #[test]
+    fn a_single_shard_alone_does_not_authorise_stealing() {
+        for nodes in [0, 2, 4] {
+            assert!(
+                !on_confirmed_single_node(nodes),
+                "a {nodes}-shard pool spans nodes, so locality is not confirmed"
+            );
+            assert_eq!(
+                resolve_decode_schedule(None, on_confirmed_single_node(nodes)),
+                DecodeSchedule::Fixed
+            );
+        }
+        // The one-shard case defers entirely to the host probe, so the two must
+        // agree: whatever this machine reports, the shard count cannot override
+        // it in the permissive direction.
+        assert_eq!(
+            on_confirmed_single_node(1),
+            crate::decode_affinity::host_is_single_numa_node(),
+            "one shard must neither add nor remove confirmation"
+        );
+    }
+
+    /// The regression guard for the defect this default fixes. One tile per
+    /// worker makes `target <= total_workers`, so the tile table *is* the fixed
+    /// split and no lane can ever claim a second tile: `steal` and `fixed`
+    /// produce byte-identical segments. The knob reported a schedule it did not
+    /// implement, and every measurement of it was measuring the fixed split.
+    ///
+    /// Note what this does *not* guard, since the first version of it claimed
+    /// otherwise: the `target <= total_workers` early return is an
+    /// optimisation, not the mechanism. Deleting it leaves every assertion here
+    /// passing, because at `target == total_workers` the general tiling loop
+    /// reproduces the fixed split exactly -- verified by mutation across all
+    /// seven shapes below, ragged ones included. The degeneracy is arithmetic
+    /// and survives the shortcut being removed.
+    #[test]
+    fn one_tile_per_worker_degenerates_to_the_fixed_split() {
+        let pool = single_group_pool_with_schedule(8, DecodeSchedule::Steal);
+        let n = 8192;
+        let align = 64;
+        // The real function, not a re-derivation of it: this is the arithmetic
+        // that made the knob inert, so the test has to execute it. Swept over
+        // ragged shapes as well as round ones -- an equality that only holds
+        // when `n` divides evenly would be a property of the shape rather than
+        // of the schedule.
+        for (workers, n, align) in [
+            (8usize, 8192usize, 64usize),
+            (8, 8191, 64),
+            (6, 14336, 64),
+            (6, 4097, 32),
+            (15, 6144, 64),
+            (15, 6151, 16),
+            (3, 97, 8),
+        ] {
+            let pool = single_group_pool_with_schedule(workers, DecodeSchedule::Steal);
+            assert_eq!(
+                pool.work_stealing_segments_with_tiles(n, align, 1),
+                pool.worker_row_segments_aligned(n, align),
+                "one tile per lane is the fixed split at ({workers}, {n}, {align}), \
+                 so `steal` was `fixed`"
+            );
+        }
+
+        // And the shipped default does not: strictly more tiles than lanes is
+        // the whole mechanism, since a straggler is only absorbed if there is an
+        // unclaimed tile left for a lane that finished early.
+        let tiles = pool.default_steal_tiles_per_worker();
+        let dynamic = pool.work_stealing_segments_aligned(n, align);
+        #[cfg(feature = "mlas")]
+        assert_eq!(tiles, DEFAULT_STEAL_TILES_PER_WORKER_MLAS);
+        if cfg!(feature = "mlas") {
+            // The MLAS executor keeps its coarse one-tile grain, so there is
+            // nothing to steal and no tile-count assertion to make.
+        } else {
+            assert_eq!(tiles, DEFAULT_STEAL_TILES_PER_WORKER_NATIVE);
+            assert!(
+                dynamic.len() > pool.total_workers,
+                "{} tiles for {} lanes leaves nothing to steal",
+                dynamic.len(),
+                pool.total_workers
+            );
+        }
+        // Whatever the grain, the tiles must still cover every output exactly
+        // once and in order -- a rebalance that drops or duplicates a row is a
+        // wrong answer, not a slow one.
+        let mut covered = 0;
+        for &(start, len) in &dynamic {
+            assert_eq!(start, covered, "tiles must tile `0..n` in order");
+            covered += len;
+        }
+        assert_eq!(covered, n);
+        pool.shutdown();
     }
 
     /// The dynamic claim must be reachable *and correct* in a default,
@@ -5168,7 +5703,7 @@ mod tests {
     /// one tile.
     #[test]
     fn work_stealing_is_reachable_from_the_env_string_without_mlas() {
-        let schedule = decode_schedule_from_raw(Some("steal"));
+        let schedule = decode_schedule_from_raw(Some("steal")).expect("`steal` names a schedule");
         assert_eq!(
             schedule,
             DecodeSchedule::Steal,
@@ -5264,6 +5799,132 @@ mod tests {
         assert_ne!(
             parse_decode_blocktime(Some("250")),
             Duration::from_nanos(250)
+        );
+    }
+
+    /// A cpuset and a CPU quota are different limits, and only the cpuset is a
+    /// set of CPUs. The reserve compares the requested width against a count of
+    /// CPUs, so it has to be given the count the process can actually keep busy
+    /// -- otherwise a quota-limited container (the ordinary `docker --cpus` /
+    /// k8s `limits.cpu` shape, where the mask still names the whole machine)
+    /// makes the reserve a permanent no-op.
+    #[test]
+    fn the_cpu_budget_is_the_smaller_of_the_mask_and_the_quota() {
+        // Unconfined: the two agree and nothing changes.
+        assert_eq!(effective_cpu_budget(32, 32), 32);
+        // cpuset: `available_parallelism` follows the mask down.
+        assert_eq!(effective_cpu_budget(4, 4), 4);
+        // Quota: the mask still names every CPU, and this is the case the
+        // reserve could not see.
+        assert_eq!(effective_cpu_budget(32, 4), 4);
+        // An unknown *quota* falls back to the mask. An unknown *mask* stays
+        // unknown: 0 is the answer `reserve_single_group_headroom` reads as
+        // "workers are unpinned", and replacing it with the quota would start
+        // reserving a worker on every platform that cannot report an affinity
+        // mask (macOS, a seccomp-filtered container) -- a behaviour change on
+        // hosts this defect does not affect.
+        assert_eq!(effective_cpu_budget(32, 0), 32);
+        assert_eq!(effective_cpu_budget(0, 4), 0);
+        assert_eq!(effective_cpu_budget(0, 0), 0);
+    }
+
+    /// The consequence of the above, stated as the shards the pool would build,
+    /// through the call site rather than through the helper: the defect was
+    /// never in `reserve_single_group_headroom`, it was in what the callers
+    /// handed it.
+    ///
+    /// Under a 4-CPU quota on a 32-CPU host the width is already clamped to 4
+    /// by `available_parallelism`, but both inputs the reserve consults still
+    /// describe the whole machine, so it stands down -- four spinning workers
+    /// holding the entire budget, with the dispatcher able to publish work only
+    /// by preempting one. (Which rule declines depends on the host: with a
+    /// readable topology `4 <= 16` cores takes the core rule, and with no
+    /// topology `4 < 32` allowed CPUs takes the headroom rule. Both return 4,
+    /// which is why the fix is at the inputs and not in the rules.)
+    #[test]
+    fn a_quota_limited_container_still_gets_dispatcher_headroom() {
+        let mask: Vec<usize> = (0..32).collect();
+        let quota = 4;
+        let total = quota;
+
+        // Pass `0` for the quota and the call site sees exactly what it saw
+        // before this fix, on any host, because the mask is synthetic.
+        let unclamped = explicit_affinity_shards_for(
+            ExplicitAffinity::Unpinned,
+            total,
+            0,
+            || None,
+            || Some(mask.clone()),
+        )
+        .expect("`off` always resolves to a single unpinned group");
+        assert_eq!(
+            unclamped[0].workers, 4,
+            "without the quota the reserve is a no-op, which is the defect"
+        );
+
+        let shards = explicit_affinity_shards_for(
+            ExplicitAffinity::Unpinned,
+            total,
+            quota,
+            || None,
+            || Some(mask.clone()),
+        )
+        .expect("`off` always resolves to a single unpinned group");
+        assert_eq!(
+            shards[0].workers, 3,
+            "against the quota-clamped budget the dispatcher keeps a CPU"
+        );
+        assert!(
+            dispatcher_owns_a_shard(&shards, total),
+            "the reserved lane returns as the dispatcher's shard, so compute width is unchanged"
+        );
+
+        // The planned-CPU arm reserves from the same budget. Its CPU list is
+        // the selection, so the quota has to be applied to it too -- a plan
+        // naming 32 CPUs under a 4-CPU quota is still a 4-CPU budget.
+        let planned = explicit_affinity_shards_for(
+            ExplicitAffinity::FromPlan,
+            total,
+            quota,
+            || Some(mask.clone()),
+            || None,
+        )
+        .expect("a non-empty plan resolves to a single pinned group");
+        assert_eq!(
+            planned[0].workers, 3,
+            "the planned arm reserves against the quota as well"
+        );
+        assert_eq!(
+            planned[0].cpus.len(),
+            mask.len(),
+            "the quota caps the worker count, never the CPU set: pinning stays free to spread"
+        );
+    }
+
+    /// The third call site, the default fallback, reached through
+    /// `node_shards_with`. It reads the host's own allowed set rather than a
+    /// synthetic one, so this asserts the one value that is host-independent:
+    /// a budget of one CPU leaves one worker, whatever the mask says. Off
+    /// single-node Linux (no readable mask, or a split across nodes) the
+    /// fallback is not the path under test and the check stands down.
+    #[test]
+    fn the_default_fallback_reserves_against_the_quota_too() {
+        let Some(allowed) = crate::decode_affinity::allowed_cpus() else {
+            return;
+        };
+        if allowed.is_empty() {
+            return;
+        }
+        let shards = node_shards_with(4, 1, |_| None);
+        if shards.len() != 1 {
+            return;
+        }
+        assert_eq!(
+            shards[0].workers,
+            1,
+            "a one-CPU budget cannot host four spinning workers plus a dispatcher, \
+             whatever the {}-CPU affinity mask says",
+            allowed.len()
         );
     }
 
@@ -5375,6 +6036,7 @@ mod tests {
             explicit_affinity_shards_for(
                 ExplicitAffinity::Malformed,
                 4,
+                0,
                 || panic!("a malformed value must not consult topology"),
                 || panic!("a malformed value must not consult topology"),
             )
@@ -5393,6 +6055,7 @@ mod tests {
         let shards = explicit_affinity_shards_for(
             ExplicitAffinity::Unpinned,
             4,
+            0,
             || panic!("`off` must not consult the affinity plan"),
             || Some((0..16).collect()),
         )
@@ -5414,6 +6077,7 @@ mod tests {
         let saturated = explicit_affinity_shards_for(
             ExplicitAffinity::Unpinned,
             4,
+            0,
             || panic!("`off` must not consult the affinity plan"),
             || Some(vec![0, 1, 2, 3]),
         )
@@ -5430,6 +6094,7 @@ mod tests {
         let unknown = explicit_affinity_shards_for(
             ExplicitAffinity::Unpinned,
             4,
+            0,
             || panic!("`off` must not consult the affinity plan"),
             || None,
         )
@@ -5448,6 +6113,7 @@ mod tests {
         let shards = explicit_affinity_shards_for(
             ExplicitAffinity::FromPlan,
             4,
+            0,
             || Some(planned.clone()),
             || panic!("a planned request must not consult the allowed set"),
         )
@@ -5506,6 +6172,7 @@ mod tests {
         let roomy = explicit_affinity_shards_for(
             ExplicitAffinity::FromPlan,
             2,
+            0,
             || Some(vec![0, 1, 2, 3, 4, 5, 6, 7]),
             || panic!("a planned request must not consult the allowed set"),
         )
@@ -5520,13 +6187,14 @@ mod tests {
     fn an_unresolvable_plan_falls_back_to_default_placement() {
         let no_allowed = || panic!("the allowed set is only for `off`");
         assert!(
-            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, || None, no_allowed)
+            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, 0, || None, no_allowed)
                 .is_none()
         );
         assert!(
             explicit_affinity_shards_for(
                 ExplicitAffinity::FromPlan,
                 4,
+                0,
                 || Some(Vec::new()),
                 no_allowed
             )
@@ -5536,6 +6204,7 @@ mod tests {
             explicit_affinity_shards_for(
                 ExplicitAffinity::DeferToDefault,
                 4,
+                0,
                 || panic!("deferring must not consult the plan"),
                 || panic!("deferring must not consult the allowed set"),
             )
@@ -5553,12 +6222,14 @@ mod tests {
     #[test]
     fn different_affinity_requests_do_not_collapse_to_the_same_placement() {
         let planned = || Some(vec![16, 17, 18, 19]);
-        let off =
-            explicit_affinity_shards_for(ExplicitAffinity::Unpinned, 4, planned, || Some(vec![16]))
-                .expect("`off` is honored");
-        let node =
-            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, planned, || Some(vec![16]))
-                .expect("`node:<index>` is honored");
+        let off = explicit_affinity_shards_for(ExplicitAffinity::Unpinned, 4, 0, planned, || {
+            Some(vec![16])
+        })
+        .expect("`off` is honored");
+        let node = explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, 0, planned, || {
+            Some(vec![16])
+        })
+        .expect("`node:<index>` is honored");
         assert_ne!(
             off[0].cpus, node[0].cpus,
             "`off` and `node:<index>` must not resolve to the same CPU set"
@@ -7657,7 +8328,7 @@ mod tests {
             cpus: vec![100, 101],
             workers: 2,
         };
-        let shards = node_shards_with(16, |total| {
+        let shards = node_shards_with(16, 0, |total| {
             assert_eq!(total, 16, "the worker count must reach the request");
             Some(vec![sentinel.clone()])
         });
@@ -7677,7 +8348,7 @@ mod tests {
     /// `DecodeAffinity::parse(None)` is `Off`.
     #[test]
     fn no_explicit_request_leaves_default_placement_intact() {
-        let defaulted = node_shards_with(16, |_| None);
+        let defaulted = node_shards_with(16, 0, |_| None);
         // Whatever this host's topology, the default path never returns an
         // empty schedule or a pool with no workers.
         assert!(!defaulted.is_empty());
@@ -8768,6 +9439,135 @@ mod tests {
             "an inline dispatch still runs every shard, on the caller"
         );
         pool.shutdown();
+    }
+
+    /// A dispatch that runs every shard inline gives the reserved CPU back.
+    ///
+    /// This is the multi-session defect in the pin knob, and it is a
+    /// *measured* one rather than a theoretical one: with the knob on, two
+    /// concurrent sessions both pin their dispatcher to the same reserved CPU,
+    /// and the one that loses the claim then computes the entire op there.
+    /// Measured on a 32-CPU host at width 16, paired and order-alternated:
+    /// 0.551x of the unpinned arm at 2 sessions (0/10 wins) and 0.321x at 4,
+    /// i.e. the loss tracks 1/sessions. A thread census read both session
+    /// threads on `cpu=30` in every sample with the knob on and on distinct
+    /// CPUs with it off.
+    ///
+    /// The post-shutdown path is used to reach `dispatch_inline`
+    /// deterministically *on this thread*: the contended path reaches it too,
+    /// but only from whichever thread loses a race, which is not a thing a test
+    /// can assert on. Both paths run the same shards on the caller, and both
+    /// are the case this releases for.
+    #[test]
+    fn an_inline_dispatch_releases_the_reserved_cpu_it_was_pinned_to() {
+        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
+            return;
+        }
+        let crate::decode_affinity::ObservedAffinity::Cpus(before) =
+            crate::decode_affinity::observe_current_thread_cpus()
+        else {
+            return;
+        };
+        if before.len() < 2 {
+            // With one allowed CPU a pin cannot narrow anything, so the restore
+            // has nothing to prove and the test would pass vacuously.
+            return;
+        }
+        let target = before[0];
+        let pool = single_group_pool(2);
+        pool.shutdown();
+
+        acquire_dispatcher_pin(target);
+        let pinned = crate::decode_affinity::observe_current_thread_cpus();
+        assert_eq!(
+            pinned,
+            crate::decode_affinity::ObservedAffinity::Cpus(vec![target]),
+            "the test's own precondition failed: the dispatcher pin did not narrow this \
+             thread to the reserved cpu, so the release has nothing to undo"
+        );
+
+        pool.dispatch_index_tasks(2, &|_| {});
+
+        let after = crate::decode_affinity::observe_current_thread_cpus();
+        assert_eq!(
+            after,
+            crate::decode_affinity::ObservedAffinity::Cpus(before),
+            "a dispatch that computes every shard on this thread must hand the reserved cpu \
+             back first; left pinned, two sessions serialize onto one cpu"
+        );
+        assert!(
+            !DISPATCHER_PIN_HELD.with(std::cell::Cell::get),
+            "the release must clear the held flag, or every later inline dispatch retries \
+             the restore syscall"
+        );
+    }
+
+    /// Taking the pin twice must not overwrite the mask it is holding for us.
+    ///
+    /// `DISPATCHER_TICK` is a `u32` incremented with `wrapping_add`, so the
+    /// "first dispatch" branch that takes the pin comes back around every 2^32
+    /// dispatches -- roughly 8 hours of continuous decode at this pool's rate,
+    /// i.e. an ordinary server uptime. A second acquire that re-read the mask
+    /// while pinned would remember the *reserved CPU* as the mask to restore,
+    /// and every later release would then be a no-op that left the thread on
+    /// one CPU for life: the exact failure this whole change exists to remove,
+    /// reintroduced by a counter wrap.
+    #[test]
+    fn taking_the_pin_a_second_time_keeps_the_mask_it_first_saved() {
+        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
+            return;
+        }
+        let crate::decode_affinity::ObservedAffinity::Cpus(before) =
+            crate::decode_affinity::observe_current_thread_cpus()
+        else {
+            return;
+        };
+        if before.len() < 2 {
+            return;
+        }
+        let target = before[0];
+
+        acquire_dispatcher_pin(target);
+        assert_eq!(
+            crate::decode_affinity::observe_current_thread_cpus(),
+            crate::decode_affinity::ObservedAffinity::Cpus(vec![target]),
+            "precondition: the first acquire must narrow this thread to the reserved cpu"
+        );
+        // The wrap: same thread, same reserved cpu, still pinned.
+        acquire_dispatcher_pin(target);
+        release_dispatcher_pin();
+
+        assert_eq!(
+            crate::decode_affinity::observe_current_thread_cpus(),
+            crate::decode_affinity::ObservedAffinity::Cpus(before),
+            "a second acquire must not overwrite the saved mask with the reserved cpu; the \
+             release then restores nothing and the thread is confined for life"
+        );
+    }
+
+    /// Releasing a pin nobody took is a no-op, not a widening.
+    ///
+    /// The release runs on every inline dispatch, including in the overwhelming
+    /// majority of processes where the knob is off and no pin was ever taken.
+    /// If it restored a *remembered* mask unconditionally it would hand a
+    /// cpuset-confined thread CPUs it was never allowed to use, and it would do
+    /// so on the hot path.
+    #[test]
+    fn releasing_a_pin_that_was_never_taken_leaves_the_mask_alone() {
+        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
+            return;
+        }
+        let before = crate::decode_affinity::observe_current_thread_cpus();
+        assert!(
+            !DISPATCHER_PIN_HELD.with(std::cell::Cell::get),
+            "this thread must not already hold the pin for the control to mean anything"
+        );
+        release_dispatcher_pin();
+        assert_eq!(
+            crate::decode_affinity::observe_current_thread_cpus(),
+            before,
+            "releasing an unheld pin must not touch this thread's affinity"
+        );
     }
 
     /// An idle gap far longer than the blocktime window must park the workers.

@@ -166,10 +166,27 @@ mod mock_kernel_ctx {
         (ptr as usize) - 1
     }
 
+    /// Stand in for the host's `CreateStatus`, and **say what went wrong**.
+    ///
+    /// The sentinel alone tells a failing assertion only that `Compute`
+    /// returned an error, never which of its many fail-closed branches
+    /// produced it. When #2200 made residency mandatory and this table did not
+    /// yet supply `GetTensorMemoryInfo`, all seven `Compute` tests reported
+    /// `Compute failed` and nothing else — while the plugin was saying
+    /// `Compute: OrtApi.GetTensorMemoryInfo is null` the whole time. The cause
+    /// had to be recovered by reading the diff instead of the failure.
+    /// libtest captures this stream per test and prints it only for tests that
+    /// fail, so the message costs nothing on a green run.
     pub unsafe extern "C" fn mock_create_status(
         _code: ort::OrtErrorCode,
-        _msg: *const std::ffi::c_char,
+        msg: *const std::ffi::c_char,
     ) -> *mut ort::OrtStatus {
+        if !msg.is_null() {
+            // SAFETY: the plugin passes a live `CString` for the duration of
+            // this call, so the pointer is a valid NUL-terminated string here.
+            let text = unsafe { std::ffi::CStr::from_ptr(msg) }.to_string_lossy();
+            eprintln!("mock host CreateStatus: {text}");
+        }
         // For test: return a non-null sentinel to signal error.
         std::ptr::dangling_mut::<ort::OrtStatus>()
     }
@@ -264,6 +281,47 @@ mod mock_kernel_ctx {
         ptr::null_mut()
     }
 
+    pub unsafe extern "C" fn mock_get_tensor_memory_info(
+        _value: *const ort::OrtValue,
+        out: *mut *const ort::OrtMemoryInfo,
+    ) -> ort::OrtStatusPtr {
+        // The production adapter now requires the same residency hooks real ORT
+        // API 27 provides. This mock models a CPU allocator; omitting the hooks
+        // is not an older supported plugin ABI, it is an incomplete OrtApi
+        // fixture that correctly makes Compute fail closed.
+        //
+        // What this does *not* cover: reporting a CUDA allocator here instead
+        // (device type GPU, name `Cuda`) leaves all twelve tests green, so
+        // nothing in this file asserts that residency reaches the kernel.
+        // `kernel_ctx.rs`'s own tests do assert it; the exported-ABI layer does
+        // not. Measured, not assumed. #2224.
+        unsafe { *out = ptr::dangling::<ort::OrtMemoryInfo>() };
+        ptr::null_mut()
+    }
+
+    pub unsafe extern "C" fn mock_memory_info_get_device_type(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut ort::OrtMemoryInfoDeviceType,
+    ) {
+        unsafe { *out = ort::OrtMemoryInfoDeviceType_CPU };
+    }
+
+    pub unsafe extern "C" fn mock_memory_info_get_name(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut *const std::ffi::c_char,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = c"Cpu".as_ptr() };
+        ptr::null_mut()
+    }
+
+    pub unsafe extern "C" fn mock_memory_info_get_id(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut i32,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 0 };
+        ptr::null_mut()
+    }
+
     pub unsafe extern "C" fn mock_get_output(
         _ctx: *mut ort::OrtKernelContext,
         index: usize,
@@ -339,6 +397,10 @@ mod mock_kernel_ctx {
             GetDimensionsCount: Some(mock_get_dimensions_count),
             GetDimensions: Some(mock_get_dimensions),
             GetTensorData: Some(mock_get_tensor_data),
+            GetTensorMemoryInfo: Some(mock_get_tensor_memory_info),
+            MemoryInfoGetDeviceType: Some(mock_memory_info_get_device_type),
+            MemoryInfoGetName: Some(mock_memory_info_get_name),
+            MemoryInfoGetId: Some(mock_memory_info_get_id),
             GetTensorMutableData: Some(mock_get_tensor_mutable_data),
             ReleaseTensorTypeAndShapeInfo: Some(mock_release_tensor_type_and_shape_info),
             ..Default::default()
@@ -763,6 +825,8 @@ fn l1_required_symbols_resolve() {
     for symbol in [
         &b"nxrt_ep_compiled_node_count"[..],
         &b"nxrt_ep_reset_compiled_node_count"[..],
+        &b"nxrt_ep_get_capability_call_count"[..],
+        &b"nxrt_ep_reset_get_capability_call_count"[..],
         &b"nxrt_ep_workspace_placement_queries"[..],
         &b"nxrt_ep_reset_workspace_placement_queries"[..],
         &b"nxrt_ep_constant_weight_inputs"[..],
@@ -862,6 +926,8 @@ fn l1_no_symbol_leakage() {
                 && *name != "ReleaseEpFactory"
                 && *name != "nxrt_ep_compiled_node_count"
                 && *name != "nxrt_ep_reset_compiled_node_count"
+                && *name != "nxrt_ep_get_capability_call_count"
+                && *name != "nxrt_ep_reset_get_capability_call_count"
                 && *name != "nxrt_ep_workspace_placement_queries"
                 && *name != "nxrt_ep_reset_workspace_placement_queries"
                 && *name != "nxrt_ep_constant_weight_inputs"

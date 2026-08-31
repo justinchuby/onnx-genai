@@ -530,6 +530,59 @@ async fn completion_logprobs_match_legacy_openai_shape() {
 }
 
 #[tokio::test]
+async fn buffered_and_sse_routes_deliver_only_committed_workflow_publications() {
+    let request = |stream| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "tiny-llm",
+                    "prompt": "hello",
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                    "stream": stream
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let buffered = app(tiny_state()).oneshot(request(false)).await.unwrap();
+    assert_eq!(buffered.status(), StatusCode::OK);
+    let buffered: Value =
+        serde_json::from_slice(&to_bytes(buffered.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let publications = buffered["workflow_outputs"]
+        .as_array()
+        .expect("buffered route exposes committed workflow publications");
+    assert!(!publications.is_empty());
+    assert!(
+        publications
+            .iter()
+            .all(|publication| publication["finality"] == "final"),
+        "{publications:#?}"
+    );
+
+    let streamed = app(tiny_state()).oneshot(request(true)).await.unwrap();
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let body = to_bytes(streamed.into_body(), usize::MAX).await.unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    let streamed_publications = text
+        .split("\n\n")
+        .filter(|event| event.lines().any(|line| line == "event: workflow_output"))
+        .map(|event| {
+            let data = event
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("workflow output event has data");
+            serde_json::from_str::<Value>(data).expect("workflow output event is JSON")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(streamed_publications.as_slice(), publications.as_slice());
+}
+
+#[tokio::test]
 async fn streaming_chat_and_completion_chunks_include_logprobs() {
     let chat = app(tiny_state())
         .oneshot(
@@ -2775,6 +2828,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
             session_id: None,
             lease: None,
             request: Box::new(build_generate_request(&slow_request)),
+            tool_call_policy: onnx_genai_engine::ToolCallPolicy::Disabled,
             admission: slow_admission,
             events: slow_tx,
             permit: crate::driver::WorkerPermit::untracked(slow_permit),
@@ -2782,7 +2836,12 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .await
         .unwrap();
     let fast_rx = driver
-        .generate(None, build_generate_request(&fast_request), None)
+        .generate(
+            None,
+            build_generate_request(&fast_request),
+            onnx_genai_engine::ToolCallPolicy::Disabled,
+            None,
+        )
         .await
         .unwrap();
 
@@ -2834,6 +2893,7 @@ async fn native_driver_sessions_generate_through_server_path() {
                     .expect("a session with no turn in flight is leasable"),
             ),
             request,
+            onnx_genai_engine::ToolCallPolicy::Disabled,
             None,
         )
         .await
@@ -4181,10 +4241,6 @@ fn workflow_package_without_conversation(scratch: &tempfile::TempDir) -> PathBuf
         .expect("workflow declares state")
         .remove("conversation")
         .expect("the fixture declares a conversation");
-    let capabilities = document["pipeline"]["workflow"]["manifest"]["capabilities"]
-        .as_array_mut()
-        .expect("the manifest declares capabilities");
-    capabilities.retain(|capability| capability.as_str() != Some("session_state_lease"));
     std::fs::write(
         &metadata,
         serde_yaml::to_string(&document).expect("serialize metadata"),
@@ -5521,7 +5577,7 @@ async fn a_conversation_past_its_bound_is_a_typed_client_error() {
         serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
             .expect("parse metadata");
     document["pipeline"]["workflow"]["inputs"]["package.conversation_limit"] = json!({
-        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "contract": {"dtype": "int64", "shape": [1]},
         "role": {"kind": "opaque"},
         "source": {"kind": "literal"},
         "required": false,
@@ -5578,7 +5634,7 @@ async fn a_failed_turn_releases_its_lease() {
         serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
             .expect("parse metadata");
     document["pipeline"]["workflow"]["inputs"]["package.conversation_limit"] = json!({
-        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "contract": {"dtype": "int64", "shape": [1]},
         "role": {"kind": "opaque"},
         "source": {"kind": "literal"},
         "required": false,
@@ -5725,17 +5781,48 @@ async fn a_cancelled_client_does_not_leak_its_session_lease() {
 /// edit collapsing them onto one code.
 #[test]
 fn capability_refusals_map_to_the_status_their_variant_means() {
-    use onnx_genai_engine::PackageCapabilityError;
+    use onnx_genai_engine::PackageExecutionError;
 
     let no_state = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::NoSessionState,
+        PackageExecutionError::NoSessionState,
     ));
     let response = crate::routes::generation_failure(no_state);
     assert_eq!(response.status, StatusCode::CONFLICT);
     assert_eq!(response.kind, "conflict_error");
 
+    let dflash = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageExecutionError::DFlashExecutionUnavailable {
+            version: "1".to_string(),
+        },
+    ));
+    let response = crate::routes::generation_failure(dflash);
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.kind, "conflict_error");
+    assert!(response.message.contains("onnx-genai.dflash-flat-block@1"));
+
+    let candidate_tree = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageExecutionError::CandidateTreeExecutionUnavailable {
+            version: "2".to_string(),
+            reason: "unsupported verifier ABI".to_string(),
+        },
+    ));
+    let response = crate::routes::generation_failure(candidate_tree);
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.kind, "conflict_error");
+    assert!(response.message.contains("onnx-genai.speculative@2"));
+
+    let dflash_raw = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageExecutionError::DFlashRawWorkflowApi {
+            operation: "run_pipeline".to_string(),
+        },
+    ));
+    let response = crate::routes::generation_failure(dflash_raw);
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(response.kind, "invalid_request_error");
+    assert!(response.message.contains("run_pipeline"));
+
     let busy = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::ExclusiveLeaseConflict {
+        PackageExecutionError::ExclusiveLeaseConflict {
             session: "shared".to_string(),
         },
     ));
@@ -5746,7 +5833,7 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert!(response.message.contains("shared"));
 
     let over_bound = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::ConversationOverBound {
+        PackageExecutionError::ConversationOverBound {
             cell: "conversation".to_string(),
             requested: 12,
             bound: 6,
@@ -5757,7 +5844,7 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert_eq!(response.kind, "invalid_request_error");
     assert_eq!(
         response.message,
-        PackageCapabilityError::ConversationOverBound {
+        PackageExecutionError::ConversationOverBound {
             cell: "conversation".to_string(),
             requested: 12,
             bound: 6,
@@ -5879,7 +5966,7 @@ async fn every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_o
         serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
             .expect("parse metadata");
     document["pipeline"]["workflow"]["inputs"]["package.conversation_limit"] = json!({
-        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "contract": {"dtype": "int64", "shape": [1]},
         "role": {"kind": "opaque"},
         "source": {"kind": "literal"},
         "required": false,

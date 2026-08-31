@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -30,6 +31,179 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 # is the one drift this gate cannot see.
 REQUIRED_JOB_NAMES = frozenset({"Fast (Linux x86_64)", "Rust quality"})
 
+# Every job this repository's workflows define, by file. `_stray_job_attribute`
+# refuses a job key indented one level too far, but it is reached through
+# `workflow_jobs()`, which reads `ci.yml` alone; the other 23 files were
+# unguarded until #2206. Scope and host are separate choices, and only the host
+# has to be required: this inventory is checked from `rust-quality`, so a job
+# that stops being *defined* anywhere blocks a merge.
+#
+# "Defined" is the whole claim, and it is narrower than "runs". Reviewed and
+# measured, this gate is blind to three ways a job stops running while every
+# name it records is still present: a workflow whose `on:`/`paths:` no longer
+# fires on pull requests, a job carrying `if: false`, and a `strategy.matrix`
+# emptied or renamed -- the inventory holds the unexpanded template
+# `CLI ORT (${{ matrix.name }})`, not the check names GitHub actually reports.
+# `if: false` on a *required* job is already refused by
+# `verify_required_job_conditions`; on a non-required job nothing refuses it.
+# See #2210. Do not read a pass here as "these checks ran".
+#
+# The names are display names -- `name:` when a job sets one, otherwise the job
+# key -- because that is what GitHub reports as the status check and what a
+# branch ruleset matches on.
+#
+# A stray-key rule fires on the *mechanism* of accidental nesting, so it cannot
+# see a job deleted outright: the file simply has fewer jobs, and nothing about
+# it is malformed. That is why this is an inventory and not another rule. The
+# cost is that adding or renaming a job means editing this table, and the
+# failure message prints the exact replacement block to paste.
+WORKFLOW_JOB_INVENTORY: dict[str, tuple[str, ...]] = {
+    "audit.yml": (
+        "audit",
+    ),
+    "benchmark.yml": (
+        "Kernel micro-benchmarks",
+    ),
+    "ci.yml": (
+        "CLI ORT (${{ matrix.name }})",
+        "CUDA compile (Linux x86_64)",
+        "CUDA compile (Windows x86_64)",
+        "Detect change scope",
+        "EP conformance (Linux x86_64)",
+        "Fast (Linux x86_64)",
+        "Rust (Windows ARM64)",
+        "Rust coverage (${{ matrix.name }})",
+        "Rust quality",
+    ),
+    "diff-guard.yml": (
+        "Deletion ratio",
+        "Root file allowlist",
+    ),
+    "hostlock.yml": (
+        "Host lock conformance",
+    ),
+    "miri.yml": (
+        "Miri unsafe-crate soundness",
+    ),
+    "mobius-producer-conformance.yml": (
+        "Mobius metadata packages (signal)",
+    ),
+    "publish-ep-plugins.yml": (
+        "Publish nxrt-ep-cpu",
+        "Publish nxrt-ep-cuda",
+        "nxrt-ep-cpu wheel (${{ matrix.name }})",
+        "nxrt-ep-cuda wheel (${{ matrix.name }})",
+    ),
+    "publish.yml": (
+        "Build ${{ matrix.package }} (${{ matrix.platform.name }})",
+        "Publish nxrt sdist to PyPI",
+        "Publish onnx-genai sdists to PyPI",
+        "Publish onnx-genai wheels to PyPI",
+        "publish",
+    ),
+    "squad-ci.yml": (
+        "test",
+    ),
+    "squad-docs.yml": (
+        "build",
+    ),
+    "squad-heartbeat.yml": (
+        "heartbeat",
+    ),
+    "squad-insider-release.yml": (
+        "release",
+    ),
+    "squad-issue-assign.yml": (
+        "assign-work",
+    ),
+    "squad-label-enforce.yml": (
+        "enforce",
+    ),
+    "squad-preview.yml": (
+        "validate",
+    ),
+    "squad-promote.yml": (
+        "Promote dev → preview",
+        "Promote preview → main (release)",
+    ),
+    "squad-release.yml": (
+        "release",
+    ),
+    "squad-triage.yml": (
+        "triage",
+    ),
+    "sync-squad-labels.yml": (
+        "sync-labels",
+    ),
+    "visualizer-test.yml": (
+        "Node security and leaf-accounting tests",
+    ),
+    "weight-cache-guard.yml": (
+        "A per-thread buffer needs a per-process bound",
+        "New weight-derived caches must be governed",
+    ),
+    "wheels.yml": (
+        "CPU wheel (${{ matrix.name }})",
+        "CUDA wheel scaffold",
+        "Publish nxrt CPU wheels",
+    ),
+    "wiki-lint.yml": (
+        "Notes stand on their own",
+    ),
+}
+
+# Every workflow that reports a check on every pull request, mapped to the
+# job-level `if:` expressions its jobs are allowed to carry.
+#
+# `WORKFLOW_JOB_INVENTORY` proves a job is still *defined*. This proves the two
+# things that decide whether a defined job still *runs* on a pull request: the
+# workflow triggers on `pull_request` at all, and no job has been quietly gated
+# behind a condition. Both were measured blind before this table existed --
+# adding `if: false` to `root-files`, `miri` or the hostlock job, or swapping
+# `pull_request:` for `workflow_dispatch:`, left every gate returning 0 while
+# printing a line byte-identical to a clean tree. See #2210.
+#
+# An empty set means "these jobs run unconditionally", which is the right
+# default for a gate: a check that can decline to run is not a gate. `ci.yml` is
+# the sole exception and carries the repo's docs-only guard, which is reasoned
+# about at length above `_ALLOWED_JOB_IF`.
+#
+# The membership itself is the assertion, in both directions: a recorded file
+# that stops firing on `pull_request` is refused, and a file that *starts*
+# firing without being recorded is refused too, so the table cannot silently
+# fall behind the tree. Adding or retiring a PR check means editing this table
+# in the same commit -- a permanent record in the diff rather than a decision
+# nobody can later find.
+#
+# NOT covered, and deliberately: `ci.yml` losing `pull_request` in the very pull
+# request that does it. GitHub decides whether to run a workflow for a
+# `pull_request` event from the file on that PR's own merge ref, so `Rust
+# quality` -- which hosts this check -- would not run to report its absence. A
+# guard cannot witness the absence of the thing hosting it. Closing that needs a
+# required check in another workflow file, which is a ruleset change and so is
+# not fixable from inside the repository; the same boundary `REQUIRED_JOB_NAMES`
+# documents. This table still catches it on push-to-`main` and in any *other*
+# pull request, which is every route except the first.
+# The repo's docs-only guard, named once because two tables assert on it:
+# `_ALLOWED_JOB_IF` (which required jobs may carry) and `PR_TRIGGERED_WORKFLOWS`
+# (which jobs in a PR-triggered workflow may carry). Two spellings of one
+# expression would drift silently and each table would keep passing.
+_DOCS_ONLY_GUARD = "needs.changes.outputs.docs_only != 'true'"
+
+PR_TRIGGERED_WORKFLOWS: dict[str, frozenset[str]] = {
+    "audit.yml": frozenset(),
+    "ci.yml": frozenset({_DOCS_ONLY_GUARD}),
+    "diff-guard.yml": frozenset(),
+    "hostlock.yml": frozenset(),
+    "miri.yml": frozenset(),
+    "mobius-producer-conformance.yml": frozenset(),
+    "squad-ci.yml": frozenset(),
+    "squad-heartbeat.yml": frozenset(),
+    "visualizer-test.yml": frozenset(),
+    "weight-cache-guard.yml": frozenset(),
+    "wiki-lint.yml": frozenset(),
+}
+
 # Crates that are intentionally not selected by any CI cargo-test lane.
 # Every entry is a written exception to the default rule: workspace members are
 # tested unless they are listed here with a reason.
@@ -48,6 +222,39 @@ DENYLIST: dict[str, str] = {
     # CI is not the right harness.
     "onnx-genai-python": "PyO3 extension crate requires wheel packaging/runtime DLL staging",
     "onnx-runtime-python": "PyO3 extension crate requires wheel packaging/runtime DLL staging",
+}
+
+# Crates the lint lane must skip, and the only kind of reason that qualifies.
+#
+# `DENYLIST` above is about *running* tests: a GPU, a wheel-staged extension
+# module, a perf harness. #2058 established that such reasons have no force
+# over clippy, which only ever *checks* -- it never links and never runs a test
+# binary -- and restored lint coverage to 21 tested crates that had lost it for
+# a reason that did not apply. That argument was never extended to the denied
+# crates themselves, so `lint` stayed `packages - DENYLIST` and four members
+# ended up linted by nothing at all: onnx-genai-bench, onnx-genai-ort-sys,
+# onnx-genai-python, onnx-runtime-python.
+#
+# That gap is not theoretical. #2132 left `onnx-runtime-python` uncompilable on
+# every platform for 22 commits. The only job that builds it is `CUDA compile`,
+# which is not a required check: it went red on the breaking merge and did not
+# block it. Lint coverage puts that same breakage in front of `Rust quality`,
+# which is required.
+#
+# An entry here must therefore name a reason clippy itself cannot get past.
+# "needs a GPU at runtime", "isn't a unit-test target" and "needs wheel
+# staging" are not such reasons -- that is the #2058 mistake with new nouns.
+LINT_EXEMPT: dict[str, str] = {
+    # Its build script shells out to the CUDA toolchain, which the Linux
+    # `Rust quality` runner does not install. Linted by the CUDA compile job,
+    # which does. Verified locally only on a box that has `nvcc`, so a local
+    # pass here is not evidence about the required runner.
+    "onnx-runtime-ep-cuda": "build script requires a CUDA toolchain absent from the quality runner",
+    # Not a toolchain limit: 28 dead-code findings in `src/bin/compare.rs`
+    # (a whole `Direct*` reporting path that nothing constructs). Tracked in
+    # #2242. Remove this entry when they are resolved -- it is debt, not an
+    # exemption on the merits.
+    "onnx-genai-bench": "not yet clippy-clean: dead-code backlog in src/bin/compare.rs (#2242)",
 }
 
 # Packages that need the ORT-backed lane because they directly or transitively
@@ -85,6 +292,8 @@ def package_args(packages: list[str]) -> str:
     # One argument per line makes command substitution work in both bash and
     # PowerShell. A single space-separated line becomes one native argument in
     # PowerShell, so `cargo` sees an invalid package name containing spaces.
+    # Callers must receive LF-only separators; see the newline handling in
+    # `main`, which bash depends on and PowerShell hides.
     return "\n".join(arg for package in packages for arg in ("-p", package))
 
 
@@ -105,10 +314,12 @@ def lane_packages(lane: str) -> list[str]:
         case "linux-only":
             selected = LINUX_ONLY & packages
         case "lint":
-            # Every package any test lane compiles. `cargo clippy` only ever
-            # *checks*, so the ort-sys/CUDA constraint that splits the test
-            # lanes does not apply to it: nothing here is linked or run.
-            selected = packages - denied
+            # Every package clippy can compile -- which, since it only ever
+            # *checks* and never links or runs a test binary, is every member
+            # except those `LINT_EXEMPT` names a toolchain reason for. The
+            # test-lane denials deliberately do not apply here; that was the
+            # whole point of #2058 and it holds for denied crates too.
+            selected = packages - set(LINT_EXEMPT)
         case _:
             raise SystemExit(f"unknown lane '{lane}'")
     return sorted(selected)
@@ -125,6 +336,78 @@ _CARGO_AGAIN = re.compile(r"(?:^|[\s;&|])cargo\s+(?:\+\S+\s+)?(?!clippy\b)\S+")
 _GENERATOR = re.compile(
     r"\$\(\s*python3?\s+\.github/scripts/workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)\s*\)"
 )
+# The same call, bound to a shell variable. The guarded form these workflows use
+# moves the lane name off the `cargo clippy` line, so the block below has to
+# read backwards to find it.
+_GENERATOR_ASSIGN = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_]*)=\"?\$\(\s*python3?\s+"
+    r"\.github/scripts/workspace_test_packages\.py\s+cargo-args\s+[a-z-]+\s*\)"
+)
+# Any assignment to a shell name. Needed so a later non-generator assignment
+# shadows an earlier generator one, which is the property `packages_tested_by`
+# already documents; recording only generator assignments would let
+# `packages="$(... lint)"` followed by `packages="-p one-crate"` keep crediting
+# the whole lint lane.
+_ANY_ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+# A YAML key or list item, at the indentation that ends a step. The forward
+# scan in `clippy_blocks` already refuses to cross one of these; the backwards
+# walk has to refuse the same boundary or it reads into the step above.
+_STEP_BOUNDARY = re.compile(r"\s*(-\s+\w+:|\w[\w-]*:)")
+
+
+def _generator_vars_before(lines: list[str], index: int, base: int) -> dict[str, str]:
+    """Generator assignments earlier in the same `run:` block, nearest first.
+
+    A step that wants to refuse an empty expansion has to bind the generator to
+    a variable first, because `cargo clippy $(...)` runs happily on nothing:
+    the substitution fails, the outer command still exits 0, and the step lints
+    the default members instead of the lane. Binding it moves the lane name off
+    the invocation line and out of the text `clippy_blocks` returns.
+
+    The read is deliberately narrow in both directions. It stops at a blank
+    line, at a line indented less than the invocation, and at a YAML key or
+    list item at or below that indentation -- the same boundary the forward
+    scan refuses to cross, because a `- run:` step carrying no `name:` sits at
+    the invocation's own indentation and `indent < base` alone would walk
+    straight through it into the step above. `clippy_blocks` then appends what
+    it finds only when the invocation actually references the variable.
+    Crediting every assignment in scope would be a join rather than a dataflow
+    read, and this scanner's whole documented risk is over-reading.
+    """
+    assigned: dict[str, str] = {}
+    shadowed: set[str] = set()
+    # If the invocation line is itself the list item or carries the `run:` key,
+    # its block starts there and has no earlier lines. Walking anyway would
+    # cross into the step above, whose body is indented *deeper* than a `- run:`
+    # line -- so the indent and boundary tests below never fire and the whole
+    # previous step is read as if it were this one's.
+    opening = lines[index].lstrip()
+    if opening.startswith("- ") or re.match(r"(-\s+)?[\w-]+:", opening):
+        return assigned
+    for position in range(index - 1, -1, -1):
+        line = lines[position]
+        if not line.strip():
+            break
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if indent < base:
+            break
+        if indent <= base and _STEP_BOUNDARY.match(stripped):
+            break
+        assignment = _ANY_ASSIGN.match(stripped)
+        if not assignment:
+            continue
+        # Walking backwards, the first assignment seen is the last one that
+        # ran, so a plain assignment here shadows a generator assignment above
+        # it and the lane must not be credited.
+        name = assignment.group(1)
+        if name in assigned or name in shadowed:
+            continue
+        if _GENERATOR_ASSIGN.match(stripped):
+            assigned[name] = line
+        else:
+            shadowed.add(name)
+    return assigned
 
 
 def clippy_blocks(lines: list[str]) -> list[str]:
@@ -177,6 +460,13 @@ def clippy_blocks(lines: list[str]) -> list[str]:
         after = _CARGO_AGAIN.search(text, match.end())
         if after:
             text = text[: after.start()]
+        # Recover a package list the invocation reads from a variable, but only
+        # the ones it actually names. The trailing boundary matters: without it
+        # `$packages` matches inside `$packages_extra` and credits a lane the
+        # invocation never used. See `_generator_vars_before`.
+        for variable, source in _generator_vars_before(lines, index, base).items():
+            if re.search(r"\$\{?" + re.escape(variable) + r"\}?(?![A-Za-z0-9_])", text):
+                text = f"{text}\n{source}"
         found.append(text)
     return found
 
@@ -220,15 +510,21 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
     uncovered = sorted(packages - tested - denied)
     stale_tested = sorted(tested - packages)
     stale_denied = sorted(denied - packages)
+    stale_lint_exempt = sorted(set(LINT_EXEMPT) - packages)
 
     commands = clippy_commands()
     linted = linted_packages() & packages
     if simulate_unlinted:
         linted.discard(simulate_unlinted)
-    unlinted = sorted(tested - linted)
+    # The domain is every package clippy can compile, not just the tested ones.
+    # It used to be `tested - linted`, which by construction could never see a
+    # denied crate -- so the four members linted by nothing were invisible to
+    # the very guard whose job is to notice that. A crate excused from running
+    # its tests is not thereby excused from compiling.
+    unlinted = sorted((packages - set(LINT_EXEMPT)) - linted)
 
     failed = False
-    if uncovered or stale_tested or stale_denied:
+    if uncovered or stale_tested or stale_denied or stale_lint_exempt:
         failed = True
         print("Workspace test package coverage check failed.", file=sys.stderr)
         if uncovered:
@@ -246,6 +542,8 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
             print(f"Non-workspace package(s) in tested lanes: {stale_tested}", file=sys.stderr)
         if stale_denied:
             print(f"Non-workspace package(s) in deny-list: {stale_denied}", file=sys.stderr)
+        if stale_lint_exempt:
+            print(f"Non-workspace package(s) in LINT_EXEMPT: {stale_lint_exempt}", file=sys.stderr)
 
     # Positive control: the lint half is computed by scanning workflow text, so
     # a scanner that silently matches nothing would report full coverage of an
@@ -262,16 +560,18 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
         failed = True
         print("Workspace lint coverage check failed.", file=sys.stderr)
         print(
-            "Package(s) are compiled and tested by CI and linted by nothing:",
+            "Package(s) are workspace members that clippy can compile and nothing lints:",
             file=sys.stderr,
         )
         for package in unlinted:
             print(f"  - {package}", file=sys.stderr)
         print(
-            "Every tested package must be reached by some `cargo clippy` step. The Linux\n"
-            "offline clippy steps select `cargo-args lint`, so a package added to a test\n"
-            "lane is linted automatically -- this failing means a clippy step went back to\n"
-            "a hand-written -p list, or a new lane is tested but not linted.",
+            "Every package clippy can compile must be reached by some `cargo clippy` step.\n"
+            "The Linux offline clippy steps select `cargo-args lint`, so a new member is\n"
+            "linted automatically -- this failing means a clippy step went back to a\n"
+            "hand-written -p list, or a member needs a LINT_EXEMPT entry naming the\n"
+            "toolchain reason clippy cannot get past. Not running a crate's tests is not\n"
+            "such a reason.",
             file=sys.stderr,
         )
     if failed:
@@ -280,8 +580,8 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
         f"workspace test package coverage ok: {len(tested)} tested, {len(denied)} denied"
     )
     print(
-        f"workspace lint coverage ok: {len(tested)} tested, all linted by "
-        f"{len(commands)} clippy invocation(s)"
+        f"workspace lint coverage ok: {len(packages) - len(LINT_EXEMPT)} linted by "
+        f"{len(commands)} clippy invocation(s), {len(LINT_EXEMPT)} lint-exempt"
     )
     return 0
 
@@ -291,8 +591,90 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
 # compile the same test targets but never run an assertion, so they must not
 # satisfy this gate.
 _RUNS_TESTS = re.compile(r"cargo\s+(?:\+\S+\s+)?(?:test|llvm-cov)\b")
+# `cargo test --no-run` builds the test binaries and executes none of them, so a
+# lane written that way proves the package compiles and proves nothing about its
+# tests. Anchored on a following space or end of fragment so it does not match
+# xargs' `--no-run-if-empty`, which `ci.yml` really does use -- matching that
+# would drop a genuine lane's credit and turn this fix into a regression.
+_NO_RUN = re.compile(r"(?:^|\s)--no-run(?=\s|$)")
+
+# Matching `_RUNS_TESTS` anywhere in a fragment credits text that merely
+# *mentions* the invocation. `echo "cargo test -p foo"` executes no test, and
+# neither does a `cargo test` line sitting in a heredoc body that is written to
+# a file. Both keep the gate green while the required lane runs nothing, which
+# is the one direction this gate calls fatal, so an invocation now counts only
+# when the fragment *begins* with it. A bounded prefix chain is allowed --
+# environment assignments and the launchers a runner legitimately wraps a test
+# command in -- because those still execute the tests. Anything else (a quote, a
+# redirect, `echo`) is refused. All six fragments the real workflow credits
+# today begin with a bare `cargo`, so this preserves every honest reading; an
+# unanticipated-but-honest prefix loses its credit and fails loudly, which is
+# the direction the module's docstring already accepts.
+_TEST_PREFIX = re.compile(
+    r"^(?:"
+    r"[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|\S*)"
+    r"|sudo|env|nice|time|timeout\s+\S+|taskset\s+\S+\s+\S+|retry\s+\S+|xvfb-run"
+    r"|xargs(?:\s+-{1,2}[A-Za-z0-9-]+)*"
+    r")\s+"
+)
+# `<<WORD`, `<<'WORD'`, `<<"WORD"`, and the `<<-` indent-stripping variant.
+_HEREDOC_START = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
+
+
+def _runs_tests(fragment: str) -> bool:
+    """True when the fragment's own command is a test invocation.
+
+    Quoted spans are removed first, so `echo "cargo test -p foo"` carries no
+    invocation at all -- that also disarms a `|` hidden inside a string, which
+    would otherwise survive the stage split below. Each pipeline stage is then
+    anchored separately, because `find . | xargs cargo test -p foo` genuinely
+    runs the tests while `echo cargo test -p foo` does not, and only the
+    position of the invocation within its stage tells the two apart.
+    """
+    for stage in _QUOTED.sub("", fragment).split("|"):
+        text = stage.strip()
+        while True:
+            match = _TEST_PREFIX.match(text)
+            if not match:
+                break
+            text = text[match.end() :].lstrip()
+        if _RUNS_TESTS.match(text):
+            return True
+    return False
+
+
+def _strip_heredocs(command: str) -> str:
+    """Drop heredoc bodies, which are data written somewhere -- not commands.
+
+    A heredoc body is indistinguishable from a command list once the block is
+    split on newlines, so `cat <<'SH' > run.sh` wrapping a `cargo test` line
+    would otherwise credit a required lane with a script it only ever writes.
+    An unterminated heredoc swallows the rest of the block: that is the
+    conservative reading, and it can only remove credit.
+    """
+    kept: list[str] = []
+    delimiter: str | None = None
+    for line in command.split("\n"):
+        if delimiter is not None:
+            if line.strip() == delimiter:
+                delimiter = None
+            continue
+        if match := _HEREDOC_START.search(line):
+            delimiter = match.group(2)
+            # The line that opens the heredoc is still a real command, but its
+            # operands are the heredoc marker; keep it so `cat`/`python` are
+            # visible without crediting what follows.
+            kept.append(_HEREDOC_START.sub("", line))
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 _LANE_CALL = re.compile(r"workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)")
 _PACKAGE_FLAG = re.compile(r"(?:^|\s)(?:-p|--package)[\s=]+([A-Za-z0-9_-]+)")
+_VAR_ASSIGN = re.compile(
+    r"(?:^|\s)(?P<var>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\"[^\"]*\"|'[^']*'|\S*)"
+)
+_VAR_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 
 
 # `ubuntu-latest` does not ship PyYAML in the interpreter `python` resolves to,
@@ -321,12 +703,30 @@ def _at_job_depth(line: str) -> bool:
 
 # Every key GitHub accepts directly under a job. A four-space key outside this
 # set is the signature of a job whose own key was indented one level too far:
-# still valid YAML, so no parser complains, but the job ceases to exist and its
-# checks stop *appearing* on a PR instead of going red. @holden hit exactly this
-# and `gh pr checks` reported fourteen green with zero failures while two checks
-# had silently ceased to be produced. Enumerating what is legal and rejecting
-# the rest is the same choice as `_at_job_depth`: a new job attribute breaks
-# this loudly, which is the direction that can be noticed.
+# still valid YAML, so PyYAML parses it happily and the job silently becomes a
+# key of the job above it.
+#
+# CORRECTION, measured 2026-08-26 against GitHub's own published parser
+# (`@actions/workflow-parser` 0.3.61, the actions/languageservices
+# implementation): GitHub does NOT accept this. Feeding it a `ci.yml` with
+# `cli-ort:` indented one level too far yields `Unexpected value 'cli-ort'`,
+# and the same edit to `diff-guard.yml` yields `Unexpected value 'root-files'`.
+# GitHub enumerates legal job keys exactly as this gate does. The earlier
+# comment here -- that the misindented job is accepted and its checks merely
+# stop appearing -- was inferred from PyYAML's behaviour and generalised to the
+# service without being tested there; it is wrong, and this gate's value is that
+# it refuses locally and by name rather than that it catches something GitHub
+# would miss. Stated as a parser result, not a service result: it is GitHub's
+# published implementation, but it was not confirmed against the live service.
+#
+# What GitHub *does* accept silently is deleting a job block outright: the same
+# measurement returns zero errors for a `diff-guard.yml` with `root-files:`
+# removed. That is the case no key-shaped rule can see, and it is why
+# `WORKFLOW_JOB_INVENTORY` exists alongside this one.
+#
+# Enumerating what is legal and rejecting the rest is the same choice as
+# `_at_job_depth`: a new job attribute breaks this loudly, which is the
+# direction that can be noticed.
 _JOB_ATTRIBUTES = frozenset(
     {
         "concurrency",
@@ -471,7 +871,7 @@ _JOB_COE = re.compile(r"^    continue-on-error:\s*(.+?)\s*$", re.MULTILINE)
 # So: the required jobs may carry the repo's known docs-only guard or no guard at
 # all, and anything else is refused rather than interpreted.
 _JOB_IF = re.compile(r"^    if:\s*(.+?)\s*$", re.MULTILINE)
-_ALLOWED_JOB_IF = frozenset({"needs.changes.outputs.docs_only != 'true'"})
+_ALLOWED_JOB_IF = frozenset({_DOCS_ONLY_GUARD})
 
 
 def job_condition(job_body: str) -> str | None:
@@ -528,7 +928,9 @@ def _swallow_reason(block: str, pipefail: bool) -> str | None:
     if not pipefail and _PIPE_AFTER_TEST.search(block):
         return "cargo test piped without pipefail; its failure is masked"
     return None
-_RUNS_IN_A_PASSING_JOB = {"success()", "always()", "true", "${{ true }}", "${{ success() }}"}
+_RUNS_IN_A_PASSING_JOB = frozenset(
+    {"success()", "always()", "true", "${{ true }}", "${{ success() }}"}
+)
 
 
 def job_steps(job_body: str) -> list[tuple[str | None, str, str | None]]:
@@ -677,14 +1079,32 @@ def packages_tested_by(commands: Iterable[str]) -> set[str]:
     an under-read merely fails loudly. If a package's only required-lane
     execution is ever written this way, this gate will refuse it rather than
     credit it, and the fix is to put the invocation on one line.
+    Bounded exception, added when the guarded two-line form landed: a lane
+    resolved into a shell variable is credited to a later `cargo test` in the
+    same block *only if that command references the variable*. The reference is
+    what does the crediting, so this stays a dataflow read rather than a join --
+    an assignment the cargo invocation never uses is still worth nothing, and
+    the self-test arms below fail if it is ever worth something. Reassignment
+    replaces a variable's lanes rather than adding to them, so shadowing the
+    name with a non-lane value drops the credit instead of keeping it.
     """
     tested: set[str] = set()
     for command in commands:
-        for fragment in re.split(r"&&|\|\||;|\n", command):
-            if not _RUNS_TESTS.search(fragment):
+        lanes_by_var: dict[str, set[str]] = {}
+        for fragment in re.split(r"&&|\|\||;|\n", _strip_heredocs(command)):
+            for assignment in _VAR_ASSIGN.finditer(fragment):
+                lanes_by_var[assignment.group("var")] = set(
+                    _LANE_CALL.findall(assignment.group("value"))
+                )
+            if not _runs_tests(fragment):
+                continue
+            if _NO_RUN.search(fragment):
                 continue
             for lane in _LANE_CALL.findall(fragment):
                 tested.update(lane_packages(lane))
+            for name in _VAR_REF.findall(fragment):
+                for lane in lanes_by_var.get(name, ()):
+                    tested.update(lane_packages(lane))
             tested.update(_PACKAGE_FLAG.findall(fragment))
     return tested
 
@@ -720,7 +1140,96 @@ def required_lane_commands(skip_lane: str | None = None) -> tuple[list[str], set
 # existed. Measured, on the real workflow, before writing it: all three of
 # `verify`, `verify-required-tier` and `self-test` exited 0 with the sole
 # Windows executor of the ORT-backed tests removed.
-_WINDOWS_RUNNER = re.compile(r"windows-[A-Za-z0-9_.-]+")
+_WINDOWS_RUNNER = re.compile(r"windows-(?!msvc\b|gnu)[A-Za-z0-9_.-]+")
+_RUNS_ON = re.compile(r"^\ {4}runs-on:\s*(.+?)\s*$", re.MULTILINE)
+_STRATEGY_BLOCK = re.compile(
+    r"^\ {4}strategy:\s*$\n(?P<body>(?:^(?:\ {5,}.*)?$\n?)*)", re.MULTILINE
+)
+_MATRIX_REF = re.compile(r"matrix\.([A-Za-z_][A-Za-z0-9_-]*)")
+_MATRIX_KEY = re.compile(
+    r"^(?P<indent>\s*)(?P<dash>-\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_-]*):\s*(?P<inline>.*)$"
+)
+
+
+def _matrix_values(body: str, keys: set[str]) -> str:
+    """Values of the named matrix keys only, never the whole `strategy:` block.
+
+    Reading the entire block reopens the hole this function exists to close: a
+    matrix that carries `target: x86_64-pc-windows-msvc` beside
+    `os: ubuntu-latest` puts `windows-msvc` in the searched text, and a job that
+    only ever cross-compiles is credited as a Windows runner again. Caught in
+    review of this change, in the fix for that very over-read -- the matrix arm
+    added here exercised `os:` alone, so re-running it could never have found it.
+    """
+    match = _STRATEGY_BLOCK.search(body)
+    if match is None:
+        return ""
+    lines = match.group("body").splitlines()
+    collected: list[str] = []
+    index = 0
+    while index < len(lines):
+        entry = _MATRIX_KEY.match(lines[index])
+        # The key's own column, not the list dash's: in `- os: ubuntu-latest`
+        # the sibling `name:` sits at the same column as `os`, and measuring
+        # from the dash would swallow it as if it were `os`'s value.
+        column = (
+            len(entry.group("indent")) + len(entry.group("dash") or "") if entry else 0
+        )
+        wanted = bool(entry) and entry.group("key") in keys
+        index += 1
+        if not wanted:
+            continue
+        collected.append(_TRAILING_COMMENT.sub("", entry.group("inline")))
+        # A key written as a block list owns the deeper-indented lines below it.
+        while index < len(lines):
+            following = lines[index]
+            if not following.strip():
+                index += 1
+                continue
+            if len(following) - len(following.lstrip()) <= column:
+                break
+            collected.append(_TRAILING_COMMENT.sub("", following))
+            index += 1
+    return "\n".join(collected)
+
+
+def job_runner_labels(body: str) -> str:
+    """The text of a job that can name the runner it executes on.
+
+    Deliberately not the whole body. `_WINDOWS_RUNNER` matched anywhere in the
+    job credited a *target triple* as a runner: `x86_64-pc-windows-msvc` in a
+    `run:` line contains `windows-msvc`. Measured on this file before the fix --
+    a synthetic job with `runs-on: ubuntu-latest` whose only step was
+    `cargo test -p ... --target x86_64-pc-windows-msvc` was reported as
+    `windows ORT coverage ok: 6 package(s) via ['EP conformance (Linux
+    x86_64)']`. A Linux job standing as the sole certified Windows executor is
+    the same over-read @gaff's first draft of `verify_windows_ort_coverage`
+    produced, reached by a different route, and the parser repair did not close
+    it. `Rust (Windows ARM64)` really does carry `windows-msvc` in its body
+    today, so this is one edit away from being live rather than hypothetical.
+
+    `runs-on:` alone is not enough: two jobs here say `runs-on: ${{ matrix.os }}`
+    and get their real labels from the matrix. So the matrix counts too -- but
+    only the keys the `runs-on:` expression actually names, and only their
+    values. Trailing comments are stripped, since `parse_jobs` removes whole
+    comment lines and leaves these: `runs-on: ubuntu-latest  # was
+    windows-latest` otherwise credits a Linux job on the strength of its own
+    changelog.
+
+    Under-reads on purpose. A `runs-on:` that resolves through anything other
+    than the matrix, or a flow-style `strategy: {matrix: ...}`, yields no labels
+    and the job goes uncredited; if it was the only Windows executor the gate
+    refuses by name. That direction is loud and fixable, while crediting a job
+    that never touches Windows is silent -- the same trade this file's
+    `packages_tested_by` docstring already states.
+    """
+    values = [_TRAILING_COMMENT.sub("", value).strip() for value in _RUNS_ON.findall(body)]
+    text = "\n".join(values)
+    if keys := {
+        key for value in values if "${{" in value for key in _MATRIX_REF.findall(value)
+    }:
+        text += "\n" + _matrix_values(body, keys)
+    return text
 
 # Refusal reasons that are discharged *on a Windows runner only*. `job_steps`
 # formats a refused condition as `if: <expr>`, so these match its output.
@@ -735,20 +1244,72 @@ _WINDOWS_STEP_IF = frozenset(
 
 def windows_ort_executors(jobs: dict[str, str] | None = None) -> dict[str, set[str]]:
     """Jobs that can run on Windows and execute ORT-backed packages there."""
+    return _windows_ort_coverage(jobs)[0]
+
+
+# A job-level `if:` that still leaves the job running whenever it is scheduled.
+# `_ALLOWED_JOB_IF` is reused deliberately: a docs-only PR is entitled to skip
+# these tests, and the required tier already treats that guard as acceptable.
+_JOB_IF_RUNS_ANYWAY = _ALLOWED_JOB_IF | frozenset({"true", "success()", "always()"})
+
+# `if: X` and `if: ${{ X }}` are the same expression to Actions. Comparing the
+# raw text would refuse a pure reformat of a guard this gate already credits,
+# turning the required lane red for an edit that changed no behaviour.
+_EXPRESSION_WRAPPER = re.compile(r"^\$\{\{\s*(.*?)\s*\}\}$")
+
+
+def _job_if_runs_anyway(condition: str) -> bool:
+    """Whether a job-level `if:` still leaves the job running when scheduled."""
+    if match := _EXPRESSION_WRAPPER.match(condition):
+        condition = match.group(1)
+    return condition in _JOB_IF_RUNS_ANYWAY
+
+
+def _windows_ort_coverage(
+    jobs: dict[str, str] | None = None,
+) -> tuple[dict[str, set[str]], dict[str, str]]:
+    """Windows ORT executors, and those refused for a job-level `if:`.
+
+    `unconditional_run_blocks` models step-level `if:` only, and
+    `verify_required_job_conditions` refuses a job-level one on a *required*
+    job. The Windows executor is deliberately not required, so it inherited
+    neither guard: `if: false` on it left every step creditable and this gate
+    reported full coverage via a job that can never run. Refused jobs are
+    returned rather than dropped, so the failure can name them instead of
+    reporting the packages as merely uncovered.
+    """
     jobs = workflow_jobs() if jobs is None else jobs
     found: dict[str, set[str]] = {}
+    refused: dict[str, str] = {}
     for name, body in jobs.items():
-        if not _WINDOWS_RUNNER.search(body):
+        if not _WINDOWS_RUNNER.search(job_runner_labels(body)):
             continue
         blocks, _ = unconditional_run_blocks(body, also_credit=_WINDOWS_STEP_IF)
-        if tested := packages_tested_by(blocks) & set(ORT_BACKED):
-            found[name] = tested
-    return found
+        tested = packages_tested_by(blocks) & set(ORT_BACKED)
+        if not tested:
+            continue
+        condition = job_condition(body)
+        if condition is not None and not _job_if_runs_anyway(condition):
+            refused[name] = condition
+            continue
+        found[name] = tested
+    return found, refused
 
 
 def verify_windows_ort_coverage(jobs: dict[str, str] | None = None) -> int:
     """Fail if no job still runs the ORT-backed tests on a Windows runner."""
-    executors = windows_ort_executors(jobs)
+    if not ORT_BACKED:
+        print(
+            "Windows ORT coverage check failed.\n"
+            "ORT_BACKED is empty, so this gate has nothing to look for and would "
+            "report success having checked no package. `ok: 0 package(s) via []` "
+            "is the same output an entirely broken gate produces, and a check "
+            "that cannot tell 'nothing is wrong' from 'I cannot see' is not a "
+            "check. Refusing instead.",
+            file=sys.stderr,
+        )
+        return 1
+    executors, refused = _windows_ort_coverage(jobs)
     covered: set[str] = set()
     for tested in executors.values():
         covered |= tested
@@ -759,6 +1320,12 @@ def verify_windows_ort_coverage(jobs: dict[str, str] | None = None) -> int:
         )
         for package in missing:
             print(f"  - {package}", file=sys.stderr)
+        for name, condition in sorted(refused.items()):
+            print(
+                f"  {name!r} would have covered them, but carries a job-level "
+                f"`if: {condition}` -- a skipped job runs no steps.",
+                file=sys.stderr,
+            )
         print(
             "No required check builds the ORT graph on Windows, so this coverage "
             "exists only here. A job that stops running them does not go red -- "
@@ -812,6 +1379,300 @@ def verify_required_tier(simulate_dropped_lane: str | None = None) -> int:
         f"{sorted(REQUIRED_JOB_NAMES)}, {len(DENYLIST)} denied"
     )
     return verify_windows_ort_coverage()
+
+
+def workflow_files() -> list[Path]:
+    """Every file GitHub will read as a workflow, both extensions it accepts."""
+    return sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
+
+
+def verify_workflow_integrity(
+    simulate_deleted_job: str | None = None,
+    simulate_dropped_trigger: str | None = None,
+    simulate_gated_job: str | None = None,
+) -> int:
+    """Every workflow parses, defines exactly the jobs it is recorded as defining, and still runs.
+
+    `verify_required_tier` covers `ci.yml` because `REQUIRED_JOB_NAMES` is an
+    inventory of it, and branch protection covers `ci.yml` again because a
+    required check that stops reporting blocks the merge. Neither reaches a file
+    that contains no required job. Measured on `diff-guard.yml`: nesting
+    `root-files` two spaces deeper leaves valid YAML, drops the root allowlist
+    from what GitHub runs, and `verify`, `verify-required-tier` and `self-test`
+    all still returned 0.
+
+    "Defined" was the whole claim until #2210. It is narrower than "runs", and
+    the gap was measured, not theorised: `if: false` on `root-files`, `miri` or
+    the hostlock job, and swapping `pull_request:` for `workflow_dispatch:` in
+    any workflow, each left all three gates returning 0 while printing a line
+    byte-identical to a clean tree. `verify_pr_trigger_integrity` closes both.
+    Matrix `include:` row removal is the one recorded vector still open --
+    renaming the matrix variable is caught, because the recorded display name
+    holds the unexpanded template and the template itself changes.
+    """
+    files = workflow_files()
+    failures: list[str] = []
+    parsed: dict[str, list[str]] = {}
+    for path in files:
+        if path.name not in WORKFLOW_JOB_INVENTORY:
+            continue
+        try:
+            found = sorted(parse_jobs(path.read_text(encoding="utf-8"), source=str(path)))
+        except SystemExit as refusal:
+            failures.append(str(refusal))
+            continue
+        if simulate_deleted_job and simulate_deleted_job in found:
+            found.remove(simulate_deleted_job)
+        parsed[path.name] = found
+
+    failures += _integrity_failures(
+        {path.name for path in files}, parsed, WORKFLOW_JOB_INVENTORY
+    )
+    failures += verify_pr_trigger_integrity(
+        simulate_dropped_trigger=simulate_dropped_trigger,
+        simulate_gated_job=simulate_gated_job,
+    )
+    seen = sum(len(jobs) for jobs in parsed.values())
+
+    if failures:
+        print("Workflow job integrity check failed.", file=sys.stderr)
+        for failure in failures:
+            print(f"  - {failure}", file=sys.stderr)
+        return 1
+    if not seen:
+        print(
+            "Workflow job integrity check failed: no jobs were read at all, so this "
+            "gate proved nothing.",
+            file=sys.stderr,
+        )
+        return 1
+    on_disk = {path.name for path in files}
+    if not (PR_TRIGGERED_WORKFLOWS.keys() & on_disk):
+        print(
+            "Workflow job integrity check failed: no PR-triggered workflow was "
+            "read, so the trigger half of this gate proved nothing.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"workflow job integrity ok: {len(files)} file(s), {seen} job(s) as "
+        f"recorded, {len(PR_TRIGGERED_WORKFLOWS)} still reporting on pull requests"
+    )
+    return 0
+
+
+def _integrity_failures(
+    on_disk: set[str],
+    parsed: dict[str, list[str]],
+    inventory: dict[str, tuple[str, ...]],
+) -> list[str]:
+    """Every difference between what the workflows define and what is recorded."""
+    failures: list[str] = []
+    for name in sorted(set(inventory) - on_disk):
+        failures.append(
+            f"{name}: recorded in WORKFLOW_JOB_INVENTORY but not on disk. Deleting a "
+            "workflow file deletes its checks silently; remove the entry in the same "
+            "commit if that is intended."
+        )
+    for name in sorted(on_disk - set(inventory)):
+        failures.append(
+            f"{name}: on disk but absent from WORKFLOW_JOB_INVENTORY, so its jobs are "
+            "unguarded. Add it with the block this gate prints."
+        )
+    for name, found in sorted(parsed.items()):
+        expected = list(inventory[name])
+        if not found:
+            failures.append(
+                f"{name}: defines no jobs at all. A workflow that runs nothing reports "
+                "no checks, which is indistinguishable from one that passed."
+            )
+            continue
+        if found == expected:
+            continue
+        if gone := sorted(set(expected) - set(found)):
+            failures.append(
+                f"{name}: job(s) GitHub will no longer run: {gone}. A job key indented "
+                "one level too far, or a block deleted outright, removes the check "
+                "rather than failing it."
+            )
+        if added := sorted(set(found) - set(expected)):
+            failures.append(f"{name}: job(s) not recorded in the inventory: {added}.")
+        failures.append(
+            f"{name}: if this change is intended, replace its entry with:\n"
+            + _inventory_entry(name, found)
+        )
+    return failures
+
+
+def _probe_trigger_forms() -> int:
+    """Every spelling GitHub accepts for `on:` reads back the same trigger set.
+
+    A parser that silently returns the empty set for a form it does not know
+    would report a PR-triggered workflow as no longer triggering -- a false red
+    on the recorded files, and a false green on the unrecorded ones, from the
+    same bug. So the unknown-form case refuses instead.
+    """
+    problems: list[str] = []
+    both = {"push", "pull_request"}
+    forms = {
+        "block keys": "name: W\non:\n  push:\n  pull_request:\n    branches: [main]\njobs:\n",
+        "block items": "name: W\non:\n  - push\n  - pull_request\njobs:\n",
+        "inline list": "name: W\non: [push, pull_request]\njobs:\n",
+        "double-quoted key": 'name: W\n"on":\n  push:\n  pull_request:\njobs:\n',
+        "single-quoted key": "name: W\n'on':\n  push:\n  pull_request:\njobs:\n",
+        "trailing comment": "name: W\non:\n  push:  # main only\n  pull_request:\njobs:\n",
+        "comment inside block": "name: W\non:\n  push:\n  # why\n  pull_request:\njobs:\n",
+    }
+    for label, text in forms.items():
+        got = workflow_triggers(text, source=label)
+        if got != both:
+            problems.append(f"{label} read as {sorted(got)}, expected {sorted(both)}")
+    if (scalar := workflow_triggers("on: push\njobs:\n")) != {"push"}:
+        problems.append(f"scalar form read as {sorted(scalar)}")
+    # `on_failure:` and `one:` both begin with the letters of `on` and neither is
+    # the triggers block; matching either would read a workflow's triggers off an
+    # unrelated key.
+    for label, text in (
+        ("no `on:` block", "name: W\njobs:\n"),
+        ("empty `on:` block", "name: W\non:\njobs:\n"),
+        ("`one:` is not `on:`", "name: W\none: x\njobs:\n"),
+    ):
+        try:
+            got = workflow_triggers(text, source=label)
+        except SystemExit:
+            continue
+        problems.append(f"{label} accepted, read as {sorted(got)}; should refuse")
+    for problem in problems:
+        print(f"  on: parse: {problem}", file=sys.stderr)
+    return 1 if problems else 0
+
+
+def _inventory_entry(name: str, jobs: Iterable[str]) -> str:
+    body = "".join(f'            "{job}",\n' for job in jobs)
+    return f'        "{name}": (\n{body}        ),'
+
+
+# Hand-parsed for the reason the rest of this file is: `ubuntu-latest` ships no
+# PyYAML and PEP 668 blocks installing it. Text parsing also sidesteps the YAML
+# 1.1 rule that makes a bare `on:` key parse as the boolean `True` -- a live
+# footgun for every PyYAML-based reader of these files, and the reason the
+# quoted spellings below are accepted too.
+_ON_KEY = re.compile(r"""^(?:"on"|'on'|on)\s*:\s*(?P<inline>.*?)\s*$""")
+_ON_CHILD = re.compile(
+    r"""^\ \ (?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|(?P<plain>[A-Za-z0-9_.-]+))\s*:"""
+)
+_ON_ITEM = re.compile(r"^\ \ -\s*(?P<value>.+?)\s*$")
+
+
+def workflow_triggers(text: str, source: str = "<workflow>") -> set[str]:
+    """The event names a workflow triggers on.
+
+    All three spellings GitHub accepts: `on: push`, `on: [push, pull_request]`,
+    and the block form with either `  push:` keys or `  - push` items.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(" ") or line.lstrip().startswith("#"):
+            continue
+        match = _ON_KEY.match(line)
+        if match is None:
+            continue
+        inline = _TRAILING_COMMENT.sub("", match.group("inline")).strip()
+        if inline:
+            return {
+                _scalar(part)
+                for part in inline.strip("[]").split(",")
+                if part.strip()
+            }
+        triggers: set[str] = set()
+        for follow in lines[index + 1 :]:
+            if (
+                follow.strip()
+                and not follow.startswith(" ")
+                and not follow.lstrip().startswith("#")
+            ):
+                break
+            if follow.lstrip().startswith("#"):
+                continue
+            if item := _ON_ITEM.match(follow):
+                triggers.add(_scalar(item.group("value")))
+            elif child := _ON_CHILD.match(follow):
+                triggers.add(
+                    child.group("dq") or child.group("sq") or child.group("plain")
+                )
+        if not triggers:
+            raise SystemExit(
+                f"{source}: `on:` block parsed to no triggers at all. Refusing to "
+                f"guess -- an empty read here would report every workflow as no "
+                f"longer running on pull requests, or none of them, depending on "
+                f"which way the caller leans."
+            )
+        return triggers
+    raise SystemExit(
+        f"{source}: no top-level `on:` block, so the gate cannot tell when this "
+        f"workflow runs."
+    )
+
+
+def verify_pr_trigger_integrity(
+    simulate_dropped_trigger: str | None = None,
+    simulate_gated_job: str | None = None,
+) -> list[str]:
+    """Every recorded PR check still fires on pull requests, and still unconditionally.
+
+    `_integrity_failures` proves a job is still defined. This proves it still
+    runs: the workflow triggers on `pull_request`, and no job hides behind a
+    condition that is not recorded for that file.
+    """
+    failures: list[str] = []
+    for path in workflow_files():
+        name = path.name
+        if name not in WORKFLOW_JOB_INVENTORY:
+            continue
+        text = path.read_text(encoding="utf-8")
+        try:
+            triggers = workflow_triggers(text, source=str(path))
+        except SystemExit as refusal:
+            failures.append(str(refusal))
+            continue
+        fires = "pull_request" in triggers
+        if simulate_dropped_trigger == name:
+            fires = False
+        recorded = name in PR_TRIGGERED_WORKFLOWS
+        if recorded and not fires:
+            failures.append(
+                f"{name}: recorded as reporting a check on every pull request, but "
+                f"its `on:` no longer includes `pull_request` (triggers: "
+                f"{sorted(triggers)}). A workflow that stops triggering removes its "
+                f"checks from the PR rather than failing them."
+            )
+        if fires and not recorded:
+            failures.append(
+                f"{name}: triggers on `pull_request` but is not recorded in "
+                f"PR_TRIGGERED_WORKFLOWS, so nothing would notice if it stopped. "
+                f"Add it with the conditions its jobs are allowed to carry."
+            )
+        if not recorded:
+            continue
+        allowed = PR_TRIGGERED_WORKFLOWS[name]
+        try:
+            jobs = parse_jobs(text, source=str(path))
+        except SystemExit:
+            continue  # already reported by _integrity_failures
+        for job, body in sorted(jobs.items()):
+            condition = job_condition(body)
+            if simulate_gated_job == name:
+                condition = "false"
+            if condition is None or condition in allowed:
+                continue
+            failures.append(
+                f"{name}: {job!r} carries `if: {condition}`, which is not recorded "
+                f"for this file. A skipped job reports conclusion \"skipped\", which "
+                f"is not a failure and does not appear as a red check -- so gating a "
+                f"PR check is indistinguishable from it passing. Allowed here: "
+                f"{sorted(allowed) or 'no condition at all'}."
+            )
+    return failures
 
 
 # Job bodies whose keys are written in the ways YAML allows. A key form this
@@ -935,6 +1796,53 @@ _CONDITIONAL_ARMS: tuple[tuple[str, str | None, list[str], list[str]], ...] = (
         ["pkg-alpha"],
         [],
     ),
+    # Reviewer finding (Pris): matching the invocation *anywhere* in a fragment
+    # credited text that is never executed as a command. Both arms below scored
+    # a full-coverage `rc=0` against the real `ci.yml` -- with output byte-
+    # identical to the clean baseline -- while the required lane ran no test at
+    # all. That is the false-green direction, so each is pinned here.
+    (
+        "a quoted test invocation is not credited",
+        '      - name: x\n        run: echo "cargo test -p pkg-alpha"\n',
+        [],
+        [],
+    ),
+    (
+        "a heredoc body is written, not run, so it is not credited",
+        "      - name: x\n        run: |\n          cat <<'SH' > run.sh\n"
+        "          cargo test -p pkg-alpha\n          SH\n",
+        [],
+        [],
+    ),
+    # The matched pair for the two above: without these, their refusal is
+    # equally explicable as "the anchor refuses everything".
+    (
+        "a launcher prefix still executes the tests, so it is credited",
+        "      - name: x\n        run: taskset -c 0-3 cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "an env-assignment prefix is credited",
+        "      - name: x\n        run: RUST_LOG=debug cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    # A downstream pipeline stage still executes: `find . | xargs cargo test`
+    # runs the tests. Anchoring the whole fragment rather than each stage
+    # dropped this lane's credit, which the `--no-run-if-empty` arm caught.
+    (
+        "a test invocation in a later pipeline stage is credited",
+        "      - name: x\n        run: find . -print0 | xargs -0 cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "a quoted invocation containing a pipe is still not credited",
+        '      - name: x\n        run: echo "x | cargo test -p pkg-alpha"\n',
+        [],
+        [],
+    ),
 )
 
 
@@ -960,7 +1868,10 @@ def _conditional_arms() -> int:
     return failures
 
 
-_PARSER_ARM_COUNT = 8
+# Hand-maintained because `_parser_arms` is inline code rather than a table.
+# `self_test` recounts the arms it actually observed and refuses if this number
+# disagrees, so a stale value here fails loudly instead of under-reporting.
+_PARSER_ARM_COUNT = 24
 
 
 # Each arm is (label, workflow text, the packages the scanner must credit).
@@ -1057,6 +1968,96 @@ def _clippy_block_arms() -> int:
     return failures
 
 
+_WORKFLOW_INTEGRITY_ARMS = (
+    "an inventoried file that vanished from disk",
+    "a workflow file nobody recorded",
+    "a file whose jobs all disappeared",
+    "an exact match is accepted (control)",
+    "a renamed job is reported in both directions",
+    "every workflow file on disk is actually read",
+)
+
+
+def _workflow_integrity_arms() -> int:
+    """Prove the inventory refuses each way a job can stop running, and only those."""
+    failures = 0
+    inventory = {"a.yml": ("Alpha", "Beta"), "b.yml": ("Gamma",)}
+
+    def arm(label: str, on_disk: set[str], parsed: dict[str, list[str]], expect: list[str]) -> int:
+        found = _integrity_failures(on_disk, parsed, inventory)
+        text = "\n".join(found)
+        missing = [needle for needle in expect if needle not in text]
+        if expect and not found:
+            print(f"  FAIL  {label}: accepted; expected it to name {expect}", file=sys.stderr)
+            return 1
+        if not expect and found:
+            print(f"  FAIL  {label}: refused a correct inventory: {found}", file=sys.stderr)
+            return 1
+        if missing:
+            print(f"  FAIL  {label}: refused without naming {missing}", file=sys.stderr)
+            return 1
+        print(f"  ok    {label} -> {'refused' if found else 'accepted'}")
+        return 0
+
+    both = {"a.yml", "b.yml"}
+    failures += arm(
+        "an inventoried file that vanished from disk",
+        {"a.yml"},
+        {"a.yml": ["Alpha", "Beta"]},
+        ["b.yml", "not on disk"],
+    )
+    failures += arm(
+        "a workflow file nobody recorded",
+        both | {"c.yml"},
+        {"a.yml": ["Alpha", "Beta"], "b.yml": ["Gamma"]},
+        ["c.yml", "unguarded"],
+    )
+    failures += arm(
+        "a file whose jobs all disappeared",
+        both,
+        {"a.yml": ["Alpha", "Beta"], "b.yml": []},
+        ["b.yml", "defines no jobs at all"],
+    )
+    # Without this the suite would be passed perfectly by a gate that refuses
+    # every input, which is the same defect one sign flipped.
+    failures += arm(
+        "an exact match is accepted (control)",
+        both,
+        {"a.yml": ["Alpha", "Beta"], "b.yml": ["Gamma"]},
+        [],
+    )
+    failures += arm(
+        "a renamed job is reported in both directions",
+        both,
+        {"a.yml": ["Alpha", "Beta renamed"], "b.yml": ["Gamma"]},
+        ["no longer run", "not recorded in the inventory", "Beta renamed"],
+    )
+
+    # `verify_workflow_integrity` derives both sides of its file comparison from
+    # `workflow_files()`, so a file that helper silently skipped would be absent
+    # from `on_disk` *and* from `parsed`, and would read as agreement. This is
+    # the only arm that resolves the file list against something else.
+    label = "every workflow file on disk is actually read"
+    independently = {
+        name
+        for name in os.listdir(WORKFLOWS)
+        if name.endswith((".yml", ".yaml")) and (WORKFLOWS / name).is_file()
+    }
+    read = {path.name for path in workflow_files()}
+    if not independently:
+        failures += 1
+        print(
+            f"  FAIL  {label}: found no workflow files, so this arm proved nothing",
+            file=sys.stderr,
+        )
+    elif skipped := sorted(independently - read):
+        failures += 1
+        print(f"  FAIL  {label}: workflow_files() never opened {skipped}", file=sys.stderr)
+    else:
+        print(f"  ok    {label} -> {len(read)} file(s), none skipped")
+    return failures
+
+
 def _parser_arms() -> int:
     """Prove a job boundary is never absorbed into the job above it."""
     failures = 0
@@ -1141,6 +2142,202 @@ def _parser_arms() -> int:
     else:
         failures += 1
         print(f"  FAIL  {label}: rc={code}, named={text!r}", file=sys.stderr)
+
+    # Every arm above this point refuses. A suite made only of refusals is
+    # passed perfectly by a gate that refuses everything, so each arm below
+    # carries its acceptance control beside it.
+    ort_flags = " ".join(f"-p {package}" for package in sorted(ORT_BACKED))
+
+    def _ort_job(runs_on: str, extra: str = "") -> dict[str, str]:
+        return {
+            "EP conformance (Linux x86_64)": (
+                f"    runs-on: {runs_on}\n    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}{extra}\n"
+            )
+        }
+
+    def _ort_job_with_if(runs_on: str, condition: str) -> dict[str, str]:
+        return {
+            "EP conformance (Linux x86_64)": (
+                f"    runs-on: {runs_on}\n    if: {condition}\n"
+                f"    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}\n"
+            )
+        }
+
+    def _coverage_arm(label: str, jobs: dict[str, str] | None, expected: int) -> int:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = verify_windows_ort_coverage(jobs=jobs)
+        if code == expected:
+            print(f"  ok    {label} -> rc={code}")
+            return 0
+        print(f"  FAIL  {label}: rc={code}, expected {expected}", file=sys.stderr)
+        return 1
+
+    # A target triple is not a runner. `x86_64-pc-windows-msvc` contains
+    # `windows-msvc`, so before `job_runner_labels` this job -- on ubuntu, and
+    # with `--target` doing the only Windows-related work -- was reported as the
+    # sole executor giving Windows coverage to all six packages.
+    failures += _coverage_arm(
+        "a Linux job cross-compiling to a Windows triple is not Windows coverage",
+        _ort_job("ubuntu-latest", " --target x86_64-pc-windows-msvc"),
+        1,
+    )
+    failures += _coverage_arm(
+        "a job whose runs-on really is a Windows runner is still credited",
+        _ort_job("windows-latest"),
+        0,
+    )
+    failures += _coverage_arm(
+        "a Windows runner reached through the matrix is still credited",
+        {
+            "Matrix Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        include:\n"
+                "          - os: windows-latest\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}\n"
+            )
+        },
+        0,
+    )
+
+    # Every route review found back into the over-read this change is named for.
+    # The matrix arm above exercises `os:` only, so it could not have caught any
+    # of these -- which is the point: a battery only refutes what it varies.
+    failures += _coverage_arm(
+        "a Windows target triple in the matrix is not a Windows runner",
+        {
+            "Cross Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        include:\n"
+                "          - os: ubuntu-latest\n"
+                "            target: x86_64-pc-windows-msvc\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags} --target ${{{{ matrix.target }}}}\n"
+            )
+        },
+        1,
+    )
+    failures += _coverage_arm(
+        "a matrix key the runs-on expression never names is not read",
+        {
+            "Unrelated Key Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        include:\n"
+                "          - os: ubuntu-latest\n"
+                "            name: windows-parity-check\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}\n"
+            )
+        },
+        1,
+    )
+    failures += _coverage_arm(
+        "a trailing comment on runs-on does not make a Linux job Windows",
+        _ort_job("ubuntu-latest  # was windows-latest until #1234"),
+        1,
+    )
+    failures += _coverage_arm(
+        "a Windows runner in a block-list matrix is still credited",
+        {
+            "Matrix List Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        os:\n"
+                "          - ubuntu-latest\n"
+                "          - windows-latest\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}\n"
+            )
+        },
+        0,
+    )
+
+    # A job-level `if:` is invisible to `unconditional_run_blocks`, which models
+    # step-level conditions only. `verify_required_job_conditions` refuses one on
+    # a required job; the Windows executor is deliberately *not* required, so it
+    # inherited no such refusal. Measured on the real `ci.yml` before the fix:
+    # `if: false` on `cli-ort` still printed `windows ORT coverage ok: 6
+    # package(s)` with rc=0 for a job that can never run.
+    failures += _coverage_arm(
+        "a Windows executor that can never run is not coverage",
+        _ort_job_with_if("windows-latest", "false"),
+        1,
+    )
+    failures += _coverage_arm(
+        "a Windows executor gated on anything unrecognised is refused",
+        _ort_job_with_if("windows-latest", "github.event_name == 'schedule'"),
+        1,
+    )
+    # Control: the refusal must be about the condition, not about job-level
+    # `if:` as such, or the arm above is passed by a gate that refuses every
+    # conditional job -- including the repo's own docs-only guard.
+    failures += _coverage_arm(
+        "the repo's docs-only guard still counts as Windows coverage",
+        _ort_job_with_if("windows-latest", "needs.changes.outputs.docs_only != 'true'"),
+        0,
+    )
+    # Review found the credited set was an exact-string match, so wrapping the
+    # very guard above in `${{ }}` -- a reformat changing no behaviour -- turned
+    # the required lane red. These two arms also close a battery gap review
+    # measured: dropping the always-true literals from the credited set left all
+    # the arms above passing, because none of them asked for a literal to be
+    # credited. Over-refusal is the loud direction, but a suite that cannot see
+    # it is not asserting the boundary, only one side of it.
+    failures += _coverage_arm(
+        "the same guard wrapped in ${{ }} is the same guard",
+        _ort_job_with_if(
+            "windows-latest", "${{ needs.changes.outputs.docs_only != 'true' }}"
+        ),
+        0,
+    )
+    failures += _coverage_arm(
+        "an always-true job condition is still Windows coverage",
+        _ort_job_with_if("windows-latest", "true"),
+        0,
+    )
+    # The failure has to name the job, or it reports a live job as an absent one
+    # and sends the reader looking for a deletion that never happened.
+    label = "a job refused for its condition is named, not silently uncovered"
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        verify_windows_ort_coverage(jobs=_ort_job_with_if("windows-latest", "false"))
+    text = out.getvalue() + err.getvalue()
+    if "if: false" in text and "EP conformance (Linux x86_64)" in text:
+        print(f"  ok    {label} -> named with its condition")
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: {text!r}", file=sys.stderr)
+
+    # `ok: 0 package(s) via []` was reachable, and it is the same string a
+    # completely blind gate prints.
+    label = "an empty ORT_BACKED is fatal rather than vacuously ok"
+    real_ort_backed = globals()["ORT_BACKED"]
+    globals()["ORT_BACKED"] = frozenset()
+    try:
+        failures += _coverage_arm(label, None, 1)
+    finally:
+        globals()["ORT_BACKED"] = real_ort_backed
+
+    # `cargo test --no-run` compiles the test binaries and runs nothing.
+    label = "--no-run is not credited as running tests"
+    if packages_tested_by(["cargo test -p pkg-alpha --no-run"]) == set():
+        print(f"  ok    {label} -> not credited")
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: credited a build-only invocation", file=sys.stderr)
+
+    # ...but xargs' `--no-run-if-empty` is a different flag, and `ci.yml` uses
+    # it. Reading it as cargo's would drop a genuine lane's credit.
+    label = "xargs --no-run-if-empty does not suppress a real lane"
+    if packages_tested_by(
+        ["find . -print0 | xargs -0 --no-run-if-empty cargo test -p pkg-alpha"]
+    ) == {"pkg-alpha"}:
+        print(f"  ok    {label} -> credited")
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: dropped a lane over an xargs flag", file=sys.stderr)
     return failures
 
 
@@ -1149,10 +2346,21 @@ _OK_IF = "needs.changes.outputs.docs_only != 'true'"
 _REQ = sorted(REQUIRED_JOB_NAMES)
 
 
-def _job_body(condition: str | None = None, step_condition: str | None = None) -> str:
+def _job_body(
+    condition: str | None = None,
+    step_condition: str | None = None,
+    *,
+    condition_on_next_line: bool = False,
+) -> str:
     body = "    name: x\n    runs-on: ubuntu-latest\n"
     if condition is not None:
-        body += f"    if: {condition}\n"
+        # YAML lets a scalar sit on the line after its key. GitHub folds the two
+        # forms into the same string and applies both; a line-anchored regex does
+        # not see the second one unless it spans the newline.
+        if condition_on_next_line:
+            body += f"    if:\n      {condition}\n"
+        else:
+            body += f"    if: {condition}\n"
     body += "    steps:\n      - name: t\n"
     if step_condition is not None:
         body += f"        if: {step_condition}\n"
@@ -1184,6 +2392,20 @@ _JOB_CONDITION_ARMS: tuple[tuple[str, dict, int, list[str]], ...] = (
      {n: _job_body(None, step_condition="false") for n in _REQ}, 0, []),
     ("job-if: both present -- the job's is the one read",
      {n: _job_body(_OK_IF, step_condition="false") for n in _REQ}, 0, []),
+    # A job-level `if:` whose value sits on the *next* line. YAML folds it into
+    # the same scalar and GitHub applies it, so the job is exactly as skippable
+    # as the inline form -- but `_JOB_IF` only sees it because `\s` matches the
+    # newline. That is a property of the class itself and holds with or without
+    # `re.MULTILINE`; the flag is separately load-bearing here, for the `^`/`$`
+    # anchors. The catch is therefore incidental, and `\s` crossing a line
+    # boundary is normally a bug, so tightening it to `[ \t]*` is the obvious
+    # future tidy-up. It would make `job_condition` return None, which this gate
+    # reads as "no guard at all: accepted" -- an unread value degrading to the
+    # most permissive verdict, in the function whose whole purpose is to refuse
+    # that. This arm is the one that fails.
+    ("job-if: a next-line scalar condition is still read as the job's",
+     {_REQ[0]: _job_body("false", condition_on_next_line=True),
+      _REQ[1]: _job_body(_OK_IF)}, 1, [_REQ[0]]),
     ("job-if: an absent required job is refused, not passed over",
      {_REQ[0]: _job_body(_OK_IF)}, 1, [_REQ[1]]),
 )
@@ -1212,7 +2434,164 @@ def _job_condition_arms() -> int:
             print(f"  ok    {label} -> exit {code}{named}")
     return failures
 
+def _probe_guarded_assignment(used: bool = True) -> int:
+    """Attribution probe for the guarded two-line form.
+
+    `used=True` is the form the workflow ships. `used=False` is the mutation
+    that matters: the same assignment, with a `cargo test` that never mentions
+    the variable. If that arm ever credits the lane, the dataflow read has
+    become a join and the gate has moved in the permissive direction.
+    """
+    resolver = "python .github/scripts/workspace_test_packages.py cargo-args ort-backed"
+    invocation = (
+        "cargo test --locked $packages -- --test-threads=1"
+        if used
+        else "cargo test --locked -p onnx-genai-cli"
+    )
+    block = "\n".join(
+        [
+            f'packages="$({resolver})"',
+            'test -n "$packages" || { echo "::error::empty"; exit 1; }',
+            invocation,
+        ]
+    )
+    tested = packages_tested_by([block])
+    want = set(ORT_BACKED) if used else {"onnx-genai-cli"}
+    if tested != want:
+        print(
+            "attribution mismatch: "
+            f"unexpected={sorted(tested - want)} absent={sorted(want - tested)}",
+            file=sys.stderr,
+        )
+        return 1
+    print("attribution as stated: " + ", ".join(sorted(tested)))
+    return 0
+
+
+def _probe_clippy_generator_var(shape: str = "referenced") -> int:
+    """Attribution probe for a clippy step whose package list is in a variable.
+
+    `referenced` is the form the workflow ships. Every other shape is a way the
+    backwards read could become a join, and each one fails quietly if it
+    regresses: an over-credited package looks linted and nothing says
+    otherwise, so `verify` stays green while the coverage claim is false.
+
+    * `unreferenced` -- the assignment is in the step and the invocation never
+      mentions it.
+    * `prefix` -- the invocation names `$packages_extra`, which contains the
+      assigned name as a prefix.
+    * `shadowed` -- a plain assignment replaces the generator before the
+      invocation runs, which is the property `packages_tested_by` documents.
+    * `neighbour` -- the assignment belongs to the *previous* step, and the
+      clippy step carries no `name:` so it sits at the invocation's own
+      indentation.
+    """
+    lane = "python .github/scripts/workspace_test_packages.py cargo-args linux-only"
+    step = [
+        "      - name: Clippy offline crates",
+        "        shell: bash",
+        "        run: |",
+        f'          packages="$({lane})"',
+        '          test -n "$packages" || { echo "::error::empty"; exit 1; }',
+    ]
+    if shape == "referenced":
+        lines = step + ["          cargo clippy --locked --all-targets $packages -- -D warnings"]
+        want = set(lane_packages("linux-only"))
+    elif shape == "unreferenced":
+        lines = step + [
+            "          cargo clippy --locked --all-targets -p onnx-genai-cli -- -D warnings"
+        ]
+        want = {"onnx-genai-cli"}
+    elif shape == "prefix":
+        lines = step + [
+            '          packages_extra="-p onnx-genai-cli"',
+            "          cargo clippy --locked --all-targets $packages_extra"
+            " -p onnx-genai-cli -- -D warnings",
+        ]
+        want = {"onnx-genai-cli"}
+    elif shape == "shadowed":
+        lines = step + [
+            '          packages="-p onnx-genai-cli"',
+            "          cargo clippy --locked --all-targets $packages"
+            " -p onnx-genai-cli -- -D warnings",
+        ]
+        want = {"onnx-genai-cli"}
+    elif shape == "neighbour":
+        lines = step + [
+            "          cargo test --locked $packages",
+            "      - run: cargo clippy --locked --all-targets $packages -- -D warnings",
+        ]
+        want = set()
+    else:  # pragma: no cover - a typo in an arm must not read as a pass
+        print(f"unknown probe shape {shape!r}", file=sys.stderr)
+        return 1
+
+    credited: set[str] = set()
+    for block in clippy_blocks(lines):
+        for found in _GENERATOR.findall(block):
+            if found in LANES:
+                credited.update(lane_packages(found))
+        credited.update(re.findall(r"-p\s+([A-Za-z0-9_-]+)", block))
+    if credited != want:
+        print(
+            "clippy attribution mismatch: "
+            f"unexpected={sorted(credited - want)} absent={sorted(want - credited)}",
+            file=sys.stderr,
+        )
+        return 1
+    print("clippy attribution as stated: " + (", ".join(sorted(credited)) or "credited nothing"))
+    return 0
+
+
 def self_test() -> int:
+    """Run every arm, then check that the count reported is the count that ran.
+
+    `total` used to be a sum of five hand-maintained lengths, one of which
+    (`_PARSER_ARM_COUNT`) is a literal. Six arms were added to `_parser_arms`
+    below and the suite still announced `59/59` while running sixty-five: the
+    arms passed, the number was wrong, and nothing failed. A count nobody checks
+    is the same defect this whole file exists to catch -- a self-report that
+    stays plausible while the thing it reports on has moved -- so the arm output
+    is captured, re-emitted unchanged, and recounted from the `ok`/`FAIL` lines
+    actually printed. A miscount is now a failure rather than a cosmetic slip.
+    """
+    out_buffer, err_buffer = io.StringIO(), io.StringIO()
+    try:
+        with redirect_stdout(out_buffer), redirect_stderr(err_buffer):
+            failures, claimed = _self_test_arms()
+    finally:
+        # On the crash path the arms that already ran are the only evidence of
+        # where it crashed, and they exist solely in these buffers. Emitting
+        # them in `finally` keeps this function's promise to re-emit unchanged
+        # even when an arm raises something the loops do not catch.
+        sys.stdout.write(out_buffer.getvalue())
+        sys.stderr.write(err_buffer.getvalue())
+    captured_out, captured_err = out_buffer.getvalue(), err_buffer.getvalue()
+
+    observed = sum(
+        1
+        for line in (captured_out + captured_err).splitlines()
+        if line.startswith("  ok    ") or line.startswith("  FAIL  ")
+    )
+    if observed != claimed:
+        print(
+            f"workspace test package self-test: reported {claimed} arm(s) but "
+            f"{observed} actually ran. The totals in `_self_test_arms` no longer "
+            "match the arms; update them rather than the count in this message.",
+            file=sys.stderr,
+        )
+        return 1
+    if failures:
+        print(
+            f"workspace test package self-test: {failures} arm(s) failed",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"workspace test package self-test: {claimed}/{claimed} arms behaved as stated")
+    return 0
+
+
+def _self_test_arms() -> tuple[int, int]:
     """Prove both gates still refuse, on content and not merely on exit code.
 
     An exit status is not enough to tell a refusal from a crash: `python` not
@@ -1237,13 +2616,136 @@ def self_test() -> int:
             1,
             ["onnx-runtime-ep-cpu"],
         ),
+        # The discriminator for #2158's shape. `onnx-runtime-python` is on the
+        # DENYLIST, so under the previous `unlinted = tested - linted` domain a
+        # denied crate could not appear in that set no matter what: this arm
+        # returned 0 and named nobody. It is the only arm here whose verdict
+        # flips on the domain rather than on the scanner, so if it ever passes
+        # a `verify` that no longer subtracts LINT_EXEMPT, the widening has
+        # been reverted and four crates are silently unlinted again.
+        (
+            "verify --simulate-unlinted onnx-runtime-python (a denied crate)",
+            verify,
+            {"simulate_unlinted": "onnx-runtime-python"},
+            1,
+            ["onnx-runtime-python"],
+        ),
+        # A LINT_EXEMPT crate must *not* be demanded: exempting it is the whole
+        # point, and without this arm the widened domain could quietly grow to
+        # include crates the quality runner cannot build.
+        (
+            "verify --simulate-unlinted onnx-genai-bench (lint-exempt)",
+            verify,
+            {"simulate_unlinted": "onnx-genai-bench"},
+            0,
+            [],
+        ),
         ("verify-required-tier (control)", verify_required_tier, {}, 0, []),
+        # Driven through the real entry point, not the helper: the defect this
+        # gate exists for lives in *which files get read*, and a helper handed
+        # the right dict by hand cannot see a file that was never opened.
+        ("verify-workflow-integrity (control)", verify_workflow_integrity, {}, 0, []),
+        (
+            'verify-workflow-integrity --simulate-deleted-job "Root file allowlist"',
+            verify_workflow_integrity,
+            {"simulate_deleted_job": "Root file allowlist"},
+            1,
+            ["Root file allowlist", "diff-guard.yml"],
+        ),
+        # The trigger and condition arms below are the #2210 half. Each names a
+        # vector that was measured returning 0 from every gate before this
+        # existed, so an arm that stops failing here is a real regression rather
+        # than a tightened message.
+        (
+            "verify-workflow-integrity --simulate-dropped-trigger diff-guard.yml",
+            verify_workflow_integrity,
+            {"simulate_dropped_trigger": "diff-guard.yml"},
+            1,
+            ["diff-guard.yml", "pull_request"],
+        ),
+        (
+            "verify-workflow-integrity --simulate-dropped-trigger ci.yml",
+            verify_workflow_integrity,
+            {"simulate_dropped_trigger": "ci.yml"},
+            1,
+            ["ci.yml", "pull_request"],
+        ),
+        (
+            "verify-workflow-integrity --simulate-gated-job diff-guard.yml",
+            verify_workflow_integrity,
+            {"simulate_gated_job": "diff-guard.yml"},
+            1,
+            ["diff-guard.yml", "if: false"],
+        ),
+        (
+            "verify-workflow-integrity --simulate-gated-job ci.yml",
+            verify_workflow_integrity,
+            {"simulate_gated_job": "ci.yml"},
+            1,
+            ["ci.yml", "if: false"],
+        ),
+        (
+            "every `on:` spelling GitHub accepts reads back the same triggers",
+            _probe_trigger_forms,
+            {},
+            0,
+            [],
+        ),
         (
             "verify-required-tier --simulate-dropped-lane ort-backed",
             verify_required_tier,
             {"simulate_dropped_lane": "ort-backed"},
             1,
             sorted(ORT_BACKED),
+        ),
+        (
+            "packages_tested_by credits a lane the cargo call uses",
+            _probe_guarded_assignment,
+            {"used": True},
+            0,
+            sorted(ORT_BACKED),
+        ),
+        (
+            "packages_tested_by refuses a lane the cargo call never uses",
+            _probe_guarded_assignment,
+            {"used": False},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages credits a lane the clippy call reads from a variable",
+            _probe_clippy_generator_var,
+            {"shape": "referenced"},
+            0,
+            sorted(lane_packages("linux-only")),
+        ),
+        (
+            "linted_packages refuses a lane the clippy call never references",
+            _probe_clippy_generator_var,
+            {"shape": "unreferenced"},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages refuses a variable whose name is only a prefix",
+            _probe_clippy_generator_var,
+            {"shape": "prefix"},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages refuses a generator a plain assignment shadowed",
+            _probe_clippy_generator_var,
+            {"shape": "shadowed"},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages refuses a variable assigned by the previous step",
+            _probe_clippy_generator_var,
+            {"shape": "neighbour"},
+            0,
+            ["credited nothing"],
         ),
     ]
     failures = 0
@@ -1272,18 +2774,16 @@ def self_test() -> int:
     failures += _conditional_arms()
     failures += _job_condition_arms()
     failures += _clippy_block_arms()
+    failures += _workflow_integrity_arms()
     total = (
         len(arms)
         + _PARSER_ARM_COUNT
         + len(_CONDITIONAL_ARMS)
         + len(_JOB_CONDITION_ARMS)
         + len(_CLIPPY_BLOCK_ARMS)
+        + len(_WORKFLOW_INTEGRITY_ARMS)
     )
-    if failures:
-        print(f"workspace test package self-test: {failures} arm(s) failed", file=sys.stderr)
-        return 1
-    print(f"workspace test package self-test: {total}/{total} arms behaved as stated")
-    return 0
+    return failures, total
 
 
 def main() -> int:
@@ -1309,6 +2809,19 @@ def main() -> int:
         "--simulate-dropped-lane",
         help="ignore required-job steps that run this lane, to prove the guard fails",
     )
+    integrity_parser = subparsers.add_parser("verify-workflow-integrity")
+    integrity_parser.add_argument(
+        "--simulate-deleted-job",
+        help="drop one job from what the workflows appear to define, to prove the guard fails",
+    )
+    integrity_parser.add_argument(
+        "--simulate-dropped-trigger",
+        help="pretend one workflow stopped triggering on pull_request, to prove the guard fails",
+    )
+    integrity_parser.add_argument(
+        "--simulate-gated-job",
+        help="pretend one workflow's jobs carry `if: false`, to prove the guard fails",
+    )
     args = parser.parse_args()
 
     if args.command == "verify":
@@ -1317,6 +2830,19 @@ def main() -> int:
         return self_test()
     if args.command == "verify-required-tier":
         return verify_required_tier(args.simulate_dropped_lane)
+    if args.command == "verify-workflow-integrity":
+        return verify_workflow_integrity(
+            args.simulate_deleted_job,
+            args.simulate_dropped_trigger,
+            args.simulate_gated_job,
+        )
+    # Windows Python writes stdout in text mode and translates "\n" into
+    # "\r\n". bash splits command substitution on IFS, which contains newline
+    # but not carriage return, so each token would keep a trailing "\r" and
+    # cargo would reject the package name. PowerShell strips CRLF when it
+    # splits native output into an array, which is why this stayed invisible
+    # while the Windows lanes ran pwsh.
+    sys.stdout.reconfigure(newline="\n")
     print(package_args(lane_packages(args.lane)))
     return 0
 

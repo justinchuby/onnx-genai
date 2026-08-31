@@ -777,6 +777,11 @@ fn variants_per_node() -> usize {
 }
 
 impl KernelCache {
+    #[inline]
+    pub(super) fn contains(&self, key: &KernelKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Next logical tick.
     fn tick(&self) -> u64 {
         self.clock.fetch_add(1, Ordering::Relaxed)
@@ -884,6 +889,7 @@ impl KernelCache {
         opset: u64,
         capture_seq_independent: bool,
         executor: ExecutorInstanceId,
+        artifact_readiness: &mut ProviderArtifactReadiness,
         ep: &dyn ExecutionProvider,
     ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
         let key = KernelKey {
@@ -938,6 +944,11 @@ impl KernelCache {
             self.last_used
                 .insert(key.clone(), AtomicU64::new(self.tick()));
             self.misses += 1;
+            // Kernel creation is the single publication chokepoint for
+            // executor-scoped provider artifacts. Invalidate permission here,
+            // not in selected callers, so build preflight, binding preparation,
+            // and runtime dispatch cannot disagree about readiness.
+            artifact_readiness.advance_to(ExecutorArtifactReadinessEpoch::new(self.misses));
             self.evict_surplus_variants(key.node, ep);
         }
         self.touch(&key);

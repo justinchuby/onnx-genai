@@ -1211,10 +1211,7 @@ fn component_materialized_dimensions(
                 let Some(value) = by_port.get(port.as_str()).copied() else {
                     continue;
                 };
-                let Some(shape) = &contract.shape else {
-                    continue;
-                };
-                for (axis, dimension) in shape.iter().enumerate() {
+                for (axis, dimension) in contract.shape.iter().enumerate() {
                     if dimension != &TensorDimension::Symbol(symbol.clone()) {
                         continue;
                     }
@@ -1330,14 +1327,12 @@ fn component_batch_policy(
     let mut companion_ports = BTreeSet::new();
     let mut summed_symbols = BTreeSet::new();
     for contract in declaration.ports.inputs.values() {
-        if let Some(shape) = &contract.shape {
-            for (axis, dimension) in shape.iter().enumerate() {
-                if (contract.batch_layout.request_axis() == Some(axis)
-                    || contract.batch_layout.packed_axis() == Some(axis))
-                    && let TensorDimension::Symbol(symbol) = dimension
-                {
-                    summed_symbols.insert(symbol.clone());
-                }
+        for (axis, dimension) in contract.shape.iter().enumerate() {
+            if (contract.batch_layout.request_axis() == Some(axis)
+                || contract.batch_layout.packed_axis() == Some(axis))
+                && let TensorDimension::Symbol(symbol) = dimension
+            {
+                summed_symbols.insert(symbol.clone());
             }
         }
         for (_, kind, companion) in contract.batch_layout.companions() {
@@ -1347,8 +1342,7 @@ fn component_batch_policy(
                     .ports
                     .inputs
                     .get(companion)
-                    .and_then(|owner| owner.shape.as_ref())
-                    .and_then(|shape| shape.first())
+                    .and_then(|owner| owner.shape.first())
             {
                 // Every owner entry is one unit at this ownership level.
                 // Higher-level owner tensors are the only typed place a nested
@@ -1374,10 +1368,7 @@ fn component_batch_policy(
             if companion_ports.contains(port) {
                 continue;
             }
-            let Some(shape) = &contract.shape else {
-                continue;
-            };
-            for (axis, dimension) in shape.iter().enumerate() {
+            for (axis, dimension) in contract.shape.iter().enumerate() {
                 if dimension != &TensorDimension::Symbol(symbol.clone()) {
                     continue;
                 }
@@ -1523,7 +1514,6 @@ ports:
   inputs:
     pixels:
       dtype: float32
-      rank: 3
       shape: [items, channels, height]
       batch_layout:
         kind: token_packed
@@ -1532,17 +1522,14 @@ ports:
           - { offsets: offsets, owner: owner }
     offsets:
       dtype: int64
-      rank: 1
       shape: [rows_plus_one]
       batch_layout: { kind: shared }
     owner:
       dtype: int64
-      rank: 1
       shape: [items]
       batch_layout: { kind: shared }
     prompt:
       dtype: int64
-      rank: 2
       shape: [batch, sequence]
       batch_layout: { kind: request_aligned, axis: 0 }
   outputs: {}
@@ -1563,7 +1550,6 @@ ports:
   inputs:
     pixels:
       dtype: float32
-      rank: 3
       shape: [frames, channels, height]
       batch_layout:
         kind: token_packed
@@ -1571,10 +1557,10 @@ ports:
         levels:
           - { offsets: frame_offsets, owner: frame_owner }
           - { offsets: clip_offsets, owner: clip_owner }
-    frame_offsets: { dtype: int64, rank: 1, shape: [clips_plus_one], batch_layout: { kind: shared } }
-    frame_owner: { dtype: int64, rank: 1, shape: [frames], batch_layout: { kind: shared } }
-    clip_offsets: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
-    clip_owner: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+    frame_offsets: { dtype: int64, shape: [clips_plus_one], batch_layout: { kind: shared } }
+    frame_owner: { dtype: int64, shape: [frames], batch_layout: { kind: shared } }
+    clip_offsets: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }
+    clip_owner: { dtype: int64, shape: [clips], batch_layout: { kind: shared } }
   outputs: {}
 "#,
         )
@@ -1592,7 +1578,6 @@ ports:
   inputs:
     rows:
       dtype: float32
-      rank: 2
       shape: [batch, hidden]
       batch_layout: { kind: request_expanded, axis: 0, factor: 2 }
   outputs: {}
@@ -1894,7 +1879,6 @@ ports:
   inputs:
     rows:
       dtype: float32
-      rank: 2
       shape: [batch, hidden]
       batch_layout: { kind: request_aligned, axis: 0 }
   outputs: {}
@@ -1950,12 +1934,11 @@ ports:
     fn workflow_inputs_must_share_one_logical_request_cardinality() {
         let workflow: WorkflowSpec = serde_yaml::from_str(
             r#"
-manifest: { capabilities: [] }
+manifest: {}
 inputs:
   packed:
     contract:
       dtype: float32
-      rank: 2
       shape: [items, hidden]
       batch_layout:
         kind: token_packed
@@ -1965,17 +1948,16 @@ inputs:
     role: { kind: opaque }
     source: { kind: application, name: packed }
   offsets:
-    contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
+    contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }
     role: { kind: opaque }
     source: { kind: application, name: offsets }
   owner:
-    contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+    contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }
     role: { kind: opaque }
     source: { kind: application, name: owner }
   prompt:
     contract:
       dtype: int64
-      rank: 2
       shape: [batch, sequence]
       batch_layout: { kind: request_aligned, axis: 0 }
     role: { kind: opaque }

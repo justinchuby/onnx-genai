@@ -1,0 +1,78 @@
+ir_version: 11
+graph {
+  node {
+    input: "frame_step_input"
+    output: "frame_step"
+    op_type: "Identity"
+  }
+  node {
+    input: "frame_length_input"
+    output: "frame_length"
+    op_type: "Identity"
+  }
+  node {
+    input: "X"
+    input: "frame_step"
+    input: ""
+    input: "frame_length"
+    output: "Y"
+    op_type: "STFT"
+    attribute {
+      name: "onesided"
+      i: 1
+      type: INT
+    }
+  }
+  name: "stft_device_shape"
+  input {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 8 }
+          dim { dim_value: 1 }
+        }
+      }
+    }
+  }
+  input {
+    name: "frame_step_input"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+  input {
+    name: "frame_length_input"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+  output {
+    name: "Y"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 3 }
+          dim { dim_value: 3 }
+          dim { dim_value: 2 }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

@@ -1,0 +1,78 @@
+ir_version: 11
+graph {
+  node {
+    input: "dft_length_input"
+    output: "dft_length"
+    op_type: "Identity"
+  }
+  node {
+    input: "axis_input"
+    output: "axis"
+    op_type: "Identity"
+  }
+  node {
+    input: "X"
+    input: "dft_length"
+    input: "axis"
+    output: "Y"
+    op_type: "DFT"
+    attribute {
+      name: "onesided"
+      i: 1
+      type: INT
+    }
+  }
+  name: "dft_device_shape"
+  input {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 8 }
+          dim { dim_value: 6 }
+          dim { dim_value: 1 }
+        }
+      }
+    }
+  }
+  input {
+    name: "dft_length_input"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+  input {
+    name: "axis_input"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+  output {
+    name: "Y"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 5 }
+          dim { dim_value: 6 }
+          dim { dim_value: 2 }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

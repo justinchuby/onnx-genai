@@ -177,11 +177,12 @@ impl ApplicationTensor {
                 self.dtype, contract.dtype
             )));
         }
-        if self.shape.len() != contract.rank {
+        if self.shape.len() != contract.rank() {
             return Err(ApiError::bad_request(format!(
-                "application input rank {} does not match metadata rank {}",
+                "application input rank {} does not match required metadata shape {:?} (rank {})",
                 self.shape.len(),
-                contract.rank
+                contract.shape,
+                contract.rank()
             )));
         }
         let dtype = parse_application_dtype(&self.dtype)?;
@@ -190,29 +191,29 @@ impl ApplicationTensor {
                 "application input shapes must contain only non-negative dimensions",
             ));
         }
-        if let Some(contract_shape) = contract.shape.as_ref() {
-            for (axis, (actual, expected)) in self.shape.iter().zip(contract_shape).enumerate() {
-                match expected {
-                    TensorDimension::Fixed(expected) if actual != expected => {
-                        return Err(ApiError::bad_request(format!(
-                            "application input shape {:?} does not match metadata shape {:?}: axis {axis} must be {expected}, got {actual}",
-                            self.shape, contract_shape
-                        )));
-                    }
-                    TensorDimension::Symbol(symbol) => {
-                        if let Some(bound) = shape_symbols.get(symbol) {
-                            if actual != bound {
-                                return Err(ApiError::bad_request(format!(
-                                    "application input shape {:?} violates metadata symbol '{symbol}': expected {bound} at axis {axis}, got {actual}",
-                                    self.shape
-                                )));
-                            }
-                        } else {
-                            shape_symbols.insert(symbol.clone(), *actual);
-                        }
-                    }
-                    TensorDimension::Fixed(_) => {}
+        let contract_shape = &contract.shape;
+        for (axis, (actual, expected)) in self.shape.iter().zip(contract_shape).enumerate() {
+            match expected {
+                TensorDimension::Fixed(expected) if actual != expected => {
+                    return Err(ApiError::bad_request(format!(
+                        "application input shape {:?} does not match metadata shape {:?}: axis {axis} must be {expected}, got {actual}",
+                        self.shape, contract_shape
+                    )));
                 }
+                TensorDimension::Symbol(symbol) => {
+                    if let Some(bound) = shape_symbols.get(symbol) {
+                        if actual != bound {
+                            return Err(ApiError::bad_request(format!(
+                                "application input shape {:?} violates metadata symbol '{symbol}': expected {bound} at axis {axis}, got {actual}",
+                                self.shape
+                            )));
+                        }
+                    } else {
+                        shape_symbols.insert(symbol.clone(), *actual);
+                    }
+                }
+                TensorDimension::Fixed(_) => {}
+                TensorDimension::Any => {}
             }
         }
         let elements = self.shape.iter().try_fold(1_usize, |total, dimension| {
@@ -1138,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn application_tensor_decodes_typed_raw_bytes() {
+    fn application_tensor_treats_each_any_dimension_independently() {
         let tensor = ApplicationTensor {
             dtype: "bfloat16".to_string(),
             shape: vec![1, 2],
@@ -1149,8 +1150,7 @@ mod tests {
             tensor
                 .lower(&onnx_genai_metadata::TensorContract {
                     dtype: "bfloat16".to_string(),
-                    rank: 2,
-                    shape: None,
+                    shape: vec![TensorDimension::Any; 2],
                     optional: false,
                     batch_layout: Default::default(),
                     padding: Vec::new(),
@@ -1176,8 +1176,7 @@ mod tests {
             .lower(
                 &onnx_genai_metadata::TensorContract {
                     dtype: "float32".to_string(),
-                    rank: 1,
-                    shape: None,
+                    shape: vec![TensorDimension::Any],
                     optional: false,
                     batch_layout: Default::default(),
                     padding: Vec::new(),
@@ -1192,13 +1191,12 @@ mod tests {
     fn application_tensor_rejects_fixed_and_symbolic_shape_mismatches() {
         let contract = onnx_genai_metadata::TensorContract {
             dtype: "float32".to_string(),
-            rank: 4,
-            shape: Some(vec![
+            shape: vec![
                 TensorDimension::Symbol("batch".to_string()),
                 TensorDimension::Fixed(4),
                 TensorDimension::Symbol("height".to_string()),
                 TensorDimension::Symbol("width".to_string()),
-            ]),
+            ],
             optional: false,
             batch_layout: Default::default(),
             padding: Vec::new(),

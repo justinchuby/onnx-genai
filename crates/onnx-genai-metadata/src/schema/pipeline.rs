@@ -453,13 +453,6 @@ pub struct AudioOutputBinding {
     #[schemars(with = "schema_vocabulary::TensorDType")]
     pub dtype: String,
 
-    /// Tensor rank of the emitted tensor.
-    ///
-    /// Redundant with `contract.rank` and retained only for programs that
-    /// declare no full contract; workflow packages declare `contract`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rank: Option<usize>,
-
     /// Full workflow tensor contract. Required when `pipeline.workflow` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<crate::schema::TensorContract>,

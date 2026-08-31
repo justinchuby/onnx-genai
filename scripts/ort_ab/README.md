@@ -264,6 +264,37 @@ is not evidence of a handoff and is not evidence against one either.
 `runnable_at_start` is a single sample taken before the first arm — a note
 about the conditions at the start, not a property of the interval; see the
 `--gate` paragraph above for why no threshold on it is honest here.
+
+Because that sample is a point, every row also carries `runnable_window_start`,
+`runnable_at_end`, `runnable_max` and `runnable_samples`, taken between cells
+across the whole matrix. **The lock covers custody, not quiet.** It stops a
+cooperating peer, which is all it can do; it says nothing about a process that
+never took it — a stray build, someone else's test matrix, an agent outside
+the protocol. So a run can hold the lock legitimately end to end, have the
+label report no handoff, and still have spent half its reps against a
+competitor, with every column reading clean. `runnable_max` is what records
+that.
+
+**Compare `runnable_max` against `runnable_window_start`, never against
+`runnable_at_start`.** The two starts are read by different instruments and
+are not interchangeable: `runnable_at_start` comes from the script, whose
+`runnable_now()` is a two-process shell pipeline that is itself runnable while
+it samples, so it reads high. Measured here over 80 interleaved pairs, mean
+`shell − python` = **+1.24**, shell strictly higher in **92.5%** of samples,
+modal delta exactly +1; on the real admission path, `runnable_at_start −
+runnable_window_start` was +1 or more in **80%** of 25 runs. Since the whole
+point of the column is to surface arrivals of roughly one runnable task on a
+shared box, comparing across the two would let the instrument offset absorb
+exactly the signal being looked for. `runnable_window_start` exists so the
+comparison is like against like.
+
+Deliberately no verdict column and no threshold — same reason `contended` is
+absent, this host is shared by design (#1802). `runnable_samples` counts the
+readings that *answered*, so a row cannot overstate its own evidence on a host
+where `/proc/loadavg` is unreadable. Sampling is once per cell, so a
+competitor that both arrives and departs inside a single cell is not seen:
+these columns bound what was **observed**, not what occurred.
+
 `--unlocked` runs anyway and stamps every row `unlocked:<state>` — for smoke
 tests, never for anything publishable — but it will **not** run over a lock
 somebody else declared, because that damage lands on their measurement, where
@@ -440,7 +471,14 @@ label, prov = hostlock_gate.require(
 ...
 label = hostlock_gate.window_label(label, prov, hostlock_gate.read_provenance())
 row.update(hostlock_gate.lock_columns(label, prov))
+row.update(hostlock_gate.occupancy_columns(samples))
 ```
+
+`samples` is a list built with `hostlock_gate.read_runnable()` — seed it
+before the first arm and append between cells, never inside one. It is a
+single `/proc/loadavg` read rather than a `hostlock.sh` call precisely
+because it runs inside a live matrix: forking the lock script there would put
+the instrument's own load on the host it is measuring.
 
 The walk up is there instead of a `parents[3]` because that constant holds
 only for a file sitting directly in the benches root — every one of the
@@ -542,9 +580,14 @@ false positive is a silent pass with no ledger line:
   `echo "run this under: scripts/hostlock.sh run -- $0"` certified a file that
   called nothing. `${x#-}`, `$#` and `a#b` survive, because a `#` only opens a
   comment at the start of a word. A heredoc terminator has to be the delimiter
-  *alone* on its line (`<<-` allows leading tabs, nothing allows spaces), and
-  a `<<` whose delimiter never arrives blanks nothing — `$(( 1 << k ))` and a
-  `<<<` herestring must not swallow a real acquisition below them.
+  *alone* on its line (`<<-` allows leading tabs, nothing allows spaces) and
+  is quote-removed first, as the shell does it — `<<'EOF'`, `<<"EOF"`,
+  `<<\EOF` and `<<E"O"F` all name `EOF` — and a delimiter that never arrives
+  consumes the rest of the file, which is what `sh` itself does with it. That
+  last rule is only safe because `$(( 1 << k ))`, `(( n = 1 << k ))`, a `<<`
+  inside a string and a `<<<` herestring are excluded *before* the heredoc
+  scan rather than after: each one would otherwise open a phantom body and
+  blank a real acquisition below it.
 - The match must be in **command position** — start of line or after
   `;`, `|`, `&`, `(`, `)`, `{`, `}`, past any `VAR=` assignments and any of
   `exec`, `env`, `sudo`, `then`, `do`. Single-line quoted regions are kept
@@ -556,14 +599,29 @@ What none of it sees is deliberate indirection — `eval`, the subcommand held
 in a variable, a `$LOCK` alias. That edge stays fail-open and cannot be closed
 by reading source; it is the same edge the Python side documents for
 `getattr(subprocess, "run")`, and it is why the ledger is a reviewed file and
-not only a program. Two narrower edges are written down in
+not only a program. One narrower edge is written down in
 `strip_shell_comments` alongside it, because a documented weakness with no
-cell behind it is one that comes back: a heredoc whose delimiter never
-arrives (fail-open, on a script the shell would reject), and a `<<` that is
-not a heredoc whose right-hand word later appears alone on a line
-(fail-closed, costing a ledger line). Review of the first version found two
-more — a multi-line quoted argument, and a heredoc ended early by an indented
-delimiter-lookalike — and both are now cells rather than caveats.
+cell behind it is one that comes back: a `<<` this scanner still mistakes for
+a heredoc operator, whose delimiter then never arrives, blanks the rest of the
+file. That is **fail-closed** — it costs a ledger line in somebody else's lane
+rather than a silent pass — which is the direction to fail in but not a free
+one. Two rounds of review of this scanner found five more, every one of them
+fail-open: a multi-line quoted argument whose interior newline put the
+following words at the start of a line; a heredoc ended early by an indented
+delimiter-lookalike; `<<'EO-F'`, where a `\w+` delimiter captured `EO`; enough
+whitespace before a quoted delimiter to defeat a fixed-width lookback; and an
+earlier version of this paragraph's own claim that an unterminated heredoc
+"blanks nothing", which was both fail-open and untrue of `sh` — `bash` warns
+and exits 0, `dash` says nothing at all, and in neither case does the body
+run. Two more went the other way and were caught by mutation rather than by
+review: `<<\EOF` and `<<E"O"F` were matched as `\EOF` and `E`, and a delimiter
+class wide enough to swallow the `;` in `cat <<EOF; echo hi` would do the
+same. Those fail *closed*, which is the safer direction and still the wrong
+answer — `<<\EOF` is an ordinary way to write `<<'EOF'`, and a check that
+demands a lock from a file already taking one gets deleted rather than obeyed.
+All of them are cells now rather than caveats, and the last three are
+**positive** cells: an over-blanking bug cannot be seen by a "this usage text
+is not custody" case, because that passes either way.
 
 Both properties came from real files. `decode_placement_census.sh` now **takes
 the lock** once for the whole census, by re-executing under `hostlock.sh run`,

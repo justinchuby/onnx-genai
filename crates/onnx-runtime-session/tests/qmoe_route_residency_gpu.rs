@@ -525,13 +525,28 @@ fn run_fault_case(fixture: &Fixture, quarantine: bool) {
     let diag = Arc::clone(provider.route_residency_diagnostics());
     let fatal_before = diag.fatal_values();
     let quarantine_before = diag.quarantined_blocks();
-    provider
-        .consume_route_residency_at_boundary_with_phase8_faults_for_executor(scope, faults)
-        .expect("fault boundary");
+    let boundary_result =
+        provider.consume_route_residency_at_boundary_with_phase8_faults_for_executor(scope, faults);
     assert!(diag.fatal_values() > fatal_before);
     if quarantine {
+        let error = boundary_result.expect_err("quarantine must invalidate the bank reservation");
+        assert!(
+            error.to_string().contains("invalidated"),
+            "unexpected quarantine error: {error}"
+        );
         assert!(diag.quarantined_blocks() > quarantine_before);
+        let replay_error = case
+            .session
+            .replay_device_graph(&mut case.bindings)
+            .expect_err("poisoned reservations must block captured replay");
+        assert!(
+            replay_error
+                .to_string()
+                .contains("route-bank reservation is unusable"),
+            "unexpected replay rejection: {replay_error}"
+        );
     } else {
+        boundary_result.expect("range-precise rollback keeps the reservation usable");
         assert_eq!(diag.quarantined_blocks(), quarantine_before);
         assert!(
             case.session
@@ -613,6 +628,11 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
     assert!(diag.device_bytes_released() > 0);
     assert!(diag.host_bytes_committed() > 0);
     assert!(ledger.used(Tier::Host) > 0);
+    let installed_boundary_count = provider
+        .retained_route_residency_artifacts(scope)
+        .expect("retained route-residency groups")
+        .len() as u64;
+    let boundaries_before_replays = diag.boundaries();
     for _ in 0..3 {
         assert!(
             primary
@@ -621,16 +641,19 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
                 .expect("capture replay")
         );
     }
-    provider.sync().expect("complete captured replays");
-    provider
-        .consume_route_residency_at_boundary_for_executor(scope)
-        .expect("consume expert-zero replay window");
+    assert_eq!(
+        diag.boundaries(),
+        boundaries_before_replays + 3 * installed_boundary_count,
+        "every public fast replay must consume its request-local telemetry window"
+    );
 
     let output_index = primary.bindings.len() - 1;
     let expert_zero_output = primary.bindings[output_index]
         .read_bytes()
         .expect("read expert-zero output");
     set_routes(&mut primary, 2, [1; ROWS]);
+    let touched_before = diag.values_touched();
+    let boundaries_before_decode = diag.boundaries();
     for _ in 0..16 {
         assert!(
             primary
@@ -639,7 +662,15 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
                 .expect("decode through remapped stable VA")
         );
     }
-    provider.sync().expect("complete sixteen decodes");
+    assert_eq!(
+        diag.boundaries(),
+        boundaries_before_decode + 16 * installed_boundary_count
+    );
+    assert_eq!(
+        diag.values_touched(),
+        touched_before,
+        "the finalized coarse placement installs once"
+    );
     assert_eq!(
         primary.bindings[output_index]
             .read_bytes()
@@ -656,26 +687,7 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
             .route_telemetry_snapshot()
             .expect("snapshot")
             .expect("producer armed");
-        assert_eq!(snapshot.routed_experts(), vec![1]);
-        assert!(snapshot.count() >= 16 * ROWS as u32);
-    }
-    let touched_before = diag.values_touched();
-    provider
-        .consume_route_residency_at_boundary_for_executor(scope)
-        .expect("consume expert-one window");
-    assert_eq!(
-        diag.values_touched(),
-        touched_before,
-        "the finalized coarse placement installs once"
-    );
-    for group in groups.iter() {
-        let next = provider
-            .route_telemetry_producer(scope, group.node)
-            .expect("producer")
-            .route_telemetry_snapshot()
-            .expect("next snapshot")
-            .expect("producer armed");
-        assert_eq!(next.count(), 0, "window reset is exact");
+        assert_eq!(snapshot.count(), 0, "public replay resets each window");
     }
 
     let mut sibling = build_case(&fixture, Arc::clone(&provider), Arc::clone(&ledger), 2);

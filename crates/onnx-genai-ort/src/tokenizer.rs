@@ -8,7 +8,7 @@ use serde_json::Value;
 /// Thin wrapper around `tokenizers::Tokenizer` for prompt/token id conversion.
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
-    eos_token_ids: Vec<u32>,
+    legacy_eos_token_ids: Vec<u32>,
 }
 
 impl Tokenizer {
@@ -17,10 +17,10 @@ impl Tokenizer {
         let path = path.as_ref();
         let inner = tokenizers::Tokenizer::from_file(path)
             .map_err(|err| OrtError::Tokenizer(err.to_string()))?;
-        let eos_token_ids = load_eos_token_ids(path, &inner)?;
+        let legacy_eos_token_ids = load_legacy_eos_token_ids(path, &inner)?;
         Ok(Self {
             inner,
-            eos_token_ids,
+            legacy_eos_token_ids,
         })
     }
 
@@ -101,14 +101,13 @@ impl Tokenizer {
         self.inner.token_to_id(token)
     }
 
-    /// Best-effort EOS id lookup for common tokenizer conventions.
-    pub fn eos_token_id(&self) -> Option<u32> {
-        self.eos_token_ids.first().copied()
-    }
-
-    /// EOS/stop token ids loaded from generation/tokenizer config.
-    pub fn eos_token_ids(&self) -> Vec<u32> {
-        self.eos_token_ids.clone()
+    /// EOS ids inferred for inference-metadata documents predating v1.2.
+    ///
+    /// New packages declare numeric token facts in inference metadata. This
+    /// compatibility value exists only so older packages retain their original
+    /// generation behavior while they are migrated.
+    pub fn legacy_eos_token_ids(&self) -> &[u32] {
+        &self.legacy_eos_token_ids
     }
 
     /// Access the underlying tokenizer for advanced callers.
@@ -117,7 +116,7 @@ impl Tokenizer {
     }
 }
 
-fn load_eos_token_ids(path: &Path, tokenizer: &tokenizers::Tokenizer) -> Result<Vec<u32>> {
+fn load_legacy_eos_token_ids(path: &Path, tokenizer: &tokenizers::Tokenizer) -> Result<Vec<u32>> {
     let mut ids = Vec::new();
     let model_dir = path.parent().unwrap_or_else(|| Path::new("."));
 

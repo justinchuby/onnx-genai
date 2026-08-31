@@ -146,6 +146,124 @@ This is not theoretical: the first two sweeps run after the harnesses started
 taking the lock were both refused, against two different agents, at moments when
 the host had been announced as free.
 
+#### Why a lock, and not an announce protocol plus a good guard
+
+This gets re-litigated roughly once a week, usually by someone who has just had
+a good day with announce-before/announce-after. Three arguments, each from a
+measured failure rather than a preference, so the next round is short.
+
+**1. Announcement is pairwise; the host is not.** "I'm taking the box" / "host
+free" is a two-party protocol, and this machine is shared by a roster of
+eighteen agents with eight or so active on any given day. On 2026-08-25 one
+agent correctly yielded the host to a second, and a third then negotiated with
+the first for a box that had already been given away. Nobody defected,
+everybody was polite, and the protocol still could not represent the state,
+because pairwise etiquette has nowhere to *put* a third party. A lock has
+exactly one holder and every non-holder reads the same answer.
+
+**2. An announcement describes an edge; a lock covers the interval.** Both
+false host-state claims recorded on 2026-08-25 were assertions that outlived
+their measurement: one agent read the host, and sent "host free, I checked
+independently" from a reading that was by then **74 minutes stale** — a hung
+process had started 14 minutes before the message went out. Three test
+processes ran for 75, 61 and 51 minutes against a ~7-minute baseline and were
+found only because somebody went looking. Note whose claims those were: one
+came from the agent who proposed the announce discipline, one from the agent
+policing it. A protocol that its own author and its own enforcer each break
+within an hour is not being defeated by carelessness.
+
+This is the same defect as `ps`-based liveness, one layer up, and it is why the
+outer harness holds the lock rather than each benchmark child: an arm that has
+exited because the harness advanced to the next arm looks exactly like a clear
+host to anyone sampling processes.
+
+**3. A per-run efficiency guard is self-protective, not preventive.** Per-run
+rusage `(utime+stime)/wall` is a genuinely excellent instrument and it belongs
+in every harness — it took an A/A null from 52% to 0.04–0.56% on this box. But
+it tells you when somebody contaminated **your** run. It does nothing about
+**you** contaminating **theirs**, so it does not compose across agents: if
+everyone adopts it and nobody locks, every run is correctly labelled and half
+of them are discarded. It converts a correctness problem into a throughput
+one, which is the right trade on a quiet box and the wrong one here, where
+processes hang for an hour unnoticed — you can discard 100% of your reps and
+never learn why. It is also blind to SMT-sibling contention and to steady
+external load, both of which hold efficiency near 1.0 while moving the number.
+
+So: hold the lock, **and** keep the efficiency guard and the A/A null. The
+lock decides whether you may **start**; the guard decides whether to
+**believe** the reps you got. Neither substitutes for the other, and the
+guards are supplementary — a run with a clean efficiency trace and no lock is
+not a defensible measurement.
+
+#### There is a third axis, and it is the one that answers the SMT blind spot
+
+The paragraph above says the efficiency guard is blind to SMT-sibling
+contention. That was written as a caveat, and it stayed a caveat for a while
+because nothing measured the thing it named. Something does now, so the
+guidance is no longer two axes and a known hole.
+
+Ask three questions, in this order, because each is blind to what the next
+one sees:
+
+| axis | question | instrument | blind to |
+|---|---|---|---|
+| **lock** | does anybody *claim* this box? | `scripts/hostlock.sh` | anyone outside the protocol |
+| **gate** | is anything *runnable* right now? | `hostlock.sh --gate N` | anything that starts after you do |
+| **foreign CPU** | is anyone on **your cores specifically**? | `onnx-runtime-hostmon` | nothing on this list, which is why it is last |
+
+The third is the one that survives a bounded, well-behaved co-tenant — the
+case that defeats runnable-count-as-admission-test outright. A deliberately
+bounded 4-of-32-CPU protocol is a good citizen and still trips a `-le 3` gate;
+it is also invisible to the lock if it never took one. What matters to your
+number is not whether the host is busy but whether the busy part overlaps the
+cores you were confined to, and that is a different question from both of the
+others.
+
+`onnx-runtime-hostmon` (`crates/onnx-runtime-hostmon`) answers it by reading
+`/proc/stat` for the CPUs in the process's own `Cpus_allowed_list` and
+subtracting the process's own time. Two things about it are worth knowing
+before you cite a column it produced:
+
+* **`foreign_pct` cannot see an SMT sibling, by construction.** A decode
+  budget of `N` confines the process to `N` *physical* cores, one logical CPU
+  per core — so the partner logical CPU of every core you run on is **outside
+  your mask**, is never counted, and shares the core's execution units with
+  your worker anyway. Measured on a 16-core/32-thread host at budget 12, a
+  verified 100%-busy spinner pinned to a sibling slowed the predicted worker
+  in five of six arms (p ≈ 2e-5 against a uniform choice among 12) with
+  in-shard time up ~1.7x for an exactly equal row segment — while
+  `foreign_%` read as low as **0.0**. Use `sibling_peak_pct`, which needs no
+  own-time subtraction (you cannot run there, so every busy jiffy is foreign)
+  and takes a peak rather than a sum, because under a barrier one saturated
+  sibling gates the whole dispatch.
+* **It reads the lock at both ends of the window, not once.** A single
+  reading at the end reports a plausible holder for a window that changed
+  hands halfway through — the stale-snapshot error moved out of `ps` and into
+  the row, where it is harder to spot. `hostlock::field` reports `Changed`
+  when the two readings disagree, and `Unverified` (rendered
+  `unverified:<owner>`; `ab.py` spells the same fact `unverified-end` in its
+  CSV) when the second read fails — because an unreadable lock is evidence
+  neither for a handoff nor against one.
+
+The library only **reads**. It does not acquire or enforce, and it must not:
+taking a lock is a decision the harness makes, and a library that took one as
+a side effect of formatting a field would be worse than no lock at all. The
+outer harness still holds the lock across every A/B/null arm.
+
+Note the failure mode this axis was built out of, because it is the general
+one: `scripts/hostlock.sh` sat on `main` for some time while
+`grep -r hostlock crates/` returned **nothing**. No benchmark, no harness and
+no result row consumed it. A capability that exists, is `pub`, and has no
+caller is indistinguishable in the output from one that was never built — and
+the absence reads as success. Shipping the lock was not the same as measuring
+under it.
+
+Do not infer HOST FREE from "nothing of mine is running", from a point-in-time
+`ps`, or from `/proc/loadavg`. A deliberately-bounded 4-of-32-CPU protocol
+shows runnable ≈4–5 and trips a `-le 3` gate while being a good citizen; a
+single-threaded 100% CPU hog shows ≈1 and passes. Load average measures the
+wrong thing for admission control. Ask the lock.
+
 ### 6. Wall-clock on a box that pages your own memory
 
 Identical configurations here have ranged **3.9–28 tok/s**, and #863 showed the
@@ -216,34 +334,89 @@ enumerates matches without running them, so the precheck is separable from the
 result:
 
 ```sh
-n=$(cargo test -q --lib "$FILTER" -- --exact --list 2>/dev/null | grep -c ': test$')
+# -p scopes the count to one test binary: without it a workspace-root run
+# enumerates every member's lib target and a correct filter reports n = 2.
+list=$(cargo test -q -p "$PKG" --lib "$FILTER" -- --exact --list 2>&1) || {
+  # The header is echoed separately: piping it through the same `tail` that
+  # truncates the compiler output silently ate it whenever the error ran long.
+  echo "BUILD-FAILED: could not enumerate tests for '$FILTER'"
+  printf '%s\n' "$list" | tail -5
+  exit 3
+}
+n=$(printf '%s\n' "$list" | grep -c ': test$')
 [ "$n" -eq 1 ] || { echo "FILTER-DRIFT: '$FILTER' selected $n, expected 1"; exit 2; }
 ```
 
+Both guards in that snippet were added after measurement. An earlier form sent
+stderr to `/dev/null` and read only the count, which gave the **right verdict for
+the wrong reason** when the crate did not build: `cargo … --list` exits 101,
+prints nothing on stdout, `grep -c` returns 0, and the guard reported
+`FILTER-DRIFT: 'root_level_probe' selected 0, expected 1` — naming the filter as
+the cause of a syntax error four files away. Checking cargo's status first
+separates *the tree does not build* from *the name does not resolve*; they are
+different bugs with different fixes, and only one of them is about your filter.
+
+That `||` reads the *assignment's* status, which is the command substitution's
+only while the assignment is bare. Wrapping the recipe in a helper — the obvious
+way to reuse it — puts a builtin in front, and the builtin's status is its own:
+
+```sh
+cmd() { return 101; }                      # a crate that does not build
+f() { list=$(cmd);       echo "$?"; }; f   # 101  guard fires
+g() { local list=$(cmd); echo "$?"; }; g   # 0    guard silent
+h() { local list; list=$(cmd); echo "$?"; }; h   # 101  guard fires again
+```
+
+`export`, `readonly`, `declare` and `typeset` mask it the same way, in `dash` as
+well as `bash`. The function wrapper above is not decoration: `local` outside a
+function is itself an error, so the masking is only reachable in the context that
+makes it likely.
+
+Measured through the whole recipe: with `local`, a crate that fails to build
+reports `FILTER-DRIFT: '$FILTER' selected 0, expected 1` and exits 2 — the
+identical wrong verdict the `||` was added to eliminate, because `grep -c` still
+counts the empty string. **`set -e` does not rescue it.** There is no failed
+command for `-e` to trip on; `local` succeeded. That is worth knowing here
+because bare `run:` steps are `bash -e`, so the shell option people assume is
+catching this is not.
+
+Assign bare, or declare separately (`local list; list=$(cmd) || …`). This is the
+pipeline rule one step over: **a status is only yours if nothing ran after the
+thing you meant to measure** — and `local` runs after it.
+
 Asserting `1 passed` in the run output is the same idea and is what
 `agrees_with_hostlock_sh.rs` does, but on its own it is a substring match on a
-*result*, and it fails in the direction this whole section is about. Measured:
+*result*. Measured — note both arms use **substring** filters, with no `--exact`:
 
 ```
 filter selects 11 passing tests -> "11 passed; 0 failed"   contains "1 passed" -> accepted
 filter selects 2, one failing   -> "1 passed; 1 failed"    contains "1 passed" -> accepted
 ```
 
-Both are false greens: the first accepts a filter that resolved to eleven tests
-instead of one, the second accepts a run containing a genuine failure. It is
-sound in `agrees_with_hostlock_sh.rs` only because that child selects exactly one
-test by construction — `window_probe_child` is a `#[test]` at the integration
-crate's root.
+Both are false greens against a substring filter. Against `--exact` they are
+**unreachable**, and that is worth stating precisely, because it inverts which
+half of the composed check is load-bearing. A test binary's full test paths are
+unique and `--exact` demands equality, so **one `--exact` filter selects at most
+one test per binary** — `11 passed` cannot occur. `agrees_with_hostlock_sh.rs` is
+therefore sound structurally, not merely by construction of `window_probe_child`:
+no rename or re-nesting of that test can make its check over-count.
 
-So the two checks **compose**, and neither is sufficient alone: the listing pins
-the selection to exactly one, which is what makes the substring reading of the
-run output trustworthy afterwards. Pin the count first, then read the result.
+What survives is narrower, and it belongs to the count rather than the string.
+Measured per binary under `--exact`:
 
-One residual gap in the count, also measured: `--list` prints an `#[ignore]`d
-test with the same `: test` suffix, so a test that gets ignored still resolves to
-`n = 1` while the run executes nothing (`0 passed; 0 failed; 1 ignored`). The
-listing proves the *name* resolves, never that the arm *ran* — which is why the
-run-output half is not optional.
+| situation | `--list` count | `1 passed` / `1 failed` in run output |
+| --- | --- | --- |
+| name resolves and the test runs | `n = 1`, accepts | accepts |
+| bare-name drift, nothing selected | `n = 0`, refuses | refuses |
+| the test gained `#[ignore]` | **`n = 1`, accepts** | refuses |
+
+The last row is the one to keep in mind: `--list` prints an `#[ignore]`d test
+with the same `: test` suffix, so the count accepts a run that executed nothing
+(`0 passed; 0 failed; 1 ignored`) and the result string refuses it. **The listing
+proves the name resolves, never that the arm ran.** So compose the two for their
+diagnostics — the count distinguishes *the name is gone* from *the test failed*,
+which one exit code cannot — but do not describe the count as the half that makes
+the string trustworthy. Under `--exact` it is the half with the false green.
 
 **All of the above is about cardinality, and cardinality is the weaker half.** A
 count answers *how many tests ran*; it never answers *whether they were the ones

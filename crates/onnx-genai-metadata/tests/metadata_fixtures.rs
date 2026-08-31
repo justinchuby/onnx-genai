@@ -55,18 +55,17 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.parameter-overlay: "1" }
-      capabilities: [workflow_ssa, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.adapter_segments:
-        contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_segments }
         source: { kind: request }
       request.adapter_counts:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_counts }
         source: { kind: request }
       request.adapter_scales:
-        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_scales }
         source: { kind: request }
     components:
@@ -80,9 +79,9 @@ pipeline:
           version: "1"
         ports:
           inputs:
-            input: { dtype: float32, rank: 2, shape: [batch, 2] }
+            input: { dtype: float32, shape: [batch, 2] }
           outputs:
-            output: { dtype: float32, rank: 2, shape: [batch, 2] }
+            output: { dtype: float32, shape: [batch, 2] }
         contract:
           id: onnx-genai.parameter-overlay
           version: "1"
@@ -97,76 +96,12 @@ pipeline:
 "#;
 
 #[test]
-fn adapter_service_contract_is_valid_and_derives_capabilities() {
+fn adapter_service_contract_is_valid_at_its_typed_extension_surface() {
     let metadata: InferenceMetadata =
         serde_yaml::from_str(ADAPTER_WORKFLOW).expect("adapter workflow parses");
     validate_metadata(&metadata).expect("adapter workflow validates");
-    let capabilities = onnx_genai_metadata::derived_capabilities(&metadata);
-    assert!(capabilities.contains("parameter_adapters"));
-    assert!(capabilities.contains("heterogeneous_adapter_batching"));
-}
-
-fn assert_capability_omission_is_rejected(document: &str, capability: &str) {
-    let mut metadata: InferenceMetadata =
-        serde_yaml::from_str(document).expect("capability fixture parses");
-    validate_metadata(&metadata).expect("capability fixture validates");
-    metadata
-        .pipeline
-        .as_mut()
-        .expect("pipeline")
-        .workflow
-        .manifest
-        .capabilities
-        .remove(capability);
-
-    let errors = validate_metadata(&metadata).expect_err("used capability omission must fail");
-    assert!(
-        errors.iter().any(|error| {
-            error
-                == &format!(
-                    "pipeline.workflow.manifest.capabilities is missing used capability \
-                     '{capability}'"
-                )
-        }),
-        "{capability}: {errors:?}"
-    );
-}
-
-#[test]
-fn structurally_derived_capability_omissions_fail_closed() {
-    for capability in ["parameter_adapters", "heterogeneous_adapter_batching"] {
-        assert_capability_omission_is_rejected(ADAPTER_WORKFLOW, capability);
-    }
-
-    let speculative = include_str!(
-        "../../../tests/fixtures/onnx_genai_workflows/speculative/inference_metadata.yaml"
-    );
-    for capability in ["grammar_guidance_adapter", "adaptive_proposal_budget"] {
-        assert_capability_omission_is_rejected(speculative, capability);
-    }
-
-    let linear_effects =
-        include_str!("../../../examples/inference_metadata/catalogue/02-cosmos3-edge-rollout.yaml");
-    assert_capability_omission_is_rejected(linear_effects, "linear_effects");
-
-    assert_capability_omission_is_rejected(
-        r#"
-pipeline:
-  workflow:
-    manifest:
-      adapter_abis: { onnx-genai.telemetry: "1" }
-      capabilities: [workflow_ssa, telemetry_adapter]
-    inputs: {}
-    components:
-      telemetry:
-        implementation: { kind: adapter, abi: onnx-genai.telemetry, version: "1" }
-        ports: {}
-    steps:
-      - kind: invoke
-        component: telemetry
-"#,
-        "telemetry_adapter",
-    );
+    let service = metadata.adapters.expect("adapter service is declared");
+    assert_eq!(service.application_capability, "onnx-genai.adapters@1");
 }
 
 #[test]
@@ -272,8 +207,8 @@ fn adapter_wire_contract_rejects_ambiguous_selection_and_indices() {
         .replace("max_adapters: 2", "max_adapters: 0")
         .replace("index: 0", "index: 2")
         .replace(
-            "contract: { dtype: int64, rank: 2, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_segments }",
-            "contract: { dtype: float32, rank: 2, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_segments }",
+            "contract: { dtype: int64, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_segments }",
+            "contract: { dtype: float32, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_segments }",
         );
     let metadata: InferenceMetadata =
         serde_yaml::from_str(&invalid).expect("invalid adapter wire contract parses");
@@ -356,8 +291,7 @@ fn minimal_workflow_document_is_valid() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {}
     components:
       noop:
         implementation:
@@ -379,11 +313,10 @@ fn optional_input_presence_is_an_explicit_branch_predicate() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, nested_control_flow, input_presence]
+    manifest: {}
     inputs:
       request.image:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
         required: false
@@ -411,11 +344,10 @@ fn optional_tensor_without_default_or_presence_is_rejected() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {}
     inputs:
       request.image:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
         required: false
@@ -439,11 +371,10 @@ fn optional_tensor_must_only_be_read_in_its_presence_branch() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, input_presence]
+    manifest: {}
     inputs:
       request.image:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
         required: false
@@ -453,7 +384,7 @@ pipeline:
         implementation: { kind: binding }
         ports:
           inputs:
-            image: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            image: { dtype: uint8, shape: [encoded_bytes] }
     steps:
       - kind: invoke
         component: consume
@@ -476,11 +407,10 @@ fn request_presence_rejects_roles_with_implicit_defaults() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, input_presence]
+    manifest: {}
     inputs:
       request.temperature:
-        contract: { dtype: float32, rank: 1, shape: [1] }
+        contract: { dtype: float32, shape: [1] }
         role: { kind: runtime, version: "1.0", role: sampling_temperature }
         source: { kind: request }
         required: false
@@ -515,12 +445,7 @@ pipeline:
 
 #[test]
 fn removed_top_level_execution_surfaces_are_rejected() {
-    for field in [
-        "strategy",
-        "structured_output",
-        "tokens",
-        "speculator_config",
-    ] {
+    for field in ["strategy", "structured_output", "speculator_config"] {
         let document = format!("{field}: {{}}\n");
         let error = serde_yaml::from_str::<InferenceMetadata>(&document)
             .expect_err("removed top-level execution metadata must not deserialize");
@@ -572,8 +497,7 @@ fn serialized_compiler_bookkeeping_is_rejected() {
             r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: []
+    manifest: {{}}
     components: {{}}
     steps: []
     {field}
@@ -587,27 +511,26 @@ pipeline:
 
 #[test]
 fn emit_valid_length_requires_integer_scalar_or_vector() {
-    fn errors(dtype: &str, rank: usize, shape: &str) -> Vec<String> {
+    fn errors(dtype: &str, shape: &str) -> Vec<String> {
         let metadata: InferenceMetadata = serde_yaml::from_str(&format!(
             r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, emit_valid_length]
+    manifest: {{}}
     inputs:
       value:
-        contract: {{ dtype: int64, rank: 1, shape: [sequence] }}
+        contract: {{ dtype: int64, shape: [sequence] }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: value }}
         required: true
       length:
-        contract: {{ dtype: {dtype}, rank: {rank}, shape: {shape} }}
+        contract: {{ dtype: {dtype}, shape: {shape} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: length }}
         required: true
     outputs:
       result:
-        contract: {{ dtype: int64, rank: 1, shape: [valid] }}
+        contract: {{ dtype: int64, shape: [valid] }}
         role: tokens
         stage: pre_adapter
     components: {{}}
@@ -624,12 +547,12 @@ pipeline:
     }
 
     assert!(
-        errors("float32", 0, "[]")
+        errors("float32", "[]")
             .iter()
             .any(|error| error.contains("must have an integer dtype"))
     );
     assert!(
-        errors("int64", 2, "[batch, one]")
+        errors("int64", "[batch, one]")
             .iter()
             .any(|error| error.contains("must be a scalar or rank-one tensor"))
     );
@@ -642,20 +565,18 @@ fn row_wise_emit_requires_a_request_aligned_batch_layout() {
             r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, emit_valid_length]
+    manifest: {{}}
     inputs:
       value:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, sequence]
           {batch_layout}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: value }}
         required: true
       length:
-        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
+        contract: {{ dtype: int64, shape: [batch] }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: length }}
         required: true
@@ -663,7 +584,6 @@ pipeline:
       result:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, generated]
           {batch_layout}
         role: tokens
@@ -724,17 +644,16 @@ fn removed_row_identity_fields_are_rejected_fail_closed() {
             r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {{}}
     inputs:
       value:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, sequence] }}
+        contract: {{ dtype: int64, shape: [batch, sequence] }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: value }}
         required: true
     outputs:
       result:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, generated] }}
+        contract: {{ dtype: int64, shape: [batch, generated] }}
         role: tokens
         stage: pre_adapter
     components: {{}}
@@ -758,8 +677,7 @@ pipeline:
             r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {{}}
     inputs: {{}}
     outputs: {{}}
     components: {{}}
@@ -780,19 +698,11 @@ fn nested_control_loops_preserve_the_request_aligned_emit() {
         r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-        - workflow_ssa
-        - linear_effects
-        - nested_control_flow
-        - typed_emit
-        - emit_valid_length
-        - serving_service_contract
+    manifest: {}
     inputs:
       value:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, sequence]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
@@ -801,7 +711,6 @@ pipeline:
       valid_length:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
@@ -810,7 +719,6 @@ pipeline:
       active.initial:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
@@ -819,7 +727,6 @@ pipeline:
       done.initial:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
@@ -828,14 +735,13 @@ pipeline:
       cache.initial:
         contract:
           dtype: float32
-          rank: 2
           shape: [batch, capacity]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
         source: { kind: application, name: cache }
         required: true
       max_iterations:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: max_iterations }
         required: true
@@ -843,7 +749,6 @@ pipeline:
       result:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, generated]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: tokens
@@ -853,7 +758,6 @@ pipeline:
       active:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -862,7 +766,6 @@ pipeline:
       done:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -871,7 +774,6 @@ pipeline:
       accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -880,7 +782,6 @@ pipeline:
       cache:
         contract:
           dtype: float32
-          rank: 2
           shape: [batch, capacity]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -958,11 +859,10 @@ fn advisory_state_may_be_session_scoped_but_is_not_semantic() {
         r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, advisory_state, session_state_lease]
+    manifest: {}
     inputs:
       estimate:
-        contract: { dtype: float32, rank: 1, shape: [batch] }
+        contract: { dtype: float32, shape: [batch] }
         role: { kind: opaque }
         source: { kind: application, name: estimate }
         required: true
@@ -973,7 +873,7 @@ pipeline:
         ports: {}
     state:
       estimate:
-        contract: { dtype: float32, rank: 1, shape: [batch] }
+        contract: { dtype: float32, shape: [batch] }
         class: advisory
         scope: session
         initializer: estimate
@@ -993,27 +893,26 @@ fn state_service_declares_semantics_not_allocator_policy() {
         r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, serving_service_contract]
+    manifest: {}
     inputs:
       active:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: active }
       done:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: done }
       accepted_len:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: accepted_len }
       cache_lengths:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: cache_lengths }
       empty_cache:
-        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: empty_cache }
     components:
@@ -1022,7 +921,7 @@ pipeline:
         ports: { roles: { input_ids: token_ids } }
     state:
       cache:
-        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
         class: semantic
         scope: invocation
         initializer: empty_cache
@@ -1031,7 +930,7 @@ pipeline:
         management: runtime
         release_boundary: invocation
       cache_lengths:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         class: semantic
         scope: invocation
         initializer: cache_lengths
@@ -1128,7 +1027,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
-      capabilities: []
     components:
       grammar:
         implementation:
@@ -1150,43 +1048,4 @@ pipeline:
             .any(|error| error.contains("unsupported action")),
         "{errors:?}"
     );
-}
-
-/// A package may declare workflow capabilities a given runtime does not
-/// implement. Those are a capability-negotiation question, not a malformed
-/// document, and must be reported apart from structural defects so a caller
-/// that never exercises them can still load the model.
-///
-/// Regression guard for the bare decoder that was rejected with
-/// `Invalid inference metadata: ["bounded_state_recurrence", "emit_valid_length",
-/// "linear_effects", ...]` — eight capability names presented as validation
-/// errors on a model that decoded correctly once they were dropped.
-#[test]
-fn unsupported_capabilities_are_reported_apart_from_structural_defects() {
-    use onnx_genai_metadata::{RuntimeCapabilities, validate_structure_and_capabilities};
-
-    let metadata: InferenceMetadata = serde_yaml::from_str(
-        r#"
-required_capabilities: [kv_cache, grouped_query_attention, some_future_feature]
-"#,
-    )
-    .expect("parse metadata");
-
-    let report = validate_structure_and_capabilities(&metadata, &RuntimeCapabilities::default());
-
-    assert!(
-        report.structural.is_empty(),
-        "a well-formed document must report no structural defects, got {:?}",
-        report.structural
-    );
-    assert_eq!(
-        report.unsupported_capabilities,
-        vec!["some_future_feature".to_string()],
-        "only the capability this runtime lacks should be listed; kv_cache and \
-         grouped_query_attention are supported"
-    );
-
-    // The strict entry point still folds both together, so callers that want
-    // all-or-nothing keep their behaviour.
-    assert!(onnx_genai_metadata::validate(&metadata, &RuntimeCapabilities::default()).is_err());
 }

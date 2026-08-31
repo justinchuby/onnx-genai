@@ -503,15 +503,6 @@
             "null"
           ]
         },
-        "rank": {
-          "description": "Tensor rank of the emitted tensor.\n\nRedundant with `contract.rank` and retained only for programs that\ndeclare no full contract; workflow packages declare `contract`.",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
         "source": {
           "description": "Program-local value produced by a transform.",
           "minLength": 1,
@@ -898,6 +889,49 @@
         }
       ]
     },
+    "CandidateTreeTopology": {
+      "description": "One of the two non-interchangeable candidate-tree topology encodings.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One parent index per flattened candidate (`-1`/a declared root sentinel\nis represented by the producer's tensor contract).",
+          "properties": {
+            "kind": {
+              "const": "parent_indices",
+              "type": "string"
+            },
+            "output": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "output"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Boolean ancestor matrix over flattened candidates.",
+          "properties": {
+            "kind": {
+              "const": "ancestor_mask",
+              "type": "string"
+            },
+            "output": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "output"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "CapacityBudget": {
       "additionalProperties": false,
       "description": "One materialized-footprint bound of an assembled invocation.\n\nA budget bounds what the invocation materializes, not what is nominally\nvalid. A packed dimension's footprint is the sum of the items' valid extents,\nwhich is exactly the packed extent because packing stores no padding; a\npadded dimension's footprint is the enclosing count times the padded extent,\nwhich is the rectangle the runtime allocates and the kernel reads. Budgeting\nthe valid sum instead would let one long and fifteen short items pass a bound\nthe group then blows through.",
@@ -1134,6 +1168,355 @@
         "component"
       ],
       "type": "object"
+    },
+    "DFlashBlockLayout": {
+      "additionalProperties": false,
+      "description": "Flat anchor-plus-mask block presented to one DFlash invocation.",
+      "properties": {
+        "anchor_position": {
+          "description": "Position holding the verifier-produced anchor token.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "attention_mask_input": {
+          "description": "Proposer input receiving validity for target context followed by the\nflat block.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "first_candidate_position": {
+          "description": "First position predicted in parallel. Validation requires this to be\nexactly one past `anchor_position`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mask_token_id": {
+          "description": "Token whose shared target embedding initializes masked positions.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "masked_positions_input": {
+          "description": "Proposer input receiving a boolean tensor with `true` exactly at masked\ncandidate positions and `false` at the anchor.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "noise_embeddings_input": {
+          "description": "Proposer input receiving target-embedding rows for the anchor followed\nby the masked candidate positions.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "position_ids_input": {
+          "description": "Proposer input receiving absolute positions for target context followed\nby the flat block.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "noise_embeddings_input",
+        "masked_positions_input",
+        "position_ids_input",
+        "attention_mask_input",
+        "anchor_position",
+        "first_candidate_position",
+        "mask_token_id"
+      ],
+      "type": "object"
+    },
+    "DFlashConditioning": {
+      "additionalProperties": false,
+      "description": "Explicit target-feature conditioning for a DFlash proposer.",
+      "properties": {
+        "combination": {
+          "$ref": "#/$defs/DFlashFeatureCombination",
+          "description": "Structural operation used to combine multiple sources."
+        },
+        "proposer_input": {
+          "description": "Proposer input receiving the fused target features.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "sources": {
+          "description": "Target component outputs, in concatenation order.\n\nA source must be a floating rank-3 `[batch, sequence, hidden]` output\nwith semantic role `hidden_states`. Layer selection is therefore\nproducer-authored provenance, not a runtime model-family lookup.",
+          "items": {
+            "$ref": "#/$defs/SpeculativeValueRef"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "sources",
+        "proposer_input",
+        "combination"
+      ],
+      "type": "object"
+    },
+    "DFlashConvolutionContract": {
+      "additionalProperties": false,
+      "description": "DFlash 2 block-local grouped dynamic convolution ABI.",
+      "properties": {
+        "first_position_reads_anchor": {
+          "description": "The first candidate reads the anchor representation as its predecessor.",
+          "type": "boolean"
+        },
+        "group_size": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "kernel_size": {
+          "format": "uint",
+          "minimum": 2,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kernel_size",
+        "group_size",
+        "first_position_reads_anchor"
+      ],
+      "type": "object"
+    },
+    "DFlashFeatureCombination": {
+      "description": "How target hidden features are fused before DFlash consumes them.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Concatenate sources in declaration order along `axis`.",
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "concatenate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DFlashOutputProjection": {
+      "additionalProperties": false,
+      "description": "Target LM-head initializer and the proposer input that borrows it.",
+      "properties": {
+        "component": {
+          "description": "Component owning the immutable initializer.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "initializer": {
+          "description": "Exact initializer name.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "layout": {
+          "$ref": "#/$defs/DFlashProjectionLayout",
+          "description": "Matrix layout required by the proposer graph."
+        },
+        "proposer_input": {
+          "description": "Proposer input receiving the initializer as a read-only tensor.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "initializer",
+        "proposer_input",
+        "layout"
+      ],
+      "type": "object"
+    },
+    "DFlashOutputs": {
+      "additionalProperties": false,
+      "description": "Typed outputs of DFlash proposal and verification.",
+      "properties": {
+        "candidate_tokens": {
+          "description": "Proposer output containing selected candidate token ids\n`[batch, proposal]`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "proposal_probabilities": {
+          "description": "Full-vocabulary proposal probabilities `[batch, proposal, vocabulary]`.\n\nAbsence is valid for greedy-only execution. A sampling request must be\nrejected before invoking the proposer when this field is absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verifier_logits": {
+          "$ref": "#/$defs/SpeculativeValueRef",
+          "description": "Target output containing exact verification logits\n`[batch, proposal_plus_bonus, vocabulary]`."
+        }
+      },
+      "required": [
+        "candidate_tokens",
+        "verifier_logits"
+      ],
+      "type": "object"
+    },
+    "DFlashProjectionLayout": {
+      "description": "Layout of the shared output projection.",
+      "enum": [
+        "hidden_vocabulary",
+        "vocabulary_hidden"
+      ],
+      "type": "string"
+    },
+    "DFlashSelectorContract": {
+      "additionalProperties": false,
+      "description": "DFlash 2 adjacent-candidate selector ABI.",
+      "properties": {
+        "candidate_ids_output": {
+          "description": "Proposer output containing top-k candidate ids\n`[batch, proposal, candidates]`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "conditional_probabilities_output": {
+          "description": "Proposer output containing the selected conditional distribution over\n`candidate_ids_output`, required for sampling.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rank": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "selected_tokens_output": {
+          "description": "Proposer output containing the selected path `[batch, proposal]`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "top_k": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "selected_tokens_output",
+        "candidate_ids_output",
+        "top_k",
+        "rank"
+      ],
+      "type": "object"
+    },
+    "DFlashSharedWeights": {
+      "additionalProperties": false,
+      "description": "Immutable target weights DFlash reuses.",
+      "properties": {
+        "input_embedding": {
+          "$ref": "#/$defs/TokenEmbeddingSource",
+          "description": "Target token embedding table used for anchor and mask rows."
+        },
+        "output_projection": {
+          "$ref": "#/$defs/DFlashOutputProjection",
+          "description": "Target output projection passed read-only to the proposer."
+        }
+      },
+      "required": [
+        "input_embedding",
+        "output_projection"
+      ],
+      "type": "object"
+    },
+    "DFlashStateCommit": {
+      "description": "How one speculative state cell is reduced to the accepted prefix.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The component's ordinary state output grows on its declared sequence\naxis and is truncated to `baseline + accepted`.",
+          "properties": {
+            "kind": {
+              "const": "sequence",
+              "type": "string"
+            },
+            "source": {
+              "$ref": "#/$defs/SpeculativeValueRef"
+            }
+          },
+          "required": [
+            "kind",
+            "source"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The component emits one complete fixed-state snapshot for each possible\naccepted length, including prefix zero.",
+          "properties": {
+            "axis": {
+              "description": "Axis enumerating prefix lengths `0..=proposal`.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "prefix_snapshots",
+              "type": "string"
+            },
+            "source": {
+              "$ref": "#/$defs/SpeculativeValueRef"
+            }
+          },
+          "required": [
+            "kind",
+            "source",
+            "axis"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DFlashStructure": {
+      "description": "Exact DFlash structural family.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Base DFlash: parallel masked-block prediction with target KV injection.",
+          "properties": {
+            "kind": {
+              "const": "base",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "DFlash 2: base DFlash plus an explicit adjacent-candidate selector and\nblock-local dynamic convolution.",
+          "properties": {
+            "convolution": {
+              "$ref": "#/$defs/DFlashConvolutionContract"
+            },
+            "kind": {
+              "const": "selector_convolution_v1",
+              "type": "string"
+            },
+            "selector": {
+              "$ref": "#/$defs/DFlashSelectorContract"
+            }
+          },
+          "required": [
+            "kind",
+            "selector",
+            "convolution"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "DType": {
       "description": "Scalar dtype vocabulary with common ONNX and runtime aliases.",
@@ -2175,6 +2558,77 @@
       },
       "type": "object"
     },
+    "MtpHiddenStateLayout": {
+      "description": "Layout of the target activation consumed by an MTP head.",
+      "oneOf": [
+        {
+          "const": "bsh",
+          "description": "`[batch, sequence, hidden]`.",
+          "type": "string"
+        },
+        {
+          "const": "bshc",
+          "description": "`[batch, sequence, hc_mult, hidden]`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MtpProposalState": {
+      "description": "Whether MTP private state is reset or retained after a proposal.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The head has no state that survives a proposal. It is reset on every\noutcome and therefore cannot become a hidden transaction participant.",
+          "properties": {
+            "kind": {
+              "const": "proposal_local",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The head state is retained only through the accepted prefix. Every\nnamed cell must be a rollback participant.",
+          "properties": {
+            "kind": {
+              "const": "accepted_prefix",
+              "type": "string"
+            },
+            "recurrent": {
+              "items": {
+                "$ref": "#/$defs/SpeculativeRecurrenceBinding"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "MtpSharedWeights": {
+      "additionalProperties": false,
+      "description": "Exact immutable weight sharing used by an MTP head.",
+      "properties": {
+        "embedding": {
+          "$ref": "#/$defs/SpeculativeInitializerRef"
+        },
+        "lm_head": {
+          "$ref": "#/$defs/SpeculativeInitializerRef"
+        }
+      },
+      "required": [
+        "embedding",
+        "lm_head"
+      ],
+      "type": "object"
+    },
     "OutputStage": {
       "enum": [
         "pre_adapter",
@@ -2234,7 +2688,18 @@
               "type": "null"
             }
           ],
-          "description": "Exact tokenizer, vocabulary, and special-token facts."
+          "description": "Exact tokenizer and vocabulary facts."
+        },
+        "tool_protocol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolProtocolDeclaration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exact, versioned tool-call protocol used to render caller-owned tools\nand parse model-produced envelopes.  Absence means this package does\nnot support tool calls; it is intentionally not a boolean capability."
         }
       },
       "type": "object"
@@ -2264,7 +2729,7 @@
           "type": "string"
         },
         "valid_lengths": {
-          "description": "Value giving how many leading entries of `dimension` are real, one entry\nper position of the axes outer to it.\n\nIt resolves in the namespace of the contract's owner: a sibling port for\na component port, a workflow value for a workflow input, output, or\nstate cell.",
+          "description": "Value giving how many leading entries of `dimension` are real, one entry\nper position of the axes outer to it.\n\nWhen those outer axes include the owning value's request axis, this\ncompanion declares the same request-aligned/request-expanded layout and\nfollows the same positional row plan. When the padded dimension is\noutside the request axis, the companion is genuinely broadcast and\ndeclares `shared`.\n\nIt resolves in the namespace of the contract's owner: a sibling port for\na component port, a workflow value for a workflow input, output, or\nstate cell.",
           "minLength": 1,
           "type": "string"
         }
@@ -2621,7 +3086,12 @@
         },
         {
           "const": "eos_token_ids",
-          "description": "Token ids that end generation.\n\nA set, not a single id: a model may end a turn with one token and a\nmessage with another, and both must stop. Declaring it here is what lets\nthe runtime's stop policy read a package's EOS from the package instead\nof rediscovering it from tokenizer side-files it may not ship.",
+          "description": "Token ids that end generation.\n\nThe request value overrides\n`package.tokenizer.special_tokens.eos_token_id`. It never carries an\nauthored package default.",
+          "type": "string"
+        },
+        {
+          "const": "eos_token_lengths",
+          "description": "Number of valid entries in each row of a padded EOS-id tensor.",
           "type": "string"
         },
         {
@@ -2976,28 +3446,6 @@
       },
       "type": "object"
     },
-    "SpecialTokenFact": {
-      "additionalProperties": false,
-      "description": "One special token, pinned by id and exact surface bytes.",
-      "properties": {
-        "content": {
-          "description": "Exact UTF-8 surface form of the token.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "id": {
-          "description": "Vocabulary id of the token.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "id",
-        "content"
-      ],
-      "type": "object"
-    },
     "SpeculationSafety": {
       "description": "Whether an effect may be executed inside a speculative region.",
       "oneOf": [
@@ -3051,14 +3499,61 @@
         }
       ]
     },
+    "SpeculativeAcceptedPath": {
+      "description": "The authority that produces the accepted candidate path.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The registered speculative executor publishes the accepted path under a\nprotocol binding. It remains an explicit output of the contract.",
+          "properties": {
+            "binding": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "runtime",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "binding"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A workflow component produces the accepted path.",
+          "properties": {
+            "kind": {
+              "const": "component",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/SpeculativeValueRef"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "SpeculativeContract": {
       "additionalProperties": false,
-      "description": "Portable compatibility facts for speculative decoding.\n\nProposal width, tree shape, scheduling, kernels, and whether speculation is\nenabled at all are runtime decisions.",
+      "description": "Portable compatibility facts for speculative decoding.\n\nThis is the only portable authority for a speculative step.  In particular,\na runtime must not supplement it from a HuggingFace sidecar, a filename, a\nmodel family, or an inferred graph convention. Proposal width, scheduling,\nbatching, kernels, and enablement remain runtime decisions.",
       "properties": {
         "distribution_preserving": {
           "default": false,
           "description": "Whether accepting proposals preserves the target's output distribution.\n\nA runtime may auto-enable speculation only when this is true; otherwise\nthe caller must opt in explicitly.",
           "type": "boolean"
+        },
+        "identity": {
+          "description": "Exact built-in contract identity. Unknown identities are not a\nbest-effort proposal format; they are an unsupported execution contract.",
+          "minLength": 1,
+          "type": "string"
         },
         "max_proposal_width": {
           "description": "Maximum number of proposed positions this package can undo.\n\nThis is a rollback bound, not a choice of proposal width: the runtime\npicks any K up to this bound. A validator rejects a package whose state\nor speculative effects cannot be undone this far.",
@@ -3070,7 +3565,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Proposer ports bound to target-owned values, by semantic role.",
+          "description": "Proposer input ports bound to target-owned values, by semantic role.\n\nThe keys are protocol roles and the values are declared proposer ports;\nneither side is recovered from a name or tensor shape at runtime.",
           "type": "object"
         },
         "proposal_execution": {
@@ -3102,9 +3597,9 @@
           "uniqueItems": true
         },
         "shared_weights": {
-          "description": "Target initializers the proposer borrows.",
+          "description": "Immutable target initializers the proposer borrows.\n\nThe component and initializer are both required. A bare string used to\nforce a loader to guess which target artifact owned an initializer.",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/SpeculativeInitializerRef"
           },
           "type": "array",
           "uniqueItems": true
@@ -3114,16 +3609,75 @@
           "minLength": 1,
           "type": "string"
         },
+        "target_port_bindings": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Target ports bound for verification, by protocol role.\n\nThis is intentionally separate from [`Self::port_bindings`]: a target\nport and a proposer port may have the same spelling while carrying\nunrelated values.",
+          "type": "object"
+        },
+        "verification": {
+          "$ref": "#/$defs/SpeculativeVerification",
+          "description": "Exact values the verifier produces and the declared accepted-path\npublication binding. Sampling is legal only when `probabilities` is\npresent; this is not inferred from `distribution_preserving`."
+        },
+        "version": {
+          "description": "Exact identity version understood by the runtime.",
+          "minLength": 1,
+          "type": "string"
+        },
         "vocabulary": {
           "$ref": "#/$defs/SpeculativeVocabulary",
           "description": "How the proposer's vocabulary relates to the target's."
         }
       },
       "required": [
+        "identity",
+        "version",
         "proposer",
         "target",
         "vocabulary",
-        "max_proposal_width"
+        "max_proposal_width",
+        "verification"
+      ],
+      "type": "object"
+    },
+    "SpeculativeInitializerRef": {
+      "additionalProperties": false,
+      "description": "A component-owned immutable initializer used by a speculative proposer.",
+      "properties": {
+        "component": {
+          "description": "Component whose ONNX artifact owns the initializer.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "initializer": {
+          "description": "Exact ONNX initializer name.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "initializer"
+      ],
+      "type": "object"
+    },
+    "SpeculativeProbabilityOutputs": {
+      "additionalProperties": false,
+      "description": "Probability outputs needed for distribution-preserving sampling.",
+      "properties": {
+        "proposal": {
+          "$ref": "#/$defs/SpeculativeValueRef",
+          "description": "Per-candidate probabilities emitted by the proposer."
+        },
+        "target": {
+          "$ref": "#/$defs/SpeculativeValueRef",
+          "description": "Target probabilities for the corresponding candidate positions."
+        }
+      },
+      "required": [
+        "proposal",
+        "target"
       ],
       "type": "object"
     },
@@ -3141,6 +3695,67 @@
           },
           "required": [
             "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One DFlash invocation predicts every masked position of a flat block in\nparallel from explicitly bound target hidden features.\n\nVersion 1 is the base DFlash architecture. Version 2 adds the DFlash 2\nselector and block-local convolution through [`DFlashStructure`];\nneither version is inferred from optional ports or tensor names.",
+          "properties": {
+            "accepted_prefix_state": {
+              "additionalProperties": {
+                "$ref": "#/$defs/DFlashStateCommit"
+              },
+              "description": "How every rollback participant commits exactly one accepted prefix.\n\nThe keys must equal the enclosing contract's `rollback_state`.\nSequence state is truncated on its declared state-group sequence\naxis. Fixed recurrent state selects an explicitly emitted\nper-prefix snapshot; a runtime never guesses from a port name.",
+              "type": "object"
+            },
+            "block": {
+              "$ref": "#/$defs/DFlashBlockLayout",
+              "description": "Anchor/masked-position layout and the proposer inputs carrying it."
+            },
+            "conditioning": {
+              "$ref": "#/$defs/DFlashConditioning",
+              "description": "Target hidden features and how they become one proposer input."
+            },
+            "draft_private_state": {
+              "description": "Mutable state cells owned only by the drafter.\n\nEvery cell is also present in the enclosing contract's\n`rollback_state`; the separate set distinguishes private draft\nstate from target state without creating another rollback authority.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "kind": {
+              "const": "dflash_flat_block",
+              "type": "string"
+            },
+            "outputs": {
+              "$ref": "#/$defs/DFlashOutputs",
+              "description": "Proposer and verifier outputs consumed by the generic runtime."
+            },
+            "shared_weights": {
+              "$ref": "#/$defs/DFlashSharedWeights",
+              "description": "Immutable target initializers reused by the proposer."
+            },
+            "structure": {
+              "$ref": "#/$defs/DFlashStructure",
+              "description": "Base DFlash or an exact versioned structural extension."
+            },
+            "version": {
+              "description": "Exact structural ABI version implemented by the reader.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "version",
+            "conditioning",
+            "block",
+            "outputs",
+            "shared_weights",
+            "accepted_prefix_state",
+            "structure"
           ],
           "type": "object"
         },
@@ -3206,6 +3821,106 @@
             "logits_output"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A multi-token-prediction head conditioned on an explicitly named target\nhidden-state output. Its head inputs, outputs, shared weights, and\nprivate-state lifetime are all declared here; it is not selected by a\nmodel family or a legacy sidecar.",
+          "properties": {
+            "hc_mult": {
+              "default": 1,
+              "description": "Number of lanes in a `bshc` hidden state. The value is one for\n`bsh`; declaring it prevents a runtime from guessing a lane axis.",
+              "format": "uint",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "hidden_layout": {
+              "$ref": "#/$defs/MtpHiddenStateLayout",
+              "default": "bsh",
+              "description": "Shape of the target hidden state and MTP-head hidden-state input.\n`bsh` is `[batch, sequence, hidden]`; `bshc` additionally carries\n`hc_mult` before the feature axis."
+            },
+            "hidden_output": {
+              "description": "MTP-head output projected through the declared shared LM head.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "hidden_size": {
+              "description": "Feature width of the declared hidden-state binding.",
+              "format": "uint",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "mtp",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/MtpProposalState",
+              "default": {
+                "kind": "proposal_local"
+              },
+              "description": "MTP private-state behavior between proposal blocks."
+            },
+            "state_output": {
+              "description": "Optional MTP-head replacement-state output.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target_hidden": {
+              "$ref": "#/$defs/SpeculativeValueRef",
+              "description": "Target output that seeds the first MTP step."
+            },
+            "target_hidden_input": {
+              "description": "MTP-head input receiving `target_hidden`.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "token_embedding_input": {
+              "description": "MTP-head input receiving the selected token embedding.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "weights": {
+              "$ref": "#/$defs/MtpSharedWeights",
+              "description": "The target embedding and LM-head initializers MTP shares. Their\ncomponent ownership is explicit so no loader searches artifacts."
+            }
+          },
+          "required": [
+            "kind",
+            "target_hidden",
+            "target_hidden_input",
+            "token_embedding_input",
+            "hidden_output",
+            "hidden_size",
+            "weights"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A generic branching candidate tree.\n\nThe tree shape is proposal data: a runtime may pick a width and schedule\nit, but it must receive the candidate ids and exactly one declared\ntopology representation from this proposer.",
+          "properties": {
+            "candidate_tokens": {
+              "description": "Proposer output carrying flattened candidate token IDs.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "candidate_tree",
+              "type": "string"
+            },
+            "topology": {
+              "$ref": "#/$defs/CandidateTreeTopology",
+              "description": "Parent-pointer or ancestor-mask topology over `candidate_tokens`."
+            }
+          },
+          "required": [
+            "kind",
+            "candidate_tokens",
+            "topology"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -3254,6 +3969,36 @@
       "required": [
         "component",
         "output"
+      ],
+      "type": "object"
+    },
+    "SpeculativeVerification": {
+      "additionalProperties": false,
+      "description": "Explicit verifier outputs for a speculative proposal.",
+      "properties": {
+        "accepted_path": {
+          "$ref": "#/$defs/SpeculativeAcceptedPath",
+          "description": "Explicit accepted-path output binding.\n\nA runtime-owned acceptance implementation names a stable binding such as\n`accepted_prefix`; a graph-owned implementation names the component\noutput that provides it. Either way the binding is declared, rather than\nselected from an output name or emission order."
+        },
+        "probabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpeculativeProbabilityOutputs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Proposal and target probability outputs used for exact rejection\nsampling. Omission means this contract is greedy-only."
+        },
+        "target_output": {
+          "$ref": "#/$defs/SpeculativeValueRef",
+          "description": "Target output used by the declared acceptance rule."
+        }
+      },
+      "required": [
+        "target_output",
+        "accepted_path"
       ],
       "type": "object"
     },
@@ -3824,24 +4569,17 @@
           },
           "type": "array"
         },
-        "rank": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
         "shape": {
+          "description": "Complete tensor shape. Its length is the tensor rank.",
           "items": {
             "$ref": "#/$defs/TensorDimension"
           },
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": "array"
         }
       },
       "required": [
         "dtype",
-        "rank"
+        "shape"
       ],
       "type": "object"
     },
@@ -3901,12 +4639,12 @@
           "type": "integer"
         },
         {
-          "description": "A runtime shape symbol.",
+          "description": "A non-empty runtime shape symbol. `Any` means one independently\nunconstrained occurrence.",
           "minLength": 1,
           "type": "string"
         }
       ],
-      "description": "One fixed or runtime-resolved tensor-shape dimension."
+      "description": "One fixed, symbolic, or unconstrained tensor-shape dimension."
     },
     "TensorShardFacts": {
       "additionalProperties": false,
@@ -3993,6 +4731,94 @@
       ],
       "type": "object"
     },
+    "TokenFacts": {
+      "additionalProperties": false,
+      "description": "Numeric model and control-token facts.\n\nThese ids are model/package facts. Token spellings, added-token maps, and\nchat templates remain in tokenizer assets and are not repeated here.",
+      "properties": {
+        "audio_token_id": {
+          "description": "Prompt placeholder replaced by audio features.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "bos_token_id": {
+          "description": "Beginning-of-sequence token.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "decoder_start_token_id": {
+          "description": "First token fed to an encoder-decoder's autoregressive decoder.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "eos_token_id": {
+          "description": "Every token id that terminates package-default autoregressive generation.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "image_token_id": {
+          "description": "Prompt placeholder replaced by image features.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pad_token_id": {
+          "description": "Padding token used by package-authored tensor contracts.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sep_token_id": {
+          "description": "Separator token used by sequence-pair models.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "video_token_id": {
+          "description": "Prompt placeholder replaced by video features.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "vision_start_token_id": {
+          "description": "Token that opens a vision segment in a multimodal prompt.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "TokenizerArtifact": {
       "additionalProperties": false,
       "description": "One package-relative tokenizer artifact.",
@@ -4015,7 +4841,10 @@
         "algorithm": {
           "description": "Tokenizer algorithm identifier, e.g. `bpe`, `unigram`, `wordpiece`.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "artifacts": {
           "description": "Package-relative tokenizer artifacts.",
@@ -4031,22 +4860,46 @@
           "type": "boolean"
         },
         "special_tokens": {
-          "additionalProperties": {
-            "$ref": "#/$defs/SpecialTokenFact"
-          },
-          "description": "Special tokens by semantic role, e.g. `bos`, `eos`, `pad`.",
-          "type": "object"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TokenFacts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Numeric model and control-token facts for this tokenizer vocabulary.\n\nToken strings, added-token mappings, and chat templates remain in the\ntokenizer assets. Request EOS inputs may override these defaults, but\nworkflow literals and termination components do not own another copy."
         },
         "vocab_size": {
           "description": "Number of entries in the vocabulary, including added tokens.",
           "format": "uint",
           "minimum": 1,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ToolProtocolDeclaration": {
+      "additionalProperties": false,
+      "description": "A portable tool-call protocol identity.  Implementations select only this\nexact pair and never infer a protocol from a model name or emitted text.",
+      "properties": {
+        "identity": {
+          "description": "Stable protocol identity, independent of model family or runtime.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "description": "Exact protocol version, including its envelope and streaming semantics.",
+          "minLength": 1,
+          "type": "string"
         }
       },
       "required": [
-        "algorithm",
-        "vocab_size"
+        "identity",
+        "version"
       ],
       "type": "object"
     },
@@ -4683,7 +5536,9 @@
       "enum": [
         "replace",
         "append",
-        "event"
+        "event",
+        "retract",
+        "finalize"
       ],
       "type": "string"
     },
@@ -4830,14 +5685,6 @@
           },
           "default": {},
           "type": "object"
-        },
-        "capabilities": {
-          "default": [],
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "uniqueItems": true
         }
       },
       "type": "object"
@@ -4847,6 +5694,13 @@
       "properties": {
         "contract": {
           "$ref": "#/$defs/TensorContract"
+        },
+        "family": {
+          "$ref": "#/$defs/WorkflowOutputFamily",
+          "default": {
+            "kind": "materialized"
+          },
+          "description": "The sole publication family for this output boundary.\n\nThe default preserves documents authored before output protocols were\nintroduced. New schema-versioned documents must state this field; see\nthe parser's version gate."
         },
         "media": {
           "anyOf": [
@@ -4883,6 +5737,59 @@
       ],
       "type": "object"
     },
+    "WorkflowOutputFamily": {
+      "description": "Publication semantics selected once for a workflow output.\n\nThis classification describes workflow semantics only. Adapters render the\nresulting publications separately and cannot change an allowed operation.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One value, replaced or grown along a declared axis.",
+          "properties": {
+            "kind": {
+              "const": "materialized",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Ordered, discrete typed occurrences.",
+          "properties": {
+            "kind": {
+              "const": "events",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A stream of typed, transaction-addressable revisions.",
+          "properties": {
+            "kind": {
+              "const": "revisions",
+              "type": "string"
+            },
+            "version": {
+              "description": "Exact revision-envelope protocol version.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "version"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "WorkflowOutputRole": {
       "oneOf": [
         {
@@ -4899,6 +5806,21 @@
         {
           "const": "video",
           "description": "A frame sequence. Distinct from `Image` because a consumer has to know\nthe value carries a temporal axis and may be published incrementally.",
+          "type": "string"
+        }
+      ]
+    },
+    "WorkflowPublicationMode": {
+      "description": "Publication visibility selected for every output in a workflow turn.\n\n`provisional_revisions` is deliberately not a generic streaming switch.\nIt is valid only when every declared output uses the versioned revision\nfamily, allowing a consumer to reconcile one transaction atomically.",
+      "oneOf": [
+        {
+          "const": "commit_only",
+          "description": "Outputs become externally observable only after the turn commits.",
+          "type": "string"
+        },
+        {
+          "const": "provisional_revisions",
+          "description": "Revision envelopes may be published before commit and are reconciled by\nthe transaction's commit or abort-to-baseline outcome.",
           "type": "string"
         }
       ]
@@ -4937,6 +5859,10 @@
           },
           "default": {},
           "type": "object"
+        },
+        "publication_mode": {
+          "$ref": "#/$defs/WorkflowPublicationMode",
+          "description": "Visibility of output publications while an admitted turn is still open.\n\nThis is one workflow-wide transaction decision, rather than a property\nof an individual emit: one turn has one commit or abort outcome that\nreconciles every output stream together."
         },
         "serving": {
           "anyOf": [
@@ -5215,6 +6141,14 @@
             "output": {
               "type": "string"
             },
+            "stream": {
+              "description": "Logical stream within the declared output. Omission selects the\noutput's default stream; it never selects an adapter.",
+              "minLength": 1,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "valid_length": {
               "type": [
                 "string",
@@ -5222,6 +6156,7 @@
               ]
             },
             "value": {
+              "description": "SSA value published by a value-carrying operation. `retract` and\n`finalize` carry no value, so this is absent for those operations.",
               "type": "string"
             },
             "when": {
@@ -5233,7 +6168,6 @@
           },
           "required": [
             "kind",
-            "value",
             "output",
             "mode"
           ],
@@ -5305,7 +6239,7 @@
           "type": "null"
         }
       ],
-      "description": "Build-time model properties and runtime-configurable capabilities."
+      "description": "Build-time model properties and runtime-configurable facts."
     },
     "package": {
       "anyOf": [
@@ -5358,23 +6292,8 @@
       ],
       "description": "Model weight quantization intent, independent of the packed representation."
     },
-    "required_capabilities": {
-      "default": [],
-      "description": "Capability identifiers that a runtime MUST support or refuse to load the model.",
-      "examples": [
-        [
-          "kv_cache",
-          "grouped_query_attention"
-        ]
-      ],
-      "items": {
-        "minLength": 1,
-        "type": "string"
-      },
-      "type": "array"
-    },
     "schema_version": {
-      "description": "Schema version of this inference-metadata document, e.g. `\"v1.1\"`.\n\nCanonically `\"v<major>.<minor>\"`, matching the `v1` that every writer in\nthis repository already stamps. Absence means the initial `v1.0`\ncontract, as do the spellings `\"v1\"`, `\"1\"`, `\"1.0\"` and `\"v1.0\"` that\npredate a canonical form; readers normalize before comparing, so all of\nthem keep loading and `\"1.1\"` is an accepted synonym for `\"v1.1\"`. A\ndocument that uses nothing new keeps stamping what it already stamped —\nrewriting an existing spelling would change the package's semantic\nidentity to say something no reader distinguishes. Bump the major only\nfor breaking schema changes, and the minor whenever a document may carry\na field an older reader would not know.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed — every structure here denies\nunknown fields — so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.\n\nThat is a statement about *additive* fields, and it is not a promise that\nthis schema never reshapes one it already had. It does, while it is\npre-release: `token_packed` moved its `offsets` and `owner` into a\n`levels` chain in v1.1, and a document written against the flat spelling\ndoes not load at any version. A version says which fields a reader must\nunderstand; it is not a compatibility guarantee spanning a reshape, and\nnothing here silently reads an old spelling as a new one. See\n`reject_flat_token_packed`.",
+      "description": "Schema version of this inference-metadata document, e.g. `\"v1.1\"`.\n\nCanonically `\"v<major>.<minor>\"`, matching the `v1` that every writer in\nthis repository already stamps. Absence means the initial `v1.0`\ncontract, as do the spellings `\"v1\"`, `\"1\"`, `\"1.0\"` and `\"v1.0\"` that\npredate a canonical form; readers normalize before comparing, so all of\nthem keep loading and `\"1.1\"` is an accepted synonym for `\"v1.1\"`. A\ndocument that uses nothing new keeps stamping what it already stamped —\nrewriting an existing spelling would change the package's semantic\nidentity to say something no reader distinguishes. Bump the major only\nfor breaking schema changes, and the minor whenever a document may carry\na field an older reader would not know.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed — every structure here denies\nunknown fields — so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.\n\nThat is a statement about *additive* fields, and it is not a promise that\nthis schema never reshapes one it already had. It does, while it is\npre-release: `token_packed` moved its `offsets` and `owner` into a\n`levels` chain in v1.1, and a document written against the flat spelling\ndoes not load at any version. A version says which fields a reader must\nunderstand; it is not a compatibility guarantee spanning a reshape, and\nnothing here silently reads an old spelling as a new one. See\n`reject_flat_token_packed`.\n\nA component using `onnx-genai.token-context@1` declares at least\n`v1.4`: the component-contract fields predate that version, so only the\nversion gate prevents a v1.3 reader from accepting the document while\nsilently ignoring the token-identity semantics.\n\nA DFlash flat-block proposal declares at least `v1.6`, so a v1.5 reader\nrefuses before ignoring its target-hidden provenance, probability, and\naccepted-prefix state fields.",
       "type": [
         "string",
         "null"

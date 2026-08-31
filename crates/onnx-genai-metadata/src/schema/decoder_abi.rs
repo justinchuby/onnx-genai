@@ -262,14 +262,41 @@ pub enum AbsentInputKind {
     Zeros,
 }
 
-/// One fixed or runtime-resolved tensor-shape dimension.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(untagged)]
+/// One fixed, symbolic, or unconstrained tensor-shape dimension.
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(with = "TensorDimensionSchema")]
 pub enum TensorDimension {
     /// A fixed, non-negative dimension.
     Fixed(#[schemars(range(min = 0))] i64),
-    /// A runtime shape symbol.
+    /// A named runtime shape symbol. The reserved spelling `Any` deserializes
+    /// as an independently unconstrained dimension instead.
     Symbol(#[schemars(length(min = 1))] String),
+    /// An unconstrained extent. Each occurrence is independent.
+    Any,
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(untagged)]
+enum TensorDimensionSchema {
+    /// A fixed, non-negative dimension.
+    Fixed(#[schemars(range(min = 0))] i64),
+    /// A non-empty runtime shape symbol. `Any` means one independently
+    /// unconstrained occurrence.
+    Symbol(#[schemars(length(min = 1))] String),
+}
+
+impl Serialize for TensorDimension {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Fixed(value) => serializer.serialize_i64(*value),
+            Self::Symbol(value) => serializer.serialize_str(value),
+            Self::Any => serializer.serialize_str("Any"),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for TensorDimension {
@@ -289,6 +316,7 @@ impl<'de> Deserialize<'de> for TensorDimension {
             Representation::Fixed(_) => Err(serde::de::Error::custom(
                 "tensor dimensions must be non-negative",
             )),
+            Representation::Symbol(value) if value == "Any" => Ok(Self::Any),
             Representation::Symbol(value) if !value.is_empty() => Ok(Self::Symbol(value)),
             Representation::Symbol(_) => {
                 Err(serde::de::Error::custom("tensor symbols must not be empty"))

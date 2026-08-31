@@ -52,8 +52,6 @@ The ONNX model and LM Studio read the same source GGUF bytes:
 then used separately to write `inference_metadata.yaml`. The active contract is:
 
 ```yaml
-required_capabilities:
-  - grouped_query_attention
 model:
   attention:
     type: group_query_attention

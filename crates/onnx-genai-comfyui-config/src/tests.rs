@@ -367,8 +367,8 @@ fn inpainting_keeps_the_mask_as_a_per_step_blend() {
     // The mask is a typed workflow input, not a run parameter the converter
     // folded away, and it gates the latent every step rather than once at the end.
     assert_eq!(
-        workflow["inputs"]["request.mask"]["contract"]["rank"],
-        json!(4)
+        workflow["inputs"]["request.mask"]["contract"]["shape"],
+        json!(["batch", 1, "latent_height", "latent_width"])
     );
     let body = body_components(&document);
     let blend = body
@@ -648,11 +648,11 @@ fn lora_routes_through_canonical_adapter_selection() {
     ] {
         assert!(workflow["inputs"][name].is_object(), "missing {name}");
     }
-    let capabilities = workflow["manifest"]["capabilities"]
-        .as_array()
-        .expect("capabilities");
-    assert!(capabilities.contains(&json!("parameter_adapters")));
-    assert!(capabilities.contains(&json!("heterogeneous_adapter_batching")));
+    assert_eq!(workflow["manifest"], json!({}));
+    assert_eq!(
+        document["adapters"]["application_capability"],
+        json!("onnx-genai.adapters@1")
+    );
     assert_eq!(
         document["adapters"]["selection"]["segments"],
         json!("request.adapter_segments")

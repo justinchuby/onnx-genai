@@ -150,6 +150,71 @@ def weight_bytes(model, block):
 
 HOSTLOCK = os.path.join(ROOT, "scripts", "hostlock.sh")
 
+#: Environment variables consulted for the host-lock owner, in order.
+OWNER_ENV = ("ONNX_GENAI_BENCH_OWNER", "HOSTLOCK_OWNER")
+
+
+def bench_owner():
+    """Who to record as the host-lock owner, or refuse to run.
+
+    There is no defensible default here, so there is no longer one.  This
+    used to fall back to a hard-coded peer's name, which meant every agent
+    on this host except that one took the box, held it for hours, and
+    stamped every archived dataset under somebody else's identity.  Nothing
+    downstream could catch it: `held_uid` corroborates the wrong name as
+    readily as the right one, because every agent here shares one uid, and
+    `hostlock.sh` reports `held_owner_source=flag` for this case -- the most
+    trusted source in its own hierarchy -- because a flag genuinely was
+    passed.  It just carried a literal nobody chose.
+
+    A name obtained by defaulting is not a weaker attribution than one
+    obtained by asking; it is a wrong one, and it is wrong in the direction
+    that matters, since the whole point of recording an owner is telling the
+    next agent who to go and ask.  Refusing costs one environment variable.
+    """
+    for var in OWNER_ENV:
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    raise SystemExit(
+        "REFUSING TO RUN: no host-lock owner. Set "
+        + " or ".join(OWNER_ENV)
+        + " to your agent name.\nThis used to default to a hard-coded name, "
+        "so every other agent's runs were archived under it; an unattributed "
+        "refusal is recoverable, a confidently misattributed dataset is not."
+    )
+
+
+def resolve_binary(path):
+    """Absolutise `--binary` against the caller's cwd, and prove it runs.
+
+    `sh()` runs children with `cwd=HERE`, so a relative `--binary` -- the
+    natural thing to paste from a `cargo build` line at the repo root -- is
+    resolved against this directory instead and does not exist.  `taskset`
+    then exits non-zero, `sh()` captures the message, the parser finds no
+    `worker` rows, and every launch scores as untrusted.  The report that
+    comes out says `n_trusted=0 of 8` above a table of dashes, which reads
+    exactly like a host too busy to measure on.  Nothing anywhere says the
+    binary never ran.
+
+    So check it here, where the answer is unambiguous, rather than let it
+    turn into a plausible wrong diagnosis eight launches later.
+    """
+    resolved = os.path.abspath(path)
+    if not os.path.isfile(resolved):
+        raise SystemExit(
+            f"REFUSING TO RUN: --binary {path!r} does not exist "
+            f"(resolved to {resolved}). Benchmark children run with cwd="
+            f"{HERE}, so a relative path is not resolved against your shell's "
+            f"directory; pass an absolute path."
+        )
+    if not os.access(resolved, os.X_OK):
+        raise SystemExit(
+            f"REFUSING TO RUN: --binary {resolved} is not executable."
+        )
+    return resolved
+
+
 # Set while this process holds the lock, so LoadWatch can tell "I hold the box"
 # apart from "somebody else does" without re-deriving ownership from pids.
 _HELD_BY_US = False
@@ -211,7 +276,7 @@ class HostLock:
                   f"{'waiting' if self.wait else 'refusing'}",
                   file=sys.stderr, flush=True)
         cmd = ["bash", HOSTLOCK, "acquire", "--owner", self.owner,
-               "--reason", self.reason, "--timeout", str(self.timeout),
+               "--reason", self.reason,
                # `acquire` defaults to --ttl 3600. A TTL is not "release this
                # if I abandon it", it is "release this on the clock, whether
                # or not I am still running" -- so on a sweep longer than an
@@ -228,9 +293,12 @@ class HostLock:
                # and the next acquirer reaps it out from under a live sweep.
                "--pid", str(os.getpid())]
         if self.wait:
-            # --timeout is only honoured with --wait; without it the flag is
-            # accepted and silently does nothing.
-            cmd.append("--wait")
+            # --timeout bounds the wait loop, so it is only meaningful
+            # alongside --wait. A no-wait acquire returns BUSY immediately and
+            # never consults it, so passing it there would be asking for a
+            # bound on a loop that does not exist; hostlock.sh refuses that
+            # combination (#2109) rather than accepting a flag it will ignore.
+            cmd += ["--wait", "--timeout", str(self.timeout)]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             why = self.WHY.get(r.returncode, "unknown failure")
@@ -526,6 +594,7 @@ def main():
                          "16 physical cores (wide, what this script used to do), "
                          "or both so the asymmetry is quantified")
     args = ap.parse_args()
+    args.binary = resolve_binary(args.binary)
 
     # `--tokens 192` or `--tokens 1:64,4:192,8:384`.
     threads = [int(x) for x in args.threads.split(",")]
@@ -560,7 +629,7 @@ def main():
     # the middle of a matrix whose cells are only comparable to each other
     # if they all saw the same machine. Released before the summary below,
     # which is arithmetic and has no business holding the host.
-    with HostLock(owner=os.environ.get("ONNX_GENAI_BENCH_OWNER", "roy"),
+    with HostLock(owner=bench_owner(),
                   reason=f"acc0 gap matrix: {args.models} t={args.threads} "
                          f"x{args.launches} launches") as lock:
         for launch in range(args.launches):

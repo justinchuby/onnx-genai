@@ -77,9 +77,7 @@ fn target_owns_hybrid_dense_decoder() {
     // Heterogeneous global/local geometry: this checkpoint's real heterogeneity
     // is head WIDTH — the global head_dim differs from the local head_dim. The
     // dimensions are independent symbolic axes on the graph ports.
-    let dim = |cell: &str, axis: usize| {
-        workflow.state[cell].contract.shape.as_ref().expect("shape")[axis].clone()
-    };
+    let dim = |cell: &str, axis: usize| workflow.state[cell].contract.shape[axis].clone();
     assert_ne!(
         dim("full_key_0", 3),
         dim("sliding_key_0", 3),

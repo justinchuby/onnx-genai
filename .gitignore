@@ -37,20 +37,17 @@ ENV/
 htmlcov/
 .tox/
 
-# Squad: ignore runtime state (logs, sessions)
-# Note: .squad/casting/* is identity and MUST be committed to main, not ignored
-# Note: .squad/decisions/inbox/ is intentionally TRACKED (not ignored). It was
-# originally grouped with runtime scratch in the 2026-07-12 "Add squad" commit on
-# the assumption that drops are consumed and cleared on the same machine that wrote
-# them. That assumption failed: worktrees were deleted before Scribe merged, losing
-# drops that existed only locally, and with multiple machines writing concurrently a
-# drop is invisible on other machines until merged. Tracking makes drops a durable
-# queue that survives worktree deletion and is visible in-flight; concurrent Scribes
-# add distinct files (no conflict) and delete/delete resolves cleanly on merge.
-# See .squad/decisions.md — "2026-07-29 — Decision inbox is a tracked durable queue".
+# Squad: local-backend runtime state. These slash-separated patterns work in
+# Git's path syntax on Windows and POSIX. Static team/config/charter/template
+# files remain tracked; the inbox README is its intentional placeholder.
+.squad/decisions/inbox/*
+!.squad/decisions/inbox/README.md
+.squad/agents/*/history*.md
 .squad/orchestration-log/
 .squad/log/
 .squad/sessions/
+.squad/identity/now.md
+.squad/memory/
 .squad/.scratch/
 .squad/.cache/
 # Squad: SubSquad activation file (local to this machine)
@@ -88,6 +85,15 @@ PR*.md
 # by whoever creates it, and only .github/root-file-allowlist.txt is able to
 # catch a name nobody predicted. Root-level only, per /*.log above.
 /.*-scratch/
+# Review bodies and merge-gate logs, written a directory down rather than at the
+# root. `.review/` is not a `-scratch` name, so the wildcard above does not reach
+# it, and `.review/pr.log` is not caught by `/*.log` below either: that pattern is
+# anchored to the root, so a .log one directory down matches nothing. Verified
+# with `git check-ignore -v .review/pr.log` (no match) against root `pr.log`
+# (matches /*.log). Found untracked in two worktrees before it was committed --
+# the allowlist check would have caught it, but only after everyone had inherited
+# the red.
+/.review/
 # Scratch buffers used when moving a block of code between files.
 .block.txt
 # Test/build output teed to a file while investigating. Root-level only, so a
@@ -148,3 +154,16 @@ roy_validate.log
 /.mutate*
 /.suite.log
 /.selftest.log
+
+# Local-only working directories. These are not "files someone might add by
+# accident" but directories every agent on a shared box creates by convention:
+# throwaway worktrees for validating a PR against latest main, and a vendored
+# upstream checkout. Measured before adding: `git add -A` in a primary checkout
+# staged 69 files from .validation-worktrees alone. The root-file allowlist job
+# does catch this once committed -- it reports the root segment, not the leaf --
+# so this is the layer that stops it reaching a commit at all, not a substitute.
+# Root-anchored, because a crate could legitimately hold a nested fixture dir of
+# any of these names and only the repository root is scratch.
+/.validation-worktrees/
+/.worktrees/
+/.ort_upstream/

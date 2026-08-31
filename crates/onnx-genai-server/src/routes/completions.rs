@@ -1,4 +1,5 @@
 use super::*;
+use crate::tool_protocol::{self, ToolOutputConstraint, ToolProtocol};
 
 pub(crate) async fn completions(
     State(state): State<AppState>,
@@ -162,9 +163,10 @@ async fn run_completion(
     enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
     let session = open_session_after_admission(&state, &handle, conversational, lease).await?;
     let generation = submit_completion(&handle, prepared.generation, session).await?;
-    let result = collect_generation_result(generation.events)
+    let collected = collect_generation_with_publications(generation.events)
         .await
         .map_err(generation_failure)?;
+    let result = collected.result;
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     let completion_tokens = result.token_ids.len();
     let logprobs = completion_logprobs(&result, &tokenizer, requested_logprobs)
@@ -186,6 +188,7 @@ async fn run_completion(
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
         },
+        workflow_outputs: collected.publications,
     })
 }
 
@@ -243,6 +246,9 @@ async fn stream_completion(
                     if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
                         stop_buffer.pending.clear();
                     }
+                }
+                Some(DriverEvent::WorkflowPublications(publications)) => {
+                    send_workflow_publications(&tx, &publications).await?;
                 }
                 Some(DriverEvent::Finished(result)) => break Ok(result),
                 Some(DriverEvent::Error(error)) => break Err(error),
@@ -324,6 +330,12 @@ pub(crate) async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
     validate_request(&request, &state.config)?;
+    tool_protocol::validate_request(
+        &request,
+        handle.tool_protocol.as_ref(),
+        handle.tool_protocol_metadata_path.as_deref(),
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let requested_session_id = session_id_from_headers(&headers)?;
     // The session header names a conversation. Which runtime state continues it
     // — a decode core's paged KV sequence, or the interpreter's session-scoped
@@ -378,6 +390,7 @@ async fn run_chat_completion(
         client_session_id.is_some(),
         &PromptContext {
             chat_template: handle.chat_template.as_deref(),
+            tool_protocol: handle.tool_protocol.as_ref(),
             image_placeholder: placeholder.as_deref(),
             generation_defaults: handle.generation_defaults.as_ref(),
             default_reasoning_effort: state.config.default_reasoning_effort,
@@ -431,6 +444,7 @@ async fn run_chat_completion(
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
+    let tool_call_policy = tool_protocol::request_policy(&request);
     let session_lookup =
         open_session_after_admission(&state, &handle, client_session_id.as_deref(), lease).await?;
 
@@ -443,10 +457,15 @@ async fn run_chat_completion(
     // owns, so this route no longer branches on which package shape was loaded.
     let generation = handle
         .engine
-        .submit_generation(session_lookup, generation_request, pipeline_input)
+        .submit_generation(
+            session_lookup,
+            generation_request,
+            tool_call_policy,
+            pipeline_input,
+        )
         .await
         .map_err(map_generate_submit_error)?;
-    let result = collect_generation_result(generation.events)
+    let result = collect_generation_with_publications(generation.events)
         .await
         .map_err(generation_failure);
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
@@ -463,28 +482,32 @@ async fn run_chat_completion(
         None
     };
 
+    let mut workflow_outputs = Vec::new();
     let (content, tool_calls, completion_tokens, finish_reason, logprobs, reasoning) = match result
     {
-        Ok(result) => {
+        Ok(collected) => {
+            workflow_outputs = collected.publications;
+            let result = collected.result;
             let default_finish_reason = finish_reason_label(&result.finish_reason);
             let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
                 .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
             let output = assistant_output_text(&result, &tokenizer);
-            let reasoning = atem_reasoning_content(&output).filter(|thought| !thought.is_empty());
-            let parsed = if tools_parseable_from_output(&request) {
-                parse_assistant_output(output, default_finish_reason).aligned_to(&request)
+            let tool_calls = committed_chat_tool_calls(&result);
+            let content = if tool_calls.is_some() {
+                None
             } else {
-                ParsedAssistantOutput {
-                    content: Some(result.text),
-                    tool_calls: None,
-                    finish_reason: default_finish_reason,
-                }
+                Some(atem_visible_content(&output).unwrap_or(output.clone()))
             };
+            let reasoning = tool_calls
+                .is_none()
+                .then(|| atem_reasoning_content(&output))
+                .flatten()
+                .filter(|thought| !thought.is_empty());
             (
-                parsed.content,
-                parsed.tool_calls,
+                content,
+                tool_calls,
                 result.token_ids.len(),
-                parsed.finish_reason,
+                default_finish_reason,
                 logprobs,
                 reasoning,
             )
@@ -523,6 +546,7 @@ async fn run_chat_completion(
         }),
         session_id: client_session_id,
         session_token_count,
+        workflow_outputs,
     })
 }
 
@@ -554,6 +578,7 @@ async fn stream_chat_completion(
         client_session_id.is_some(),
         &PromptContext {
             chat_template: handle.chat_template.as_deref(),
+            tool_protocol: handle.tool_protocol.as_ref(),
             image_placeholder: placeholder.as_deref(),
             generation_defaults: handle.generation_defaults.as_ref(),
             default_reasoning_effort: state.config.default_reasoning_effort,
@@ -604,6 +629,7 @@ async fn stream_chat_completion(
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
+    let tool_call_policy = tool_protocol::request_policy(&request);
     let (tx, rx) = mpsc::channel(16);
     let session_lookup =
         open_session_after_admission(&state, &handle, client_session_id.as_deref(), lease).await?;
@@ -611,7 +637,12 @@ async fn stream_chat_completion(
     // owns, so this route no longer branches on which package shape was loaded.
     let generation = handle
         .engine
-        .submit_generation(session_lookup, generation_request, pipeline_input)
+        .submit_generation(
+            session_lookup,
+            generation_request,
+            tool_call_policy,
+            pipeline_input,
+        )
         .await
         .map_err(map_generate_submit_error)?;
     await_driver_admission(generation.admission).await?;
@@ -621,17 +652,25 @@ async fn stream_chat_completion(
     tokio::spawn(async move {
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
 
+        if request.has_tool_context() {
+            return stream_declared_tool_chat_completion(
+                &tx,
+                (&id, created, &model),
+                &tokenizer,
+                handle.private_channels,
+                requested_top_logprobs,
+                &user_stop_sequences,
+                wants_constrained_json,
+                &mut driver_rx,
+            )
+            .await;
+        }
+
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
         let mut channel_gate = PrivateChannelGate::new(handle.private_channels);
-        let mut buffered_text = String::new();
-        let buffer_for_tool_detection =
-            request.has_tool_context() && tools_parseable_from_output(&request);
         let result = loop {
             match driver_rx.recv().await {
                 Some(DriverEvent::Token(token)) => {
-                    if requested_top_logprobs.is_some() {
-                        continue;
-                    }
                     let finish_reason = token.finish_reason.clone();
                     // The special-token spelling is only read by an armed gate; a
                     // model with no private channel discards it, so skip the extra
@@ -649,9 +688,10 @@ async fn stream_chat_completion(
                         .await?;
                     }
                     let content = stop_buffer.push(&revealed.content);
-                    if buffer_for_tool_detection {
-                        buffered_text.push_str(&content);
-                    } else if !wants_constrained_json && !content.is_empty() {
+                    if requested_top_logprobs.is_none()
+                        && !wants_constrained_json
+                        && !content.is_empty()
+                    {
                         send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
                     }
@@ -659,12 +699,17 @@ async fn stream_chat_completion(
                         stop_buffer.pending.clear();
                     }
                 }
+                Some(DriverEvent::WorkflowPublications(publications)) => {
+                    if let Err(error) = send_workflow_publications(&tx, &publications).await {
+                        break Err(StreamOutputFailure::Delivery(error));
+                    }
+                }
                 Some(DriverEvent::Finished(result)) => break Ok(result),
-                Some(DriverEvent::Error(error)) => break Err(error),
+                Some(DriverEvent::Error(error)) => break Err(StreamOutputFailure::Driver(error)),
                 None => {
-                    break Err(DriverFailure::internal(
+                    break Err(StreamOutputFailure::Driver(DriverFailure::internal(
                         "generation stream ended before result",
-                    ));
+                    )));
                 }
             }
         };
@@ -672,64 +717,26 @@ async fn stream_chat_completion(
         match result {
             Ok(result) => {
                 if let Some(requested_top_logprobs) = requested_top_logprobs {
-                    let mut tool_calls = if buffer_for_tool_detection {
-                        parse_tool_calls(&assistant_output_text(&result, &tokenizer))
-                    } else {
-                        Vec::new()
-                    };
-                    align_tool_calls(&mut tool_calls, &request);
-                    if tool_calls.is_empty() {
-                        send_chat_logprob_chunks(
-                            &tx,
-                            (&id, created, &model),
-                            &result,
-                            &tokenizer,
-                            requested_top_logprobs,
-                            &user_stop_sequences,
-                            handle.private_channels,
-                        )
-                        .await?;
-                        send_stream_chunk(
-                            &tx,
-                            done_chunk(
-                                &id,
-                                created,
-                                &model,
-                                finish_reason_label(&result.finish_reason),
-                            ),
-                        )
-                        .await?;
-                    } else {
-                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
-                    }
-                } else if buffer_for_tool_detection {
-                    let parsed = parse_assistant_output(
-                        assistant_output_text(&result, &tokenizer),
-                        finish_reason_label(&result.finish_reason),
+                    send_chat_logprob_chunks(
+                        &tx,
+                        (&id, created, &model),
+                        &result,
+                        &tokenizer,
+                        requested_top_logprobs,
+                        &user_stop_sequences,
+                        handle.private_channels,
                     )
-                    .aligned_to(&request);
-                    if let Some(tool_calls) = parsed.tool_calls {
-                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
-                    } else {
-                        let content = parsed.content.unwrap_or_else(|| {
-                            if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                                buffered_text.push_str(&stop_buffer.flush());
-                            }
-                            buffered_text
-                        });
-                        if !content.is_empty() {
-                            send_stream_chunk(
-                                &tx,
-                                content_chunk(&id, created, &model, content, None),
-                            )
-                            .await?;
-                        }
-                        send_stream_chunk(
-                            &tx,
-                            done_chunk(&id, created, &model, parsed.finish_reason),
-                        )
-                        .await?;
-                    }
+                    .await?;
+                    send_stream_chunk(
+                        &tx,
+                        done_chunk(
+                            &id,
+                            created,
+                            &model,
+                            finish_reason_label(&result.finish_reason),
+                        ),
+                    )
+                    .await?;
                 } else if wants_constrained_json {
                     let content = visible_assistant_text(&result, &tokenizer);
                     if !content.is_empty() {
@@ -778,7 +785,7 @@ async fn stream_chat_completion(
                     .await?;
                 }
             }
-            Err(err)
+            Err(StreamOutputFailure::Driver(err))
                 if wants_constrained_json
                     && json_constraint_stopped_incomplete_message(&err.message) =>
             {
@@ -789,7 +796,7 @@ async fn stream_chat_completion(
                 .await?;
                 send_stream_chunk(&tx, done_chunk(&id, created, &model, "stop")).await?;
             }
-            Err(err) => {
+            Err(StreamOutputFailure::Driver(err)) => {
                 let error = generation_failure(err);
                 tx.send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
@@ -802,6 +809,7 @@ async fn stream_chat_completion(
                 .await
                 .context("stream receiver closed")?;
             }
+            Err(StreamOutputFailure::Delivery(error)) => return Err(error),
         }
 
         tx.send(Ok(Event::default().data("[DONE]")))
@@ -811,6 +819,139 @@ async fn stream_chat_completion(
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_declared_tool_chat_completion(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    response: (&str, u64, &str),
+    tokenizer: &Tokenizer,
+    private_channels: bool,
+    requested_top_logprobs: Option<usize>,
+    user_stop_sequences: &[String],
+    wants_constrained_json: bool,
+    driver_rx: &mut mpsc::Receiver<DriverEvent>,
+) -> anyhow::Result<()> {
+    let (id, created, model) = response;
+    let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.to_vec());
+    let mut channel_gate = PrivateChannelGate::new(private_channels);
+    let mut buffered_text = String::new();
+    let result = loop {
+        match driver_rx.recv().await {
+            Some(DriverEvent::Token(token)) => {
+                let finish_reason = token.finish_reason.clone();
+                let spelled = channel_gate
+                    .armed()
+                    .then(|| tokenizer.decode_with_special_tokens(&[token.token_id]).ok())
+                    .flatten();
+                let revealed = channel_gate.push(spelled.as_deref(), &token.text);
+                if !revealed.reasoning.is_empty() {
+                    send_stream_chunk(tx, reasoning_chunk(id, created, model, revealed.reasoning))
+                        .await?;
+                }
+                buffered_text.push_str(&stop_buffer.push(&revealed.content));
+                if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
+                    stop_buffer.pending.clear();
+                }
+            }
+            Some(DriverEvent::WorkflowPublications(publications)) => {
+                if let Err(error) = send_workflow_publications(tx, &publications).await {
+                    break Err(StreamOutputFailure::Delivery(error));
+                }
+            }
+            Some(DriverEvent::Finished(result)) => break Ok(result),
+            Some(DriverEvent::Error(error)) => break Err(StreamOutputFailure::Driver(error)),
+            None => {
+                break Err(StreamOutputFailure::Driver(DriverFailure::internal(
+                    "generation stream ended before result",
+                )));
+            }
+        }
+    };
+
+    match result {
+        Ok(result) => {
+            let remaining = channel_gate.flush();
+            if !remaining.reasoning.is_empty() {
+                send_stream_chunk(tx, reasoning_chunk(id, created, model, remaining.reasoning))
+                    .await?;
+            }
+            buffered_text.push_str(&stop_buffer.push(&remaining.content));
+            if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+                let trailing = stop_buffer.flush();
+                buffered_text.push_str(&trailing);
+            }
+            if let Some(tool_calls) = committed_chat_tool_calls(&result) {
+                send_tool_call_deltas(tx, response, tool_calls).await?;
+            } else if let Some(requested_top_logprobs) = requested_top_logprobs {
+                send_chat_logprob_chunks(
+                    tx,
+                    response,
+                    &result,
+                    tokenizer,
+                    requested_top_logprobs,
+                    user_stop_sequences,
+                    private_channels,
+                )
+                .await?;
+                send_stream_chunk(
+                    tx,
+                    done_chunk(
+                        id,
+                        created,
+                        model,
+                        finish_reason_label(&result.finish_reason),
+                    ),
+                )
+                .await?;
+            } else {
+                if !buffered_text.is_empty() {
+                    send_stream_chunk(tx, content_chunk(id, created, model, buffered_text, None))
+                        .await?;
+                }
+                send_stream_chunk(
+                    tx,
+                    done_chunk(
+                        id,
+                        created,
+                        model,
+                        finish_reason_label(&result.finish_reason),
+                    ),
+                )
+                .await?;
+            }
+        }
+        Err(StreamOutputFailure::Driver(err))
+            if wants_constrained_json
+                && json_constraint_stopped_incomplete_message(&err.message) =>
+        {
+            send_stream_chunk(
+                tx,
+                content_chunk(id, created, model, "{}".to_string(), None),
+            )
+            .await?;
+            send_stream_chunk(tx, done_chunk(id, created, model, "stop")).await?;
+        }
+        Err(StreamOutputFailure::Driver(err)) => {
+            let error = generation_failure(err);
+            tx.send(Ok(Event::default().event("error").data(
+                serde_json::to_string(&ErrorResponse {
+                    error: ErrorBody {
+                        message: error.message,
+                        kind: error.kind,
+                    },
+                })?,
+            )))
+            .await
+            .context("stream receiver closed")?;
+        }
+        Err(StreamOutputFailure::Delivery(error)) => return Err(error),
+    }
+
+    tx.send(Ok(Event::default().data("[DONE]")))
+        .await
+        .context("stream receiver closed")?;
+    Ok(())
 }
 
 async fn await_driver_admission(
@@ -918,12 +1059,32 @@ mod stream_admission_tests {
 }
 
 pub(crate) async fn collect_generation_result(
-    mut rx: mpsc::Receiver<DriverEvent>,
+    rx: mpsc::Receiver<DriverEvent>,
 ) -> Result<GenerateResult, DriverFailure> {
+    collect_generation_with_publications(rx)
+        .await
+        .map(|collected| collected.result)
+}
+
+struct CollectedGeneration {
+    result: GenerateResult,
+    publications: Vec<serde_json::Value>,
+}
+
+async fn collect_generation_with_publications(
+    mut rx: mpsc::Receiver<DriverEvent>,
+) -> Result<CollectedGeneration, DriverFailure> {
+    let mut publications = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
             DriverEvent::Token(_) => {}
-            DriverEvent::Finished(result) => return Ok(result),
+            DriverEvent::WorkflowPublications(committed) => publications.extend(committed),
+            DriverEvent::Finished(result) => {
+                return Ok(CollectedGeneration {
+                    result,
+                    publications,
+                });
+            }
             DriverEvent::Error(error) => return Err(error),
         }
     }
@@ -1288,7 +1449,7 @@ fn lease_bound_session(
     sessions
         .acquire(binding, client_id)
         .map(Some)
-        .map_err(package_capability_failure)
+        .map_err(package_execution_failure)
 }
 
 /// Refuse a session id that names a conversation inside a *different* model.
@@ -1400,7 +1561,7 @@ async fn get_or_create_session(
         ensure_session_belongs_to_model(handle, &binding, client_id)?;
         return sessions
             .acquire(binding, client_id)
-            .map_err(package_capability_failure);
+            .map_err(package_execution_failure);
     }
 
     let opened = handle
@@ -1414,7 +1575,7 @@ async fn get_or_create_session(
     // from the moment it exists, whichever way the claim below resolves.
     let lease = sessions
         .acquire(binding.clone(), client_id)
-        .map_err(package_capability_failure)?;
+        .map_err(package_execution_failure)?;
     // Claim decides; a caller that lost the race, and a caller the registry
     // refused outright, both close the session they opened rather than leaving
     // it to accumulate a conversation nobody will read.
@@ -1424,7 +1585,7 @@ async fn get_or_create_session(
             ensure_session_belongs_to_model(handle, &existing, client_id)?;
             sessions
                 .acquire(existing, client_id)
-                .map_err(package_capability_failure)
+                .map_err(package_execution_failure)
         }
         Ok(crate::session::SessionClaim::Claimed { evicted }) => {
             close_evicted_session(&state.registry, evicted).await?;
@@ -1446,11 +1607,32 @@ pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateReques
     }
 }
 
+/// Build options for one already-resolved package protocol.
+///
+/// Callers that do not have package admission state must use
+/// [`build_generate_request`], which intentionally never guesses a protocol.
+pub fn build_generate_request_with_protocol(
+    request: &ChatCompletionRequest,
+    protocol: &ToolProtocol,
+) -> Result<GenerateRequest, tool_protocol::ToolProtocolError> {
+    let mut options =
+        build_generate_options(request, request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS));
+    apply_tool_output_constraint(&mut options, protocol, request)?;
+    let rendered = protocol.render(request)?;
+    Ok(GenerateRequest {
+        prompt: GeneratePrompt::Text(build_prompt_with_tool_prefix(
+            request,
+            &rendered.fallback_prefix,
+        )),
+        options,
+    })
+}
+
 pub(crate) fn prepare_completion(
     request: &CompletionRequest,
     handle: &ModelHandle,
 ) -> Result<PreparedCompletion, ApiError> {
-    let mut options = build_completion_options(request, &handle.tokenizer);
+    let mut options = build_completion_options(request);
     options.max_context = handle.model_max_context;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
@@ -1497,7 +1679,12 @@ async fn submit_completion(
     match generation {
         CompletionGeneration::Plain(request) => handle
             .engine
-            .generate(session, request, None)
+            .generate(
+                session,
+                request,
+                onnx_genai_engine::ToolCallPolicy::Disabled,
+                None,
+            )
             .await
             .map_err(map_generate_submit_error),
         CompletionGeneration::Fim {
@@ -1525,7 +1712,7 @@ fn tokenize_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<usize, ApiErro
         .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))
 }
 
-fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) -> GenerateOptions {
+fn build_completion_options(request: &CompletionRequest) -> GenerateOptions {
     let mut options = GenerateOptions {
         max_new_tokens: request.max_tokens,
         temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
@@ -1539,7 +1726,6 @@ fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) 
     if let Some(stop) = request.stop.clone() {
         options.stop_sequences = stop.into_sequences();
     }
-    add_tokenizer_stop_sequences(&mut options, tokenizer);
     options
 }
 
@@ -1609,10 +1795,16 @@ fn positional_image_placeholder(
 /// fail, so they are passed as one value instead of four positional arguments.
 struct PromptContext<'a> {
     chat_template: Option<&'a ChatTemplate>,
+    tool_protocol: Option<&'a ToolProtocol>,
     image_placeholder: Option<&'a str>,
     generation_defaults: Option<&'a GenerationDefaults>,
     /// Applied when the request omits `reasoning_effort`.
     default_reasoning_effort: Option<ReasoningEffort>,
+}
+
+enum StreamOutputFailure {
+    Driver(DriverFailure),
+    Delivery(anyhow::Error),
 }
 
 fn prepare_generate_request(
@@ -1638,6 +1830,10 @@ fn prepare_generate_request(
         context.generation_defaults,
         &chat_sampling_overrides(request),
     );
+    if let Some(protocol) = context.tool_protocol {
+        apply_tool_output_constraint(&mut options, protocol, request)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
@@ -1708,10 +1904,19 @@ fn build_generate_options(
     if let Some(constraint) = response_format_constraint(request) {
         options.constraint = Some(constraint);
     }
-    if let Some(constraint) = forced_tool_choice_constraint(request) {
-        options.constraint = Some(constraint);
-    }
     options
+}
+
+fn apply_tool_output_constraint(
+    options: &mut GenerateOptions,
+    protocol: &ToolProtocol,
+    request: &ChatCompletionRequest,
+) -> Result<(), tool_protocol::ToolProtocolError> {
+    match protocol.output_constraint(request)? {
+        ToolOutputConstraint::Unchanged => {}
+        ToolOutputConstraint::Set(constraint) => options.constraint = constraint,
+    }
+    Ok(())
 }
 
 /// The caller's *explicit* sampling selections for a chat completion, feeding
@@ -1786,107 +1991,16 @@ fn response_format_constraint(request: &ChatCompletionRequest) -> Option<Generat
     }
 }
 
-fn forced_tool_choice_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
-    let schemas = forced_tool_choice_schemas(request)?;
-    let schema = if schemas.len() == 1 {
-        schemas.into_iter().next()?
-    } else {
-        serde_json::json!({ "anyOf": schemas })
-    };
-    let schema = serde_json::to_string(&schema).ok()?;
-    Some(GenerateConstraint::Lark(format!(
-        "start: \"<tool_call>\\n\" tool \"\\n</tool_call>\"\ntool: %json {schema}\n"
-    )))
-}
-
-fn forced_tool_choice_schemas(request: &ChatCompletionRequest) -> Option<Vec<serde_json::Value>> {
-    let tools = request
-        .tools
-        .as_ref()?
-        .iter()
-        .filter(|tool| tool.kind == "function");
-    let selected = match request.tool_choice.as_ref()? {
-        ToolChoice::Mode(ToolChoiceMode::Required) => tools.collect::<Vec<_>>(),
-        ToolChoice::Specific(choice) if choice.kind == "function" => tools
-            .filter(|tool| tool.function.name == choice.function.name)
-            .collect::<Vec<_>>(),
-        ToolChoice::Mode(ToolChoiceMode::Auto | ToolChoiceMode::None) | ToolChoice::Specific(_) => {
-            Vec::new()
-        }
-    };
-
-    let schemas = selected
-        .into_iter()
-        .map(tool_call_schema_for_tool)
-        .collect::<Vec<_>>();
-    (!schemas.is_empty()).then_some(schemas)
-}
-
-fn tool_call_schema_for_tool(tool: &ChatTool) -> serde_json::Value {
-    let arguments_schema = tool
-        .function
-        .parameters
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": { "enum": [tool.function.name.clone()] },
-            "arguments": arguments_schema
-        },
-        "required": ["name", "arguments"],
-        "additionalProperties": false
-    })
-}
-
 fn build_generate_options_with_tokenizer(
     request: &ChatCompletionRequest,
-    tokenizer: &Tokenizer,
+    _tokenizer: &Tokenizer,
     output_budget: usize,
 ) -> GenerateOptions {
-    let mut options = build_generate_options(request, output_budget);
-    add_tokenizer_stop_sequences(&mut options, tokenizer);
-    options
-}
-
-fn add_tokenizer_stop_sequences(options: &mut GenerateOptions, tokenizer: &Tokenizer) {
-    let eos_token_ids = tokenizer.eos_token_ids();
-    if let Some(first) = eos_token_ids.first().copied() {
-        options.eos_token_id = Some(first);
-    }
-    for eos_token_id in eos_token_ids {
-        let eos_sequence = StopSequence::Tokens(vec![eos_token_id]);
-        if !options.stop_sequences.contains(&eos_sequence) {
-            options.stop_sequences.push(eos_sequence);
-        }
-    }
-    if let Some(im_end_id) = tokenizer.token_id("<|im_end|>") {
-        let im_end_sequence = StopSequence::Tokens(vec![im_end_id]);
-        if !options.stop_sequences.contains(&im_end_sequence) {
-            options.stop_sequences.push(im_end_sequence);
-        }
-    }
+    build_generate_options(request, output_budget)
 }
 
 fn json_constraint_stopped_incomplete_message(message: &str) -> bool {
     message.contains("JSON constrained decoding stopped before a complete JSON value")
-}
-
-fn tools_parseable_from_output(request: &ChatCompletionRequest) -> bool {
-    !matches!(
-        request.tool_choice,
-        Some(ToolChoice::Mode(ToolChoiceMode::None))
-    )
-}
-
-fn tools_offered_to_model(request: &ChatCompletionRequest) -> Option<&Vec<ChatTool>> {
-    if matches!(
-        request.tool_choice,
-        Some(ToolChoice::Mode(ToolChoiceMode::None))
-    ) {
-        return None;
-    }
-    request.tools.as_ref().filter(|tools| !tools.is_empty())
 }
 
 fn build_session_prompt(messages: &[ChatMessage], image_placeholder: Option<&str>) -> String {
@@ -1959,13 +2073,17 @@ fn render_prompt(
             .iter()
             .map(|message| template_message(message, context.image_placeholder))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let tools_json = tools_offered_to_model(request)
-            .map(serde_json::to_string)
-            .transpose()?;
+        let rendered_tools = context
+            .tool_protocol
+            .map(|protocol| protocol.render(request))
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         return chat_template
             .render_with_reasoning_effort(
                 &messages,
-                tools_json.as_deref(),
+                rendered_tools
+                    .as_ref()
+                    .and_then(|rendered| rendered.tools_json.as_deref()),
                 true,
                 request
                     .reasoning_effort
@@ -1974,24 +2092,25 @@ fn render_prompt(
             )
             .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
     }
-    Ok(build_prompt(request))
+    let prefix = context
+        .tool_protocol
+        .map(|protocol| protocol.render(request))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .map_or_else(String::new, |rendered| rendered.fallback_prefix);
+    Ok(build_prompt_with_tool_prefix(request, &prefix))
 }
 
 /// Build the Phase 2 chat prompt with a simple role-tagged template:
 /// `<|role|>\n{content}\n` for every message, followed by `<|assistant|>\n`.
 /// Model-specific templates will replace this once tokenizer chat templates are wired.
 pub fn build_prompt(request: &ChatCompletionRequest) -> String {
+    build_prompt_with_tool_prefix(request, "")
+}
+
+fn build_prompt_with_tool_prefix(request: &ChatCompletionRequest, tool_prefix: &str) -> String {
     let mut prompt = String::new();
-    if let Some(tools) = tools_offered_to_model(request) {
-        prompt.push_str("<|tools|>\n");
-        prompt.push_str(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
-        prompt.push('\n');
-    }
-    if let Some(tool_choice) = &request.tool_choice {
-        prompt.push_str("<|tool_choice|>\n");
-        prompt.push_str(&tool_choice_prompt(tool_choice));
-        prompt.push('\n');
-    }
+    prompt.push_str(tool_prefix);
     for message in &request.messages {
         prompt.push_str("<|");
         prompt.push_str(message.role.trim());
@@ -2017,251 +2136,21 @@ pub fn build_prompt(request: &ChatCompletionRequest) -> String {
     prompt
 }
 
-fn tool_choice_prompt(tool_choice: &ToolChoice) -> String {
-    match tool_choice {
-        ToolChoice::Mode(mode) => match mode {
-            ToolChoiceMode::Auto => "auto".to_string(),
-            ToolChoiceMode::None => "none".to_string(),
-            ToolChoiceMode::Required => "required".to_string(),
-        },
-        ToolChoice::Specific(choice) => format!("function: {}", choice.function.name),
-    }
-}
-
-pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
-    // Model families do not normally mix formats. When they do, use ATEM,
-    // Qwen, Llama, then Mistral order so generated call IDs remain deterministic.
-    let parsed_calls = extract_atem_tool_calls(output)
-        .into_iter()
-        .chain(extract_qwen_tool_calls(output))
-        .chain(extract_llama_tool_calls(output))
-        .chain(extract_mistral_tool_calls(output));
-    let mut calls = Vec::new();
-    for value in parsed_calls {
-        if let Some(call) = parsed_tool_call_to_openai(calls.len(), value) {
-            calls.push(call);
-        }
-    }
-    calls
-}
-
-fn extract_atem_tool_calls(output: &str) -> Vec<serde_json::Value> {
-    const INVOKE: &str = "<atem:invoke";
-    const INVOKE_CLOSE: &str = "</atem:invoke>";
-    const PARAMETER: &str = "<atem:parameter";
-    const PARAMETER_CLOSE: &str = "</atem:parameter>";
-
-    let mut calls = Vec::new();
-    let mut rest = output;
-    while let Some(start) = rest.find(INVOKE) {
-        rest = &rest[start + INVOKE.len()..];
-        let Some(tag_end) = rest.find('>') else {
-            break;
-        };
-        let Some(name) = tag_attribute(&rest[..tag_end], "name") else {
-            rest = &rest[tag_end + 1..];
-            continue;
-        };
-        rest = &rest[tag_end + 1..];
-        let Some(invoke_end) = rest.find(INVOKE_CLOSE) else {
-            break;
-        };
-        let body = &rest[..invoke_end];
-        let mut arguments = serde_json::Map::new();
-        let mut parameters = body;
-        while let Some(parameter_start) = parameters.find(PARAMETER) {
-            parameters = &parameters[parameter_start + PARAMETER.len()..];
-            let Some(parameter_tag_end) = parameters.find('>') else {
-                break;
-            };
-            let Some(key) = tag_attribute(&parameters[..parameter_tag_end], "name") else {
-                parameters = &parameters[parameter_tag_end + 1..];
-                continue;
-            };
-            parameters = &parameters[parameter_tag_end + 1..];
-            let Some(parameter_end) = parameters.find(PARAMETER_CLOSE) else {
-                break;
-            };
-            // A parameter that opens another parameter before it closes was
-            // opened twice: a value cannot contain a parameter, so the outer
-            // tag is a stray and the inner one is the real parameter. Taking
-            // the outer at its word would swallow the stray tag into the value
-            // and lose the argument the model meant to pass.
-            if let Some(nested) = parameters.find(PARAMETER)
-                && nested < parameter_end
-            {
-                parameters = &parameters[nested..];
-                continue;
-            }
-            let raw_value = &parameters[..parameter_end];
-            let value = serde_json::from_str(raw_value.trim())
-                .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
-            arguments.insert(key, value);
-            parameters = &parameters[parameter_end + PARAMETER_CLOSE.len()..];
-        }
-        calls.push(serde_json::json!({
-            "name": name,
-            "arguments": arguments,
-        }));
-        rest = &rest[invoke_end + INVOKE_CLOSE.len()..];
-    }
-    calls
-}
-
-fn tag_attribute(tag: &str, attribute: &str) -> Option<String> {
-    let marker = format!("{attribute}=\"");
-    let value = tag.split_once(&marker)?.1;
-    Some(value.split_once('"')?.0.to_string())
-}
-
-fn extract_qwen_tool_calls(output: &str) -> Vec<serde_json::Value> {
-    let mut values = Vec::new();
-    let mut rest = output;
-    while let Some(start) = rest.find("<tool_call>") {
-        rest = &rest[start + "<tool_call>".len()..];
-        let Some(end) = rest.find("</tool_call>") else {
-            break;
-        };
-        let body = rest[..end].trim();
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-            values.push(value);
-        }
-        rest = &rest[end + "</tool_call>".len()..];
-    }
-    values
-}
-
-fn extract_llama_tool_calls(output: &str) -> Vec<serde_json::Value> {
-    const MARKER: &str = "<|python_tag|>";
-    let mut values = Vec::new();
-    let mut rest = output;
-    while let Some(start) = rest.find(MARKER) {
-        rest = &rest[start + MARKER.len()..];
-        let mut json = rest;
-        loop {
-            json = json.trim_start();
-            if let Some(after_separator) = json.strip_prefix(';') {
-                json = after_separator;
-                continue;
-            }
-            if json.is_empty() || json.starts_with("<|") {
-                break;
-            }
-            let Some((value, consumed)) = parse_json_value_prefix(json) else {
-                break;
-            };
-            values.push(value);
-            json = &json[consumed..];
-        }
-    }
-    values
-}
-
-fn extract_mistral_tool_calls(output: &str) -> Vec<serde_json::Value> {
-    const MARKER: &str = "[TOOL_CALLS]";
-    let mut values = Vec::new();
-    let mut rest = output;
-    while let Some(start) = rest.find(MARKER) {
-        rest = &rest[start + MARKER.len()..];
-        if let Some((serde_json::Value::Array(calls), _)) =
-            parse_json_value_prefix(rest.trim_start())
-        {
-            values.extend(calls);
-        }
-    }
-    values
-}
-
-fn parse_json_value_prefix(input: &str) -> Option<(serde_json::Value, usize)> {
-    let mut stream = serde_json::Deserializer::from_str(input).into_iter::<serde_json::Value>();
-    let value = stream.next()?.ok()?;
-    Some((value, stream.byte_offset()))
-}
-
-#[derive(Debug, Clone)]
-pub struct ParsedAssistantOutput {
-    pub content: Option<String>,
-    pub tool_calls: Option<Vec<ChatMessageToolCall>>,
-    pub finish_reason: &'static str,
-}
-
-impl ParsedAssistantOutput {
-    /// Point every parsed call at a tool the caller actually offered.
-    fn aligned_to(mut self, request: &ChatCompletionRequest) -> Self {
-        if let Some(calls) = self.tool_calls.as_deref_mut() {
-            align_tool_calls(calls, request);
-        }
-        self
-    }
-}
-
-/// Resolve an over-qualified call back to the tool the caller offered.
-///
-/// A model offered a bare name sometimes answers with a dotted one, and it is
-/// led there from both directions. This package's own tool instructions carry a
-/// namespaced example (`example_tool_name.example_function_name`), which invites
-/// a leading namespace — `functions.read`. The same instructions derive the
-/// valid recipients by splitting each offered name on `.`, so a set of bare
-/// names is advertised back as `read.*`, `bash.*`, which invites a *trailing*
-/// segment instead: a model told to address `read.*` obliges by borrowing the
-/// first thing to hand, usually a parameter name — `read.filePath`.
-///
-/// Either way the extra segment is the model's spelling, not the caller's, and
-/// a client can only dispatch a name it offered — it rejects anything else as an
-/// unavailable tool. So a dotted name that is not itself on offer is resolved to
-/// an offered tool when exactly one of its segments names one.
-///
-/// Requiring exactly one *distinct* target keeps the resolution from being a
-/// guess without punishing a model that merely repeats itself: `glob.glob`
-/// names one tool twice and resolves, while a call whose segments name two
-/// different offered tools has no single intended target and is left alone. Anything else is likewise left untouched for the caller to
-/// reject, because inventing a target it never offered would be worse than the
-/// error it already knows how to report.
-fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionRequest) {
-    let Some(offered) = tools_offered_to_model(request) else {
-        return;
-    };
-    let names_a_tool =
-        |name: &str| -> bool { offered.iter().any(|tool| tool.function.name == name) };
-    for call in calls {
-        if names_a_tool(&call.function.name) {
-            continue;
-        }
-        let targets: std::collections::BTreeSet<&str> = call
-            .function
-            .name
-            .split('.')
-            .filter(|segment| names_a_tool(segment))
-            .collect();
-        let [target] = targets.into_iter().collect::<Vec<_>>()[..] else {
-            continue;
-        };
-        let target = target.to_string();
-        call.function.name = target;
-    }
-}
-
-pub fn parse_assistant_output(
-    output: String,
-    default_finish_reason: &'static str,
-) -> ParsedAssistantOutput {
-    // OpenAI tool calls end the assistant turn. The batch row finishes normally
-    // with finish_reason=tool_calls; role=tool follow-up messages are submitted
-    // as a new turn rather than pausing and resuming mid-token.
-    let tool_calls = parse_tool_calls(&output);
-    if tool_calls.is_empty() {
-        ParsedAssistantOutput {
-            content: Some(atem_visible_content(&output).unwrap_or(output)),
-            tool_calls: None,
-            finish_reason: default_finish_reason,
-        }
-    } else {
-        ParsedAssistantOutput {
-            content: None,
-            tool_calls: Some(tool_calls),
-            finish_reason: "tool_calls",
-        }
-    }
+fn committed_chat_tool_calls(result: &GenerateResult) -> Option<Vec<ChatMessageToolCall>> {
+    (!result.tool_calls.is_empty()).then(|| {
+        result
+            .tool_calls
+            .iter()
+            .map(|call| ChatMessageToolCall {
+                id: call.id.clone(),
+                kind: "function".to_string(),
+                function: crate::types::ChatMessageToolCallFunction {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+            })
+            .collect()
+    })
 }
 
 /// Opens an ATEM channel, ending the address that names its recipient.
@@ -2476,26 +2365,6 @@ fn assistant_output_text(result: &GenerateResult, tokenizer: &Tokenizer) -> Stri
     } else {
         result.text.clone()
     }
-}
-
-fn parsed_tool_call_to_openai(
-    index: usize,
-    value: serde_json::Value,
-) -> Option<ChatMessageToolCall> {
-    let name = value.get("name")?.as_str()?.to_string();
-    let arguments = value
-        .get("arguments")
-        .or_else(|| value.get("parameters"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    Some(ChatMessageToolCall {
-        id: format!("call_{index}"),
-        kind: "function".to_string(),
-        function: ChatMessageToolCallFunction {
-            name,
-            arguments: serde_json::to_string(&arguments).ok()?,
-        },
-    })
 }
 
 fn chat_logprobs(
@@ -2730,6 +2599,17 @@ fn finish_reason_label(reason: &FinishReason) -> &'static str {
     match reason {
         FinishReason::MaxTokens | FinishReason::Length => "length",
         FinishReason::EosToken | FinishReason::StopSequence { .. } => "stop",
+        FinishReason::ToolCalls => "tool_calls",
+    }
+}
+
+#[cfg(test)]
+mod finish_reason_tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_stop_maps_only_to_the_openai_tool_calls_label() {
+        assert_eq!(finish_reason_label(&FinishReason::ToolCalls), "tool_calls");
     }
 }
 
@@ -2811,10 +2691,54 @@ mod prompt_rendering_tests {
     ) -> PromptContext<'a> {
         PromptContext {
             chat_template: Some(template),
+            tool_protocol: None,
             image_placeholder: None,
             generation_defaults: None,
             default_reasoning_effort,
         }
+    }
+
+    #[test]
+    fn production_generate_preparation_uses_the_declared_atem_adapter() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "use weather"}],
+            "tools": [{"type": "function", "function": {
+                "name": "weather", "parameters": {"type": "object"}
+            }}],
+            "tool_choice": "required",
+            "response_format": {"type": "json_object"}
+        }))
+        .expect("request");
+        let protocol =
+            ToolProtocol::from_declaration(&onnx_genai_metadata::ToolProtocolDeclaration {
+                identity: "atem-xml".to_string(),
+                version: "v1".to_string(),
+            })
+            .expect("declared ATEM adapter");
+        let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json");
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("fixture tokenizer");
+        let prepared = prepare_generate_request(
+            &request,
+            &tokenizer,
+            false,
+            &PromptContext {
+                chat_template: None,
+                tool_protocol: Some(&protocol),
+                image_placeholder: None,
+                generation_defaults: None,
+                default_reasoning_effort: None,
+            },
+            DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+        .expect("production preparation");
+
+        assert_eq!(prepared.request.options.constraint, None);
+        assert_eq!(
+            tool_protocol::request_policy(&request),
+            onnx_genai_engine::ToolCallPolicy::Required
+        );
     }
 
     #[test]
@@ -3183,175 +3107,6 @@ mod output_budget_tests {
 }
 
 #[cfg(test)]
-mod atem_tool_call_parsing_tests {
-    use super::*;
-
-    fn arguments(output: &str) -> serde_json::Value {
-        let calls = parse_tool_calls(output);
-        assert_eq!(calls.len(), 1, "expected one call from {output:?}");
-        serde_json::from_str(&calls[0].function.arguments).expect("arguments")
-    }
-
-    // Observed from OpenCode: the model opened the same parameter twice, and
-    // taking the outer tag at its word swallowed the stray tag into the value,
-    // so the call reached the client with the argument it needed missing.
-    #[test]
-    fn a_parameter_opened_twice_keeps_the_inner_one() {
-        assert_eq!(
-            arguments(concat!(
-                "<atem:invoke name=\"bash\">\n",
-                "<atem:parameter name=\"command\">\n",
-                "<atem:parameter name=\"command\">ls -la</atem:parameter>\n",
-                "</atem:invoke>",
-            )),
-            serde_json::json!({"command": "ls -la"})
-        );
-    }
-
-    // The repair is confined to the parameter that was opened twice; the ones
-    // around it are read exactly as they were written.
-    #[test]
-    fn a_stray_open_tag_does_not_disturb_its_neighbours() {
-        assert_eq!(
-            arguments(concat!(
-                "<atem:invoke name=\"edit\">\n",
-                "<atem:parameter name=\"path\">a.py</atem:parameter>\n",
-                "<atem:parameter name=\"text\">",
-                "<atem:parameter name=\"text\">hi</atem:parameter>\n",
-                "<atem:parameter name=\"count\">2</atem:parameter>\n",
-                "</atem:invoke>",
-            )),
-            serde_json::json!({"path": "a.py", "text": "hi", "count": 2})
-        );
-    }
-
-    // A well-formed call is unaffected, including a value that legitimately
-    // carries angle brackets.
-    #[test]
-    fn a_well_formed_call_is_read_as_written() {
-        assert_eq!(
-            arguments(concat!(
-                "<atem:invoke name=\"bash\">\n",
-                "<atem:parameter name=\"command\">echo \"<b>hi</b>\"</atem:parameter>\n",
-                "</atem:invoke>",
-            )),
-            serde_json::json!({"command": "echo \"<b>hi</b>\""})
-        );
-    }
-}
-
-#[cfg(test)]
-mod tool_name_alignment_tests {
-    use super::*;
-    use serde_json::json;
-
-    fn request_offering(names: &[&str]) -> ChatCompletionRequest {
-        let tools: Vec<_> = names
-            .iter()
-            .map(|name| json!({"type": "function", "function": {"name": name}}))
-            .collect();
-        serde_json::from_value(json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": tools
-        }))
-        .expect("request")
-    }
-
-    fn call(name: &str) -> ChatMessageToolCall {
-        serde_json::from_value(json!({
-            "id": "call_0",
-            "type": "function",
-            "function": {"name": name, "arguments": "{}"}
-        }))
-        .expect("call")
-    }
-
-    fn aligned(name: &str, offered: &[&str]) -> String {
-        let mut calls = vec![call(name)];
-        align_tool_calls(&mut calls, &request_offering(offered));
-        calls.remove(0).function.name
-    }
-
-    // The package's tool instructions show a namespaced example, so the model
-    // sometimes qualifies a bare name. The client only knows the name it
-    // offered, and rejects anything else as an unavailable tool.
-    #[test]
-    fn a_namespaced_call_resolves_to_the_offered_tool() {
-        assert_eq!(aligned("glob.glob", &["glob", "read"]), "glob");
-        assert_eq!(aligned("functions.read", &["glob", "read"]), "read");
-    }
-
-    // The instructions advertise a bare tool set back as `read.*`, `bash.*`, so
-    // a model told to address `read.*` supplies a second segment from whatever
-    // is to hand -- usually a parameter name. The tool it means is unambiguous.
-    #[test]
-    fn a_call_qualified_with_a_parameter_name_resolves_to_the_offered_tool() {
-        assert_eq!(aligned("read.filePath", &["read", "bash"]), "read");
-        assert_eq!(aligned("bash.command", &["read", "bash"]), "bash");
-        assert_eq!(aligned("write.filePath.content", &["write"]), "write");
-    }
-
-    // Two segments naming two different offered tools have no single intended
-    // target, so the call is left for the caller to reject rather than resolved
-    // to whichever segment happens to be looked at first.
-    #[test]
-    fn a_call_naming_two_offered_tools_is_not_resolved() {
-        assert_eq!(aligned("read.write", &["read", "write"]), "read.write");
-    }
-
-    // A name the caller offered is never rewritten, even when it contains a dot.
-    #[test]
-    fn an_offered_name_is_left_alone() {
-        assert_eq!(aligned("glob", &["glob"]), "glob");
-        assert_eq!(aligned("fs.read", &["fs.read", "read"]), "fs.read");
-    }
-
-    // A suffix that names nothing on offer stays as the model spelled it, so
-    // the caller reports the unavailable tool it already knows how to report
-    // rather than dispatching one it never offered.
-    #[test]
-    fn an_unknown_call_is_left_for_the_caller_to_reject() {
-        assert_eq!(aligned("shell.exec", &["glob", "read"]), "shell.exec");
-        assert_eq!(aligned("wander", &["glob", "read"]), "wander");
-    }
-
-    // Suffix resolution is safe only because it matches a call's final segment
-    // against an offered tool's *whole* name, so the resolved target is always a
-    // single offered name and never a choice between two. When two offered tools
-    // merely share a final segment (`fs.read`, `net.read`) and the model writes a
-    // third namespace (`svc.read`), the bare segment `read` is offered by
-    // neither, so the call is left alone for the caller to reject rather than
-    // being resolved arbitrarily to one of them.
-    #[test]
-    fn a_shared_final_segment_is_not_resolved_arbitrarily() {
-        assert_eq!(aligned("svc.read", &["fs.read", "net.read"]), "svc.read");
-        // An exact offer still wins and is never rewritten to the other.
-        assert_eq!(aligned("net.read", &["fs.read", "net.read"]), "net.read");
-    }
-
-    // The whole path a real turn travels: an ATEM tool call the model spelled
-    // with a namespace it was never offered is parsed and then resolved to the
-    // offered tool, so the client dispatches it instead of rejecting `glob.glob`.
-    #[test]
-    fn a_namespaced_atem_call_dispatches_through_the_full_parse_path() {
-        let output = "to=functions.glob<|message|>\
-             <atem:invoke name=\"glob.glob\">\
-             <atem:parameter name=\"pattern\">*.rs</atem:parameter>\
-             </atem:invoke>"
-            .to_string();
-        let parsed =
-            parse_assistant_output(output, "stop").aligned_to(&request_offering(&["glob", "read"]));
-        let calls = parsed.tool_calls.expect("an ATEM invoke is a tool call");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].function.name, "glob",
-            "the namespaced call is dispatched to the offered flat tool"
-        );
-    }
-}
-
-#[cfg(test)]
 mod channel_gate_tests {
     use super::*;
 
@@ -3563,7 +3318,7 @@ mod channel_gate_tests {
 }
 
 // The buffered (non-streamed) path does not go through the gate: it composes
-// `atem_reasoning_content` for the reasoning and `parse_assistant_output` for
+// `atem_reasoning_content` for the reasoning and `atem_visible_content` for
 // the answer, exactly as `run_chat_completion` does. These assert that a
 // buffered turn reports its thinking on `reasoning_content` while keeping it out
 // of `content`, so the two paths agree instead of the buffered one silently
@@ -3580,10 +3335,7 @@ mod buffered_reasoning_tests {
             " to=self<|message|>weigh it<|eom|><|start|>assistant to=user<|message|>Hi<|eot|>"
                 .to_string();
         assert_eq!(atem_reasoning_content(&output).as_deref(), Some("weigh it"));
-        assert_eq!(
-            parse_assistant_output(output, "stop").content.as_deref(),
-            Some("Hi")
-        );
+        assert_eq!(atem_visible_content(&output).as_deref(), Some("Hi"));
     }
 
     // A buffered turn that never reaches the user still reports what it thought,
@@ -3595,9 +3347,6 @@ mod buffered_reasoning_tests {
             atem_reasoning_content(&output).as_deref(),
             Some("still going")
         );
-        assert_eq!(
-            parse_assistant_output(output, "stop").content.as_deref(),
-            Some("")
-        );
+        assert_eq!(atem_visible_content(&output).as_deref(), Some(""));
     }
 }

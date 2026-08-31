@@ -66,12 +66,6 @@ pub(super) fn show(model: &Path) -> anyhow::Result<()> {
 
 fn show_metadata(metadata_path: &Path) -> anyhow::Result<()> {
     let metadata = load_metadata(metadata_path)?;
-    if !metadata.required_capabilities.is_empty() {
-        println!(
-            "capabilities:    {}",
-            metadata.required_capabilities.join(", ")
-        );
-    }
     if let Some(model_caps) = &metadata.model {
         if let Some(max_len) = model_caps.max_sequence_length {
             println!("max sequence:    {max_len}");

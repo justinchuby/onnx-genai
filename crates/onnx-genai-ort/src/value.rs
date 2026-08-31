@@ -854,6 +854,21 @@ impl Value {
         tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
     }
 
+    /// Copy a Bool tensor out as canonical Rust booleans.
+    pub fn to_vec_bool(&self) -> Result<Vec<bool>> {
+        self.ensure_host_accessible("to_vec_bool")?;
+        if self.dtype != DataType::Bool {
+            return Err(OrtError::InvalidArgument(format!(
+                "requested Bool data from {:?} tensor",
+                self.dtype
+            )));
+        }
+        Ok(tensor_data_to_vec::<u8>(self.ptr.as_ptr(), self.numel())?
+            .into_iter()
+            .map(|value| value != 0)
+            .collect())
+    }
+
     pub(crate) fn as_ptr(&self) -> *const onnx_genai_ort_sys::OrtValue {
         self.ptr.as_ptr()
     }
@@ -2172,6 +2187,12 @@ mod clone_owned_tests {
     fn clone_owned_round_trips_bool() {
         // 1 byte per Bool element; ORT stores false/true as 0/1.
         assert_clone_owned_round_trips(vec![1, 0, 1, 1], &[4], DataType::Bool);
+        let value =
+            Value::from_raw_bytes(vec![1, 0, 1, 1], &[4], DataType::Bool).expect("bool value");
+        assert_eq!(
+            value.to_vec_bool().expect("bool readback"),
+            [true, false, true, true]
+        );
     }
 
     #[test]

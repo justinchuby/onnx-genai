@@ -2,7 +2,7 @@
 //! selected for bare decoder metadata. Workflow KV services cover composite
 //! shared/paged serving; the native path has a unit test in `engine::runtime`.
 
-use onnx_genai_engine::{Engine, EngineConfig};
+use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
 use onnx_genai_ort::SessionOptions;
 use std::path::{Path, PathBuf};
 
@@ -44,6 +44,60 @@ fn past_present_capability_matches_single_sequence_decode() -> anyhow::Result<()
     assert!(
         engine.continuous_batch_manager(2).is_err(),
         "non-batching engine must refuse a width-2 continuous batch manager"
+    );
+    Ok(())
+}
+
+/// A missing shared-KV backend is an optimization refusal, not a package-load
+/// or request-execution failure.  The non-shared past/present fixture gives the
+/// public batch API a real unsupported backend while preserving the ordinary
+/// isolated decoder path as an oracle.
+#[test]
+fn unsupported_shared_forward_falls_back_to_isolated_requests() -> anyhow::Result<()> {
+    let fixture = fixture("tiny-llm")?;
+    let requests = vec![
+        GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![1]),
+            options: GenerateOptions {
+                greedy: true,
+                stop_on_eos: false,
+                max_new_tokens: 2,
+                ..GenerateOptions::default()
+            },
+        },
+        GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![1, 2, 3]),
+            options: GenerateOptions {
+                greedy: true,
+                stop_on_eos: false,
+                max_new_tokens: 5,
+                ..GenerateOptions::default()
+            },
+        },
+    ];
+
+    let mut isolated = cpu_engine(&fixture)?;
+    let expected = requests
+        .iter()
+        .cloned()
+        .map(|request| isolated.generate(request))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let mut batched = cpu_engine(&fixture)?;
+    let actual = batched.generate_batched_static(requests.clone())?;
+
+    assert_eq!(actual, expected);
+    assert!(
+        !batched.batching_capability().supports_batching(),
+        "this fixture must exercise the isolated fallback"
+    );
+
+    let mut scheduled = cpu_engine(&fixture)?;
+    assert_eq!(
+        scheduled.run_continuous_batch_scheduled(requests, 2)?,
+        expected,
+        "scheduler admission must also decline unsupported shared forwarding before \
+         request-visible work and preserve isolated results"
     );
     Ok(())
 }

@@ -6,7 +6,6 @@ use anyhow::Context;
 use onnx_genai_engine::PipelineGenerateRequest;
 use onnx_genai_metadata::{RuntimeInputRole, SemanticInputRole, TensorDimension};
 use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Tokenizer, Value};
-use onnx_genai_preprocess::audio::WHISPER_N_FRAMES;
 
 pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_samples, preprocess_wav};
 pub use crate::image_input::MAX_EXPANDED_PROMPT_TOKENS;
@@ -301,8 +300,7 @@ pub fn audio_decoder_prompt(
     let mut tokens = vec![
         tokenizer
             .token_id("<|startoftranscript|>")
-            .or_else(|| tokenizer.eos_token_id())
-            .unwrap_or(0),
+            .context("tokenizer is missing required '<|startoftranscript|>' token")?,
     ];
     if let Some(language) = language.filter(|value| !value.is_empty()) {
         let token = format!("<|{}|>", language.to_ascii_lowercase());
@@ -329,9 +327,6 @@ pub fn build(directory: &PipelineModelDirectory) -> anyhow::Result<MultimodalSpe
 }
 
 /// The token a package declares as its expandable image placeholder.
-///
-/// This is an ordinary tokenizer fact, keyed by semantic role like `bos` and
-/// `eos`, so a package states it once and every front end reads the same value.
 fn image_placeholder_token_id(
     metadata: Option<&onnx_genai_metadata::InferenceMetadata>,
 ) -> Option<u32> {
@@ -341,12 +336,9 @@ fn image_placeholder_token_id(
         .tokenizer
         .as_ref()?
         .special_tokens
-        .get(IMAGE_PLACEHOLDER_ROLE)
-        .map(|token| token.id)
+        .as_ref()?
+        .image_token_id
 }
-
-/// Semantic role naming the prompt token that stands for one whole image.
-pub const IMAGE_PLACEHOLDER_ROLE: &str = "image_placeholder";
 
 /// Replace each declared image placeholder with that image's token run.
 ///
@@ -362,13 +354,13 @@ fn expand_image_placeholders(
     prompt_token_ids: &mut Vec<u32>,
 ) -> anyhow::Result<()> {
     let placeholder = spec.placeholder_token_id.with_context(|| {
-        format!(
-            "What: this package accepts an image but cannot place it in the prompt. \
-             Why: it declares no `{IMAGE_PLACEHOLDER_ROLE}` special token, so there is no \
-             token for the image's features to replace, and the encoded image would be \
-             preprocessed and then ignored. \
-             How: declare package.tokenizer.special_tokens.{IMAGE_PLACEHOLDER_ROLE}."
-        )
+        "What: this package accepts an image but cannot place it in the prompt. \
+         Why: it declares no numeric image placeholder token, so there is no \
+         token for the image's features to replace, and the encoded image would be \
+         preprocessed and then ignored. \
+         How: declare `package.tokenizer.special_tokens.image_token_id`; keep its text \
+         spelling only in tokenizer assets."
+            .to_string()
     })?;
     let program = spec
         .program
@@ -395,12 +387,10 @@ fn expand_image_placeholders(
         .as_ref()
         .context("preprocessing.image pixels output must declare a TensorContract")?
         .shape
-        .as_ref()
-        .context("preprocessing.image pixels output must declare a shape")?
         .iter()
         .map(|dim| match dim {
             TensorDimension::Fixed(value) => *value,
-            TensorDimension::Symbol(_) => -1,
+            TensorDimension::Symbol(_) | TensorDimension::Any => -1,
         })
         .collect::<Vec<_>>();
     let bundle =
@@ -453,7 +443,7 @@ fn derive_specs(
         .collect::<Vec<_>>();
     let encoded_media = media_inputs
         .iter()
-        .find(|(_, input)| input.contract.dtype == "uint8" && input.contract.rank == 1);
+        .find(|(_, input)| input.contract.dtype == "uint8" && input.contract.rank() == 1);
     let vision = if let Some(program) = preprocessing.and_then(|p| p.image.as_ref()) {
         let (name, _input) = encoded_media
             .context("preprocessing.image requires a uint8 rank-1 media workflow input")?;
@@ -491,26 +481,26 @@ fn derive_specs(
                     features.name
                 )
             })?;
-            if contract.rank != 3 {
+            if contract.rank() != 3 {
                 anyhow::bail!(
                     "preprocessing.audio output '{}' must be rank 3 [batch, mel, frames]",
                     features.name
                 );
             }
             let dimension = |index: usize| {
-                contract
-                    .shape
-                    .as_ref()
-                    .and_then(|shape| shape.get(index))
-                    .and_then(|value| match value {
-                        TensorDimension::Fixed(size) => usize::try_from(*size).ok(),
-                        TensorDimension::Symbol(_) => None,
-                    })
+                contract.shape.get(index).and_then(|value| match value {
+                    TensorDimension::Fixed(size) => usize::try_from(*size).ok(),
+                    TensorDimension::Symbol(_) | TensorDimension::Any => None,
+                })
             };
             let n_mels = dimension(1).context(
                 "preprocessing.audio must declare a concrete mel-bin count in its feature contract",
             )?;
-            let n_frames = dimension(2).unwrap_or(WHISPER_N_FRAMES);
+            let n_frames = dimension(2).context(
+                "preprocessing.audio must declare a concrete frame count in output \
+                 `audio_features` shape [batch, mel, frames]; symbolic or Any frames cannot \
+                 size the feature tensor",
+            )?;
             Some(AudioInputSpec::from_encoded_input(
                 (*name).clone(),
                 n_mels,
@@ -520,30 +510,17 @@ fn derive_specs(
         }
         _ => media_inputs
             .iter()
-            .find(|(_, input)| input.contract.dtype == "float32" && input.contract.rank == 3)
+            .find(|(_, input)| input.contract.dtype == "float32" && input.contract.rank() == 3)
             .map(|(name, input)| {
                 let shape = input
                     .contract
                     .shape
-                    .as_ref()
-                    .map(|dims| {
-                        dims.iter()
-                            .map(|dim| match dim {
-                                // A symbolic dimension is unknown at load time; -1 is
-                                // how `from_input` already spells "dynamic", and it
-                                // rejects a symbolic mel axis rather than assuming one.
-                                TensorDimension::Fixed(value) => *value,
-                                TensorDimension::Symbol(_) => -1,
-                            })
-                            .collect::<Vec<_>>()
+                    .iter()
+                    .map(|dim| match dim {
+                        TensorDimension::Fixed(value) => *value,
+                        TensorDimension::Symbol(_) | TensorDimension::Any => -1,
                     })
-                    .with_context(|| {
-                        format!(
-                            "audio media input '{name}' must declare `contract.shape` \
-                             [batch, mel, frames]; rank alone cannot state the mel-bin count \
-                             the feature extractor must produce"
-                        )
-                    })?;
+                    .collect::<Vec<_>>();
                 AudioInputSpec::from_input((*name).clone(), &shape, None)
             })
             .transpose()?,
@@ -554,14 +531,14 @@ fn derive_specs(
 
 #[cfg(test)]
 mod media_binding_tests {
-    use onnx_genai_metadata::{PreprocessingSpec, WorkflowSpec};
+    use onnx_genai_metadata::{InferenceMetadata, PreprocessingSpec, WorkflowSpec};
 
-    use super::derive_specs;
+    use super::{derive_specs, image_placeholder_token_id};
 
     /// A workflow declaring exactly the given `media` runtime inputs.
     fn workflow(inputs: serde_json::Value) -> WorkflowSpec {
         serde_json::from_value(serde_json::json!({
-            "manifest": { "capabilities": ["workflow_ssa"] },
+            "manifest": {},
             "inputs": inputs,
             "outputs": {},
             "components": {},
@@ -579,6 +556,23 @@ mod media_binding_tests {
     }
 
     #[test]
+    fn image_placeholder_comes_from_package_tokenizer_facts() {
+        let metadata: InferenceMetadata = serde_json::from_value(serde_json::json!({
+            "schema_version": "v1.2",
+            "package": {
+                "tokenizer": {
+                    "special_tokens": {
+                        "image_token_id": 151655,
+                    },
+                },
+            },
+        }))
+        .expect("metadata");
+
+        assert_eq!(image_placeholder_token_id(Some(&metadata)), Some(151655));
+    }
+
+    #[test]
     fn a_rank_3_float_media_input_binds_the_audio_front_end() {
         // Whisper-shaped packages take an already-featurized log-mel tensor. The
         // server owns mel extraction, so the contract's own shape is what states
@@ -586,7 +580,6 @@ mod media_binding_tests {
         let workflow = workflow(serde_json::json!({
             "audio_features": media(serde_json::json!({
                 "dtype": "float32",
-                "rank": 3,
                 "shape": [1, 80, 3000],
             })),
         }));
@@ -599,20 +592,55 @@ mod media_binding_tests {
     }
 
     #[test]
-    fn an_audio_contract_without_a_shape_is_refused_by_name() {
-        // Rank alone cannot state the mel-bin count, and guessing 80 would make
-        // a 128-mel model produce silent garbage. Fail with the key to declare.
+    fn capability_free_media_workflow_parses_with_crlf() {
+        let authored = workflow(serde_json::json!({
+            "audio_features": media(serde_json::json!({
+                "dtype": "float32",
+                "shape": [1, 80, 3000],
+            })),
+        }));
+        let yaml = serde_yaml::to_string(&authored)
+            .expect("a structurally declared media workflow serializes");
+        assert!(
+            !yaml.contains("capabilities"),
+            "media eligibility is structural, not a manifest capability list"
+        );
+        let crlf = yaml.replace('\n', "\r\n");
+        let reparsed: WorkflowSpec =
+            serde_yaml::from_str(&crlf).expect("CRLF capability-free workflow parses");
+        assert!(
+            derive_specs(&reparsed, None, None)
+                .expect("media contract is sufficient")
+                .audio
+                .is_some(),
+            "the runtime media input and tensor contract, not a list flag, select audio"
+        );
+    }
+
+    #[test]
+    fn an_audio_contract_with_unconstrained_shape_is_refused_by_name() {
+        // Unconstrained extents cannot state the mel-bin count, and guessing 80
+        // would make a 128-mel model produce silent garbage.
         let workflow = workflow(serde_json::json!({
-            "audio_features": media(serde_json::json!({ "dtype": "float32", "rank": 3 })),
+            "audio_features": media(serde_json::json!({
+                "dtype": "float32",
+                "shape": ["Any", "Any", "Any"],
+            })),
         }));
         let error = derive_specs(&workflow, None, None).expect_err("must refuse");
-        assert!(format!("{error:#}").contains("contract.shape"), "{error:#}");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("audio_features")
+                && message.contains("80 or 128 mel bins")
+                && message.contains("-1"),
+            "{message}"
+        );
     }
 
     #[test]
     fn an_image_package_binds_vision_and_leaves_audio_unbound() {
         let workflow = workflow(serde_json::json!({
-            "image_bytes": media(serde_json::json!({ "dtype": "uint8", "rank": 1 })),
+            "image_bytes": media(serde_json::json!({ "dtype": "uint8", "shape": ["Any"] })),
         }));
         let preprocessing: PreprocessingSpec = serde_json::from_value(serde_json::json!({
             "image": {
@@ -668,7 +696,7 @@ mod media_binding_tests {
                     "name": "image.pixel_values",
                     "content": "pixels",
                     "dtype": "float32",
-                    "contract": { "dtype": "float32", "rank": 2, "shape": ["num_patches", 1536] },
+                    "contract": { "dtype": "float32", "shape": ["num_patches", 1536] },
                 }],
             },
         }))
@@ -677,7 +705,7 @@ mod media_binding_tests {
 
     fn image_workflow() -> WorkflowSpec {
         workflow(serde_json::json!({
-            "image_bytes": media(serde_json::json!({ "dtype": "uint8", "rank": 1 })),
+            "image_bytes": media(serde_json::json!({ "dtype": "uint8", "shape": ["Any"] })),
         }))
     }
 
@@ -770,7 +798,7 @@ mod media_binding_tests {
             super::MultimodalInput::from_images(&vision, &[encoded_png()], &mut prompt, 4096)
                 .expect_err("must refuse");
         assert!(
-            format!("{error:#}").contains("image_placeholder"),
+            format!("{error:#}").contains("tokens.image_token_id"),
             "{error:#}"
         );
     }

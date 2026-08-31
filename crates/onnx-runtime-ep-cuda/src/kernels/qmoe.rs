@@ -17,6 +17,9 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
     EpError, ExecutorInstanceId, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
+use onnx_runtime_ep_cpu::kernels::moe::{
+    Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
+};
 use onnx_runtime_ir::{DataType, Node, NodeId};
 
 use crate::error::driver_err;
@@ -1042,46 +1045,6 @@ fn linear_module_source(layout: QuantLayout) -> (&'static str, &'static str) {
     (module, source)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Activation {
-    Relu,
-    Gelu,
-    Silu,
-    Swiglu,
-    Identity,
-}
-
-impl Activation {
-    fn parse(node: &Node) -> Result<Self> {
-        let name = match node.attr("activation_type") {
-            Some(value) => value
-                .as_str()
-                .ok_or_else(|| error("attribute activation_type must be a string"))?,
-            None => "relu",
-        };
-        match name {
-            "relu" => Ok(Self::Relu),
-            "gelu" => Ok(Self::Gelu),
-            "silu" => Ok(Self::Silu),
-            "swiglu" => Ok(Self::Swiglu),
-            "identity" => Ok(Self::Identity),
-            other => Err(error(format!(
-                "unsupported activation_type '{other}' (supported: relu, gelu, silu, swiglu, identity)"
-            ))),
-        }
-    }
-
-    fn kernel_id(self) -> i32 {
-        match self {
-            Self::Relu => 0,
-            Self::Gelu => 1,
-            Self::Silu => 2,
-            Self::Swiglu => 3,
-            Self::Identity => 4,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct MoeAttributes {
     k: usize,
@@ -1100,7 +1063,12 @@ impl MoeAttributes {
         if k <= 0 {
             return Err(error(format!("k must be > 0, got {k}")));
         }
-        let activation = Activation::parse(node)?;
+        let activation_name = match node.attr("activation_type") {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| error("attribute activation_type must be a string"))?,
+            None => "relu",
+        };
         let prefill_min_tokens = int_attr(node, "prefill_min_tokens", 2)?;
         if prefill_min_tokens < 2 {
             return Err(error(format!(
@@ -1114,43 +1082,27 @@ impl MoeAttributes {
             ));
         }
         let swiglu_fusion = int_attr(node, "swiglu_fusion", 0)?;
-        if !(0..=2).contains(&swiglu_fusion) {
-            return Err(error(format!(
-                "swiglu_fusion must be 0, 1, or 2, got {swiglu_fusion}"
-            )));
-        }
-        if activation != Activation::Swiglu && swiglu_fusion != 0 {
-            return Err(error(
-                "swiglu_fusion is only valid when activation_type='swiglu'",
-            ));
-        }
         let activation_alpha = float_attr(node, "activation_alpha", 1.0)?;
         let activation_beta = float_attr(node, "activation_beta", 0.0)?;
-        let swiglu_limit = float_attr(node, "swiglu_limit", f32::INFINITY)?;
-        for (name, value) in [
-            ("activation_alpha", activation_alpha),
-            ("activation_beta", activation_beta),
-            ("swiglu_limit", swiglu_limit),
-        ] {
-            if value.is_nan() {
-                return Err(error(format!("attribute {name} must not be NaN")));
-            }
-        }
-        if swiglu_limit <= 0.0 {
-            return Err(error(format!(
-                "swiglu_limit must be positive, got {swiglu_limit}"
-            )));
-        }
+        let swiglu_limit = float_attr(node, "swiglu_limit", DEFAULT_SWIGLU_LIMIT)?;
+        let activation_attributes = validate_moe_activation_attributes(
+            activation_name,
+            swiglu_fusion,
+            activation_alpha,
+            activation_beta,
+            swiglu_limit,
+        )
+        .map_err(error)?;
         Ok(Self {
             k: usize::try_from(k).map_err(|_| error("k exceeds usize limits"))?,
             prefill_min_tokens: usize::try_from(prefill_min_tokens)
                 .map_err(|_| error("prefill_min_tokens exceeds usize limits"))?,
-            activation,
+            activation: activation_attributes.activation,
             normalize_routing_weights,
-            swiglu_fusion: swiglu_fusion as usize,
-            activation_alpha,
-            activation_beta,
-            swiglu_limit,
+            swiglu_fusion: activation_attributes.swiglu_fusion,
+            activation_alpha: activation_attributes.activation_alpha,
+            activation_beta: activation_attributes.activation_beta,
+            swiglu_limit: activation_attributes.swiglu_limit,
         })
     }
 
@@ -1275,22 +1227,25 @@ impl RouteTelemetrySourceRegistry {
         &self,
         node_id: NodeId,
         runtime: Arc<CudaRuntime>,
-    ) -> Arc<QMoERouteTelemetry> {
+    ) -> Option<Arc<QMoERouteTelemetry>> {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            return None;
+        }
         let executor = ExecutorInstanceId::from_raw(self.active_executor.load(Ordering::Acquire));
         if executor == ExecutorInstanceId::UNSCOPED {
-            return Arc::new(QMoERouteTelemetry::new(runtime));
+            return Some(Arc::new(QMoERouteTelemetry::new(runtime)));
         }
         let mut sources = self
             .sources
             .lock()
             .expect("cuda_ep route-telemetry registry poisoned");
-        Arc::clone(
+        Some(Arc::clone(
             sources
                 .entry(executor)
                 .or_default()
                 .entry(node_id)
                 .or_insert_with(|| Arc::new(QMoERouteTelemetry::new(runtime))),
-        )
+        ))
     }
 
     /// Snapshot one executor's producer sources.
@@ -1396,7 +1351,7 @@ impl QMoEFactory {
         self.create_kernel_with_telemetry(
             node,
             _input_shapes,
-            Arc::new(QMoERouteTelemetry::new(Arc::clone(&self.runtime))),
+            Some(Arc::new(QMoERouteTelemetry::new(Arc::clone(&self.runtime)))),
         )
     }
 
@@ -1404,7 +1359,7 @@ impl QMoEFactory {
         &self,
         node: &Node,
         _input_shapes: &[Vec<usize>],
-        telemetry: Arc<QMoERouteTelemetry>,
+        telemetry: Option<Arc<QMoERouteTelemetry>>,
     ) -> Result<QMoEKernel> {
         let attributes = MoeAttributes::from_node(node)?;
         let bits = int_attr(node, "expert_weight_bits", 4)?;
@@ -1497,6 +1452,9 @@ pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
                 "QMoE: quant_type must be the string 'int' for CUDA integer-affine expert weights",
             ));
         }
+    }
+    if let Err(reason) = MoeAttributes::from_node(node) {
+        return Some(Cow::Owned(reason.to_string()));
     }
     None
 }
@@ -1602,7 +1560,7 @@ pub struct QMoEKernel {
     block_size: usize,
     scratch: Mutex<ScratchPool>,
     warmed: AtomicBool,
-    telemetry: Arc<QMoERouteTelemetry>,
+    telemetry: Option<Arc<QMoERouteTelemetry>>,
 }
 
 impl QMoEKernel {
@@ -1611,32 +1569,47 @@ impl QMoEKernel {
         &self,
         config: RouteTelemetryConfig,
     ) -> std::result::Result<(), TelemetryUnsupported> {
-        self.telemetry.arm_route_telemetry(config)
+        self.telemetry
+            .as_ref()
+            .expect("the concrete QMoE telemetry test seam always provisions a producer")
+            .arm_route_telemetry(config)
     }
 
     #[doc(hidden)]
     pub fn disarm_route_telemetry(&self) {
-        self.telemetry.disarm_route_telemetry();
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.disarm_route_telemetry();
+        }
     }
 
     #[doc(hidden)]
     pub fn reset_route_telemetry_boundary(&self) -> Result<()> {
-        self.telemetry.reset_route_telemetry_boundary()
+        match &self.telemetry {
+            Some(telemetry) => telemetry.reset_route_telemetry_boundary(),
+            None => Ok(()),
+        }
     }
 
     #[doc(hidden)]
     pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
-        self.telemetry.route_telemetry_snapshot()
+        match &self.telemetry {
+            Some(telemetry) => telemetry.route_telemetry_snapshot(),
+            None => Ok(None),
+        }
     }
 
     #[doc(hidden)]
     pub fn route_telemetry_footprint_bytes(&self) -> usize {
-        self.telemetry.route_telemetry_footprint_bytes()
+        self.telemetry
+            .as_ref()
+            .map_or(0, |telemetry| telemetry.route_telemetry_footprint_bytes())
     }
 
     #[doc(hidden)]
     pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
-        self.telemetry.route_telemetry_bitmap_addr()
+        self.telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.route_telemetry_bitmap_addr())
     }
 }
 
@@ -2194,7 +2167,10 @@ impl Kernel for QMoEKernel {
         // capacity — the pointers are null and the route kernel is
         // byte-identical; a capacity mismatch leaves telemetry inert for this
         // call and never fails inference.
-        let (telemetry_bitmap, telemetry_header) = self.telemetry.launch_ptrs(experts);
+        let (telemetry_bitmap, telemetry_header) = self
+            .telemetry
+            .as_ref()
+            .map_or((0, 0), |telemetry| telemetry.launch_ptrs(experts));
 
         self.launch_route(
             router_probs_ptr,
@@ -3401,6 +3377,40 @@ mod tests {
             )]))
             .unwrap();
             assert!(attrs.activation.kernel_id() >= 0);
+        }
+    }
+
+    #[test]
+    fn invalid_activation_attributes_decline_before_factory_creation() {
+        for (name, value) in [
+            ("activation_alpha", f32::NAN),
+            ("activation_alpha", f32::INFINITY),
+            ("activation_alpha", f32::NEG_INFINITY),
+            ("activation_beta", f32::NAN),
+            ("activation_beta", f32::INFINITY),
+            ("activation_beta", f32::NEG_INFINITY),
+            ("swiglu_limit", f32::NAN),
+            ("swiglu_limit", f32::INFINITY),
+            ("swiglu_limit", f32::NEG_INFINITY),
+            ("swiglu_limit", 0.0),
+            ("swiglu_limit", -1.0),
+        ] {
+            let invalid = node(&[
+                ("expert_weight_bits", Attribute::Int(4)),
+                ("block_size", Attribute::Int(16)),
+                ("activation_type", Attribute::String(b"swiglu".to_vec())),
+                ("swiglu_fusion", Attribute::Int(1)),
+                (name, Attribute::Float(value)),
+            ]);
+            let reason = unsupported_reason(&invalid)
+                .unwrap_or_else(|| panic!("{name}={value} must be declined at claim time"));
+            assert!(reason.contains(name), "unexpected claim reason: {reason}");
+            let error = MoeAttributes::from_node(&invalid)
+                .expect_err("the same attribute must fail factory/create parsing");
+            assert!(
+                error.to_string().contains(name),
+                "unexpected create error: {error}"
+            );
         }
     }
 

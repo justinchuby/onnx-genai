@@ -679,17 +679,146 @@ fn shared_ort_library(path: &std::path::Path) -> Option<&'static libloading::Lib
         .as_ref()
 }
 
+unsafe extern "C" fn dsa_schema_create_kernel(
+    _op: *const ort::OrtCustomOp,
+    _api: *const ort::OrtApi,
+    _info: *const ort::OrtKernelInfo,
+) -> *mut std::ffi::c_void {
+    Box::into_raw(Box::new(0u8)).cast()
+}
+
+unsafe extern "C" fn dsa_schema_name(_op: *const ort::OrtCustomOp) -> *const std::os::raw::c_char {
+    c"DsaIndexSelect".as_ptr()
+}
+
+unsafe extern "C" fn dsa_schema_provider(
+    _op: *const ort::OrtCustomOp,
+) -> *const std::os::raw::c_char {
+    c"CPUExecutionProvider".as_ptr()
+}
+
+unsafe extern "C" fn dsa_schema_input_type(
+    _op: *const ort::OrtCustomOp,
+    _index: usize,
+) -> ort::ONNXTensorElementDataType {
+    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+}
+
+unsafe extern "C" fn dsa_schema_input_count(_op: *const ort::OrtCustomOp) -> usize {
+    4
+}
+
+unsafe extern "C" fn dsa_schema_output_i64(
+    _op: *const ort::OrtCustomOp,
+    _index: usize,
+) -> ort::ONNXTensorElementDataType {
+    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+}
+
+unsafe extern "C" fn dsa_schema_output_f32(
+    _op: *const ort::OrtCustomOp,
+    _index: usize,
+) -> ort::ONNXTensorElementDataType {
+    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+}
+
+unsafe extern "C" fn dsa_schema_output_count(_op: *const ort::OrtCustomOp) -> usize {
+    1
+}
+
+unsafe extern "C" fn dsa_schema_compute(
+    _kernel: *mut std::ffi::c_void,
+    _context: *mut ort::OrtKernelContext,
+) {
+}
+
+unsafe extern "C" fn dsa_schema_destroy(kernel: *mut std::ffi::c_void) {
+    if !kernel.is_null() {
+        drop(unsafe { Box::from_raw(kernel.cast::<u8>()) });
+    }
+}
+
+unsafe extern "C" fn dsa_schema_required(
+    _op: *const ort::OrtCustomOp,
+    _index: usize,
+) -> ort::OrtCustomOpInputOutputCharacteristic {
+    ort::INPUT_OUTPUT_REQUIRED
+}
+
+unsafe extern "C" fn dsa_schema_default_memory(
+    _op: *const ort::OrtCustomOp,
+    _index: usize,
+) -> ort::OrtMemType {
+    ort::OrtMemTypeDefault
+}
+
+unsafe extern "C" fn dsa_schema_variadic_min_arity(_op: *const ort::OrtCustomOp) -> i32 {
+    1
+}
+
+unsafe extern "C" fn dsa_schema_variadic_homogeneous(_op: *const ort::OrtCustomOp) -> i32 {
+    1
+}
+
+unsafe extern "C" fn dsa_schema_start_version(_op: *const ort::OrtCustomOp) -> i32 {
+    1
+}
+
+unsafe extern "C" fn dsa_schema_end_version(_op: *const ort::OrtCustomOp) -> i32 {
+    i32::MAX
+}
+
+fn dsa_schema_op(output_type: ort::ONNXTensorElementDataType) -> Box<ort::OrtCustomOp> {
+    let get_output_type = match output_type {
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 => dsa_schema_output_i64,
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT => dsa_schema_output_f32,
+        other => panic!("unsupported DsaIndexSelect schema output type {other}"),
+    };
+    Box::new(ort::OrtCustomOp {
+        version: ort::ORT_API_VERSION,
+        CreateKernel: Some(dsa_schema_create_kernel),
+        GetName: Some(dsa_schema_name),
+        GetExecutionProviderType: Some(dsa_schema_provider),
+        GetInputType: Some(dsa_schema_input_type),
+        GetInputTypeCount: Some(dsa_schema_input_count),
+        GetOutputType: Some(get_output_type),
+        GetOutputTypeCount: Some(dsa_schema_output_count),
+        KernelCompute: Some(dsa_schema_compute),
+        KernelDestroy: Some(dsa_schema_destroy),
+        GetInputCharacteristic: Some(dsa_schema_required),
+        GetOutputCharacteristic: Some(dsa_schema_required),
+        GetInputMemoryType: Some(dsa_schema_default_memory),
+        GetVariadicInputMinArity: Some(dsa_schema_variadic_min_arity),
+        GetVariadicInputHomogeneity: Some(dsa_schema_variadic_homogeneous),
+        GetVariadicOutputMinArity: Some(dsa_schema_variadic_min_arity),
+        GetVariadicOutputHomogeneity: Some(dsa_schema_variadic_homogeneous),
+        CreateKernelV2: None,
+        KernelComputeV2: None,
+        InferOutputShapeFn: None,
+        GetStartVersion: Some(dsa_schema_start_version),
+        GetEndVersion: Some(dsa_schema_end_version),
+        GetMayInplace: None,
+        ReleaseMayInplace: None,
+        GetAliasMap: None,
+        ReleaseAliasMap: None,
+    })
+}
+
 #[allow(clippy::type_complexity)]
-unsafe fn conformance_setup(
+unsafe fn conformance_setup_with_session_status(
     reg_name: &str,
     model_path: &std::path::Path,
     disable_fallback: bool,
+    custom_schema_output: Option<ort::ONNXTensorElementDataType>,
 ) -> Option<(
     &'static libloading::Library,
     *const ort::OrtApi,
     *mut ort::OrtEnv,
     *mut ort::OrtSessionOptions,
     *mut ort::OrtSession,
+    *mut ort::OrtCustomOpDomain,
+    Option<Box<ort::OrtCustomOp>>,
+    *mut ort::OrtStatus,
 )> {
     let ort_lib_dir = match find_ort_lib_dir() {
         Some(d) => d,
@@ -798,6 +927,21 @@ unsafe fn conformance_setup(
     unsafe { check_status(api, status, "CreateSessionOptions") };
     unsafe { pin_intra_op_threads(api, session_options) };
 
+    let (custom_op_domain, custom_op) = if let Some(output_type) = custom_schema_output {
+        let custom_op = dsa_schema_op(output_type);
+        let mut domain: *mut ort::OrtCustomOpDomain = ptr::null_mut();
+        let status =
+            unsafe { ((*api).CreateCustomOpDomain.unwrap())(c"pkg.nxrt".as_ptr(), &mut domain) };
+        unsafe { check_status(api, status, "CreateCustomOpDomain(pkg.nxrt)") };
+        let status = unsafe { ((*api).CustomOpDomain_Add.unwrap())(domain, custom_op.as_ref()) };
+        unsafe { check_status(api, status, "CustomOpDomain_Add(DsaIndexSelect)") };
+        let status = unsafe { ((*api).AddCustomOpDomain.unwrap())(session_options, domain) };
+        unsafe { check_status(api, status, "AddCustomOpDomain(pkg.nxrt)") };
+        (domain, Some(custom_op))
+    } else {
+        (ptr::null_mut(), None)
+    };
+
     // Disable ORT's built-in CPU EP fallback — forces failure if our plugin EP
     // declines a node, proving the test is not vacuous.
     if disable_fallback {
@@ -850,12 +994,64 @@ unsafe fn conformance_setup(
     let mut session: *mut ort::OrtSession = ptr::null_mut();
     let status =
         unsafe { ort_session::create_session(api, env, session_options, model_path, &mut session) };
-    unsafe { check_status(api, status, "CreateSession") };
 
+    Some((
+        lib,
+        api,
+        env,
+        session_options,
+        session,
+        custom_op_domain,
+        custom_op,
+        status,
+    ))
+}
+
+#[allow(clippy::type_complexity)]
+unsafe fn conformance_setup(
+    reg_name: &str,
+    model_path: &std::path::Path,
+    disable_fallback: bool,
+) -> Option<(
+    &'static libloading::Library,
+    *const ort::OrtApi,
+    *mut ort::OrtEnv,
+    *mut ort::OrtSessionOptions,
+    *mut ort::OrtSession,
+)> {
+    let (lib, api, env, session_options, session, domain, custom_op, status) = unsafe {
+        conformance_setup_with_session_status(reg_name, model_path, disable_fallback, None)?
+    };
+    debug_assert!(domain.is_null());
+    debug_assert!(custom_op.is_none());
+    unsafe { check_status(api, status, "CreateSession") };
     Some((lib, api, env, session_options, session))
 }
 
 /// Shared teardown: ReleaseSession, ReleaseSessionOptions, Unregister, ReleaseEnv.
+unsafe fn conformance_teardown_with_custom_domain(
+    api: *const ort::OrtApi,
+    env: *mut ort::OrtEnv,
+    session_options: *mut ort::OrtSessionOptions,
+    session: *mut ort::OrtSession,
+    reg_name: &str,
+    custom_op_domain: *mut ort::OrtCustomOpDomain,
+) {
+    unsafe {
+        if !session.is_null() {
+            ((*api).ReleaseSession.unwrap())(session);
+        }
+        ((*api).ReleaseSessionOptions.unwrap())(session_options);
+        let reg_name_c = std::ffi::CString::new(reg_name).unwrap();
+        let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name_c.as_ptr());
+        check_status(api, status, "UnregisterExecutionProviderLibrary");
+        if !custom_op_domain.is_null() {
+            ((*api).ReleaseCustomOpDomain.unwrap())(custom_op_domain);
+        }
+        ((*api).ReleaseEnv.unwrap())(env);
+    }
+}
+
 unsafe fn conformance_teardown(
     api: *const ort::OrtApi,
     env: *mut ort::OrtEnv,
@@ -864,13 +1060,37 @@ unsafe fn conformance_teardown(
     reg_name: &str,
 ) {
     unsafe {
-        ((*api).ReleaseSession.unwrap())(session);
-        ((*api).ReleaseSessionOptions.unwrap())(session_options);
-        let reg_name_c = std::ffi::CString::new(reg_name).unwrap();
-        let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name_c.as_ptr());
-        check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
+        conformance_teardown_with_custom_domain(
+            api,
+            env,
+            session_options,
+            session,
+            reg_name,
+            ptr::null_mut(),
+        )
     }
+}
+
+unsafe fn read_ep_counter(lib: &libloading::Library, symbol: &[u8]) -> usize {
+    let counter: libloading::Symbol<'_, unsafe extern "C" fn() -> usize> =
+        unsafe { lib.get(symbol) }.unwrap_or_else(|e| {
+            panic!(
+                "{} not exported from cpu-plugin cdylib: {e}",
+                String::from_utf8_lossy(symbol)
+            )
+        });
+    unsafe { counter() }
+}
+
+unsafe fn reset_ep_counter(lib: &libloading::Library, symbol: &[u8]) {
+    let reset: libloading::Symbol<'_, unsafe extern "C" fn()> = unsafe { lib.get(symbol) }
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} not exported from cpu-plugin cdylib: {e}",
+                String::from_utf8_lossy(symbol)
+            )
+        });
+    unsafe { reset() };
 }
 
 // ─── Helper: query EP graph assignment ────────────────────────────────────────
@@ -3434,6 +3654,200 @@ fn conformance_matmul_initializer_weights() {
 // on `CPUExecutionProvider`, if a claimed node arrives fragmented rather than
 // whole, or if the resulting partition produces wrong numbers.
 
+/// Importing `pkg.nxrt` at opset 2 must resolve the sole since-version-1
+/// `DsaIndexSelect` implementation through ORT's model import, plugin
+/// `GetCapability`, assignment, Compile, and Compute paths.
+#[test]
+fn dsa_index_select_later_opset_import_assigns_and_runs_v1() {
+    let _lock = lock_ort_ep();
+    let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/dsa_index_select_opset2/model.onnx.textproto");
+    let ep_path = skip_if_missing!(
+        find_ep_cdylib(),
+        "dsa_index_select_later_opset_import_assigns_and_runs_v1: EP cdylib not found"
+    );
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+
+    unsafe {
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_get_capability_call_count");
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_compiled_node_count");
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_executed_node_count");
+    }
+
+    let Some((_lib, api, env, opts, session, domain, custom_op, status)) = (unsafe {
+        conformance_setup_with_session_status(
+            "cpu_ep_dsa_opset2",
+            &model_path,
+            true,
+            Some(ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64),
+        )
+    }) else {
+        eprintln!(
+            "*** SKIPPED: dsa_index_select_later_opset_import_assigns_and_runs_v1 — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        check_status(api, status, "CreateSession(DsaIndexSelect opset 2)");
+        assert!(
+            read_ep_counter(&ep_lib, b"nxrt_ep_get_capability_call_count") > 0,
+            "real ORT session creation must enter the plugin C-ABI GetCapability callback"
+        );
+        let info = query_ep_assignment(api, session);
+        assert_eq!(
+            info.ops_on_our_ep(),
+            vec!["DsaIndexSelect"],
+            "pkg.nxrt opset 2 must resolve and assign the sole since-version-1 kernel; got {:?}",
+            info.assignments
+        );
+        assert_eq!(
+            read_ep_counter(&ep_lib, b"nxrt_ep_compiled_node_count"),
+            1,
+            "ORT must compile the assigned DsaIndexSelect node exactly once"
+        );
+
+        let mut query = [1.0f32, 0.0, 0.0, 1.0];
+        let mut key = [1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let mut weights = [1.0f32, 1.0];
+        let mut bias = [0.0f32, f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0, 0.0, 0.0];
+        let query_value = make_float_tensor(api, &mut query, &[1, 2, 1, 2]);
+        let key_value = make_float_tensor(api, &mut key, &[1, 3, 2]);
+        let weights_value = make_float_tensor(api, &mut weights, &[1, 2, 1]);
+        let bias_value = make_float_tensor(api, &mut bias, &[1, 1, 2, 3]);
+        let input_names = [
+            c"query".as_ptr(),
+            c"key".as_ptr(),
+            c"weights".as_ptr(),
+            c"attention_bias".as_ptr(),
+        ];
+        let inputs: [*const ort::OrtValue; 4] = [query_value, key_value, weights_value, bias_value];
+        let output_names = [c"selected_indices".as_ptr()];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            inputs.len(),
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(DsaIndexSelect opset 2)");
+        assert_output_shape(api, output, &[1, 1, 2, 2], "dsa_selected_indices");
+        assert_output_dtype(
+            api,
+            output,
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            "dsa_selected_indices",
+        );
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(DsaIndexSelect)");
+        let selected = std::slice::from_raw_parts(data_ptr.cast::<i64>(), 4);
+        assert_eq!(
+            selected,
+            &[0, -1, 1, 2],
+            "the v1 kernel must run with causal padding and ascending selected indices"
+        );
+        assert_eq!(
+            read_ep_counter(&ep_lib, b"nxrt_ep_executed_node_count"),
+            1,
+            "the assigned v1 DsaIndexSelect kernel must execute exactly once"
+        );
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(query_value);
+        ((*api).ReleaseValue.unwrap())(key_value);
+        ((*api).ReleaseValue.unwrap())(weights_value);
+        ((*api).ReleaseValue.unwrap())(bias_value);
+        conformance_teardown_with_custom_domain(
+            api,
+            env,
+            opts,
+            session,
+            "cpu_ep_dsa_opset2",
+            domain,
+        );
+        drop(custom_op);
+    }
+}
+
+#[test]
+fn dsa_index_select_non_int64_output_is_declined_before_compile_or_compute() {
+    let _lock = lock_ort_ep();
+    let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/dsa_index_select_float_output/model.onnx.textproto");
+    let ep_path = skip_if_missing!(
+        find_ep_cdylib(),
+        "dsa_index_select_non_int64_output_is_declined_before_compile_or_compute: EP cdylib not found"
+    );
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+
+    unsafe {
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_get_capability_call_count");
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_compiled_node_count");
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_executed_node_count");
+    }
+
+    let Some((_lib, api, env, opts, session, domain, custom_op, status)) = (unsafe {
+        conformance_setup_with_session_status(
+            "cpu_ep_dsa_bad_output",
+            &model_path,
+            false,
+            Some(ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT),
+        )
+    }) else {
+        eprintln!(
+            "*** SKIPPED: dsa_index_select_non_int64_output_is_declined_before_compile_or_compute — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        assert!(
+            read_ep_counter(&ep_lib, b"nxrt_ep_get_capability_call_count") > 0,
+            "the invalid-output model must reach the plugin C-ABI GetCapability callback"
+        );
+        check_status(api, status, "CreateSession(DsaIndexSelect Float32 output)");
+        assert!(
+            !session.is_null(),
+            "the schema-only CPU fallback must keep the model importable so plugin assignment \
+             can be inspected"
+        );
+        let info = query_ep_assignment(api, session);
+        assert!(
+            !info.ops_on_our_ep().contains(&"DsaIndexSelect"),
+            "a Float32 selected_indices output must not be assigned to cpu_ep; got {:?}",
+            info.assignments
+        );
+        assert_eq!(
+            read_ep_counter(&ep_lib, b"nxrt_ep_compiled_node_count"),
+            0,
+            "the dtype gate must decline the node before Compile"
+        );
+        assert_eq!(
+            read_ep_counter(&ep_lib, b"nxrt_ep_executed_node_count"),
+            0,
+            "the dtype gate must decline the node before Compute"
+        );
+
+        conformance_teardown_with_custom_domain(
+            api,
+            env,
+            opts,
+            session,
+            "cpu_ep_dsa_bad_output",
+            domain,
+        );
+        drop(custom_op);
+    }
+}
+
 /// bfloat16 shows why giving a node back can be worse than running it slowly:
 /// ORT's CPU EP has no bfloat16 `Tanh` kernel at all, so handing one over turns
 /// a working session into a `NOT_IMPLEMENTED` session-creation failure.
@@ -4412,6 +4826,25 @@ struct MatmulFamilyCase {
     ort_can_build: bool,
     /// Absolute tolerance for the elementwise comparison against ORT.
     tolerance: f32,
+    /// How many nodes this model has, and therefore how many must end up on
+    /// our EP before a per-node number means anything.
+    ///
+    /// The old check was `ops_on_our_ep().contains(&case.op)` — a membership
+    /// test. It passes when *one* node of the right type is ours, so a
+    /// hundred-node chain of which we claimed three would still have reported
+    /// a ratio, and any per-node figure a reader derived from that row by
+    /// dividing by its nominal depth would have been wrong by a factor of 33.
+    /// That is the same defect as a thread-name filter that matches nothing:
+    /// the filter answers, the answer is vacuous, and the vacuity is
+    /// invisible in the number.
+    ///
+    /// Fallback is disabled for these sessions, so in principle a declined
+    /// node fails session creation rather than going elsewhere quietly — but
+    /// that is an inference about ORT's behaviour, and it says nothing about
+    /// nodes the graph optimiser *removed* (a `Relu` chain is idempotent and
+    /// a folder is entitled to collapse it). Counting is a measurement and
+    /// costs one comparison per case.
+    expected_ep_nodes: usize,
 }
 
 /// One runtime input: name, element type, dims and raw little-endian bytes.
@@ -4576,6 +5009,7 @@ opset_import: [{{ version: 17 }}]
         output_elem: elem,
         ort_can_build: true,
         tolerance,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -4696,6 +5130,7 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
         // variant also rounds its activation and result to 11 significand
         // bits, which at this magnitude costs about one unit.
         tolerance: if act_elem == ELEM_F32 { 0.5 } else { 4.0 },
+        expected_ep_nodes: 1,
     }
 }
 
@@ -4795,6 +5230,7 @@ opset_import: [{{ version: 13 }}]
         // of a value landing precisely on .5 is implementation-defined, so one
         // least-significant unit is allowed.
         tolerance: 1.0,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -5451,6 +5887,7 @@ opset_import: [{{ version: 17 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 0.0,
+        expected_ep_nodes: 1,
     };
 
     let path = write_generated_model(case.name, &case.model);
@@ -5563,6 +6000,7 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 0.0,
+        expected_ep_nodes: 1,
     };
 
     let path = write_generated_model(case.name, &case.model);
@@ -5822,6 +6260,7 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 0.5,
+        expected_ep_nodes: 1,
     };
     (case, other_b)
 }
@@ -6058,6 +6497,7 @@ opset_import: {opset_imports}
         output_elem: elem,
         ort_can_build: true,
         tolerance,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -6138,6 +6578,7 @@ opset_import: [{{ version: 17 }}]
         // A Relu chain is exact in both implementations; Identity is a copy.
         // Anything above zero here would be hiding a real disagreement.
         tolerance: 0.0,
+        expected_ep_nodes: depth,
     }
 }
 
@@ -6191,6 +6632,7 @@ opset_import: [{{ version: 17 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 1e-3,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -6216,7 +6658,27 @@ fn dispatch_grid_cases() -> Vec<MatmulFamilyCase> {
     const TINY: usize = 8;
     vec![
         chain_case("grid_identity_1_static", "Identity", 1, W, false),
-        chain_case("grid_identity_10_static", "Identity", 10, W, false),
+        // Ten `Identity` nodes go in; **one** arrives. ORT collapses the
+        // redundant chain during session build, so by the time our EP sees
+        // the graph it is a single node. That is the observation — `got 1
+        // ours, 0 elsewhere` the first time the count check ran — and not a
+        // claim about which ORT pass does it, which cannot be checked from
+        // this tree.
+        //
+        // Nothing published was wrong because of it: the in-code per-node
+        // probe already divides by `ops_on_our_ep().len()` rather than by the
+        // case's depth, and the #1077 figures come from the `relu_*_tiny`
+        // rows. The hazard was a human dividing this row's *total* by its
+        // nominal depth of ten. The count check makes that impossible to do
+        // silently.
+        //
+        // Kept rather than deleted: it is now a pin on that folding
+        // behaviour. It must not be read as a depth-10 point; at run time it
+        // is `grid_identity_1_static` with a longer name.
+        MatmulFamilyCase {
+            expected_ep_nodes: 1,
+            ..chain_case("grid_identity_10_static", "Identity", 10, W, false)
+        },
         chain_case("grid_relu_1_static", "Relu", 1, W, false),
         chain_case("grid_relu_10_static", "Relu", 10, W, false),
         chain_case("grid_relu_100_static", "Relu", 100, W, false),
@@ -6809,9 +7271,26 @@ fn plugin_path_ab_vs_plain_ort() {
 
         unsafe {
             let info = query_ep_assignment(api, session);
+            let ours = info.ops_on_our_ep();
+            let theirs = info.ops_not_on_our_ep();
+            // Categorical, not statistical: N nodes in must give N nodes on
+            // our EP. It costs one comparison, it is immune to host noise,
+            // and it is the only thing standing between a per-node number and
+            // a denominator that was never true. `contains` used to be the
+            // whole check, and `contains` cannot tell 100 nodes from 1.
             assert!(
-                info.ops_on_our_ep().contains(&case.op),
-                "{}: not assigned to this EP, refusing to report a ratio",
+                ours.len() == case.expected_ep_nodes && theirs.is_empty(),
+                "{}: expected all {} node(s) on this EP, got {} ours {ours:?} and \
+                 {} elsewhere {theirs:?} — refusing to report a per-node ratio \
+                 against a denominator that is not what ran",
+                case.name,
+                case.expected_ep_nodes,
+                ours.len(),
+                theirs.len()
+            );
+            assert!(
+                ours.contains(&case.op),
+                "{}: node count matches but the op does not — got {ours:?}",
                 case.name
             );
 
@@ -6866,7 +7345,7 @@ fn plugin_path_ab_vs_plain_ort() {
             // Allocation attribution runs before the timed loop so its
             // counter updates never land inside a measured iteration.
             if run_ours
-                && let Some((buf, names)) = probe_dispatch(
+                && let Some((buf, names, event_names)) = probe_dispatch(
                     api,
                     session,
                     &input_name_ptrs,
@@ -6885,6 +7364,7 @@ fn plugin_path_ab_vs_plain_ort() {
                     64,
                     &buf,
                     &names,
+                    &event_names,
                 );
             }
 
@@ -7892,13 +8372,42 @@ fn probe_phase_names(lib: &libloading::Library) -> Vec<String> {
     }
 }
 
-const PROBE_EVENTS: &[&str] = &[
-    "OrtFfiCall",
-    "DispatchAlloc",
-    "NodeExecuted",
-    "ShapeInferred",
-    "OutputMaterialized",
-];
+const PROBE_EVENTS_FALLBACK_LEN: usize = 5;
+
+/// Event names, read from the library rather than copied.
+///
+/// The hard-coded `PROBE_EVENTS` list this replaces had drifted from `Event`
+/// and mislabelled three of the five counters: `StatusCreated` printed as
+/// "NodeExecuted", `ComputeExecute` -- the per-`Run` divisor -- as
+/// "ShapeInferred", and `NodeExecuted` as "OutputMaterialized". Two of those
+/// names named no event at all.
+///
+/// It survived because the guard beside it checked arity, not identity: a pure
+/// reordering keeps the count at five, so `written == need` still held, and the
+/// message on that assertion claimed to detect the very drift it could not see.
+/// `probe_phase_names` already existed for exactly this reason one list over.
+fn probe_event_names(lib: &libloading::Library) -> Vec<String> {
+    // SAFETY: the export is `extern "C"` with this signature and returns either
+    // null or a 'static NUL-terminated string owned by the library.
+    unsafe {
+        let name_of: libloading::Symbol<
+            '_,
+            unsafe extern "C" fn(usize) -> *const std::os::raw::c_char,
+        > = match lib.get(b"nxrt_dispatch_probe_event_name") {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for i in 0.. {
+            let p = name_of(i);
+            if p.is_null() {
+                break;
+            }
+            out.push(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned());
+        }
+        out
+    }
+}
 
 /// Open the EP cdylib a second time to reach its probe exports.
 ///
@@ -7932,7 +8441,7 @@ unsafe fn probe_dispatch(
     values: &[*const ort::OrtValue],
     output_names: &[*const std::os::raw::c_char],
     runs: usize,
-) -> Option<(Vec<u64>, Vec<String>)> {
+) -> Option<(Vec<u64>, Vec<String>, Vec<String>)> {
     if std::env::var("NXRT_MM_BENCH_PROBE").unwrap_or_default() != "1" {
         return None;
     }
@@ -7946,22 +8455,43 @@ unsafe fn probe_dispatch(
             lib.get(b"nxrt_dispatch_probe_snapshot").ok()?;
         reset();
         bench_runs(api, session, input_names, values, output_names, runs);
-        let buckets = probe_phase_names(lib).len();
+        let phase_names = probe_phase_names(lib);
+        let buckets = phase_names.len();
         assert!(buckets > 0, "cdylib exports no phase names");
-        let need = (buckets - 1) * 2 + buckets * 2 + PROBE_EVENTS.len();
+        // Both lists come from the image, so the layout below is derived from
+        // the same source of truth the numbers are. The previous form used a
+        // hard-coded length here, which made this assertion a check on arity
+        // alone -- and a reordering of the event enum keeps the arity identical
+        // while moving every label, which is exactly what had happened.
+        let event_names = probe_event_names(lib);
+        assert_eq!(
+            event_names.len(),
+            PROBE_EVENTS_FALLBACK_LEN,
+            "cdylib exports {} event names; if the event enum genuinely grew, update \
+             PROBE_EVENTS_FALLBACK_LEN, but check first that the *order* still matches",
+            event_names.len()
+        );
+        let need = (buckets - 1) * 2 + buckets * 2 + event_names.len();
         let mut buf = vec![0u64; need];
         let written = snapshot(buf.as_mut_ptr(), need);
         assert_eq!(
             written, need,
             "probe wrote {written} u64s, this harness expected {need} \
-             — PROBE_EVENTS is out of sync with dispatch_probe"
+             — the exported phase/event lists disagree with dispatch_probe's layout"
         );
-        Some((buf, probe_phase_names(lib)))
+        Some((buf, phase_names, event_names))
     }
 }
 
 /// Print allocations and bytes per phase, normalised per `Run` and per node.
-fn report_probe(case: &str, nodes: usize, runs: usize, buf: &[u64], names: &[String]) {
+fn report_probe(
+    case: &str,
+    nodes: usize,
+    runs: usize,
+    buf: &[u64],
+    names: &[String],
+    event_names: &[String],
+) {
     let nb = names.len();
     let np = nb - 1;
     let (calls, ns) = (&buf[..np], &buf[np..2 * np]);
@@ -8001,7 +8531,7 @@ fn report_probe(case: &str, nodes: usize, runs: usize, buf: &[u64], names: &[Str
         total as f64 / per_node,
         total_bytes as f64 / per_run
     );
-    for (i, name) in PROBE_EVENTS.iter().enumerate() {
+    for (i, name) in event_names.iter().enumerate() {
         println!("# event {name},{:.3}/run", events[i] as f64 / per_run);
     }
 }

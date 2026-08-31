@@ -41,6 +41,31 @@ CUDA_TARGETS_WITHOUT_SUFFIX = frozenset({"matmul_nbits_marlin_numerics"})
 # CPU-only machine that believes it tested a GPU.
 #
 ALWAYS_RUN = frozenset({"suite_canary_gpu"})
+# Rust integration targets are separate processes, so no in-process mutex can
+# serialize one target against another. These locks intentionally serialize
+# only the libtest threads inside the named binary: that is where concurrent EP
+# construction exhausts VMM address reservations and process-global telemetry
+# deltas race. Keeping the lock local to each target makes that scope explicit.
+#
+# This set is the policy census, deliberately independent from the implementation
+# mapping below. MHA, DFT, and STFT were added after parallel execution reproduced
+# VMM/telemetry races; NMS already carried the same target-local isolation and is
+# therefore part of the policy too. A mapping cannot remove its own obligation:
+# the scanner first requires its keys to equal this non-empty set.
+EXPECTED_SUITE_ISOLATION_TARGETS = frozenset(
+    {
+        "multi_head_attention_gpu",
+        "dft_gpu",
+        "stft_gpu",
+        "nms_gpu",
+    }
+)
+SERIALIZED_TARGET_LOCKS = {
+    "multi_head_attention_gpu": ("lock_mha_gpu", "MHA_GPU_LOCK"),
+    "dft_gpu": ("lock_dft_gpu", "DFT_GPU_LOCK"),
+    "stft_gpu": ("lock_stft_gpu", "STFT_GPU_LOCK"),
+    "nms_gpu": ("lock_nms_gpu", "NMS_GPU_LOCK"),
+}
 SUMMARY = re.compile(
     r"test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; "
     r"(?P<ignored>\d+) ignored; (?P<measured>\d+) measured; (?P<filtered>\d+) filtered out"
@@ -98,6 +123,15 @@ class ActiveResult(LibtestResult):
 
 BASE_CONFIG = FeatureConfig("without-gpu-tests", "cuda")
 GPU_CONFIG = FeatureConfig("with-gpu-tests", "cuda,gpu-tests")
+CUDA_PLUGIN_PACKAGE = "onnx-runtime-ep-cuda-plugin"
+CUDA_PLUGIN_TARGET = "cuda_unique_ort_e2e"
+CUDA_PLUGIN_FEATURES = "cuda"
+CUDA_PLUGIN_MIN_TESTS = 3
+SESSION_PACKAGE = "onnx-runtime-session"
+SESSION_HETERO_TARGET = "hetero_cuda_gpu"
+SESSION_BASE_FEATURES = "cuda,cuda-13000"
+SESSION_GPU_FEATURES = "gpu-tests,cuda-13000"
+SESSION_HETERO_MIN_TESTS = 1
 
 
 def run(command: list[str | Path]) -> subprocess.CompletedProcess[str]:
@@ -492,6 +526,154 @@ def test_items(source: str) -> list[TestItem]:
     return items
 
 
+def function_body(source: str, name: str, start_line: int = 1) -> str | None:
+    """Masked body of `name` at or below `start_line`, or None if malformed."""
+    blobs = source_blobs(source)
+    if blobs is None:
+        return None
+    masked_blob, _ = blobs
+    lines = masked_blob.splitlines(keepends=True)
+    start = sum(len(line) for line in lines[: max(0, start_line - 1)])
+    declaration = re.search(rf"\bfn\s+{re.escape(name)}\s*[(<]", masked_blob[start:])
+    if declaration is None:
+        return None
+    open_brace = masked_blob.find("{", start + declaration.end())
+    if open_brace == -1:
+        return None
+    depth = 0
+    for cursor in range(open_brace, len(masked_blob)):
+        if masked_blob[cursor] == "{":
+            depth += 1
+        elif masked_blob[cursor] == "}":
+            depth -= 1
+            if depth == 0:
+                return masked_blob[open_brace + 1 : cursor]
+    return None
+
+
+def tests_missing_suite_lock(source: str, lock_function: str) -> list[TestItem]:
+    """Tests that do not hold the target's suite lock through function exit.
+
+    The accepted shape deliberately binds the guard as the first statement and
+    never names that binding again. A Rust local otherwise lives to the end of
+    its enclosing function, so this proves the critical section includes every
+    later operation and assertion. Any later identifier use fails closed: it
+    covers explicit/qualified `drop`, assignment, shadowing, and moving the
+    guard into a call or shorter scope without pretending this source guard is
+    a complete Rust parser. Comments and literals are already blanked by
+    `function_body`, so prose cannot manufacture a premature release.
+    """
+    first_statement = re.compile(
+        rf"\s*let\s+(?:mut\s+)?(?P<guard>[A-Za-z][A-Za-z0-9_]*|_[A-Za-z0-9_]+)\s*=\s*"
+        rf"{re.escape(lock_function)}\s*\(\s*\)\s*;"
+    )
+    missing: list[TestItem] = []
+    for item in test_items(source):
+        body = function_body(source, item.name, item.line)
+        acquisition = first_statement.match(body) if body is not None else None
+        if acquisition is None:
+            missing.append(item)
+            continue
+        guard = acquisition.group("guard")
+        later_guard_use = re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(guard)}(?![A-Za-z0-9_])",
+            body[acquisition.end() :],
+        )
+        if later_guard_use is not None:
+            missing.append(item)
+    return missing
+
+
+def suite_isolation_errors(
+    configured: Mapping[str, tuple[str, str]],
+    sources: Mapping[str, str],
+    expected: frozenset[str] = EXPECTED_SUITE_ISOLATION_TARGETS,
+) -> list[str]:
+    """Validate the independent target census and every configured source."""
+    errors: list[str] = []
+
+    if not expected:
+        return [
+            "suite-isolation policy target census is empty; the guard refuses to pass vacuously"
+        ]
+    if not configured:
+        return [
+            "suite-isolation lock configuration is empty; expected exactly "
+            + ", ".join(sorted(expected))
+        ]
+
+    actual = frozenset(configured)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        details = []
+        if missing:
+            details.append(f"missing {missing}")
+        if unexpected:
+            details.append(f"unexpected {unexpected}")
+        errors.append(
+            "suite-isolation configured target census does not match policy: "
+            + "; ".join(details)
+        )
+
+    for target in sorted(expected & actual):
+        lock_function, lock_static = configured[target]
+        relative = Path("crates") / "onnx-runtime-ep-cuda" / "tests" / f"{target}.rs"
+        source = sources.get(target)
+        if source is None:
+            errors.append(
+                f"{relative}: serialized CUDA target is missing; the suite-isolation "
+                "census cannot verify it"
+            )
+            continue
+        blobs = source_blobs(source)
+        if blobs is None:
+            errors.append(
+                f"{relative}: source masking changed length; refusing to trust the "
+                "suite-isolation scan"
+            )
+            continue
+        masked, _ = blobs
+        items = test_items(source)
+        if not items:
+            errors.append(
+                f"{relative}: serialized CUDA target contains no #[test] items; "
+                "suite isolation would otherwise pass vacuously"
+            )
+        static_declaration = re.compile(
+            rf"\bstatic\s+{re.escape(lock_static)}\s*:\s*Mutex\s*<\s*\(\s*\)\s*>\s*="
+        )
+        helper = function_body(source, lock_function)
+        if (
+            static_declaration.search(masked) is None
+            or helper is None
+            or re.search(rf"\b{re.escape(lock_static)}\s*\.\s*lock\s*\(\s*\)", helper)
+            is None
+        ):
+            errors.append(
+                f"{relative}: {lock_function} must acquire the process-wide "
+                f"{lock_static}; otherwise per-test calls do not serialize the target"
+            )
+        for item in tests_missing_suite_lock(source, lock_function):
+            errors.append(
+                f"{relative}:{item.line}: {item.name} must acquire {lock_function}() "
+                "as its first statement and keep that guard live through function exit "
+                "so EP construction, execution, telemetry, and assertions share one "
+                "critical section"
+            )
+    return errors
+
+
+def scan_source_for_suite_isolation() -> list[str]:
+    """Affected CUDA targets lock before EP construction, execution, or stats."""
+    sources: dict[str, str] = {}
+    for target in EXPECTED_SUITE_ISOLATION_TARGETS:
+        path = TESTS / f"{target}.rs"
+        if path.is_file():
+            sources[target] = path.read_text(encoding="utf-8")
+    return suite_isolation_errors(SERIALIZED_TARGET_LOCKS, sources)
+
+
 def un_ignored_tests(source: str) -> list[tuple[int, str]]:
     """Every `#[test]` in `source` not ignored when `gpu-tests` is off, 1-based."""
     found: list[tuple[int, str]] = []
@@ -724,8 +906,8 @@ def census_errors(by_dir: Mapping[Path, Sequence[Path]]) -> list[str]:
     guard reads.
 
     The check is per-directory rather than on the total. An aggregate
-    non-empty test only defends the all-or-nothing case: with 61 targets in
-    one directory and 21 in the other, deleting the larger leaves the total
+    non-empty test only defends the all-or-nothing case: if one directory has
+    many targets and another has fewer, deleting either can leave the total
     comfortably non-zero and the gate reports a confident pass over the
     remainder. The crates have already split once for exactly this kind of
     reason, so a move that lands one directory somewhere TEST_DIRS does not
@@ -774,6 +956,151 @@ def parse_test_binaries_from_json(stdout: str) -> list[TestBinary]:
         for target in sorted(binaries)
         if target not in ALWAYS_RUN
     ]
+
+
+def parse_named_test_binary_from_json(stdout: str, expected_target: str) -> TestBinary | None:
+    """Find one explicitly requested integration-test artifact in Cargo JSON."""
+    binary: TestBinary | None = None
+    for line in stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("reason") != "compiler-artifact":
+            continue
+        target = message.get("target", {})
+        if target.get("name") != expected_target or "test" not in target.get("kind", []):
+            continue
+        executable = message.get("executable")
+        if executable:
+            binary = TestBinary(expected_target, Path(executable))
+    return binary
+
+
+def feature_target_inventory_errors(
+    label: str,
+    binary: TestBinary | None,
+    inventory: frozenset[str],
+    minimum: int,
+) -> list[str]:
+    errors: list[str] = []
+    if binary is None:
+        errors.append(
+            f"{label}: Cargo emitted no executable for the requested feature-gated test target"
+        )
+    if len(inventory) < minimum:
+        errors.append(
+            f"{label}: feature-enabled inventory has {len(inventory)} test(s); "
+            f"expected at least {minimum}"
+        )
+    return errors
+
+
+def build_named_test_binary(
+    package: str, target: str, features: str
+) -> TestBinary:
+    result = run(
+        [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            package,
+            "--no-default-features",
+            "--features",
+            features,
+            "--test",
+            target,
+            "--no-run",
+            "--message-format=json",
+        ]
+    )
+    if result.returncode != 0:
+        print(result.stdout, file=sys.stderr, end="")
+        print(result.stderr, file=sys.stderr, end="")
+        raise RuntimeError(
+            f"cargo test --no-run failed for {package}/{target} with {features}"
+        )
+    binary = parse_named_test_binary_from_json(result.stdout, target)
+    errors = feature_target_inventory_errors(
+        f"{package}/{target}", binary, frozenset(), 0
+    )
+    if errors:
+        raise RuntimeError(errors[0])
+    assert binary is not None
+    return binary
+
+
+def verify_production_feature_targets() -> tuple[list[str], list[str]]:
+    """Compile and census production GPU tests without executing GPU paths."""
+    errors: list[str] = []
+
+    plugin_binary = build_named_test_binary(
+        CUDA_PLUGIN_PACKAGE, CUDA_PLUGIN_TARGET, CUDA_PLUGIN_FEATURES
+    )
+    plugin_inventory = list_inventory(plugin_binary)
+    errors.extend(
+        feature_target_inventory_errors(
+            f"{CUDA_PLUGIN_PACKAGE}/{CUDA_PLUGIN_TARGET} with {CUDA_PLUGIN_FEATURES}",
+            plugin_binary,
+            plugin_inventory,
+            CUDA_PLUGIN_MIN_TESTS,
+        )
+    )
+
+    session_base_binary = build_named_test_binary(
+        SESSION_PACKAGE, SESSION_HETERO_TARGET, SESSION_BASE_FEATURES
+    )
+    session_base_inventory = list_inventory(session_base_binary)
+    errors.extend(
+        feature_target_inventory_errors(
+            f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET} without gpu-tests",
+            session_base_binary,
+            session_base_inventory,
+            SESSION_HETERO_MIN_TESTS,
+        )
+    )
+    _, passed, failed, ignored, names = run_libtest(session_base_binary)
+    errors.extend(
+        validate_ignored_result(
+            IgnoredResult(
+                SESSION_HETERO_TARGET,
+                len(session_base_inventory),
+                passed,
+                failed,
+                ignored,
+                known_names(names, session_base_inventory),
+            )
+        )
+    )
+
+    session_gpu_binary = build_named_test_binary(
+        SESSION_PACKAGE, SESSION_HETERO_TARGET, SESSION_GPU_FEATURES
+    )
+    session_gpu_inventory = list_inventory(session_gpu_binary)
+    errors.extend(
+        feature_target_inventory_errors(
+            f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET} with gpu-tests",
+            session_gpu_binary,
+            session_gpu_inventory,
+            SESSION_HETERO_MIN_TESTS,
+        )
+    )
+    errors.extend(
+        compare_inventories(
+            {SESSION_HETERO_TARGET: session_base_inventory},
+            {SESSION_HETERO_TARGET: session_gpu_inventory},
+        )
+    )
+
+    summaries = [
+        f"{CUDA_PLUGIN_PACKAGE}/{CUDA_PLUGIN_TARGET}: "
+        f"{len(plugin_inventory)} test(s) compiled with {CUDA_PLUGIN_FEATURES}",
+        f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET}: "
+        f"{len(session_base_inventory)} test(s) present without gpu-tests and ignored; "
+        f"{len(session_gpu_inventory)} present with gpu-tests and compiled only",
+    ]
+    return summaries, errors
 
 
 def build_test_binaries(config: FeatureConfig) -> list[TestBinary]:
@@ -937,6 +1264,11 @@ def declares_gpu_tests_feature(manifest: str) -> bool:
 
 
 def self_test() -> None:
+    if re.search(r"\b\d+\s+targets?\b", census_errors.__doc__ or ""):
+        raise AssertionError(
+            "census_errors documentation must describe relative inventory sizes, "
+            "not copy a source-derived target count that will go stale"
+        )
     for manifest, expected in (
         ("[features]\ngpu-tests = []\n", True),
         ('[features]\ngpu-tests = ["onnx-runtime-cuda-memory/gpu-tests"]\n', True),
@@ -1077,6 +1409,21 @@ def self_test() -> None:
     ]
     if parsed != expected:
         raise AssertionError(f"JSON parser fixture returned {parsed!r}")
+    named_binary = parse_named_test_binary_from_json(fixture_stdout, "fixture_gpu")
+    if named_binary != expected[0]:
+        raise AssertionError(f"named feature target parser returned {named_binary!r}")
+    missing_target_errors = feature_target_inventory_errors(
+        "missing-feature-target", None, frozenset(), 1
+    )
+    if not any("no executable" in error for error in missing_target_errors):
+        raise AssertionError(
+            "a missing feature-gated target must fail even before its inventory is read"
+        )
+    empty_feature_errors = feature_target_inventory_errors(
+        "empty-feature-target", expected[0], frozenset(), 1
+    )
+    if not any("inventory has 0" in error for error in empty_feature_errors):
+        raise AssertionError("an empty feature-enabled target inventory must fail")
 
     if compare_inventories({"target": frozenset({"a"})}, {"target": frozenset({"a"})}):
         raise AssertionError("matching inventories should pass")
@@ -1172,6 +1519,159 @@ def self_test() -> None:
         names = [name for _, name in un_ignored_tests(source)]
         if names != expected:
             raise AssertionError(f"source scan fixture returned {names!r}, expected {expected!r}: {source!r}")
+
+    # Suite-isolation fixtures pin both sides of the structural guarantee. The
+    # positive controls make a deleted or delayed acquisition fail, while the
+    # negative controls keep comments, strings, and a neighbour's lock from
+    # satisfying the check.
+    for source, expected in (
+        ("#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n    run();\n}\n", []),
+        ("#[test]\nfn a() {\n    run();\n}\n", ["a"]),
+        (
+            "#[test]\nfn a() {\n    construct_ep();\n    let _suite_lock = lock_gpu();\n}\n",
+            ["a"],
+        ),
+        (
+            '#[test]\nfn a() {\n    let note = "let _suite_lock = lock_gpu();";\n    run();\n}\n',
+            ["a"],
+        ),
+        (
+            "#[test]\nfn a() {\n    // let _suite_lock = lock_gpu();\n    run();\n}\n",
+            ["a"],
+        ),
+        (
+            "#[test]\nfn first() {\n    let _suite_lock = lock_gpu();\n}\n"
+            "#[test]\nfn second() {\n    run();\n}\n",
+            ["second"],
+        ),
+        (
+            "#[test]\nfn a() {\n    let _ = lock_gpu();\n    run();\n}\n",
+            ["a"],
+        ),
+        # Acquiring first is insufficient if the guard is explicitly ended.
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    drop(_suite_lock);\n    run();\n}\n",
+            ["a"],
+        ),
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    std::mem::drop(_suite_lock);\n    run();\n}\n",
+            ["a"],
+        ),
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    { core::mem::drop(_suite_lock); }\n    run();\n}\n",
+            ["a"],
+        ),
+        # Rebinding, assignment, and moves can also end the original guard.
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    let _suite_lock = ();\n    run();\n}\n",
+            ["a"],
+        ),
+        (
+            "#[test]\nfn a() {\n    let mut suite_lock = lock_gpu();\n"
+            "    suite_lock = lock_gpu();\n    run();\n}\n",
+            ["a"],
+        ),
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    consume(_suite_lock);\n    run();\n}\n",
+            ["a"],
+        ),
+        # Masked comments and literals must not look like guard uses.
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    // std::mem::drop(_suite_lock);\n"
+            "    let note = \"drop(_suite_lock)\";\n    run();\n}\n",
+            [],
+        ),
+    ):
+        names = [item.name for item in tests_missing_suite_lock(source, "lock_gpu")]
+        if names != expected:
+            raise AssertionError(
+                f"suite-lock scan fixture returned {names!r}, expected {expected!r}: {source!r}"
+            )
+    helper_fixture = (
+        "static GPU_LOCK: Mutex<()> = Mutex::new(());\n"
+        "fn lock_gpu() -> MutexGuard<'static, ()> {\n"
+        "    GPU_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())\n"
+        "}\n"
+    )
+    helper = function_body(helper_fixture, "lock_gpu")
+    if helper is None or not re.search(r"\bGPU_LOCK\s*\.\s*lock\s*\(\s*\)", helper):
+        raise AssertionError("suite-lock helper scan cannot observe a known lock acquisition")
+
+    def isolated_target_fixture(lock_function: str, lock_static: str) -> str:
+        return (
+            f"static {lock_static}: Mutex<()> = Mutex::new(());\n"
+            f"fn {lock_function}() -> MutexGuard<'static, ()> {{\n"
+            f"    {lock_static}.lock().unwrap_or_else(|poisoned| poisoned.into_inner())\n"
+            "}\n"
+            "#[test]\n"
+            "fn exercises_gpu() {\n"
+            f"    let _lock = {lock_function}();\n"
+            "    run();\n"
+            "}\n"
+        )
+
+    healthy_isolation_sources = {
+        target: isolated_target_fixture(lock_function, lock_static)
+        for target, (lock_function, lock_static) in SERIALIZED_TARGET_LOCKS.items()
+    }
+    if suite_isolation_errors(SERIALIZED_TARGET_LOCKS, healthy_isolation_sources):
+        raise AssertionError("the complete suite-isolation census must pass")
+
+    empty_map_errors = suite_isolation_errors({}, {})
+    if len(empty_map_errors) != 1 or "configuration is empty" not in empty_map_errors[0]:
+        raise AssertionError("an empty isolation map must fail as an empty configuration")
+
+    removed_target = dict(SERIALIZED_TARGET_LOCKS)
+    removed_target.pop("dft_gpu")
+    removed_errors = suite_isolation_errors(removed_target, healthy_isolation_sources)
+    if not any(
+        "target census does not match policy" in error and "dft_gpu" in error
+        for error in removed_errors
+    ):
+        raise AssertionError(
+            "removing one configured target must fail the independent policy census"
+        )
+
+    zero_test_sources = dict(healthy_isolation_sources)
+    zero_test_sources["stft_gpu"] = helper_fixture.replace("GPU_LOCK", "STFT_GPU_LOCK").replace(
+        "lock_gpu", "lock_stft_gpu"
+    )
+    zero_test_errors = suite_isolation_errors(SERIALIZED_TARGET_LOCKS, zero_test_sources)
+    if not any(
+        "stft_gpu.rs" in error and "contains no #[test] items" in error
+        for error in zero_test_errors
+    ):
+        raise AssertionError(
+            "a mapped source with zero tests must fail instead of passing vacuously"
+        )
+
+    missing_acquisition_sources = dict(healthy_isolation_sources)
+    missing_acquisition_sources["multi_head_attention_gpu"] = missing_acquisition_sources[
+        "multi_head_attention_gpu"
+    ].replace("    let _lock = lock_mha_gpu();\n", "")
+    missing_acquisition_errors = suite_isolation_errors(
+        SERIALIZED_TARGET_LOCKS, missing_acquisition_sources
+    )
+    if not any(
+        "multi_head_attention_gpu.rs" in error
+        and "exercises_gpu must acquire lock_mha_gpu()" in error
+        for error in missing_acquisition_errors
+    ):
+        raise AssertionError("removing one test acquisition must name the unisolated test")
+
+    wrong_lock_map = dict(SERIALIZED_TARGET_LOCKS)
+    wrong_lock_map["nms_gpu"] = ("lock_nms_gpu", "NOT_THE_NMS_LOCK")
+    wrong_lock_errors = suite_isolation_errors(wrong_lock_map, healthy_isolation_sources)
+    if not any(
+        "nms_gpu.rs" in error and "NOT_THE_NMS_LOCK" in error for error in wrong_lock_errors
+    ):
+        raise AssertionError("a wrong configured lock name must fail the helper/static check")
 
     if mask_source('let s = "a // b"; // c\n')[0][0].rstrip() != 'let s = "______";':
         raise AssertionError("masking must blank literals and comments while preserving columns")
@@ -1352,6 +1852,7 @@ def main() -> int:
         source_errors = (
             scan_source_for_missing_ignores()
             + scan_source_for_inventory_drift()
+            + scan_source_for_suite_isolation()
             + census_errors(by_dir)
         )
         if source_errors:
@@ -1361,7 +1862,9 @@ def main() -> int:
             return 1
         print(
             f"CUDA test source scan passed over {len(policed)} CUDA test targets: "
-            "every test carries an ignore and is present with gpu-tests off"
+            "every test carries an ignore and is present with gpu-tests off; "
+            f"{len(EXPECTED_SUITE_ISOLATION_TARGETS)} resource-sensitive targets acquire their "
+            "suite lock before test work and keep its guard live through function exit"
         )
         return 0
 
@@ -1373,6 +1876,7 @@ def main() -> int:
     errors: list[str] = (
         scan_source_for_missing_ignores()
         + scan_source_for_inventory_drift()
+        + scan_source_for_suite_isolation()
         + census_errors(policed_cuda_targets_by_dir())
     )
     for crate in CUDA_CRATES:
@@ -1385,6 +1889,8 @@ def main() -> int:
     base_inventory = collect_inventories(base_binaries)
     gpu_inventory = collect_inventories(gpu_binaries)
     errors.extend(compare_inventories(base_inventory, gpu_inventory))
+    production_summaries, production_errors = verify_production_feature_targets()
+    errors.extend(production_errors)
 
     base_by_target = {binary.target: binary for binary in base_binaries}
     gpu_by_target = {binary.target: binary for binary in gpu_binaries}
@@ -1437,6 +1943,8 @@ def main() -> int:
         f"({total_ignored} ignored), {total_gpu_inventory} tests/{len(gpu_inventory)} targets with gpu-tests "
         f"({total_active_failed} fail-loud, {total_active_ignored} ignored, 0 passed on this no-CUDA host)"
     )
+    for summary in production_summaries:
+        print(f"Production feature target census passed: {summary}")
     return 0
 
 

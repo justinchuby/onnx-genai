@@ -44,11 +44,14 @@ use std::time::{Duration, Instant};
 
 use crate::connector::{
     CachePriority, CompressionFormat, ConnectorCapabilities, ConnectorError, ConnectorHealth,
-    ConnectorResult, FetchedKv, KvCacheConnector, KvCacheKey, KvCacheLocation, KvPayload,
-    KvStoreEntry,
+    ConnectorResult, FetchedKv, KvCacheConnector, KvCacheIsolation, KvCacheKey, KvCacheLocation,
+    KvPayload, KvStoreEntry,
 };
 use crate::fp8::Fp8Format;
-use crate::{Device, DiskKvBackingStore, KvBackingStore, PageId, PageTable, PrefixCache, TokenId};
+use crate::{
+    Device, DiskKvBackingStore, KvBackingStore, PageId, PageTable, PrefixCache,
+    RuntimeTieringPolicy, StateStorageDisposition, TokenId,
+};
 
 /// Optional cold-cold disk tier configuration.
 ///
@@ -101,6 +104,13 @@ impl Default for LocalTieredConfig {
     }
 }
 
+impl LocalTieredConfig {
+    /// Canonical runtime-only budget policy derived from this backend config.
+    pub fn runtime_policy(&self) -> RuntimeTieringPolicy {
+        RuntimeTieringPolicy::new(self.hot_capacity, self.max_cached_pages)
+    }
+}
+
 /// Per-chunk bookkeeping held in the interior map.
 #[derive(Clone, Debug)]
 struct ChunkEntry {
@@ -113,6 +123,7 @@ struct ChunkEntry {
     path: Vec<TokenId>,
     /// Resident payload, or `None` after a successful cold-tier spill.
     payload: Option<KvPayload>,
+    disposition: StateStorageDisposition,
 }
 
 impl ChunkEntry {
@@ -165,9 +176,16 @@ impl LocalTieredConnector {
         };
         let page_table = PageTable::new(config.page_size.max(1), config.hot_capacity);
         let backing_store = match &config.disk_backend {
-            Some(disk) => DiskKvBackingStore::new(&disk.path)
-                .ok()
-                .map(|store| Box::new(store) as Box<dyn KvBackingStore>),
+            Some(disk) => Some(
+                DiskKvBackingStore::new(&disk.path)
+                    .map_err(|error| {
+                        ConnectorError::Backend(format!(
+                            "cannot initialize lossless F32 disk tier at '{}': {error}",
+                            disk.path.display()
+                        ))
+                    })
+                    .map(|store| Box::new(store) as Box<dyn KvBackingStore>)?,
+            ),
             None => None,
         };
         Ok(Self {
@@ -188,9 +206,10 @@ impl LocalTieredConnector {
     /// This is useful for embedding applications and tests that need a custom
     /// durable tier. It replaces any disk tier selected by `config`.
     pub fn with_backing_store(
-        config: LocalTieredConfig,
+        mut config: LocalTieredConfig,
         backing_store: Box<dyn KvBackingStore>,
     ) -> ConnectorResult<Self> {
+        config.disk_backend = None;
         let connector = Self::new(config)?;
         connector
             .inner
@@ -223,22 +242,30 @@ impl LocalTieredConnector {
             .max(1)
     }
 
-    /// Deterministic prefix-cache path uniquely encoding a key. Identical chunk
-    /// content (same model / layers / index / hash) maps to the same path, which
-    /// is what makes chunk-granular prefix sharing work.
+    /// Deterministic prefix-cache path uniquely encoding a key.
     fn key_path(key: &KvCacheKey) -> Vec<TokenId> {
-        let model_hash =
-            crate::connector::hash_tokens(&key.model_id.bytes().map(u32::from).collect::<Vec<_>>());
-        vec![
-            (model_hash >> 32) as u32,
-            model_hash as u32,
+        let mut path = Vec::new();
+        match &key.isolation {
+            KvCacheIsolation::Session(session) => {
+                path.extend([0, (*session >> 32) as u32, *session as u32]);
+            }
+            KvCacheIsolation::SharedDomain(domain) => {
+                path.push(1);
+                path.extend(domain.bytes().map(u32::from));
+            }
+        }
+        path.push(256);
+        path.extend(key.model_id.bytes().map(u32::from));
+        path.push(256);
+        path.extend([
             key.layer_range.start as u32,
             key.layer_range.end as u32,
             key.chunk_index,
             (key.chunk_hash >> 32) as u32,
             key.chunk_hash as u32,
             key.num_tokens,
-        ]
+        ]);
+        path
     }
 }
 
@@ -250,10 +277,12 @@ impl Interior {
 
     /// Allocate one hot page, making priority-aware room first so the page
     /// table's own LRU auto-eviction never has to demote a pinned page.
-    fn allocate_hot(&mut self, priority: CachePriority) -> ConnectorResult<PageId> {
-        if self.page_table.free_count(Device::Gpu(0)) == 0
-            && self.page_table.hot_used_count() >= self.page_table.hot_capacity()
-        {
+    fn allocate_hot(
+        &mut self,
+        priority: CachePriority,
+        policy: RuntimeTieringPolicy,
+    ) -> ConnectorResult<PageId> {
+        if policy.needs_cold_migration(self.page_table.hot_used_count(), 1) {
             self.demote_one(priority)?;
         }
         self.page_table
@@ -304,7 +333,8 @@ impl Interior {
     }
 
     /// Persist fully cold payloads and release their host-RAM copies.
-    fn spill_cold_payloads(&mut self) -> ConnectorResult<()> {
+    fn spill_cold_payloads(&mut self, policy: RuntimeTieringPolicy) -> ConnectorResult<()> {
+        let backing_store_available = self.backing_store.is_some();
         let Some(store) = self.backing_store.as_mut() else {
             return Ok(());
         };
@@ -318,7 +348,10 @@ impl Interior {
                     Some(Device::Gpu(_))
                 )
             });
-            if all_cold && let Some(payload) = entry.payload.as_ref() {
+            if all_cold
+                && policy.may_spill_payload(entry.disposition, backing_store_available)
+                && let Some(payload) = entry.payload.as_ref()
+            {
                 store.write(key, payload).map_err(ConnectorError::Backend)?;
                 entry.payload = None;
             }
@@ -345,12 +378,14 @@ impl Interior {
     /// Hard, priority-aware eviction until the cache fits `budget` pages.
     /// Opportunistic chunks go first, then Session, then SystemPrompt; ties break
     /// on oldest `stored_at`. Pinned chunks are never evicted.
-    fn evict_to_budget(&mut self, budget: usize) {
-        while self.cached_page_count() > budget {
+    fn evict_to_budget(&mut self, policy: RuntimeTieringPolicy) {
+        while policy.exceeds_cache_budget(self.cached_page_count()) {
             let victim = self
                 .chunks
                 .iter()
-                .filter(|(k, _)| !self.pinned.contains(k))
+                .filter(|(k, entry)| {
+                    !self.pinned.contains(k) && policy.may_evict_for_recompute(entry.disposition)
+                })
                 .min_by(|(_, a), (_, b)| {
                     evict_rank(b.priority)
                         .cmp(&evict_rank(a.priority))
@@ -493,6 +528,7 @@ impl KvCacheConnector for LocalTieredConnector {
         let size_bytes = entry.kv_data.byte_size();
         let path = Self::key_path(&entry.key);
         let scale = self.fp8_format;
+        let policy = self.config.runtime_policy();
 
         let mut inner = self.inner.lock().map_err(poisoned_lock_error)?;
 
@@ -503,6 +539,8 @@ impl KvCacheConnector for LocalTieredConnector {
             existing.priority = entry.priority;
             existing.ttl = entry.ttl;
             existing.stored_at = Instant::now();
+            existing.disposition.spillable &= entry.disposition.spillable;
+            existing.disposition.recomputable &= entry.disposition.recomputable;
             return Ok(());
         }
 
@@ -516,7 +554,7 @@ impl KvCacheConnector for LocalTieredConnector {
         } else {
             let mut pages = Vec::with_capacity(num_pages);
             for _ in 0..num_pages {
-                match inner.allocate_hot(entry.priority) {
+                match inner.allocate_hot(entry.priority, policy) {
                     Ok(pid) => pages.push(pid),
                     Err(err) => {
                         for pid in pages {
@@ -546,17 +584,18 @@ impl KvCacheConnector for LocalTieredConnector {
                 size_bytes,
                 path,
                 payload: Some(entry.kv_data),
+                disposition: entry.disposition,
             },
         );
 
-        inner.spill_cold_payloads()?;
-        let budget = self.config.max_cached_pages;
-        inner.evict_to_budget(budget);
+        inner.spill_cold_payloads(policy)?;
+        inner.evict_to_budget(policy);
         Ok(())
     }
 
     async fn fetch(&self, key: &KvCacheKey, target: Device) -> ConnectorResult<FetchedKv> {
         let start = Instant::now();
+        let policy = self.config.runtime_policy();
         let mut inner = self.inner.lock().map_err(poisoned_lock_error)?;
         if inner
             .chunks
@@ -589,9 +628,7 @@ impl KvCacheConnector for LocalTieredConnector {
                     continue;
                 }
                 // Promote respecting pins: make room ourselves, then move tier.
-                if inner.page_table.free_count(Device::Gpu(0)) == 0
-                    && inner.page_table.hot_used_count() >= inner.page_table.hot_capacity()
-                {
+                if policy.needs_cold_migration(inner.page_table.hot_used_count(), 1) {
                     inner.demote_one(priority)?;
                 }
                 inner
@@ -617,6 +654,7 @@ impl KvCacheConnector for LocalTieredConnector {
         let Ok(mut inner) = self.inner.try_lock() else {
             return;
         };
+        let policy = self.config.runtime_policy();
         if let Device::Gpu(_) = target {
             let Some(entry) = inner.chunks.get(key).cloned() else {
                 return;
@@ -630,18 +668,17 @@ impl KvCacheConnector for LocalTieredConnector {
                 if already_hot {
                     continue;
                 }
-                if inner.page_table.free_count(Device::Gpu(0)) == 0
-                    && inner.page_table.hot_used_count() >= inner.page_table.hot_capacity()
+                if policy.needs_cold_migration(inner.page_table.hot_used_count(), 1)
                     && inner.demote_one(priority).is_err()
                 {
                     break;
                 }
-                if inner.page_table.hot_used_count() >= inner.page_table.hot_capacity() {
+                if policy.needs_cold_migration(inner.page_table.hot_used_count(), 1) {
                     break;
                 }
                 let _ = inner.page_table.migrate_page(pid, Device::Gpu(0));
             }
-            let _ = inner.spill_cold_payloads();
+            let _ = inner.spill_cold_payloads(policy);
         }
     }
 
@@ -700,7 +737,10 @@ impl KvCacheConnector for LocalTieredConnector {
 mod tests {
     use super::*;
     use crate::connector::{KvLayerPayload, KvPayload, KvPayloadDtype};
-    use crate::{HostPageStoreFactory, KvError, KvPageStore, KvPageStoreFactory, PageStoreLayout};
+    use crate::{
+        HostPageStoreFactory, InMemoryKvBackingStore, KvError, KvPageStore, KvPageStoreFactory,
+        PageStoreLayout,
+    };
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -727,6 +767,7 @@ mod tests {
 
     fn key(model: &str, chunk_index: u32, chunk_hash: u64, num_tokens: u32) -> KvCacheKey {
         KvCacheKey {
+            isolation: KvCacheIsolation::Session(1),
             model_id: model.to_string(),
             layer_range: 0..1,
             chunk_hash,
@@ -768,6 +809,7 @@ mod tests {
             key,
             priority,
             ttl: None,
+            disposition: StateStorageDisposition::new(true, true),
         }
     }
 
@@ -819,6 +861,7 @@ mod tests {
                 kv_data: expected_first.clone(),
                 priority: CachePriority::Session,
                 ttl: None,
+                disposition: StateStorageDisposition::new(true, true),
             })
             .await
             .unwrap();
@@ -827,6 +870,7 @@ mod tests {
                 kv_data: expected_second.clone(),
                 priority: CachePriority::Session,
                 ttl: None,
+                disposition: StateStorageDisposition::new(true, true),
             })
             .await
             .unwrap();
@@ -835,6 +879,7 @@ mod tests {
                 kv_data: expected_third.clone(),
                 priority: CachePriority::Session,
                 ttl: None,
+                disposition: StateStorageDisposition::new(true, true),
             })
             .await
             .unwrap();
@@ -999,6 +1044,80 @@ mod tests {
         // A surviving chunk still round-trips its exact payload.
         let fetched = conn.fetch(&k2, Device::Gpu(0)).await.unwrap();
         assert_eq!(fetched.payload, payload_for(&k2, 2, 4));
+    }
+
+    #[tokio::test]
+    async fn nonrecomputable_entries_survive_cache_budget_pressure() {
+        let mut cfg = small_config();
+        cfg.max_cached_pages = 1;
+        let conn = LocalTieredConnector::new(cfg).unwrap();
+        let first = key("m", 0, 1, 4);
+        let second = key("m", 1, 2, 4);
+        for cache_key in [&first, &second] {
+            let mut entry = store_entry(cache_key.clone(), CachePriority::Session);
+            entry.disposition = StateStorageDisposition::new(true, false);
+            conn.store(entry).await.unwrap();
+        }
+        assert_ne!(
+            conn.lookup(&first).await.unwrap(),
+            KvCacheLocation::NotFound
+        );
+        assert_ne!(
+            conn.lookup(&second).await.unwrap(),
+            KvCacheLocation::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn nonspillable_entries_remain_in_host_memory() {
+        let parent = unique_temp_path("nonspillable");
+        let mut cfg = small_config();
+        cfg.hot_capacity = 1;
+        cfg.disk_backend = Some(DiskTierConfig {
+            path: parent.clone(),
+        });
+        let conn = LocalTieredConnector::new(cfg).unwrap();
+        let first = key("m", 0, 1, 4);
+        let mut entry = store_entry(first.clone(), CachePriority::Session);
+        entry.disposition = StateStorageDisposition::new(false, true);
+        conn.store(entry).await.unwrap();
+        conn.store(store_entry(key("m", 1, 2, 4), CachePriority::Session))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            conn.lookup(&first).await.unwrap(),
+            KvCacheLocation::LocalCpu { .. }
+        ));
+        assert_eq!(conn.spill_count().unwrap(), 0);
+        drop(conn);
+        assert!(std::fs::read_dir(&parent).unwrap().next().is_none());
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn isolation_partition_prevents_cross_tenant_reuse() {
+        let conn = LocalTieredConnector::new(small_config()).unwrap();
+        let tenant_a = KvCacheKey {
+            isolation: KvCacheIsolation::SharedDomain("tenant-a".to_owned()),
+            ..key("m", 0, 1, 4)
+        };
+        let tenant_b = KvCacheKey {
+            isolation: KvCacheIsolation::SharedDomain("tenant-b".to_owned()),
+            ..tenant_a.clone()
+        };
+        conn.store(store_entry(tenant_a.clone(), CachePriority::SystemPrompt))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            conn.lookup(&tenant_a).await.unwrap(),
+            KvCacheLocation::NotFound
+        );
+        assert_eq!(
+            conn.lookup(&tenant_b).await.unwrap(),
+            KvCacheLocation::NotFound
+        );
     }
 
     #[tokio::test]
@@ -1177,10 +1296,19 @@ mod tests {
         cfg.disk_backend = Some(DiskTierConfig {
             path: unavailable_path.clone(),
         });
-        let degraded = LocalTieredConnector::new(cfg).unwrap();
-        let health = degraded.health().await;
+        let error = LocalTieredConnector::new(cfg).err().unwrap();
+        let mut override_cfg = small_config();
+        override_cfg.disk_backend = Some(DiskTierConfig {
+            path: unavailable_path.clone(),
+        });
+        LocalTieredConnector::with_backing_store(
+            override_cfg,
+            Box::new(InMemoryKvBackingStore::default()),
+        )
+        .unwrap();
         std::fs::remove_file(unavailable_path).unwrap();
-        assert!(matches!(health, ConnectorHealth::Degraded { .. }));
+        assert!(matches!(error, ConnectorError::Backend(message) if
+            message.contains("cannot initialize lossless F32 disk tier")));
     }
 
     #[tokio::test]
@@ -1345,6 +1473,7 @@ mod tests {
         };
         let conn = LocalTieredConnector::new(cfg).unwrap();
         let k = KvCacheKey {
+            isolation: KvCacheIsolation::Session(1),
             model_id: "test-model".to_string(),
             layer_range: 0..NUM_LAYERS,
             chunk_hash: 0xDEAD_BEEF,
@@ -1356,6 +1485,7 @@ mod tests {
             kv_data: original.clone(),
             priority: CachePriority::Session,
             ttl: None,
+            disposition: StateStorageDisposition::new(true, true),
         })
         .await
         .unwrap();

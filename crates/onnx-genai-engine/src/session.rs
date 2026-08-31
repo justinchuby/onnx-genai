@@ -32,6 +32,10 @@ pub(crate) struct ActiveGenerate {
     /// interpreter method the run-to-completion path drives in a `for`, rather
     /// than running a second loop that would have to restate the semantics.
     pub(crate) cursor: crate::pipeline::WorkflowGenerationCursor,
+    /// Baseline for every runtime-owned decoder participant. This remains
+    /// attached to the multi-step request until it has either committed or
+    /// aborted; per-step scheduling must not make a partial turn durable.
+    pub(crate) turn: crate::engine::DecoderTurnParticipant,
     pub(crate) session_id: SessionId,
     pub(crate) state: EngineSession,
     pub(crate) options: GenerateOptions,
@@ -45,6 +49,9 @@ pub(crate) struct ActiveGenerate {
     pub(crate) budget_cap: Option<GenerationBudgetCap>,
     pub(crate) step: usize,
     pub(crate) rng: SamplingRng,
+    /// A stop reached by authored loop setup before the first scheduled body
+    /// iteration.
+    pub(crate) setup_finish: Option<crate::FinishReason>,
 }
 
 pub(crate) struct DraftModel {

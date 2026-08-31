@@ -13,10 +13,24 @@
 
 mod common;
 
+use std::sync::{Mutex, MutexGuard};
+
 use common::{
     absent_input, assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
 };
 use onnx_runtime_ir::{Attribute, DataType};
+
+static MHA_GPU_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_mha_gpu() -> MutexGuard<'static, ()> {
+    MHA_GPU_LOCK.lock().unwrap_or_else(|poisoned| {
+        eprintln!(
+            "WARNING: MHA_GPU_LOCK was poisoned by a prior test panic — recovering. \
+             Investigate the original failure above."
+        );
+        poisoned.into_inner()
+    })
+}
 
 const OP: &str = "MultiHeadAttention";
 const DOMAIN: &str = "com.microsoft";
@@ -230,6 +244,7 @@ fn all_dtypes() -> [DataType; 3] {
 )]
 #[test]
 fn self_attention_decode_and_prefill() {
+    let _suite_lock = lock_mha_gpu();
     let ep = require_cuda();
     for dtype in all_dtypes() {
         // Prefill: S=L=4.
@@ -267,6 +282,7 @@ fn self_attention_decode_and_prefill() {
 )]
 #[test]
 fn causal_prefill_matches_cpu() {
+    let _suite_lock = lock_mha_gpu();
     let ep = require_cuda();
     for dtype in all_dtypes() {
         check(
@@ -291,6 +307,7 @@ fn causal_prefill_matches_cpu() {
 )]
 #[test]
 fn with_bias_matches_cpu() {
+    let _suite_lock = lock_mha_gpu();
     let ep = require_cuda();
     for dtype in all_dtypes() {
         check(
@@ -315,6 +332,7 @@ fn with_bias_matches_cpu() {
 )]
 #[test]
 fn cross_attention_bnsh_kv_matches_cpu() {
+    let _suite_lock = lock_mha_gpu();
     let ep = require_cuda();
     for dtype in all_dtypes() {
         check(
@@ -339,6 +357,7 @@ fn cross_attention_bnsh_kv_matches_cpu() {
 )]
 #[test]
 fn past_kv_cache_matches_cpu() {
+    let _suite_lock = lock_mha_gpu();
     let ep = require_cuda();
     for dtype in all_dtypes() {
         // Decode step attending a 4-long cache plus 1 new key, present emitted.
@@ -365,6 +384,7 @@ fn past_kv_cache_matches_cpu() {
 )]
 #[test]
 fn key_padding_mask_forms_match_cpu() {
+    let _suite_lock = lock_mha_gpu();
     let ep = require_cuda();
     for dtype in all_dtypes() {
         // KeyLen (B,): both rows keep a real (well-conditioned) subset of keys.
@@ -416,6 +436,7 @@ fn key_padding_mask_forms_match_cpu() {
 )]
 #[test]
 fn fully_padded_row_matches_cpu_f32() {
+    let _suite_lock = lock_mha_gpu();
     let ep = require_cuda();
     check(
         Case {
@@ -439,6 +460,7 @@ fn fully_padded_row_matches_cpu_f32() {
 )]
 #[test]
 fn attention_bias_broadcasts_match_cpu() {
+    let _suite_lock = lock_mha_gpu();
     let ep = require_cuda();
     for dtype in all_dtypes() {
         let (batch, num_heads, q_seq, kv_seq) = (2usize, 2usize, 3usize, 3usize);
@@ -482,6 +504,7 @@ fn attention_bias_broadcasts_match_cpu() {
 )]
 #[test]
 fn bias_mask_and_present_together_match_cpu() {
+    let _suite_lock = lock_mha_gpu();
     let ep = require_cuda();
     for dtype in all_dtypes() {
         check(

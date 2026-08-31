@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::{Mutex, MutexGuard};
+
 use common::{
     Tensor, build_graph, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
 };
@@ -7,6 +9,18 @@ use onnx_runtime_ep_api::{ExecutionProvider, KernelMatch};
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, cufft_plan_cache_stats};
 use onnx_runtime_ir::{Attribute, DataType, TensorLayout, static_shape};
 use onnx_runtime_loader::Model;
+
+static DFT_GPU_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_dft_gpu() -> MutexGuard<'static, ()> {
+    DFT_GPU_LOCK.lock().unwrap_or_else(|poisoned| {
+        eprintln!(
+            "WARNING: DFT_GPU_LOCK was poisoned by a prior test panic — recovering. \
+             Investigate the original failure above."
+        );
+        poisoned.into_inner()
+    })
+}
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
@@ -25,11 +39,22 @@ fn dft(
     attrs: &[(&str, Attribute)],
     optional: &[Tensor],
 ) -> Vec<f32> {
+    dft_at(ep, 20, input_tensor, output_shape, attrs, optional)
+}
+
+fn dft_at(
+    ep: &onnx_runtime_ep_cuda::CudaExecutionProvider,
+    opset: u64,
+    input_tensor: Tensor,
+    output_shape: &[usize],
+    attrs: &[(&str, Attribute)],
+    optional: &[Tensor],
+) -> Vec<f32> {
     let mut inputs = vec![input_tensor];
     inputs.extend_from_slice(optional);
     let outputs = [(DataType::Float32, output_shape.to_vec())];
     decode_floats(
-        &run_cuda(ep, "DFT", "", 20, &inputs, &outputs, attrs)[0],
+        &run_cuda(ep, "DFT", "", opset, &inputs, &outputs, attrs)[0],
         DataType::Float32,
     )
 }
@@ -40,11 +65,21 @@ fn cpu_dft(
     attrs: &[(&str, Attribute)],
     optional: &[Tensor],
 ) -> Vec<f32> {
+    cpu_dft_at(20, input_tensor, output_shape, attrs, optional)
+}
+
+fn cpu_dft_at(
+    opset: u64,
+    input_tensor: Tensor,
+    output_shape: &[usize],
+    attrs: &[(&str, Attribute)],
+    optional: &[Tensor],
+) -> Vec<f32> {
     let mut inputs = vec![input_tensor];
     inputs.extend_from_slice(optional);
     let outputs = [(DataType::Float32, output_shape.to_vec())];
     decode_floats(
-        &run_cpu("DFT", "", 20, &inputs, &outputs, attrs)[0],
+        &run_cpu("DFT", "", opset, &inputs, &outputs, attrs)[0],
         DataType::Float32,
     )
 }
@@ -54,7 +89,53 @@ fn cpu_dft(
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn opset_defaults_and_explicit_axes_match_cpu_on_rank4_input() {
+    let _suite_lock = lock_dft_gpu();
+    let ep = require_cuda();
+    let tensor = float_input(DataType::Float32, &[1, 8, 6, 1], &[0.0; 48]);
+    let onesided = [("onesided", Attribute::Int(1))];
+
+    let opset17 = dft_at(&ep, 17, tensor.clone(), &[1, 5, 6, 2], &onesided, &[]);
+    assert_close(
+        &opset17,
+        &cpu_dft_at(17, tensor.clone(), &[1, 5, 6, 2], &onesided, &[]),
+        1e-5,
+    );
+
+    let opset20 = dft_at(&ep, 20, tensor.clone(), &[1, 8, 4, 2], &onesided, &[]);
+    assert_close(
+        &opset20,
+        &cpu_dft_at(20, tensor.clone(), &[1, 8, 4, 2], &onesided, &[]),
+        1e-5,
+    );
+
+    let axis_attr = [("onesided", Attribute::Int(1)), ("axis", Attribute::Int(2))];
+    let explicit_attr = dft_at(&ep, 17, tensor.clone(), &[1, 8, 4, 2], &axis_attr, &[]);
+    assert_close(
+        &explicit_attr,
+        &cpu_dft_at(17, tensor.clone(), &[1, 8, 4, 2], &axis_attr, &[]),
+        1e-5,
+    );
+
+    let optional = [
+        common::absent_input(DataType::Undefined),
+        input(DataType::Int64, &[], &[1_i64]),
+    ];
+    let explicit_input = dft_at(&ep, 20, tensor.clone(), &[1, 5, 6, 2], &onesided, &optional);
+    assert_close(
+        &explicit_input,
+        &cpu_dft_at(20, tensor, &[1, 5, 6, 2], &onesided, &optional),
+        1e-5,
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn forward_complex_n4_pins_sign_convention() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let input = float_input(
         DataType::Float32,
@@ -73,6 +154,7 @@ fn forward_complex_n4_pins_sign_convention() {
 )]
 #[test]
 fn inverse_complex_n4_applies_exactly_one_over_n() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let spectrum = float_input(
         DataType::Float32,
@@ -91,6 +173,7 @@ fn inverse_complex_n4_applies_exactly_one_over_n() {
 )]
 #[test]
 fn real_full_has_conjugate_tail_and_onesided_has_n_over_two_plus_one() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let input = float_input(DataType::Float32, &[1, 4, 1], &[1.0, 2.0, 3.0, 4.0]);
     let full = dft(&ep, input.clone(), &[1, 4, 2], &[], &[]);
@@ -114,6 +197,7 @@ fn real_full_has_conjugate_tail_and_onesided_has_n_over_two_plus_one() {
 )]
 #[test]
 fn dft_length_truncates_and_zero_pads() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let input_tensor = float_input(DataType::Float32, &[1, 4, 1], &[1.0, -2.0, 0.5, 3.0]);
     for length in [2_i64, 7] {
@@ -142,6 +226,7 @@ fn dft_length_truncates_and_zero_pads() {
 )]
 #[test]
 fn batched_non_default_axis_matches_cpu() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let values = (0..2 * 3 * 4)
         .map(|index| (index as f32 - 7.0) * 0.25)
@@ -161,6 +246,7 @@ fn batched_non_default_axis_matches_cpu() {
 )]
 #[test]
 fn claim_gates_decline_unsupported_dtype_layout_and_complex_onesided() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     assert!(CUDA_COVERED_OPS.contains(&"DFT"));
 
@@ -236,6 +322,7 @@ fn claim_gates_decline_unsupported_dtype_layout_and_complex_onesided() {
 )]
 #[test]
 fn repeated_geometry_reuses_bounded_cufft_plan_and_declares_capture_unsupported() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let values = (0..13)
         .map(|index| index as f32 * 0.125)

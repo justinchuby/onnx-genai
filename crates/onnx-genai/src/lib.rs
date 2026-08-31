@@ -19,7 +19,8 @@ pub use onnx_genai_engine::{
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
     GenerateTokenCallback, GenerationBudgetCap, GreedySampler, JsonConstraint, LogitProcessor,
     MirostatConfig, MirostatVersion, ProcessorChain, ProcessorChainBuilder, ProcessorContext,
-    ProcessorSignal, Sampler, SamplingOverrides, SessionId, SpeculativeAcceptContext,
-    SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext, StopSequence, TokenId,
-    XtcConfig,
+    ProcessorSignal, Sampler, SamplingOverrides, SessionForkError, SessionForkParticipant,
+    SessionForkParticipantKind, SessionForkPlan, SessionId, SessionPosition,
+    SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
+    StopSequence, TokenId, XtcConfig,
 };

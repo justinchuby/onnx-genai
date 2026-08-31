@@ -2164,18 +2164,6 @@ impl CudaWeightPage {
         Self::upload_async_inner(runtime, dtype, shape, bytes, staging, None)
     }
 
-    #[cfg(test)]
-    pub(crate) fn upload_async_queued(
-        runtime: &Arc<CudaRuntime>,
-        dtype: DataType,
-        shape: Vec<usize>,
-        bytes: &[u8],
-        staging: PinnedStaging,
-        queue: Arc<CudaDeferredReleaseQueue>,
-    ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
-        Self::upload_async_inner(runtime, dtype, shape, bytes, staging, Some(queue))
-    }
-
     fn upload_async_inner(
         runtime: &Arc<CudaRuntime>,
         dtype: DataType,
@@ -2869,6 +2857,7 @@ struct PhysicalAdmission {
 struct RouteWeightReservation {
     identity: FinalizedExpertWeight,
     allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+    health: Arc<RouteReservationHealth>,
     ptr: CUdeviceptr,
     len: usize,
 }
@@ -2880,6 +2869,44 @@ struct RouteReservationSet {
     device_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
     host_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
     groups: Vec<onnx_runtime_ep_api::ExpertWeightGroup>,
+    health: Arc<RouteReservationHealth>,
+}
+
+#[doc(hidden)]
+pub struct RouteReservationHealth {
+    usable: AtomicBool,
+    reason: Mutex<Option<String>>,
+}
+
+impl RouteReservationHealth {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            usable: AtomicBool::new(true),
+            reason: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn mark_unusable(&self, reason: String) {
+        if self.usable.swap(false, Ordering::AcqRel) {
+            *self
+                .reason
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
+        }
+    }
+
+    pub(crate) fn ensure_usable(&self) -> Result<(), String> {
+        if self.usable.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let reason = self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| "reservation health was invalidated".to_string());
+        Err(reason)
+    }
 }
 
 #[derive(Clone)]
@@ -2889,6 +2916,7 @@ pub struct RouteReservationAuthorities {
     pub device_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
     pub host_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
     pub groups: Vec<onnx_runtime_ep_api::ExpertWeightGroup>,
+    pub(crate) health: Arc<RouteReservationHealth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4065,6 +4093,7 @@ impl CudaWeightResidency {
         > = Arc::clone(queue)
             as Arc<dyn onnx_runtime_cuda_memory::virtual_memory::DeferredReservationQueue>;
 
+        let health = RouteReservationHealth::new();
         let mut by_key = HashMap::new();
         let mut catalogs = HashMap::new();
         let mut allocators = HashMap::new();
@@ -4109,6 +4138,7 @@ impl CudaWeightResidency {
             let reservation = Arc::new(RouteWeightReservation {
                 identity: member.clone(),
                 allocator: Arc::clone(&allocator),
+                health: Arc::clone(&health),
                 ptr: ptr.as_ptr() as CUdeviceptr,
                 len: member.catalog.tensor_len(),
             });
@@ -4124,6 +4154,7 @@ impl CudaWeightResidency {
             device_pool,
             host_pool,
             groups: banks.iter().map(|bank| bank.group.clone()).collect(),
+            health,
         });
         installed.insert(executor, Arc::clone(&set));
         Ok(Self::authorities_from_set(&set))
@@ -4136,6 +4167,7 @@ impl CudaWeightResidency {
             device_pool: Arc::clone(&set.device_pool),
             host_pool: Arc::clone(&set.host_pool),
             groups: set.groups.clone(),
+            health: Arc::clone(&set.health),
         }
     }
 
@@ -4188,6 +4220,13 @@ impl CudaWeightResidency {
         let Some(reservation) = reservation else {
             return Ok(None);
         };
+        reservation.health.ensure_usable().map_err(|reason| {
+            WeightHandleError::DeviceBinding(format!(
+                "route-bank value key {key} is unavailable because its executor-scoped \
+                 reservation was invalidated after a failed atomic residency transition: \
+                 {reason}; tear down and rebuild the executor"
+            ))
+        })?;
         if weight.boundary != reservation.identity.weight.boundary
             || weight.dtype != reservation.identity.weight.dtype
             || weight.shape != reservation.identity.weight.shape

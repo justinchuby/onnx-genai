@@ -2,19 +2,11 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - serving_service_contract
-      - session_state_lease
-      - nested_control_flow
+    manifest: {}
     inputs:
       request.active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -29,7 +21,6 @@ pipeline:
       request.done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -44,7 +35,6 @@ pipeline:
       request.accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -59,7 +49,6 @@ pipeline:
       request.observation:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 3
@@ -77,7 +66,6 @@ pipeline:
       request.action:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - action_dim
@@ -93,7 +81,6 @@ pipeline:
       request.world_state:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - latent_dim
@@ -109,7 +96,6 @@ pipeline:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -123,7 +109,6 @@ pipeline:
       package.continue:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -136,7 +121,6 @@ pipeline:
       predicted_observation:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 3
@@ -150,7 +134,6 @@ pipeline:
       latent:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - latent_dim
@@ -168,7 +151,6 @@ pipeline:
           inputs:
             world_state:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - latent_dim
@@ -177,7 +159,6 @@ pipeline:
                 axis: 0
             observation:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 3
@@ -188,7 +169,6 @@ pipeline:
                 axis: 0
             action:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - action_dim
@@ -198,7 +178,6 @@ pipeline:
           outputs:
             next_world_state:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - latent_dim
@@ -207,7 +186,6 @@ pipeline:
                 axis: 0
             predicted_observation:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 3
@@ -218,7 +196,6 @@ pipeline:
                 axis: 0
             latent:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - latent_dim
@@ -229,7 +206,6 @@ pipeline:
       world_state:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - latent_dim
@@ -246,7 +222,6 @@ pipeline:
       predicted_observation:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 3
@@ -262,7 +237,6 @@ pipeline:
       latent:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - latent_dim

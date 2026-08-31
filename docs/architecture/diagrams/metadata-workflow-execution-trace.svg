@@ -1,0 +1,237 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1440" viewBox="0 0 2560 1440" role="img" aria-label="Inference metadata workflow execution trace">
+<defs><marker id="arrow-blue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2D6B9A"/></marker><marker id="arrow-coral" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#C64E42"/></marker><marker id="arrow-green" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2E7D4F"/></marker><marker id="arrow-purple" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#6E4DA3"/></marker><marker id="arrow-amber" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#B7791F"/></marker><marker id="arrow-navy" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#315B7D"/></marker></defs>
+<rect x="0" y="0" width="2560" height="1440" rx="8" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="0"/>
+<text x="38" y="52" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="30" font-weight="700" fill="#163A5F"><tspan x="38" dy="0">Inference Metadata: Workflow Execution Trace</tspan></text>
+<text x="40" y="75" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="500" fill="#5C6B7A"><tspan x="40" dy="0">One turn, in semantic time order — responsibilities describe the contract, not a current implementation.</tspan></text>
+<rect x="1320" y="20" width="16" height="16" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1"/>
+<text x="1343" y="31" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="600" fill="#3B4854"><tspan x="1343" dy="0">Normative metadata</tspan></text>
+<rect x="1620" y="20" width="16" height="16" rx="8" fill="#E8F0F8" stroke="#315B7D" stroke-width="1"/>
+<text x="1643" y="31" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="600" fill="#3B4854"><tspan x="1643" dy="0">Package / graph facts</tspan></text>
+<rect x="1920" y="20" width="16" height="16" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1"/>
+<text x="1943" y="31" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="600" fill="#3B4854"><tspan x="1943" dy="0">Runtime policy / setup</tspan></text>
+<rect x="1320" y="49" width="16" height="16" rx="8" fill="#E3F2FD" stroke="#2D6B9A" stroke-width="1"/>
+<text x="1343" y="60" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="600" fill="#3B4854"><tspan x="1343" dy="0">Execution / data flow</tspan></text>
+<rect x="1620" y="49" width="16" height="16" rx="8" fill="#E7F5EA" stroke="#2E7D4F" stroke-width="1"/>
+<text x="1643" y="60" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="600" fill="#3B4854"><tspan x="1643" dy="0">Committed</tspan></text>
+<rect x="1920" y="49" width="16" height="16" rx="8" fill="#FDE9E7" stroke="#C64E42" stroke-width="1"/>
+<text x="1943" y="60" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="600" fill="#3B4854"><tspan x="1943" dy="0">Provisional / abort</tspan></text>
+<text x="2240" y="86.5" text-anchor="end" font-family="Inter,Arial,sans-serif" font-size="9.5" font-weight="500" fill="#5C6B7A"><tspan x="2240" dy="0">Solid = semantic flow   Thick = carry/commit   Dashed = optional   Dotted = validation   Red dashed = rollback</tspan></text>
+<rect x="200" y="100" width="305" height="1290" rx="8" fill="#FBFCFE" stroke="#D6E1EB" stroke-width="1"/>
+<rect x="200" y="100" width="305" height="36" rx="8" fill="#163A5F" stroke="#163A5F" stroke-width="1"/>
+<text x="352.5" y="118" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#FFFFFF"><tspan x="352.5" dy="0">Package + Metadata</tspan><tspan x="352.5" dy="15.0">Interpreter</tspan></text>
+<rect x="515" y="100" width="305" height="1290" rx="8" fill="#FBFCFE" stroke="#D6E1EB" stroke-width="1"/>
+<rect x="515" y="100" width="305" height="36" rx="8" fill="#163A5F" stroke="#163A5F" stroke-width="1"/>
+<text x="667.5" y="118" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#FFFFFF"><tspan x="667.5" dy="0">Validator +</tspan><tspan x="667.5" dy="15.0">Execution Planner</tspan></text>
+<rect x="830" y="100" width="335" height="1290" rx="8" fill="#FBFCFE" stroke="#D6E1EB" stroke-width="1"/>
+<rect x="830" y="100" width="335" height="36" rx="8" fill="#163A5F" stroke="#163A5F" stroke-width="1"/>
+<text x="997.5" y="118" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#FFFFFF"><tspan x="997.5" dy="0">Runtime Scheduler /</tspan><tspan x="997.5" dy="15.0">Request Admission</tspan></text>
+<rect x="1175" y="100" width="315" height="1290" rx="8" fill="#FBFCFE" stroke="#D6E1EB" stroke-width="1"/>
+<rect x="1175" y="100" width="315" height="36" rx="8" fill="#163A5F" stroke="#163A5F" stroke-width="1"/>
+<text x="1332.5" y="118" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#FFFFFF"><tspan x="1332.5" dy="0">Memory + Device /</tspan><tspan x="1332.5" dy="15.0">EP Layer</tspan></text>
+<rect x="1500" y="100" width="345" height="1290" rx="8" fill="#FBFCFE" stroke="#D6E1EB" stroke-width="1"/>
+<rect x="1500" y="100" width="345" height="36" rx="8" fill="#163A5F" stroke="#163A5F" stroke-width="1"/>
+<text x="1672.5" y="118" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#FFFFFF"><tspan x="1672.5" dy="0">Component / Graph</tspan><tspan x="1672.5" dy="15.0">Executor</tspan></text>
+<rect x="1855" y="100" width="325" height="1290" rx="8" fill="#FBFCFE" stroke="#D6E1EB" stroke-width="1"/>
+<rect x="1855" y="100" width="325" height="36" rx="8" fill="#163A5F" stroke="#163A5F" stroke-width="1"/>
+<text x="2017.5" y="118" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#FFFFFF"><tspan x="2017.5" dy="0">State + Transaction</tspan><tspan x="2017.5" dy="15.0">Manager</tspan></text>
+<rect x="2190" y="100" width="325" height="1290" rx="8" fill="#FBFCFE" stroke="#D6E1EB" stroke-width="1"/>
+<rect x="2190" y="100" width="325" height="36" rx="8" fill="#163A5F" stroke="#163A5F" stroke-width="1"/>
+<text x="2352.5" y="118" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#FFFFFF"><tspan x="2352.5" dy="0">Output /</tspan><tspan x="2352.5" dy="15.0">Host Adapter</tspan></text>
+<rect x="24" y="100" width="160" height="1290" rx="8" fill="#F7F9FC" stroke="#BED0E1" stroke-width="1"/>
+<text x="104" y="124" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#163A5F"><tspan x="104" dy="0">TIME ↓</tspan></text>
+<line x1="104" y1="135" x2="104" y2="1376" stroke="#315B7D" stroke-width="3" marker-end="url(#arrow-navy)"/>
+<rect x="32" y="145" width="144" height="120" rx="8" fill="#EEF3F8" stroke="#BED0E1" stroke-width="1"/>
+<text x="47" y="170" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#6E4DA3"><tspan x="47" dy="0">PHASE 0</tspan></text>
+<text x="47" y="188" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#163A5F"><tspan x="47" dy="0">LOAD + INTERPRET</tspan></text>
+<rect x="32" y="275" width="144" height="165" rx="8" fill="#EEF3F8" stroke="#BED0E1" stroke-width="1"/>
+<text x="47" y="300" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#6E4DA3"><tspan x="47" dy="0">PHASE 1</tspan></text>
+<text x="47" y="318" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#163A5F"><tspan x="47" dy="0">PLAN + PREPARE</tspan></text>
+<rect x="32" y="450" width="144" height="155" rx="8" fill="#EEF3F8" stroke="#BED0E1" stroke-width="1"/>
+<text x="47" y="475" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#6E4DA3"><tspan x="47" dy="0">PHASE 2</tspan></text>
+<text x="47" y="493" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#163A5F"><tspan x="47" dy="0">ADMIT + PREPARE INPUTS</tspan></text>
+<rect x="32" y="615" width="144" height="160" rx="8" fill="#EEF3F8" stroke="#BED0E1" stroke-width="1"/>
+<text x="47" y="640" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#6E4DA3"><tspan x="47" dy="0">PHASE 3</tspan></text>
+<text x="47" y="658" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#163A5F"><tspan x="47" dy="0">ROOT / PREFILL + SETUP</tspan></text>
+<rect x="32" y="785" width="144" height="255" rx="8" fill="#EEF3F8" stroke="#BED0E1" stroke-width="1"/>
+<text x="47" y="810" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#6E4DA3"><tspan x="47" dy="0">PHASE 4</tspan></text>
+<text x="47" y="828" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#163A5F"><tspan x="47" dy="0">DECODE / GENERATE ITERATION</tspan></text>
+<rect x="32" y="1050" width="144" height="110" rx="8" fill="#EEF3F8" stroke="#BED0E1" stroke-width="1"/>
+<text x="47" y="1075" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#6E4DA3"><tspan x="47" dy="0">PHASE 5</tspan></text>
+<text x="47" y="1093" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#163A5F"><tspan x="47" dy="0">OUTPUT BOUNDARY</tspan></text>
+<rect x="32" y="1170" width="144" height="120" rx="8" fill="#EEF3F8" stroke="#BED0E1" stroke-width="1"/>
+<text x="47" y="1195" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#6E4DA3"><tspan x="47" dy="0">PHASE 6</tspan></text>
+<text x="47" y="1213" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#163A5F"><tspan x="47" dy="0">COMMIT OR ABORT</tspan></text>
+<rect x="32" y="1300" width="144" height="90" rx="8" fill="#EEF3F8" stroke="#BED0E1" stroke-width="1"/>
+<text x="47" y="1325" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#6E4DA3"><tspan x="47" dy="0">PHASE 7</tspan></text>
+<text x="47" y="1343" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#163A5F"><tspan x="47" dy="0">RETAIN + REUSE</tspan></text>
+<rect x="210" y="158" width="142" height="91" rx="8" fill="#E8F0F8" stroke="#315B7D" stroke-width="1.4"/>
+<text x="220" y="176.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="700" fill="#163A5F"><tspan x="220" dy="0">Read package facts</tspan></text>
+<text x="220" y="193.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9.5" font-weight="500" fill="#163A5F"><tspan x="220" dy="0">manifest/schema</tspan><tspan x="220" dy="11.875">components + artifacts</tspan><tspan x="220" dy="11.875">ports/tensors/layouts</tspan><tspan x="220" dy="11.875">workflow + control</tspan></text>
+<rect x="363" y="158" width="132" height="91" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1.4"/>
+<text x="373" y="176.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="700" fill="#3F2A61"><tspan x="373" dy="0">Read contracts</tspan></text>
+<text x="373" y="193.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9.5" font-weight="500" fill="#3F2A61"><tspan x="373" dy="0">outputs/publication</tspan><tspan x="373" dy="11.875">state groups + cells</tspan><tspan x="373" dy="11.875">tool/speculative</tspan><tspan x="373" dy="11.875">capabilities</tspan></text>
+<rect x="525" y="158" width="285" height="91" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1.4"/>
+<text x="535" y="178" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#3F2A61"><tspan x="535" dy="0">Validate semantic closure</tspan></text>
+<text x="535" y="194.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#3F2A61"><tspan x="535" dy="0">identity/version • SSA/dataflow</tspan><tspan x="535" dy="13.125">shapes/dtypes/layouts</tspan><tspan x="535" dy="13.125">state readers/writers/final writer</tspan><tspan x="535" dy="13.125">effects + output protocol + participants</tspan></text>
+<rect x="840" y="170" width="315" height="67" rx="8" fill="#FDE9E7" stroke="#C64E42" stroke-width="1.4"/>
+<text x="850" y="190" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#87332B"><tspan x="850" dy="0">FAIL CLOSED</tspan></text>
+<text x="850" y="206.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#87332B"><tspan x="850" dy="0">Unsatisfied semantics stop before</tspan><tspan x="850" dy="13.125">allocation or mutation.</tspan></text>
+<line x1="495" y1="203" x2="525" y2="203" stroke="#6E4DA3" stroke-width="1.5" stroke-dasharray="3 5" marker-end="url(#arrow-purple)"/>
+<text x="455" y="191" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#6E4DA3"><tspan x="455" dy="0">admit facts</tspan></text>
+<line x1="820" y1="203" x2="840" y2="203" stroke="#C64E42" stroke-width="1.5" stroke-dasharray="3 5" marker-end="url(#arrow-coral)"/>
+<rect x="525" y="289" width="285" height="75" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1.4"/>
+<text x="535" y="309" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#3F2A61"><tspan x="535" dy="0">Build semantic execution plan</tspan></text>
+<text x="535" y="325.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#3F2A61"><tspan x="535" dy="0">Preserve branch / loop / setup /</tspan><tspan x="535" dy="13.125">emit / state semantics.</tspan></text>
+<rect x="840" y="289" width="315" height="75" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4" stroke-dasharray="8 5"/>
+<text x="850" y="309" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="850" dy="0">Choose runtime policy</tspan></text>
+<text x="850" y="325.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="850" dy="0">RUNTIME CHOICE</tspan><tspan x="850" dy="13.125">placement • scheduling • batching</tspan><tspan x="850" dy="13.125">cache policy • memory tier • kernels</tspan></text>
+<rect x="1185" y="289" width="295" height="75" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4"/>
+<text x="1195" y="309" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="1195" dy="0">Plan explicit transfers</tspan></text>
+<text x="1195" y="325.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="1195" dy="0">Map each component device.</tspan><tspan x="1195" dy="13.125">No implicit cross-device copy.</tspan></text>
+<rect x="1185" y="374" width="295" height="52" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4"/>
+<text x="1195" y="394" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="1195" dy="0">Classify lifetimes</tspan></text>
+<text x="1195" y="410.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="1195" dy="0">weights • session/row state • inputs</tspan><tspan x="1195" dy="13.125">scratch/intermediates • output journal</tspan></text>
+<rect x="1510" y="289" width="325" height="62" rx="8" fill="#E8F0F8" stroke="#315B7D" stroke-width="1.4"/>
+<text x="1520" y="309" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#163A5F"><tspan x="1520" dy="0">Load / compile components</tspan></text>
+<text x="1520" y="325.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#163A5F"><tspan x="1520" dy="0">Create sessions + kernels.</tspan></text>
+<rect x="1510" y="361" width="325" height="65" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4" stroke-dasharray="8 5"/>
+<text x="1520" y="381" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="1520" dy="0">Assess graph capture</tspan></text>
+<text x="1520" y="397.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="1520" dy="0">RUNTIME CHOICE</tspan><tspan x="1520" dy="13.125">stable topology/shapes/addresses/effects</tspan></text>
+<rect x="840" y="374" width="315" height="52" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4" stroke-dasharray="8 5"/>
+<text x="850" y="394" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="850" dy="0">Decline safely when ineligible</tspan></text>
+<text x="850" y="410.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="850" dy="0">Ordinary execution preserves semantics.</tspan></text>
+<line x1="820" y1="327" x2="840" y2="327" stroke="#6E4DA3" stroke-width="1.5" stroke-dasharray="3 5" marker-end="url(#arrow-purple)"/>
+<line x1="1165" y1="327" x2="1185" y2="327" stroke="#B7791F" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+<line x1="1490" y1="327" x2="1510" y2="327" stroke="#2D6B9A" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+<line x1="1672" y1="351" x2="1672" y2="361" stroke="#B7791F" stroke-width="1.5" stroke-dasharray="8 5" marker-end="url(#arrow-amber)"/>
+<text x="1680" y="357" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#B7791F"><tspan x="1680" dy="0">optional</tspan></text>
+<rect x="2200" y="464" width="305" height="126" rx="8" fill="#E3F2FD" stroke="#2D6B9A" stroke-width="1.4"/>
+<text x="2210" y="484" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#174C72"><tspan x="2210" dy="0">Receive host request</tspan></text>
+<text x="2210" y="500.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#174C72"><tspan x="2210" dy="0">prompt/messages • image/audio • tools</tspan><tspan x="2210" dy="13.125">generation policy</tspan><tspan x="2210" dy="13.125">external initial state / session ID</tspan></text>
+<rect x="840" y="464" width="315" height="62" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4"/>
+<text x="850" y="484" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="850" dy="0">Admit request + lease session</tspan></text>
+<text x="850" y="500.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="850" dy="0">Establish committed baseline:</tspan><tspan x="850" dy="13.125">semantic state • effects • output heads.</tspan></text>
+<rect x="210" y="464" width="285" height="126" rx="8" fill="#E8F0F8" stroke="#315B7D" stroke-width="1.4"/>
+<text x="220" y="484" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#163A5F"><tspan x="220" dy="0">Prepare declared inputs</tspan></text>
+<text x="220" y="500.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#163A5F"><tspan x="220" dy="0">tokenize / render prompt</tspan><tspan x="220" dy="13.125">preprocess image/audio</tspan><tspan x="220" dy="13.125">typed companions: lengths, masks,</tspan><tspan x="220" dy="13.125">positions, layout, grid, frame facts</tspan></text>
+<rect x="525" y="464" width="285" height="62" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1.4"/>
+<text x="535" y="484" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#3F2A61"><tspan x="535" dy="0">Check + bind</tspan></text>
+<text x="535" y="500.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#3F2A61"><tspan x="535" dy="0">Validate context/budgets/contracts.</tspan><tspan x="535" dy="13.125">Bind workflow inputs.</tspan></text>
+<rect x="1865" y="464" width="305" height="62" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1.4"/>
+<text x="1875" y="484" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#3F2A61"><tspan x="1875" dy="0">Separate two forms of reuse</tspan></text>
+<text x="1875" y="500.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#3F2A61"><tspan x="1875" dy="0">Session continuation = semantic restore.</tspan><tspan x="1875" dy="13.125">Prefix cache = compatible computation.</tspan></text>
+<rect x="840" y="536" width="315" height="54" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4" stroke-dasharray="8 5"/>
+<text x="850" y="556" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="850" dy="0">Choose rows + proposal</tspan></text>
+<text x="850" y="572.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="850" dy="0">isolated or live-row batch; target-only</tspan><tspan x="850" dy="13.125">or MTP/DFlash/etc. — declared + admitted</tspan></text>
+<line x1="2190" y1="527" x2="1165" y2="527" stroke="#2D6B9A" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+<line x1="1165" y1="495" x2="1145" y2="495" stroke="#6E4DA3" stroke-width="1.5" stroke-dasharray="3 5" marker-end="url(#arrow-purple)"/>
+<line x1="820" y1="495" x2="830" y2="495" stroke="#6E4DA3" stroke-width="1.5" stroke-dasharray="3 5" marker-end="url(#arrow-purple)"/>
+<line x1="1175" y1="557" x2="1855" y2="557" stroke="#6E4DA3" stroke-width="1.5" stroke-dasharray="8 5" marker-end="url(#arrow-purple)"/>
+<text x="1510" y="555" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#6E4DA3"><tspan x="1510" dy="0">separate contracts</tspan></text>
+<rect x="1865" y="629" width="305" height="65" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1.4"/>
+<text x="1875" y="649" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#3F2A61"><tspan x="1875" dy="0">Restore / initialize through dataflow</tspan></text>
+<text x="1875" y="665.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#3F2A61"><tspan x="1875" dy="0">Open a working transaction from the</tspan><tspan x="1875" dy="13.125">committed baseline.</tspan></text>
+<rect x="1185" y="629" width="295" height="65" rx="8" fill="#E3F2FD" stroke="#2D6B9A" stroke-width="1.4"/>
+<text x="1195" y="649" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#174C72"><tspan x="1195" dy="0">Transfer explicitly</tspan></text>
+<text x="1195" y="665.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#174C72"><tspan x="1195" dy="0">Inputs/intermediates move only to</tspan><tspan x="1195" dy="13.125">the selected component device.</tspan></text>
+<rect x="1510" y="629" width="325" height="65" rx="8" fill="#E3F2FD" stroke="#2D6B9A" stroke-width="1.4"/>
+<text x="1520" y="649" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#174C72"><tspan x="1520" dy="0">Execute root prefix + prefill</tspan></text>
+<text x="1520" y="665.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#174C72"><tspan x="1520" dy="0">Run selected graph components.</tspan></text>
+<rect x="1510" y="704" width="325" height="57" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1.4"/>
+<text x="1520" y="724" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#3F2A61"><tspan x="1520" dy="0">Run loop.setup exactly once</tspan></text>
+<text x="1520" y="740.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#3F2A61"><tspan x="1520" dy="0">Per loop entry — never assumed empty</tspan><tspan x="1520" dy="13.125">or forced root-only.</tspan></text>
+<rect x="1185" y="704" width="295" height="57" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4"/>
+<text x="1195" y="724" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="1195" dy="0">Provision declared working state</tspan></text>
+<text x="1195" y="740.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="1195" dy="0">KV/recurrent/n-gram histories • RNG</tspan><tspan x="1195" dy="13.125">grammar/effect/output working state</tspan></text>
+<rect x="1865" y="704" width="305" height="57" rx="8" fill="#FDE9E7" stroke="#C64E42" stroke-width="1.4"/>
+<text x="1875" y="724" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#87332B"><tspan x="1875" dy="0">Keep writes tentative</tspan></text>
+<text x="1875" y="740.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#87332B"><tspan x="1875" dy="0">Working state is not committed yet.</tspan></text>
+<line x1="2018" y1="661" x2="1490" y2="661" stroke="#2D6B9A" stroke-width="3" marker-end="url(#arrow-blue)"/>
+<line x1="1490" y1="661" x2="1510" y2="661" stroke="#2D6B9A" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+<line x1="1672" y1="694" x2="1672" y2="704" stroke="#6E4DA3" stroke-width="3" marker-end="url(#arrow-purple)"/>
+<line x1="1490" y1="732" x2="1500" y2="732" stroke="#B7791F" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+<line x1="1845" y1="732" x2="1855" y2="732" stroke="#C64E42" stroke-width="3" marker-end="url(#arrow-coral)"/>
+<rect x="840" y="799" width="315" height="67" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4" stroke-dasharray="8 5"/>
+<text x="850" y="819" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="850" dy="0">Select live rows + assemble batch</tspan></text>
+<text x="850" y="835.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="850" dy="0">Typed batch companions + row state.</tspan><tspan x="850" dy="13.125">Isolated fallback remains valid.</tspan></text>
+<rect x="1510" y="799" width="325" height="67" rx="8" fill="#E3F2FD" stroke="#2D6B9A" stroke-width="1.4"/>
+<text x="1520" y="819" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#174C72"><tspan x="1520" dy="0">Bind iteration inputs</tspan></text>
+<text x="1520" y="835.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#174C72"><tspan x="1520" dy="0">tokens/embeddings • positions/masks</tspan><tspan x="1520" dy="13.125">row state • iteration • policy inputs</tspan></text>
+<rect x="1185" y="876" width="295" height="56" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4" stroke-dasharray="8 5"/>
+<text x="1195" y="896" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="1195" dy="0">Capture / replay if eligible</tspan></text>
+<text x="1195" y="912.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="1195" dy="0">First eligible iteration records; dynamic</tspan><tspan x="1195" dy="13.125">incompatibility declines to ordinary flow.</tspan></text>
+<rect x="1510" y="876" width="325" height="56" rx="8" fill="#E3F2FD" stroke="#2D6B9A" stroke-width="1.4"/>
+<text x="1520" y="896" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#174C72"><tspan x="1520" dy="0">Execute normal target path</tspan></text>
+<text x="1520" y="912.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#174C72"><tspan x="1520" dy="0">Required target semantics remain valid.</tspan></text>
+<rect x="1510" y="942" width="325" height="84" rx="8" fill="#E3F2FD" stroke="#2D6B9A" stroke-width="1.4"/>
+<text x="1520" y="962" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#174C72"><tspan x="1520" dy="0">Sample / constrain / terminate</tspan></text>
+<text x="1520" y="978.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#174C72"><tspan x="1520" dy="0">Execute in the declared order.</tspan><tspan x="1520" dy="13.125">Produce tentative token/result values.</tspan></text>
+<rect x="1865" y="942" width="305" height="84" rx="8" fill="#FDE9E7" stroke="#C64E42" stroke-width="1.4"/>
+<text x="1875" y="962" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#87332B"><tspan x="1875" dy="0">Update tentative row working set</tspan></text>
+<text x="1875" y="978.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#87332B"><tspan x="1875" dy="0">state + effects + output journal.</tspan><tspan x="1875" dy="13.125">Finished: emit/release/compact.</tspan><tspan x="1875" dy="13.125">Preserve row ownership.</tspan></text>
+<rect x="850" y="875" width="1315" height="58" rx="8" fill="#FFF9F8" stroke="#C64E42" stroke-width="1.5" stroke-dasharray="8 5"/>
+<text x="860" y="888" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#87332B"><tspan x="860" dy="0">OPTIONAL SPECULATION — declared + admitted; preserves target semantics</tspan></text>
+<text x="875" y="909.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9.5" font-weight="500" fill="#87332B"><tspan x="875" dy="0">Proposer: explicit inputs / target features + draft-private state</tspan></text>
+<text x="1285" y="909.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9.5" font-weight="500" fill="#87332B"><tspan x="1285" dy="0">candidate block/path + probabilities</tspan></text>
+<text x="1625" y="909.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9.5" font-weight="500" fill="#87332B"><tspan x="1625" dy="0">target verifies → accepted prefix + correction/bonus</tspan></text>
+<text x="1985" y="909.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9.5" font-weight="500" fill="#87332B"><tspan x="1985" dy="0">crop / rollback target, draft, feature states</tspan></text>
+<line x1="1165" y1="833" x2="1510" y2="833" stroke="#2D6B9A" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+<line x1="1510" y1="904" x2="1845" y2="904" stroke="#C64E42" stroke-width="1.5" stroke-dasharray="8 5" marker-end="url(#arrow-coral)"/>
+<text x="1660" y="894" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#C64E42"><tspan x="1660" dy="0">verify</tspan></text>
+<line x1="2017" y1="933" x2="2017" y2="942" stroke="#C64E42" stroke-width="3" stroke-dasharray="8 5" marker-end="url(#arrow-coral)"/>
+<text x="2030" y="939" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#C64E42"><tspan x="2030" dy="0">accepted prefix</tspan></text>
+<line x1="1672" y1="932" x2="1672" y2="942" stroke="#B7791F" stroke-width="1.5" stroke-dasharray="8 5" marker-end="url(#arrow-amber)"/>
+<text x="1682" y="939" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#B7791F"><tspan x="1682" dy="0">capture replay</tspan></text>
+<line x1="1845" y1="984" x2="1855" y2="984" stroke="#2D6B9A" stroke-width="3" marker-end="url(#arrow-blue)"/>
+<line x1="1000" y1="866" x2="1000" y2="942" stroke="#B7791F" stroke-width="1.5" stroke-dasharray="8 5" marker-end="url(#arrow-amber)"/>
+<text x="1010" y="937" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#B7791F"><tspan x="1010" dy="0">next iteration</tspan></text>
+<rect x="1865" y="1064" width="305" height="37" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1.4"/>
+<text x="1875" y="1082" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#3F2A61"><tspan x="1875" dy="0">Carry emit semantics</tspan></text>
+<text x="1875" y="1098" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="8" font-weight="500" fill="#3F2A61"><tspan x="1875" dy="0">operation • guard • valid length • effect order</tspan></text>
+<rect x="1865" y="1106" width="305" height="38" rx="8" fill="#E3F2FD" stroke="#2D6B9A" stroke-width="1.4"/>
+<text x="1875" y="1124" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#174C72"><tspan x="1875" dy="0">Route token explicitly</tspan></text>
+<text x="1875" y="1140" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="8" font-weight="500" fill="#174C72"><tspan x="1875" dy="0">ID → tokenizer/decoder → host/tool parser/continuation</tspan></text>
+<rect x="2200" y="1064" width="305" height="80" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1.4"/>
+<text x="2210" y="1082" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10" font-weight="700" fill="#3F2A61"><tspan x="2210" dy="0">Publish declared output boundary</tspan></text>
+<text x="2210" y="1098" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="8" font-weight="500" fill="#3F2A61"><tspan x="2210" dy="0">typed values/events/revisions • protocol family in contract</tspan><tspan x="2210" dy="10.0">Host adapts detokenization, tool protocol, media assembly</tspan><tspan x="2210" dy="10.0">Transport framing/backpressure OUTSIDE metadata.</tspan></text>
+<line x1="2180" y1="1104" x2="2190" y2="1104" stroke="#6E4DA3" stroke-width="3" marker-end="url(#arrow-purple)"/>
+<polygon points="2017,1184 2064.0,1219.0 2017,1254 1970.0,1219.0" fill="#FFF3DA" stroke="#B7791F" stroke-width="2"/>
+<text x="2017" y="1209" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#6E4812"><tspan x="2017" dy="0">SUCCESS?</tspan></text>
+<rect x="1865" y="1264" width="305" height="56" rx="8" fill="#FDE9E7" stroke="#C64E42" stroke-width="1.4"/>
+<text x="1875" y="1284" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#87332B"><tspan x="1875" dy="0">abort_to_baseline</tspan></text>
+<text x="1875" y="1300.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#87332B"><tspan x="1875" dy="0">Restore working state; invalidate every</tspan><tspan x="1875" dy="13.125">provisional publication. NOT a revision op.</tspan></text>
+<rect x="2200" y="1178" width="305" height="77" rx="8" fill="#E7F5EA" stroke="#2E7D4F" stroke-width="1.4"/>
+<text x="2210" y="1198" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#1F5C39"><tspan x="2210" dy="0">Commit complete semantic write set</tspan></text>
+<text x="2210" y="1214.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#1F5C39"><tspan x="2210" dy="0">KV/recurrent/n-gram • RNG • grammar /</tspan><tspan x="2210" dy="13.125">constraints • continuation • effects • output heads</tspan></text>
+<rect x="2200" y="1264" width="305" height="56" rx="8" fill="#E7F5EA" stroke="#2E7D4F" stroke-width="1.4"/>
+<text x="2210" y="1284" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#1F5C39"><tspan x="2210" dy="0">Finalize durable outputs</tspan></text>
+<text x="2210" y="1300.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#1F5C39"><tspan x="2210" dy="0">Turn commit finalizes open outputs;</tspan><tspan x="2210" dy="13.125">early optional finalize becomes durable.</tspan></text>
+<rect x="525" y="1178" width="285" height="77" rx="8" fill="#F0EAF8" stroke="#6E4DA3" stroke-width="1.4"/>
+<text x="535" y="1198" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#3F2A61"><tspan x="535" dy="0">Admit provisional mode only if retractable</tspan></text>
+<text x="535" y="1214.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#3F2A61"><tspan x="535" dy="0">Otherwise select commit_only or reject</tspan><tspan x="535" dy="13.125">before mutation.</tspan></text>
+<line x1="2017" y1="1254" x2="2017" y2="1264" stroke="#C64E42" stroke-width="3" stroke-dasharray="8 5" marker-end="url(#arrow-coral)"/>
+<text x="2030" y="1262" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#C64E42"><tspan x="2030" dy="0">abort / cancel / failure</tspan></text>
+<line x1="2064" y1="1219" x2="2190" y2="1219" stroke="#2E7D4F" stroke-width="3" marker-end="url(#arrow-green)"/>
+<text x="2115" y="1214" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#2E7D4F"><tspan x="2115" dy="0">success</tspan></text>
+<line x1="2190" y1="1255" x2="2190" y2="1264" stroke="#2E7D4F" stroke-width="3" marker-end="url(#arrow-green)"/>
+<line x1="820" y1="1216" x2="1855" y2="1216" stroke="#6E4DA3" stroke-width="1.5" stroke-dasharray="3 5" marker-end="url(#arrow-purple)"/>
+<text x="1260" y="1212" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#6E4DA3"><tspan x="1260" dy="0">admission guard</tspan></text>
+<rect x="2200" y="1314" width="305" height="62" rx="8" fill="#E7F5EA" stroke="#2E7D4F" stroke-width="1.4"/>
+<text x="2210" y="1334" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#1F5C39"><tspan x="2210" dy="0">Return committed output</tspan></text>
+<text x="2210" y="1350.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#1F5C39"><tspan x="2210" dy="0">Deliver to caller / adapter.</tspan></text>
+<rect x="1865" y="1314" width="305" height="62" rx="8" fill="#E7F5EA" stroke="#2E7D4F" stroke-width="1.4"/>
+<text x="1875" y="1334" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#1F5C39"><tspan x="1875" dy="0">Retain session semantic state</tspan></text>
+<text x="1875" y="1350.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#1F5C39"><tspan x="1875" dy="0">Next turn restores this committed baseline.</tspan></text>
+<rect x="840" y="1314" width="315" height="62" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4" stroke-dasharray="8 5"/>
+<text x="850" y="1334" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="850" dy="0">Optionally reuse compatible-prefix cache</tspan></text>
+<text x="850" y="1350.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="850" dy="0">Optimization only — never session identity.</tspan></text>
+<rect x="1185" y="1314" width="295" height="62" rx="8" fill="#FFF3DA" stroke="#B7791F" stroke-width="1.4"/>
+<text x="1195" y="1334" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="12" font-weight="700" fill="#6E4812"><tspan x="1195" dy="0">Release transient; retain policy assets</tspan></text>
+<text x="1195" y="1350.5" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#6E4812"><tspan x="1195" dy="0">release inputs/scratch/slots; retain weights,</tspan><tspan x="1195" dy="13.125">compiled/captured graphs and pools by policy</tspan></text>
+<line x1="2017" y1="1345" x2="2190" y2="1345" stroke="#2E7D4F" stroke-width="3" marker-end="url(#arrow-green)"/>
+<line x1="1175" y1="1345" x2="830" y2="1345" stroke="#B7791F" stroke-width="1.5" stroke-dasharray="8 5" marker-end="url(#arrow-amber)"/>
+<text x="1000" y="1343" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#B7791F"><tspan x="1000" dy="0">optional reuse</tspan></text>
+<line x1="1855" y1="1369" x2="104" y2="1369" stroke="#2E7D4F" stroke-width="3" stroke-dasharray="8 5" marker-end="url(#arrow-green)"/>
+<text x="760" y="1365" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="9" font-weight="600" fill="#2E7D4F"><tspan x="760" dy="0">next turn → Phase 2 admission</tspan></text>
+<text x="40" y="1415" text-anchor="start" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="500" fill="#5C6B7A"><tspan x="40" dy="0">Semantic requirement = must preserve declared workflow meaning.  Runtime choice = may optimize or decline without changing that meaning.</tspan></text>
+</svg>

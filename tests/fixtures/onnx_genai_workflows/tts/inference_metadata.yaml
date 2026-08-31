@@ -1,20 +1,11 @@
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - nested_control_flow
-      - loop_induction_values
-      - typed_emit
-      - serving_service_contract
-      - bounded_state_recurrence
+    manifest: {}
     inputs:
       request.prompt_tokens:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - text_sequence_len
@@ -31,7 +22,6 @@ pipeline:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -44,7 +34,6 @@ pipeline:
       package.false:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -59,7 +48,6 @@ pipeline:
       package.zero_scalar:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -70,7 +58,6 @@ pipeline:
       package.one_scalar:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -81,7 +68,6 @@ pipeline:
       package.remaining_groups:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -93,7 +79,6 @@ pipeline:
       package.predictor_context_limit:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -105,7 +90,6 @@ pipeline:
       package.predictor_mask_limit:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -117,7 +101,6 @@ pipeline:
       package.talker_context_limit:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -129,7 +112,6 @@ pipeline:
       package.one_control:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -141,7 +123,6 @@ pipeline:
       package.zero_batch:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -156,7 +137,6 @@ pipeline:
       package.one_batch:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -171,7 +151,6 @@ pipeline:
       package.true:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -186,7 +165,6 @@ pipeline:
       package.setup_predictor_iteration_0:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -197,7 +175,6 @@ pipeline:
       package.setup_predictor_iteration_1:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -208,7 +185,6 @@ pipeline:
       package.loop_1_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -220,7 +196,6 @@ pipeline:
       package.loop_0_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -233,7 +208,6 @@ pipeline:
       waveform:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 1
@@ -303,7 +277,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - sequence
@@ -314,7 +287,6 @@ pipeline:
           outputs:
             last_logits:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -330,7 +302,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -340,7 +311,6 @@ pipeline:
           outputs:
             token:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -364,7 +334,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -374,7 +343,6 @@ pipeline:
           outputs:
             token:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -398,7 +366,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -408,7 +375,6 @@ pipeline:
           outputs:
             token:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -432,7 +398,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -442,7 +407,6 @@ pipeline:
           outputs:
             token:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -466,7 +430,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -476,7 +439,6 @@ pipeline:
           outputs:
             token:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -500,7 +462,6 @@ pipeline:
           inputs:
             done:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -509,7 +470,6 @@ pipeline:
           outputs:
             continue:
               dtype: bool
-              rank: 1
               shape:
               - 1
       tts_state_initializer:
@@ -521,7 +481,6 @@ pipeline:
           inputs:
             prompt_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - sequence
@@ -531,7 +490,6 @@ pipeline:
           outputs:
             frame_codes:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 4
@@ -540,7 +498,6 @@ pipeline:
                 axis: 0
             token_slot:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -549,7 +506,6 @@ pipeline:
                 axis: 0
             code_history:
               dtype: int64
-              rank: 3
               shape:
               - batch
               - 0
@@ -566,7 +522,6 @@ pipeline:
           inputs:
             token:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -575,7 +530,6 @@ pipeline:
           outputs:
             slot:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -591,7 +545,6 @@ pipeline:
           inputs:
             frame_codes:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 4
@@ -600,7 +553,6 @@ pipeline:
                 axis: 0
             token:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -608,12 +560,10 @@ pipeline:
                 axis: 0
             index:
               dtype: int64
-              rank: 0
               shape: []
           outputs:
             next_frame:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 4
@@ -629,7 +579,6 @@ pipeline:
           inputs:
             history:
               dtype: int64
-              rank: 3
               shape:
               - batch
               - frames
@@ -639,7 +588,6 @@ pipeline:
                 axis: 0
             frame:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 4
@@ -649,7 +597,6 @@ pipeline:
           outputs:
             next_history:
               dtype: int64
-              rank: 3
               shape:
               - batch
               - frames + 1
@@ -666,7 +613,6 @@ pipeline:
           inputs:
             left:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -674,7 +620,6 @@ pipeline:
                 axis: 0
             right:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -683,7 +628,6 @@ pipeline:
           outputs:
             total:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -698,7 +642,6 @@ pipeline:
           inputs:
             prefill_embeds:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - prefill_sequence
@@ -709,7 +652,6 @@ pipeline:
           outputs:
             attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - past_seq_len + seq_len
@@ -718,14 +660,12 @@ pipeline:
                 axis: 0
             position_ids:
               dtype: int64
-              rank: 3
               shape:
               - 3
               - batch
               - sequence_len
             body_attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - prefill_sequence + 1
@@ -734,14 +674,12 @@ pipeline:
                 axis: 0
             body_position_ids:
               dtype: int64
-              rank: 3
               shape:
               - 3
               - batch
               - 1
             past_key_values.0.key:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 1
@@ -752,7 +690,6 @@ pipeline:
                 axis: 0
             past_key_values.0.value:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 1
@@ -770,7 +707,6 @@ pipeline:
           inputs:
             prefill_embeds:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - prefill_sequence
@@ -781,7 +717,6 @@ pipeline:
           outputs:
             attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - past_seq_len + seq_len
@@ -790,7 +725,6 @@ pipeline:
                 axis: 0
             position_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - sequence_len
@@ -799,7 +733,6 @@ pipeline:
                 axis: 0
             body_attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - prefill_sequence + 1
@@ -808,7 +741,6 @@ pipeline:
                 axis: 0
             body_position_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -817,7 +749,6 @@ pipeline:
                 axis: 0
             past_key_values.0.key:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 8
@@ -828,7 +759,6 @@ pipeline:
                 axis: 0
             past_key_values.0.value:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 8
@@ -839,7 +769,6 @@ pipeline:
                 axis: 0
             past_key_values.1.key:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 8
@@ -850,7 +779,6 @@ pipeline:
                 axis: 0
             past_key_values.1.value:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 8
@@ -861,7 +789,6 @@ pipeline:
                 axis: 0
             past_key_values.2.key:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 8
@@ -872,7 +799,6 @@ pipeline:
                 axis: 0
             past_key_values.2.value:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 8
@@ -883,7 +809,6 @@ pipeline:
                 axis: 0
             past_key_values.3.key:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 8
@@ -894,7 +819,6 @@ pipeline:
                 axis: 0
             past_key_values.3.value:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 8
@@ -905,7 +829,6 @@ pipeline:
                 axis: 0
             past_key_values.4.key:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 8
@@ -916,7 +839,6 @@ pipeline:
                 axis: 0
             past_key_values.4.value:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 8
@@ -934,7 +856,6 @@ pipeline:
           inputs:
             attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - context
@@ -943,7 +864,6 @@ pipeline:
                 axis: 0
             position_ids:
               dtype: int64
-              rank: 3
               shape:
               - 3
               - batch
@@ -954,7 +874,6 @@ pipeline:
           outputs:
             next_attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - context + 1
@@ -963,7 +882,6 @@ pipeline:
                 axis: 0
             next_position_ids:
               dtype: int64
-              rank: 3
               shape:
               - 3
               - batch
@@ -980,7 +898,6 @@ pipeline:
           inputs:
             attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - context
@@ -989,7 +906,6 @@ pipeline:
                 axis: 0
             position_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -999,7 +915,6 @@ pipeline:
           outputs:
             next_attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - context + 1
@@ -1008,7 +923,6 @@ pipeline:
                 axis: 0
             next_position_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -1024,7 +938,6 @@ pipeline:
           inputs:
             history:
               dtype: int64
-              rank: 3
               shape:
               - batch
               - frames
@@ -1035,7 +948,6 @@ pipeline:
           outputs:
             codes:
               dtype: int64
-              rank: 3
               shape:
               - batch
               - 4
@@ -1047,7 +959,6 @@ pipeline:
       last_frame:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - 4
@@ -1061,7 +972,6 @@ pipeline:
       history:
         contract:
           dtype: int64
-          rank: 3
           shape:
           - batch
           - frames
@@ -1079,7 +989,6 @@ pipeline:
       talker_mask:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - talker_context
@@ -1096,7 +1005,6 @@ pipeline:
       talker_position:
         contract:
           dtype: int64
-          rank: 3
           shape:
           - 3
           - batch
@@ -1108,7 +1016,6 @@ pipeline:
       frame:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - 4
@@ -1122,7 +1029,6 @@ pipeline:
       code_token:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1135,7 +1041,6 @@ pipeline:
       predictor_mask:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - predictor_context
@@ -1152,7 +1057,6 @@ pipeline:
       predictor_position:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - 1
@@ -1166,7 +1070,6 @@ pipeline:
       active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1180,7 +1083,6 @@ pipeline:
       done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1194,7 +1096,6 @@ pipeline:
       accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1208,7 +1109,6 @@ pipeline:
       talker_cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1222,7 +1122,6 @@ pipeline:
       predictor_cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1236,7 +1135,6 @@ pipeline:
       talker_cache_0:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 1
@@ -1258,7 +1156,6 @@ pipeline:
       talker_cache_1:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 1
@@ -1280,7 +1177,6 @@ pipeline:
       predictor_cache_0:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 8
@@ -1302,7 +1198,6 @@ pipeline:
       predictor_cache_1:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 8
@@ -1324,7 +1219,6 @@ pipeline:
       predictor_cache_2:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 8
@@ -1346,7 +1240,6 @@ pipeline:
       predictor_cache_3:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 8
@@ -1368,7 +1261,6 @@ pipeline:
       predictor_cache_4:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 8
@@ -1390,7 +1282,6 @@ pipeline:
       predictor_cache_5:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 8
@@ -1412,7 +1303,6 @@ pipeline:
       predictor_cache_6:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 8
@@ -1434,7 +1324,6 @@ pipeline:
       predictor_cache_7:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 8
@@ -1456,7 +1345,6 @@ pipeline:
       predictor_cache_8:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 8
@@ -1478,7 +1366,6 @@ pipeline:
       predictor_cache_9:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 8
@@ -1500,7 +1387,6 @@ pipeline:
       loop_1_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -1510,7 +1396,6 @@ pipeline:
       loop_0_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -2175,7 +2060,6 @@ pipeline:
           value: code.iteration
           contract:
             dtype: int64
-            rank: 0
             shape: []
       - kind: invoke
         component: code_history_append
@@ -2242,7 +2126,6 @@ pipeline:
         value: talker.iteration
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
     - kind: invoke
@@ -2266,13 +2149,6 @@ package:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
-    special_tokens:
-      bos:
-        id: 1
-        content: <s>
-      eos:
-        id: 2
-        content: </s>
   constraint_languages:
   - dialect: gbnf
     version: '1'

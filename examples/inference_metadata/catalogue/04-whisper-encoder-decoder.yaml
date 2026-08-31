@@ -2,15 +2,11 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - typed_emit
+    manifest: {}
     inputs:
       request.input_features:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 80
@@ -28,7 +24,6 @@ pipeline:
       request.decoder_input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - text_sequence
@@ -46,7 +41,6 @@ pipeline:
       logits:
         contract:
           dtype: float16
-          rank: 3
           shape:
           - batch
           - sequence
@@ -65,7 +59,6 @@ pipeline:
           inputs:
             input_features:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - 80
@@ -76,7 +69,6 @@ pipeline:
           outputs:
             encoder_hidden_states:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - audio_sequence
@@ -92,7 +84,6 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - text_sequence
@@ -101,7 +92,6 @@ pipeline:
                 axis: 0
             encoder_hidden_states:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - audio_sequence
@@ -112,7 +102,6 @@ pipeline:
           outputs:
             logits:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - sequence

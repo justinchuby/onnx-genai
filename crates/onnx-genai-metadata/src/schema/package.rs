@@ -12,13 +12,32 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PackageFacts {
-    /// Exact tokenizer, vocabulary, and special-token facts.
+    /// Exact tokenizer and vocabulary facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokenizer: Option<TokenizerFacts>,
 
     /// Constraint/grammar dialects this package's parser can interpret.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraint_languages: Vec<ConstraintLanguageFacts>,
+
+    /// Exact, versioned tool-call protocol used to render caller-owned tools
+    /// and parse model-produced envelopes.  Absence means this package does
+    /// not support tool calls; it is intentionally not a boolean capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_protocol: Option<ToolProtocolDeclaration>,
+}
+
+/// A portable tool-call protocol identity.  Implementations select only this
+/// exact pair and never infer a protocol from a model name or emitted text.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolProtocolDeclaration {
+    /// Stable protocol identity, independent of model family or runtime.
+    #[schemars(length(min = 1))]
+    pub identity: String,
+    /// Exact protocol version, including its envelope and streaming semantics.
+    #[schemars(length(min = 1))]
+    pub version: String,
 }
 
 /// Tokenizer facts and package-relative artifacts.
@@ -29,12 +48,14 @@ pub struct PackageFacts {
 #[serde(deny_unknown_fields)]
 pub struct TokenizerFacts {
     /// Tokenizer algorithm identifier, e.g. `bpe`, `unigram`, `wordpiece`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
-    pub algorithm: String,
+    pub algorithm: Option<String>,
 
     /// Number of entries in the vocabulary, including added tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
-    pub vocab_size: usize,
+    pub vocab_size: Option<usize>,
 
     /// Whether the tokenizer operates on raw bytes rather than Unicode scalars.
     #[serde(default)]
@@ -45,9 +66,13 @@ pub struct TokenizerFacts {
     #[schemars(length(min = 1))]
     pub artifacts: Vec<TokenizerArtifact>,
 
-    /// Special tokens by semantic role, e.g. `bos`, `eos`, `pad`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub special_tokens: BTreeMap<String, SpecialTokenFact>,
+    /// Numeric model and control-token facts for this tokenizer vocabulary.
+    ///
+    /// Token strings, added-token mappings, and chat templates remain in the
+    /// tokenizer assets. Request EOS inputs may override these defaults, but
+    /// workflow literals and termination components do not own another copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub special_tokens: Option<TokenFacts>,
 }
 
 /// One package-relative tokenizer artifact.
@@ -59,15 +84,40 @@ pub struct TokenizerArtifact {
     pub location: String,
 }
 
-/// One special token, pinned by id and exact surface bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+/// Numeric model and control-token facts.
+///
+/// These ids are model/package facts. Token spellings, added-token maps, and
+/// chat templates remain in tokenizer assets and are not repeated here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SpecialTokenFact {
-    /// Vocabulary id of the token.
-    pub id: u32,
-    /// Exact UTF-8 surface form of the token.
-    #[schemars(length(min = 1))]
-    pub content: String,
+pub struct TokenFacts {
+    /// Padding token used by package-authored tensor contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_token_id: Option<u32>,
+    /// Beginning-of-sequence token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bos_token_id: Option<u32>,
+    /// Every token id that terminates package-default autoregressive generation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eos_token_id: Vec<u32>,
+    /// Separator token used by sequence-pair models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sep_token_id: Option<u32>,
+    /// First token fed to an encoder-decoder's autoregressive decoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_start_token_id: Option<u32>,
+    /// Prompt placeholder replaced by image features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_token_id: Option<u32>,
+    /// Prompt placeholder replaced by video features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_token_id: Option<u32>,
+    /// Prompt placeholder replaced by audio features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_token_id: Option<u32>,
+    /// Token that opens a vision segment in a multimodal prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_start_token_id: Option<u32>,
 }
 
 /// A constraint language the package's parser accepts.
@@ -345,12 +395,21 @@ pub struct ExpertShardFacts {
 
 /// Portable compatibility facts for speculative decoding.
 ///
-/// Proposal width, tree shape, scheduling, kernels, and whether speculation is
-/// enabled at all are runtime decisions.
+/// This is the only portable authority for a speculative step.  In particular,
+/// a runtime must not supplement it from a HuggingFace sidecar, a filename, a
+/// model family, or an inferred graph convention. Proposal width, scheduling,
+/// batching, kernels, and enablement remain runtime decisions.
 // Not `Eq`: a chained proposer's declared embedding normalizer is a real number.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SpeculativeContract {
+    /// Exact built-in contract identity. Unknown identities are not a
+    /// best-effort proposal format; they are an unsupported execution contract.
+    #[schemars(length(min = 1))]
+    pub identity: String,
+    /// Exact identity version understood by the runtime.
+    #[schemars(length(min = 1))]
+    pub version: String,
     /// Workflow component that proposes tokens.
     #[schemars(length(min = 1))]
     pub proposer: String,
@@ -365,15 +424,28 @@ pub struct SpeculativeContract {
     /// to `max_proposal_width`.
     #[serde(default)]
     pub proposal_execution: SpeculativeProposalExecution,
-    /// Proposer ports bound to target-owned values, by semantic role.
+    /// Proposer input ports bound to target-owned values, by semantic role.
+    ///
+    /// The keys are protocol roles and the values are declared proposer ports;
+    /// neither side is recovered from a name or tensor shape at runtime.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub port_bindings: BTreeMap<String, String>,
+    /// Target ports bound for verification, by protocol role.
+    ///
+    /// This is intentionally separate from [`Self::port_bindings`]: a target
+    /// port and a proposer port may have the same spelling while carrying
+    /// unrelated values.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub target_port_bindings: BTreeMap<String, String>,
     /// State groups the proposer shares with the target.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub shared_state: BTreeSet<String>,
-    /// Target initializers the proposer borrows.
+    /// Immutable target initializers the proposer borrows.
+    ///
+    /// The component and initializer are both required. A bare string used to
+    /// force a loader to guess which target artifact owned an initializer.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub shared_weights: BTreeSet<String>,
+    pub shared_weights: BTreeSet<SpeculativeInitializerRef>,
     /// How the proposer's vocabulary relates to the target's.
     pub vocabulary: SpeculativeVocabulary,
     /// Maximum number of proposed positions this package can undo.
@@ -389,9 +461,92 @@ pub struct SpeculativeContract {
     /// the caller must opt in explicitly.
     #[serde(default)]
     pub distribution_preserving: bool,
+    /// Exact values the verifier produces and the declared accepted-path
+    /// publication binding. Sampling is legal only when `probabilities` is
+    /// present; this is not inferred from `distribution_preserving`.
+    pub verification: SpeculativeVerification,
     /// State groups that must roll back when a proposal is rejected.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub rollback_state: BTreeSet<String>,
+}
+
+impl SpeculativeContract {
+    /// Admit distribution-preserving sampling only when both distributions were
+    /// declared. Greedy verification is intentionally a separate structural
+    /// path and needs no probability tensor.
+    pub fn admit_sampling(&self) -> Result<(), String> {
+        if self.verification.probabilities.is_none() {
+            return Err("speculative sampling was requested, but \
+                 speculative.verification.probabilities is absent. Declare both \
+                 proposal and target probability outputs for \
+                 distribution-preserving rejection sampling, or use greedy verification."
+                .to_string());
+        }
+        if !self.distribution_preserving {
+            return Err(
+                "speculative sampling was requested, but this contract does not claim \
+                 distribution_preserving. Use greedy verification or re-export a proposer \
+                 with exact proposal/target probability correction."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A component-owned immutable initializer used by a speculative proposer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculativeInitializerRef {
+    /// Component whose ONNX artifact owns the initializer.
+    #[schemars(length(min = 1))]
+    pub component: String,
+    /// Exact ONNX initializer name.
+    #[schemars(length(min = 1))]
+    pub initializer: String,
+}
+
+/// Explicit verifier outputs for a speculative proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculativeVerification {
+    /// Target output used by the declared acceptance rule.
+    pub target_output: SpeculativeValueRef,
+    /// Explicit accepted-path output binding.
+    ///
+    /// A runtime-owned acceptance implementation names a stable binding such as
+    /// `accepted_prefix`; a graph-owned implementation names the component
+    /// output that provides it. Either way the binding is declared, rather than
+    /// selected from an output name or emission order.
+    pub accepted_path: SpeculativeAcceptedPath,
+    /// Proposal and target probability outputs used for exact rejection
+    /// sampling. Omission means this contract is greedy-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probabilities: Option<SpeculativeProbabilityOutputs>,
+}
+
+/// The authority that produces the accepted candidate path.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SpeculativeAcceptedPath {
+    /// The registered speculative executor publishes the accepted path under a
+    /// protocol binding. It remains an explicit output of the contract.
+    Runtime {
+        #[schemars(length(min = 1))]
+        binding: String,
+    },
+    /// A workflow component produces the accepted path.
+    Component { value: SpeculativeValueRef },
+}
+
+/// Probability outputs needed for distribution-preserving sampling.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculativeProbabilityOutputs {
+    /// Per-candidate probabilities emitted by the proposer.
+    pub proposal: SpeculativeValueRef,
+    /// Target probabilities for the corresponding candidate positions.
+    pub target: SpeculativeValueRef,
 }
 
 /// Execution shape of a speculative proposer.
@@ -402,6 +557,41 @@ pub enum SpeculativeProposalExecution {
     /// One proposer invocation returns the complete token block.
     #[default]
     Block,
+    /// One DFlash invocation predicts every masked position of a flat block in
+    /// parallel from explicitly bound target hidden features.
+    ///
+    /// Version 1 is the base DFlash architecture. Version 2 adds the DFlash 2
+    /// selector and block-local convolution through [`DFlashStructure`];
+    /// neither version is inferred from optional ports or tensor names.
+    DflashFlatBlock {
+        /// Exact structural ABI version implemented by the reader.
+        #[schemars(length(min = 1))]
+        version: String,
+        /// Target hidden features and how they become one proposer input.
+        conditioning: Box<DFlashConditioning>,
+        /// Anchor/masked-position layout and the proposer inputs carrying it.
+        block: Box<DFlashBlockLayout>,
+        /// Proposer and verifier outputs consumed by the generic runtime.
+        outputs: Box<DFlashOutputs>,
+        /// Immutable target initializers reused by the proposer.
+        shared_weights: Box<DFlashSharedWeights>,
+        /// Mutable state cells owned only by the drafter.
+        ///
+        /// Every cell is also present in the enclosing contract's
+        /// `rollback_state`; the separate set distinguishes private draft
+        /// state from target state without creating another rollback authority.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        draft_private_state: BTreeSet<String>,
+        /// How every rollback participant commits exactly one accepted prefix.
+        ///
+        /// The keys must equal the enclosing contract's `rollback_state`.
+        /// Sequence state is truncated on its declared state-group sequence
+        /// axis. Fixed recurrent state selects an explicitly emitted
+        /// per-prefix snapshot; a runtime never guesses from a port name.
+        accepted_prefix_state: Box<BTreeMap<String, DFlashStateCommit>>,
+        /// Base DFlash or an exact versioned structural extension.
+        structure: Box<DFlashStructure>,
+    },
     /// Repeated proposer invocations form an autoregressive proposal chain.
     Chained {
         /// Proposer input port receiving the previous selected token embedding.
@@ -459,6 +649,285 @@ pub enum SpeculativeProposalExecution {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_embedding: Option<TokenEmbeddingSource>,
     },
+    /// A multi-token-prediction head conditioned on an explicitly named target
+    /// hidden-state output. Its head inputs, outputs, shared weights, and
+    /// private-state lifetime are all declared here; it is not selected by a
+    /// model family or a legacy sidecar.
+    Mtp {
+        /// Target output that seeds the first MTP step.
+        target_hidden: SpeculativeValueRef,
+        /// MTP-head input receiving `target_hidden`.
+        #[schemars(length(min = 1))]
+        target_hidden_input: String,
+        /// MTP-head input receiving the selected token embedding.
+        #[schemars(length(min = 1))]
+        token_embedding_input: String,
+        /// MTP-head output projected through the declared shared LM head.
+        #[schemars(length(min = 1))]
+        hidden_output: String,
+        /// Shape of the target hidden state and MTP-head hidden-state input.
+        /// `bsh` is `[batch, sequence, hidden]`; `bshc` additionally carries
+        /// `hc_mult` before the feature axis.
+        #[serde(default)]
+        hidden_layout: MtpHiddenStateLayout,
+        /// Feature width of the declared hidden-state binding.
+        #[schemars(range(min = 1))]
+        hidden_size: usize,
+        /// Number of lanes in a `bshc` hidden state. The value is one for
+        /// `bsh`; declaring it prevents a runtime from guessing a lane axis.
+        #[serde(default = "one")]
+        #[schemars(range(min = 1))]
+        hc_mult: usize,
+        /// Optional MTP-head replacement-state output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state_output: Option<String>,
+        /// The target embedding and LM-head initializers MTP shares. Their
+        /// component ownership is explicit so no loader searches artifacts.
+        weights: MtpSharedWeights,
+        /// MTP private-state behavior between proposal blocks.
+        #[serde(default)]
+        state: MtpProposalState,
+    },
+    /// A generic branching candidate tree.
+    ///
+    /// The tree shape is proposal data: a runtime may pick a width and schedule
+    /// it, but it must receive the candidate ids and exactly one declared
+    /// topology representation from this proposer.
+    CandidateTree {
+        /// Proposer output carrying flattened candidate token IDs.
+        #[schemars(length(min = 1))]
+        candidate_tokens: String,
+        /// Parent-pointer or ancestor-mask topology over `candidate_tokens`.
+        topology: CandidateTreeTopology,
+    },
+}
+
+fn one() -> usize {
+    1
+}
+
+/// Layout of the target activation consumed by an MTP head.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MtpHiddenStateLayout {
+    /// `[batch, sequence, hidden]`.
+    #[default]
+    Bsh,
+    /// `[batch, sequence, hc_mult, hidden]`.
+    Bshc,
+}
+
+/// Exact immutable weight sharing used by an MTP head.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MtpSharedWeights {
+    pub embedding: SpeculativeInitializerRef,
+    pub lm_head: SpeculativeInitializerRef,
+}
+
+/// Whether MTP private state is reset or retained after a proposal.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MtpProposalState {
+    /// The head has no state that survives a proposal. It is reset on every
+    /// outcome and therefore cannot become a hidden transaction participant.
+    #[default]
+    ProposalLocal,
+    /// The head state is retained only through the accepted prefix. Every
+    /// named cell must be a rollback participant.
+    AcceptedPrefix {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        recurrent: Vec<SpeculativeRecurrenceBinding>,
+    },
+}
+
+/// One of the two non-interchangeable candidate-tree topology encodings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateTreeTopology {
+    /// One parent index per flattened candidate (`-1`/a declared root sentinel
+    /// is represented by the producer's tensor contract).
+    ParentIndices {
+        #[schemars(length(min = 1))]
+        output: String,
+    },
+    /// Boolean ancestor matrix over flattened candidates.
+    AncestorMask {
+        #[schemars(length(min = 1))]
+        output: String,
+    },
+}
+
+/// Explicit target-feature conditioning for a DFlash proposer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashConditioning {
+    /// Target component outputs, in concatenation order.
+    ///
+    /// A source must be a floating rank-3 `[batch, sequence, hidden]` output
+    /// with semantic role `hidden_states`. Layer selection is therefore
+    /// producer-authored provenance, not a runtime model-family lookup.
+    #[schemars(length(min = 1))]
+    pub sources: Vec<SpeculativeValueRef>,
+    /// Proposer input receiving the fused target features.
+    #[schemars(length(min = 1))]
+    pub proposer_input: String,
+    /// Structural operation used to combine multiple sources.
+    pub combination: DFlashFeatureCombination,
+}
+
+/// How target hidden features are fused before DFlash consumes them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DFlashFeatureCombination {
+    /// Concatenate sources in declaration order along `axis`.
+    Concatenate { axis: usize },
+}
+
+/// Flat anchor-plus-mask block presented to one DFlash invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashBlockLayout {
+    /// Proposer input receiving target-embedding rows for the anchor followed
+    /// by the masked candidate positions.
+    #[schemars(length(min = 1))]
+    pub noise_embeddings_input: String,
+    /// Proposer input receiving a boolean tensor with `true` exactly at masked
+    /// candidate positions and `false` at the anchor.
+    #[schemars(length(min = 1))]
+    pub masked_positions_input: String,
+    /// Proposer input receiving absolute positions for target context followed
+    /// by the flat block.
+    #[schemars(length(min = 1))]
+    pub position_ids_input: String,
+    /// Proposer input receiving validity for target context followed by the
+    /// flat block.
+    #[schemars(length(min = 1))]
+    pub attention_mask_input: String,
+    /// Position holding the verifier-produced anchor token.
+    pub anchor_position: usize,
+    /// First position predicted in parallel. Validation requires this to be
+    /// exactly one past `anchor_position`.
+    pub first_candidate_position: usize,
+    /// Token whose shared target embedding initializes masked positions.
+    pub mask_token_id: u32,
+}
+
+/// Typed outputs of DFlash proposal and verification.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashOutputs {
+    /// Proposer output containing selected candidate token ids
+    /// `[batch, proposal]`.
+    #[schemars(length(min = 1))]
+    pub candidate_tokens: String,
+    /// Full-vocabulary proposal probabilities `[batch, proposal, vocabulary]`.
+    ///
+    /// Absence is valid for greedy-only execution. A sampling request must be
+    /// rejected before invoking the proposer when this field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_probabilities: Option<String>,
+    /// Target output containing exact verification logits
+    /// `[batch, proposal_plus_bonus, vocabulary]`.
+    pub verifier_logits: SpeculativeValueRef,
+}
+
+/// Immutable target weights DFlash reuses.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashSharedWeights {
+    /// Target token embedding table used for anchor and mask rows.
+    pub input_embedding: TokenEmbeddingSource,
+    /// Target output projection passed read-only to the proposer.
+    pub output_projection: DFlashOutputProjection,
+}
+
+/// Target LM-head initializer and the proposer input that borrows it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashOutputProjection {
+    /// Component owning the immutable initializer.
+    #[schemars(length(min = 1))]
+    pub component: String,
+    /// Exact initializer name.
+    #[schemars(length(min = 1))]
+    pub initializer: String,
+    /// Proposer input receiving the initializer as a read-only tensor.
+    #[schemars(length(min = 1))]
+    pub proposer_input: String,
+    /// Matrix layout required by the proposer graph.
+    pub layout: DFlashProjectionLayout,
+}
+
+/// Layout of the shared output projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DFlashProjectionLayout {
+    HiddenVocabulary,
+    VocabularyHidden,
+}
+
+/// How one speculative state cell is reduced to the accepted prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DFlashStateCommit {
+    /// The component's ordinary state output grows on its declared sequence
+    /// axis and is truncated to `baseline + accepted`.
+    Sequence { source: SpeculativeValueRef },
+    /// The component emits one complete fixed-state snapshot for each possible
+    /// accepted length, including prefix zero.
+    PrefixSnapshots {
+        source: SpeculativeValueRef,
+        /// Axis enumerating prefix lengths `0..=proposal`.
+        axis: usize,
+    },
+}
+
+/// Exact DFlash structural family.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DFlashStructure {
+    /// Base DFlash: parallel masked-block prediction with target KV injection.
+    Base,
+    /// DFlash 2: base DFlash plus an explicit adjacent-candidate selector and
+    /// block-local dynamic convolution.
+    SelectorConvolutionV1 {
+        selector: DFlashSelectorContract,
+        convolution: DFlashConvolutionContract,
+    },
+}
+
+/// DFlash 2 adjacent-candidate selector ABI.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashSelectorContract {
+    /// Proposer output containing the selected path `[batch, proposal]`.
+    #[schemars(length(min = 1))]
+    pub selected_tokens_output: String,
+    /// Proposer output containing top-k candidate ids
+    /// `[batch, proposal, candidates]`.
+    #[schemars(length(min = 1))]
+    pub candidate_ids_output: String,
+    /// Proposer output containing the selected conditional distribution over
+    /// `candidate_ids_output`, required for sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditional_probabilities_output: Option<String>,
+    #[schemars(range(min = 1))]
+    pub top_k: usize,
+    #[schemars(range(min = 1))]
+    pub rank: usize,
+}
+
+/// DFlash 2 block-local grouped dynamic convolution ABI.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashConvolutionContract {
+    #[schemars(range(min = 2))]
+    pub kernel_size: usize,
+    #[schemars(range(min = 1))]
+    pub group_size: usize,
+    /// The first candidate reads the anchor representation as its predecessor.
+    pub first_position_reads_anchor: bool,
 }
 
 /// An explicit reference to a value a workflow component produces.

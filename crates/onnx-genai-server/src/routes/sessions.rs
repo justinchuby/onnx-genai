@@ -43,6 +43,61 @@ pub(crate) async fn create_session(
     }))
 }
 
+pub(crate) async fn fork_session(
+    State(state): State<AppState>,
+    AxumPath(source_id): AxumPath<String>,
+    ApiJson(request): ApiJson<SessionForkRequest>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    let binding = state
+        .sessions
+        .get(&source_id)
+        .map_err(session_registry_failure)?
+        .ok_or_else(|| ApiError::not_found(format!("session {source_id} not found")))?;
+    let lease = state
+        .sessions
+        .acquire(binding.clone(), &source_id)
+        .map_err(package_execution_failure)?;
+    let model = binding.model().as_str().to_string();
+    let handle = state
+        .registry
+        .resolve(&model)
+        .map_err(map_registry_error)?
+        .ok_or_else(|| {
+            ApiError::unavailable(format!(
+                "session {source_id} belongs to unloaded model '{model}'"
+            ))
+        })?;
+    let child_id = state.sessions.next_client_id().map_err(|error| {
+        ApiError::internal(format!("forked session id generation failed: {error}"))
+    })?;
+    let placement = handle
+        .engine
+        .fork_session(
+            lease,
+            onnx_genai_engine::SessionPosition::new(request.position),
+        )
+        .await
+        .map_err(session_fork_failure)?;
+    let child_binding = handle.engine.binding(placement);
+    let evicted = match state
+        .sessions
+        .insert(child_id.clone(), child_binding.clone())
+    {
+        Ok(evicted) => evicted,
+        Err(error) => {
+            if let Ok(lease) = state.sessions.acquire(child_binding, &child_id) {
+                close_leased_session(&state.registry, lease).await?;
+            }
+            return Err(session_registry_failure(error));
+        }
+    };
+    close_evicted_session(&state.registry, evicted).await?;
+    Ok(Json(SessionResponse {
+        id: child_id,
+        object: "session",
+    }))
+}
+
 /// Close a session.
 ///
 /// Closing is a mutation of the conversation — the sharpest one there is — so it

@@ -5,16 +5,10 @@ pipeline:
     manifest:
       adapter_abis:
         onnx-genai.parameter-overlay: '1'
-      capabilities:
-      - workflow_ssa
-      - typed_emit
-      - parameter_adapters
-      - heterogeneous_adapter_batching
     inputs:
       request.active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -29,7 +23,6 @@ pipeline:
       activations:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - 2
@@ -44,7 +37,6 @@ pipeline:
       request.adapter_segments:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - 2
@@ -60,7 +52,6 @@ pipeline:
       request.adapter_counts:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -75,7 +66,6 @@ pipeline:
       request.adapter_scales:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - 2
@@ -92,7 +82,6 @@ pipeline:
       result:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - 2
@@ -116,7 +105,6 @@ pipeline:
           inputs:
             input:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - 2
@@ -126,7 +114,6 @@ pipeline:
           outputs:
             output:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - 2
@@ -276,10 +263,3 @@ package:
     byte_level: true
     artifacts:
     - location: tokenizer.json
-    special_tokens:
-      bos:
-        id: 1
-        content: <s>
-      eos:
-        id: 2
-        content: </s>

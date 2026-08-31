@@ -8,13 +8,14 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use onnx_runtime_ep_api::{
-    CaptureSupport, DeviceBuffer, EpConfig, ExecutionProvider, ExecutorArtifactFinalization,
+    CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider,
+    ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
     ExecutorInstanceId, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata, TensorMut,
-    TensorView, WorkspaceRequirement,
+    TensorView, ViewOutput, WorkspaceRequirement,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{
@@ -22,7 +23,9 @@ use onnx_runtime_ir::{
     TensorLayout, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_loader::{Model, encode_model};
-use onnx_runtime_session::{InferenceSession, OpsetVersion, SessionError, Tensor, WarmupShape};
+use onnx_runtime_session::{
+    DeviceGraphCaptureResult, InferenceSession, OpsetVersion, SessionError, Tensor, WarmupShape,
+};
 use onnx_runtime_shape_inference::{InferenceRegistry, MAX_SHAPE_DATA_ELEMS, MergePolicy};
 
 // This synthetic name must remain unregistered so unsupported-op error tests cannot go stale.
@@ -109,15 +112,34 @@ fn i64_tensor(shape: &[usize], data: &[i64]) -> Tensor {
     Tensor::from_raw(DataType::Int64, shape.to_vec(), &bytes).unwrap()
 }
 
+#[derive(Clone, Copy)]
+enum TestArtifactFinalization {
+    Complete,
+    PendingOnce,
+    StructuralDecline,
+    FailOnce,
+    ReadyPendingFailedReady,
+}
+
 struct HostDownloadCountingEp {
     cpu: CpuExecutionProvider,
     host_downloads: Arc<AtomicUsize>,
     kernel_compiles: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    kernel_executions: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    route_readiness_checks: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_finalizations: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    route_terminal_outcomes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    route_boundary_consumes: Arc<AtomicUsize>,
     route_drains: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_install_graph_nodes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     assert_finalized_before_execute: bool,
     capture_checks: Arc<AtomicUsize>,
+    artifact_finalization: TestArtifactFinalization,
+    fake_device_graph: bool,
+    graph_capturing: Arc<AtomicBool>,
+    graph_installed: Arc<AtomicBool>,
+    graph_segment_replays: Arc<AtomicUsize>,
+    graph_fast_replays: Arc<AtomicUsize>,
 }
 
 impl HostDownloadCountingEp {
@@ -128,11 +150,21 @@ impl HostDownloadCountingEp {
             cpu,
             host_downloads,
             kernel_compiles: Arc::new(Mutex::new(HashMap::new())),
+            kernel_executions: Arc::new(Mutex::new(HashMap::new())),
+            route_readiness_checks: Arc::new(Mutex::new(HashMap::new())),
             route_finalizations: Arc::new(Mutex::new(HashMap::new())),
+            route_terminal_outcomes: Arc::new(Mutex::new(HashMap::new())),
+            route_boundary_consumes: Arc::new(AtomicUsize::new(0)),
             route_drains: Arc::new(Mutex::new(HashMap::new())),
             route_install_graph_nodes: Arc::new(Mutex::new(HashMap::new())),
             assert_finalized_before_execute: false,
             capture_checks: Arc::new(AtomicUsize::new(0)),
+            artifact_finalization: TestArtifactFinalization::Complete,
+            fake_device_graph: false,
+            graph_capturing: Arc::new(AtomicBool::new(false)),
+            graph_installed: Arc::new(AtomicBool::new(false)),
+            graph_segment_replays: Arc::new(AtomicUsize::new(0)),
+            graph_fast_replays: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -143,12 +175,61 @@ impl HostDownloadCountingEp {
         }
     }
 
+    fn new_pending_once_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            artifact_finalization: TestArtifactFinalization::PendingOnce,
+            ..Self::new(host_downloads)
+        }
+    }
+
+    fn new_structural_decline_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            artifact_finalization: TestArtifactFinalization::StructuralDecline,
+            ..Self::new(host_downloads)
+        }
+    }
+
+    fn new_fail_once_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            artifact_finalization: TestArtifactFinalization::FailOnce,
+            ..Self::new(host_downloads)
+        }
+    }
+
+    fn new_fast_replay_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            artifact_finalization: TestArtifactFinalization::ReadyPendingFailedReady,
+            fake_device_graph: true,
+            ..Self::new(host_downloads)
+        }
+    }
+
     fn kernel_compiles(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
         Arc::clone(&self.kernel_compiles)
     }
 
+    fn kernel_executions(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
+        Arc::clone(&self.kernel_executions)
+    }
+
     fn route_finalizations(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
         Arc::clone(&self.route_finalizations)
+    }
+
+    fn route_readiness_checks(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
+        Arc::clone(&self.route_readiness_checks)
+    }
+
+    fn route_terminal_outcomes(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
+        Arc::clone(&self.route_terminal_outcomes)
+    }
+
+    fn route_boundary_consumes(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.route_boundary_consumes)
     }
 
     fn route_drains(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
@@ -162,13 +243,23 @@ impl HostDownloadCountingEp {
     fn capture_checks(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.capture_checks)
     }
+
+    fn graph_segment_replays(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.graph_segment_replays)
+    }
+
+    fn graph_fast_replays(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.graph_fast_replays)
+    }
 }
 
 struct FinalizationCheckingKernel {
     inner: Box<dyn Kernel>,
     executor: ExecutorInstanceId,
-    finalizations: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    terminal_outcomes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    executions: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     capture_checks: Arc<AtomicUsize>,
+    force_capture_supported: bool,
 }
 
 impl Kernel for FinalizationCheckingKernel {
@@ -182,9 +273,15 @@ impl Kernel for FinalizationCheckingKernel {
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> EpResult<()> {
         assert!(
-            scoped_count(&self.finalizations, self.executor) > 0,
+            scoped_count(&self.terminal_outcomes, self.executor) > 0,
             "kernel executed before provider artifacts finalized"
         );
+        *self
+            .executions
+            .lock()
+            .unwrap()
+            .entry(self.executor)
+            .or_default() += 1;
         self.inner.execute(inputs, outputs)
     }
 
@@ -199,18 +296,36 @@ impl Kernel for FinalizationCheckingKernel {
         self.inner.supports_strided_input(input_idx)
     }
 
+    fn view_outputs(
+        &self,
+        inputs: &[TensorView],
+        output_shapes: &[Vec<usize>],
+        num_outputs: usize,
+    ) -> Option<Vec<ViewOutput>> {
+        self.inner.view_outputs(inputs, output_shapes, num_outputs)
+    }
+
+    fn may_produce_views(&self) -> bool {
+        self.inner.may_produce_views()
+    }
+
     fn capture_support(&self) -> CaptureSupport {
         assert!(
-            scoped_count(&self.finalizations, self.executor) > 0,
+            scoped_count(&self.terminal_outcomes, self.executor) > 0,
             "capture audit reached a kernel before provider artifacts finalized"
         );
         self.capture_checks.fetch_add(1, Ordering::Relaxed);
-        self.inner.capture_support()
+        if self.force_capture_supported {
+            CaptureSupport::Supported
+        } else {
+            self.inner.capture_support()
+        }
     }
 }
 
 impl ExecutionProvider for HostDownloadCountingEp {
     fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+        self.route_boundary_consumes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -218,8 +333,23 @@ impl ExecutionProvider for HostDownloadCountingEp {
         &self,
         executor: ExecutorInstanceId,
         graph: &Graph,
+        readiness: ExecutorArtifactReadinessEpoch,
         _finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
-    ) -> ExecutorArtifactFinalization {
+    ) -> EpResult<ExecutorArtifactFinalization> {
+        *self
+            .route_readiness_checks
+            .lock()
+            .unwrap()
+            .entry(executor)
+            .or_default() += 1;
+        if scoped_count(&self.route_terminal_outcomes, executor) > 0
+            && !matches!(
+                self.artifact_finalization,
+                TestArtifactFinalization::ReadyPendingFailedReady
+            )
+        {
+            return Ok(ExecutorArtifactFinalization::Complete);
+        }
         assert!(
             self.kernel_compiles
                 .lock()
@@ -230,17 +360,59 @@ impl ExecutionProvider for HostDownloadCountingEp {
                 > 0,
             "provider artifacts finalized before this executor compiled a kernel"
         );
-        *self
-            .route_finalizations
-            .lock()
-            .unwrap()
-            .entry(executor)
-            .or_default() += 1;
-        self.route_install_graph_nodes
-            .lock()
-            .unwrap()
-            .insert(executor, graph.num_nodes());
-        ExecutorArtifactFinalization::Complete
+        let attempt = {
+            let mut attempts = self.route_finalizations.lock().unwrap();
+            let attempt = attempts.entry(executor).or_default();
+            *attempt += 1;
+            *attempt
+        };
+        match self.artifact_finalization {
+            TestArtifactFinalization::PendingOnce if attempt == 1 => Ok(
+                ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProviderReadiness {
+                    reason: format!(
+                        "test provider awaits a later compiled specialization after epoch {}",
+                        readiness.get()
+                    ),
+                }),
+            ),
+            TestArtifactFinalization::FailOnce if attempt == 1 => {
+                Err(EpError::KernelFailed(format!(
+                    "injected artifact finalization failure at epoch {}",
+                    readiness.get()
+                )))
+            }
+            TestArtifactFinalization::ReadyPendingFailedReady if attempt == 2 => Ok(
+                ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProviderReadiness {
+                    reason: format!(
+                        "test provider awaits a later compiled specialization after epoch {}",
+                        readiness.get()
+                    ),
+                }),
+            ),
+            TestArtifactFinalization::ReadyPendingFailedReady if attempt == 3 => {
+                Err(EpError::KernelFailed(format!(
+                    "injected artifact finalization failure at epoch {}",
+                    readiness.get()
+                )))
+            }
+            TestArtifactFinalization::Complete
+            | TestArtifactFinalization::PendingOnce
+            | TestArtifactFinalization::FailOnce
+            | TestArtifactFinalization::StructuralDecline
+            | TestArtifactFinalization::ReadyPendingFailedReady => {
+                *self
+                    .route_terminal_outcomes
+                    .lock()
+                    .unwrap()
+                    .entry(executor)
+                    .or_default() += 1;
+                self.route_install_graph_nodes
+                    .lock()
+                    .unwrap()
+                    .insert(executor, graph.num_nodes());
+                Ok(ExecutorArtifactFinalization::Complete)
+            }
+        }
     }
 
     fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {
@@ -311,8 +483,10 @@ impl ExecutionProvider for HostDownloadCountingEp {
             Ok(Box::new(FinalizationCheckingKernel {
                 inner: kernel,
                 executor,
-                finalizations: Arc::clone(&self.route_finalizations),
+                terminal_outcomes: Arc::clone(&self.route_terminal_outcomes),
+                executions: Arc::clone(&self.kernel_executions),
                 capture_checks: Arc::clone(&self.capture_checks),
+                force_capture_supported: self.fake_device_graph,
             }))
         } else {
             Ok(kernel)
@@ -351,6 +525,60 @@ impl ExecutionProvider for HostDownloadCountingEp {
 
     fn sync(&self) -> EpResult<()> {
         self.cpu.sync()
+    }
+
+    fn begin_device_graph_capture(&self, kernels: &[&dyn Kernel]) -> EpResult<()> {
+        if !self.fake_device_graph {
+            return Err(EpError::KernelFailed(
+                "test provider device graph capture is disabled".to_string(),
+            ));
+        }
+        assert!(
+            !kernels.is_empty(),
+            "capture must contain a compiled kernel"
+        );
+        assert!(
+            !self.graph_capturing.swap(true, Ordering::SeqCst),
+            "capture cannot begin twice"
+        );
+        Ok(())
+    }
+
+    fn end_device_graph_capture(&self) -> EpResult<()> {
+        assert!(
+            self.graph_capturing.swap(false, Ordering::SeqCst),
+            "capture must be active before it ends"
+        );
+        self.graph_installed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn abort_device_graph_capture(&self) -> EpResult<()> {
+        self.graph_capturing.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn replay_device_graph(&self) -> EpResult<()> {
+        assert!(
+            self.graph_installed.load(Ordering::SeqCst),
+            "fast replay requires an installed graph"
+        );
+        self.graph_fast_replays.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn replay_device_graph_segment(&self, index: usize) -> EpResult<()> {
+        assert_eq!(index, 0, "single-graph capture installs one segment");
+        assert!(
+            self.graph_installed.load(Ordering::SeqCst),
+            "segment replay requires an installed graph"
+        );
+        self.graph_segment_replays.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn reset_device_graph(&self) -> EpResult<bool> {
+        Ok(self.graph_installed.swap(false, Ordering::SeqCst))
     }
 }
 
@@ -1826,6 +2054,82 @@ fn symbolic_gelu_model() -> Vec<u8> {
     encode_model(&Model::new(&graph)).expect("encode symbolic Gelu model")
 }
 
+fn symbolic_matmul_model() -> Vec<u8> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 20);
+    let rows = graph.intern_symbol("rows");
+    let x = input_shaped(
+        &mut graph,
+        "x",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(2)],
+    );
+    let weight = f32_init(
+        &mut graph,
+        "weight",
+        &[2, 2],
+        &[
+            1.0, 0.0, //
+            0.0, 1.0,
+        ],
+    );
+    let y = graph.create_named_value(
+        "y",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(2)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(x), Some(weight)],
+        vec![y],
+    ));
+    graph.add_output(y);
+    encode_model(&Model::new(&graph)).expect("encode symbolic MatMul model")
+}
+
+fn runtime_dispatch_specialization_model() -> Vec<u8> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 20);
+    let elements = graph.intern_symbol("elements");
+    let data = input_shaped(
+        &mut graph,
+        "data",
+        DataType::Float32,
+        vec![Dim::Symbolic(elements)],
+    );
+    let shape = input(&mut graph, "shape", DataType::Int64, &[2]);
+    let rows = graph.intern_symbol("runtime_rows");
+    let columns = graph.intern_symbol("runtime_columns");
+    let reshaped = graph.create_named_value(
+        "reshaped",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Symbolic(columns)],
+    );
+    graph.mark_value_shape_unknown(reshaped);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Reshape",
+        vec![Some(data), Some(shape)],
+        vec![reshaped],
+    ));
+    let bias = f32_init(&mut graph, "bias", &[1], &[0.5]);
+    let y = graph.create_named_value(
+        "y",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Symbolic(columns)],
+    );
+    graph.mark_value_shape_unknown(y);
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Add",
+        vec![Some(reshaped), Some(bias)],
+        vec![y],
+    ));
+    graph.add_output(y);
+    encode_model(&Model::new(&graph)).expect("encode runtime-dispatch specialization model")
+}
+
 fn scoped_count(
     counts: &Mutex<HashMap<ExecutorInstanceId, usize>>,
     executor: ExecutorInstanceId,
@@ -1833,11 +2137,34 @@ fn scoped_count(
     counts.lock().unwrap().get(&executor).copied().unwrap_or(0)
 }
 
+fn total_count(counts: &Mutex<HashMap<ExecutorInstanceId, usize>>) -> usize {
+    counts.lock().unwrap().values().sum()
+}
+
+fn assert_artifacts_pending(
+    error: SessionError,
+    executor: ExecutorInstanceId,
+    readiness_epoch: u64,
+) {
+    match error {
+        SessionError::ExecutionProviderArtifactsPending {
+            executor: actual_executor,
+            readiness_epoch: actual_epoch,
+            ..
+        } => {
+            assert_eq!(actual_executor, executor.get());
+            assert_eq!(actual_epoch, readiness_epoch);
+        }
+        other => panic!("expected typed provider-artifact pending error, got {other}"),
+    }
+}
+
 #[test]
 fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
     let downloads = Arc::new(AtomicUsize::new(0));
     let ep = HostDownloadCountingEp::new_lifecycle(Arc::clone(&downloads));
     let compiles = ep.kernel_compiles();
+    let readiness_checks = ep.route_readiness_checks();
     let finalizations = ep.route_finalizations();
     let drains = ep.route_drains();
     let install_nodes = ep.route_install_graph_nodes();
@@ -1861,6 +2188,7 @@ fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
         1,
         "static build finalizes exactly once"
     );
+    assert_eq!(scoped_count(&readiness_checks, executor), 1);
     assert_eq!(
         scoped_count(&install_nodes, executor),
         1,
@@ -1871,6 +2199,11 @@ fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
     let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
     session.run(&[("x", &x)]).expect("run static Gelu");
     assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(
+        scoped_count(&readiness_checks, executor),
+        1,
+        "same static specialization needs no new provider readiness check"
+    );
 
     drop(session);
     assert_eq!(scoped_count(&drains, executor), 1);
@@ -1878,10 +2211,48 @@ fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
 }
 
 #[test]
+fn static_build_pending_fails_closed_and_drains_unpublished_executor() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_pending_once_lifecycle(downloads);
+    let compiles = ep.kernel_compiles();
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let drains = ep.route_drains();
+    let ep = Arc::new(ep);
+
+    let error = match InferenceSession::builder()
+        .model_bytes(&static_gelu_model())
+        .execution_provider(ep)
+        .build()
+    {
+        Err(error) => error,
+        Ok(_) => panic!("static build must not publish a pending executor"),
+    };
+    assert!(matches!(
+        error,
+        SessionError::ExecutionProviderArtifactsPending {
+            readiness_epoch: 1,
+            ..
+        }
+    ));
+    assert_eq!(total_count(&compiles), 1);
+    assert_eq!(total_count(&finalizations), 1);
+    assert_eq!(total_count(&terminal_outcomes), 0);
+    assert_eq!(total_count(&executions), 0);
+    assert_eq!(
+        total_count(&drains),
+        1,
+        "failed static build drains exactly its unpublished executor scope"
+    );
+}
+
+#[test]
 fn symbolic_first_resolved_compile_finalizes_before_use_and_specialization_does_not_reinstall() {
     let downloads = Arc::new(AtomicUsize::new(0));
     let ep = HostDownloadCountingEp::new_lifecycle(downloads);
     let compiles = ep.kernel_compiles();
+    let readiness_checks = ep.route_readiness_checks();
     let finalizations = ep.route_finalizations();
     let drains = ep.route_drains();
     let capture_checks = ep.capture_checks();
@@ -1904,6 +2275,7 @@ fn symbolic_first_resolved_compile_finalizes_before_use_and_specialization_does_
     let x2 = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
     session.run(&[("x", &x2)]).expect("first symbolic run");
     assert_eq!(scoped_count(&compiles, executor), 1);
+    assert_eq!(scoped_count(&readiness_checks, executor), 1);
     assert_eq!(scoped_count(&finalizations, executor), 1);
     let mut binding = session
         .allocate_device_binding("x", Some("y"), DataType::Float32, vec![2], vec![2])
@@ -1933,16 +2305,523 @@ fn symbolic_first_resolved_compile_finalizes_before_use_and_specialization_does_
         1,
         "stable executor artifacts make dynamic specialization reinstall-free"
     );
+    assert_eq!(
+        scoped_count(&readiness_checks, executor),
+        2,
+        "a new compiled specialization re-confirms the executor terminal outcome"
+    );
 
     drop(session);
     assert_eq!(scoped_count(&drains, executor), 1);
 }
 
 #[test]
-fn shared_provider_concurrent_symbolic_executors_finalize_and_drain_independently() {
+fn pending_blocks_execution_and_capture_until_a_new_compilation_epoch_finalizes_once() {
     let downloads = Arc::new(AtomicUsize::new(0));
-    let ep = Arc::new(HostDownloadCountingEp::new_lifecycle(downloads));
+    let ep = HostDownloadCountingEp::new_pending_once_lifecycle(downloads);
+    let readiness_checks = ep.route_readiness_checks();
     let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let capture_checks = ep.capture_checks();
+    let drains = ep.route_drains();
+    let ep = Arc::new(ep);
+
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build pending lifecycle session");
+    let executor = session.executor_instance_id();
+    let x2 = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    let error = session
+        .run(&[("x", &x2)])
+        .expect_err("first readiness epoch must remain pending");
+    assert_artifacts_pending(error, executor, 1);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&readiness_checks, executor), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 0);
+    assert_eq!(scoped_count(&executions, executor), 0);
+    assert_eq!(capture_checks.load(Ordering::Relaxed), 0);
+
+    let mut binding = session
+        .allocate_device_binding("x", Some("y"), DataType::Float32, vec![2], vec![2])
+        .expect("allocate pending capture binding");
+    binding
+        .write_bytes(0, &f32_bytes(&[-1.0, 1.0]))
+        .expect("seed pending capture binding");
+    let error =
+        match session.try_capture_with_device_bindings(&[], std::slice::from_mut(&mut binding)) {
+            Err(error) => error,
+            Ok(_) => panic!("capture must not begin while artifacts are pending"),
+        };
+    assert_artifacts_pending(error, executor, 1);
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        1,
+        "the same readiness epoch must not busy-retry finalization"
+    );
+    assert_eq!(scoped_count(&readiness_checks, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 0);
+    assert_eq!(capture_checks.load(Ordering::Relaxed), 0);
+
+    let error = session
+        .run(&[("x", &x2)])
+        .expect_err("same-shape eager retry must remain pending");
+    assert_artifacts_pending(error, executor, 1);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 0);
+
+    let x4 = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    session
+        .run(&[("x", &x4)])
+        .expect("new specialization advances readiness and finalizes");
+    assert_eq!(scoped_count(&finalizations, executor), 2);
+    assert_eq!(scoped_count(&readiness_checks, executor), 2);
+    assert_eq!(
+        scoped_count(&terminal_outcomes, executor),
+        1,
+        "provider installation reaches one terminal outcome"
+    );
+    assert_eq!(scoped_count(&executions, executor), 1);
+
+    session
+        .run(&[("x", &x2)])
+        .expect("completed executor reuses the installed producer identity");
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        2,
+        "later specializations must not reinstall executor-owned artifacts"
+    );
+    assert_eq!(scoped_count(&readiness_checks, executor), 2);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 2);
+
+    drop(session);
+    assert_eq!(scoped_count(&drains, executor), 1);
+}
+
+#[test]
+fn permanent_structural_decline_is_terminal_before_execution() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_structural_decline_lifecycle(downloads);
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build structural-decline lifecycle session");
+    let executor = session.executor_instance_id();
+
+    let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    session
+        .run(&[("x", &x)])
+        .expect("honest terminal structural decline permits execution");
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 1);
+
+    let x = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    session
+        .run(&[("x", &x)])
+        .expect("later specialization reuses terminal decline");
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 2);
+}
+
+#[test]
+fn failed_finalization_is_cached_until_readiness_advances() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_fail_once_lifecycle(downloads);
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build failed-finalization lifecycle session");
+    let executor = session.executor_instance_id();
+
+    let x2 = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    for _ in 0..2 {
+        let error = session
+            .run(&[("x", &x2)])
+            .expect_err("failed readiness epoch must not execute");
+        assert!(matches!(
+            error,
+            SessionError::ExecutionProviderArtifactFinalizationFailed {
+                readiness_epoch: 1,
+                ..
+            }
+        ));
+    }
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        1,
+        "same failed epoch must not re-enter the provider"
+    );
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 0);
+    assert_eq!(scoped_count(&executions, executor), 0);
+
+    let x4 = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    session
+        .run(&[("x", &x4)])
+        .expect("new compilation epoch retries failed finalization");
+    assert_eq!(scoped_count(&finalizations, executor), 2);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 1);
+}
+
+#[test]
+fn single_graph_fast_replay_obeys_pending_failed_and_ready_specializations() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_fast_replay_lifecycle(downloads);
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let boundary_consumes = ep.route_boundary_consumes();
+    let executions = ep.kernel_executions();
+    let drains = ep.route_drains();
+    let segment_replays = ep.graph_segment_replays();
+    let fast_replays = ep.graph_fast_replays();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build fast-replay lifecycle session");
+    let executor = session.executor_instance_id();
+
+    let input = session
+        .allocate_device_binding("x", None::<String>, DataType::Float32, vec![2], vec![2])
+        .expect("allocate persistent capture input");
+    let output = session
+        .allocate_device_output_binding("y", DataType::Float32, vec![2], vec![2])
+        .expect("allocate persistent capture output");
+    let mut bindings = vec![input, output];
+    bindings[0]
+        .write_bytes(0, &f32_bytes(&[-1.0, 1.0]))
+        .expect("seed persistent capture input");
+    assert!(matches!(
+        session
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .expect("first specialization reaches a terminal outcome and captures"),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    assert_eq!(session.captured_graph_segment_count(), 1);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 1);
+    assert_eq!(segment_replays.load(Ordering::SeqCst), 1);
+    assert_eq!(fast_replays.load(Ordering::SeqCst), 0);
+
+    let x4 = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    let error = session
+        .run(&[("x", &x4)])
+        .expect_err("second specialization remains pending");
+    assert_artifacts_pending(error, executor, 2);
+    assert_eq!(scoped_count(&executions, executor), 1);
+    let error = session
+        .replay_device_graph(&mut bindings)
+        .expect_err("fast replay must not bypass pending readiness");
+    assert_artifacts_pending(error, executor, 2);
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        2,
+        "fast replay must not busy-retry a pending epoch"
+    );
+    assert_eq!(fast_replays.load(Ordering::SeqCst), 0);
+
+    let x8 = Tensor::from_f32(&[8], &[-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let error = session
+        .run(&[("x", &x8)])
+        .expect_err("third specialization fails finalization");
+    assert!(matches!(
+        error,
+        SessionError::ExecutionProviderArtifactFinalizationFailed {
+            executor: actual_executor,
+            readiness_epoch: 3,
+            ..
+        } if actual_executor == executor.get()
+    ));
+    let error = session
+        .replay_device_graph(&mut bindings)
+        .expect_err("fast replay must not bypass failed readiness");
+    assert!(matches!(
+        error,
+        SessionError::ExecutionProviderArtifactFinalizationFailed {
+            executor: actual_executor,
+            readiness_epoch: 3,
+            ..
+        } if actual_executor == executor.get()
+    ));
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        3,
+        "fast replay must not re-enter a failed epoch"
+    );
+    assert_eq!(scoped_count(&executions, executor), 1);
+    assert_eq!(fast_replays.load(Ordering::SeqCst), 0);
+
+    let x16 = Tensor::from_f32(
+        &[16],
+        &[
+            -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+        ],
+    )
+    .unwrap();
+    session
+        .run(&[("x", &x16)])
+        .expect("fourth specialization reaches a terminal outcome");
+    assert_eq!(scoped_count(&finalizations, executor), 4);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 2);
+    assert_eq!(scoped_count(&executions, executor), 2);
+    let boundaries_before_fast_replay = boundary_consumes.load(Ordering::SeqCst);
+    assert!(
+        session
+            .replay_device_graph(&mut bindings)
+            .expect("ready authority permits the installed fast replay")
+    );
+    assert_eq!(fast_replays.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        boundary_consumes.load(Ordering::SeqCst),
+        boundaries_before_fast_replay + 1,
+        "single-graph fast replay must traverse the production request boundary"
+    );
+
+    drop(session);
+    assert_eq!(scoped_count(&drains, executor), 1);
+}
+
+#[test]
+fn binding_preparation_cache_misses_revoke_fast_replay_until_terminal() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_fast_replay_lifecycle(downloads);
+    let compiles = ep.kernel_compiles();
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let fast_replays = ep.graph_fast_replays();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_matmul_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build binding-preparation lifecycle session");
+    let executor = session.executor_instance_id();
+
+    let input = session
+        .allocate_device_binding(
+            "x",
+            None::<String>,
+            DataType::Float32,
+            vec![1, 2],
+            vec![1, 2],
+        )
+        .expect("allocate captured MatMul input");
+    let output = session
+        .allocate_device_output_binding("y", DataType::Float32, vec![1, 2], vec![1, 2])
+        .expect("allocate captured MatMul output");
+    let mut captured_bindings = vec![input, output];
+    captured_bindings[0]
+        .write_bytes(0, &f32_bytes(&[1.0, 2.0]))
+        .expect("seed captured MatMul input");
+    assert!(matches!(
+        session
+            .try_capture_with_device_bindings(&[], &mut captured_bindings)
+            .expect("initial specialization finalizes and captures"),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    assert_eq!(scoped_count(&compiles, executor), 1);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 1);
+
+    let mut prepared_binding_sets = Vec::new();
+    for (rows, expected_epoch, expected_attempt) in [(2, 2, 2), (3, 3, 3), (4, 4, 4)] {
+        let input = session
+            .allocate_device_binding(
+                "x",
+                None::<String>,
+                DataType::Float32,
+                vec![rows, 2],
+                vec![rows, 2],
+            )
+            .expect("allocate prepared MatMul input");
+        let output = session
+            .allocate_device_output_binding("y", DataType::Float32, vec![rows, 2], vec![rows, 2])
+            .expect("allocate prepared MatMul output");
+        prepared_binding_sets.push(vec![input, output]);
+        session
+            .prepare_with_device_bindings(
+                &[],
+                prepared_binding_sets
+                    .last_mut()
+                    .expect("just pushed prepared bindings"),
+            )
+            .expect("binding preparation publishes a new specialization");
+        assert_eq!(scoped_count(&compiles, executor), expected_epoch);
+
+        let result = session.replay_device_graph(&mut captured_bindings);
+        match expected_attempt {
+            2 => assert_artifacts_pending(
+                result.expect_err("prepared specialization keeps replay pending"),
+                executor,
+                expected_epoch as u64,
+            ),
+            3 => assert!(matches!(
+                result.expect_err("prepared specialization makes replay fail closed"),
+                SessionError::ExecutionProviderArtifactFinalizationFailed {
+                    executor: actual_executor,
+                    readiness_epoch,
+                    ..
+                } if actual_executor == executor.get()
+                    && readiness_epoch == expected_epoch as u64
+            )),
+            4 => assert!(result.expect("ready prepared specialization permits replay")),
+            _ => unreachable!(),
+        }
+        assert_eq!(scoped_count(&finalizations, executor), expected_attempt);
+        assert_eq!(
+            scoped_count(&executions, executor),
+            1,
+            "binding preparation and readiness checks must not execute kernels"
+        );
+    }
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 2);
+    assert_eq!(fast_replays.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn runtime_dispatch_cache_miss_finalizes_before_kernel_use() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_fast_replay_lifecycle(downloads);
+    let compiles = ep.kernel_compiles();
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&runtime_dispatch_specialization_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build runtime-dispatch lifecycle session");
+    let executor = session.executor_instance_id();
+
+    let data2 = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    let shape12 = i64_tensor(&[2], &[1, 2]);
+    let error = session
+        .run(&[("data", &data2), ("shape", &shape12)])
+        .expect_err("runtime Add specialization remains pending");
+    assert_artifacts_pending(error, executor, 2);
+    assert_eq!(
+        scoped_count(&compiles, executor),
+        2,
+        "preflight compiles Reshape and runtime dispatch compiles Add"
+    );
+    assert_eq!(scoped_count(&finalizations, executor), 2);
+    assert_eq!(
+        scoped_count(&executions, executor),
+        0,
+        "the Reshape is a view and pending blocks the runtime-compiled Add"
+    );
+
+    let error = session
+        .run(&[("data", &data2), ("shape", &shape12)])
+        .expect_err("same runtime specialization remains latched pending");
+    assert_artifacts_pending(error, executor, 2);
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        2,
+        "pending epoch must not busy-retry"
+    );
+    assert_eq!(scoped_count(&executions, executor), 0);
+
+    let data4 = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    let shape22 = i64_tensor(&[2], &[2, 2]);
+    let error = session
+        .run(&[("data", &data4), ("shape", &shape22)])
+        .expect_err("new preflight specialization reaches the injected failure");
+    assert!(matches!(
+        error,
+        SessionError::ExecutionProviderArtifactFinalizationFailed {
+            executor: actual_executor,
+            readiness_epoch: 3,
+            ..
+        } if actual_executor == executor.get()
+    ));
+    assert_eq!(scoped_count(&compiles, executor), 3);
+    assert_eq!(scoped_count(&finalizations, executor), 3);
+    assert_eq!(scoped_count(&executions, executor), 0);
+
+    let error = session
+        .run(&[("data", &data4), ("shape", &shape22)])
+        .expect_err("same preflight specialization remains latched failed");
+    assert!(matches!(
+        error,
+        SessionError::ExecutionProviderArtifactFinalizationFailed {
+            readiness_epoch: 3,
+            ..
+        }
+    ));
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        3,
+        "failed epoch must not busy-retry"
+    );
+
+    let data6 = Tensor::from_f32(&[6], &[-1.0, 0.0, 1.0, 2.0, 3.0, 4.0]).unwrap();
+    let shape32 = i64_tensor(&[2], &[3, 2]);
+    let outputs = session
+        .run(&[("data", &data6), ("shape", &shape32)])
+        .expect("later preflight and runtime specializations both finalize");
+    assert_eq!(outputs[0].shape, vec![3, 2]);
+    assert_eq!(scoped_count(&compiles, executor), 5);
+    assert_eq!(scoped_count(&finalizations, executor), 5);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 3);
+    assert_eq!(scoped_count(&executions, executor), 1);
+}
+
+#[test]
+fn cancellation_while_pending_drains_without_execution() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_pending_once_lifecycle(downloads);
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let drains = ep.route_drains();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build cancellable pending session");
+    let executor = session.executor_instance_id();
+    let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    let error = session
+        .run(&[("x", &x)])
+        .expect_err("run remains pending before cancellation");
+    assert_artifacts_pending(error, executor, 1);
+
+    drop(session);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 0);
+    assert_eq!(scoped_count(&executions, executor), 0);
+    assert_eq!(scoped_count(&drains, executor), 1);
+}
+
+#[test]
+fn shared_provider_concurrent_pending_executors_finalize_and_drain_independently() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = Arc::new(HostDownloadCountingEp::new_pending_once_lifecycle(
+        downloads,
+    ));
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
     let drains = ep.route_drains();
     let model = symbolic_gelu_model();
 
@@ -1963,15 +2842,44 @@ fn shared_provider_concurrent_symbolic_executors_finalize_and_drain_independentl
     std::thread::scope(|scope| {
         scope.spawn(|| {
             let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
-            first.run(&[("x", &x)]).expect("first concurrent run");
+            first
+                .run(&[("x", &x)])
+                .expect_err("first executor initially pending");
         });
         scope.spawn(|| {
             let x = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
-            second.run(&[("x", &x)]).expect("second concurrent run");
+            second
+                .run(&[("x", &x)])
+                .expect_err("second executor initially pending");
         });
     });
     assert_eq!(scoped_count(&finalizations, first_id), 1);
     assert_eq!(scoped_count(&finalizations, second_id), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, first_id), 0);
+    assert_eq!(scoped_count(&terminal_outcomes, second_id), 0);
+    assert_eq!(scoped_count(&executions, first_id), 0);
+    assert_eq!(scoped_count(&executions, second_id), 0);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let x = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+            first
+                .run(&[("x", &x)])
+                .expect("first executor finalizes independently");
+        });
+        scope.spawn(|| {
+            let x = Tensor::from_f32(&[8], &[-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+            second
+                .run(&[("x", &x)])
+                .expect("second executor finalizes independently");
+        });
+    });
+    assert_eq!(scoped_count(&finalizations, first_id), 2);
+    assert_eq!(scoped_count(&finalizations, second_id), 2);
+    assert_eq!(scoped_count(&terminal_outcomes, first_id), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, second_id), 1);
+    assert_eq!(scoped_count(&executions, first_id), 1);
+    assert_eq!(scoped_count(&executions, second_id), 1);
 
     drop(first);
     assert_eq!(scoped_count(&drains, first_id), 1);
@@ -1984,7 +2892,8 @@ fn shared_provider_concurrent_symbolic_executors_finalize_and_drain_independentl
     second
         .run(&[("x", &x)])
         .expect("surviving sibling still runs");
-    assert_eq!(scoped_count(&finalizations, second_id), 1);
+    assert_eq!(scoped_count(&finalizations, second_id), 2);
+    assert_eq!(scoped_count(&terminal_outcomes, second_id), 1);
     drop(second);
     assert_eq!(scoped_count(&drains, second_id), 1);
 }

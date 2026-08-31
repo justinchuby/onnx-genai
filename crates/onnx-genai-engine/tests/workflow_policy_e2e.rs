@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
     Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
+    SessionForkParticipantKind, SessionPosition,
 };
 use onnx_genai_ort::{DataType, SessionOptions, Value};
 
@@ -665,31 +666,30 @@ preprocessing:
         name: image.pixel_values
         content: pixels
         dtype: float32
-        contract: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
+        contract: { dtype: float32, shape: [total_patches, 3, 2, 2] }
       - source: grid
         name: image.grid
         content: original_size
         dtype: int64
-        contract: { dtype: int64, rank: 2, shape: [1, 2] }
+        contract: { dtype: int64, shape: [1, 2] }
 pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.image-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.batch_anchor:
-        contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+        contract: { dtype: int64, shape: [batch, sequence] }
         role: { kind: opaque }
         source: { kind: application, name: batch_anchor }
         required: true
       request.image:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: opaque }
         source: { kind: application, name: image }
         required: true
     outputs:
       result:
-        contract: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
+        contract: { dtype: float32, shape: [total_patches, 3, 2, 2] }
         role: image
         value_range: zero_to_one
         stage: post_adapter
@@ -698,33 +698,33 @@ pipeline:
         implementation: { kind: adapter, abi: onnx-genai.image-preprocess, version: "1" }
         ports:
           inputs:
-            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            encoded: { dtype: uint8, shape: [encoded_bytes] }
           outputs:
-            pixel_values: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
-            grid: { dtype: int64, rank: 2, shape: [1, 2] }
+            pixel_values: { dtype: float32, shape: [total_patches, 3, 2, 2] }
+            grid: { dtype: int64, shape: [1, 2] }
         effects: []
       vision:
         implementation: { kind: onnx, artifact: vision.onnx.textproto }
         ports:
           inputs:
-            pixel_values: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
-            grid: { dtype: int64, rank: 2, shape: [1, 2] }
+            pixel_values: { dtype: float32, shape: [total_patches, 3, 2, 2] }
+            grid: { dtype: int64, shape: [1, 2] }
           outputs:
-            image_features: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
+            image_features: { dtype: float32, shape: [total_patches, 3, 2, 2] }
       embedding:
         implementation: { kind: onnx, artifact: embedding.onnx.textproto }
         ports:
           inputs:
-            input: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
+            input: { dtype: float32, shape: [total_patches, 3, 2, 2] }
           outputs:
-            output: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
+            output: { dtype: float32, shape: [total_patches, 3, 2, 2] }
       decoder:
         implementation: { kind: onnx, artifact: decoder.onnx.textproto }
         ports:
           inputs:
-            input: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
+            input: { dtype: float32, shape: [total_patches, 3, 2, 2] }
           outputs:
-            output: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
+            output: { dtype: float32, shape: [total_patches, 3, 2, 2] }
     steps:
         - kind: invoke
           component: preprocess
@@ -793,17 +793,15 @@ preprocessing:
         dtype: float32
         contract:
           dtype: float32
-          rank: 4
           shape: [batch, 3, 2, 2]
           batch_layout: { kind: request_aligned, axis: 0 }
 pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.video-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.video:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: opaque }
         source: { kind: application, name: video }
         required: true
@@ -811,7 +809,6 @@ pipeline:
       result:
         contract:
           dtype: float32
-          rank: 4
           shape: [batch, 3, 2, 2]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: video
@@ -821,11 +818,10 @@ pipeline:
         implementation: { kind: adapter, abi: onnx-genai.video-preprocess, version: "1" }
         ports:
           inputs:
-            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            encoded: { dtype: uint8, shape: [encoded_bytes] }
           outputs:
             pixels:
               dtype: float32
-              rank: 4
               shape: [batch, 3, 2, 2]
               batch_layout: { kind: request_aligned, axis: 0 }
     steps:
@@ -869,18 +865,17 @@ fn optional_media_presence_selects_real_or_empty_features() -> anyhow::Result<()
     let metadata = r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, nested_control_flow, typed_emit, input_presence]
+    manifest: {}
     inputs:
       request.image_features:
-        contract: { dtype: float32, rank: 2, shape: [num_features, 4] }
+        contract: { dtype: float32, shape: [num_features, 4] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
         required: false
         present_as: request.image_present
     outputs:
       result:
-        contract: { dtype: float32, rank: 2, shape: [num_features, 4] }
+        contract: { dtype: float32, shape: [num_features, 4] }
         role: tensor
         stage: pre_adapter
     components:
@@ -888,14 +883,14 @@ pipeline:
         implementation: { kind: onnx, artifact: supplied.onnx.textproto }
         ports:
           inputs:
-            input: { dtype: float32, rank: 2, shape: [num_features, 4] }
+            input: { dtype: float32, shape: [num_features, 4] }
           outputs:
-            output: { dtype: float32, rank: 2, shape: [num_features, 4] }
+            output: { dtype: float32, shape: [num_features, 4] }
       empty:
         implementation: { kind: onnx, artifact: empty.onnx.textproto }
         ports:
           outputs:
-            output: { dtype: float32, rank: 2, shape: [0, 4] }
+            output: { dtype: float32, shape: [0, 4] }
     steps:
       - kind: branch
         predicate: request.image_present
@@ -950,36 +945,35 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
-        contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] }
+        contract: { dtype: float32, shape: [batch, vocabulary] }
         role: { kind: opaque }
         source: { kind: application, name: logits }
         required: true
       temperature:
-        contract: { dtype: float32, rank: 1, shape: [1] }
+        contract: { dtype: float32, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_temperature }
         source: { kind: request }
         required: true
       top_k:
-        contract: { dtype: int64, rank: 1, shape: [1] }
+        contract: { dtype: int64, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_top_k }
         source: { kind: request }
         required: true
       top_p:
-        contract: { dtype: float32, rank: 1, shape: [1] }
+        contract: { dtype: float32, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_top_p }
         source: { kind: request }
         required: true
       grammar_mask:
-        contract: { dtype: bool, rank: 2, shape: [batch, vocabulary] }
+        contract: { dtype: bool, shape: [batch, vocabulary] }
         role: { kind: opaque }
         source: { kind: application, name: grammar_mask }
         required: true
     outputs:
       token:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: tokens
         stage: pre_adapter
     components:
@@ -1119,41 +1113,40 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
     inputs:
       initial_cache:
-        contract: { dtype: float32, rank: 2, shape: [batch, cache] }
+        contract: { dtype: float32, shape: [batch, cache] }
         role: { kind: opaque }
         source: { kind: application, name: initial_cache }
         required: true
       token_state:
-        contract: { dtype: float32, rank: 2, shape: [batch, 1] }
+        contract: { dtype: float32, shape: [batch, 1] }
         role: { kind: opaque }
         source: { kind: application, name: token_state }
         required: true
       iterations:
-        contract: { dtype: int64, rank: 1, shape: [1] }
+        contract: { dtype: int64, shape: [1] }
         role: { kind: opaque }
         source: { kind: application, name: iterations }
         required: true
       continue:
-        contract: { dtype: bool, rank: 0, shape: [] }
+        contract: { dtype: bool, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: continue }
         required: true
       one:
-        contract: { dtype: int64, rank: 1, shape: [1] }
+        contract: { dtype: int64, shape: [1] }
         role: { kind: opaque }
         source: { kind: application, name: one }
         required: true
       max_context:
-        contract: { dtype: int64, rank: 1, shape: [1] }
+        contract: { dtype: int64, shape: [1] }
         role: { kind: opaque }
         source: { kind: application, name: max_context }
         required: true
     outputs:
       final_cache:
-        contract: { dtype: float32, rank: 2, shape: [batch, cache] }
+        contract: { dtype: float32, shape: [batch, cache] }
         role: tensor
         stage: pre_adapter
     components:
@@ -1161,7 +1154,7 @@ pipeline:
         implementation: { kind: onnx, artifact: decoder.onnx.textproto }
     state:
       cache:
-        contract: { dtype: float32, rank: 2, shape: [batch, cache] }
+        contract: { dtype: float32, shape: [batch, cache] }
         scope: invocation
         initializer: initial_cache
         recurrence: { kind: growing, axis: 1, increment: one, max: max_context }
@@ -1223,30 +1216,29 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
-        contract: { dtype: float32, rank: 2, shape: [1, 4] }
+        contract: { dtype: float32, shape: [1, 4] }
         role: { kind: opaque }
         source: { kind: application, name: logits }
         required: true
       min_p:
-        contract: { dtype: float32, rank: 1, shape: [1] }
+        contract: { dtype: float32, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_min_p }
         source: { kind: request }
         required: true
       eos:
-        contract: { dtype: int64, rank: 1, shape: [1] }
+        contract: { dtype: int64, shape: [1] }
         role: { kind: opaque }
         source: { kind: application, name: eos }
         required: true
     outputs:
       token:
-        contract: { dtype: int64, rank: 1, shape: [1] }
+        contract: { dtype: int64, shape: [1] }
         role: tokens
         stage: pre_adapter
       done:
-        contract: { dtype: bool, rank: 1, shape: [1] }
+        contract: { dtype: bool, shape: [1] }
         role: tensor
         stage: pre_adapter
     components:
@@ -1388,16 +1380,15 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
-        contract: { dtype: float32, rank: 2, shape: [batch, 4] }
+        contract: { dtype: float32, shape: [batch, 4] }
         role: { kind: opaque }
         source: { kind: application, name: logits }
         required: true
     outputs:
       token:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: tokens
         stage: pre_adapter
     components:
@@ -1478,21 +1469,20 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits.raw:
-        contract: { dtype: float32, rank: 2, shape: [1, 4] }
+        contract: { dtype: float32, shape: [1, 4] }
         role: { kind: opaque }
         source: { kind: application, name: logits.raw }
         required: true
       logits_raw:
-        contract: { dtype: float32, rank: 2, shape: [1, 4] }
+        contract: { dtype: float32, shape: [1, 4] }
         role: { kind: opaque }
         source: { kind: application, name: logits_raw }
         required: true
     outputs:
       token:
-        contract: { dtype: int64, rank: 1, shape: [1] }
+        contract: { dtype: int64, shape: [1] }
         role: tokens
         stage: pre_adapter
     components:
@@ -1548,17 +1538,16 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       eos:
-        contract: { dtype: int64, rank: 1, shape: [num_eos] }
+        contract: { dtype: int64, shape: [num_eos] }
         role: { kind: opaque }
         source: { kind: literal }
         required: true
         default: 99
     outputs:
       result:
-        contract: { dtype: int64, rank: 1, shape: [num_eos] }
+        contract: { dtype: int64, shape: [num_eos] }
         role: tokens
         stage: pre_adapter
     components: {}
@@ -1585,21 +1574,20 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       prompt:
-        contract: { dtype: int64, rank: 2, shape: [batch, prompt_sequence] }
+        contract: { dtype: int64, shape: [batch, prompt_sequence] }
         role: { kind: opaque }
         source: { kind: application, name: prompt }
         required: true
       token:
-        contract: { dtype: int64, rank: 2, shape: [batch, 1] }
+        contract: { dtype: int64, shape: [batch, 1] }
         role: { kind: opaque }
         source: { kind: application, name: token }
         required: true
     outputs:
       result:
-        contract: { dtype: int64, rank: 2, shape: [batch, 1] }
+        contract: { dtype: int64, shape: [batch, 1] }
         role: tokens
         stage: pre_adapter
     components:
@@ -1607,9 +1595,9 @@ pipeline:
         implementation: { kind: onnx, artifact: identity.onnx.textproto }
         ports:
           inputs:
-            input: { dtype: int64, rank: 2, shape: [batch, sequence] }
+            input: { dtype: int64, shape: [batch, sequence] }
           outputs:
-            output: { dtype: int64, rank: 2, shape: [batch, sequence] }
+            output: { dtype: int64, shape: [batch, sequence] }
     steps:
         - kind: invoke
           component: identity
@@ -1646,33 +1634,32 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit, bounded_state_growth]
     inputs:
       prompt:
-        contract: { dtype: int64, rank: 2, shape: [batch, prompt_sequence] }
+        contract: { dtype: int64, shape: [batch, prompt_sequence] }
         role: { kind: opaque }
         source: { kind: application, name: prompt }
         required: true
       token:
-        contract: { dtype: int64, rank: 2, shape: [batch, 1] }
+        contract: { dtype: int64, shape: [batch, 1] }
         role: { kind: opaque }
         source: { kind: application, name: token }
         required: true
       one:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: { kind: opaque }
         source: { kind: literal }
         required: false
         default: 1
       maximum:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: { kind: opaque }
         source: { kind: literal }
         required: false
         default: 8
     outputs:
       result:
-        contract: { dtype: int64, rank: 2, shape: [batch, prompt_sequence] }
+        contract: { dtype: int64, shape: [batch, prompt_sequence] }
         role: tokens
         stage: pre_adapter
     components:
@@ -1680,13 +1667,13 @@ pipeline:
         implementation: { kind: onnx, artifact: pair.onnx.textproto }
         ports:
           inputs:
-            left: { dtype: int64, rank: 2, shape: [batch, sequence] }
-            right: { dtype: int64, rank: 2, shape: [batch, sequence] }
+            left: { dtype: int64, shape: [batch, sequence] }
+            right: { dtype: int64, shape: [batch, sequence] }
           outputs:
-            output: { dtype: int64, rank: 2, shape: [batch, sequence] }
+            output: { dtype: int64, shape: [batch, sequence] }
     state:
       dummy:
-        contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+        contract: { dtype: int64, shape: [batch, sequence] }
         scope: invocation
         initializer: prompt
         recurrence: { kind: growing, axis: 1, increment: one, max: maximum }
@@ -1725,50 +1712,49 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
     inputs:
-      logits: { contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] },
+      logits: { contract: { dtype: float32, shape: [batch, vocabulary] },
                 role: { kind: opaque }, source: { kind: application, name: logits }, required: true }
       seed:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: { kind: runtime, version: v1, role: seed }
         source: { kind: request }
         required: true
-      offset: { contract: { dtype: int64, rank: 1, shape: [batch] },
+      offset: { contract: { dtype: int64, shape: [batch] },
                 role: { kind: opaque }, source: { kind: application, name: offset }, required: true }
-      eos: { contract: { dtype: int64, rank: 1, shape: [batch] },
+      eos: { contract: { dtype: int64, shape: [batch] },
              role: { kind: opaque }, source: { kind: application, name: eos }, required: true }
-      iteration: { contract: { dtype: int64, rank: 1, shape: [batch] },
+      iteration: { contract: { dtype: int64, shape: [batch] },
                    role: { kind: opaque }, source: { kind: application, name: iteration }, required: true }
-      max_iterations: { contract: { dtype: int64, rank: 1, shape: [batch] },
+      max_iterations: { contract: { dtype: int64, shape: [batch] },
                         role: { kind: opaque }, source: { kind: application, name: max_iterations }, required: true }
       iterations:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         role: { kind: runtime, version: v1, role: max_output_tokens }
         source: { kind: request }
         required: true
-      initial_continue: { contract: { dtype: bool, rank: 1, shape: [1] },
+      initial_continue: { contract: { dtype: bool, shape: [1] },
                           role: { kind: opaque },
                           source: { kind: application, name: initial_continue }, required: true }
     outputs:
-      tokens: { contract: { dtype: int64, rank: 1, shape: [generated] },
+      tokens: { contract: { dtype: int64, shape: [generated] },
                 role: tokens, stage: pre_adapter }
     components:
       binding:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
-          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          inputs: { value: { dtype: int64, shape: [batch] } }
+          outputs: { value: { dtype: int64, shape: [batch] } }
       sampler:
         implementation: { kind: onnx, artifact: sampler.onnx.textproto }
         ports:
           inputs:
-            logits: { dtype: float32, rank: 2, shape: [batch, vocabulary] }
-            seed: { dtype: int64, rank: 1, shape: [batch] }
-            offset: { dtype: int64, rank: 1, shape: [batch] }
+            logits: { dtype: float32, shape: [batch, vocabulary] }
+            seed: { dtype: int64, shape: [batch] }
+            offset: { dtype: int64, shape: [batch] }
           outputs:
-            token_ids: { dtype: int64, rank: 1, shape: [batch] }
-            next_offset: { dtype: int64, rank: 1, shape: [batch] }
+            token_ids: { dtype: int64, shape: [batch] }
+            next_offset: { dtype: int64, shape: [batch] }
         contract:
           id: onnx-genai.token-sampler
           version: "1"
@@ -1781,12 +1767,12 @@ pipeline:
         implementation: { kind: onnx, artifact: eos.onnx.textproto }
         ports:
           inputs:
-            token_ids: { dtype: int64, rank: 1, shape: [batch] }
-            eos_token_ids: { dtype: int64, rank: 1, shape: [batch] }
-            iteration: { dtype: int64, rank: 1, shape: [batch] }
-            max_iterations: { dtype: int64, rank: 1, shape: [batch] }
+            token_ids: { dtype: int64, shape: [batch] }
+            eos_token_ids: { dtype: int64, shape: [batch] }
+            iteration: { dtype: int64, shape: [batch] }
+            max_iterations: { dtype: int64, shape: [batch] }
           outputs:
-            terminated: { dtype: bool, rank: 1, shape: [batch] }
+            terminated: { dtype: bool, shape: [batch] }
         contract:
           id: onnx-genai.termination-predicate
           version: "1"
@@ -1799,16 +1785,16 @@ pipeline:
       invert:
         implementation: { kind: onnx, artifact: not.onnx.textproto }
         ports:
-          inputs: { done: { dtype: bool, rank: 1, shape: [batch] } }
-          outputs: { continue: { dtype: bool, rank: 1, shape: [1] } }
+          inputs: { done: { dtype: bool, shape: [batch] } }
+          outputs: { continue: { dtype: bool, shape: [1] } }
     state:
       rng:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         scope: invocation
         initializer: offset
         recurrence: { kind: invariant }
       active:
-        contract: { dtype: bool, rank: 1, shape: [1] }
+        contract: { dtype: bool, shape: [1] }
         scope: invocation
         initializer: initial_continue
         recurrence: { kind: invariant }
@@ -1909,42 +1895,40 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
-                     loop_induction_values]
     inputs:
-      sample: { contract: { dtype: float32, rank: 2, shape: [batch, width] },
+      sample: { contract: { dtype: float32, shape: [batch, width] },
                 role: { kind: opaque }, source: { kind: application, name: sample }, required: true }
-      derivative: { contract: { dtype: float32, rank: 2, shape: [batch, width] },
+      derivative: { contract: { dtype: float32, shape: [batch, width] },
                     role: { kind: opaque }, source: { kind: application, name: derivative }, required: true }
-      schedule: { contract: { dtype: float32, rank: 1, shape: [schedule_length] },
+      schedule: { contract: { dtype: float32, shape: [schedule_length] },
                   role: { kind: opaque }, source: { kind: application, name: schedule }, required: true }
-      iterations: { contract: { dtype: int64, rank: 0, shape: [] },
+      iterations: { contract: { dtype: int64, shape: [] },
                     role: { kind: opaque }, source: { kind: application, name: iterations },
                     required: true }
-      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+      continue: { contract: { dtype: bool, shape: [] },
                   role: { kind: opaque }, source: { kind: application, name: continue },
                   required: true }
     outputs:
-      latent: { contract: { dtype: float32, rank: 2, shape: [batch, width] },
+      latent: { contract: { dtype: float32, shape: [batch, width] },
                 role: tensor, stage: pre_adapter }
-      steps: { contract: { dtype: int64, rank: 1, shape: [generated] },
+      steps: { contract: { dtype: int64, shape: [generated] },
                role: event, stage: pre_adapter }
     components:
       sample_binding:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: float32, rank: 2, shape: [batch, width] } }
-          outputs: { value: { dtype: float32, rank: 2, shape: [batch, width] } }
+          inputs: { value: { dtype: float32, shape: [batch, width] } }
+          outputs: { value: { dtype: float32, shape: [batch, width] } }
       solver:
         implementation: { kind: onnx, artifact: solver.onnx.textproto }
         ports:
           inputs:
-            sample: { dtype: float32, rank: 2, shape: [batch, width] }
-            derivative: { dtype: float32, rank: 2, shape: [batch, width] }
-            step: { dtype: int64, rank: 1, shape: [batch] }
-            schedule: { dtype: float32, rank: 1, shape: [schedule_length] }
+            sample: { dtype: float32, shape: [batch, width] }
+            derivative: { dtype: float32, shape: [batch, width] }
+            step: { dtype: int64, shape: [batch] }
+            schedule: { dtype: float32, shape: [schedule_length] }
           outputs:
-            next_state: { dtype: float32, rank: 2, shape: [batch, width] }
+            next_state: { dtype: float32, shape: [batch, width] }
         contract:
           id: onnx-genai.solver-step
           version: "1"
@@ -1956,7 +1940,7 @@ pipeline:
             next_state: next_state
     state:
       latent:
-        contract: { dtype: float32, rank: 2, shape: [batch, width] }
+        contract: { dtype: float32, shape: [batch, width] }
         scope: invocation
         initializer: latent.current
         recurrence: { kind: invariant }
@@ -1981,7 +1965,7 @@ pipeline:
           max_iterations: iterations
           iteration:
             value: diffusion.step
-            contract: { dtype: int64, rank: 1, shape: [batch] }
+            contract: { dtype: int64, shape: [batch] }
           carried:
             - cell: latent
               initial: latent.current
@@ -2029,22 +2013,20 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
-                     loop_induction_values]
     inputs:
-      outer_count: { contract: { dtype: int64, rank: 0, shape: [] },
+      outer_count: { contract: { dtype: int64, shape: [] },
                      role: { kind: opaque }, source: { kind: application, name: outer_count },
                      required: true }
-      inner_count: { contract: { dtype: int64, rank: 0, shape: [] },
+      inner_count: { contract: { dtype: int64, shape: [] },
                      role: { kind: opaque }, source: { kind: application, name: inner_count },
                      required: true }
-      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+      continue: { contract: { dtype: bool, shape: [] },
                   role: { kind: opaque }, source: { kind: application, name: continue },
                   required: true }
     outputs:
-      outer_steps: { contract: { dtype: int64, rank: 1, shape: [outer_events] },
+      outer_steps: { contract: { dtype: int64, shape: [outer_events] },
                      role: event, stage: pre_adapter }
-      inner_steps: { contract: { dtype: int64, rank: 1, shape: [inner_events] },
+      inner_steps: { contract: { dtype: int64, shape: [inner_events] },
                      role: event, stage: pre_adapter }
     components: {}
     steps:
@@ -2064,13 +2046,13 @@ pipeline:
               max_iterations: inner_count
               iteration:
                 value: inner.index
-                contract: { dtype: int64, rank: 1, shape: [1] }
+                contract: { dtype: int64, shape: [1] }
               carried: []
         continue_when: continue
         max_iterations: outer_count
         iteration:
           value: outer.index
-          contract: { dtype: int64, rank: 1, shape: [1] }
+          contract: { dtype: int64, shape: [1] }
         carried: []
 "#;
     let root = package("nested-induction", metadata, &[])?;
@@ -2096,30 +2078,29 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
-      current: { contract: { dtype: int64, rank: 2, shape: [batch, sequence] }, role: { kind: opaque },
+      current: { contract: { dtype: int64, shape: [batch, sequence] }, role: { kind: opaque },
                  source: { kind: application, name: current }, required: true }
-      proposed: { contract: { dtype: int64, rank: 2, shape: [batch, sequence] }, role: { kind: opaque },
+      proposed: { contract: { dtype: int64, shape: [batch, sequence] }, role: { kind: opaque },
                   source: { kind: application, name: proposed }, required: true }
-      mask: { contract: { dtype: bool, rank: 2, shape: [batch, sequence] }, role: { kind: opaque },
+      mask: { contract: { dtype: bool, shape: [batch, sequence] }, role: { kind: opaque },
               source: { kind: application, name: mask }, required: true }
-      step: { contract: { dtype: int64, rank: 1, shape: [batch] }, role: { kind: opaque },
+      step: { contract: { dtype: int64, shape: [batch] }, role: { kind: opaque },
               source: { kind: application, name: step }, required: true }
     outputs:
-      tokens: { contract: { dtype: int64, rank: 2, shape: [batch, sequence] }, role: tokens, stage: pre_adapter }
+      tokens: { contract: { dtype: int64, shape: [batch, sequence] }, role: tokens, stage: pre_adapter }
     components:
       update:
         implementation: { kind: onnx, artifact: update.onnx.textproto }
         ports:
           inputs:
-            current_tokens: { dtype: int64, rank: 2, shape: [batch, sequence] }
-            proposed_tokens: { dtype: int64, rank: 2, shape: [batch, sequence] }
-            masked: { dtype: bool, rank: 2, shape: [batch, sequence] }
-            step: { dtype: int64, rank: 1, shape: [batch] }
+            current_tokens: { dtype: int64, shape: [batch, sequence] }
+            proposed_tokens: { dtype: int64, shape: [batch, sequence] }
+            masked: { dtype: bool, shape: [batch, sequence] }
+            step: { dtype: int64, shape: [batch] }
           outputs:
-            next_state: { dtype: int64, rank: 2, shape: [batch, sequence] }
-            next_mask: { dtype: bool, rank: 2, shape: [batch, sequence] }
+            next_state: { dtype: int64, shape: [batch, sequence] }
+            next_mask: { dtype: bool, shape: [batch, sequence] }
         contract:
           id: onnx-genai.masked-update
           version: "1"
@@ -2166,19 +2147,18 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
-      target: { contract: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary],
+      target: { contract: { dtype: float32, shape: [batch, draft, vocabulary],
                             batch_layout: { kind: request_aligned, axis: 0 } }, role: { kind: opaque },
                 source: { kind: application, name: target }, required: true }
-      proposed: { contract: { dtype: int64, rank: 2, shape: [batch, draft],
+      proposed: { contract: { dtype: int64, shape: [batch, draft],
                               batch_layout: { kind: request_aligned, axis: 0 } }, role: { kind: opaque },
                   source: { kind: application, name: proposed }, required: true }
     outputs:
-      accepted_len: { contract: { dtype: int64, rank: 1, shape: [batch],
+      accepted_len: { contract: { dtype: int64, shape: [batch],
                                   batch_layout: { kind: request_aligned, axis: 0 } },
                       role: tensor, stage: pre_adapter }
-      accepted_tokens: { contract: { dtype: int64, rank: 2, shape: [batch, accepted],
+      accepted_tokens: { contract: { dtype: int64, shape: [batch, accepted],
                                      batch_layout: { kind: request_aligned, axis: 0 } },
                          role: tokens, stage: pre_adapter }
     components:
@@ -2189,16 +2169,16 @@ pipeline:
           budgets: [{ dimensions: [batch], max_total: 2 }]
         ports:
           inputs:
-            target_scores: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary],
+            target_scores: { dtype: float32, shape: [batch, draft, vocabulary],
                              batch_layout: { kind: request_aligned, axis: 0 } }
-            proposed_tokens: { dtype: int64, rank: 2, shape: [batch, draft],
+            proposed_tokens: { dtype: int64, shape: [batch, draft],
                                batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            accepted_tokens: { dtype: int64, rank: 2, shape: [batch, draft],
+            accepted_tokens: { dtype: int64, shape: [batch, draft],
                                batch_layout: { kind: request_aligned, axis: 0 } }
-            accepted_count: { dtype: int64, rank: 1, shape: [batch],
+            accepted_count: { dtype: int64, shape: [batch],
                               batch_layout: { kind: request_aligned, axis: 0 } }
-            done: { dtype: bool, rank: 1, shape: [batch],
+            done: { dtype: bool, shape: [batch],
                     batch_layout: { kind: request_aligned, axis: 0 } }
         contract:
           id: onnx-genai.speculative-verifier
@@ -2268,51 +2248,48 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-        [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
-         bounded_state_recurrence]
     inputs:
-      tentative: { contract: { dtype: int64, rank: 2, shape: [batch, state] },
+      tentative: { contract: { dtype: int64, shape: [batch, state] },
                    role: { kind: opaque }, source: { kind: application, name: tentative },
                    required: true }
-      correction: { contract: { dtype: int64, rank: 2, shape: [batch, state] },
+      correction: { contract: { dtype: int64, shape: [batch, state] },
                     role: { kind: opaque }, source: { kind: application, name: correction },
                     required: true }
-      accepted_len: { contract: { dtype: int64, rank: 1, shape: [1] },
+      accepted_len: { contract: { dtype: int64, shape: [1] },
                       role: { kind: opaque }, source: { kind: application, name: accepted_len },
                       required: true }
-      accept: { contract: { dtype: bool, rank: 0, shape: [] },
+      accept: { contract: { dtype: bool, shape: [] },
                 role: { kind: opaque }, source: { kind: application, name: accept },
                 required: true }
-      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+      continue: { contract: { dtype: bool, shape: [] },
                   role: { kind: opaque }, source: { kind: application, name: continue },
                   required: true }
-      iterations: { contract: { dtype: int64, rank: 0, shape: [] },
+      iterations: { contract: { dtype: int64, shape: [] },
                     role: { kind: opaque }, source: { kind: application, name: iterations },
                     required: true }
-      max_context: { contract: { dtype: int64, rank: 0, shape: [] },
+      max_context: { contract: { dtype: int64, shape: [] },
                      role: { kind: opaque }, source: { kind: application, name: max_context },
                      required: true }
     outputs:
-      state: { contract: { dtype: int64, rank: 2, shape: [batch, state] },
+      state: { contract: { dtype: int64, shape: [batch, state] },
                role: tensor, stage: pre_adapter }
     components:
       identity:
         implementation: { kind: onnx, artifact: identity.onnx.textproto }
         ports:
-          inputs: { input: { dtype: int64, rank: 2, shape: [batch, state] } }
-          outputs: { output: { dtype: int64, rank: 2, shape: [batch, state] } }
+          inputs: { input: { dtype: int64, shape: [batch, state] } }
+          outputs: { output: { dtype: int64, shape: [batch, state] } }
       accepted_prefix:
         implementation: { kind: onnx, artifact: prefix.onnx.textproto }
         ports:
           inputs:
-            state: { dtype: int64, rank: 2, shape: [batch, tentative] }
-            valid_length: { dtype: int64, rank: 1, shape: [1] }
+            state: { dtype: int64, shape: [batch, tentative] }
+            valid_length: { dtype: int64, shape: [1] }
           outputs:
-            selected: { dtype: int64, rank: 2, shape: [batch, state] }
+            selected: { dtype: int64, shape: [batch, state] }
     state:
       rollback:
-        contract: { dtype: int64, rank: 2, shape: [batch, state] }
+        contract: { dtype: int64, shape: [batch, state] }
         scope: invocation
         initializer: rollback.current
         recurrence: { kind: bounded, axis: 1, max: max_context }
@@ -2399,60 +2376,56 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
-      capabilities:
-        [workflow_ssa, linear_effects, typed_emit, emit_valid_length, emit_row_identity,
-         nested_control_flow, grammar_guidance_adapter, adaptive_proposal_budget,
-         advisory_state]
     inputs:
-      proposed: { contract: { dtype: int64, rank: 2, shape: [batch, proposal] },
+      proposed: { contract: { dtype: int64, shape: [batch, proposal] },
                   role: { kind: opaque }, source: { kind: application, name: proposed },
                   required: true }
-      target: { contract: { dtype: float32, rank: 3, shape: [batch, proposal, vocabulary] },
+      target: { contract: { dtype: float32, shape: [batch, proposal, vocabulary] },
                 role: { kind: opaque }, source: { kind: application, name: target },
                 required: true }
-      logits: { contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] },
+      logits: { contract: { dtype: float32, shape: [batch, vocabulary] },
                 role: { kind: opaque }, source: { kind: application, name: logits },
                 required: true }
-      grammar_state: { contract: { dtype: int64, rank: 1, shape: [batch] },
+      grammar_state: { contract: { dtype: int64, shape: [batch] },
                        role: { kind: opaque },
                        source: { kind: application, name: grammar_state }, required: true }
-      transition_table: { contract: { dtype: int64, rank: 2, shape: [grammar_states, vocabulary] },
+      transition_table: { contract: { dtype: int64, shape: [grammar_states, vocabulary] },
                           role: { kind: opaque },
                           source: { kind: application, name: transition_table }, required: true }
-      zero_length: { contract: { dtype: int64, rank: 1, shape: [batch] },
+      zero_length: { contract: { dtype: int64, shape: [batch] },
                      role: { kind: opaque }, source: { kind: application, name: zero_length },
                      required: true }
-      evaluated: { contract: { dtype: int64, rank: 1, shape: [batch] },
+      evaluated: { contract: { dtype: int64, shape: [batch] },
                    role: { kind: opaque }, source: { kind: application, name: evaluated },
                    required: true }
-      current_k: { contract: { dtype: int64, rank: 1, shape: [batch] },
+      current_k: { contract: { dtype: int64, shape: [batch] },
                    role: { kind: opaque }, source: { kind: application, name: current_k },
                    required: true }
-      estimates: { contract: { dtype: float32, rank: 2, shape: [batch, budget_slots] },
+      estimates: { contract: { dtype: float32, shape: [batch, budget_slots] },
                    role: { kind: opaque }, source: { kind: application, name: estimates },
                    required: true }
-      filled: { contract: { dtype: bool, rank: 1, shape: [batch] },
+      filled: { contract: { dtype: bool, shape: [batch] },
                 role: { kind: opaque }, source: { kind: application, name: filled },
                 required: true }
-      draft_ms: { contract: { dtype: float32, rank: 1, shape: [batch] },
+      draft_ms: { contract: { dtype: float32, shape: [batch] },
                   role: { kind: opaque }, source: { kind: application, name: draft_ms },
                   required: true }
-      target_ms: { contract: { dtype: float32, rank: 1, shape: [batch] },
+      target_ms: { contract: { dtype: float32, shape: [batch] },
                    role: { kind: opaque }, source: { kind: application, name: target_ms },
                    required: true }
-      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+      continue: { contract: { dtype: bool, shape: [] },
                   role: { kind: opaque }, source: { kind: application, name: continue },
                   required: true }
-      iterations: { contract: { dtype: int64, rank: 0, shape: [] },
+      iterations: { contract: { dtype: int64, shape: [] },
                     role: { kind: opaque }, source: { kind: application, name: iterations },
                     required: true }
     outputs:
-      tokens: { contract: { dtype: int64, rank: 2, shape: [batch, generated],
+      tokens: { contract: { dtype: int64, shape: [batch, generated],
                             batch_layout: { kind: request_aligned, axis: 0 } },
                 role: tokens, stage: pre_adapter }
-      next_k: { contract: { dtype: int64, rank: 1, shape: [batch] },
+      next_k: { contract: { dtype: int64, shape: [batch] },
                 role: tensor, stage: pre_adapter }
-      final_grammar_state: { contract: { dtype: int64, rank: 1, shape: [batch] },
+      final_grammar_state: { contract: { dtype: int64, shape: [batch] },
                              role: tensor, stage: pre_adapter }
     effects:
       grammar:
@@ -2462,20 +2435,20 @@ pipeline:
       bind_grammar:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
-          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          inputs: { value: { dtype: int64, shape: [batch] } }
+          outputs: { value: { dtype: int64, shape: [batch] } }
         effects: []
       bind_k:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
-          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          inputs: { value: { dtype: int64, shape: [batch] } }
+          outputs: { value: { dtype: int64, shape: [batch] } }
         effects: []
       bind_estimates:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: float32, rank: 2, shape: [batch, budget_slots] } }
-          outputs: { value: { dtype: float32, rank: 2, shape: [batch, budget_slots] } }
+          inputs: { value: { dtype: float32, shape: [batch, budget_slots] } }
+          outputs: { value: { dtype: float32, shape: [batch, budget_slots] } }
         effects: []
       grammar_clone:
         implementation: { kind: adapter, abi: onnx-genai.grammar-guidance, version: "1" }
@@ -2496,16 +2469,16 @@ pipeline:
             action: clone
         ports: &grammar_ports
           inputs:
-            state: { dtype: int64, rank: 1, shape: [batch] }
-            tokens: { dtype: int64, rank: 2, shape: [batch, proposal] }
-            valid_length: { dtype: int64, rank: 1, shape: [batch] }
-            transition_table: { dtype: int64, rank: 2, shape: [grammar_states, vocabulary] }
+            state: { dtype: int64, shape: [batch] }
+            tokens: { dtype: int64, shape: [batch, proposal] }
+            valid_length: { dtype: int64, shape: [batch] }
+            transition_table: { dtype: int64, shape: [grammar_states, vocabulary] }
           outputs:
-            next_state: { dtype: int64, rank: 1, shape: [batch] }
-            consumed_length: { dtype: int64, rank: 1, shape: [batch] }
-            logits_mask: { dtype: bool, rank: 2, shape: [batch, vocabulary] }
-            forced_tokens: { dtype: int64, rank: 2, shape: [batch, 1] }
-            forced_length: { dtype: int64, rank: 1, shape: [batch] }
+            next_state: { dtype: int64, shape: [batch] }
+            consumed_length: { dtype: int64, shape: [batch] }
+            logits_mask: { dtype: bool, shape: [batch, vocabulary] }
+            forced_tokens: { dtype: int64, shape: [batch, 1] }
+            forced_length: { dtype: int64, shape: [batch] }
         effects: [grammar]
       grammar_lookahead:
         implementation: { kind: adapter, abi: onnx-genai.grammar-guidance, version: "1" }
@@ -2549,12 +2522,12 @@ pipeline:
         implementation: { kind: onnx, artifact: verifier.onnx.textproto }
         ports:
           inputs:
-            target_scores: { dtype: float32, rank: 3, shape: [batch, proposal, vocabulary] }
-            proposed_tokens: { dtype: int64, rank: 2, shape: [batch, proposal] }
+            target_scores: { dtype: float32, shape: [batch, proposal, vocabulary] }
+            proposed_tokens: { dtype: int64, shape: [batch, proposal] }
           outputs:
-            accepted_tokens: { dtype: int64, rank: 2, shape: [batch, proposal] }
-            accepted_count: { dtype: int64, rank: 1, shape: [1] }
-            done: { dtype: bool, rank: 1, shape: [batch] }
+            accepted_tokens: { dtype: int64, shape: [batch, proposal] }
+            accepted_count: { dtype: int64, shape: [1] }
+            done: { dtype: bool, shape: [batch] }
         contract:
           id: onnx-genai.speculative-verifier
           version: "1"
@@ -2568,25 +2541,25 @@ pipeline:
         implementation: { kind: onnx, artifact: min.onnx.textproto }
         ports:
           inputs:
-            accepted: { dtype: int64, rank: 1, shape: [batch] }
-            grammar: { dtype: int64, rank: 1, shape: [batch] }
+            accepted: { dtype: int64, shape: [batch] }
+            grammar: { dtype: int64, shape: [batch] }
           outputs:
-            length: { dtype: int64, rank: 1, shape: [1] }
+            length: { dtype: int64, shape: [1] }
       adaptive:
         implementation: { kind: onnx, artifact: adaptive.onnx.textproto }
         ports:
           inputs:
-            current_k: { dtype: int64, rank: 1, shape: [batch] }
-            accepted: { dtype: int64, rank: 1, shape: [batch] }
-            evaluated: { dtype: int64, rank: 1, shape: [batch] }
-            committed_tokens: { dtype: int64, rank: 1, shape: [batch] }
-            filled_proposal_budget: { dtype: bool, rank: 1, shape: [batch] }
-            draft_ms: { dtype: float32, rank: 1, shape: [batch] }
-            target_ms: { dtype: float32, rank: 1, shape: [batch] }
-            estimates: { dtype: float32, rank: 2, shape: [batch, budget_slots] }
+            current_k: { dtype: int64, shape: [batch] }
+            accepted: { dtype: int64, shape: [batch] }
+            evaluated: { dtype: int64, shape: [batch] }
+            committed_tokens: { dtype: int64, shape: [batch] }
+            filled_proposal_budget: { dtype: bool, shape: [batch] }
+            draft_ms: { dtype: float32, shape: [batch] }
+            target_ms: { dtype: float32, shape: [batch] }
+            estimates: { dtype: float32, shape: [batch, budget_slots] }
           outputs:
-            next_k: { dtype: int64, rank: 1, shape: [batch] }
-            next_estimates: { dtype: float32, rank: 2, shape: [batch, budget_slots] }
+            next_k: { dtype: int64, shape: [batch] }
+            next_estimates: { dtype: float32, shape: [batch, budget_slots] }
         contract:
           id: onnx-genai.adaptive-proposal-budget
           version: "1"
@@ -2605,27 +2578,27 @@ pipeline:
         implementation: { kind: onnx, artifact: guided.onnx.textproto }
         ports:
           inputs:
-            logits: { dtype: float32, rank: 2, shape: [batch, vocabulary] }
-            logits_mask: { dtype: bool, rank: 2, shape: [batch, vocabulary] }
-            forced_tokens: { dtype: int64, rank: 2, shape: [batch, 1] }
-            forced_length: { dtype: int64, rank: 1, shape: [batch] }
+            logits: { dtype: float32, shape: [batch, vocabulary] }
+            logits_mask: { dtype: bool, shape: [batch, vocabulary] }
+            forced_tokens: { dtype: int64, shape: [batch, 1] }
+            forced_length: { dtype: int64, shape: [batch] }
           outputs:
-            token: { dtype: int64, rank: 2, shape: [batch, 1] }
+            token: { dtype: int64, shape: [batch, 1] }
     state:
       grammar:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         class: semantic
         scope: invocation
         initializer: grammar.current
         recurrence: { kind: invariant }
       adaptive:
-        contract: { dtype: float32, rank: 2, shape: [batch, budget_slots] }
+        contract: { dtype: float32, shape: [batch, budget_slots] }
         class: advisory
         scope: invocation
         initializer: adaptive.current
         recurrence: { kind: invariant }
       proposal_k:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         class: advisory
         scope: invocation
         initializer: k.current
@@ -2827,10 +2800,9 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.telemetry: "1" }
-      capabilities: [workflow_ssa, linear_effects, typed_emit, telemetry_adapter]
     inputs: {}
     outputs:
-      elapsed_ms: { contract: { dtype: float32, rank: 0, shape: [] },
+      elapsed_ms: { contract: { dtype: float32, shape: [] },
                     role: tensor, stage: pre_adapter }
     effects:
       telemetry:
@@ -2848,7 +2820,7 @@ pipeline:
             action: start
         ports:
           inputs: {}
-          outputs: { timestamp: { dtype: int64, rank: 0, shape: [] } }
+          outputs: { timestamp: { dtype: int64, shape: [] } }
         effects: [telemetry]
       clock_elapsed:
         implementation: { kind: adapter, abi: onnx-genai.telemetry, version: "1" }
@@ -2861,8 +2833,8 @@ pipeline:
           parameters:
             action: elapsed
         ports:
-          inputs: { timestamp: { dtype: int64, rank: 0, shape: [] } }
-          outputs: { duration_ms: { dtype: float32, rank: 0, shape: [] } }
+          inputs: { timestamp: { dtype: int64, shape: [] } }
+          outputs: { duration_ms: { dtype: float32, shape: [] } }
         effects: [telemetry]
     steps:
         - kind: invoke
@@ -2890,47 +2862,51 @@ pipeline:
 #[test]
 fn workflow_threads_loop_branch_effects_and_session_state() -> anyhow::Result<()> {
     let metadata = r#"
+schema_version: v1.5
 pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-        [workflow_ssa, linear_effects, typed_emit, streaming_emit,
-         nested_control_flow, session_state_lease]
     inputs:
-      initial: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
+      initial: { contract: { dtype: int64, shape: [] }, role: { kind: opaque },
                  source: { kind: application, name: initial }, required: true }
-      run_branch: { contract: { dtype: bool, rank: 0, shape: [] }, role: { kind: opaque },
+      run_branch: { contract: { dtype: bool, shape: [] }, role: { kind: opaque },
                     source: { kind: application, name: run_branch }, required: true }
-      increment: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
+      increment: { contract: { dtype: int64, shape: [] }, role: { kind: opaque },
                    source: { kind: application, name: increment }, required: true }
-      limit: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
+      limit: { contract: { dtype: int64, shape: [] }, role: { kind: opaque },
                source: { kind: application, name: limit }, required: true }
       iterations:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         role: { kind: runtime, version: v1, role: max_iterations }
         source: { kind: request }
         required: true
-      initial_continue: { contract: { dtype: bool, rank: 0, shape: [] },
+      initial_continue: { contract: { dtype: bool, shape: [] },
                           role: { kind: opaque },
                           source: { kind: application, name: initial_continue }, required: true }
     outputs:
-      state: { contract: { dtype: int64, rank: 0, shape: [] }, role: tensor, stage: pre_adapter }
-      events: { contract: { dtype: int64, rank: 0, shape: [] }, role: event, stage: pre_adapter }
+      state: { contract: { dtype: int64, shape: [] }, role: tensor,
+               family: { kind: materialized }, stage: pre_adapter }
+      events: { contract: { dtype: int64, shape: [] }, role: event,
+                family: { kind: events }, stage: pre_adapter }
+    effects:
+      world_effect:
+        retry: transactional
+        speculation_safety: { kind: clonable }
     components:
       binding:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: int64, rank: 0, shape: [] } }
-          outputs: { value: { dtype: int64, rank: 0, shape: [] } }
+          inputs: { value: { dtype: int64, shape: [] } }
+          outputs: { value: { dtype: int64, shape: [] } }
       update:
         implementation: { kind: onnx, artifact: update.onnx.textproto }
         ports:
           inputs:
-            current: { dtype: int64, rank: 0, shape: [] }
-            update: { dtype: int64, rank: 0, shape: [] }
+            current: { dtype: int64, shape: [] }
+            update: { dtype: int64, shape: [] }
           outputs:
-            next: { dtype: int64, rank: 0, shape: [] }
+            next: { dtype: int64, shape: [] }
         contract:
           id: onnx-genai.state-update
           version: "1"
@@ -2938,23 +2914,24 @@ pipeline:
             current: current
             update: update
             next: next
+        effects: [world_effect]
       predicate:
         implementation: { kind: onnx, artifact: less.onnx.textproto }
         ports:
           inputs:
-            value: { dtype: int64, rank: 0, shape: [] }
-            limit: { dtype: int64, rank: 0, shape: [] }
+            value: { dtype: int64, shape: [] }
+            limit: { dtype: int64, shape: [] }
           outputs:
-            continue: { dtype: bool, rank: 0, shape: [] }
+            continue: { dtype: bool, shape: [] }
     state:
       world:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         scope: session
         initializer: initial
         recurrence: { kind: invariant }
         session: { policy: exclusive }
       active:
-        contract: { dtype: bool, rank: 0, shape: [] }
+        contract: { dtype: bool, shape: [] }
         scope: invocation
         initializer: initial_continue
         recurrence: { kind: invariant }
@@ -3046,6 +3023,8 @@ pipeline:
         ],
     )?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let world_session = engine.create_session()?;
+    let world_session_name = world_session.to_string();
     let first_options = onnx_genai_engine::GenerateOptions {
         max_new_tokens: 4,
         ..Default::default()
@@ -3054,7 +3033,7 @@ pipeline:
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: first_options,
     })
-    .with_session_id("world-a")
+    .with_session_id(world_session_name.clone())
     .with_input(
         "run_branch",
         Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
@@ -3067,6 +3046,16 @@ pipeline:
     .with_input("increment", Value::from_slice_i64(&[1], &[])?)
     .with_input("limit", Value::from_slice_i64(&[3], &[])?);
     assert_eq!(engine.run_pipeline(first)?["state"].to_vec_i64()?, [3]);
+    let fork_plan = engine.prepare_session_fork(world_session, SessionPosition::new(1))?;
+    assert!(fork_plan.participants().iter().any(|participant| {
+        participant.kind == SessionForkParticipantKind::GenericFeatureState
+            && participant.name == "world"
+    }));
+    assert!(fork_plan.participants().iter().any(|participant| {
+        participant.kind == SessionForkParticipantKind::TransactionalEffect
+            && participant.name == "world_effect"
+    }));
+    let forked_world = engine.fork_session(fork_plan)?;
 
     let second_options = onnx_genai_engine::GenerateOptions {
         max_new_tokens: 1,
@@ -3076,7 +3065,7 @@ pipeline:
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: second_options,
     })
-    .with_session_id("world-a")
+    .with_session_id(world_session_name.clone())
     .with_input(
         "run_branch",
         Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
@@ -3090,6 +3079,27 @@ pipeline:
     .with_input("limit", Value::from_slice_i64(&[5], &[])?);
     assert_eq!(engine.run_pipeline(second)?["state"].to_vec_i64()?, [4]);
 
+    let forked = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![]),
+        options: onnx_genai_engine::GenerateOptions {
+            max_new_tokens: 1,
+            ..Default::default()
+        },
+    })
+    .with_session_id(forked_world.to_string())
+    .with_input(
+        "run_branch",
+        Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
+    )
+    .with_input(
+        "initial_continue",
+        Value::from_raw_bytes(vec![1], &[], DataType::Bool)?,
+    )
+    .with_input("initial", Value::from_slice_i64(&[0], &[])?)
+    .with_input("increment", Value::from_slice_i64(&[3], &[])?)
+    .with_input("limit", Value::from_slice_i64(&[9], &[])?);
+    assert_eq!(engine.run_pipeline(forked)?["state"].to_vec_i64()?, [6]);
+
     let third_options = onnx_genai_engine::GenerateOptions {
         max_new_tokens: 1,
         ..Default::default()
@@ -3098,7 +3108,7 @@ pipeline:
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: third_options,
     })
-    .with_session_id("world-a")
+    .with_session_id(world_session_name)
     .with_input(
         "run_branch",
         Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
@@ -3111,6 +3121,8 @@ pipeline:
     .with_input("increment", Value::from_slice_i64(&[1], &[])?)
     .with_input("limit", Value::from_slice_i64(&[5], &[])?);
     assert_eq!(engine.run_pipeline(third)?["state"].to_vec_i64()?, [5]);
+    engine.close_session(world_session)?;
+    engine.close_session(forked_world)?;
     Ok(())
 }
 
@@ -3121,97 +3133,94 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-        [workflow_ssa, linear_effects, typed_emit, streaming_emit,
-         nested_control_flow, session_state_lease, advisory_state]
     inputs:
-      initial: { contract: { dtype: int64, rank: 0, shape: [] },
+      initial: { contract: { dtype: int64, shape: [] },
                  role: { kind: opaque }, source: { kind: application, name: initial },
                  required: true }
-      observation: { contract: { dtype: int64, rank: 0, shape: [] },
+      observation: { contract: { dtype: int64, shape: [] },
                      role: { kind: opaque },
                      source: { kind: application, name: observation }, required: true }
-      action_threshold: { contract: { dtype: int64, rank: 0, shape: [] },
+      action_threshold: { contract: { dtype: int64, shape: [] },
                           role: { kind: opaque },
                           source: { kind: application, name: action_threshold }, required: true }
-      low_delta: { contract: { dtype: int64, rank: 0, shape: [] },
+      low_delta: { contract: { dtype: int64, shape: [] },
                    role: { kind: opaque }, source: { kind: application, name: low_delta },
                    required: true }
-      high_delta: { contract: { dtype: int64, rank: 0, shape: [] },
+      high_delta: { contract: { dtype: int64, shape: [] },
                     role: { kind: opaque }, source: { kind: application, name: high_delta },
                     required: true }
-      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+      continue: { contract: { dtype: bool, shape: [] },
                   role: { kind: opaque }, source: { kind: application, name: continue },
                   required: true }
       iterations:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         role: { kind: runtime, version: v1, role: max_iterations }
         source: { kind: request }
         required: true
     outputs:
-      latent: { contract: { dtype: int64, rank: 0, shape: [] },
+      latent: { contract: { dtype: int64, shape: [] },
                 role: tensor, stage: pre_adapter }
-      advisory_count: { contract: { dtype: int64, rank: 0, shape: [] },
+      advisory_count: { contract: { dtype: int64, shape: [] },
                         role: tensor, stage: pre_adapter }
-      actions: { contract: { dtype: bool, rank: 0, shape: [] },
+      actions: { contract: { dtype: bool, shape: [] },
                  role: event, stage: pre_adapter }
     components:
       bind_state:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: int64, rank: 0, shape: [] } }
-          outputs: { value: { dtype: int64, rank: 0, shape: [] } }
+          inputs: { value: { dtype: int64, shape: [] } }
+          outputs: { value: { dtype: int64, shape: [] } }
         effects: []
       observation_encoder:
         implementation: { kind: onnx, artifact: observation.onnx.textproto }
         ports:
           inputs:
-            current: { dtype: int64, rank: 0, shape: [] }
-            update: { dtype: int64, rank: 0, shape: [] }
+            current: { dtype: int64, shape: [] }
+            update: { dtype: int64, shape: [] }
           outputs:
-            next: { dtype: int64, rank: 0, shape: [] }
+            next: { dtype: int64, shape: [] }
       action_policy:
         implementation: { kind: onnx, artifact: action.onnx.textproto }
         ports:
           inputs:
-            value: { dtype: int64, rank: 0, shape: [] }
-            limit: { dtype: int64, rank: 0, shape: [] }
+            value: { dtype: int64, shape: [] }
+            limit: { dtype: int64, shape: [] }
           outputs:
-            continue: { dtype: bool, rank: 0, shape: [] }
+            continue: { dtype: bool, shape: [] }
       environment_low:
         implementation: { kind: onnx, artifact: environment-low.onnx.textproto }
         ports:
           inputs:
-            current: { dtype: int64, rank: 0, shape: [] }
-            update: { dtype: int64, rank: 0, shape: [] }
+            current: { dtype: int64, shape: [] }
+            update: { dtype: int64, shape: [] }
           outputs:
-            next: { dtype: int64, rank: 0, shape: [] }
+            next: { dtype: int64, shape: [] }
       environment_high:
         implementation: { kind: onnx, artifact: environment-high.onnx.textproto }
         ports:
           inputs:
-            current: { dtype: int64, rank: 0, shape: [] }
-            update: { dtype: int64, rank: 0, shape: [] }
+            current: { dtype: int64, shape: [] }
+            update: { dtype: int64, shape: [] }
           outputs:
-            next: { dtype: int64, rank: 0, shape: [] }
+            next: { dtype: int64, shape: [] }
       advisory_counter:
         implementation: { kind: onnx, artifact: advisory-counter.onnx.textproto }
         ports:
           inputs:
-            current: { dtype: int64, rank: 0, shape: [] }
-            update: { dtype: int64, rank: 0, shape: [] }
+            current: { dtype: int64, shape: [] }
+            update: { dtype: int64, shape: [] }
           outputs:
-            next: { dtype: int64, rank: 0, shape: [] }
+            next: { dtype: int64, shape: [] }
     state:
       latent:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         class: semantic
         scope: session
         initializer: initial
         recurrence: { kind: invariant }
         session: { policy: exclusive }
       advisory_steps:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         class: advisory
         scope: session
         initializer: initial
@@ -3354,51 +3363,49 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-        [workflow_ssa, linear_effects, typed_emit, streaming_emit, nested_control_flow]
     inputs:
       accept:
-        contract: { dtype: bool, rank: 0, shape: [] }
+        contract: { dtype: bool, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: accept }
         required: true
       accepted_tokens:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: { kind: opaque }
         source: { kind: application, name: accepted_tokens }
         required: true
       corrected_tokens:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: { kind: opaque }
         source: { kind: application, name: corrected_tokens }
         required: true
       accepted_kv:
-        contract: { dtype: float32, rank: 2, shape: [batch, cache] }
+        contract: { dtype: float32, shape: [batch, cache] }
         role: { kind: opaque }
         source: { kind: application, name: accepted_kv }
         required: true
       corrected_kv:
-        contract: { dtype: float32, rank: 2, shape: [batch, cache] }
+        contract: { dtype: float32, shape: [batch, cache] }
         role: { kind: opaque }
         source: { kind: application, name: corrected_kv }
         required: true
       accepted_rng:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: { kind: opaque }
         source: { kind: application, name: accepted_rng }
         required: true
       corrected_rng:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: { kind: opaque }
         source: { kind: application, name: corrected_rng }
         required: true
     outputs:
       event:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: event
         stage: pre_adapter
       final:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: tokens
         stage: pre_adapter
     effects:
@@ -3415,26 +3422,26 @@ pipeline:
       token_binding:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
-          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          inputs: { value: { dtype: int64, shape: [batch] } }
+          outputs: { value: { dtype: int64, shape: [batch] } }
         effects: [speculative]
       plain_token_binding:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
-          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          inputs: { value: { dtype: int64, shape: [batch] } }
+          outputs: { value: { dtype: int64, shape: [batch] } }
         effects: []
       kv_binding:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: float32, rank: 2, shape: [batch, cache] } }
-          outputs: { value: { dtype: float32, rank: 2, shape: [batch, cache] } }
+          inputs: { value: { dtype: float32, shape: [batch, cache] } }
+          outputs: { value: { dtype: float32, shape: [batch, cache] } }
         effects: [kv]
       rng_binding:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
-          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          inputs: { value: { dtype: int64, shape: [batch] } }
+          outputs: { value: { dtype: int64, shape: [batch] } }
         effects: [rng]
     steps:
         - kind: branch

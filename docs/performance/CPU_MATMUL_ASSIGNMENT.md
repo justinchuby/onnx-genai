@@ -968,6 +968,65 @@ python3 scripts/ort_ab/ab.py --native-only --null-control \
 these cells a paired run depressed the native median by up to 6x and pushed the null control past the
 effect being measured.
 
+**Matching the widths does not make a paired run safe (2026-08-27).** #1839 removed the *count*
+half of that bias — `resolve_ort_intra_threads` now sizes ORT's pool to the native budget — and the
+guard it shipped with is silent once the widths agree. Prompted by a cross-agent report, the
+placement half was measured directly, reading `Cpus_allowed_list` per thread from `/proc` on a live
+paired run at `--native-threads 8`: **8 ORT threads on `0-31` against every native thread on
+`0,2,4,6,8,10,12,14`**. `bench_generic` builds the ORT session *before* `InferenceSession::load`
+reaches `bound_process_to_decode_budget`, so ORT's pool inherits the startup mask and the native
+arm inherits the confined one. Equal count, unequal set — and ORT spins between runs, so a share of
+that spin lands on exactly the CPUs being timed:
+
+| arm (`gemm_nbits_llama3_8b_qkv_t8`, width 8, 40 runs, medians of 4) | native p50 | vs reference |
+|---|---|---|
+| `--native-only` (no ORT session exists) | 2.11 ms | reference |
+| paired, equal width, ORT unconfined | 2.78 ms | **+32%** |
+| paired, equal width, ORT spin disabled | 2.26 ms | +7% |
+
+So ~78% of the residue is idle spin, and the overlap predicts its size: 8 spinners over 32 CPUs put
+~2 CPUs' worth of load on the native arm's 8, and 2/8 ≈ 25% against a measured 32%.
+
+Three findings worth more than the patch. First, **the obvious remedy is the harmful one** —
+`taskset`-ing both arms onto the same 8 CPUs, to "make it symmetric", concentrates every ORT spinner
+onto the measured cores: native 2.9–3.8 ms became **13.6–18.0 ms (5x worse)** while ORT got ~2x
+faster. Symmetry of the mask is not symmetry of the interference. Second, **the asymmetry inverts
+with width**: at `--native-threads 32` it is ORT that pins one thread per CPU while the native arm
+floats across all 32, so its direction cannot be inferred from one row. Third, the predicted
+mechanism was **not observed** where it was expected — a native-only A/B between a confined set
+containing this host's permanently-busy cpu0 and a set of the same width and topology gave prod
+1.98 ms against "clean" 2.15 ms, i.e. the arm with the busy CPU was *faster*.
+
+**That third result is withdrawn as unestablished** (2026-08-27, on Holden's challenge). Two defects,
+either of which is sufficient:
+
+* **Neither arm was clean.** The control set had cpu20 and cpu26 at ~28% busy — recorded at the time
+  as a caveat, which was too weak a word for a 8.6% effect. Worse, re-checking the host afterwards
+  found an unpinned 123%-CPU process (`copilot --resume`, affinity `0-31`) whose threads were
+  observed on cpus 4, 7, 11 and 14 — inside the *prod* set and on the siblings of two of its cores.
+  Both arms were contaminated, by different amounts, in an uncontrolled direction. A comparison
+  between two dirty arms cannot support a null.
+* **The guard used to accept the reps is blind to the contention mode this host exhibits.** Reps were
+  kept on per-run CPU efficiency, `(utime+stime)/wall`. That ratio cannot see SMT contention: a
+  thread whose sibling is busy still accrues ~100% of its own CPU time while delivering materially
+  less work, so a contended rep scores ~1.00 and is kept. On **this** box the sibling map is
+  `(0,1), (2,3), …` — *not* `(0,16)` — so the prod set `0,2,…,14` left every sibling `1,3,…,15`
+  unreserved and in the path of exactly the roaming process above. An efficiency-gated A/A null
+  would have looked tight throughout.
+
+The claim is not inverted, it is unsupported: the data cannot distinguish "cpu0 membership is free"
+from "the control was dirtier than the treatment". Settling it needs both siblings of every measured
+core in the mask with only one running, plus per-CPU `/proc/stat` foreign-busy sampled over the
+measurement window on the confined set *and* its siblings, with contaminated reps discarded rather
+than averaged. Nothing else in this section depends on it: the +32% spin result is a three-arm
+comparison in which all arms share whatever contamination is present, and the shipped warning is
+keyed on a structural condition, not on a measured margin.
+
+Shipped as a second warning (`ort_spin_overlap_warning`) keyed on the *span* rather than the width,
+verified to fire on the biased run and stay silent under `--native-only` and on an unconfined host.
+Left as a warning, not a default: disabling ORT's spin would measure ORT in a configuration nobody
+ships, trading a bias against the native arm for one against ORT.
+
 ### 9. The int4 prefill's fused dequant pack was scalar, and its row gate was measured against it (**fixed**)
 
 Section 5 fused the dequantization into the GEBP pack, so the f32 weight is never materialized: at
@@ -2047,6 +2106,14 @@ time. That figure is now stale; the re-measurement replaces it.
 > dispatcher migrates at most once per launch, so migration is not it. The knob
 > ships **off**, and would need prefill in the matrix before it could ship on --
 > the dispatcher is the session thread and keeps its affinity after decode ends.
+> **A concurrency cliff in the knob was found and fixed on 2026-08-26 (#2177):**
+> the reserve frees one CPU and every dispatching thread pinned to it, while a
+> thread that loses the pool's single claim computes *every* shard inline -- so
+> two sessions ran at **0.551x** of unpinned and four at **0.321x**, 0/10 in both
+> cells, with both session threads observed on `cpu=30`. `dispatch_inline` now
+> gives the CPU back; the same cells read 1.027 and 1.019 and the single-session
+> gain is unchanged. See the addendum in
+> `docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`.
 > **The A/A null therefore remains open, and the +23% steal-tiles candidate
 > remains blocked behind it.** **A third mechanism has now been tested and
 > rejected: transparent-hugepage backing of the weight arena.** THP is
@@ -3173,15 +3240,40 @@ Full report:
   change read +0.28% on that row** — one against a main three commits earlier,
   one against the same main with `-Cllvm-args=-align-all-functions=5` applied
   identically to every arm. So the layout component of a source-level A/B here
-  reaches ~2%, is not stable across rebuilds, and **is structurally invisible
+  is not stable across rebuilds, and **is structurally invisible
   to an A/A**, which compares a file with itself. Every A/A in that document
-  brackets 1.000 while the 1.9% artifact sits in the same table.
-  Standing consequence: a sub-2% source-level A/B with no route-not-taken row
+  brackets 1.000 while the artifact sits in the same table.
+  **Magnitude revised down, 2026-08-26.** All three of those pairs were
+  measured through a gate blind to SMT-sibling contention. Re-taking that cell
+  on `533546095` through the gate #2216 added reads **0.9972
+  [0.9930, 0.9993]** against an A/A of 1.0000 [0.9958, 1.0021] — intervals that
+  do not overlap the original, so most of the 1.9% was a contended hyperthread
+  sibling and not layout. The route proof re-ran on the same rebuilt arms and
+  still reports `before == after == poison == 4cb1dcffe7454cff` at that cell,
+  so the *attribution* is untouched; only the size is.
+
+  **Retracted in size, 2026-08-26, by direct measurement.** The ~2% is not
+  layout at all. Built the same source at two independent layouts — default,
+  and `-Cllvm-args=-align-all-functions=5`, which moves 50% → 91% of `FUNC`
+  symbols onto a 32-byte boundary — and ran one against the other as an **A/B′
+  null** through the #2216 gate: **1.0014 [1.0000, 1.0042]** at prefill block 32
+  `m = 1` and **0.9993 [0.9971, 1.0005]** on the block-16 decode, with the arms
+  bit-identical, which is what certifies only the layout moved. Layout
+  sensitivity at these cells is under half a percent, so the spread across the
+  three original pairs was SMT contention wearing layout's clothes. Pairs A and
+  C no longer need re-taking — the question they were queued to answer has been
+  answered directly and better. Two consequences: the ~2% decode win clears its
+  real floor by roughly 5x and **stands**, and the `m = 1` −0.28% sits inside
+  the floor and is not a regression.
+  Standing consequence: a small source-level A/B with no route-not-taken row
   is not confirmed. Where a route-not-taken row exists, prove it with a
   poisoned build and read it as the experiment's floor. Where it does not,
-  **require the result to reproduce across independently built pairs of
-  binaries** — cheapest on demand by rebuilding every arm under
-  `-Cllvm-args=-align-all-functions=5`, which perturbs layout and nothing else.
+  **measure an A/B′ null on the cell you are claiming** — rebuild every arm
+  under `-Cllvm-args=-align-all-functions=5`, then compare the aligned `after`
+  against the default-layout `after`. That is a pure layout null on the exact
+  cell, certified by the harness's cross-arm bit-identity check, and it
+  replaces the older rule of distrusting anything under 2%: measure your own
+  floor rather than importing someone else's.
   Reproducing across two block sizes from one pair does *not* substitute:
   a single pair of binaries has a single layout, and I initially argued
   otherwise in this document. The 1/m decay of the ratio does not distinguish
@@ -3189,6 +3281,37 @@ Full report:
   total that grows with `m` produces the identical curve. What distinguishes
   them is that the route-not-taken row is the only one that moves when the
   layout does.
+* **The clip that the modulo elimination rests on is mutation-tested, and a
+  review finding that it was not is disposed as falsified (2026-08-26).** The
+  finding (Pris) was that the substitution `(depth + q) % block_size` →
+  `offset_base + q` relies on `run` being clipped to `block_size - offset_base`,
+  and that a removal or relaxation of that clip could corrupt output while the
+  int4 tests stayed green. The premise about the invariant is exactly right and
+  matches the code comment; the claim about the tests is not. Mutating
+  `dequant_panel_avx2`'s clip four ways and running
+  `cargo test -p onnx-runtime-ep-cpu --lib int4_`:
+
+  | mutant | result |
+  | --- | --- |
+  | `run = whole - p` (clip removed) | **killed**, 4 tests |
+  | `run = (2 * block_size - offset_base).min(..)` | **killed** |
+  | `run = (block_size - offset_base + DEQUANT_GROUP).min(..)` | **killed**, 4 tests |
+  | `offset_base = depth & (block_size - 1)` (power-of-two only) | **killed** at `block = 24` |
+  | no-op edit to the same line | survived |
+
+  The no-op surviving is the calibration that makes the kills meaningful: the
+  suite discriminates rather than reddening at any touch. The guard is
+  `int4_dequant_panel_is_bit_identical_to_the_per_column_path`, which is a
+  differential test against the scalar `dequant_column` across `block_size`
+  2/4/8/24/32/40/128 × `nr` × `kc` × `pc` — so it catches clip damage as output
+  divergence without needing to name the invariant. The fourth mutant also
+  shows the non-power-of-two sizes are load-bearing: trim 24 and 40 from that
+  list as redundant and the masked form goes green. Recorded in the test's own
+  comment so a future tidy-up cannot remove them silently. Related sub-finding
+  also checked and rejected: every int4 test in `x86_sgemm.rs` is already
+  `#[cfg(target_arch = "x86_64")]`-gated and reaches `dequant_panel_avx2`
+  through the real dispatcher, so there is no un-gated test claiming AVX2
+  execution.
 * **The decode headline was overstated, by my own instrument's rules.** #1809
   said 1.015x; two sweeps here give 1.0116 and 1.0095, and in both the
   decode-loop **A/A interval excludes 1.000, with opposite signs** (+0.63% at
@@ -3212,6 +3335,66 @@ Full report:
   `int4_modulo_arms.sh` additionally **fails hard if two arms come out
   byte-identical** — that failure still produces a full table of numbers, every
   one of them a null between a binary and itself.
+* **The whole matrix was quiet-host-only evidence, and now is not (2026-08-27).**
+  Every number above was taken pinned to an idle core behind two gates whose
+  purpose is to *discard* any launch that was not alone on it. The recorded
+  correction on #1729 says that is not sufficient for something that ships as a
+  default: "a policy that wins only under exclusive quiet-host conditions is
+  not a valid default." The eliminated modulo is on by default with no opt-out,
+  so it owed that evidence. `int4_modulo_matrix.py --co-tenant {smt,dram}` now
+  supplies it by **injecting** contention instead of gating it out — a pinned
+  spinner on the measured core's SMT sibling, or eight pinned streaming hogs on
+  other physical cores — against a rule fixed before the first contended
+  launch. Result: **PASS in both regimes**, on prefill and on decode, and the
+  two move in opposite directions in the way the mechanism predicts. Under SMT
+  the win roughly **doubles** — 1.0041 → 1.0089 at prefill `m = 1`, and
+  **1.0095 → 1.0224** on the decode loop, intervals non-overlapping in both —
+  because the eliminated work is integer-division issue and a sibling competes
+  for exactly those slots. Under DRAM starvation it **fades to a null**
+  (prefill 0.9975 / 0.9991; decode 1.0038 [0.9956, 1.0155]), because a fixed
+  ALU saving disappears into a memory stall. No
+  interval anywhere is below 1.000. The `dram` `m = 16` cell reads 1.0066 but
+  its own A/A is 1.0054, so it is reported as no resolvable effect rather than
+  a gain — that regime's floor is ~4x the quiet host's.
+  Two things generalise past this patch. First, **a co-tenant arm has to be
+  gate-*inverted*, not gate-removed**: an arm whose injected load silently
+  failed to start is a quiet-host arm wearing a busy-host heading, and it
+  passes clean and reads identically in the artifact, which is the exact number
+  the arm exists to replace. Each contended launch therefore proves its own
+  contention against a floor, and the gates still meaningful in that mode keep
+  firing — a stray competitor on the sibling still voids a `dram` launch.
+  Second, the host lock and the injected load are not alternatives: the lock is
+  what makes the co-tenant a *controlled* variable rather than the uncontrolled
+  one every other gate here exists to reject. This is #1802 item 4 ("both arms
+  in the gates") delivered for this harness, and the arm is reusable by anyone
+  else who owes busy-host evidence for a default.
+* **The pin is now verified rather than assumed (2026-08-27).** Every row in
+  that matrix is labelled `cpu4`, and that label rested entirely on the
+  `taskset` in the launch line. `taskset` is not a bound — it is one
+  `sched_setaffinity` call, and the pinned process can make another — so
+  #1812's finding that `ONNX_GENAI_CPU_DECODE_THREADS=N` confines a process to
+  N cpus of the *pool's* choosing is a live hazard for a harness that sets that
+  variable on every decode launch. Measured directly, reading each thread's
+  allowed mask back from `/proc`: at `taskset -c 4` with width 1 every thread
+  is `allowed=4` and runs on 4 (`path=flat`, `PIN-OFF`); at `-c 4-7` width 4
+  the pool stays inside the mask; at `-c 4` width 4 it **clamps to
+  `realized=1` and prints `WIDTH-MISMATCH`** instead of escaping. The pin held,
+  the rows are measured where they claim, and the clamp is the #1802-shaped
+  behaviour, now held by a test. The width=1 result also closes the exposure
+  #1812 raises for this file's rows specifically: that amplification needs a
+  barrier across a multi-cpu set, and a single-cpu `flat` launch has none,
+  while a foreign thread on the pinned cpu drops `(utime+stime)/wall` below the
+  floor and is discarded per launch. It does reach **wider** assignments, where
+  a flat `0.95` floor is the wrong instrument — a 2-wide launch that kept both
+  cpus scores ~2.00 and #1812's contaminated one scores 1.02, so the floor now
+  scales with the assignment (at one cpu it still returns 0.95 and changes no
+  decision, keeping these rows comparable). Both checks were wrong on the first
+  attempt and the controls are what said so: mutation testing killed a verdict
+  on last-run cpu (which lags `sched_setaffinity` and would abort correct
+  runs), and a positive control — a child that widens its own mask 300ms in —
+  returned `conformant` from a probe that stopped sampling at its first read.
+  **A check that has only ever said "conformant" has not been shown to be a
+  check**, which is the same argument as the vacuous-guard rule one level up.
 * **Disposition: no kernel change.** #1809's code was already correct and
   already on main. What shipped is the corrected scope, the per-row route
   fingerprint, the bootstrap and A/A self-check, and the two scripts that make
@@ -3312,3 +3495,52 @@ One standing caveat is *reinforced* rather than revised: `t=1` runs
 `path=flat` and `t>=2` runs `path=spmd-pool`, so a `t=1` vs `t=2` comparison
 crosses routes as well as widths. This file already reads that row as "vs
 serial" rather than "vs a one-worker pool" (§20), and that phrasing stands.
+
+## "aarch64 green" for `x86_sgemm.rs` is vacuous, not misleading
+
+A cross-agent report (Holden, 2026-08-27) raised what looks like a serious hole in this file's
+coverage, and it is worth recording because the reasoning is sound and the conclusion is wrong.
+
+The observation is correct as far as it goes. `x86_sgemm.rs` gates its test module
+`#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]` — **21 tests that do not exist
+on aarch64** — while `matmul.rs:52` declares `#[path = "x86_sgemm.rs"] pub(crate) mod x86_sgemm;`
+with no `cfg` at all. Read together those say: the module is compiled everywhere, its tests run in
+one place, so an aarch64 green tick is zero tests over live code. Crate-wide the same shape appears
+in seven modules totalling **48 tests** that never run on aarch64.
+
+Both halves dissolve under measurement.
+
+* **This file has no ungated code.** All **38** of its top-level items carry their own `target_arch`
+  gate, including `Int4Weight` and its entire `impl`. On aarch64 the module is empty, so the gated
+  test module is exactly right — zero tests over *zero* code. The ungated `mod` declaration is a
+  layout convenience, and it is what makes the file look uncovered to a reader.
+* **The other six modules are the normal, correct pattern**, not defects: every file with an
+  arch-gated test module (`dense_elementwise`, `elementwise`, `fused_matmul_bias`, `gemm`,
+  `simd_activations`) *also* has at least one ungated `#[cfg(test)]` module. The gated ones test
+  SIMD routes that only exist on x86; the portable behaviour is tested portably. Counting gated
+  tests measures how much SIMD there is, not how much is unchecked.
+
+**The instrument is the compiler, and it costs one command:**
+`cargo check --target aarch64-unknown-linux-gnu --tests -p onnx-runtime-ep-cpu`. On aarch64
+`Int4Weight` and `NR` simply do not resolve. This was not a thought experiment — the first draft of
+the fix moved the packer's differential test outside the arch gate to "close the hole", and that
+draft failed to compile for the target because *the code under test does not exist there*. The
+proposed remedy and the reported defect were the same misreading.
+
+**The mechanical guard already exists and is stricter than the one proposed.** A hand-maintained
+allowlist of arch-excluded test names was suggested, so that a newly gated-out test fails the build.
+`scripts/check_cross_compile.sh` already does better: CI runs
+`cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings` with
+`onnx-runtime-ep-cpu` in scope (`:91`), and `--all-targets` covers test code. It uses the compiler as
+the oracle instead of a regex over source, so it cannot be defeated by a comment or a formatting
+change — the failure mode that has already cost a review round elsewhere in this repo. The draft
+above would have been caught on the way in. No new guard was added; adding one would have duplicated
+a stronger existing gate with a weaker one.
+
+What *did* land is the piece that was genuinely missing: `mod portable_block_arithmetic`, ungated,
+holding the arithmetic identity `(depth + q) % block_size == offset_base + q` that licenses the
+packer's hoisted-modulo. Its `assert_ne!` at `q == run` is the load-bearing half — without it the
+test restates the substitution instead of bounding it, and would stay green if the `run` clip that
+makes the substitution legal were ever relaxed. It is explicitly *not* a route-execution claim; the
+facts that the packer applies the clip and that the AVX2 route runs are carried by the differential
+test and the poisoned-binary proof, both necessarily x86-gated because the code they exercise is.

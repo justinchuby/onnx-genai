@@ -15,7 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
+use onnx_genai_engine::{
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
+    SessionForkParticipantKind, SessionPosition,
+};
 
 fn decoder_package() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/onnx_genai_workflows/decoder")
@@ -33,10 +36,6 @@ fn package_without_conversation(root: &Path) -> anyhow::Result<()> {
         .expect("workflow declares state")
         .remove(serde_yaml::Value::String("conversation".into()))
         .expect("the fixture declares a conversation");
-    let capabilities = document["pipeline"]["workflow"]["manifest"]["capabilities"]
-        .as_sequence_mut()
-        .expect("the manifest declares capabilities");
-    capabilities.retain(|capability| capability.as_str() != Some("session_state_lease"));
     std::fs::write(&metadata, serde_yaml::to_string(&document)?)?;
     Ok(())
 }
@@ -67,7 +66,7 @@ fn narrow_the_conversation_bound(root: &Path, limit: i64) -> anyhow::Result<()> 
     let mut document: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&metadata)?)?;
     let declared: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "contract: {{ dtype: int64, rank: 1, shape: [1] }}\nrole: {{ kind: opaque }}\nsource:          {{ kind: literal }}\nrequired: false\ndefault: {limit}\n"
+        "contract: {{ dtype: int64, shape: [1] }}\nrole: {{ kind: opaque }}\nsource:          {{ kind: literal }}\nrequired: false\ndefault: {limit}\n"
     ))?;
     document["pipeline"]["workflow"]["inputs"]
         .as_mapping_mut()
@@ -223,6 +222,131 @@ fn independent_sessions_do_not_see_each_other() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn semantic_fork_copies_continuation_and_output_baselines_then_diverges() -> anyhow::Result<()> {
+    let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let parent = engine.create_session()?;
+    engine.generate_in_session(parent, tokens(&[2, 4, 6, 3], 3))?;
+    let position = engine.session_token_count(parent)?;
+    let baseline = engine
+        .session_conversation(parent)?
+        .expect("the fixture declares a continuation");
+
+    let plan = engine.prepare_session_fork(parent, SessionPosition::new(position))?;
+    assert!(plan.participants().iter().any(|participant| {
+        participant.kind == SessionForkParticipantKind::ContinuationCursor
+            && participant.name == "conversation"
+    }));
+    assert!(plan.participants().iter().any(|participant| {
+        participant.kind == SessionForkParticipantKind::OutputPublication
+            && participant.state_type.contains("lineage")
+    }));
+    let child = engine.fork_session(plan)?;
+    assert_eq!(engine.session_conversation(child)?, Some(baseline.clone()));
+
+    engine.generate_in_session(parent, tokens(&[5, 7], 2))?;
+    engine.generate_in_session(child, tokens(&[9, 8], 2))?;
+    let parent_after = engine
+        .session_conversation(parent)?
+        .expect("parent continuation");
+    let child_after = engine
+        .session_conversation(child)?
+        .expect("child continuation");
+    assert_eq!(&parent_after[..baseline.len()], baseline.as_slice());
+    assert_eq!(&child_after[..baseline.len()], baseline.as_slice());
+    assert_ne!(parent_after, child_after);
+
+    engine.reset_session(parent)?;
+    assert_eq!(engine.session_conversation(parent)?, Some(Vec::new()));
+    assert_eq!(
+        engine.session_conversation(child)?,
+        Some(child_after),
+        "resetting one fork must not release or mutate the other"
+    );
+    engine.close_session(parent)?;
+    engine.close_session(child)?;
+    Ok(())
+}
+
+#[test]
+fn workflow_fork_plan_cannot_cross_engine_ownership_domains() -> anyhow::Result<()> {
+    let mut engine_a = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let mut engine_b = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let source_a = engine_a.create_session()?;
+    let source_b = engine_b.create_session()?;
+    assert_eq!(
+        source_a, source_b,
+        "the regression requires colliding engine-local session ids"
+    );
+
+    let request = tokens(&[2, 4, 6, 3], 2);
+    engine_a.generate_in_session(source_a, request.clone())?;
+    engine_b.generate_in_session(source_b, request)?;
+    let position = engine_a.session_token_count(source_a)?;
+    assert_eq!(position, engine_b.session_token_count(source_b)?);
+    let before = engine_b
+        .session_conversation(source_b)?
+        .expect("workflow declares continuation");
+
+    let plan = engine_a.prepare_session_fork(source_a, SessionPosition::new(position))?;
+    let error = engine_b
+        .fork_session(plan)
+        .expect_err("a prepared workflow snapshot cannot cross engine ownership domains");
+    assert!(
+        error
+            .to_string()
+            .contains("different runtime ownership domain"),
+        "{error}"
+    );
+    assert_eq!(
+        engine_b.session_conversation(source_b)?,
+        Some(before),
+        "foreign admission must not install or mutate workflow state"
+    );
+    let next = engine_b.create_session()?;
+    assert_eq!(
+        next,
+        source_b + 1,
+        "foreign admission must not mint or expose a child id"
+    );
+    engine_b.close_session(next)?;
+    engine_b.close_session(source_b)?;
+    engine_a.close_session(source_a)?;
+    Ok(())
+}
+
+#[test]
+fn fork_rejects_uncommitted_positions_and_stale_plans_before_child_publication()
+-> anyhow::Result<()> {
+    let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let parent = engine.create_session()?;
+    engine.generate_in_session(parent, tokens(&[2, 4, 6, 3], 2))?;
+    let position = engine.session_token_count(parent)?;
+    let sessions_before = engine.session_token_count(parent)?;
+
+    let older = engine
+        .prepare_session_fork(parent, SessionPosition::new(position - 1))
+        .expect_err("output/continuation baselines exist only at committed boundaries");
+    assert!(older.to_string().contains("output/continuation"), "{older}");
+    assert_eq!(engine.session_token_count(parent)?, sessions_before);
+
+    let stale = engine.prepare_session_fork(parent, SessionPosition::new(position))?;
+    engine.generate_in_session(parent, tokens(&[5], 1))?;
+    let error = engine
+        .fork_session(stale)
+        .expect_err("a plan cannot publish after its source advances");
+    assert!(error.to_string().contains("stale"), "{error}");
+    let next = engine.create_session()?;
+    assert_eq!(
+        next,
+        parent + 1,
+        "rejected admission must not mint or publish a child identity"
+    );
+    engine.close_session(next)?;
+    engine.close_session(parent)?;
+    Ok(())
+}
+
 /// Reset frees the conversation and keeps the id; close frees it and does not.
 #[test]
 fn reset_and_close_release_the_conversation() -> anyhow::Result<()> {
@@ -349,9 +473,9 @@ fn a_conversation_is_refused_past_the_bound_it_declares() -> anyhow::Result<()> 
         .generate_in_session(session, tokens(&[5, 7], 2))
         .expect_err("a turn past the declared bound must be refused");
     let capability =
-        onnx_genai_engine::package_capability_error(&refused).expect("the refusal is typed");
+        onnx_genai_engine::package_execution_error(&refused).expect("the refusal is typed");
     match capability {
-        onnx_genai_engine::PackageCapabilityError::ConversationOverBound {
+        onnx_genai_engine::PackageExecutionError::ConversationOverBound {
             cell,
             requested,
             bound,
@@ -647,12 +771,12 @@ fn a_failed_turn_releases_its_lease_and_its_reservation() -> anyhow::Result<()> 
     let refused = engine
         .generate_in_session(session, tokens(&[5, 7], 2))
         .expect_err("a turn past the declared bound must be refused");
-    let capability = onnx_genai_engine::package_capability_error(&refused)
+    let capability = onnx_genai_engine::package_execution_error(&refused)
         .expect("the refusal is typed, so a front end never reads its wording");
     assert!(
         matches!(
             capability,
-            onnx_genai_engine::PackageCapabilityError::ConversationOverBound { bound: 6, .. }
+            onnx_genai_engine::PackageExecutionError::ConversationOverBound { bound: 6, .. }
         ),
         "{capability:?}"
     );
@@ -678,7 +802,7 @@ fn a_failed_turn_releases_its_lease_and_its_reservation() -> anyhow::Result<()> 
 /// is different: the same request succeeds once the turn in flight finishes.
 #[test]
 fn a_busy_session_is_a_retryable_capability_refusal() {
-    let busy = onnx_genai_engine::PackageCapabilityError::ExclusiveLeaseConflict {
+    let busy = onnx_genai_engine::PackageExecutionError::ExclusiveLeaseConflict {
         session: "shared".to_string(),
     };
     assert!(busy.is_retryable());
@@ -686,8 +810,8 @@ fn a_busy_session_is_a_retryable_capability_refusal() {
 
     let error: anyhow::Error = busy.into();
     assert!(matches!(
-        onnx_genai_engine::package_capability_error(&error),
-        Some(onnx_genai_engine::PackageCapabilityError::ExclusiveLeaseConflict { .. })
+        onnx_genai_engine::package_execution_error(&error),
+        Some(onnx_genai_engine::PackageExecutionError::ExclusiveLeaseConflict { .. })
     ));
 }
 

@@ -512,6 +512,8 @@ impl Executor {
         // resolved kernel reference borrows `cache` for the rest of the dispatch.
         let cache = &mut self.cache;
         let kernel_bindings = &mut self.kernel_bindings;
+        let provider_artifact_readiness = &mut self.provider_artifact_readiness;
+        let finalized_expert_banks = &self.finalized_expert_banks;
         let capture_growing = &self.capture_growing_symbols;
         let mut ctx = KernelDispatchContext {
             executor: self.instance_id,
@@ -589,6 +591,7 @@ impl Executor {
                         opset,
                         node_capture_seq_independent(ctx.graph, node, capture_growing),
                         instance_id,
+                        provider_artifact_readiness,
                         ep.as_ref(),
                     )?;
                     kernel_bindings[pi] = Some(key);
@@ -618,12 +621,23 @@ impl Executor {
                     opset,
                     node_capture_seq_independent(ctx.graph, node, capture_growing),
                     instance_id,
+                    provider_artifact_readiness,
                     ep.as_ref(),
                 )?;
                 kernel_bindings[pi] = Some(key);
                 k
             }
         };
+        // Preflight cannot compile a node whose inputs become concrete only
+        // during runtime shape resolution. If lookup above created that
+        // specialization, the cache publication chokepoint invalidated the
+        // authority. Finalize it now, while no kernel work has been enqueued.
+        provider_artifact_readiness.finalize_if_needed(
+            ep.as_ref(),
+            instance_id,
+            ctx.graph,
+            finalized_expert_banks,
+        )?;
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata

@@ -51,12 +51,88 @@
 #   lock_dir_source, so a recorded row says which lock its `declared=yes` is
 #   a claim about.
 #
+# Machine-readable output: the parser contract.
+#
+#   Three grammars, and the guarantee is the same in all three: NO FIELD CAN
+#   EVER CONTAIN ITS GRAMMAR'S DELIMITER, so no escaping is required to read
+#   one back, and a naive parser is a correct parser.
+#
+#     provenance --oneline   one line, fields separated by a single SPACE
+#     provenance             one `key=value` per LINE
+#     status --porcelain     one `key=value` per LINE
+#
+#   Safety comes from refusal at emit time, not from encoding. That is the
+#   deliberate trade: an escaping grammar would be more expressive and would
+#   oblige every consumer -- awk one-liners, issue comments, other agents'
+#   scripts -- to implement an unescaper before they could read a row safely,
+#   and the ones that did not would be silently wrong. Refusal keeps the flat
+#   form flat, which is what makes this recipe safe to recommend at all:
+#
+#     hostlock.sh provenance --oneline | awk '{for(i=1;i<=NF;i++){
+#         split($i,kv,"="); m[kv[1]]=kv[2]} print m["hostlock_state"]}'
+#
+#   Guarantees, in the order a parser depends on them:
+#
+#   1. Field ORDER is fixed and every field is present on every row. A missing
+#      field is a bug, not an absent value; absence is spelled `none` or
+#      `unknown`.
+#   2. Keys match [a-z][a-z0-9_]*. Values in `--oneline` contain no
+#      whitespace. Values in the line-oriented grammars contain no newline.
+#   3. NO value in any grammar contains a control character (C0, DEL). This is
+#      about the reader, not the parser: ESC[2K and CR are not whitespace, so
+#      they passed every delimiter check, and a row that parses as HELD can be
+#      made to DISPLAY as FREE in any terminal or renderer that honours ANSI.
+#      Rows get pasted into issue comments, so that is a real reading. The
+#      class is pinned to C0+DEL with LC_ALL=C so it is identical on every
+#      agent's machine; the 8-bit C1 controls (0x80-0x9F) are deliberately NOT
+#      covered, because those bytes are ordinary UTF-8 continuation bytes and
+#      refusing them would call a legitimate `naïve/漢字` path malformed.
+#      This guarantee covers the HUMAN lines too -- `status`, and the reap,
+#      release and legacy warnings -- because those are where a forged FREE
+#      actually gets acted on, and nothing downstream re-checks them. It also
+#      covers the values that never came from a lock file at all: `lock_dir`,
+#      the legacy path and the config path arrive from `HOSTLOCK_DIR` or from
+#      the BOX-WIDE config that every process by every user on this host
+#      reads, so one peer writing `lock_dir=` forges those lines for EVERY
+#      agent. Review found them unguarded after this paragraph already
+#      claimed them; the paragraph was right about where the guard belongs
+#      and wrong about where it was.
+#      Residual, disclosed rather than fixed: a terminal that honours 8-bit
+#      C1 can still act on a raw 0x9B. That is the price of not calling
+#      `naïve/漢字` malformed, and the two cannot both be had in a byte
+#      grammar.
+#   4. A value that could not satisfy the above is replaced ENTIRELY by the
+#      sentinel `@malformed`. It is never truncated -- a silently kept prefix
+#      presented as a whole value is the defect this contract exists to stop.
+#      `@` cannot occur in an accepted name, so the sentinel is unforgeable.
+#      Length is bounded on the same terms and with the same remedy: a value
+#      over HL_MAX_VALUE is refused, and a name over HL_MAX_NAME is a hard
+#      error at parse time. This is the one guard that changes a row which
+#      contains no control character at all, and it is called out here so
+#      that "control-free rows are unchanged" is not read wider than it is.
+#   5. `_raw` lines, and the free-text fields `reason`, `worktree`, `cmd`,
+#      `held_worktree`, `held_cmd`, are the exception to (4): they are allowed
+#      to contain spaces, so they are ENCODED rather than refused. If and only
+#      if the value contained a control character it is emitted in bash `$'…'`
+#      form, which is unambiguous and self-announcing. An ordinary value is
+#      emitted verbatim, so normal rows are byte-identical to before.
+#   6. `_raw` is a DIAGNOSTIC, never a parsed field. It appears only beside a
+#      field the guard rejected, and it is the rejected text -- do not read a
+#      value out of it and act on it.
+#
+#   Fields whose text originates with the OPERATOR (`owner`, `reason`) are
+#   validated at write time as well, so a lock published by this version is
+#   already clean. Read-side guards are not thereby redundant: peers run their
+#   own checkouts at their own commits, and a lock file this version reads is
+#   very often one it did not write.
+#
 # Usage:
 #   hostlock.sh status [--porcelain]    # who holds it, is that holder alive
 #   hostlock.sh acquire [opts]          # take it, or fail / wait
 #   hostlock.sh release                 # give it back (only if you hold it)
 #   hostlock.sh wait [--timeout S]      # block until free, do not take it
-#   hostlock.sh run [opts] -- CMD...    # acquire, run CMD, always release
+#   hostlock.sh run --reason TEXT [opts] -- CMD...
+#                                       # acquire, run CMD, always release
 #   hostlock.sh provenance [opts]       # lock state as fields, to record WITH
 #                                       # each measured row (see below)
 #
@@ -75,8 +151,16 @@
 #                     default is never exported: every agent on a shared box
 #                     runs as the same unix user, so that would make every
 #                     lock read as ours. See #1929.
+#                     PREFER --owner. `provenance` reports how the name was
+#                     obtained as `held_owner_source=flag|env|user|unknown`,
+#                     and only `flag` is a name somebody chose for THIS run.
+#                     An inherited $HOSTLOCK_OWNER outlives the `run` that
+#                     exported it and will quietly stamp a later, unrelated
+#                     benchmark with the exporter's name. See #2260.
 #   --wait            block until free instead of failing immediately
-#   --timeout S       give up after S seconds (default 3600 with --wait)
+#   --timeout S       give up after S seconds (default 3600). Only `wait`,
+#                     `run`, and `acquire --wait` ever enter a wait loop, so
+#                     passing it anywhere else is refused rather than ignored.
 #   --gate N          after taking the lock, also wait until the instantaneous
 #                     runnable count is <= N, so non-participating load (other
 #                     agents' builds, a stray editor) is drained too.
@@ -115,6 +199,10 @@
 #                     `run` cannot leak a lock in the first place: it anchors
 #                     to its own pid and start time, which die on every exit
 #                     path, and a zombie anchor is caught by `pid_is_live`.
+#                     Nor can it declare the box free while its own job runs:
+#                     a SIGKILLed run cannot reap its tree, so liveness also
+#                     consults the wrapped command's process group and the
+#                     lock stays held until that group is empty.
 #                     To bound the JOB rather than the CLAIM, bound the
 #                     process tree -- setsid + process group + a hard
 #                     `timeout` + a verified reap (`pgrep -g`). A lock TTL
@@ -169,6 +257,12 @@
 #     directory is not the problem, the host is. No lock is ever taken on this
 #     path, so the caller can treat it as "this box cannot participate" rather
 #     than as contention. See require_supported_platform.
+#   9 nested against our own holder -- this process is already inside a `run`
+#     holding THIS lock, so the holder we would wait for cannot release until
+#     we return. Separate from 2 and 3 for the same reason 7 is: those say a
+#     peer has the box, and reporting contention for a lock we ourselves hold
+#     sends the caller looking for a co-tenant who does not exist (#1977).
+#     See nested_under_own_run.
 #
 # `run` otherwise does NOT use this table: it returns the wrapped command's
 # own status, so a command exiting 5 is indistinguishable from a gate failure.
@@ -261,17 +355,39 @@
 #                                --expect-runnable 2)" >> results.tsv
 #
 # Append the line to the row; do not `eval` it. The fields are `key=value` and
-# every value in the one-line form is a bounded token, but `reason` is free
-# text written by whichever peer holds this shared, fixed-path lock, so it is
-# omitted from `--oneline` entirely and only appears in the multi-line form,
-# where the newline delimits it. Parse with awk/split on `=`, never with the
-# shell.
+# every value in the one-line form is a bounded token -- which is a property
+# this script enforces on the way OUT, not one it assumes. Owners are
+# validated when written, and re-checked when read back, because the lock is a
+# shared fixed path and a peer running an older copy of this script from their
+# own worktree can leave a value in the metadata that this version would never
+# have written. A value that cannot travel in the flat grammar is reported as
+# `malformed` rather than truncated to its first word; the multi-line form
+# carries the original on its own line as `held_by_raw`. `reason` is free text
+# written by whichever peer holds the lock, so it is omitted from `--oneline`
+# entirely and only appears in the multi-line form, where the newline
+# delimits it.
+#
+# Parse with awk, never with the shell, and split on the FIRST `=` only:
+#
+#   awk '{ for (i = 1; i <= NF; i++) {
+#            p = index($i, "="); m[substr($i, 1, p - 1)] = substr($i, p + 1) } ... }'
+#
+# `gate` is `satisfied:3<=10000`, so a plain `split($i, kv, "=")` truncates it
+# to `satisfied:3<`. That loses the bound the gate was judged against, which
+# is the only part of the field a later reader can check.
 #
 # Record `hostlock_state` and `takeover` alongside `held_by` -- `held_by` names
 # the holder of a STALE lock just as readily as a live one, so on its own it
 # can attribute a row to somebody who was already dead. A row that cannot say
 # what the host was doing is not a measurement, it is an anecdote with a number
 # in it.
+#
+# `held_by` also cannot be trusted on its own to name the right AGENT, which is
+# a separate failure from naming a dead one. Read it together with
+# `held_owner_source`: `flag` means somebody typed it for this run, `env` means
+# it was inherited and may name whoever exported it, `user` means it names a
+# shared unix account rather than an agent. `held_worktree` and `held_cmd` come
+# from the kernel and settle it when they disagree with `held_by`.
 #
 # (end of usage summary)
 #
@@ -285,7 +401,13 @@
 #
 # The lock is a directory (mkdir is atomic on POSIX). Inside it is an anchor
 # pid AND that pid's start time from /proc/<pid>/stat. A crashed holder is
-# reaped automatically by the next acquirer. The start time is what makes
+# reaped automatically by the next acquirer -- unless the job it started
+# outlived it, in which case the lock stays held until that job is gone. The
+# anchor is the CLAIM; the wrapped command's process group is the JOB, and
+# only the job holds cores. `run` publishes `child_pgid` for exactly this, and
+# a SIGKILLed run leaves both a dead anchor and a live tree, because the one
+# signal it cannot trap is also the one that stops it reaping. See
+# orphan_group_pids. The start time is what makes
 # that safe: pids are recycled, so "is there a process with pid 12345" is not
 # the same question as "is the process that took this lock still alive".
 # Reaping is guarded by a second lock, so two acquirers racing on the same
@@ -321,6 +443,152 @@ die() {
     echo "hostlock: $*" >&2
     exit 1
 }
+
+# `has_ctrl` and `display_safe` live here, above everything that emits, and
+# not down beside the flat-row guards where the rest of this machinery sits.
+# The config validation below is the FIRST thing that runs and the first
+# thing that emits, so a definition placed with its siblings was still ~1000
+# lines too late: `display_safe: command not found`, and the message lost
+# both the path and the value it exists to report. Bash resolves a function
+# at call time, so nothing warned until the path was taken.
+# Does this value contain a control character?
+#
+# THE GAP THIS CLOSES, because it is not the one the other guards close.
+# Every guard above was written against a PARSER: the flat row's delimiter is
+# a space, the porcelain's is a newline, so each rejects its own delimiter and
+# a value that survives cannot forge a field. That reasoning is correct and it
+# is complete -- for a parser.
+#
+# It is not complete for a READER. These rows exist to be pasted into issue
+# comments and read in terminals; the header says so. A terminal has its own
+# delimiters, and they are not whitespace: ESC[2K erases the line, ESC[1000D
+# returns the cursor to column 0, and a bare CR does the same. None of those
+# is a space or a newline, so every guard here passed them.
+#
+# Demonstrated on the released script, with the payload reaching `lock_dir`
+# through $HOSTLOCK_DIR and containing NO whitespace at all:
+#
+#   physical bytes : hostlock_state=HELD ... lock_dir=/w/a^[[2K^[[1000Dhostlock_state=FREE
+#   awk last-wins  : hostlock_state=HELD          <- the parser guard held
+#   what a terminal displays:
+#                    hostlock_state=FREE lock_scope=private ...
+#
+# The row is simultaneously correct to a machine and inverted to a human, and
+# the human is the one who then takes the box. `reason` is the worse vector of
+# the two because `run` REQUIRES it, so it is the field every caller supplies:
+# `--reason $'moe\e[2K\e[1000Dstate=FREE'` makes `status --porcelain` print
+# `state=HELD` and display `state=FREE` on the next line.
+#
+# [:cntrl:] and not a printable-ASCII whitelist: a worktree path may contain
+# UTF-8 perfectly legitimately, and `/home/naïve/漢字` must not be called
+# malformed. Verified both directions -- ESC and CR classify as control, while
+# spaces, UTF-8 paths and ordinary paths do not.
+has_ctrl() {
+    # LC_ALL=C pins the class to C0 plus DEL, which is exactly what the parser
+    # contract promises. Without it the class follows the caller's locale: in
+    # a single-byte locale such as latin1, 0x80-0x9F ARE control characters,
+    # and those bytes are ordinary UTF-8 continuation bytes -- so a worktree
+    # path containing `é` or `漢` would start being called malformed for
+    # nobody's benefit. Pinning it makes the classification identical on every
+    # agent's box regardless of environment, which is the property a shared
+    # lock needs. Verified no-match for UTF-8 and match for ESC/CR/DEL under
+    # C, C.UTF-8 and en_US.utf8.
+    local LC_ALL=C
+    case "$1" in
+        *[[:cntrl:]]*) return 0 ;;
+    esac
+    return 1
+}
+
+# Render a value that is allowed to contain spaces so it cannot act on a
+# terminal.
+#
+# For the fields that must stay free text -- `reason`, `worktree`, `cmd`, and
+# the `_raw` recovery lines -- rejection would be cry-wolf: a reason is prose
+# and a command line is full of spaces, and a guard that refuses ordinary
+# input is a guard somebody deletes. So these are ENCODED rather than refused.
+#
+# Encoding is conditional on the value actually containing a control
+# character, and that is deliberate. An unconditional `%q` would rewrite every
+# ordinary reason -- `--reason 'moe matrix sweep'` would start publishing as
+# `moe\ matrix\ sweep` -- which changes the output every existing consumer
+# already reads in order to defend against input none of them have ever seen.
+# Conditional encoding leaves the normal row byte-identical and makes the
+# abnormal one loudly, visibly quoted: `$'moe\E[2K'` is self-evidently not a
+# reason somebody typed.
+#
+# `printf %q` and not a hand-rolled tr/sed pass: it is bash builtin, it is a
+# documented total encoding rather than a blacklist I would have to keep in
+# sync with [:cntrl:], and it escapes the backslash it introduces, so the
+# result is unambiguous. Checked that its output carries no raw control bytes.
+#
+# One honest limit, because `%q` encodes FOR A SHELL. The result is
+# `$'moe\E[2K'`, which is inert in every reading that matters here -- a
+# terminal prints it literally, a markdown comment shows it, awk sees an
+# ordinary token -- but it is shell-ACTIVE: `eval "echo $enc"` reconstitutes
+# the raw ESC. So this neutralises the payload for reading, not for
+# re-execution, and a row pasted into a shell AND EVALUATED can still act.
+# That is an acceptable boundary: the same is true of every byte in the row,
+# and `--oneline` output is documented for awk rather than for eval.
+display_safe() {
+    if has_ctrl "$1"; then
+        printf '%q' "$1"
+    else
+        printf '%s' "$1"
+    fi
+    # Always 0. Several callers interpolate this inside another command
+    # substitution where a non-zero status would be either invisible or, if
+    # `set -e` is ever added to this script, fatal. Nothing branches on it --
+    # unlike `flat_value`, whose status `prov_add` genuinely consumes.
+    return 0
+}
+
+# The options are already documented, exhaustively, in this file's header --
+# but only to someone who opens a 2000-line shell script. Four agents spent a
+# night arguing to build this tool while it sat in scripts/ with a test suite,
+# and `--help` answering "unknown subcommand" is a large part of why. So print
+# the header rather than a second copy of it: a curated duplicate would drift,
+# and the drift would land on exactly the flags people get wrong (`--wait` is
+# a bare flag, `--reason` is mandatory for `run`).
+#
+# The end anchor is `# (end of usage summary)`, the same one the no-argument
+# path uses -- deliberately not a second boundary of my own. That marker exists
+# because an earlier `sed -n '3,50p'` here silently stopped covering the header
+# as it grew, so flags added by a change were absent from that change's own
+# help. A private anchor would reintroduce exactly that drift, one copy along.
+# Both anchor lines are load-bearing; renaming either breaks help, loudly, in
+# the conformance suite.
+#
+# Defined here, next to `die`, rather than beside its `cmd_*` siblings, for one
+# reason: everything below refuses, and help must outrank every refusal. See
+# the interception directly beneath this function.
+cmd_help() {
+    sed -n '/^# Usage:/,/^# (end of usage summary)/p' "$0" | sed '$d' | sed 's/^#\{1\} \{0,1\}//'
+    echo "Full notes, including how to read a gated row: $0"
+}
+
+# Answer help before anything is validated -- and "anything" is meant
+# literally, which is why this sits at the top of the file and not at the
+# dispatch `case` where a subcommand would naturally be handled.
+#
+# Four separate gates below can refuse, and every one of them refuses in
+# exactly the situation that sends someone to `--help`:
+#
+#   * `require_supported_platform` (below) exits 8 on a host without /proc --
+#     macOS, native Windows, a stripped container. "What does this tool need?"
+#     is the question those users have, and the answer is in the header.
+#   * the lock_dir config resolution dies on a relative or empty `lock_dir` --
+#     the mistake made by someone following the header's own instructions for
+#     moving the lock, who then cannot read those instructions to see it.
+#   * `require_name` rejects a $HOSTLOCK_OWNER or $USER containing a space.
+#   * the anchor-pid check rejects a stale `--pid`.
+#
+# Asking how the tool works must never depend on holding it correctly, so the
+# only thing allowed to run first is the thing that prints the answer.
+# `cmd_help` needs no state: `$0` and `sed`, both available at this point.
+case "${1:-}" in
+    help|-h|--help) cmd_help; exit 0 ;;
+esac
 
 # Refuse a platform this script cannot make its liveness claims on.
 #
@@ -442,7 +710,7 @@ else
     # prevent. Only the env path (tests) skips this, because it never consults
     # the config in the first place.
     if [ -f "$HOSTLOCK_CONF_PATH" ] && grep -q '^[[:space:]]*lock_dir[[:space:]]*=' "$HOSTLOCK_CONF_PATH" 2>/dev/null; then
-        die "${HOSTLOCK_CONF_PATH}: lock_dir must be a non-empty absolute path (got '$(conf_lock_dir || true)')"
+        die "$(display_safe "${HOSTLOCK_CONF_PATH}"): lock_dir must be a non-empty absolute path (got '$(display_safe "$(conf_lock_dir || true)")')"
     fi
     LOCK_DIR="$HOSTLOCK_BUILTIN_DIR"
     LOCK_DIR_SOURCE=default
@@ -471,8 +739,8 @@ META="${LOCK_DIR}/meta"
 warn_if_private() {
     [ "$LOCK_SCOPE" = private ] || return 0
     [ "${HOSTLOCK_PRIVATE_OK:-0}" = 1 ] && return 0
-    echo "hostlock: WARNING: HOSTLOCK_DIR is set, so this is a PRIVATE lock at ${LOCK_DIR}." >&2
-    echo "hostlock: it coordinates with NOBODY -- peers on this host use ${SHARED_LOCK_DIR}." >&2
+    echo "hostlock: WARNING: HOSTLOCK_DIR is set, so this is a PRIVATE lock at $(display_safe "${LOCK_DIR}")." >&2
+    echo "hostlock: it coordinates with NOBODY -- peers on this host use $(display_safe "${SHARED_LOCK_DIR}")." >&2
     echo "hostlock: set HOSTLOCK_PRIVATE_OK=1 to acknowledge and silence (the test suite does)." >&2
 }
 
@@ -513,8 +781,8 @@ refuse_if_legacy_held() {
     local h
     h=$(legacy_holder) || return 0
     echo "hostlock: BUSY (legacy path)" >&2
-    echo "hostlock: ${HOSTLOCK_LEGACY_PATH} is held by ${h% *} (pid ${h#* }), which is the path this host used" >&2
-    echo "hostlock: before ${HOSTLOCK_CONF_PATH} moved the lock to ${LOCK_DIR}. That holder cannot see our lock," >&2
+    echo "hostlock: $(display_safe "${HOSTLOCK_LEGACY_PATH}") is held by $(display_safe "${h% *}") (pid $(num_or "${h#* }" '?')), which is the path this host used" >&2
+    echo "hostlock: before $(display_safe "${HOSTLOCK_CONF_PATH}") moved the lock to $(display_safe "${LOCK_DIR}"). That holder cannot see our lock," >&2
     echo "hostlock: so taking this one would put two benchmarks on the box. Wait for it to release." >&2
     return 2
 }
@@ -542,6 +810,16 @@ proc_state_and_start() {
     rest=$(tr -d '\0' 2>/dev/null <"/proc/${pid}/stat" | sed 's/.*) //') || return 1
     [ -n "$rest" ] || return 1
     awk '{print $1, $20}' <<<"$rest"
+}
+
+# Process group id (field 5) of a pid, from the same remainder as the reads
+# above: after the comm field is dropped, $1 is state, $3 is pgrp, $20 is
+# start time.
+proc_pgid() {
+    local pid=$1 rest
+    rest=$(tr -d '\0' 2>/dev/null <"/proc/${pid}/stat" | sed 's/.*) //') || return 1
+    [ -n "$rest" ] || return 1
+    awk '{print $3}' <<<"$rest"
 }
 
 runnable_now() {
@@ -690,7 +968,21 @@ meta_get() {
 # reason stays readable instead of silently welding two words together, and
 # NULs and CRs are dropped outright.
 meta_value() {
-    printf '%s' "$1" | tr -d '\000\r' | tr '\n' ' '
+    local v
+    v=$(printf '%s' "$1" | tr -d '\000\r' | tr '\n' ' ')
+    # NUL, CR and newline were handled here because they break the metadata
+    # FILE -- one `key=value` per line, read back with sed plus `head -1`. That
+    # is a storage argument, and it is why the rest of the control set was
+    # never considered: ESC does not break the file at all. It breaks whoever
+    # later prints the value.
+    #
+    # Encoding at write time is not a substitute for the read-side guards and
+    # is not meant to be. A peer running an older checkout writes this file
+    # too, so the reader can never assume it was written by this version --
+    # which is exactly why `display_safe` is also applied on every read. This
+    # is the half that stops THIS version from producing such a file at all,
+    # so a lock published today is clean no matter who reads it.
+    display_safe "$v"
 }
 
 # The repo checkout the holder is working in.
@@ -734,7 +1026,13 @@ holder_cmd() {
     fi
     local c=""
     if [ -n "${ANCHOR_PID:-}" ] && [ -r "/proc/${ANCHOR_PID}/cmdline" ]; then
-        c=$(tr '\000' ' ' <"/proc/${ANCHOR_PID}/cmdline" 2>/dev/null)
+        # `2>/dev/null` FIRST: redirections are applied left to right, and a
+        # failure to open the input file is reported on whatever stderr is
+        # current at that moment. Written the other way round the guard is
+        # applied too late to silence the thing it exists to silence. The
+        # `-r` test above does not close the window -- the holder can exit
+        # between the test and the read, which is exactly when this runs.
+        c=$(tr '\000' ' ' 2>/dev/null <"/proc/${ANCHOR_PID}/cmdline")
     fi
     printf '%s' "$c"
 }
@@ -832,11 +1130,95 @@ holder_alive() {
     anchor_alive "$pid" "$start"
 }
 
+# Processes still alive in the WRAPPED COMMAND's process group, for use when
+# the anchor itself is gone. Prints them; returns 1 when there are none.
+#
+# The wedge this closes, reproduced on this host before it was fixed: `run` is
+# SIGKILLed, so its EXIT trap never fires and it never reaps the tree it
+# started. The anchor pid dies, `holder_alive` says no, `reapable` says yes,
+# and `status` prints "STALE ... next acquire will reap it" -- while the
+# wrapped command's children still hold every core they had. The next
+# acquirer takes a box that is not free and measures against a live
+# competitor it cannot see, which is the one outcome this lock exists to
+# prevent.
+#
+# This is the same failure the `--ttl` text at the top of this file already
+# names as the reason `run` refuses a finite TTL -- "it would relabel the host
+# as free while the runaway kept burning cores" -- arriving through a door
+# nobody checked. The anchor is the CLAIM. The process group is the JOB. The
+# job is what holds the cores, so the job is what liveness has to mean.
+#
+# It matters because the holder is usually NOT the process doing the damage:
+# a `cargo test` that forks qemu children, a driver that spawns arm binaries.
+# Anchor-only liveness asks whether the bookkeeper is alive, not the workers.
+#
+# `child_pgid` is recorded only when the child leads its own group (see the
+# guard in `run`), so this can never name this script's own group, and it is
+# only ever consulted once the anchor is dead -- so it cannot keep a lock
+# alive on the strength of the holder.
+#
+# ZOMBIES DO NOT COUNT: `live_pids` already excludes them, and it must, or a
+# not-yet-reaped child would read as a core-holder on every clean teardown.
+#
+# A pgid can be recycled, and a recycled one would hold the lock against a
+# stranger's processes. That is the conservative direction -- BUSY when it is
+# free, never FREE when it is busy -- which is the direction this file takes
+# everywhere else. `status` names the surviving pids so an operator can see in
+# one line whether they are the job or a coincidence.
+orphan_group_pids() {
+    local pgid live
+    pgid=$(meta_get child_pgid) || return 1
+    [ -n "$pgid" ] || return 1
+    case "$pgid" in '' | *[!0-9]*) return 1 ;; esac
+    live=$(live_pids "-$pgid")
+    [ -n "$live" ] || return 1
+    printf '%s' "$live"
+}
+
+# Are we running INSIDE a `run` that holds this very lock?
+#
+# `run` always sets DO_WAIT, so a nested acquire against the same lock path
+# waits for a holder that is its own ancestor: the parent cannot release until
+# the wrapped command returns, and the wrapped command is the thing waiting.
+# That is not contention, it is a cycle, and it burns the full --timeout
+# (default 3600s) before reporting a peer that was never there (#1977).
+#
+# Both halves are load-bearing. The path alone is not enough: a `run` whose
+# wrapped command daemonises leaves the variable set in a process that outlives
+# the lock, and refusing that process's later, legitimate acquire would be a
+# fail-closed bug of our own making. So the live lock's own anchor must still
+# be the one we exported -- if the parent released, or was reaped and the lock
+# republished by somebody else, the anchors differ and this is an ordinary
+# acquire against an ordinary peer.
+#
+# Deliberately NOT a pid-ancestry walk. /proc/<pid>/stat ppid chains break the
+# moment anything reparents (a daemonised harness, a subreaper, an agent whose
+# shell exits), and the failure direction there is to stop recognising our own
+# holder -- back to the hang. The exported pair is exact for the case that
+# actually deadlocks, and silent for every case that does not.
+nested_under_own_run() {
+    [ -n "${HOSTLOCK_HELD_DIR:-}" ] || return 1
+    [ -n "${HOSTLOCK_HELD_ANCHOR:-}" ] || return 1
+    [ "$HOSTLOCK_HELD_DIR" = "$LOCK_DIR" ] || return 1
+    [ "$(meta_get anchor_pid 2>/dev/null || echo "")" = "$HOSTLOCK_HELD_ANCHOR" ] || return 1
+    return 0
+}
+
 lock_age() {
-    local epoch now
+    local epoch now age
     epoch=$(num_or "$(meta_get acquired_epoch || echo 0)" 0)
     now=$(date +%s)
-    echo $((now - epoch))
+    # `10#` because `num_or` guarantees digits but NOT the absence of a
+    # leading zero, and `$(( 010 ))` is 8, not 10. Neither this nor the
+    # clamp below can forge anything -- `num_or` already sent every
+    # non-digit to the default, so no arithmetic injection is reachable.
+    # They are data quality, in a column harnesses aggregate: a lock
+    # stamped one second into the future currently reports a NEGATIVE age,
+    # and a mean over a column containing one is silently wrong rather
+    # than visibly wrong.
+    age=$(( now - 10#$epoch ))
+    [ "$age" -lt 0 ] && age=0
+    echo "$age"
 }
 
 # 0 if the lock has outlived its declared TTL. ttl=0 means never expires,
@@ -895,7 +1277,13 @@ reapable() {
         [ "$((now - mtime))" -gt "$UNPARSEABLE_GRACE" ]
         return $?
     fi
-    ! holder_alive && return 0
+    ! holder_alive && {
+        # A dead anchor is not a free host if the job it started is still
+        # running. Checked only here, on the path that would otherwise hand
+        # the box to the next acquirer.
+        orphan_group_pids >/dev/null && return 1
+        return 0
+    }
     holder_expired
 }
 
@@ -1040,10 +1428,10 @@ reap_if_dead() {
     local reaped=1
     if [ -d "$LOCK_DIR" ] && reapable; then
         local pid owner
-        pid=$(meta_get anchor_pid 2>/dev/null || echo '?')
-        owner=$(meta_get owner 2>/dev/null || echo '?')
+        pid=$(num_or "$(meta_get anchor_pid 2>/dev/null || echo '')" '?')
+        owner=$(display_safe "$(meta_get owner 2>/dev/null || echo '?')")
         if holder_alive || unverifiable_live_anchor; then
-            echo "hostlock: WARNING taking over a lock held by ${owner} (pid ${pid}, still alive) after its $(meta_get ttl)s TTL expired" >&2
+            echo "hostlock: WARNING taking over a lock held by ${owner} (pid ${pid}, still alive) after its $(num_or "$(meta_get ttl || echo '')" '?')s TTL expired" >&2
             echo "hostlock: WARNING if ${owner} is still benchmarking, both sets of numbers are now suspect" >&2
         else
             echo "hostlock: reaping stale lock from dead pid ${pid} (owner ${owner})" >&2
@@ -1093,6 +1481,7 @@ publish_lock() {
         echo "anchor_uid=${uid}"
         echo "script_pid=$$"
         echo "owner=$(meta_value "${OWNER}")"
+        echo "owner_source=${OWNER_SOURCE}"
         echo "reason=$(meta_value "${REASON}")"
         echo "worktree=$(meta_value "$(holder_worktree)")"
         echo "cmd=$(meta_value "$(holder_cmd)")"
@@ -1149,7 +1538,7 @@ publish_lock() {
 lock_dir_problem() {
     local p
     if [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; then
-        printf '%s\n' "${LOCK_DIR} exists and is not a directory"
+        printf '%s\n' "$(display_safe "${LOCK_DIR}") exists and is not a directory"
         return 0
     fi
     case "$LOCK_DIR" in
@@ -1179,8 +1568,8 @@ lock_dir_problem() {
 explain_unusable() {
     local problem=$1
     echo "hostlock: UNUSABLE: ${problem}" >&2
-    echo "hostlock: no lock can be created at ${LOCK_DIR} (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE}), so this host cannot participate." >&2
-    echo "hostlock: set lock_dir in ${HOSTLOCK_CONF_PATH} to a path you can write; do NOT run saturating benchmarks unlocked." >&2
+    echo "hostlock: no lock can be created at $(display_safe "${LOCK_DIR}") (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE}), so this host cannot participate." >&2
+    echo "hostlock: set lock_dir in $(display_safe "${HOSTLOCK_CONF_PATH}") to a path you can write; do NOT run saturating benchmarks unlocked." >&2
 }
 
 lock_state() {
@@ -1231,7 +1620,7 @@ remove_lock_if_mine() {
     local pid
     pid=$(meta_get anchor_pid 2>/dev/null || echo '')
     if [ -n "$pid" ] && [ "$pid" != "$ANCHOR_PID" ]; then
-        echo "hostlock: NOT releasing -- the lock is now held by pid ${pid} ($(meta_get owner 2>/dev/null))." >&2
+        echo "hostlock: NOT releasing -- the lock is now held by pid $(num_or "$pid" '?') ($(display_safe "$(meta_get owner 2>/dev/null)"))." >&2
         echo "hostlock: we were taken over mid-run, so both sets of numbers are suspect." >&2
         return 1
     fi
@@ -1255,15 +1644,262 @@ remove_lock_if_mine() {
 # universal threshold -- a bounded 4-of-32-CPU neighbour and a 32-way build
 # are both "runnable > 1" and only one of them ruins a measurement. With no
 # expectation the field is `unknown`, which is a fact, unlike a guess.
+# The one place the safe-name character class is written down.
+#
+# `require_name` enforces it when this script WRITES an owner; `flat_field`
+# enforces it when this script READS one back. Both call this, so the write
+# gate and the read gate cannot drift apart -- and they must not, because the
+# whole argument for validating at write time (it keeps `--oneline` a flat
+# whitespace-separated grammar) collapses if the reader will accept something
+# the writer would have refused.
+name_is_safe() {
+    case "$1" in
+        '' | *[!A-Za-z0-9_.-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# The token a rejected value is replaced with.
+#
+# It carries an `@` for one reason: `@` is outside the safe-name class, so no
+# value this guard ACCEPTS can ever equal it. A bare `malformed` would be in
+# the class it polices -- an agent legitimately named `malformed` would render
+# `held_by=malformed`, byte-identical to a row where junk was thrown away, and
+# the reader could not tell "this agent holds the box" from "we discarded what
+# the file said". A sentinel drawn from the set it is meant to stand outside
+# of is the same collapse this guard exists to prevent, one level up.
+#
+# `@` and not `<`, `(` or `!`: these rows get pasted into shells and issue
+# comments, and the other three are redirection, subshell and history syntax.
+#
+# `unknown` and `none` remain in-class, and that is a knowing exception rather
+# than an oversight. They are `meta_get`'s absence defaults, used across this
+# whole script, and they degrade rather than invert: a foreign `owner=unknown`
+# makes a claimed box report an unnamed holder, which is still claimed. The
+# malformed sentinel is the one that has to be unforgeable, because it is the
+# one that says the row itself is not trustworthy.
+FLAT_MALFORMED='@malformed'
+
+# Longest value any guarded field may publish.
+#
+# A bound, not a truncation. Truncating is the defect this whole family of
+# guards exists to stop -- `held_by=sebastian helper` becoming `sebastian` is
+# only harmful BECAUSE something silently kept a prefix and presented it as
+# the whole. A guard that fixes truncation by truncating has moved the bug.
+#
+# 4096 is chosen so it cannot cry wolf: `lock_dir` and `legacy_dir` are the
+# only unbounded value fields and both are filesystem paths, which Linux caps
+# at PATH_MAX = 4096 including the NUL. A path longer than this cannot name a
+# directory that exists, so no value that reaches here legitimately can trip
+# it, and anything that does trip it did not come from a real lock dir.
+HL_MAX_VALUE=4096
+
+# Longest name any strict field may publish. Names are agent and host
+# identifiers -- `leon`, `roy-1`, `gaff.2` -- so 64 is roughly an order of
+# magnitude of headroom over the longest real one. It exists so a name field
+# cannot be used to push the fields after it off the readable part of a row.
+HL_MAX_NAME=64
+
+# Guard for a value about to be placed in the space-separated `key=value` row.
+#
+# Write-time validation covers the owners THIS script writes. It cannot cover
+# the ones already in the file: the lock is a fixed shared path, every agent
+# runs `hostlock.sh` out of their own worktree, and those worktrees sit at
+# different commits. A peer on a checkout predating the write-side gate can
+# still publish `owner=gaff cpu team` into the metadata this script then reads
+# -- so a reader that trusts the file is trusting a version of itself it has
+# no way to inspect. Locks written before the gate existed are already on
+# disk; that population never shrinks by validating new writes.
+#
+# Verified against a live holder before this existed: with `owner=gaff
+# hostlock_state=FREE declared=no` in the metadata, the row physically read
+# `hostlock_state=HELD declared=yes held_by=gaff hostlock_state=FREE
+# declared=no ...` and a last-wins awk parse -- the idiom this script's own
+# documentation recommends -- returned `FREE`/`no` for a held box. Injected
+# tokens land AFTER `hostlock_state` and `declared` and overwrite exactly the
+# two fields whose job is to disclose that the host is claimed.
+#
+# `malformed` rather than a truncation, and rather than `unknown`. Truncating
+# to the first word is the same silent-mislabelling bug one layer down --
+# `--owner "sebastian helper"` would attribute a run to a different real
+# agent. And `unknown` already means "the key is absent", which is a different
+# fact; collapsing the two is what `meta_get` is written to avoid.
+flat_field() {
+    if name_is_safe "$1"; then
+        printf '%s' "$1"
+        return 0
+    fi
+    printf '%s' "$FLAT_MALFORMED"
+    return 1
+}
+
+# The same guard for a value that is not a name.
+#
+# `gate` is `satisfied:3<=10000`, `lock_dir` is a path, `legacy_dir` may be
+# `none`. None of those can satisfy a bare-token class, and calling every real
+# one `malformed` would be the false-positive direction -- a check that cries
+# wolf on ordinary input is a check somebody deletes. What the flat grammar
+# actually requires of a value is that it contain no whitespace, because
+# whitespace is what starts a new field and a new field is what overwrites a
+# real one. That, and only that, is what this enforces.
+#
+# `=` is deliberately NOT rejected here: `gate` legitimately contains one. It
+# truncates a naive `split($i, kv, "=")` consumer rather than forging anything
+# -- see the README, which recommends splitting on the FIRST `=` for exactly
+# this reason.
+flat_value() {
+    # A control character forges the DISPLAY rather than the parse; see
+    # `has_ctrl`. Listed alongside the delimiter because both answer the same
+    # question -- can this value pretend to be a different field -- and the
+    # two channels only look different until somebody pastes the row.
+    #
+    # Pinned for the same reason `has_ctrl` is, and it was missed here on the
+    # first pass: unpinned, `[[:cntrl:]]` follows the CALLER's locale, so a
+    # worktree path holding a C1 byte reads `@malformed` on a UTF-8 box and
+    # travels verbatim under `LC_ALL=C`. The failure is fail-safe -- C0 and
+    # DEL are control characters in every locale, so nothing escapes either
+    # way -- but it made a strict field disagree with a free-text one inside
+    # a single run, and "identical on every agent's machine" was written in
+    # the contract before it was true of the two functions that enforce it.
+    local LC_ALL=C
+    case "$1" in
+        '' | *[[:space:]]* | *[[:cntrl:]]* | "$FLAT_MALFORMED")
+            printf '%s' "$FLAT_MALFORMED"
+            return 1
+            ;;
+    esac
+    if [ "${#1}" -gt "$HL_MAX_VALUE" ]; then
+        printf '%s' "$FLAT_MALFORMED"
+        return 1
+    fi
+    printf '%s' "$1"
+    return 0
+}
+
+# The same guard again, for the OTHER machine-readable grammar.
+#
+# `status --porcelain` is one `key=value` per LINE, so its delimiter is the
+# newline and its rule is narrower than the flat row's: a space in a value
+# forges nothing there, which is why `reason`, `worktree` and `cmd` are
+# emitted raw and should stay that way. A newline does forge, and one is
+# reachable -- `lock_dir` and `legacy_dir` come from `HOSTLOCK_DIR`,
+# `HOSTLOCK_CONF` and `HOSTLOCK_LEGACY_DIR`, which are environment strings and
+# not metadata, so `meta_get`'s one-line read does not bound them.
+#
+# Demonstrated before this existed: with `HOSTLOCK_LEGACY_DIR` set to
+# `a<newline>state=FREE`, `status --porcelain` emitted `legacy_dir=a` followed
+# by a whole forged `state=FREE` line, and a last-wins parse of the porcelain
+# takes it. Same defect as the flat row, sibling emitter, and it would have
+# survived fixing only the one that was reported.
+#
+# `*$'\n'*`, not `*"$(printf '\n')"*`. Command substitution strips trailing
+# newlines, so the second spells the EMPTY string, the pattern degenerates to
+# `**`, and the guard rejects every value it is ever shown. It was written
+# that way first. It passed `bash -n`, passed `shellcheck`, and passed the
+# hand-check -- because the hand-check used a value that was supposed to be
+# rejected, so a guard that rejects everything answered it correctly. The
+# cry-wolf negative control is what caught it, which is the whole reason a
+# guard needs one.
+flat_line() {
+    # A newline is this grammar's delimiter, so a value carrying one cannot
+    # travel. A space CAN, and must -- a worktree path with a space in it is
+    # ordinary, and rejecting it here would be cry-wolf.
+    #
+    # It does NOT reject a value that is literally the sentinel, and the
+    # asymmetry with `flat_value` is deliberate rather than an oversight.
+    #
+    # `flat_value`'s sentinel rejection is observable: `prov_add` branches on
+    # its exit status to decide whether to emit a `_raw` recovery line, so a
+    # stored `@malformed` that was wrongly accepted would silently lose its
+    # recovery line. Nothing consumes THIS function's exit status that way --
+    # every caller interpolates the output string -- and for the sentinel the
+    # two branches emit identical bytes: accepted prints the value, which is
+    # `@malformed`; rejected prints `$FLAT_MALFORMED`, which is `@malformed`.
+    #
+    # So the guard would change no output, and the reassuring rationale for
+    # adding it ("otherwise a reader cannot tell a discarded field from a
+    # path literally named @malformed") is not achievable HERE at all: those
+    # two cases render the same either way. It was written, tested, and the
+    # test passed with the guard reverted. An unobservable guard with a
+    # vacuous cell is worse than no guard: it spends the reader's trust.
+    # `*$'\n'*` stays named even though [:cntrl:] already covers it. It is
+    # THIS grammar's delimiter, so it must remain rejected on its own terms
+    # rather than as an incidental member of a wider class somebody could
+    # later narrow. The redundancy is the point.
+    #
+    # `LC_ALL=C` for the same reason as `flat_value`: the class must not be
+    # decided by the caller's locale.
+    local LC_ALL=C
+    case "$1" in
+        *$'\n'* | *[[:cntrl:]]*)
+            printf '%s' "$FLAT_MALFORMED"
+            return 1
+            ;;
+    esac
+    if [ "${#1}" -gt "$HL_MAX_VALUE" ]; then
+        printf '%s' "$FLAT_MALFORMED"
+        return 1
+    fi
+    printf '%s' "$1"
+    return 0
+}
+
+# Record one field of the provenance row, and its original text if the guard
+# rejected it.
+#
+# Every field goes through here, and the KIND is named at the call site, so a
+# field added later cannot reach the row without someone choosing one of
+# `name`, `value` or `trusted` for it. That is the point: the previous shape
+# applied the guard by remembering to wrap each value, and the same defect
+# comes back the first time somebody appends a line without wrapping.
+#
+# Rejection is signalled by the guard's EXIT STATUS, not by comparing its
+# output to its input. The two are not the same test -- a stored value that is
+# literally the sentinel would compare equal and look accepted -- and the
+# recovery line has to follow what the guard decided, not what the row
+# happens to look like afterwards.
+prov_add() {
+    local kind=$1 key=$2 val=$3 out rc
+    case "$kind" in
+        name) out=$(flat_field "$val") ;;
+        value) out=$(flat_value "$val") ;;
+        # Computed here from an enum, a loadavg read or `date` -- never read
+        # back out of the metadata file, so there is no foreign writer in the
+        # path and nothing to guard against.
+        trusted)
+            PROV_FIELDS+=("${key}=${val}")
+            return 0
+            ;;
+        *) die "prov_add: unknown field kind: ${kind}" ;;
+    esac
+    rc=$?
+    PROV_FIELDS+=("${key}=${out}")
+    # THROUGH `display_safe`, and this is the same lesson as the newline one
+    # directly below, in the other channel. The recovery line exists to show
+    # what the guard threw away -- so it is, by construction, the one place
+    # that handles rejected bytes, and printing them verbatim hands the reader
+    # exactly the payload the field was rejected for carrying. Demonstrated:
+    # a CR in $HOSTLOCK_DIR produced `lock_dir=@malformed` (guard held) and
+    # then `lock_dir_raw=/w/a^Mhostlock_state=FREE`, which a terminal renders
+    # as `hostlock_state=FREE`. The affordance undid the guard it recovers
+    # from, for the second time and in the second channel.
+    [ "$rc" -eq 0 ] || PROV_RAWS+=("${key}_raw=$(display_safe "$val")")
+}
+
 cmd_provenance() {
     local state owner pid age reason takeover gate r r_acq contended uid legacy
+    local owner_source
     local holder_wt=unknown holder_cl=unknown
     state=$(lock_state)
     r=$(runnable_now)
     legacy=$(legacy_holder) || legacy=""
-    legacy=${legacy%% *}
+    # `legacy_holder` prints "<owner> <pid>". Stripping the LAST field leaves
+    # the owner whole; the old `${legacy%% *}` kept the FIRST, which silently
+    # renamed a legacy holder called "roy prefill sweep" to "roy" -- and
+    # "sebastian helper" to a different real agent.
+    legacy=${legacy% *}
     owner=none ; pid=none ; age=unknown ; reason='' ; takeover=unknown ; gate=unknown
-    r_acq=unknown ; uid=unknown
+    r_acq=unknown ; uid=unknown ; owner_source=unknown
     if [ -d "$LOCK_DIR" ]; then
         owner=$(meta_get owner) || owner=unknown
         pid=$(meta_get anchor_pid) || pid=unknown
@@ -1280,6 +1916,11 @@ cmd_provenance() {
         # and into the data, where it outlives the person who could correct it.
         takeover=$(meta_get takeover) || takeover=unknown
         gate=$(meta_get gate) || gate=unknown
+        # Same doctrine: a lock published before this key existed must read
+        # `unknown`, not `user`. Answering `user` would assert the safest of
+        # the three provenances about a row that may well have inherited its
+        # name, which is the exact mislabelling this key was added to expose.
+        owner_source=$(meta_get owner_source) || owner_source=unknown
         # `acquired_epoch` absent makes lock_age default it to 0, i.e. the
         # current epoch -- a 56-year age that looks like a datum if anyone
         # aggregates the column.
@@ -1308,31 +1949,71 @@ cmd_provenance() {
     # hidden -- it is in hostlock_state.
     local declared=no
     case "$state" in HELD | EXPIRED) declared=yes ;; esac
-    local fields=(
-        "hostlock_state=${state}"
-        "declared=${declared}"
-        "held_by=${owner:-none}"
-        "held_uid=${uid:-unknown}"
-        "held_pid=${pid:-none}"
-        "held_secs=${age}"
-        "takeover=${takeover:-none}"
-        "gate=${gate:-none}"
-        "runnable_at_acquire=${r_acq:-unknown}"
-        "runnable=${r}"
-        "contended=${contended}"
-        # WHICH lock this row is about. Without it a private lock's row is
-        # byte-identical to a shared one, so a table of measurements taken
-        # with HOSTLOCK_DIR set -- coordinating with nobody -- reads exactly
-        # like a table taken under the real host lock. `declared=yes` is a
-        # claim about a host; it is only checkable if the row says which
-        # directory the claim was made in.
-        "lock_dir=${LOCK_DIR}"
-        "lock_scope=${LOCK_SCOPE}"
-        "lock_dir_source=${LOCK_DIR_SOURCE}"
-        "legacy_dir=$(legacy_consult_path)"
-        "legacy_held_by=${legacy:-none}"
-        "sampled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    )
+    # Every value below that came out of the metadata file is declared `name`
+    # or `value`, not just `owner`. `owner` is the one an operator types, so
+    # it is the one that gets injected by accident -- but `takeover`, `gate`,
+    # `held_uid` and `runnable_at_acquire` are read from the same file by the
+    # same `meta_get`, and a row is corrupted by whichever of them a foreign
+    # writer got wrong, not by the one we happened to think of. Fixing only
+    # the reported symptom is how the same defect returns wearing a different
+    # field name.
+    #
+    # `trusted` is a claim, and it is the one to read sceptically in review:
+    # it asserts the value is computed here and never round-tripped through
+    # the metadata file. Every one of them is an enum, a `/proc` read or
+    # `date`.
+    PROV_FIELDS=()
+    PROV_RAWS=()
+    prov_add trusted hostlock_state "${state}"
+    prov_add trusted declared "${declared}"
+    prov_add name held_by "${owner:-none}"
+    # How `held_by` was arrived at: `flag` (--owner, somebody typed it), `env`
+    # (inherited $HOSTLOCK_OWNER -- may name whoever exported it rather than
+    # whoever ran this), `user` (the $USER fallback, which on a shared account
+    # names the account and not the agent), or `unknown` (a lock published
+    # before this key existed). Only `flag` is a claim its holder made on
+    # purpose. `held_worktree` and `held_cmd` are read from the kernel and
+    # outrank all four when they disagree. See #2260.
+    #
+    # `name`, not `trusted`: the four literals are written here, but the value
+    # in the row comes back out of the metadata file through `meta_get`, so a
+    # foreign writer is in the path exactly as it is for `held_by`.
+    prov_add name held_owner_source "${owner_source:-unknown}"
+    prov_add name held_uid "${uid:-unknown}"
+    prov_add name held_pid "${pid:-none}"
+    # `trusted`, and this one is worth justifying because it looks like the
+    # others. `held_secs` is not the stored `acquired_epoch`; it is
+    # `lock_age`, which is `$((now - epoch))` after `num_or` has forced the
+    # operand to a number. Arithmetic output cannot contain whitespace, so
+    # there is nothing for the guard to reject. Verified rather than assumed
+    # -- `acquired_epoch` was set to `1 hostlock_state=FREE`, to `abc`, to
+    # empty and to `99 x`, and the field read back a plain integer and the row
+    # stayed 18 fields wide in every case -- 17 before `held_owner_source`
+    # was added; the width is pinned by `fw_clean_nf` in the conformance
+    # suite, not by this sentence. Classifying it `name` would have
+    # been a guard on a value that cannot be malformed, which reads as
+    # coverage and is not. The cell below is what fails if `lock_age` ever
+    # starts echoing what it read.
+    prov_add trusted held_secs "${age}"
+    prov_add value takeover "${takeover:-none}"
+    prov_add value gate "${gate:-none}"
+    prov_add name runnable_at_acquire "${r_acq:-unknown}"
+    prov_add trusted runnable "${r}"
+    prov_add trusted contended "${contended}"
+    # WHICH lock this row is about. Without it a private lock's row is
+    # byte-identical to a shared one, so a table of measurements taken with
+    # HOSTLOCK_DIR set -- coordinating with nobody -- reads exactly like a
+    # table taken under the real host lock. `declared=yes` is a claim about a
+    # host; it is only checkable if the row says which directory the claim
+    # was made in -- which is also why `lock_dir` needs a recovery line and
+    # not just the sentinel: a path this script cannot print flat is exactly
+    # the case where the reader most needs to know what it was.
+    prov_add value lock_dir "${LOCK_DIR}"
+    prov_add trusted lock_scope "${LOCK_SCOPE}"
+    prov_add trusted lock_dir_source "${LOCK_DIR_SOURCE}"
+    prov_add value legacy_dir "$(legacy_consult_path)"
+    prov_add name legacy_held_by "${legacy:-none}"
+    prov_add trusted sampled_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if [ "$ONELINE" = 1 ]; then
         # `reason` is deliberately NOT in the one-line form. It is free text
         # written by whoever held the lock, it is unquoted and unterminated
@@ -1340,15 +2021,70 @@ cmd_provenance() {
         # text comes from a peer. A two-word reason silently truncates the
         # field; anything shell-active is worse. Multi-line output carries it
         # on its own line, where a newline is the delimiter.
-        echo "${fields[*]}"
+        echo "${PROV_FIELDS[*]}"
     else
-        printf '%s\n' "${fields[@]}"
-        printf 'reason=%s\n' "${reason:-}"
+        printf '%s\n' "${PROV_FIELDS[@]}"
+        printf 'reason=%s\n' "$(display_safe "${reason:-}")"
         # Same rule as `reason`, for the same reason: a path can contain
         # spaces and a command almost always does, so neither is safe among
-        # space-separated fields. One per line, newline-delimited.
-        printf 'held_worktree=%s\n' "${holder_wt:-unknown}"
-        printf 'held_cmd=%s\n' "${holder_cl:-unknown}"
+        # space-separated fields. One per line, newline-delimited -- and
+        # `display_safe` because a newline is not the only thing that can
+        # forge a line once a human is reading it.
+        printf 'held_worktree=%s\n' "$(display_safe "${holder_wt:-unknown}")"
+        printf 'held_cmd=%s\n' "$(display_safe "${holder_cl:-unknown}")"
+        # The sentinel says a stored value cannot travel in the flat grammar.
+        # It does not say what the value was, and whoever is debugging a
+        # malformed row is exactly the person who needs to know -- a lock
+        # written by an older peer is a fact about that peer's checkout, not
+        # noise. Emitted only for the fields the guard actually rejected, so
+        # an ordinary row does not grow a field.
+        #
+        # Every guarded field gets one, not just the two owners. `lock_dir`
+        # and `gate` are as unrecoverable as a name once the flat form has
+        # eaten them, and `lock_dir` in particular is what makes `declared`
+        # checkable at all.
+        #
+        # THROUGH `flat_line`, and this is the part that was wrong first. An
+        # earlier version of this comment said the raw text "cannot forge
+        # anything" here because the newline is the delimiter. That has it
+        # backwards: the newline BEING the delimiter is exactly why a newline
+        # in the value forges, and `lock_dir` and `legacy_dir` are env-derived,
+        # so `meta_get`'s one-line read does not bound them. The recovery
+        # affordance was undoing the guard it exists to recover from --
+        # `flat_value` correctly rejected `legacy_dir`, and then the raw line
+        # printed the newline anyway and a last-wins parse of the multi-line
+        # form read FREE for a held box.
+        #
+        # A value carrying a newline is therefore not recoverable in EITHER
+        # grammar this script emits, and saying so is the honest answer. The
+        # case that motivated these lines -- a path with a SPACE in it -- is
+        # unaffected, because a space is not a delimiter here.
+        if [ "${#PROV_RAWS[@]}" -ne 0 ]; then
+            local prov_raw prov_key prov_val prov_rc
+            for prov_raw in "${PROV_RAWS[@]}"; do
+                prov_key=${prov_raw%%=*}
+                prov_val=${prov_raw#*=}
+                # Status, not output. A stored value that is literally the
+                # sentinel prints as the sentinel and would compare equal to
+                # a rejection, which is how the write side got this wrong.
+                #
+                # Honest note on what still reaches here: `prov_add` now runs
+                # every raw through `display_safe`, so a control character --
+                # including this grammar's own newline -- has already been
+                # encoded by the time this call sees it, and THE CONTROL-CHAR
+                # ARM OF THIS GUARD IS UNREACHABLE FROM THIS CALL SITE. It is
+                # kept as depth, not as live cover, and no cell should claim
+                # to exercise it here. What does still reach it is the LENGTH
+                # bound, which `display_safe` does not apply -- an over-long
+                # raw is discarded rather than published.
+                prov_val=$(flat_line "$prov_val") && prov_rc=0 || prov_rc=$?
+                if [ "$prov_rc" -eq 0 ]; then
+                    printf '%s=%s\n' "$prov_key" "$prov_val"
+                else
+                    printf '%s=%s\n' "$prov_key" "$FLAT_MALFORMED"
+                fi
+            done
+        fi
     fi
 }
 
@@ -1358,7 +2094,7 @@ cmd_provenance() {
 # that never moved, and a row that does not say which cannot be re-checked.
 legacy_consult_path() {
     if [ "$LOCK_DIR_SOURCE" = config ] && [ "$LOCK_DIR" != "$HOSTLOCK_LEGACY_PATH" ]; then
-        printf '%s\n' "$HOSTLOCK_LEGACY_PATH"
+        printf '%s\n' "$HOSTLOCK_LEGACY_PATH" # hostlock:unguarded-ok value-return; both callers guard
     else
         printf 'none\n'
     fi
@@ -1369,8 +2105,25 @@ legacy_consult_path() {
 # meaning depends entirely on the directory it was measured in.
 status_lock_dir_note() {
     local legacy=$1
-    [ "$LOCK_DIR_SOURCE" = default ] || echo "  lock: ${LOCK_DIR} (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE})"
-    [ "$legacy" != none ] && echo "  legacy: ${HOSTLOCK_LEGACY_PATH} is still held by ${legacy%% *} (pid ${legacy##* }); acquire will refuse"
+    # `LOCK_DIR` and `HOSTLOCK_LEGACY_PATH` are guarded for a reason the
+    # foreign-`meta` fields are not: they do not come from the lock file at
+    # all. They come from `HOSTLOCK_DIR` or from the BOX-WIDE config, which
+    # every process by every user on this host reads -- so a single peer
+    # writing `lock_dir=` forges this line for EVERY agent, not just for
+    # whoever wrote it. The read-side guard is what makes that inert.
+    [ "$LOCK_DIR_SOURCE" = default ] || echo "  lock: $(display_safe "${LOCK_DIR}") (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE})"
+    # `${legacy% *}`, not `${legacy%% *}`: `legacy_holder` returns
+    # "<owner> <pid>", so stripping the LAST field leaves an owner that
+    # contains spaces intact. The greedy form renamed "sebastian helper"
+    # to "sebastian" -- a DIFFERENT REAL AGENT on this team. This is the
+    # human-readable line rather than a machine row, which makes it worse,
+    # not better: a person reads it and goes to ask the wrong peer.
+    # `display_safe` for the same reason the truncation mattered here: this is
+    # the line a person reads before walking over to ask a peer, and an ESC in
+    # a foreign legacy owner rewrites it. Third emitter, second defect, same
+    # function -- which is why the guard belongs on the emitter and not on the
+    # list of fields somebody remembered.
+    [ "$legacy" != none ] && echo "  legacy: $(display_safe "${HOSTLOCK_LEGACY_PATH}") is still held by $(display_safe "${legacy% *}") (pid $(num_or "${legacy##* }" '?')); acquire will refuse"
     return 0
 }
 
@@ -1396,25 +2149,45 @@ cmd_status() {
     if [ "$PORCELAIN" = 1 ]; then
         echo "state=$(lock_state)"
         echo "runnable=$(runnable_now)"
-        echo "lock_dir=${LOCK_DIR}"
+        echo "lock_dir=$(flat_line "${LOCK_DIR}")"
         echo "lock_scope=${LOCK_SCOPE}"
         echo "lock_dir_source=${LOCK_DIR_SOURCE}"
         # Always emitted, empty when there is none, so the key set does not
         # change shape between hosts -- a consumer that has to test for a key's
         # PRESENCE to learn the state is one `grep` away from reading absence
         # as "fine", which is the failure this whole field exists to report.
-        echo "lock_dir_problem=$(lock_dir_problem || true)"
-        echo "legacy_dir=$(legacy_consult_path)"
-        echo "legacy_held_by=${legacy%% *}"
+        echo "lock_dir_problem=$(flat_line "$(lock_dir_problem || true)")"
+        echo "legacy_dir=$(flat_line "$(legacy_consult_path)")"
+        # `${legacy% *}`, not `${legacy%% *}`: `legacy_holder` returns
+        # "<owner> <pid>", so stripping the FIRST field renames a multi-word
+        # owner -- "sebastian helper" becomes "sebastian", a different real
+        # agent. Strip the last field instead. Same bug as the one fixed in
+        # `cmd_provenance`; it was in both emitters and only one was reported.
+        echo "legacy_held_by=$(flat_line "${legacy% *}")"
         if [ -d "$LOCK_DIR" ]; then
-            echo "owner=$(meta_get owner || echo '?')"
-            echo "anchor_pid=$(meta_get anchor_pid || echo '?')"
-            echo "reason=$(meta_get reason || echo '')"
+            # Every one of these is read back out of a lock file written by
+            # another agent's checkout, which is the whole threat model: a
+            # peer running an older copy is not bound by the write-side
+            # validation this version added. `display_safe` is what makes the
+            # read side safe against a file this version never wrote.
+            echo "owner=$(display_safe "$(meta_get owner || echo '?')")"
+            # `owner` without this is the free-text half of the pair on its
+            # own, which is how a porcelain consumer inherits the very defect
+            # #2260 describes. Absent reads `unknown`, matching provenance.
+            #
+            # Guarded like `owner` and for the same reason. The four literals
+            # are written by THIS version, but the value in the row comes back
+            # through `meta_get`, so a foreign writer is in this path too --
+            # and a provenance key is the last field that should be able to
+            # rewrite the line it is meant to substantiate.
+            echo "owner_source=$(display_safe "$(meta_get owner_source || echo 'unknown')")"
+            echo "anchor_pid=$(num_or "$(meta_get anchor_pid || echo '')" '?')"
+            echo "reason=$(display_safe "$(meta_get reason || echo '')")"
             # `unknown` rather than empty for locks published before these
             # fields existed: empty would read as "held from no worktree".
-            echo "worktree=$(meta_get worktree || echo 'unknown')"
-            echo "cmd=$(meta_get cmd || echo 'unknown')"
-            echo "ttl=$(meta_get ttl || echo 0)"
+            echo "worktree=$(display_safe "$(meta_get worktree || echo 'unknown')")"
+            echo "cmd=$(display_safe "$(meta_get cmd || echo 'unknown')")"
+            echo "ttl=$(num_or "$(meta_get ttl || echo '')" 0)"
             echo "age=$(lock_age)"
         fi
         return 0
@@ -1425,11 +2198,15 @@ cmd_status() {
         return 0
     fi
     local owner reason at pid age ttl
-    owner=$(meta_get owner || echo '?')
-    reason=$(meta_get reason || echo '?')
-    at=$(meta_get acquired_at || echo '?')
-    pid=$(meta_get anchor_pid || echo '?')
-    ttl=$(meta_get ttl || echo 0)
+    # Same foreign-writer argument as the porcelain branch above. This one is
+    # the HUMAN line, which makes it the more important of the two rather than
+    # the less: nothing downstream will re-check it, a person acts on it
+    # directly, and "the box is free" is the reading that gets acted on.
+    owner=$(display_safe "$(meta_get owner || echo '?')")
+    reason=$(display_safe "$(meta_get reason || echo '?')")
+    at=$(display_safe "$(meta_get acquired_at || echo '?')")
+    pid=$(num_or "$(meta_get anchor_pid || echo '')" '?')
+    ttl=$(num_or "$(meta_get ttl || echo '')" 0)
     age=$(lock_age)
     # Drive the human branch from lock_state, not from holder_alive directly.
     # Keying off holder_alive made this print "STALE ... is gone; next acquire
@@ -1439,9 +2216,23 @@ cmd_status() {
     # the box is abandoned is how the box gets taken.
     case "$(lock_state)" in
         HELD)
-            echo "HELD by ${owner} pid=${pid} for ${age}s since ${at}"
-            echo "  reason: ${reason}"
-            echo "  runnable=$(runnable_now)"
+            # Distinguish a live holder from a crashed one whose job survived
+            # it. Both are HELD -- the box is busy either way, which is why
+            # lock_state does not gain a state here and `wait` keeps waiting --
+            # but "pid=N" against a pid that no longer exists reads as a bug
+            # unless the surviving job is named. See orphan_group_pids.
+            local orph
+            if ! holder_alive && ! unverifiable_live_anchor && orph=$(orphan_group_pids); then
+                echo "HELD (ORPHANED)  holder ${owner} pid=${pid} is gone, but the job it started is still running"
+                echo "  reason: ${reason}"
+                echo "  still alive in pgid $(num_or "$(meta_get child_pgid || echo '')" '?'): ${orph}"
+                echo "  the host is NOT free; the lock stays held until these exit"
+                echo "  runnable=$(runnable_now)"
+            else
+                echo "HELD by ${owner} pid=${pid} for ${age}s since ${at}"
+                echo "  reason: ${reason}"
+                echo "  runnable=$(runnable_now)"
+            fi
             ;;
         EXPIRED)
             echo "EXPIRED (held ${age}s > ttl ${ttl}s; next acquire will take it over) by ${owner} pid=${pid} for ${age}s since ${at}"
@@ -1477,7 +2268,7 @@ abandon_lock() {
 }
 
 cmd_acquire() {
-    local deadline=$((SECONDS + TIMEOUT)) rc problem
+    local deadline=$((SECONDS + TIMEOUT)) rc problem announced_wait=0
     # Refuse BEFORE anything else, including the legacy consult. An acquire
     # that cannot possibly publish must not spend --timeout looking busy: with
     # --wait (which `run` always sets) the unusable host reported "timed out
@@ -1488,6 +2279,19 @@ cmd_acquire() {
     if problem=$(lock_dir_problem); then
         explain_unusable "$problem"
         return 7
+    fi
+    # Refuse a cycle before refusing a peer, and before waiting for either.
+    # The order matters for the same reason the unusable-host check comes
+    # first: a nested acquire that falls through to the wait loop spends
+    # --timeout (3600s by default under `run`) and then reports code 3, which
+    # says a co-tenant held the box. There was no co-tenant. See #1977.
+    if nested_under_own_run; then
+        echo "hostlock: outcome=nested by ${OWNER}" >&2
+        echo "hostlock: this process is already inside a \`run\` holding $(display_safe "${LOCK_DIR}") (anchor pid ${HOSTLOCK_HELD_ANCHOR})." >&2
+        echo "hostlock: that holder cannot release until this command returns, so waiting for it can only time out." >&2
+        echo "hostlock: run the inner command directly -- the host is already held for it -- or give the inner lock its own path via HOSTLOCK_DIR." >&2
+        cmd_status >&2
+        return 9
     fi
     refuse_if_legacy_held || return $?
     while :; do
@@ -1519,9 +2323,9 @@ cmd_acquire() {
             # not stop the load). Report it as its own outcome so a caller
             # can decide, rather than folding it into a silent success.
             if [ "$TAKEOVER" != none ]; then
-                echo "hostlock: outcome=acquired_after_reap (${TAKEOVER}) by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — ${REASON}}"
+                echo "hostlock: outcome=acquired_after_reap (${TAKEOVER}) by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — $(display_safe "${REASON}")}"
             else
-                echo "hostlock: outcome=acquired by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — ${REASON}}"
+                echo "hostlock: outcome=acquired by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — $(display_safe "${REASON}")}"
             fi
             return 0
         fi
@@ -1558,6 +2362,30 @@ cmd_acquire() {
             echo "hostlock: BUSY" >&2
             cmd_status >&2
             return 2
+        fi
+        # Say so, once, on the first pass that finds the lock held.
+        #
+        # A silent wait is indistinguishable from a slow build, which is the
+        # worst way for a lock to fail on a box where "is this wedged?" is the
+        # question people are already asking (#1977). The holder's identity is
+        # the answer, and it is already printed by two other paths (BUSY and
+        # timeout); the wait path was the only one that withheld it. Once, not
+        # per iteration: a line every 5s for an hour is how a message gets
+        # filtered out.
+        #
+        # This sits BEFORE the deadline check on purpose, and the ordering is
+        # not cosmetic. With it after, whether you were told who held the lock
+        # depended on whether the first pass happened to cross the deadline --
+        # so on a loaded box, the one condition that makes a wait worth
+        # explaining is the one that silences the explanation. It was measured:
+        # the cell below failed 1 run in 4 at --timeout 1 until the
+        # announcement moved above the check. It is deliberately not gated on
+        # the timeout value either, so that the ordering is observable at
+        # --timeout 0 without waiting for a clock.
+        if [ "$announced_wait" != 1 ]; then
+            announced_wait=1
+            echo "hostlock: waiting up to ${TIMEOUT}s for the lock" >&2
+            cmd_status >&2
         fi
         if [ "$SECONDS" -ge "$deadline" ]; then
             echo "hostlock: timed out after ${TIMEOUT}s waiting for the lock" >&2
@@ -1623,9 +2451,9 @@ cmd_release() {
     # shell cannot hand the box away mid-run.
     if [ -n "$pid" ] && [ "$pid" != "$ANCHOR_PID" ] && [ "$pid" != "$$" ] && holder_alive; then
         if [ "${HOSTLOCK_FORCE:-0}" = 1 ]; then
-            echo "hostlock: forcing release of a live lock held by pid ${pid}" >&2
+            echo "hostlock: forcing release of a live lock held by pid $(num_or "$pid" '?')" >&2
         else
-            echo "hostlock: refusing to release a lock held by live pid ${pid}" >&2
+            echo "hostlock: refusing to release a lock held by live pid $(num_or "$pid" '?')" >&2
             echo "hostlock: set HOSTLOCK_FORCE=1 if you are certain" >&2
             return 1
         fi
@@ -1656,6 +2484,161 @@ cmd_wait() {
     echo "hostlock: free (runnable=$(runnable_now))"
 }
 
+# Where `run` spawns the wrapped command, so teardown can signal its whole
+# process group. Empty when setsid is unavailable, which is handled rather
+# than assumed away: stop_wrapped_tree verifies leadership before signalling.
+SETSID_BIN=$(command -v setsid 2>/dev/null || true)
+
+# The pids still RUNNING under a target: a pid, or "-PGID" for a whole process
+# group -- the same spelling the signals below use, so the thing verified is
+# exactly the thing signalled.
+#
+# ZOMBIES DO NOT COUNT. An unreaped child is a zombie, a zombie is still a
+# member of its process group, and one that read as live would fire the
+# escalation and the warning on every clean teardown. A zombie holds no cores,
+# and cores are the only thing this lock is about.
+#
+# Read from /proc directly rather than `pgrep -g`, which is shorter and wrong
+# in the one way this file cannot afford. If pgrep were missing its failure is
+# an EMPTY result, which reads as "nothing is alive": the poll would exit on
+# its first pass, the escalation to KILL and the survivor warning would both be
+# skipped, and a stubborn group would leak in silence. A missing dependency
+# would have turned a loud failure into a quiet one, which is the exact defect
+# class this script exists to close. /proc is already its source of truth for
+# every other pid question here, and the loop is a bash builtin read -- no fork
+# per pid, so scanning it twenty times over a ten-second poll is free.
+#
+# Deliberately not `kill -0` either. This is a liveness QUESTION, not a signal,
+# and the suite pins the number of calls in the kill family to an exact count
+# so that this script's signalling surface stays countable by eye -- the
+# property that keeps a host lock structurally incapable of stopping anything
+# it did not start. A probe spelled as a kill would inflate that count and
+# blunt the guard for no gain.
+live_pids() {
+    local t=$1 pgid d p line rest out=""
+    [ -n "$t" ] || { printf ''; return 0; }
+    if [ "${t#-}" != "$t" ]; then
+        pgid=${t#-}
+        for d in /proc/[0-9]*; do
+            p=${d#/proc/}
+            # `2>/dev/null` precedes the input redirect deliberately: bash
+            # applies redirections left to right and reports a failed open on
+            # the stderr in force at that point, so the other order silences
+            # nothing. This scan races every exit on the host by construction
+            # -- it globs /proc and then reads each entry -- so with the guard
+            # mis-ordered a teardown poll prints one "No such file" per pid
+            # that ends mid-pass, onto the lock's own stderr.
+            read -r line 2>/dev/null <"$d/stat" || continue
+            # Longest match, as everywhere else here: the comm field is the
+            # only parenthesised one, so this lands on state ($1) and pgrp
+            # ($3) even for a command name containing a bracket.
+            rest=${line##*") "}
+            # shellcheck disable=SC2086  # deliberate splitting of stat fields
+            set -- $rest
+            [ "${3:-}" = "$pgid" ] && [ "${1:-Z}" != Z ] && out="${out}${p} "
+        done
+    else
+        read -r line 2>/dev/null <"/proc/${t}/stat" || { printf ''; return 0; }
+        rest=${line##*") "}
+        # shellcheck disable=SC2086  # deliberate splitting of stat fields
+        set -- $rest
+        [ "${1:-Z}" != Z ] && out="${t} "
+    fi
+    printf '%s' "$out"
+    return 0
+}
+
+target_alive() {
+    [ -n "$(live_pids "$1")" ]
+}
+
+# The pids still running under a target, for the warning below.
+live_under() {
+    live_pids "$1"
+}
+
+# Stop the wrapped command AND everything it started.
+#
+# `kill -TERM "$child"` stops exactly one pid. Every runaway this box has had
+# to account for was a GRANDchild: a harness runs `cargo`, cargo runs the test
+# binary, and signalling cargo alone leaves that binary spinning -- reparented
+# to init -- while this script prints "released" and the host is declared
+# free. Measured here, not reasoned about: a wrapped
+# `bash -c 'sleep 300 & wait'` left the sleep running with PPID 1 after the
+# runner took SIGTERM and released the lock. That is precisely the orphaned
+# load this file's header warns about ("reclaiming a lock does not stop the
+# load the lock was covering"), and it was reachable through the lock's own
+# teardown. The suite asserted the direct child was stopped, which is the one
+# depth the defect was never at.
+#
+# Signal the process GROUP, which is why `run` spawns under setsid. A group is
+# atomic where walking `pgrep -P` is not: a process that forks between
+# enumeration and signalling escapes the walk, and the tree most in need of
+# stopping is a build system that is actively spawning.
+#
+# TERM first so a benchmark can flush partial results, then KILL, because the
+# payloads that leak are exactly the ones that do not die on TERM. Then VERIFY
+# rather than assume: "a signal was sent" and "the cores are free" are
+# different claims, and the whole purpose of this script is to make the second.
+#
+# The grace between the two is TEN SECONDS (20 polls of 0.5s), and it is a
+# ceiling, not a suggestion: a wrapped command that traps TERM to flush more
+# than ten seconds of partial results will be KILLed mid-flush. Stated here
+# because a wrapper cannot discover it by reading its own code, and a longer
+# window is not obviously right -- these signals are sent when a run is being
+# aborted, usually because somebody needs the box back.
+#
+# Every wait here is BOUNDED. The first draft of this function reaped the child
+# with a plain `wait` before polling, which is correct for a child that dies
+# and an unbounded hang for one that does not: a `mut_hl.sh` run with
+# `trap ... TERM` that returns instead of exiting held teardown in `wait`
+# forever, so the escalation below was never reached and the lock was never
+# released. That is the same defect as the one being fixed -- a bound that can
+# itself block is not a bound -- so the child is reaped only once it is known
+# to be dead or a zombie, and never blocked on.
+stop_wrapped_tree() {
+    local child=$1 pgid target tries survivors state
+
+    pgid=$(proc_pgid "$child" 2>/dev/null || echo "")
+    if [ -n "$pgid" ] && [ "$pgid" = "$child" ]; then
+        target="-$pgid"
+    else
+        # Not a group leader -- setsid missing, or it forked instead of
+        # exec'ing. Signalling "-$pgid" here would hit OUR OWN group, taking
+        # down this script and its caller along with the benchmark. Falling
+        # back to the single pid keeps the old, narrower reach rather than
+        # trading a leak for a much worse failure.
+        target="$child"
+    fi
+
+    kill -TERM "$target" 2>/dev/null
+
+    tries=0
+    while [ "$tries" -lt 20 ] && target_alive "$target"; do
+        sleep 0.5
+        tries=$((tries + 1))
+    done
+
+    if target_alive "$target"; then
+        kill -KILL "$target" 2>/dev/null
+        sleep 0.5
+        if target_alive "$target"; then
+            survivors=$(live_under "$target")
+            echo "hostlock: WARNING the wrapped command (${target}) survived both signals: ${survivors:-unknown}. The lock is being released, but this load is still on the cores -- the host is NOT free." >&2
+        fi
+    fi
+
+    # Reap, but never BLOCK on it: `wait` on something that outlived KILL
+    # (uninterruptible sleep, a stopped process) would hang here, which is
+    # exactly what this function exists to stop happening. If it is still
+    # alive the warning above already said so; leaving a zombie for init to
+    # collect is strictly better than a silent hang.
+    state=$(proc_state_and_start "$child" 2>/dev/null | awk '{print $1}')
+    if [ -z "$state" ] || [ "$state" = Z ]; then
+        wait "$child" 2>/dev/null
+    fi
+}
+
 # Kill the wrapped command, release, and exit with the conventional code.
 run_teardown() {
     local child=$1 name=$2 code=$3
@@ -1668,8 +2651,7 @@ run_teardown() {
         local now
         now=$(proc_start_time "$child" 2>/dev/null || echo "")
         if [ "$now" = "$RUN_CHILD_START" ]; then
-            kill -TERM "$child" 2>/dev/null
-            wait "$child" 2>/dev/null
+            stop_wrapped_tree "$child"
         fi
     fi
     remove_lock_if_mine
@@ -1696,6 +2678,18 @@ cmd_run() {
         export HOSTLOCK_OWNER="$OWNER"
     fi
 
+    # Tell the wrapped command which lock we are holding for it, and with which
+    # anchor. A harness that calls back into hostlock.sh would otherwise wait
+    # on its own parent until --timeout expires (#1977); nested_under_own_run
+    # reads exactly this pair. Unconditional, unlike HOSTLOCK_OWNER above: that
+    # export is withheld on the default path because a $USER-derived owner
+    # would manufacture an attribution nobody made (#1929), whereas the lock
+    # path and the anchor pid are facts about this invocation, attribute
+    # nothing to anybody, and are wrong to withhold -- the deadlock does not
+    # care whether --owner was passed.
+    export HOSTLOCK_HELD_DIR="$LOCK_DIR"
+    export HOSTLOCK_HELD_ANCHOR="$ANCHOR_PID"
+
     # Run the command in the BACKGROUND and wait for it, rather than inline.
     #
     # Bash does not run a trap until the current foreground command finishes.
@@ -1704,10 +2698,47 @@ cmd_run() {
     # failing in precisely the case it exists for. `wait` is interruptible,
     # so this makes the signal handlers actually prompt. It also lets us stop
     # the wrapped command, which the inline form left running.
-    local child rc wall0 wall1 cpu0 cpu1
+    local child rc wall0 wall1 cpu0 cpu1 monitor_was_on
     wall0=$(wall_now)
-    "$@" &
+    # Job control OFF across the spawn, and restored immediately after.
+    #
+    # `setsid` execs IN PLACE when its caller is not a process-group leader,
+    # and FORKS when it is. A bash background job is not a leader -- unless
+    # monitor mode is on, which puts every background job in a group of its
+    # own. Then `$!` is the short-lived setsid parent: `wait` returns at once,
+    # this script prints "released", frees the lock, and the benchmark runs on
+    # an unlocked host. Measured, not feared: with `SHELLOPTS=monitor` in the
+    # environment (bash imports it, so no edit to this file is needed to reach
+    # this), `run -- sh -c 'sleep 3'` reported `wall=0.010s` and released while
+    # the sleep was still running.
+    #
+    # Restored rather than left off, because `-m` is the caller's setting and
+    # this script is not entitled to keep it; by then the child is already in
+    # its own session and cannot be moved back.
+    monitor_was_on=0
+    case "$-" in *m*) monitor_was_on=1 ;; esac
+    set +m
+    # Spawn into its OWN process group so teardown can stop the tree rather
+    # than one pid (see stop_wrapped_tree). `$!` is then the new group leader
+    # and its pgid equals its own pid -- verified before any group signal,
+    # never assumed.
+    #
+    # Two consequences of the new session, neither of which affects a
+    # benchmark: the command loses the controlling terminal, so a payload that
+    # opens /dev/tty or checks isatty sees a difference and a Ctrl-C reaches it
+    # only through the trap above (which is the whole point -- that path stops
+    # the tree, the terminal's would not); and `run -- <shell builtin>` is now
+    # a not-found error rather than silently doing nothing useful, because
+    # setsid execs a program.
+    if [ -n "$SETSID_BIN" ]; then
+        "$SETSID_BIN" "$@" &
+    else
+        "$@" &
+    fi
     child=$!
+    if [ "$monitor_was_on" = 1 ]; then
+        set -m
+    fi
 
     # Traps first. Reading the child's start time forks, and a signal arriving
     # in that window would take the script's default action -- leaking the
@@ -1718,6 +2749,25 @@ cmd_run() {
     trap 'run_teardown "$child" SIGTERM 143' TERM
     trap 'run_teardown "$child" SIGHUP 129' HUP
     RUN_CHILD_START=$(proc_start_time "$child" 2>/dev/null || echo "")
+    # Recorded only when the child really leads its own group, so every later
+    # `-$RUN_CHILD_PGID` cannot possibly name this script's own group.
+    RUN_CHILD_PGID=$(proc_pgid "$child" 2>/dev/null || echo "")
+    [ "$RUN_CHILD_PGID" = "$child" ] || RUN_CHILD_PGID=""
+
+    # Publish the group, so that a run which is KILLED -- and therefore never
+    # runs a trap, never reaps its tree, and leaves the lock anchored to a
+    # dead pid -- still declares the box busy for as long as its children
+    # hold cores. See orphan_group_pids.
+    #
+    # An append, not a publish_lock field: the lock is taken before the child
+    # exists, so the group is not knowable at publish time. Safe because
+    # `meta_get` is first-match-wins and nothing else ever writes this key, so
+    # this cannot shadow or forge an earlier field; and a reader that catches
+    # the append mid-write simply fails to match, falling back to anchor-only
+    # liveness, which is the behaviour that existed before this line.
+    if [ -n "$RUN_CHILD_PGID" ] && [ -d "$LOCK_DIR" ]; then
+        printf 'child_pgid=%s\n' "$RUN_CHILD_PGID" >>"$META" 2>/dev/null || true
+    fi
 
     # Baseline the child-CPU counter as late as possible: it accumulates only
     # when a child is REAPED, so every fork above (the start-time read, the
@@ -1731,6 +2781,17 @@ cmd_run() {
     cpu1=$CPU_TICKS
     wall1=$(wall_now)
     trap - INT TERM HUP
+    # A command that returned is not the same as a host that is quiet: it can
+    # leave a background grandchild behind, and the next line declares the box
+    # free. Report that rather than releasing over it in silence. Deliberately
+    # a warning and not a kill -- on this path the command RETURNED rather
+    # than being signalled (at any exit status; this is not gated on rc), so
+    # whatever it left behind it left deliberately, and stopping it would be
+    # this script overruling that. On the SIGNAL path the run is being aborted
+    # and stop_wrapped_tree does kill, which is the opposite situation.
+    if [ -n "$RUN_CHILD_PGID" ] && target_alive "-$RUN_CHILD_PGID"; then
+        echo "hostlock: WARNING the command exited but left its process group (${RUN_CHILD_PGID}) running: $(live_under "-$RUN_CHILD_PGID"). Releasing anyway; the host is not necessarily idle." >&2
+    fi
     remove_lock_if_mine
     echo "hostlock: released (command exit ${rc})"
     # A failing command's own status always wins: it is the more important
@@ -1753,14 +2814,34 @@ cmd_run() {
 # read as `mine:` to every other agent. That is the flattering error, and the
 # naive one-line export puts it on the DEFAULT path -- which is why the
 # default is recorded here as undeclared and never exported.
+#
+# OWNER_SOURCE says HOW the name was arrived at, which is a different question
+# from whether it was declared and the one that actually decides whether a name
+# can be trusted. `--owner` is somebody typing their name. `$HOSTLOCK_OWNER` is
+# an INHERITED environment variable, and `run` deliberately exports it (see
+# OWNER_DECLARED above) so a nested harness coordinates under one name. The
+# cost of that export is that any LATER, unrelated process in the same
+# environment silently adopts the exporter's name -- a real occurrence, not a
+# hypothetical: two archived benchmark datasets are stamped `held_by=roy` while
+# their `worktree` and `cmd` fields, both read from the kernel, name a
+# different agent entirely. Nothing in the row flagged the contradiction,
+# because `declared=yes` is true of both cases and `held_uid` agrees with
+# either -- every agent on this box shares one account, so the uid corroborates
+# a wrong name exactly as readily as a right one.
 OWNER_DECLARED=0
+OWNER_SOURCE="user"
 if [ -n "${HOSTLOCK_OWNER:-}" ]; then
     OWNER_DECLARED=1
+    OWNER_SOURCE="env"
 fi
 OWNER="${HOSTLOCK_OWNER:-${USER:-unknown}}"
 REASON="${HOSTLOCK_REASON:-}"
 DO_WAIT=0
 TIMEOUT=3600
+# Distinguishes "the caller asked for this bound" from the default, so the
+# guard below can refuse an inert `--timeout` without also refusing every
+# subcommand that merely inherits 3600.
+TIMEOUT_GIVEN=""
 GATE=""
 GATE_TIMEOUT=900
 TTL=""
@@ -1772,6 +2853,7 @@ TAKEOVER=none
 EXPECT_RUNNABLE=""
 ONELINE=0
 RUN_CHILD_START=""
+RUN_CHILD_PGID=""
 EXPECT_CORES=""
 MIN_EFFICIENCY=""
 CPU_TICKS=""
@@ -1841,9 +2923,16 @@ require_ufloat() {
 require_name() {
     case "$2" in
         '') die "$1 requires a non-empty name" ;;
-        *[!A-Za-z0-9_.-]*)
-            die "$1 takes a name of letters, digits, '_', '.' or '-' only, got: '$2' -- it is published in the provenance row as space-separated key=value pairs, where anything else can overwrite the fields that disclose whether the box is claimed" ;;
     esac
+    name_is_safe "$2" ||
+        die "$1 takes a name of letters, digits, '_', '.' or '-' only, got: '$2' -- it is published in the provenance row as space-separated key=value pairs, where anything else can overwrite the fields that disclose whether the box is claimed"
+    # Refused rather than shortened, and the reason is the bug this family of
+    # guards exists for: a silently kept prefix presented as the whole value
+    # is how `sebastian helper` became `sebastian`. Length is bounded here so
+    # a name cannot push the fields after it out of the readable part of a
+    # row; a name that trips 64 characters is a mistake worth being told about.
+    [ "${#2}" -le "$HL_MAX_NAME" ] ||
+        die "$1 takes a name of at most ${HL_MAX_NAME} characters, got ${#2}"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -1861,6 +2950,7 @@ while [ "$#" -gt 0 ]; do
             OWNER=${2:-}
             require_name "$1" "$OWNER"
             OWNER_DECLARED=1
+            OWNER_SOURCE="flag"
             shift 2
             ;;
         --wait)
@@ -1870,6 +2960,7 @@ while [ "$#" -gt 0 ]; do
         --timeout)
             TIMEOUT=$2
             require_uint "$1" "$TIMEOUT"
+            TIMEOUT_GIVEN=1
             shift 2
             ;;
         --gate)
@@ -1987,6 +3078,34 @@ else
     # environment variable, where every setting produced identical placement.
     if [ -n "$EXPECT_CORES" ] || [ -n "$MIN_EFFICIENCY" ]; then
         die "--expect-cores/--min-efficiency apply to \`run\` only; ${SUB} has no command to measure"
+    fi
+    # `--timeout` is read from exactly two places, and both are wait loops:
+    # `cmd_wait`'s own, and `cmd_acquire`'s deadline check, which sits *after*
+    # the `DO_WAIT != 1` early return and so is unreachable without `--wait`
+    # (`run` needs no flag -- it sets DO_WAIT itself). For every other form the
+    # value is parsed, range-checked by require_uint, and never compared:
+    # `acquire --timeout 1800` returns BUSY immediately while its caller
+    # believes it waited half an hour. Refused for the same reason as the two
+    # knobs above, and stated by the same comment -- accepting it silently is
+    # how a knob comes to be believed in while being inert (#2109).
+    #
+    # The exemption is `acquire --wait`, not `--wait`. `--wait` sets DO_WAIT for
+    # whatever subcommand it is passed to, but only `cmd_acquire` reads it, so
+    # `status --wait` is itself inert. Keying off DO_WAIT alone would let
+    # `status --wait --timeout 10` launder an inert bound past the guard by
+    # pairing it with a second inert flag -- catching the bare form and missing
+    # that one would leave the defect exactly where it started.
+    if [ -n "$TIMEOUT_GIVEN" ] && [ "$SUB" != wait ] &&
+       ! { [ "$SUB" = acquire ] && [ "$DO_WAIT" = 1 ]; }; then
+        if [ "$SUB" = acquire ]; then
+            die "--timeout is inert here: acquire without --wait never enters a wait loop, so the bound would be parsed and ignored.
+       Use \`acquire --wait --timeout ${TIMEOUT}\` to actually wait, \`wait --timeout ${TIMEOUT}\` to block without taking the lock, or drop --timeout to fail fast."
+        fi
+        # Every other subcommand returns without looping at all, so there is no
+        # form of it that would honour the bound -- naming `--wait` here would
+        # just be advice to pass a second flag that is equally inert.
+        die "--timeout is inert here: \`${SUB}\` never enters a wait loop, so the bound would be parsed and ignored.
+       Only \`wait\`, \`run\`, and \`acquire --wait\` consult it; drop --timeout from this invocation."
     fi
     : "${ANCHOR_PID:=$PPID}"
     : "${TTL:=3600}"

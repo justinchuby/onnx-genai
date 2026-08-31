@@ -4171,42 +4171,36 @@ impl DecodeCudaState {
     /// The largest sequence length the device could *ever* hold is
     /// `device_free / bytes_per_token`, so reserve exactly that. On the VMM
     /// path the reservation is **virtual-only** — physical pages are committed
-    /// on demand out of a fixed 64 GiB address arena — so an over-large but
-    /// finite bound is nearly free, and a decode that outgrows it still fails
-    /// at the same physical ceiling the sentinel implied. This resolves the
-    /// bound *only here, only for the VMM reservation*; `capacity.max_len` and
-    /// the non-VMM path that relies on the sentinel are left untouched.
+    /// on demand out of the provider's VMM arena. That arena requests
+    /// `max(16 * total_vram, 1 TiB)` and halves failed reservations down to a
+    /// 64 GiB minimum; it is not a fixed 64 GiB allocation. An over-large but
+    /// finite KV bound therefore consumes address space, not VRAM, and a decode
+    /// that outgrows physical memory still fails at the physical ceiling the
+    /// sentinel implied. This resolves the bound *only here, only for the VMM
+    /// reservation*; `capacity.max_len` and the non-VMM path that relies on the
+    /// sentinel are left untouched.
     ///
     /// Requires a device free-memory reading. Without one the VMM path has no
     /// bound to reserve, so this errors with actionable guidance rather than
     /// overflowing or silently guessing a bound.
     fn vmm_unbounded_reservation_len(capacity: &CudaKvCapacity) -> anyhow::Result<usize> {
-        // CEILING / KNOWN LIMITATION (tracked in issue #1288):
         // For a metadata-less model on the VMM path we reserve up-front virtual
         // address space for `free_bytes / bytes_per_token` tokens. Adding the
-        // per-token mask (8 B/token on top of bytes_per_token) makes the total
-        // carved span ~1.2x device_free. All EP device allocations — decoder
-        // WEIGHTS, KV, and decode SCRATCH — carve from the SAME single VMM arena
-        // of RESERVATION_BYTES = 64 << 30 (see onnx-runtime-ep-cuda provider
-        // `memory()`), and the reservation is virtual-only (only committed
-        // ranges claim physical granules). Measured: loading qwen05b-q4 with VMM
-        // already occupies ~440 MiB across 517 spans in that arena before any KV
-        // reservation. Consequence: on a GPU with ~53 GiB or more free VRAM this
-        // carve can exceed the free virtual span and fail LOUDLY at construction.
-        // That regime is untestable on the RTX 4060 (8 GB) this was developed on,
-        // so we deliberately do NOT clamp here. A correct clamp would need (a) a
-        // public free-VA accessor on the VMM allocator (none exists today; the
-        // free `Spans` are not exposed and `committed_and_reserved()` returns
-        // physical-committed + capacity, not free VA) and (b) a decode-scratch
-        // margin policy, because scratch shares the same arena and an over-tight
-        // clamp would fail later at scratch-carve time instead of loudly here.
+        // per-token mask (8 B/token on top of bytes_per_token) makes the carved
+        // span ~1.2x device_free. Decoder weights, KV, and scratch share the
+        // provider arena, whose accepted reservation comes from the descending
+        // 16x-VRAM/1-TiB policy. Only mapped granules consume physical memory.
+        // We deliberately do not clamp to a guessed fixed arena size here: if a
+        // platform accepts only a smaller rung and the carve does not fit, the
+        // VMM allocator reports the actual virtual-space exhaustion.
         let device_memory = capacity.device_memory.as_ref().with_context(|| {
             format!(
                 "cannot size the VMM-backed CUDA KV reservation for a model with no \
                  max_sequence_length metadata ({}): the device free-memory query is \
                  unavailable, so there is no bound to reserve up front. Set \
                  ONNX_GENAI_CUDA_KV_MAX_LEN or load_with_cuda_kv_max_len to a concrete \
-                 length, or run without ONNX_GENAI_CUDA_VMM to use the grow-on-demand path.",
+                 length. VMM is the CUDA provider's sole built-in allocator, so there is \
+                 no allocator-selection flag to disable.",
                 capacity.source
             )
         })?;
@@ -5268,6 +5262,49 @@ impl DecodeCudaState {
             .get(row)
             .copied()
             .with_context(|| format!("native CUDA row_len {row} out of range"))
+    }
+
+    pub(crate) fn row_is_active(&self, row: usize) -> anyhow::Result<bool> {
+        self.row_active
+            .get(row)
+            .copied()
+            .with_context(|| format!("native CUDA row activity {row} out of range"))
+    }
+
+    /// Whether every mutable batch-row participant can be restored
+    /// independently. Fixed recurrent/convolution bindings are currently
+    /// shared device allocations without a row-slice snapshot seam, so they
+    /// must decline before a row is admitted.
+    pub(crate) fn supports_row_transactions(&self) -> bool {
+        self.fixed_state_binding_range.is_empty()
+    }
+
+    /// Restore one row's cursor, attention visibility, and activity without
+    /// changing any sibling row.
+    pub(crate) fn restore_row(
+        &mut self,
+        row: usize,
+        target_len: usize,
+        active: bool,
+    ) -> anyhow::Result<()> {
+        let current_len = self.row_len(row)?;
+        if target_len > current_len {
+            bail!(
+                "cannot restore native CUDA row {row} from length {current_len} forward to \
+                 baseline length {target_len}"
+            );
+        }
+        if target_len < current_len {
+            let word = std::mem::size_of::<i64>();
+            let row_stride = self.max_len * word;
+            let zeros = vec![0u8; (current_len - target_len) * word];
+            self.bindings[0].write_bytes(row * row_stride + target_len * word, &zeros)?;
+        }
+        self.row_lens[row] = target_len;
+        self.row_active[row] = active;
+        let logical_len = self.row_lens.iter().copied().max().unwrap_or_default();
+        self.bindings[0].set_logical_shape(vec![self.batch, logical_len])?;
+        self.set_logical_len(logical_len)
     }
 
     /// Read the current `[batch, 1, vocab]` logits binding back to the host as

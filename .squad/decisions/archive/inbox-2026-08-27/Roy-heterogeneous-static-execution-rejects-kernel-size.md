@@ -1,0 +1,6 @@
+### 2026-08-26T05-11-35: Heterogeneous static execution rejects kernel-sized outputs and classifies source outputs
+**By:** Roy
+**What:** Heterogeneous static execution rejects kernel-sized outputs and classifies source outputs
+**References:** branch fix/hetero-dynamic-kernel-and-initializer-output, Gaff final audit findings 1 and 2
+**Why:** WHAT: The opt-in heterogeneous static tensor-DAG executor rejects every assigned kernel whose Kernel capability reports kernel-sized outputs, regardless of HostOwned or DeviceWorkspace policy. Producer-less values are exhaustively classified as external graph inputs or initializers; initializer graph outputs resolve canonical WeightStore bytes into the same governed host-output policy as produced outputs, while unknown sources fail loudly. WHY: Declared static extents are not proof of runtime cardinality for Unique/NMS, and treating every producer-less output as external loses initializer outputs. The generic capability/source classifications avoid op-name special cases, preserve single-EP behavior, and keep transfer accounting honest.
+<!-- Archived from the durable decision inbox by Scribe on 2026-08-27; original inbox content above is unchanged. -->

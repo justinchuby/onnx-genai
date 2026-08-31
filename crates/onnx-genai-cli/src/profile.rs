@@ -1016,7 +1016,7 @@ impl RunProfile {
                 if arena.reserved_bytes == 0 && arena.commits == 0 {
                     let _ = writeln!(
                         out,
-                        "{:<24} not installed (set ONNX_GENAI_CUDA_VMM=1)",
+                        "{:<24} not initialized (load a native CUDA model/session; VMM is always on)",
                         "vmm arena"
                     );
                 } else {

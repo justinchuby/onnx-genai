@@ -256,6 +256,55 @@ fn e8m0_scaling_and_reserved_reject() {
     assert!(dequantize_planar_kn(&layout, &packed, &[0xffu8; 1]).is_err());
 }
 
+#[test]
+fn value_admission_rejects_exact_reserved_and_overflow_boundaries() {
+    let fp8 = PlanarLayout::new(PlanarBlockFormat::BlockFp8, 1, 1, 1, 1).unwrap();
+    for reserved in [0x7fu8, 0xff] {
+        let err = validate_planar_values(&fp8, &[reserved], &[127])
+            .expect_err("both E4M3FN reserved codes must fail admission");
+        assert!(err.to_string().contains("reserved E4M3"));
+    }
+    let err = validate_planar_values(&fp8, &[0x38], &[0xff])
+        .expect_err("reserved UE8M0 must fail block_fp8 admission");
+    assert!(err.to_string().contains("reserved E8M0"));
+
+    // max finite E4M3FN (448): exponent 246 remains finite, 247 overflows f32.
+    validate_planar_values(&fp8, &[0x7e], &[246]).unwrap();
+    let err = validate_planar_values(&fp8, &[0x7e], &[247])
+        .expect_err("finite E4M3FN times a large finite UE8M0 scale must fail closed");
+    assert!(err.to_string().contains("overflows"));
+
+    let fp4 = PlanarLayout::new(PlanarBlockFormat::Fp4Planar, 1, 32, 1, 32).unwrap();
+    let max_e2m1 = [0x77u8; 16];
+    let err = validate_planar_values(&fp4, &max_e2m1, &[0xff])
+        .expect_err("reserved UE8M0 must fail fp4_planar admission");
+    assert!(err.to_string().contains("reserved E8M0"));
+
+    // max E2M1 (6): exponent 252 remains finite, 253 overflows f32.
+    validate_planar_values(&fp4, &max_e2m1, &[252]).unwrap();
+    let err = validate_planar_values(&fp4, &max_e2m1, &[253])
+        .expect_err("finite E2M1 times a large finite UE8M0 scale must fail closed");
+    assert!(err.to_string().contains("overflows"));
+}
+
+#[test]
+fn admitted_bank_identity_is_stable_and_expert_failures_are_named() {
+    let layout = PlanarLayout::new(PlanarBlockFormat::BlockFp8, 1, 2, 1, 2).unwrap();
+    let packed = [0x38u8, 0x40];
+    let scale = [127u8];
+    let first = validate_planar_values(&layout, &packed, &scale).unwrap();
+    let second = validate_planar_values(&layout, &packed, &scale).unwrap();
+    assert_eq!(first, second);
+    assert_ne!(first.get(), 0);
+
+    let mut packed_bank = packed.repeat(2);
+    let scale_bank = scale.repeat(2);
+    packed_bank[2] = 0x7f;
+    let err = validate_planar_expert_bank_values(&layout, 2, &packed_bank, &scale_bank)
+        .expect_err("a malformed second expert must reject the whole immutable bank");
+    assert!(err.to_string().contains("expert 1"));
+}
+
 // ---------------------------------------------------------------------------
 // Layout geometry (shape-faithful tiny DeepSeek dims)
 // ---------------------------------------------------------------------------

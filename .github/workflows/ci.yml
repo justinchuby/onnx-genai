@@ -81,14 +81,27 @@ jobs:
           # Only an explicit, fully-classified all-docs diff flips it to true.
           docs_only=false
 
+          # Use and test the same predicate that classifies the real diff. A
+          # broken/missing classifier cannot abort this job and make dependent
+          # required checks skip: it marks the instrument unhealthy below,
+          # which forces full CI.
+          scope_classifier_ok=false
+          if [ -r .github/scripts/ci_change_scope.sh ] \
+            && . .github/scripts/ci_change_scope.sh \
+            && ci_change_scope_self_test; then
+            scope_classifier_ok=true
+          else
+            echo "change-scope classifier missing or failed its self-test"
+          fi
+
           # A file whose bytes are compiled into an artifact is source, whatever
           # its extension. `include_str!`/`include_bytes!` make a markdown file
           # part of the build, so a docs-only edit to one can break `cargo test`
           # while classifying as docs and skipping the very checks that would
           # catch it (#2077: renaming an HTML comment marker in
-          # docs/genai/INFERENCE_METADATA_DECISIONS.md panics
-          # capability_catalogue.rs, and dropping a table row fails its
-          # assert_eq -- both are pure markdown edits).
+          # docs/genai/METADATA_EXTENSION_REGISTRY.md makes
+          # extension_registry.rs fail its exact generated-content check --
+          # both are pure markdown edits).
           #
           # Derived by scanning rather than listed, so it cannot go stale when a
           # third embed is added (Rule 10). The scan is whole-file, not
@@ -128,7 +141,7 @@ jobs:
 
           # A scan that found nothing and a scan that cannot find anything are
           # the same two lines of log. If the regex, the pathspec or perl ever
-          # stops matching, `embedded` is empty, is_docs_path never blocks, and
+          # stops matching, `embedded` is empty, ci_is_docs_path never blocks, and
           # this guard is inert -- reopening #2077 behind a green run. So report
           # the count, and treat zero as a broken instrument rather than as an
           # answer: this repo has 149 such targets and cannot legitimately
@@ -143,20 +156,6 @@ jobs:
             echo "embed scan resolved no targets; the scan itself is broken"
             embed_scan_ok=false
           fi
-
-          is_docs_path() {
-            case "$1" in
-              docs/*|wiki/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
-                ;;
-              *)
-                return 1 ;;
-            esac
-            # Compiled into an artifact => source, not docs.
-            if [ -n "$embedded" ] && printf '%s\n' "$embedded" | grep -qxF -- "$1"; then
-              return 1
-            fi
-            return 0
-          }
 
           files=""
           case "$EVENT_NAME" in
@@ -184,14 +183,14 @@ jobs:
               ;;
           esac
 
-          if [ "$embed_scan_ok" != true ]; then
-            echo "embedded-file scan failed; classifying as code (fail closed)"
+          if [ "$embed_scan_ok" != true ] || [ "$scope_classifier_ok" != true ]; then
+            echo "change-scope instrument failed; classifying as code (fail closed)"
             docs_only=false
           elif [ -n "$files" ]; then
             docs_only=true
             while IFS= read -r f; do
               [ -z "$f" ] && continue
-              if ! is_docs_path "$f"; then
+              if ! ci_is_docs_path "$f" "$embedded"; then
                 docs_only=false
                 break
               fi
@@ -224,6 +223,14 @@ jobs:
       # Deliberately unset elsewhere, so a contributor inside a 1-core container
       # still gets a stated skip instead of a red suite.
       NXRT_REQUIRE_PLACEMENT_TESTS: "1"
+      # Same asymmetry, for `kernels::matmul::x86_sgemm`'s AVX2 differential
+      # tests. Eleven of them opened with a bare `if !has_simd_x86() { return; }`
+      # -- a silent pass -- so a lane that lost AVX2, or anything setting
+      # `ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86=1`, turned all eleven into green
+      # no-ops at once, including the sole remaining falsifier for #1809's int4
+      # packing change. This lane is x86_64, so their silence is a defect here
+      # rather than a fact about somebody's laptop. See #1817.
+      NXRT_REQUIRE_SIMD_X86_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v5
@@ -321,15 +328,50 @@ jobs:
         run: >-
           cargo build --locked
           -p onnx-genai-bench --features bench-native --bin profile_native
+      # The broad offline package run below includes this target, but a
+      # dedicated guarded step keeps the repository-wide fixture census visible
+      # in a required check and refuses a zero-test target. The guard checks a
+      # positive textproto floor plus sentinels rooted in unrelated fixture
+      # trees, as well as the zero-binary invariant.
+      - name: Verify checked-in ONNX fixture census
+        shell: bash
+        run: |
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
+          run_test_step "checked-in ONNX fixture census" \
+            cargo test --locked \
+            -p onnx-genai-metadata \
+            --test textproto_fixtures
+      # The package set is resolved into a variable before use, never
+      # substituted inline. As `cargo test $(resolver ...)` a resolver failure
+      # expands to nothing and leaves a bare `cargo test`, which exits 0 having
+      # tested cargo's `default-members` instead of this lane's set -- for this
+      # lane that silently drops 14 crates (the whole plugin/ABI surface) and
+      # pulls in `onnx-genai-ort-sys`, which the DENYLIST exists to keep out.
+      # The assignment makes a non-zero resolver exit fail the step under
+      # `set -e`; the `test -n` covers a resolver that succeeds but prints
+      # nothing. `verify` cannot catch this: it never reads this file, so a
+      # lane name here that the resolver does not know stays invisible to it.
+      # `shell: bash` is required, not cosmetic: these steps also run on the
+      # Windows lanes, where the default shell is pwsh, and `set -e` plus
+      # `test -n` are bash semantics. The inline form happened to work under
+      # both shells only because the resolver prints one token per line, which
+      # pwsh splats as an argument array -- an accident, not a contract. The
+      # resolver forces LF separators for the same reason: pwsh strips CRLF
+      # when it splits native output, bash does not, and a trailing "\r" on
+      # each token reaches cargo as part of the package name.
       - name: Test Linux offline crates
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages
       - name: Clippy Linux offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          $(python .github/scripts/workspace_test_packages.py cargo-args lint)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args lint)"
+          test -n "$packages" || { echo "::error::lane 'lint' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets $packages -- -D warnings
 
   rust-quality:
     name: Rust quality
@@ -383,10 +425,35 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
 
+      # Every cheap gate from here down is guarded with `!cancelled()` rather
+      # than the implicit `success()`, for the reason #2170 gave for the CUDA
+      # lane: one failing step otherwise silences every later one, and this job
+      # runs twenty independent gates in a row. An unformatted tree -- ten
+      # seconds of work -- currently hides the other nineteen, so a tree that
+      # breaks formatting AND the dispatch manifest AND the promotion guard
+      # reports one of the three, and each fix costs another queue wait to
+      # discover the next. Serialising N independent failures into N round
+      # trips is the expensive part: the queue has been measured at ~2h, while
+      # this whole job is 13-19min.
+      #
+      # Deliberately NOT applied to the cargo steps below (clippy, the MLAS
+      # feature gates, the compile checks, the cross-target pass). Those are
+      # the minutes in this job, and running all of them after an unrelated
+      # ten-second failure would turn every trivial red into a full-length
+      # one -- which is a real cost when the queue is deep, and the reason
+      # this is not a blanket port of #2170. The twenty steps guarded here are
+      # hermetic shell/python checks plus `cargo fmt`; none of them compile
+      # anything, so unmasking them is worth seconds, not minutes.
+      #
+      # The aarch64 install and the cross-target check that consumes it stay
+      # chained on purpose: the second cannot say anything useful if the first
+      # did not run.
+      #
       # Blocking, like the clippy gate below. The sweep this exception was
       # waiting on has landed, so an unformatted tree is now a failure rather
       # than a note nobody reads.
       - name: Check formatting
+        if: ${{ !cancelled() }}
         run: cargo fmt --all -- --check
 
       # A release publishes crates one at a time against crates.io, so one
@@ -394,9 +461,11 @@ jobs:
       # the registry half-updated. Cheap to check here; expensive to discover
       # during a release.
       - name: Check publish order
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_publish_order.py
 
       - name: Verify workspace test package coverage
+        if: ${{ !cancelled() }}
         run: python .github/scripts/workspace_test_packages.py verify
 
       # `verify` above answers "is every crate in *some* lane", which stayed
@@ -405,7 +474,21 @@ jobs:
       # status check run them. #1982 put a failing `shape_dispatch_gate` on
       # `main` with both required checks green; #2015 is the general case.
       - name: Verify every workspace crate is tested by a required lane
+        if: ${{ !cancelled() }}
         run: python .github/scripts/workspace_test_packages.py verify-required-tier
+
+      # Both gates above read `ci.yml` and nothing else, so the stray-key rule
+      # that refuses a job nested one level too far never looked at the other
+      # 23 workflow files. Measured on `diff-guard.yml`: nesting `root-files`
+      # two spaces deeper is valid YAML, drops the root allowlist from what
+      # GitHub runs, and `verify`, `verify-required-tier` and `self-test` all
+      # returned 0. `ci.yml` escapes that only because branch protection blocks
+      # on a missing required check, and a file with no required job in it has
+      # no such backstop. Scope and host are separate choices: this reads every
+      # workflow file, from a job the ruleset requires. See #2206.
+      - name: Verify every workflow still defines the jobs it is recorded as defining
+        if: ${{ !cancelled() }}
+        run: python .github/scripts/workspace_test_packages.py verify-workflow-integrity
 
       # Both gates above are the kind that pass by seeing nothing, so each one
       # is asked to fail on demand and is judged on what it *names*, not on its
@@ -415,39 +498,49 @@ jobs:
       # that -- it reported both gates as refusing while neither had run.
       # `--simulate-missing` had shipped with no caller since it was written.
       - name: Workspace test package gates can still detect (self-test)
+        if: ${{ !cancelled() }}
         run: python .github/scripts/workspace_test_packages.py self-test
 
       - name: Check the profile table matches the samples
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_profile_table.py
 
       - name: Check platform-specific kernel files are named accordingly
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_platform_naming.py
 
       - name: Check dispatch branches have reachability tests
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_dispatch_reachability.py
 
       - name: Check dispatch manifest lint can still detect (self-test)
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_dispatch_manifest.py --self-test
 
       - name: Check dispatch manifest claims have proving counters
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_dispatch_manifest.py
 
       # Commands written into scripts and runbooks are never executed, so a
       # renamed feature or a deleted binary rots there indefinitely and only
       # surfaces when someone copies the line and blames their environment.
       - name: Check documented command lint can still detect (self-test)
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_documented_commands.py --self-test
 
       - name: Check documented cargo commands still resolve
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_documented_commands.py
 
       - name: Check feature-gated fast paths have fallback coverage
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_feature_gate_coverage.py
 
       # A documented environment variable that nothing parses produces no error
       # and no effect, so the mistake survives indefinitely. `device_policy`
       # went months that way (#678). This makes the gap a CI failure.
       - name: Check documented environment variables are implemented
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/verify_documented_env_vars.py
 
       # A `#[test]` added to a CUDA target without an ignore runs on every
@@ -468,10 +561,16 @@ jobs:
       # manifest `required-features`) deletes the test from the base-config
       # inventory, so the lane is green because the tests are not there. #1927
       # lost thirteen that way and nothing reported it.
+      #
+      # The same source scan also pins the resource-sensitive MHA/DFT/STFT
+      # targets: every test must acquire its target-local process mutex before
+      # constructing an EP or reading process-global telemetry.
       - name: Check CUDA test source scan can still detect (self-test)
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/verify_cuda_test_honesty.py --self-test
 
-      - name: Check CUDA tests are ignored, not deleted by a cfg
+      - name: Check CUDA test source contracts
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/verify_cuda_test_honesty.py --source-scan
 
       # Rust warnings are errors: clippy is blocking for every crate CI tests.
@@ -491,10 +590,11 @@ jobs:
       # mlas-sys is also checked by the Windows ARM64 job so MSVC/native
       # build-script regressions do not hide behind the Linux quality lane.
       - name: Run clippy on all offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          $(python .github/scripts/workspace_test_packages.py cargo-args lint)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args lint)"
+          test -n "$packages" || { echo "::error::lane 'lint' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets $packages -- -D warnings
 
       # Wrapped in `run_test_step` because the selector is a bare test NAME,
       # which libtest does not police: an exact-name filter that matches nothing
@@ -573,21 +673,26 @@ jobs:
       # so a precondition that started rejecting correct trees fails here
       # instead of on every developer's box. #1816.
       - name: Cross-compile gate preconditions (self-test)
+        if: ${{ !cancelled() }}
         run: |
           shellcheck scripts/check_cross_compile.sh scripts/check_cross_compile_test.sh
           bash scripts/check_cross_compile_test.sh
       - name: Cross-target compile check (catches os- and arch-gating errors)
         run: bash scripts/check_cross_compile.sh
 
-      # The merge gate is the one script whose failure mode is a green report:
-      # if it ever treats an absent required check as a passing one, nothing
-      # downstream notices, because the evidence it was supposed to collect is
-      # exactly what is missing. Its suite is hermetic (`gh` is shimmed), so it
-      # costs a second here and refuses to merge anything. #1966.
-      - name: Merge gate can still refuse (self-test)
+      # Same shape one branch further out: the promotion workflow strips the
+      # team-only paths on the way to the release branch, and both the strip and
+      # the check that backstops it used to end in `|| true`. A failed
+      # `git ls-files` produced an empty match set, which the consumer read as
+      # "no forbidden files" and promoted. The suite is hermetic (`git` is
+      # shimmed) and every arm is differential -- it runs the pre-fix shape too
+      # and requires it to pass what the fixed shape fails, so the day it stops
+      # discriminating it says so rather than going quiet.
+      - name: Promotion guards fail closed (self-test)
+        if: ${{ !cancelled() }}
         run: |
-          shellcheck scripts/merge_when_green.sh scripts/merge_when_green_test.sh
-          bash scripts/merge_when_green_test.sh
+          shellcheck scripts/squad_promote_guard.sh scripts/squad_promote_guard_test.sh
+          bash scripts/squad_promote_guard_test.sh
 
       # The Miri lane and the three MLAS steps above select tests by name, and
       # libtest exits 0 on a filter that matches nothing -- so a renamed test
@@ -598,6 +703,7 @@ jobs:
       # rather than in miri.yml so it is covered by a required lane instead of
       # by the lane it guards.
       - name: Test step wrapper still refuses an empty filter (self-test)
+        if: ${{ !cancelled() }}
         run: |
           shellcheck scripts/test_step.sh scripts/test_step_test.sh
           bash scripts/test_step_test.sh
@@ -675,10 +781,11 @@ jobs:
       - name: Test ORT-backed workspace crates
         env:
           NXRT_REQUIRE_ORT_TESTS: "1"
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
-          -- --test-threads=1
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)"
+          test -n "$packages" || { echo "::error::lane 'ort-backed' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages -- --test-threads=1
 
       # No shipped artifact links MLAS: the wheel builds it only when someone
       # opts in with NXRT_EP_CPU_RESEARCH_MLAS=1 on one of the platforms in
@@ -793,9 +900,11 @@ jobs:
         run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
 
       - name: Test cross-platform offline crates with coverage
-        run: >-
-          cargo llvm-cov --locked --codecov --output-path codecov-offline.json
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
+          test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
+          cargo llvm-cov --locked --codecov --output-path codecov-offline.json $packages
       - name: Upload offline coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
@@ -808,9 +917,11 @@ jobs:
       # validates that the native build script stays MSVC-compatible.
       - name: Test Linux-only offline crates with coverage
         if: runner.os == 'Linux'
-        run: >-
-          cargo llvm-cov --locked --codecov --output-path codecov-mlas.json
-          $(python .github/scripts/workspace_test_packages.py cargo-args linux-only)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args linux-only)"
+          test -n "$packages" || { echo "::error::lane 'linux-only' resolved to an empty package set"; exit 1; }
+          cargo llvm-cov --locked --codecov --output-path codecov-mlas.json $packages
       - name: Upload MLAS coverage to Codecov
         if: always() && runner.os == 'Linux'
         uses: codecov/codecov-action@v4
@@ -887,15 +998,17 @@ jobs:
       # offline crates is already reported by x64/macOS lanes, and ARM64
       # instrumentation owned the critical path.
       - name: Test cross-platform offline crates
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
+          test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages
       - name: Clippy Windows ARM64 offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          --target aarch64-pc-windows-msvc
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets --target aarch64-pc-windows-msvc $packages -- -D warnings
 
   ep-conformance:
     name: EP conformance (Linux x86_64)
@@ -1094,10 +1207,11 @@ jobs:
       # remains the only place these tests run on Windows and stays here.
       - name: Test ORT-backed workspace crates
         if: runner.os == 'Windows'
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
-          -- --test-threads=1
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)"
+          test -n "$packages" || { echo "::error::lane 'ort-backed' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages -- --test-threads=1
       - name: Execute checked-in Mobius workflow packages
         env:
           MOBIUS_WORKFLOW_CONFORMANCE_DIR: ${{ github.workspace }}/tests/fixtures/onnx_genai_workflows
@@ -1228,9 +1342,11 @@ jobs:
       # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit.
       # The CUDA integration tests are compiled and reported as ignored unless
       # the `gpu-tests` feature is enabled on a real CUDA runner. ORT-linked
-      # crates stay out of portable tests because onnx-genai-ort-sys downloads
-      # native ORT; onnx-runtime-python's feature check here provides compile
-      # coverage for that integration path.
+      # crates stay out of portable execution because onnx-genai-ort-sys
+      # downloads native ORT; the inventory step below deliberately pays that
+      # setup cost to compile (but not execute) the CUDA plugin E2E target.
+      # onnx-runtime-python's feature check here provides compile coverage for
+      # that integration path.
       - name: Check CUDA execution provider and Python feature
         run: >-
           cargo check --locked
@@ -1238,7 +1354,29 @@ jobs:
           -p onnx-runtime-python
           --features onnx-runtime-python/cuda
 
-      - name: Verify CUDA test inventory and skip honesty
+      # Every step from here down is guarded with `!cancelled()` rather than the
+      # implicit `success()`, because none of them depends on the step above for
+      # anything but a warm build cache -- and each is, per its own comment, the
+      # *only* place its gate runs. Under the implicit `success()` a compile
+      # error in one crate silently switches all seven off: `2d380b722` broke
+      # `onnx-runtime-python` (#2158), which is checked in the step above, and
+      # steps 7-13 of this job reported `skipped` for the next 26 hours. The lane
+      # is named "CUDA compile", so its red tick reads as one compile failure and
+      # gives no hint that seven checks stopped being performed -- there is no
+      # signal to miss. A check ordered behind a failing step is not a weak
+      # check, it is an absent one. Same reasoning as `cli-ort` above.
+      #
+      # The job still fails if any of them fails; this only stops one step's
+      # failure from silencing gates that have nothing to do with it.
+      # Besides the broad EP/memory inventory, this compiles and lists the
+      # exact production targets that had been absent from CI:
+      # onnx-runtime-ep-cuda-plugin/cuda_unique_ort_e2e with `cuda`, and
+      # onnx-runtime-session/hetero_cuda_gpu both without and with `gpu-tests`.
+      # The base hetero inventory is executed only to prove its device test is
+      # ignored; both feature-enabled GPU paths are compile/list-only because
+      # GitHub-hosted runners have no CUDA device.
+      - name: Verify CUDA and production feature test inventories
+        if: ${{ !cancelled() }}
         run: python .github/scripts/verify_cuda_test_honesty.py
 
       # The capture-sync source audit is a static check (it reads kernel sources,
@@ -1246,6 +1384,7 @@ jobs:
       # as a GPU test. Run it explicitly here so a capture-unsafe synchronize()
       # still fails the CPU lane at PR time.
       - name: Audit CUDA kernel capture-sync contract
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test capture_sync_contract
 
       # The int4 MatMulNBits parity oracle self-checks are pure-CPU (no device):
@@ -1254,6 +1393,7 @@ jobs:
       # deliberately does not police this target (it is in ALWAYS_RUN), so run it
       # explicitly here to keep the oracle math exercised on the CPU lane (#1177).
       - name: Verify int4 MatMulNBits numerics oracle
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test matmul_nbits_marlin_oracle
 
       # The safe-point rejection rules are pure predicate logic over
@@ -1263,6 +1403,7 @@ jobs:
       # lane, so without this step the target would be compiled and never run
       # (#1875).
       - name: Verify granule transition safe-point rules
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test content_preserving_transition
 
       # Non-`_gpu` targets in this crate run in no other lane: the honesty
@@ -1271,6 +1412,7 @@ jobs:
       # would compile and never execute, which is the failure they were moved
       # out of `_gpu` targets to avoid.
       - name: Verify expert route telemetry CPU oracle
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test expert_route_telemetry_probe
 
       # `--all-targets` and `gpu-tests` are both load-bearing. Without them
@@ -1285,11 +1427,34 @@ jobs:
       # reused for this crate (its dependency builds are). The Windows CUDA
       # lane deliberately keeps the narrower invocation -- it does not build
       # the gpu-tests binaries at all, so the same change there would be a
-      # full extra build for lints this Linux step already covers.
+      # full extra build for lints the two Linux steps below cover between
+      # them: `cuda,gpu-tests` for the device arms, `cuda` for the shim arms.
       - name: Clippy CUDA execution provider
+        if: ${{ !cancelled() }}
         run: >-
           cargo clippy -p onnx-runtime-ep-cuda
           --all-targets --features cuda,gpu-tests -- -D warnings
+      # Features are additive, so the pass above cannot see this crate's
+      # `#[cfg(not(feature = "gpu-tests"))]` arms -- the shim bodies in
+      # coarse_residency_plan_gpu, content_preserving_transition_gpu,
+      # route_residency_boundary_gpu and route_residency_consume_gpu that stand
+      # in for device work when the feature is off. Until this step existed no
+      # lane compiled them: Linux always enables `gpu-tests`, and Windows omits
+      # `--all-targets`.
+      #
+      # Measured in both directions rather than argued, by injecting a
+      # `useless_format` into the `not(gpu-tests)` arm of
+      # content_preserving_transition_gpu.rs:
+      #   --features cuda           --all-targets  ->  error, rc=101  (caught)
+      #   --features cuda,gpu-tests --all-targets  ->  exit 0         (missed)
+      # So a defect confined to those arms was invisible to every check while
+      # the whole lane stayed green. Added while the configuration was clean,
+      # which is the only time a new gate costs nothing to land.
+      - name: Clippy CUDA execution provider without gpu-tests
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo clippy -p onnx-runtime-ep-cuda
+          --all-targets --features cuda -- -D warnings
       # (it appeared in ci.yml only inside a comment). That left ~167 cfg sites
       # -- native_decode/{mod,load,cuda,tensor}.rs, memory_authority.rs,
       # pipeline/* -- never type-checked, linted, or tested, so a change could
@@ -1302,6 +1467,7 @@ jobs:
       # this caught is invisible to `--lib` alone, because the accessor's only
       # caller lives in a `#[cfg(test)]` module.
       - name: Clippy engine native-CUDA integration
+        if: ${{ !cancelled() }}
         run: >-
           cargo clippy --locked
           -p onnx-genai-engine
@@ -1374,5 +1540,10 @@ jobs:
           -p onnx-runtime-python
           --features onnx-runtime-python/cuda
 
+      # Same isolation as the Linux CUDA lane: this lint has no dependency on
+      # the check above beyond a warm cache, so `onnx-runtime-python` failing to
+      # compile (#2158) must not silently stop `onnx-runtime-ep-cuda` being
+      # linted on Windows as well.
       - name: Clippy CUDA execution provider
+        if: ${{ !cancelled() }}
         run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings

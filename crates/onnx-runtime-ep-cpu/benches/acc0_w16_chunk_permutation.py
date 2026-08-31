@@ -583,12 +583,13 @@ def main():
 
     if not args.binary:
         ap.error("--binary is required unless --replay is given")
+    args.binary = H.resolve_binary(args.binary)
 
     # The whole sweep runs under the advisory host lock, not each launch: a
     # per-launch acquire would release the box between launches and let a
     # competitor land in the middle of a matrix that is only comparable if
     # every arm saw the same machine.
-    with H.HostLock(owner="roy",
+    with H.HostLock(owner=H.bench_owner(),
                     reason=f"acc0 w16 chunk permutation, {args.launches} launches") as lock:
         recs = []
         for launch in range(args.launches):

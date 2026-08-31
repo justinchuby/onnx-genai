@@ -23,6 +23,333 @@ fn native_logical_len(engine: &Engine, id: SessionId) -> Option<usize> {
         .map(|state| state.tokens.len())
 }
 
+/// Commit-only token publication owned by one native decoder turn.
+///
+/// Native decode mutates its KV/session participants before it knows whether
+/// the whole turn will complete. Holding the externally visible payloads here
+/// makes an execution error after any selected token indistinguishable from a
+/// turn that produced no output at all. `flush` consumes the journal, so a
+/// successful turn cannot publish the same token twice through this authority.
+#[cfg(feature = "native-backend")]
+struct CommitOnlyTokenStager {
+    limit: usize,
+    tokens: Vec<crate::config::GenerateToken>,
+}
+
+#[cfg(feature = "native-backend")]
+impl CommitOnlyTokenStager {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            tokens: Vec::new(),
+        }
+    }
+
+    fn stage(&mut self, token: crate::config::GenerateToken) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tokens.len() < self.limit,
+            "atomic native output staging exhausted its {}-token admission after buffering {} \
+             token(s); generation must not publish output beyond its admitted token budget",
+            self.limit,
+            self.tokens.len()
+        );
+        self.tokens
+            .try_reserve(1)
+            .context("failed to reserve the next atomic native output staging entry")?;
+        self.tokens.push(token);
+        Ok(())
+    }
+
+    /// Reject a divergent internal result before the turn commits. The callback
+    /// journal is the exact output the decoder selected, not a reconstruction
+    /// from a later result.
+    fn validate(&self, result: &GenerateResult) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tokens.len() == result.token_ids.len(),
+            "native generation staged {} token event(s), but returned {} token id(s); refusing \
+             to commit divergent output",
+            self.tokens.len(),
+            result.token_ids.len()
+        );
+        for (index, (staged, token_id)) in self.tokens.iter().zip(&result.token_ids).enumerate() {
+            anyhow::ensure!(
+                staged.token_id == *token_id,
+                "native generation staged token {} at output index {index}, but returned token \
+                 {token_id}; refusing to commit divergent output",
+                staged.token_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Deliver a committed, immutable journal in original token order.
+    ///
+    /// A receiver failure here is a post-commit delivery failure, matching the
+    /// decoder-turn contract: it cannot turn an already committed result into
+    /// an abort after any token may have reached its consumer.
+    fn flush(self, callback: Option<&mut GenerateTokenCallback<'_>>) -> anyhow::Result<()> {
+        let Some(callback) = callback else {
+            return Ok(());
+        };
+        for token in self.tokens {
+            callback(token)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "native-backend", any(test, feature = "test-output-staging")))]
+thread_local! {
+    static TEST_NATIVE_OUTPUT_STAGE_LIMIT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "native-backend")]
+fn native_output_stage_limit(admitted_limit: usize) -> usize {
+    #[cfg(any(test, feature = "test-output-staging"))]
+    if let Some(limit) = TEST_NATIVE_OUTPUT_STAGE_LIMIT.with(std::cell::Cell::get) {
+        return limit;
+    }
+    admitted_limit
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+fn with_native_output_stage_limit_for_test<T>(limit: usize, operation: impl FnOnce() -> T) -> T {
+    TEST_NATIVE_OUTPUT_STAGE_LIMIT.with(|stage_limit| {
+        let previous = stage_limit.replace(Some(limit));
+        let output = operation();
+        stage_limit.set(previous);
+        output
+    })
+}
+
+/// Typed baseline for the runtime-owned half of an admitted decoder turn.
+///
+/// Workflow cells use `TurnTransaction` directly. Decoder sessions cannot be
+/// represented as `Value`s: their KV pages, runner bindings, and optional
+/// draft session are owned by the engine. This participant uses the same
+/// transaction/baseline identities and snapshots every one of those owners
+/// before the first mutation.
+pub(crate) struct DecoderTurnParticipant {
+    turn: crate::pipeline::TurnTransaction,
+    tokens: Vec<TokenId>,
+    kv_token_count: usize,
+    sampled_fastpath_failed: bool,
+    speculative_stats: SpeculativeStats,
+    connector_stats: ConnectorStats,
+    decode: crate::decode::DecodeTurnBaseline,
+    draft: Option<DraftTurnParticipant>,
+}
+
+struct DraftTurnParticipant {
+    tokens: Vec<TokenId>,
+    kv_token_count: usize,
+    decode: crate::decode::DecodeTurnBaseline,
+}
+
+impl DecoderTurnParticipant {
+    pub(crate) fn admit(
+        transaction: crate::pipeline::TurnTransactionId,
+        state: &mut EngineSession,
+        speculative_stats: SpeculativeStats,
+        connector_stats: ConnectorStats,
+    ) -> anyhow::Result<Self> {
+        let decode = state
+            .decode_state
+            .snapshot_turn_baseline(state.kv_token_count)
+            .context("cannot admit atomic decoder turn for target state")?;
+        let draft = state
+            .draft
+            .as_mut()
+            .map(|draft| {
+                Ok::<DraftTurnParticipant, anyhow::Error>(DraftTurnParticipant {
+                    tokens: draft.tokens.clone(),
+                    kv_token_count: draft.kv_token_count,
+                    decode: draft
+                        .decode_state
+                        .snapshot_turn_baseline(draft.kv_token_count)
+                        .context("cannot admit atomic decoder turn for draft state")?,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            turn: crate::pipeline::TurnTransaction::admit_runtime_participant(transaction),
+            tokens: state.tokens.clone(),
+            kv_token_count: state.kv_token_count,
+            sampled_fastpath_failed: state.sampled_fastpath_failed,
+            speculative_stats,
+            connector_stats,
+            decode,
+            draft,
+        })
+    }
+
+    pub(crate) fn commit(
+        mut self,
+    ) -> Result<
+        crate::pipeline::TurnTransactionOutcome,
+        crate::pipeline::TurnTransactionResolutionError,
+    > {
+        self.turn.commit_runtime_participant()
+    }
+
+    /// Publish commit-only token output after all decoder participants have
+    /// committed. Callback delivery is deliberately outside the turn: a callback
+    /// error reports a failed delivery of an already committed result, never an
+    /// execution failure that would require retracting an irrevocable publication.
+    fn publish_committed_tokens(
+        tokenizer: &onnx_genai_ort::Tokenizer,
+        result: &GenerateResult,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<()> {
+        let Some(callback) = callback else {
+            return Ok(());
+        };
+        for (index, token_id) in result.token_ids.iter().copied().enumerate() {
+            callback(crate::config::GenerateToken {
+                token_id,
+                text: tokenizer.decode(&[token_id])?,
+                finish_reason: (index + 1 == result.token_ids.len())
+                    .then(|| result.finish_reason.clone()),
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abort(
+        mut self,
+        engine: &mut Engine,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        reason: crate::pipeline::TurnAbortReason,
+    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
+        let session = engine.session.as_deref().context(MISSING_ORT_SESSION)?;
+        crate::kv_bridge::restore_decode_turn_baseline(crate::kv_bridge::DecodeTurnRestore {
+            session,
+            kv_model: engine.kv_model.as_ref(),
+            kv_cache: &mut engine.kv_cache,
+            seq: session_id,
+            tokens: &mut state.tokens,
+            decode_state: &mut state.decode_state,
+            kv_token_count: &mut state.kv_token_count,
+            baseline_tokens: &self.tokens,
+            baseline_kv_token_count: self.kv_token_count,
+            baseline: &self.decode,
+        })
+        .context("failed to restore target decoder participant to atomic-turn baseline")?;
+        state.sampled_fastpath_failed = self.sampled_fastpath_failed;
+        engine.last_speculative_stats = self.speculative_stats;
+        engine.connector.restore_stats(self.connector_stats);
+        match (engine.draft.as_mut(), state.draft.as_mut(), self.draft) {
+            (Some(model), Some(state), Some(baseline)) => {
+                crate::kv_bridge::restore_decode_turn_baseline(
+                    crate::kv_bridge::DecodeTurnRestore {
+                        session: &model.session,
+                        kv_model: model.kv_model.as_ref(),
+                        kv_cache: &mut model.kv_cache,
+                        seq: state.seq,
+                        tokens: &mut state.tokens,
+                        decode_state: &mut state.decode_state,
+                        kv_token_count: &mut state.kv_token_count,
+                        baseline_tokens: &baseline.tokens,
+                        baseline_kv_token_count: baseline.kv_token_count,
+                        baseline: &baseline.decode,
+                    },
+                )
+                .context("failed to restore draft decoder participant to atomic-turn baseline")?;
+            }
+            (None, None, None) => {}
+            _ => anyhow::bail!(
+                "cannot abort atomic decoder turn: draft participant topology changed during \
+                 execution; retain the admitted draft session until the turn resolves"
+            ),
+        }
+        Ok(self.turn.abort(reason)?)
+    }
+}
+
+#[cfg(feature = "native-backend")]
+struct NativeDecoderTurnParticipant {
+    turn: crate::pipeline::TurnTransaction,
+    session_id: SessionId,
+    active_before: Option<SessionId>,
+    materialized_len: Option<usize>,
+    recurrent: Option<crate::native_decode::RecurrentStateSnapshot>,
+    speculative_stats: SpeculativeStats,
+    connector_stats: ConnectorStats,
+}
+
+#[cfg(feature = "native-backend")]
+impl NativeDecoderTurnParticipant {
+    fn admit(engine: &mut Engine, session_id: SessionId) -> anyhow::Result<Self> {
+        let active_before = engine.native_active_session;
+        let native = engine.native_session.as_mut().context(
+            "cannot admit atomic native decoder turn: native decoder session is unavailable",
+        )?;
+        let materialized_len = (active_before == Some(session_id)).then(|| native.current_len());
+        let recurrent = materialized_len
+            .filter(|length| *length > 0 && native.has_recurrent_state())
+            .map(|_| {
+                native.snapshot_recurrent_state().with_context(|| {
+                    "cannot admit atomic native decoder turn: recurrent state has no \
+                     snapshot/restore support; implement that participant before mutation"
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            turn: crate::pipeline::TurnTransaction::admit_runtime_participant(
+                engine.workflow.next_turn_transaction_id(),
+            ),
+            session_id,
+            active_before,
+            materialized_len,
+            recurrent,
+            speculative_stats: engine.last_speculative_stats,
+            connector_stats: engine.connector.stats().clone(),
+        })
+    }
+
+    fn commit(
+        mut self,
+    ) -> Result<
+        crate::pipeline::TurnTransactionOutcome,
+        crate::pipeline::TurnTransactionResolutionError,
+    > {
+        self.turn.commit_runtime_participant()
+    }
+
+    fn abort(
+        mut self,
+        engine: &mut Engine,
+        reason: crate::pipeline::TurnAbortReason,
+    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
+        engine.last_speculative_stats = self.speculative_stats;
+        engine.connector.restore_stats(self.connector_stats);
+        let native = engine.native_session.as_mut().context(
+            "cannot abort atomic native decoder turn: native decoder session is unavailable",
+        )?;
+        match self.materialized_len {
+            Some(length) => {
+                native.rewind(length)?;
+                if let Some(snapshot) = &self.recurrent {
+                    native.restore_recurrent_state(snapshot)?;
+                }
+                engine.native_active_session = Some(self.session_id);
+            }
+            None => {
+                // This turn had to evict another session's materialized native
+                // cache. Its logical history remains in `native_sessions`; make
+                // the cache explicitly cold rather than leaving a provisional
+                // target prefix observable as an active session.
+                native.reset()?;
+                engine.native_active_session = None;
+            }
+        }
+        let _ = self.active_before;
+        Ok(self.turn.abort(reason)?)
+    }
+}
+
 /// The ORT backend as a [`SessionStore`]: a session in `Engine::sessions`, its
 /// paged KV sequence, its scheduler entry, and any aligned draft state.
 struct OrtSessions<'a>(&'a mut Engine);
@@ -78,7 +405,7 @@ impl SessionStore for OrtSessions<'_> {
             .sessions
             .remove(&id)
             .with_context(|| format!("session {id} not found"))?;
-        let result = (|| {
+        let result = (|| -> anyhow::Result<()> {
             let session = engine.session.as_deref().context(MISSING_ORT_SESSION)?;
             rewind_target_state_to_len(
                 session,
@@ -320,64 +647,45 @@ impl Engine {
 
     /// Every token id this model ends generation on.
     ///
-    /// A model may end a turn with one token and a message with another; both
-    /// stop it. The package's own declaration comes first because it is the
-    /// package speaking about itself — a package that ships no tokenizer
-    /// side-files still states its EOS — and the tokenizer's ids extend it
-    /// rather than replacing it, so neither source can silently drop the
-    /// other's.
+    /// Numeric package defaults have one authority:
+    /// `package.tokenizer.special_tokens`. Tokenizer assets supply spellings
+    /// and chat templates, never an additional numeric stop set.
     pub(crate) fn default_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
-        let mut ids = self.declared_eos_token_ids()?;
-        for id in self
-            .tokenizer
-            .as_deref()
-            .map(Tokenizer::eos_token_ids)
-            .unwrap_or_default()
+        if let Some(tokens) = self
+            .metadata
+            .package
+            .as_ref()
+            .and_then(|package| package.tokenizer.as_ref())
+            .and_then(|tokenizer| tokenizer.special_tokens.as_ref())
         {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
+            return Ok(tokens.eos_token_id.clone());
         }
-        Ok(ids)
-    }
 
-    /// EOS ids the package's workflow declares, via the `eos_token_ids` role.
-    ///
-    /// Read from the workflow's own literal default, so a package states its
-    /// stop condition in the one place it states everything else. Without this
-    /// the declaration is inert: it would be materialized into the graph's
-    /// inputs and never reach the runtime's stop policy, which is what "declared
-    /// but dead" meant.
-    fn declared_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
-        let workflow = self.workflow.workflow_spec();
-        workflow
-            .inputs
-            .values()
-            .filter(|input| {
-                matches!(
-                    &input.role,
-                    onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
-                        if *role == onnx_genai_metadata::RuntimeInputRole::EosTokenIds
-                )
-            })
-            .filter_map(|input| input.default.as_ref())
-            .map(literal_token_ids)
-            .collect::<anyhow::Result<Vec<_>>>()
-            .map(|groups| groups.concat())
+        let version =
+            onnx_genai_metadata::version::normalize(self.metadata.schema_version.as_deref())
+                .map_err(anyhow::Error::msg)?;
+        if version < onnx_genai_metadata::version::TOKEN_AUTHORITY_SCHEMA_VERSION {
+            return Ok(self
+                .tokenizer
+                .as_deref()
+                .map(|tokenizer| tokenizer.legacy_eos_token_ids().to_vec())
+                .unwrap_or_default());
+        }
+
+        Ok(Vec::new())
     }
 
     /// Apply the model's stop condition to a request.
     ///
-    /// Every declared EOS id becomes a stop sequence, not just the first. A
+    /// Every effective EOS id becomes a stop sequence, not just the first. A
     /// model with two end tokens is stopped by either, which a single
     /// `eos_token_id` field cannot express — and silently dropping the rest
     /// means generation runs past its end and emits control tokens as text.
     ///
-    /// A caller's explicit `eos_token_id` selects which id is *reported* as the
-    /// EOS, and does not suppress the others: the model's end tokens are facts
-    /// about the model, and a request narrowing them would make the runtime emit
-    /// tokens the model meant as terminal.
-    fn apply_eos_defaults(&self, options: &mut GenerateOptions) -> anyhow::Result<()> {
+    /// A caller's explicit EOS set is a request override. When absent, the
+    /// package defaults come from
+    /// `package.tokenizer.special_tokens.eos_token_id`.
+    pub(super) fn apply_eos_defaults(&self, options: &mut GenerateOptions) -> anyhow::Result<()> {
         apply_eos_policy(options, &self.default_eos_token_ids()?);
         Ok(())
     }
@@ -397,6 +705,36 @@ impl Engine {
             .context("this package declares no tokenizer, so it cannot tokenize or decode text")
     }
 
+    pub(crate) fn tool_call_observer(
+        &self,
+        policy: &ToolCallPolicy,
+    ) -> anyhow::Result<Option<crate::pipeline::ToolCallStagedOutputObserver>> {
+        if !policy.observes_output() {
+            return Ok(None);
+        }
+        if let ToolCallPolicy::Specific { function } = policy {
+            anyhow::ensure!(
+                !function.is_empty(),
+                "specific tool-call policy requires a non-empty function name"
+            );
+        }
+        let declaration = self
+            .metadata
+            .package
+            .as_ref()
+            .and_then(|package| package.tool_protocol.as_ref())
+            .context(
+                "tool-call generation was requested, but package.tool_protocol is absent; declare \
+                 one exact supported identity/version pair or disable tool-call observation",
+            )?;
+        let protocol = onnx_genai_metadata::ToolProtocol::from_declaration(declaration)
+            .map_err(anyhow::Error::new)?;
+        Ok(Some(crate::pipeline::ToolCallStagedOutputObserver::new(
+            protocol,
+            policy.clone(),
+        )))
+    }
+
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         self.max_context_for_request(options)
     }
@@ -405,16 +743,26 @@ impl Engine {
     fn generate_native_cold_with_callback(
         &mut self,
         mut request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.last_speculative_stats = SpeculativeStats::default();
         if request.options.speculative_mode.is_none() && self.mtp.is_some() {
             request.options.speculative_mode = Some(self.speculative_mode.clone());
         }
         reject_native_request_speculation(&request.options)?;
         request.options.validate()?;
         let mut options = request.options;
+        if matches!(options.speculative_mode, Some(SpeculativeMode::Mtp(_)))
+            && !options.selects_greedily()
+        {
+            self.metadata
+                .speculative
+                .as_ref()
+                .context("native MTP mode was selected without a canonical speculative contract")?
+                .admit_sampling()
+                .map_err(anyhow::Error::msg)?;
+        }
         self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
@@ -422,7 +770,14 @@ impl Engine {
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
-        let speculation_plan = native_speculation_plan(&options, &chain);
+        let mut tool_observer = self.tool_call_observer(&tool_call_policy)?;
+        // Speculation is an optimization. Until its accepted-token callback can
+        // carry a normal host stop, tool-aware requests use the ordinary
+        // declared loop rather than losing transactional observation.
+        let speculation_plan = tool_observer
+            .is_none()
+            .then(|| native_speculation_plan(&options, &chain))
+            .flatten();
         let scheduler_session_id = self.next_native_session_id();
         let scheduled = self.admit_generate_request_with_scheduler(
             scheduler_session_id,
@@ -432,6 +787,16 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        let mut staged_output =
+            CommitOnlyTokenStager::new(native_output_stage_limit(options.max_new_tokens));
+        let turn = match NativeDecoderTurnParticipant::admit(self, scheduler_session_id) {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.scheduler.complete(scheduler_session_id);
+                return Err(error);
+            }
+        };
+        self.last_speculative_stats = SpeculativeStats::default();
         let workspace_query_rows = native_workspace_query_rows(
             prompt_tokens.len(),
             speculation_plan.as_ref(),
@@ -445,120 +810,156 @@ impl Engine {
             .prepare_generation_workspace_for_query_rows(&prompt_tokens, workspace_query_rows)
         {
             self.scheduler.complete(scheduler_session_id);
-            return Err(error);
+            return match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                Ok(_) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "atomic native cold turn failed during workspace preparation and its \
+                     baseline restoration also failed: {rollback:#}"
+                ))),
+            };
         }
         if let Some(callback) = admission_callback.as_mut() {
             callback();
         }
 
-        // Speculation ON (implemented greedy prompt-lookup) → the native
-        // speculative driver. Every other request stays on the untouched plain
-        // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
-        // Borrowed before the mutable native-session borrows below.
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .context("this package declares no tokenizer, so it cannot decode text")?;
-        let runtime = &*self.workflow;
-        // The authored block body this request iterates, read from the
-        // package's own declared loop. Resolved before the mutable native
-        // session borrow below, which the driver holds for the whole drive.
-        let block_runtime = match speculation_plan.as_ref() {
-            Some(_) => Some(self.workflow.iteration_runtime(
-                onnx_genai_metadata::decoder_workflow::IterationPolicy::SpeculativeBlock,
-            )?),
-            None => None,
-        };
-        let result = if let Some(plan) = speculation_plan {
-            let block_runtime = block_runtime.expect("a speculation plan resolves a block body");
-            let mut stats = SpeculativeStats::default();
-            let result = (|| {
+        let result = {
+            let mut stage_token = |token| staged_output.stage(token);
+            // Speculation ON (implemented greedy prompt-lookup) → the native
+            // speculative driver. Every other request stays on the untouched plain
+            // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
+            // Borrowed before the mutable native-session borrows below.
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("this package declares no tokenizer, so it cannot decode text")?;
+            let runtime = &*self.workflow;
+            // The authored block body this request iterates, read from the
+            // package's own declared loop. Resolved before the mutable native
+            // session borrow below, which the driver holds for the whole drive.
+            let block_runtime = match speculation_plan.as_ref() {
+                Some(_) => Some(self.workflow.iteration_runtime(
+                    onnx_genai_metadata::decoder_workflow::IterationPolicy::SpeculativeBlock,
+                )?),
+                None => None,
+            };
+            if let Some(plan) = speculation_plan {
+                let block_runtime =
+                    block_runtime.expect("a speculation plan resolves a block body");
+                let mut stats = SpeculativeStats::default();
+                let result = (|| {
+                    let native_session = self
+                        .native_session
+                        .as_mut()
+                        .context("native decoder session is unavailable")?;
+                    let mut driver = match plan.kind {
+                        NativeSpeculationKind::PromptLookup { ngram, max_tokens } => {
+                            crate::native_speculative::NativeSpeculativeDriver::new_prompt_lookup(
+                                native_session,
+                                ngram,
+                                max_tokens,
+                                plan.width,
+                            )?
+                        }
+                        NativeSpeculationKind::Mtp => {
+                            let mtp = self.mtp.as_ref().context(
+                                "native MTP speculation requested without a loaded MTP head",
+                            )?;
+                            // Reuse the generic MtpProposer (guaranteed target token +
+                            // K speculative drafts from the ORT MTP head) through the
+                            // native driver; the head runs on the ORT CUDA EP while the
+                            // hybrid GDN target runs natively. The recurrent-state
+                            // commit-by-accepted primitive (#1633) advances the target's
+                            // GDN/conv state on accept.
+                            let proposer = MtpProposer::new_owned(
+                                std::sync::Arc::clone(&mtp.session),
+                                onnx_genai_ort::MtpDecodeOptions {
+                                    kv_mode: mtp.kv_mode,
+                                    batch_size: 1,
+                                    hc_mult: mtp.runtime_config.hc_mult,
+                                    hidden_state_rank4: mtp.runtime_config.target_hidden_layout
+                                        == MtpHiddenLayout::Bshc,
+                                    hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
+                                    state_output: mtp.runtime_config.mtp_state_output.clone(),
+                                },
+                                mtp.embedder.clone(),
+                                mtp.lm_head.clone(),
+                                mtp.runtime_config.cache_scope,
+                            )?;
+                            let hidden_size = mtp
+                                .runtime_config
+                                .hc_mult
+                                .saturating_mul(mtp.config.hidden_size);
+                            crate::native_speculative::NativeSpeculativeDriver::new_mtp(
+                                native_session,
+                                proposer,
+                                hidden_size,
+                                plan.width,
+                            )?
+                        }
+                    };
+                    driver.generate(
+                        &prompt_tokens,
+                        &options,
+                        &chain,
+                        tokenizer,
+                        &block_runtime,
+                        &mut stats,
+                        Some(&mut stage_token),
+                    )
+                })();
+                self.last_speculative_stats = stats;
+                result
+            } else {
                 let native_session = self
                     .native_session
                     .as_mut()
                     .context("native decoder session is unavailable")?;
-                let mut driver = match plan.kind {
-                    NativeSpeculationKind::PromptLookup { ngram, max_tokens } => {
-                        crate::native_speculative::NativeSpeculativeDriver::new_prompt_lookup(
-                            native_session,
-                            ngram,
-                            max_tokens,
-                            plan.width,
-                        )?
-                    }
-                    NativeSpeculationKind::Mtp => {
-                        let mtp = self.mtp.as_ref().context(
-                            "native MTP speculation requested without a loaded MTP head",
-                        )?;
-                        // Reuse the generic MtpProposer (guaranteed target token +
-                        // K speculative drafts from the ORT MTP head) through the
-                        // native driver; the head runs on the ORT CUDA EP while the
-                        // hybrid GDN target runs natively. The recurrent-state
-                        // commit-by-accepted primitive (#1633) advances the target's
-                        // GDN/conv state on accept.
-                        let proposer = MtpProposer::new_owned(
-                            std::sync::Arc::clone(&mtp.session),
-                            onnx_genai_ort::MtpDecodeOptions {
-                                kv_mode: mtp.kv_mode,
-                                batch_size: 1,
-                                hc_mult: mtp.runtime_config.hc_mult,
-                                hidden_state_rank4: mtp.runtime_config.target_hidden_layout
-                                    == MtpHiddenLayout::Bshc,
-                                hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
-                                state_output: mtp.runtime_config.mtp_state_output.clone(),
-                            },
-                            mtp.embedder.clone(),
-                            mtp.lm_head.clone(),
-                            mtp.runtime_config.cache_scope,
-                        )?;
-                        let hidden_size = mtp
-                            .runtime_config
-                            .hc_mult
-                            .saturating_mul(mtp.config.hidden_size);
-                        crate::native_speculative::NativeSpeculativeDriver::new_mtp(
-                            native_session,
-                            proposer,
-                            hidden_size,
-                            plan.width,
-                        )?
-                    }
-                };
-                driver.generate(
+                native_session.generate_with_callback_and_staged_observer(
                     &prompt_tokens,
                     &options,
                     &chain,
                     tokenizer,
-                    &block_runtime,
-                    &mut stats,
-                    callback,
+                    runtime,
+                    tool_observer.as_mut(),
+                    Some(&mut stage_token),
                 )
-            })();
-            self.last_speculative_stats = stats;
-            result
-        } else {
-            let native_session = self
-                .native_session
-                .as_mut()
-                .context("native decoder session is unavailable")?;
-            native_session.generate_with_callback(
-                &prompt_tokens,
-                &options,
-                &chain,
-                tokenizer,
-                runtime,
-                callback,
-            )
+            }
+        };
+        let result = augment_backend_error(
+            result.and_then(|mut result| {
+                result.budget_cap = budget_cap;
+                staged_output.validate(&result)?;
+                Ok(result)
+            }),
+            EngineDecodeBackend::Native,
+        );
+        let result = match result {
+            Ok(result) => {
+                let _outcome = turn.commit()?;
+                Ok(result)
+            }
+            Err(error) => {
+                match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                    Ok(_) => Err(error),
+                    Err(rollback) => Err(error.context(format!(
+                        "atomic native cold turn failed and its baseline restoration also \
+                         failed: {rollback:#}"
+                    ))),
+                }
+            }
         };
         self.scheduler.complete(scheduler_session_id);
-        let mut result = augment_backend_error(result, EngineDecodeBackend::Native)?;
-        result.budget_cap = budget_cap;
-        Ok(result)
+        result.and_then(|result| {
+            staged_output.flush(callback)?;
+            Ok(result)
+        })
     }
 
     #[cfg(not(feature = "native-backend"))]
     fn generate_native_cold_with_callback(
         &mut self,
         _request: GenerateRequest,
+        _tool_call_policy: ToolCallPolicy,
         _admission_callback: Option<&mut dyn FnMut()>,
         _callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -779,7 +1180,27 @@ impl Engine {
             request.with_session_id(session_id.to_string()),
             on_admitted,
             callback,
-        )?;
+        );
+        let delivery_commit = result
+            .as_ref()
+            .err()
+            .and_then(|error| {
+                error
+                    .downcast_ref::<crate::pipeline::speculative::CandidateTreeOutputDeliveryError>(
+                    )
+            })
+            .map(|error| error.committed_tokens);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(committed) = delivery_commit
+                    && let Some(count) = self.workflow_sessions.get_mut(&session_id)
+                {
+                    *count = count.saturating_add(committed);
+                }
+                return Err(error);
+            }
+        };
         // A package that declares its conversation knows how long it is; asking
         // it is what keeps `session_token_count` the same number a decode-core
         // session reports — prompt and generated tokens both — rather than the
@@ -813,14 +1234,16 @@ impl Engine {
     /// publishes the same `tokens` output. What it does not have is a fused
     /// session to route the decode step to, so it invokes the component the
     /// package names.
-    fn generate_interpreted(
+    fn generate_interpreted_with_tool_policy(
         &mut self,
         request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
         on_admitted: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.generate_with_pipeline_callbacks(
-            crate::pipeline::PipelineGenerateRequest::new(request),
+            crate::pipeline::PipelineGenerateRequest::new(request)
+                .with_tool_call_policy(tool_call_policy),
             on_admitted,
             callback,
         )
@@ -852,12 +1275,20 @@ impl Engine {
         // put in front of it, which for a package continuing its conversation by
         // prepending is every earlier turn. Admitting on the request alone
         // under-reserves for exactly the turns that need the most.
-        let carried = if self.workflow_sessions.contains_key(&session_id) {
-            self.workflow
-                .session_prepended_prompt_len(&session_id.to_string())
-        } else {
-            0
-        };
+        //
+        // Read unconditionally, from the map that holds the value. #2251: this
+        // was gated on `workflow_sessions` -- engine-side, keyed by `SessionId`
+        // -- while the value comes from `workflow.worker.session_state`, which
+        // is pipeline-side and keyed by `(String, cell)`. Since
+        // `session_prepended_prompt_len` is total and answers 0 for a session it
+        // does not know, the gate was redundant whenever the two maps agreed and
+        // discarded a real prefix whenever they did not. Its only reachable
+        // effect was to under-reserve, which is the failure this comment warns
+        // about. The sole caller is the workflow path, so nothing on a
+        // non-workflow hot path pays for the removal.
+        let carried = self
+            .workflow
+            .session_prepended_prompt_len(&session_id.to_string());
         let prompt_tokens = self.interpreted_prompt_token_count(prompt)? + carried;
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
@@ -1072,13 +1503,42 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_tool_policy_callbacks(
+            request,
+            ToolCallPolicy::Disabled,
+            admission_callback,
+            token_callback,
+        )
+    }
+
+    /// Generate with a transport-neutral tool-call policy.
+    ///
+    /// When enabled, token callbacks are commit-only: protocol parsing and
+    /// request-policy validation complete inside the semantic transaction
+    /// before any generated output is delivered.
+    pub fn generate_with_tool_policy_callbacks(
+        &mut self,
+        request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.require_workflow_execution_admitted()?;
+        // Resolve the exact protocol and request policy before a cold path can
+        // allocate its short-lived session or admit scheduler state.
+        let _ = self.tool_call_observer(&tool_call_policy)?;
         // One entry point, one interpreter, one declared loop. What varies is
         // whether this runtime holds the fused decode session that implements
         // the package's declared `autoregressive-decode` step. Without one, the
         // interpreter invokes every declared component from the artifact the
         // package names — the same loop, the same emits, the same stop.
         if !self.holds_decode_core() {
-            return self.generate_interpreted(request, admission_callback, token_callback);
+            return self.generate_interpreted_with_tool_policy(
+                request,
+                tool_call_policy,
+                admission_callback,
+                token_callback,
+            );
         }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
@@ -1092,6 +1552,7 @@ impl Engine {
             if request.options.cold_start || native_spec_requested {
                 let result = self.generate_native_cold_with_callback(
                     request,
+                    tool_call_policy,
                     admission_callback,
                     token_callback,
                 );
@@ -1102,6 +1563,7 @@ impl Engine {
             return self.generate_native_in_session_with_callbacks(
                 session_id,
                 request,
+                tool_call_policy,
                 admission_callback,
                 token_callback,
             );
@@ -1111,17 +1573,20 @@ impl Engine {
             {
                 return self.generate_native_cold_with_callback(
                     request,
+                    tool_call_policy,
                     admission_callback,
                     token_callback,
                 );
             }
         }
+
         let session_id = self.create_session()?;
         let result = self.generate_in_session_with_priority_and_callback(
             session_id,
             request,
             Priority::Normal,
             None,
+            tool_call_policy,
             admission_callback,
             token_callback,
         );
@@ -1131,6 +1596,29 @@ impl Engine {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
         }
+    }
+
+    /// Generate through the ordinary Engine surface with a request-scoped
+    /// cancellation authority and transaction checkpoints.
+    pub fn generate_with_control_callbacks(
+        &mut self,
+        request: GenerateRequest,
+        control: crate::pipeline::GenerationControl,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.holds_decode_core() {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_with_control_callbacks",
+                runtime: "the fused decode backend",
+            }
+            .into());
+        }
+        self.generate_with_pipeline_callbacks(
+            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+            admission_callback,
+            token_callback,
+        )
     }
 
     /// Generate text in a persistent session, reusing the session's accumulated KV state.
@@ -1150,7 +1638,13 @@ impl Engine {
         priority: Priority,
     ) -> anyhow::Result<GenerateResult> {
         self.generate_in_session_with_priority_and_callback(
-            session_id, request, priority, None, None, None,
+            session_id,
+            request,
+            priority,
+            None,
+            ToolCallPolicy::Disabled,
+            None,
+            None,
         )
     }
 
@@ -1166,6 +1660,7 @@ impl Engine {
             request,
             Priority::Normal,
             None,
+            ToolCallPolicy::Disabled,
             None,
             callback,
         )
@@ -1179,11 +1674,55 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_tool_policy_callbacks(
+            session_id,
+            request,
+            ToolCallPolicy::Disabled,
+            admission_callback,
+            token_callback,
+        )
+    }
+
+    /// Continue a session with transport-neutral tool-call observation.
+    pub fn generate_in_session_with_tool_policy_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         self.generate_in_session_with_priority_and_callback(
             session_id,
             request,
             Priority::Normal,
             None,
+            tool_call_policy,
+            admission_callback,
+            token_callback,
+        )
+    }
+
+    /// Continue an interpreted workflow session with request-scoped
+    /// cancellation and transaction checkpoints.
+    pub fn generate_in_session_with_control_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        control: crate::pipeline::GenerationControl,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.holds_decode_core() {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_in_session_with_control_callbacks",
+                runtime: "the fused decode backend",
+            }
+            .into());
+        }
+        self.generate_in_workflow_session(
+            session_id,
+            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
             admission_callback,
             token_callback,
         )
@@ -1208,20 +1747,24 @@ impl Engine {
             request,
             Priority::Normal,
             Some(sampler),
+            ToolCallPolicy::Disabled,
             None,
             None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_in_session_with_priority_and_callback(
         &mut self,
         session_id: SessionId,
         request: GenerateRequest,
         priority: Priority,
         mut custom_sampler: Option<Box<dyn Sampler>>,
+        tool_call_policy: ToolCallPolicy,
         mut admission_callback: Option<&mut dyn FnMut()>,
-        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.require_workflow_execution_admitted()?;
         // A package with no decode core keeps its conversation in the
         // session-scoped cells its workflow declares. Routing here rather than
         // in one of the wrappers above is what makes every `generate_in_session`
@@ -1235,7 +1778,8 @@ impl Engine {
             );
             return self.generate_in_workflow_session(
                 session_id,
-                crate::pipeline::PipelineGenerateRequest::new(request),
+                crate::pipeline::PipelineGenerateRequest::new(request)
+                    .with_tool_call_policy(tool_call_policy),
                 admission_callback,
                 callback,
             );
@@ -1251,11 +1795,12 @@ impl Engine {
             return self.generate_native_in_session_with_callbacks(
                 session_id,
                 request,
+                tool_call_policy,
                 admission_callback,
                 callback,
             );
         }
-        self.last_speculative_stats = SpeculativeStats::default();
+        let mut tool_observer = self.tool_call_observer(&tool_call_policy)?;
         request.options.validate()?;
         let mut options = request.options.clone();
         self.apply_eos_defaults(&mut options)?;
@@ -1290,6 +1835,20 @@ impl Engine {
             self.scheduler.complete(session_id);
             anyhow::bail!("session {session_id} not found");
         };
+        let turn = match DecoderTurnParticipant::admit(
+            self.workflow.next_turn_transaction_id(),
+            &mut state,
+            self.last_speculative_stats,
+            self.connector.stats().clone(),
+        ) {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.sessions.insert(session_id, state);
+                self.scheduler.complete(session_id);
+                return Err(error);
+            }
+        };
+        self.last_speculative_stats = SpeculativeStats::default();
 
         let result = (|| -> anyhow::Result<GenerateResult> {
             let prefix_cache_hit_len =
@@ -1299,7 +1858,10 @@ impl Engine {
             let has_custom_sampler = custom_sampler.is_some();
             loop_state.custom_sampler = custom_sampler.take();
 
-            if self.should_use_speculative(&options) && !has_custom_sampler {
+            if tool_observer.is_none()
+                && self.should_use_speculative(&options)
+                && !has_custom_sampler
+            {
                 return self.generate_speculative_loop(crate::speculative::SpeculativeLoopState {
                     session_id,
                     state: &mut state,
@@ -1311,7 +1873,7 @@ impl Engine {
                     generated_text: &mut loop_state.generated_text,
                     generated_logprobs: &mut loop_state.logprobs,
                     rng: &mut loop_state.rng,
-                    callback: callback.as_deref_mut(),
+                    callback: None,
                 });
             }
 
@@ -1341,7 +1903,7 @@ impl Engine {
             // -- one forward pass, KV stays its business -- and the token
             // policy beside it is the single sampling/stopping implementation,
             // shared with every other package.
-            crate::pipeline::generation::generate_with_decode_core(
+            crate::pipeline::generation::generate_with_decode_core_and_staged_observer(
                 runtime,
                 &mut backend,
                 &mut loop_state,
@@ -1352,20 +1914,54 @@ impl Engine {
                     tokenizer,
                     max_context,
                 },
-                callback.as_deref_mut(),
+                tool_observer.as_mut(),
+                None,
             )
         })()
         .and_then(|mut result| {
             if !exceeded_context_limit(state.tokens.len(), max_context) {
                 self.ensure_session_kv_current(session_id, &mut state)?;
-                self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())?;
             }
             result.budget_cap = budget_cap;
             Ok(result)
         });
+        let result = match result {
+            Ok(result) => {
+                let _outcome = turn.commit()?;
+                if !exceeded_context_limit(state.tokens.len(), max_context)
+                    && let Err(error) =
+                        self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())
+                {
+                    tracing::debug!(
+                        %error,
+                        "committed decoder turn could not publish optional prefix-cache state"
+                    );
+                }
+                Ok(result)
+            }
+            Err(error) => match turn.abort(
+                self,
+                session_id,
+                &mut state,
+                crate::pipeline::TurnAbortReason::ExecutionFailure,
+            ) {
+                Ok(_outcome) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "atomic decoder turn failed and its baseline restoration also failed: \
+                     {rollback:#}"
+                ))),
+            },
+        };
         self.sessions.insert(session_id, state);
         self.scheduler.complete(session_id);
-        result
+        result.and_then(|result| {
+            DecoderTurnParticipant::publish_committed_tokens(
+                self.require_tokenizer()?,
+                &result,
+                callback,
+            )?;
+            Ok(result)
+        })
     }
 
     /// Drive a set of already-arrived prioritized requests to completion.
@@ -1411,13 +2007,46 @@ impl Engine {
             {
                 let arrival = arrivals[next_arrival].clone();
                 next_arrival += 1;
-                let active_request = self.prepare_active_generate(arrival.request)?;
+                let active_request = match self.prepare_active_generate(arrival.request.clone()) {
+                    Ok(active) => active,
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::pipeline::PerTokenCursorIneligible>()
+                            .is_some() =>
+                    {
+                        let result = self
+                            .generate_in_session_with_priority_and_callback(
+                                arrival.request.session_id,
+                                arrival.request.request,
+                                arrival.request.priority,
+                                None,
+                                ToolCallPolicy::Disabled,
+                                None,
+                                None,
+                            )
+                            .context(
+                                "the prioritized cursor declined a valid topology and generic \
+                                 workflow execution failed",
+                            )?;
+                        generated_steps += result.token_ids.len();
+                        results.push(PrioritizedGenerateResult {
+                            session_id: arrival.request.session_id,
+                            result,
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if active
                     .insert(active_request.session_id, active_request)
                     .is_some()
                 {
                     anyhow::bail!("session already has an active generation request");
                 }
+            }
+
+            if results.len() == total_requests {
+                break;
             }
 
             let decision = self.scheduler.schedule();
@@ -1453,7 +2082,26 @@ impl Engine {
                         .map(generation_budget_cap);
                     active_request.options.max_new_tokens = max_tokens;
                 }
-                let step_result = self.step_active_generate(&mut active_request)?;
+                let step_result = match self.step_active_generate(&mut active_request) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let rollback = active_request.turn.abort(
+                            self,
+                            session_id,
+                            &mut active_request.state,
+                            crate::pipeline::TurnAbortReason::ExecutionFailure,
+                        );
+                        self.sessions.insert(session_id, active_request.state);
+                        self.scheduler.complete(session_id);
+                        return match rollback {
+                            Ok(_) => Err(error),
+                            Err(rollback) => Err(error.context(format!(
+                                "atomic prioritized turn failed and its baseline restoration \
+                                 also failed: {rollback:#}"
+                            ))),
+                        };
+                    }
+                };
                 generated_steps += 1;
                 if let Some(result) = step_result {
                     let session_id = active_request.session_id;
@@ -1522,7 +2170,7 @@ impl Engine {
                 // package cannot do, or whether the server failed. Matching on
                 // prose would make that a guess, and it was being reported as a
                 // 500 for a package that is simply stateless.
-                return Err(PackageCapabilityError::NoSessionState.into());
+                return Err(PackageExecutionError::NoSessionState.into());
             }
             let id = self.workflow_session_ids.mint();
             self.workflow_sessions.insert(id, 0);
@@ -1616,46 +2264,6 @@ impl Engine {
         session_state::rewind_to(&mut OrtSessions(self), session_id, position)
     }
 
-    /// Capability for session fork, if the selected backend supports safe CoW
-    /// fork at the engine level.
-    ///
-    /// Current ORT decode runners do not expose clone/import semantics strong
-    /// enough to fork without deep-copying or aliasing mutable KV, so this
-    /// returns `None` today. A future supported backend should return `Some` and
-    /// route fork through [`Engine::fork_session`].
-    pub fn session_fork_capability(&self) -> Option<SessionForkCapability> {
-        None
-    }
-
-    /// Fork a persistent session at a logical token boundary.
-    ///
-    /// Callers can obtain `capability` only from
-    /// [`Engine::session_fork_capability`], which is `None` for all current
-    /// backends. Keeping the capability token in the signature prevents
-    /// unsupported engines from being asked to fork through the typed API.
-    pub fn fork_session(
-        &mut self,
-        _capability: &SessionForkCapability,
-        source: SessionId,
-        position: SessionPosition,
-    ) -> anyhow::Result<SessionId> {
-        self.require_ort_backend("session fork")?;
-        let state = self
-            .sessions
-            .get(&source)
-            .with_context(|| format!("session {source} not found"))?;
-        let position = position.get();
-        let current = state.tokens.len();
-        if position > current {
-            anyhow::bail!(
-                "cannot fork session {source} at token {position}; current length is {current}"
-            );
-        }
-        anyhow::bail!(
-            "session fork is not yet enabled: safe CoW fork requires cloneable/importable decoder state aligned with paged KV; current ORT runner/static-cache paths would require deep-copying or unsafe KV aliasing"
-        )
-    }
-
     /// Reset a persistent session, freeing its current state while keeping the id usable.
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
         // Resetting is the same promise for every package: the id stays usable
@@ -1681,7 +2289,7 @@ impl Engine {
         session_state::reset(&mut OrtSessions(self), session_id)
     }
 
-    fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
+    pub(crate) fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
         let session = self
             .session
             .as_ref()
@@ -1894,9 +2502,9 @@ impl Engine {
     /// Process-global CUDA VMM arena counters, when this build has the native
     /// CUDA execution provider.
     ///
-    /// `None` means the build cannot have an arena. All-zero means no arena was
-    /// ever built, which is the normal state without `ONNX_GENAI_CUDA_VMM` --
-    /// and is distinguishable from an arena that was built and never committed
+    /// `None` means the build cannot have an arena. All-zero means no native
+    /// CUDA session has initialized the always-on arena in this process yet,
+    /// and is distinguishable from an initialized arena that never committed
     /// anything (`reserved_bytes > 0, commits == 0`), which is the bug #659 hid
     /// behind a log line for an entire release.
     pub fn vmm_arena_stats(&self) -> Option<crate::VmmArenaStats> {
@@ -2119,13 +2727,14 @@ impl Engine {
         // integration test. If injection is not possible we fall back to the
         // reporting-only `lookup_extension`, never claiming a hit we can't serve.
         if self.connector.is_active() {
-            let injected = self.try_connector_kv_injection(state, prompt_tokens, in_process_hit)?;
+            let injected =
+                self.try_connector_kv_injection(session_id, state, prompt_tokens, in_process_hit)?;
             if let Some(total) = injected {
                 return Ok(in_process_hit.max(total));
             }
             let _ = self
                 .connector
-                .lookup_extension(prompt_tokens, in_process_hit);
+                .lookup_extension(session_id, prompt_tokens, in_process_hit);
         }
         Ok(in_process_hit)
     }
@@ -2142,6 +2751,7 @@ impl Engine {
     /// input to feed.
     fn try_connector_kv_injection(
         &mut self,
+        session_id: SessionId,
         state: &mut EngineSession,
         prompt_tokens: &[TokenId],
         in_process_hit: usize,
@@ -2167,9 +2777,13 @@ impl Engine {
         // Leave at least one prompt token to feed the decoder: cap the fetch to
         // `prompt_len - 1` tokens so `fetched_tokens` equals what we inject.
         let max_tokens = prompt_tokens.len().saturating_sub(1);
-        let outcome =
-            self.connector
-                .fetch_extension(prompt_tokens, boundary, max_tokens, Device::Cpu);
+        let outcome = self.connector.fetch_extension(
+            session_id,
+            prompt_tokens,
+            boundary,
+            max_tokens,
+            Device::Cpu,
+        );
         if outcome.fetched_tokens == 0 {
             return Ok(None);
         }
@@ -2217,33 +2831,106 @@ impl Engine {
             anyhow::bail!("session {} not found", request.session_id);
         }
         if self.should_use_speculative(&options) {
-            anyhow::bail!(
-                "prioritized drive API currently supports the single-sequence non-speculative path; batched/speculative drive is future work"
-            );
+            return Err(crate::pipeline::PerTokenCursorIneligible::new(
+                "this valid request selects speculative proposal and verification, which cannot \
+                 suspend at the prioritized cursor's one-target-token boundary",
+            )
+            .into());
         }
 
         let max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
-        // The declared loop is bound and its setup run before scheduler
-        // admission: a package this drive cannot advance is refused without
-        // having admitted the request or touched its session state.
-        let cursor = crate::pipeline::WorkflowGenerationCursor::start(
-            &self.workflow,
-            crate::pipeline::PipelineGenerateRequest::new(GenerateRequest {
-                prompt: crate::GeneratePrompt::TokenIds(prompt_tokens.clone()),
-                options: options.clone(),
-            }),
-            crate::pipeline::generation::DECODE_CORE_CONTRACTS,
-            &mut None,
-        )?;
+        crate::pipeline::WorkflowGenerationCursor::validate_per_token_capability(&self.workflow)?;
         let mut state = self
             .sessions
             .remove(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        let prefix_cache_hit_len =
-            self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
-        let rng = SamplingRng::new(options.seed);
-        let logprobs = options.top_logprobs.map(|_| Vec::new());
+        let turn = match DecoderTurnParticipant::admit(
+            self.workflow.next_turn_transaction_id(),
+            &mut state,
+            self.last_speculative_stats,
+            self.connector.stats().clone(),
+        ) {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.sessions.insert(request.session_id, state);
+                return Err(error);
+            }
+        };
+        let prepared = (|| -> anyhow::Result<_> {
+            let prefix_cache_hit_len =
+                self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
+            let mut loop_state =
+                DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
+            let (cursor, setup_finish) = {
+                let tokenizer = self
+                    .tokenizer
+                    .as_ref()
+                    .context("this package declares no tokenizer, so it cannot decode text")?;
+                let mut backend = SessionDecodeLoopBackend {
+                    session: self
+                        .session
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                    kv_model: self.kv_model.as_ref(),
+                    kv_cache: &mut self.kv_cache,
+                    scheduler: &mut self.scheduler,
+                    session_id: request.session_id,
+                    state: &mut state,
+                };
+                let mut host = crate::pipeline::generation::GenerationNodeHost::new(
+                    &mut backend,
+                    &mut loop_state,
+                    &crate::pipeline::generation::GenerationRequest {
+                        options: &options,
+                        chain: &chain,
+                        tokenizer,
+                        max_context,
+                    },
+                    None,
+                );
+                let cursor = {
+                    let mut host_ref: Option<&mut dyn crate::pipeline::WorkflowNodeHost> =
+                        Some(&mut host);
+                    crate::pipeline::WorkflowGenerationCursor::start(
+                        &self.workflow,
+                        crate::pipeline::PipelineGenerateRequest::new(GenerateRequest {
+                            prompt: crate::GeneratePrompt::TokenIds(prompt_tokens.clone()),
+                            options: options.clone(),
+                        }),
+                        crate::pipeline::generation::DECODE_CORE_CONTRACTS,
+                        &mut host_ref,
+                    )?
+                };
+                anyhow::ensure!(
+                    host.can_suspend(),
+                    "authored loop setup leaves a decoder result pending for a later policy node; \
+                     the prioritized per-token optimization cannot suspend at that boundary, so \
+                     execute this package through the generic generation path"
+                );
+                (cursor, host.reached_finish())
+            };
+            Ok((cursor, setup_finish, prefix_cache_hit_len, loop_state))
+        })();
+        let (cursor, setup_finish, prefix_cache_hit_len, loop_state) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let rollback = turn.abort(
+                    self,
+                    request.session_id,
+                    &mut state,
+                    crate::pipeline::TurnAbortReason::ExecutionFailure,
+                );
+                self.sessions.insert(request.session_id, state);
+                return match rollback {
+                    Ok(_) => Err(error),
+                    Err(rollback) => Err(error.context(format!(
+                        "atomic prioritized-turn preparation failed and its baseline restoration \
+                         also failed: {rollback:#}"
+                    ))),
+                };
+            }
+        };
         self.scheduler.enqueue_generate_request(
             request.session_id,
             prompt_tokens.len(),
@@ -2252,6 +2939,7 @@ impl Engine {
         );
         Ok(ActiveGenerate {
             cursor,
+            turn,
             session_id: request.session_id,
             state,
             options,
@@ -2259,12 +2947,13 @@ impl Engine {
             max_context,
             prompt_len: prompt_tokens.len(),
             prefix_cache_hit_len,
-            generated_tokens: Vec::new(),
-            generated_text: String::new(),
-            logprobs,
+            generated_tokens: loop_state.generated_tokens,
+            generated_text: loop_state.generated_text,
+            logprobs: loop_state.logprobs,
             budget_cap: None,
-            step: 0,
-            rng,
+            step: loop_state.step,
+            rng: loop_state.rng,
+            setup_finish,
         })
     }
 
@@ -2281,7 +2970,24 @@ impl Engine {
             rng: std::mem::replace(&mut active.rng, SamplingRng::new(Some(0))),
             custom_sampler: None,
         };
-        let step_result = {
+        let step_result = if let Some(finish_reason) = active.setup_finish.take() {
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("this package declares no tokenizer, so it cannot decode text")?;
+            ensure_constrained_finish(
+                &active.options,
+                &loop_state.generated_text,
+                finish_reason.clone(),
+            )?;
+            Some(crate::decode_loop::finish_result(
+                tokenizer,
+                &loop_state.generated_tokens,
+                finish_reason,
+                loop_state.prefix_cache_hit_len,
+                loop_state.logprobs.as_deref(),
+            )?)
+        } else {
             // Borrowed before the disjoint mutable borrows the backend takes.
             let tokenizer = self
                 .tokenizer
@@ -2319,6 +3025,12 @@ impl Engine {
                 let mut host_ref: Option<&mut dyn crate::pipeline::WorkflowNodeHost> =
                     Some(&mut host);
                 let ran = cursor.advance(runtime, &mut host_ref)?;
+                anyhow::ensure!(
+                    host.can_suspend(),
+                    "an authored loop iteration leaves a decoder result pending for a later \
+                     policy node; the prioritized per-token optimization cannot suspend at that \
+                     boundary, so execute this package through the generic generation path"
+                );
                 (ran, host.reached_finish())
             };
             let finish = match (ran, finish) {
@@ -2378,22 +3090,55 @@ impl Engine {
     }
 
     fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<()> {
-        // The workflow's own emit and the tokens this drive committed describe
-        // the same generation; if they disagree, one is wrong and nothing
-        // outside can tell which.
-        crate::pipeline::generation::verify_emitted_tokens(
-            &self.workflow,
-            &active.cursor,
-            &active.generated_tokens,
-        )?;
-        active.cursor.finish(&self.workflow)?;
-        if !exceeded_context_limit(active.state.tokens.len(), active.max_context) {
-            self.ensure_session_kv_current(active.session_id, &mut active.state)?;
-            self.insert_cached_prefixes(active.session_id, &active.state, active.prompt_len)?;
-        }
-        self.sessions.insert(active.session_id, active.state);
+        let session_id = active.session_id;
+        let result = (|| -> anyhow::Result<()> {
+            // The workflow's own emit and the tokens this drive committed describe
+            // the same generation; if they disagree, one is wrong and nothing
+            // outside can tell which.
+            crate::pipeline::generation::verify_emitted_tokens(
+                &self.workflow,
+                &active.cursor,
+                &active.generated_tokens,
+            )?;
+            active.cursor.finish(&self.workflow)?;
+            if !exceeded_context_limit(active.state.tokens.len(), active.max_context) {
+                self.ensure_session_kv_current(active.session_id, &mut active.state)?;
+            }
+            Ok(())
+        })();
+        let result = match result {
+            Ok(()) => {
+                let _outcome = active.turn.commit()?;
+                if !exceeded_context_limit(active.state.tokens.len(), active.max_context)
+                    && let Err(error) = self.insert_cached_prefixes(
+                        active.session_id,
+                        &active.state,
+                        active.prompt_len,
+                    )
+                {
+                    tracing::debug!(
+                        %error,
+                        "committed prioritized turn could not publish optional prefix-cache state"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => match active.turn.abort(
+                self,
+                session_id,
+                &mut active.state,
+                crate::pipeline::TurnAbortReason::CommitFailure,
+            ) {
+                Ok(_outcome) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "atomic prioritized turn failed during commit and its baseline restoration \
+                     also failed: {rollback:#}"
+                ))),
+            },
+        };
+        self.sessions.insert(session_id, active.state);
         self.scheduler.complete(active.session_id);
-        Ok(())
+        result
     }
 
     /// Borrow the ORT decoder session, returning an error instead of aborting
@@ -2443,7 +3188,7 @@ impl Engine {
     /// chunk in the connector. Best-effort: any gating failure or extraction
     /// error skips storing (never surfaced to inference). See
     /// [`crate::connector_bridge::ConnectorBridge::store_prefix_with`].
-    fn store_connector_prefix(&mut self, state: &EngineSession) {
+    fn store_connector_prefix(&mut self, session_id: SessionId, state: &EngineSession) {
         if !state.decode_state.runner_supports_kv_handoff() {
             return;
         }
@@ -2469,6 +3214,7 @@ impl Engine {
             }
         };
         self.connector.store_prefix_with(
+            session_id,
             &state.tokens,
             state.kv_token_count,
             |chunk_start, num_tokens| {
@@ -2489,7 +3235,7 @@ impl Engine {
         // runners with f32 KV can hand off owned tensors; other paths skip
         // (store is a no-op for the default `Null` connector regardless).
         if self.connector.is_active() {
-            self.store_connector_prefix(state);
+            self.store_connector_prefix(session_id, state);
         }
         if state.decode_state.uses_token_prefix_cache() {
             if prompt_len > 0 && prompt_len <= state.kv_token_count {
@@ -2552,6 +3298,7 @@ impl Engine {
                 .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
             token_ids: generated_tokens.to_vec(),
             finish_reason,
+            tool_calls: Vec::new(),
             prefix_cache_hit_len,
             logprobs: logprobs.map(<[crate::config::TokenLogprob]>::to_vec),
             budget_cap: None,
@@ -2637,14 +3384,23 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
 
 #[cfg(feature = "native-backend")]
 impl Engine {
+    /// Override the native turn's staged-output bound for a dependent-crate
+    /// regression test. The `test-output-staging` feature is never enabled by
+    /// production feature sets.
+    #[cfg(feature = "test-output-staging")]
+    #[doc(hidden)]
+    pub fn set_native_output_staging_limit_for_test(&mut self, limit: Option<usize>) {
+        TEST_NATIVE_OUTPUT_STAGE_LIMIT.with(|stage_limit| stage_limit.set(limit));
+    }
+
     fn generate_native_in_session_with_callbacks(
         &mut self,
         session_id: SessionId,
         request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
         let mut options = request.options;
         reject_native_request_speculation(&options)?;
@@ -2655,6 +3411,7 @@ impl Engine {
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let mut tool_observer = self.tool_call_observer(&tool_call_policy)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
                 "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"
@@ -2671,6 +3428,16 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        let mut staged_output =
+            CommitOnlyTokenStager::new(native_output_stage_limit(options.max_new_tokens));
+        let turn = match NativeDecoderTurnParticipant::admit(self, session_id) {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.scheduler.complete(session_id);
+                return Err(error);
+            }
+        };
+        self.last_speculative_stats = SpeculativeStats::default();
         if let Err(error) = self
             .native_session
             .as_mut()
@@ -2678,7 +3445,13 @@ impl Engine {
             .prepare_generation_workspace_preserving_state(&prompt_tokens)
         {
             self.scheduler.complete(session_id);
-            return Err(error);
+            return match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                Ok(_) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "atomic native decoder turn failed during workspace preparation and its \
+                     baseline restoration also failed: {rollback:#}"
+                ))),
+            };
         }
         if let Some(callback) = admission_callback.as_mut() {
             callback();
@@ -2819,6 +3592,7 @@ impl Engine {
             }
 
             let mut result = {
+                let mut stage_token = |token| staged_output.stage(token);
                 // Borrowed before the mutable native-session borrow below.
                 let tokenizer = self
                     .tokenizer
@@ -2841,14 +3615,15 @@ impl Engine {
                     resume_from = prompt_tokens.len().saturating_sub(1);
                 }
 
-                native.generate_incremental_with_callback(
+                native.generate_incremental_with_callback_and_staged_observer(
                     &prompt_tokens,
                     resume_from,
                     &options,
                     &chain,
                     tokenizer,
                     runtime,
-                    callback,
+                    tool_observer.as_mut(),
+                    Some(&mut stage_token),
                 )?
             };
             result.budget_cap = budget_cap;
@@ -2866,39 +3641,31 @@ impl Engine {
 
             Ok(result)
         })();
+        let result = result.and_then(|result| {
+            staged_output.validate(&result)?;
+            Ok(result)
+        });
+        let result = match result {
+            Ok(result) => {
+                let _outcome = turn.commit()?;
+                Ok(result)
+            }
+            Err(error) => {
+                match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                    Ok(_) => Err(error),
+                    Err(rollback) => Err(error.context(format!(
+                        "atomic native decoder turn failed and its baseline restoration also \
+                     failed: {rollback:#}"
+                    ))),
+                }
+            }
+        };
         self.scheduler.complete(session_id);
-        result
-    }
-}
-
-/// Token ids carried by a workflow literal, scalar or list.
-///
-/// A package may declare one end token or several with the same field; reading
-/// both shapes here is what keeps "declare your EOS" from having two spellings.
-fn literal_token_ids(literal: &onnx_genai_metadata::LiteralValue) -> anyhow::Result<Vec<TokenId>> {
-    use onnx_genai_metadata::{LiteralValue, ScalarValue};
-    let scalars = match literal {
-        LiteralValue::Scalar(scalar) => std::slice::from_ref(scalar),
-        LiteralValue::Elements(elements) => elements.as_slice(),
-    };
-    scalars
-        .iter()
-        .map(|scalar| match scalar {
-            // Dropping a malformed id would be the worst outcome: the package
-            // says "these tokens end me", the runtime silently keeps a subset,
-            // and generation runs past an end token the author declared. A
-            // package that cannot state its stop condition must fail to load,
-            // not load with a quietly smaller one.
-            ScalarValue::Integer(value) => TokenId::try_from(*value).map_err(|_| {
-                anyhow::anyhow!(
-                    "declared end-of-generation token id {value} is not a valid token id"
-                )
-            }),
-            other => anyhow::bail!(
-                "declared end-of-generation token ids must be integers; found {other:?}"
-            ),
+        result.and_then(|result| {
+            staged_output.flush(callback)?;
+            Ok(result)
         })
-        .collect()
+    }
 }
 
 #[cfg(test)]
@@ -2906,6 +3673,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "native-backend")]
     use crate::ProcessorChain;
+    use std::path::Path;
     #[cfg(feature = "native-backend")]
     use std::path::PathBuf;
 
@@ -2914,6 +3682,221 @@ mod tests {
         assert!(generate_uses_scheduler(EngineDecodeBackend::Ort));
         assert!(generate_uses_scheduler(EngineDecodeBackend::Native));
         assert!(generate_uses_scheduler(EngineDecodeBackend::Auto));
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn tiny_native_cold_engine() -> anyhow::Result<Engine> {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..EngineConfig::default()
+            },
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn tiny_native_cold_request(speculative: bool) -> GenerateRequest {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+        request.options.max_new_tokens = 3;
+        request.options.temperature = 0.0;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        if speculative {
+            request.options.speculative_mode = Some(crate::SpeculativeMode::PromptLookup {
+                ngram: 1,
+                max_tokens: 2,
+            });
+        }
+        request
+    }
+
+    /// The callback the server passes here emits `DriverEvent::Token`
+    /// immediately. Both routes must therefore retain all callback payloads
+    /// until their native turn has committed.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn cold_native_and_prompt_lookup_flush_staged_tokens_once_in_order() -> anyhow::Result<()> {
+        for (route, speculative) in [("cold native", false), ("native prompt lookup", true)] {
+            let mut engine = tiny_native_cold_engine()?;
+            let request = tiny_native_cold_request(speculative);
+            let mut observed = Vec::new();
+            let mut callback = |token: crate::GenerateToken| -> anyhow::Result<()> {
+                observed.push(token.token_id);
+                Ok(())
+            };
+
+            let result = engine.generate_with_callback(request, Some(&mut callback))?;
+            assert_eq!(
+                observed, result.token_ids,
+                "{route} must flush each committed staged token once and in order"
+            );
+            assert_eq!(
+                observed.len(),
+                result.token_ids.len(),
+                "{route} must neither omit nor duplicate a staged token"
+            );
+        }
+        Ok(())
+    }
+
+    /// A one-token staging limit injects an error only after the first native
+    /// token has been selected and buffered. It exercises the same public cold
+    /// route the server calls, whose callback directly publishes token events.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn cold_native_and_prompt_lookup_abort_after_staging_without_publishing_tokens()
+    -> anyhow::Result<()> {
+        for (route, speculative) in [("cold native", false), ("native prompt lookup", true)] {
+            let mut engine = tiny_native_cold_engine()?;
+            let request = tiny_native_cold_request(speculative);
+            let mut externally_published = Vec::new();
+            let mut callback = |token: crate::GenerateToken| -> anyhow::Result<()> {
+                externally_published.push(token.token_id);
+                Ok(())
+            };
+
+            let error = with_native_output_stage_limit_for_test(1, || {
+                engine.generate_with_callback(request.clone(), Some(&mut callback))
+            })
+            .expect_err("{route} must fail when its second staged token exceeds the test limit");
+            let message = format!("{error:#}");
+            assert!(
+                message
+                    .contains("output staging exhausted its 1-token admission after buffering 1"),
+                "{route} must fail after staging token one, got: {message}"
+            );
+            assert!(
+                externally_published.is_empty(),
+                "{route} must not publish a DriverEvent::Token-shaped callback from an aborted turn"
+            );
+            assert_eq!(
+                engine.native_active_session, None,
+                "{route} must restore the cold native-session baseline"
+            );
+            assert_eq!(
+                engine
+                    .native_session
+                    .as_ref()
+                    .expect("native engine owns its decode session")
+                    .current_len(),
+                0,
+                "{route} must restore the cold native decoder baseline"
+            );
+
+            let mut retry_events = Vec::new();
+            let mut retry_callback = |token: crate::GenerateToken| -> anyhow::Result<()> {
+                retry_events.push(token.token_id);
+                Ok(())
+            };
+            let retry =
+                engine.generate_with_callback(request.clone(), Some(&mut retry_callback))?;
+            let mut control = tiny_native_cold_engine()?;
+            let expected = control.generate(request)?;
+            assert_eq!(
+                retry.token_ids, expected.token_ids,
+                "{route} retry after an aborted staged turn must be deterministic"
+            );
+            assert_eq!(
+                retry_events, retry.token_ids,
+                "{route} retry must publish only its committed stream"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn aborted_turn_restores_tier_journal_and_preserves_sibling_session() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let chunk_size = 2;
+        let config = EngineConfig {
+            kv_connector: KvConnectorConfig {
+                backend: KvConnectorBackend::LocalTiered(onnx_genai_kv::LocalTieredConfig {
+                    chunk_size,
+                    page_size: chunk_size,
+                    ..onnx_genai_kv::LocalTieredConfig::default()
+                }),
+                isolation: crate::config::KvConnectorIsolation::SharedDomain(
+                    "atomic-tier-rollback".to_string(),
+                ),
+                chunk_size,
+                ..KvConnectorConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::from_dir(&fixture, config)?;
+        let prompt = vec![10, 11, 12, 13, 14, 15];
+        let mut warm = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+        warm.options.max_new_tokens = 1;
+        warm.options.temperature = 0.0;
+        warm.options.stop_on_eos = false;
+        engine.generate(warm)?;
+        assert!(engine.last_connector_stats().stores > 0);
+
+        let sibling = engine.create_session()?;
+        let mut sibling_request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+        sibling_request.options.max_new_tokens = 1;
+        sibling_request.options.temperature = 0.0;
+        sibling_request.options.stop_on_eos = false;
+        engine.generate_in_session(sibling, sibling_request)?;
+        let sibling_len = engine.session_token_count(sibling)?;
+        assert!(sibling_len > 0);
+        let committed_connector_stats = engine.last_connector_stats();
+
+        engine.token_prefix_cache.clear();
+        engine.prefix_cache = PrefixCache::new();
+        let target = engine.create_session()?;
+        let mut state = engine
+            .sessions
+            .remove(&target)
+            .context("target session exists")?;
+        let turn = DecoderTurnParticipant::admit(
+            engine.workflow.next_turn_transaction_id(),
+            &mut state,
+            engine.last_speculative_stats,
+            engine.connector.stats().clone(),
+        )?;
+
+        let restored = engine.prepare_session_prefix(target, &mut state, &prompt)?;
+        assert!(restored > 0, "the aborted turn must exercise tier restore");
+        assert!(
+            engine.last_connector_stats().fetched_tokens > 0,
+            "tier restore activity must be staged inside the admitted turn"
+        );
+        assert!(state.kv_token_count > 0);
+
+        turn.abort(
+            &mut engine,
+            target,
+            &mut state,
+            crate::pipeline::TurnAbortReason::ExecutionFailure,
+        )?;
+        assert!(state.tokens.is_empty());
+        assert_eq!(state.kv_token_count, 0);
+        assert_eq!(engine.kv_cache.len(target)?, 0);
+        engine.sessions.insert(target, state);
+        assert_eq!(engine.session_token_count(target)?, 0);
+        assert_eq!(engine.session_token_count(sibling)?, sibling_len);
+        assert_eq!(
+            engine.last_connector_stats(),
+            committed_connector_stats,
+            "an aborted tier restore must not replace the last committed activity journal"
+        );
+
+        let mut retry = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+        retry.options.max_new_tokens = 2;
+        retry.options.temperature = 0.0;
+        retry.options.stop_on_eos = false;
+        let actual = engine.generate_in_session(target, retry.clone())?;
+        let expected = Engine::from_dir(&fixture, EngineConfig::default())?.generate(retry)?;
+        assert_eq!(actual.token_ids, expected.token_ids);
+        assert_eq!(engine.session_token_count(sibling)?, sibling_len);
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]
@@ -3031,6 +4014,7 @@ mod tests {
             0,
         )?;
         Ok(Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(match shape {
                 crate::pipeline::generation::TestSessionShape::Stateless => {
                     crate::pipeline::generation::test_decoder_runtime()?
@@ -3132,8 +4116,8 @@ mod tests {
             .expect_err("a package publishing tokens with no session state cannot hold a session");
 
         assert_eq!(
-            crate::engine::package_capability_error(&error),
-            Some(PackageCapabilityError::NoSessionState),
+            crate::engine::package_execution_error(&error),
+            Some(PackageExecutionError::NoSessionState),
             "the refusal must be the typed one a front end reads for its status code, \
              not prose that happens to say something similar: {error}"
         );
@@ -3282,6 +4266,91 @@ mod tests {
                     },
                     if refuse { "refused" } else { "admitted" }
                 ));
+            }
+        }
+
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        Ok(())
+    }
+
+    /// #2251: the carried prefix is charged from the map that holds it, not
+    /// gated on a second map that merely agrees today.
+    ///
+    /// `admit_interpreted_generate_request` used to gate the carry on
+    /// `workflow_sessions` (engine-side, keyed by `SessionId`) while reading
+    /// its value from `workflow.worker.session_state` (pipeline-side, keyed by
+    /// `(String, cell)`). `session_prepended_prompt_len` is already total --
+    /// it returns 0 for a session it does not know -- so when the two maps
+    /// agree the gate is redundant, and when they diverge it can only discard
+    /// a real prefix and under-reserve. No input exists for which it helps.
+    ///
+    /// A redundant gate cannot be tested through the agreeing case, which is
+    /// why deleting it left the rest of the suite green. This builds the
+    /// divergence the gate purported to handle: a conversation still live in
+    /// the pipeline while the engine map has forgotten it, which is what any
+    /// future close/reset/eviction path that skips `forget_session` leaves
+    /// behind. The failure mode is silent -- an admission that should have
+    /// been a refusal -- so no existing assertion reaches it.
+    ///
+    /// Each arm gets its own engine. Sharing one would let the admitted arm's
+    /// reservation, which `admit_*` takes and only `complete()` returns, pay
+    /// for the other arm's refusal and let this pass with the carry ignored.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_carried_conversation_is_charged_even_when_the_engine_map_forgot_the_session()
+    -> anyhow::Result<()> {
+        let mut wrong = Vec::new();
+        for (label, seed, refuse) in [
+            ("a forgotten session that has heard nothing", &[][..], false),
+            ("a forgotten session holding 3 tokens", &[7, 8, 9][..], true),
+        ] {
+            // 10 B/token, so this budget holds 3 tokens. A turn stating 1
+            // prompt token and 1 new token needs 2 and fits; the same turn
+            // carrying 3 earlier tokens needs 5 and cannot.
+            let mut engine = interpreted_conversation_engine_with_byte_budget(30)?;
+            let session_id = engine.create_session()?;
+            if !seed.is_empty() {
+                engine
+                    .workflow
+                    .seed_session_conversation(&session_id.to_string(), seed)?;
+            }
+
+            // The divergence itself. `create_session` is what put the id in the
+            // engine-side map, so this genuinely removes it rather than being a
+            // no-op -- asserted below, because a silently-failed removal would
+            // send both arms down the agreeing path and pass while proving
+            // nothing.
+            assert!(
+                engine.workflow_sessions.remove(&session_id).is_some(),
+                "{label}: the engine-side map must have held the session for removing it to mean \
+                 anything"
+            );
+            assert_eq!(
+                engine
+                    .workflow
+                    .session_prepended_prompt_len(&session_id.to_string()),
+                seed.len(),
+                "{label}: the conversation must still be readable from the map the carry is read \
+                 from, or this arm is not testing the carry"
+            );
+
+            let prompt = GeneratePrompt::TokenIds(vec![1]);
+            let error = engine
+                .admit_interpreted_generate_request(session_id, &prompt, 1)
+                .map(|_| String::from("<admitted>"))
+                .unwrap_or_else(|error| error.to_string());
+            // Matching the budget refusal specifically keeps "was refused"
+            // from being satisfied by an unrelated failure.
+            let refused = error.contains("scheduler admission failed: KV byte budget");
+            match (refuse, refused) {
+                (true, false) => wrong.push(format!(
+                    "{label}: the carried conversation was not charged, so a turn over budget was \
+                     admitted; got: {error}"
+                )),
+                (false, true) => wrong.push(format!(
+                    "{label}: a turn the budget has room for was refused: {error}"
+                )),
+                _ => {}
             }
         }
 
@@ -3559,6 +4628,7 @@ mod tests {
         // model. This is the honesty guarantee -- capability is not read off the
         // decode_path alone.
         let mut engine = Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             workflow_sessions: HashMap::new(),
             workflow_session_ids: SharedSessionIds::new(),
@@ -3631,19 +4701,18 @@ mod tests {
 /// correctly on one route and runs past its end on another — which is
 /// unobservable from the API and shows up as a serving-only bug.
 pub(crate) fn apply_eos_policy(options: &mut GenerateOptions, ids: &[TokenId]) {
-    if !options.stop_on_eos {
-        return;
-    }
-    if options.eos_token_id.is_none()
-        && let Some(&id) = ids.first()
-    {
-        options.eos_token_id = Some(id);
-    }
-    for &id in ids {
+    if let Some(id) = options.eos_token_id {
         if !options.eos_token_ids.contains(&id) {
             options.eos_token_ids.push(id);
         }
+        return;
     }
+    if !options.eos_token_ids.is_empty() {
+        options.eos_token_id = options.eos_token_ids.first().copied();
+        return;
+    }
+    options.eos_token_ids.extend_from_slice(ids);
+    options.eos_token_id = options.eos_token_ids.first().copied();
 }
 
 /// The legacy direct decode path cannot be selected.
@@ -3715,33 +4784,5 @@ mod canonical_refusal_tests {
             );
         }
         Ok(())
-    }
-
-    /// A package whose declared end tokens are malformed fails loudly.
-    ///
-    /// Filtering them out would mean the package says "these tokens end me" and
-    /// the runtime silently keeps a subset — generation then runs past an end
-    /// token its author declared, which is invisible from the API.
-    #[test]
-    fn a_malformed_end_token_declaration_is_an_error() {
-        use onnx_genai_metadata::{LiteralValue, ScalarValue};
-        let error = super::literal_token_ids(&LiteralValue::Elements(vec![
-            ScalarValue::Integer(2),
-            ScalarValue::Integer(-1),
-        ]))
-        .expect_err("a negative token id is not a token id");
-        assert!(
-            format!("{error:#}").contains("not a valid token id"),
-            "{error:#}"
-        );
-
-        let error = super::literal_token_ids(&LiteralValue::Scalar(ScalarValue::String(
-            "eos".to_string(),
-        )))
-        .expect_err("a string is not a token id");
-        assert!(
-            format!("{error:#}").contains("must be integers"),
-            "{error:#}"
-        );
     }
 }

@@ -83,6 +83,12 @@ pub enum ShapeInference {
         /// The `N` attribute: the dequantized weight's column count.
         n: usize,
     },
+    /// `pkg.nxrt::DsaIndexSelect` v1: `[B,S,H,D]` query plus indexer inputs
+    /// produces fixed-width indices `[B,1,S,top_k]`.
+    DsaIndexSelect {
+        /// Required positive `top_k` attribute, which fixes the output width.
+        top_k: usize,
+    },
     /// `QLinearMatMul`: `MatMul` semantics between input 0 and input **3**.
     ///
     /// The quantization parameters sit between the two operands
@@ -107,8 +113,12 @@ pub enum ShapeInference {
     GatherBlockQuantized,
     /// Shape op — emits [len(dims[start:end])] as a 1-D int64 tensor.
     ShapeOp { start: i64, end: Option<i64> },
-    /// Squeeze: remove dims listed in `axes` (or all size-1 dims if empty).
+    /// Squeeze: remove dimensions listed in an explicitly provided axes list.
     Squeeze { axes: Vec<i64> },
+    /// Squeeze with absent axes: remove every unit dimension.
+    SqueezeAllUnitDims,
+    /// Opset-13+ Squeeze with present axes read from input[1].
+    SqueezeFromInput,
     /// Unsqueeze: insert unit dims at `axes`.
     Unsqueeze { axes: Vec<i64> },
     /// Reshape — output shape read from input[1] at Compute time.
@@ -122,7 +132,10 @@ pub enum ShapeInference {
         axes: Option<Vec<i64>>,
         noop_with_empty_axes: bool,
     },
-    /// Opset-18+ reduction where axes come from input[1].
+    /// Reduction whose schema carries axes in optional input[1].
+    ///
+    /// This starts at opset 13 for ReduceSum and opset 18 for the other
+    /// reduction-family operators.
     ReductionFromInput {
         keepdims: bool,
         noop_with_empty_axes: bool,
@@ -233,6 +246,7 @@ pub enum ShapeInference {
     Dft {
         onesided: bool,
         axis_attr: Option<i64>,
+        default_axis: i64,
     },
     /// `ai.onnx::Compress`: select along `axis` (or over the flattened input
     /// when absent) using a 1-D Bool `condition`.
@@ -277,6 +291,19 @@ pub enum DeclineReason {
 const KERNEL_SIZED_OUTPUT_STRATEGIES: &[(&str, &str)] =
     &[("", "NonMaxSuppression"), ("", "Unique")];
 
+type ShapeSchemaBuilder =
+    fn(&Node, &[Vec<Option<usize>>], usize) -> Result<ShapeInference, &'static str>;
+
+const DSA_INDEX_SELECT_SCHEMAS: &[(i64, ShapeSchemaBuilder)] = &[(1, build_dsa_index_select)];
+
+fn resolve_shape_schema<T>(opset: i64, schemas: &[(i64, T)]) -> Option<&T> {
+    schemas
+        .iter()
+        .filter(|(since_version, _)| *since_version <= opset)
+        .max_by_key(|(since_version, _)| *since_version)
+        .map(|(_, schema)| schema)
+}
+
 fn kernel_sized_output_strategy(domain: &str, op_type: &str) -> bool {
     let domain = if domain == "ai.onnx" { "" } else { domain };
     KERNEL_SIZED_OUTPUT_STRATEGIES
@@ -310,6 +337,17 @@ impl ShapeInference {
         if let Some(rule) = SharedNativeShapeRule::for_node(node) {
             let fallback = match rule {
                 SharedNativeShapeRule::ConstantOfShape => Self::ConstantOfShape,
+                SharedNativeShapeRule::Dft => Self::Dft {
+                    onesided: node
+                        .attr("onesided")
+                        .and_then(onnx_runtime_ir::Attribute::as_int)
+                        .unwrap_or(0)
+                        != 0,
+                    axis_attr: node
+                        .attr("axis")
+                        .and_then(onnx_runtime_ir::Attribute::as_int),
+                    default_axis: if opset >= 20 { -2 } else { 1 },
+                },
                 SharedNativeShapeRule::Expand => Self::Expand,
                 SharedNativeShapeRule::Stft => Self::Declined {
                     op_type: "STFT".into(),
@@ -467,6 +505,25 @@ impl ShapeInference {
                     reason: DeclineReason::NodeNotShapeable("MatMulNBits without a usable N attribute"),
                 },
             },
+            "DsaIndexSelect" if domain == "pkg.nxrt" => {
+                let Some(build) = resolve_shape_schema(opset, DSA_INDEX_SELECT_SCHEMAS) else {
+                    return Self::Declined {
+                        op_type: op.to_string(),
+                        domain: domain.to_string(),
+                        reason: DeclineReason::NodeNotShapeable(
+                            "DsaIndexSelect has no schema at the imported opset",
+                        ),
+                    };
+                };
+                match build(node, input_shapes, num_outputs) {
+                    Ok(rule) => rule,
+                    Err(reason) => Self::Declined {
+                        op_type: op.to_string(),
+                        domain: domain.to_string(),
+                        reason: DeclineReason::NodeNotShapeable(reason),
+                    },
+                }
+            }
 
             // ── Gemm ──────────────────────────────────────────────────────
             "Gemm" => {
@@ -507,16 +564,16 @@ impl ShapeInference {
 
             // ── Squeeze ───────────────────────────────────────────────────
             "Squeeze" => {
-                // opset 13+: axes from input[1]; earlier: attribute.
-                let axes = if opset >= 13 {
-                    // We can't read input[1] at compile time (data-dependent),
-                    // but we know input_shapes[0] and can remove all size-1 dims
-                    // if no axes input is provided.
-                    ints_attr("axes").unwrap_or_default()
+                // The graph reader injects constant opset-13 axes as an
+                // attribute. Otherwise a present input must be read at Compute;
+                // an absent input retains the schema default (all unit dims).
+                if let Some(axes) = ints_attr("axes") {
+                    Self::Squeeze { axes }
+                } else if opset >= 13 && node.inputs.get(1).is_some_and(Option::is_some) {
+                    Self::SqueezeFromInput
                 } else {
-                    ints_attr("axes").unwrap_or_default()
-                };
-                Self::Squeeze { axes }
+                    Self::SqueezeAllUnitDims
+                }
             }
 
             // ── Unsqueeze ─────────────────────────────────────────────────
@@ -543,10 +600,10 @@ impl ShapeInference {
             "Slice" => Self::SliceData,
 
             // ── Reductions ────────────────────────────────────────────────
-            op_name if is_reduction(op_name) => {
+            op_name if reduction_axes_input_since(op_name).is_some() => {
                 let keepdims = int_attr("keepdims").unwrap_or(1) != 0;
                 let noop_with_empty_axes = int_attr("noop_with_empty_axes").unwrap_or(0) != 0;
-                if opset >= 18 {
+                if reduction_axes_are_input(op_name, opset) {
                     Self::ReductionFromInput {
                         keepdims,
                         noop_with_empty_axes,
@@ -654,6 +711,7 @@ impl ShapeInference {
             "DFT" => Self::Dft {
                 onesided: int_attr("onesided").unwrap_or(0) != 0,
                 axis_attr: int_attr("axis"),
+                default_axis: if opset >= 20 { -2 } else { 1 },
             },
 
             // ── Compress ──────────────────────────────────────────────────
@@ -672,20 +730,97 @@ impl ShapeInference {
     }
 }
 
-fn is_reduction(op: &str) -> bool {
-    matches!(
-        op,
-        "ReduceMean"
-            | "ReduceSum"
-            | "ReduceProd"
-            | "ReduceMax"
-            | "ReduceMin"
-            | "ReduceL1"
-            | "ReduceL2"
-            | "ReduceLogSum"
-            | "ReduceLogSumExp"
-            | "ReduceSumSquare"
-    )
+fn reduction_axes_input_since(op: &str) -> Option<i64> {
+    // ONNX moved ReduceSum.axes to optional input[1] in schema 13. The rest of
+    // this reduction family retained the attribute through schema 17 and moved
+    // at schema 18. This is also the reduction-family census: a newly supported
+    // operator must choose its own boundary rather than inherit a blanket one.
+    match op {
+        "ReduceSum" => Some(13),
+        "ReduceMean" | "ReduceProd" | "ReduceMax" | "ReduceMin" | "ReduceL1" | "ReduceL2"
+        | "ReduceLogSum" | "ReduceLogSumExp" | "ReduceSumSquare" => Some(18),
+        _ => None,
+    }
+}
+
+fn reduction_axes_are_input(op: &str, opset: i64) -> bool {
+    reduction_axes_input_since(op).is_some_and(|since| opset >= since)
+}
+
+fn build_dsa_index_select(
+    node: &Node,
+    input_shapes: &[Vec<Option<usize>>],
+    num_outputs: usize,
+) -> Result<ShapeInference, &'static str> {
+    if node
+        .attributes
+        .keys()
+        .any(|name| !matches!(name.as_str(), "top_k" | "scale" | "weights_scale"))
+    {
+        return Err("DsaIndexSelect has an attribute outside the frozen v1 ABI");
+    }
+    if node.inputs.len() != 4 || input_shapes.len() != 4 {
+        return Err("DsaIndexSelect requires four input shapes");
+    }
+    if node.inputs.iter().any(Option::is_none) {
+        return Err("DsaIndexSelect inputs are all required");
+    }
+    if num_outputs != 1 {
+        return Err("DsaIndexSelect requires exactly one output");
+    }
+    let top_k = node
+        .attr("top_k")
+        .and_then(|attribute| attribute.as_int())
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|&value| value > 0)
+        .ok_or("DsaIndexSelect requires a positive integer top_k attribute")?;
+    if !node
+        .attr("scale")
+        .and_then(|attribute| attribute.as_float())
+        .is_some_and(|value| value.is_finite() && value > 0.0)
+    {
+        return Err("DsaIndexSelect requires a finite positive float scale attribute");
+    }
+    if node.attr("weights_scale").is_some_and(|attribute| {
+        attribute
+            .as_float()
+            .is_none_or(|value| !value.is_finite() || value <= 0.0)
+    }) {
+        return Err("DsaIndexSelect weights_scale must be a finite positive float");
+    }
+
+    let expected_ranks = [4usize, 3, 3, 4];
+    if input_shapes
+        .iter()
+        .zip(expected_ranks)
+        .any(|(shape, rank)| shape.len() != rank)
+    {
+        return Err("DsaIndexSelect input ranks must be query=4, key=3, weights=3, bias=4");
+    }
+
+    let same_static = |left: (usize, usize), right: (usize, usize)| match (
+        input_shapes[left.0][left.1],
+        input_shapes[right.0][right.1],
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    };
+    if !same_static((0, 0), (1, 0))
+        || !same_static((0, 0), (2, 0))
+        || !same_static((0, 0), (3, 0))
+        || !same_static((0, 1), (2, 1))
+        || !same_static((0, 2), (2, 2))
+        || !same_static((0, 3), (1, 2))
+        || !same_static((0, 1), (3, 2))
+        || !same_static((1, 1), (3, 3))
+    {
+        return Err("DsaIndexSelect static input dimensions are inconsistent");
+    }
+    if input_shapes[3][1].is_some_and(|heads| heads != 1) {
+        return Err("DsaIndexSelect attention_bias head-broadcast dimension must be 1");
+    }
+
+    Ok(ShapeInference::DsaIndexSelect { top_k })
 }
 
 fn build_conv(node: &Node, input_shapes: &[Vec<Option<usize>>]) -> Option<ShapeInference> {
@@ -855,14 +990,20 @@ pub struct SubgraphRouting {
 /// an illegal host-pointer dereference. ORT owns scratch memory for the
 /// duration of the `Compute` call, which exactly matches an intermediate's
 /// lifetime, so `IntermediateBuf` never frees `scratch_ptr`.
-pub struct IntermediateBuf {
-    pub data: Vec<u8>,
+pub(crate) struct IntermediateBuf {
+    pub(crate) data: Vec<u8>,
     /// When non-null, the buffer is backed by ORT scratch memory (possibly on
     /// device) instead of the host `data` vector. Not owned — never freed here.
-    pub scratch_ptr: *mut u8,
-    pub shape: Vec<usize>,
-    pub strides: Vec<i64>,
-    pub dtype: DataType,
+    pub(crate) scratch_ptr: *mut u8,
+    /// Inline rather than `Vec` because every buffer-sink output built one of
+    /// each per node, and a rank that fits inline needs no allocator at all.
+    /// The struct is wider as a result and is moved twice on the routed path
+    /// (staged, then installed), so this trades two `malloc`/`free` pairs for a
+    /// larger `memcpy`; see the PR for the measured net.
+    pub(crate) shape: crate::dim_vec::DimVec<usize>,
+    pub(crate) strides: crate::dim_vec::DimVec<i64>,
+    pub(crate) dtype: DataType,
+    pub(crate) device: DeviceId,
 }
 
 impl IntermediateBuf {
@@ -885,13 +1026,13 @@ impl IntermediateBuf {
     }
 
     /// Immutable view backed by this buffer.
-    pub fn view(&self) -> TensorView<'_> {
+    pub(crate) fn view(&self) -> TensorView<'_> {
         TensorView::new(
             DevicePtr(self.ptr().cast()),
             self.dtype,
             &self.shape,
             &self.strides,
-            onnx_runtime_ir::DeviceId::cpu(),
+            self.device,
         )
     }
 }
@@ -1994,7 +2135,7 @@ unsafe fn mem_info_is_device(api: &ort::OrtApi, mem_info: *const ort::OrtMemoryI
 fn host_operand_indices(strategy: &ShapeInference) -> &'static [usize] {
     match strategy {
         ShapeInference::SharedNative { fallback, .. } => host_operand_indices(fallback),
-        ShapeInference::ReshapeData { .. } => &[1],
+        ShapeInference::ReshapeData { .. } | ShapeInference::SqueezeFromInput => &[1],
         ShapeInference::SliceData => &[1, 2, 3, 4],
         ShapeInference::ReductionFromInput { .. } => &[1],
         _ => &[],
@@ -2253,6 +2394,10 @@ unsafe fn stage_host_boundary_inputs(
 ///   * `StandardAttention` (`standard_attention.rs`), single-token single-batch
 ///     decode only — every other geometry is `StepScoped` and *is* served: the
 ///     score and staged-K/V scratch is pooled or per-call inside `run`.
+///   * `DsaIndexSelect` (`dsa_index_select.rs`) declares no external workspace:
+///     its kernel-owned slot grows only outside capture and remains pointer-stable
+///     from warmup through graph replay, so the plugin and native executors use
+///     the same production path.
 ///   * `MatMulNBits` bf16 activations: the `Bf16Scratch` staging arena is
 ///     always self-owned and is listed here only because it is easy to assume
 ///     otherwise — that path declares [`WorkspaceRequirement::NONE`], so it is
@@ -2554,6 +2699,8 @@ unsafe extern "C" fn compute_execute(
                 inputs,
                 owned: owned_outputs,
                 slots: slot_map,
+                shapes,
+                host_pool,
             } = scratch;
             if let Err(e) = unsafe { read_inputs_into(api_ref, kernel_context, inputs) } {
                 return fail_status(&format!("Compute: {e}"));
@@ -2906,14 +3053,29 @@ unsafe extern "C" fn compute_execute(
                                                 ));
                                             }
                                         };
+                                        let device = match unsafe {
+                                            crate::kernel_ctx::device_from_memory_info(
+                                                api_ref,
+                                                mem_info,
+                                                format_args!(
+                                                    "node {node_idx} dynamic intermediate"
+                                                ),
+                                            )
+                                        } {
+                                            Ok(device) => device,
+                                            Err(error) => return fail_status(&error),
+                                        };
                                         new_bufs.push((
                                             *buffer_index,
                                             IntermediateBuf {
                                                 data: Vec::new(),
                                                 scratch_ptr: scratch,
-                                                shape: output.shape.clone(),
+                                                shape: crate::dim_vec::DimVec::from_slice(
+                                                    &output.shape,
+                                                ),
                                                 strides: contiguous_strides(&output.shape),
                                                 dtype: output.dtype,
+                                                device,
                                             },
                                         ));
                                         slot_kinds.push(RoutedSlotKind::Buffer);
@@ -2962,7 +3124,7 @@ unsafe extern "C" fn compute_execute(
                                     ));
                                 }
                                 if let Some(stale) = intermediates[buffer_index].take() {
-                                    recycle_host_intermediate(stale.data);
+                                    host_pool.recycle_intermediate(stale.data);
                                 }
                                 intermediates[buffer_index] = Some(buffer);
                             }
@@ -2970,7 +3132,7 @@ unsafe extern "C" fn compute_execute(
                                 &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
                             {
                                 if let Some(dead) = intermediates[buffer_index].take() {
-                                    recycle_host_intermediate(dead.data);
+                                    host_pool.recycle_intermediate(dead.data);
                                 }
                             }
                             continue;
@@ -3044,9 +3206,12 @@ unsafe extern "C" fn compute_execute(
                                         IntermediateBuf {
                                             data: output.bytes,
                                             scratch_ptr: std::ptr::null_mut(),
-                                            shape: output.shape,
+                                            shape: crate::dim_vec::DimVec::from_slice(
+                                                &output.shape,
+                                            ),
                                             strides,
                                             dtype: output.dtype,
+                                            device: DeviceId::cpu(),
                                         },
                                     ));
                                 }
@@ -3068,7 +3233,7 @@ unsafe extern "C" fn compute_execute(
                                 ));
                             }
                             if let Some(stale) = intermediates[buf_idx].take() {
-                                recycle_host_intermediate(stale.data);
+                                host_pool.recycle_intermediate(stale.data);
                             }
                             intermediates[buf_idx] = Some(buf);
                         }
@@ -3076,7 +3241,7 @@ unsafe extern "C" fn compute_execute(
                             &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
                         {
                             if let Some(dead) = intermediates[buf_idx].take() {
-                                recycle_host_intermediate(dead.data);
+                                host_pool.recycle_intermediate(dead.data);
                             }
                         }
                         continue;
@@ -3084,12 +3249,12 @@ unsafe extern "C" fn compute_execute(
 
                     // Infer output shapes.
                     let shape_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
-                    let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return fail_status(&format!("Compute: shape inference failed: {e}"));
-                        }
-                    };
+                    if let Err(e) =
+                        infer_shapes_into(&entry.shape_inference, &kernel_inputs, shapes)
+                    {
+                        return fail_status(&format!("Compute: shape inference failed: {e}"));
+                    }
+                    let output_shapes = &*shapes;
                     shape_probe.end();
 
                     // Execute — dispatch based on sinks.
@@ -3219,12 +3384,24 @@ unsafe extern "C" fn compute_execute(
                         let numel: usize = shape.iter().product();
                         let byte_len = dtype.byte_size() * numel;
                         let strides = contiguous_strides(shape);
-                        let (data, scratch_ptr) = match intermediate_scratch {
+                        let (data, scratch_ptr, device) = match intermediate_scratch {
                             Some(mem_info) => {
                                 match unsafe {
                                     alloc_scratch(api_ref, kernel_context, mem_info, byte_len)
                                 } {
-                                    Ok(ptr) => (Vec::new(), ptr.cast::<u8>()),
+                                    Ok(ptr) => {
+                                        let device = match unsafe {
+                                            crate::kernel_ctx::device_from_memory_info(
+                                                api_ref,
+                                                mem_info,
+                                                format_args!("node {node_idx} intermediate output"),
+                                            )
+                                        } {
+                                            Ok(device) => device,
+                                            Err(error) => return fail_status(&error),
+                                        };
+                                        (Vec::new(), ptr.cast::<u8>(), device)
+                                    }
                                     Err(e) => {
                                         return fail_status(&format!(
                                             "Compute: intermediate scratch alloc failed: {e}"
@@ -3232,23 +3409,32 @@ unsafe extern "C" fn compute_execute(
                                     }
                                 }
                             }
-                            None => (take_host_intermediate(byte_len), std::ptr::null_mut()),
+                            None => (
+                                host_pool.take_intermediate(byte_len),
+                                std::ptr::null_mut(),
+                                DeviceId::cpu(),
+                            ),
                         };
                         new_bufs.push((
                             buf_idx,
                             IntermediateBuf {
                                 data,
                                 scratch_ptr,
-                                shape: shape.clone(),
+                                // `shape` is borrowed from the reusable buffer,
+                                // which the next node overwrites, so the buf
+                                // owns a copy. Now an inline copy rather than
+                                // an allocation, for a rank that fits.
+                                shape: (*shape).clone(),
                                 strides,
                                 dtype,
+                                device,
                             },
                         ));
                     }
 
                     // Collect all output views using the per-slot view map so
                     // positions stay aligned even when absent slots are present.
-                    let absent_shapes: &[Vec<usize>] = &output_shapes;
+                    let absent_shapes: &[crate::dim_vec::DimVec<usize>] = output_shapes;
                     // One entry per *absent* slot, not per output slot. Only
                     // absent slots read these, and a node with an absent output is
                     // the exception, so building them for every output cost an
@@ -3260,7 +3446,15 @@ unsafe extern "C" fn compute_execute(
                         absent_scratch.iter().map(|(slot, _, _)| *slot),
                         absent_shapes,
                     );
-                    let mut all_output_views: Vec<_> = {
+                    // Same stack storage as the single-node path's output views
+                    // below, for the same reason and with the same seed. On the
+                    // routed path it is paid once per *node* rather than once per
+                    // `Run`, so a 100-node graph collected -- and freed -- a
+                    // hundred short-lived vectors of views per `Run` for storage
+                    // that never outlives the node that built it.
+                    let mut inline_views;
+                    let mut heap_views;
+                    let all_output_views: &mut [TensorMut<'_>] = {
                         // Taken lazily. Collecting these into their own `Vec` and
                         // immediately draining it built a second vector of views per
                         // node, for every node of every `Run`, to hand each view
@@ -3268,30 +3462,60 @@ unsafe extern "C" fn compute_execute(
                         // doing this; the routed path is where it is paid per node.
                         let mut ort_iter = ort_outputs.iter_mut().map(|o| o.view_mut());
                         let mut buf_iter = new_bufs.iter_mut();
-                        slot_kinds
-                            .iter()
-                            .enumerate()
-                            .map(|(slot_idx, kind)| match kind {
-                                RoutedSlotKind::Ort => ort_iter.next().unwrap(),
-                                RoutedSlotKind::Buffer => {
-                                    let (_, buf) = buf_iter.next().unwrap();
-                                    buf_view_mut(buf)
-                                }
-                                RoutedSlotKind::Absent(idx) => {
-                                    let (_, scratch_buf, dtype) = &mut absent_scratch[*idx];
-                                    let shape = &absent_shapes[slot_idx];
-                                    let strides = &absent_strides_storage[*idx];
-                                    TensorMut::new(
-                                        DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
-                                        *dtype,
-                                        shape.as_slice(),
-                                        strides.as_slice(),
-                                        DeviceId::cpu(),
-                                    )
-                                    .mark_absent()
-                                }
-                            })
-                            .collect()
+                        let views =
+                            slot_kinds
+                                .iter()
+                                .enumerate()
+                                .map(|(slot_idx, kind)| match kind {
+                                    RoutedSlotKind::Ort => ort_iter.next().unwrap(),
+                                    RoutedSlotKind::Buffer => {
+                                        let (_, buf) = buf_iter.next().unwrap();
+                                        buf_view_mut(buf)
+                                    }
+                                    RoutedSlotKind::Absent(idx) => {
+                                        let (_, scratch_buf, dtype) = &mut absent_scratch[*idx];
+                                        let shape = &absent_shapes[slot_idx];
+                                        let strides = &absent_strides_storage[*idx];
+                                        TensorMut::new(
+                                            DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
+                                            *dtype,
+                                            shape.as_slice(),
+                                            strides.as_slice(),
+                                            DeviceId::cpu(),
+                                        )
+                                        .mark_absent()
+                                    }
+                                });
+                        if slot_kinds.len() <= INLINE_OPERANDS {
+                            inline_views = std::array::from_fn::<_, INLINE_OPERANDS, _>(|_| {
+                                absent_output_view()
+                            });
+                            // `zip` stops at the shorter side, which is `views`
+                            // here -- the seeded tail past `slot_kinds.len()` is
+                            // left alone and never handed to the kernel.
+                            for (dst, view) in inline_views.iter_mut().zip(views) {
+                                *dst = view;
+                            }
+                            &mut inline_views[..slot_kinds.len()]
+                        } else {
+                            // Unreachable for every op this EP can currently
+                            // claim -- four is the widest any of them gets
+                            // (`SkipLayerNormalization` and `AttentionStd` are
+                            // the ones that reach it), and a node whose shapes
+                            // cannot be inferred is declined before it ever
+                            // reaches here. `Unique` is not a counter-example
+                            // despite also having four: kernel-sized outputs
+                            // take the branch above and never arrive. Kept
+                            // because that is a fact about today's table rather
+                            // than about this code, and because the alternative
+                            // to a heap arm is a panic on the first op that adds
+                            // a fifth output.
+                            crate::dispatch_probe::count(
+                                crate::dispatch_probe::Event::DispatchAlloc,
+                            );
+                            heap_views = Vec::from_iter(views);
+                            &mut heap_views[..]
+                        }
                     };
 
                     let plans = match exported.workspace_plan_cache(node_idx) {
@@ -3335,7 +3559,7 @@ unsafe extern "C" fn compute_execute(
                     let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
                     if let Err(e) = entry.kernel.execute_with_workspace(
                         &kernel_inputs,
-                        &mut all_output_views,
+                        all_output_views,
                         workspace,
                     ) {
                         return fail_status(&format!("Compute: kernel execution failed: {e}"));
@@ -3352,7 +3576,7 @@ unsafe extern "C" fn compute_execute(
                             ));
                         }
                         if let Some(stale) = intermediates[buf_idx].take() {
-                            recycle_host_intermediate(stale.data);
+                            host_pool.recycle_intermediate(stale.data);
                         }
                         intermediates[buf_idx] = Some(buf);
                     }
@@ -3365,13 +3589,13 @@ unsafe extern "C" fn compute_execute(
                         &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
                     {
                         if let Some(dead) = intermediates[buf_idx].take() {
-                            recycle_host_intermediate(dead.data);
+                            host_pool.recycle_intermediate(dead.data);
                         }
                     }
                 }
 
                 for slot in intermediates.drain(..).flatten() {
-                    recycle_host_intermediate(slot.data);
+                    host_pool.recycle_intermediate(slot.data);
                 }
             } else if exported.entries.len() == 1 {
                 // ── Fast path: single-kernel subgraph ─────────────────────────
@@ -3588,12 +3812,10 @@ unsafe extern "C" fn compute_execute(
                     return ok_status();
                 }
                 let lookup_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
-                let output_shapes = match infer_shapes(&entry.shape_inference, kernel_inputs) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return fail_status(&format!("Compute: shape inference failed: {e}"));
-                    }
-                };
+                if let Err(e) = infer_shapes_into(&entry.shape_inference, kernel_inputs, shapes) {
+                    return fail_status(&format!("Compute: shape inference failed: {e}"));
+                }
+                let output_shapes = &*shapes;
                 lookup_probe.end();
                 // Allocate outputs. Absent slots get a local scratch buffer so the
                 // kernel sees the full output arity and can index by position,
@@ -3683,7 +3905,7 @@ unsafe extern "C" fn compute_execute(
                 // `TensorMut`s. `absent_slot_strides` builds one entry per *absent*
                 // slot, so a node with no absent outputs -- every elementwise op,
                 // which is most of what reaches this path -- allocates nothing here.
-                let absent_shapes: &[Vec<usize>] = &output_shapes;
+                let absent_shapes: &[crate::dim_vec::DimVec<usize>] = output_shapes;
                 // See the routed path. `slot_map` pushes `Absent(idx)` with
                 // increasing `idx`, so filtering it in slot order yields the strides
                 // in absent-index order.
@@ -4115,6 +4337,40 @@ pub(crate) struct RunScratch {
     owned: Vec<crate::kernel_ctx::OwnedOutput>,
     /// Which output slots are ORT-allocated and which are absent scratch.
     slots: Vec<SlotKind>,
+    /// Inferred output shapes for the node being executed.
+    ///
+    /// Lives here so the storage outlives the node *and* the `Run`.
+    /// [`infer_shapes`] returns a fresh `Vec<Vec<usize>>` per node per `Run`,
+    /// and at depth 100 that measured 277.2 Ir/node: 57.4 for the inner
+    /// `to_vec`, 63.0 for the one-element `vec![_]` (which lowers to
+    /// `box_new_uninit`), and 78.4 each for the drop glue and the `free`. On
+    /// top of that sits a proportional share of glibc's `_int_free`, the
+    /// single largest allocator line in the profile at 482.4 Ir/node
+    /// aggregated over every Rust deallocation.
+    ///
+    /// A per-`Run` local would leave depth 1 exactly where it started, since
+    /// there the buffer would be allocated and dropped for its single node.
+    /// Parking it with the rest of the scratch is what makes the fixed-`Run`
+    /// cost fall too.
+    shapes: Vec<crate::dim_vec::DimVec<usize>>,
+    /// Retired host intermediate storage, reused by later nodes and later
+    /// `Run`s on this thread.
+    ///
+    /// Lives here for exactly the reason given above this struct: it used to be
+    /// a thread-local of its own, so every take and every recycle paid a
+    /// separate `__tls_get_addr` and a separate `RefCell` borrow. Those are
+    /// **per buffer per node**, not per `Run`, so on a 100-node chain the
+    /// pooling machinery resolved the thread-local ~200 times to serve ~100
+    /// buffers. Sharing `RunScratch`'s single resolution makes it zero extra.
+    ///
+    /// **Deliberately not cleared by [`RunScratch::clear_and_bound`].** Every
+    /// other field here is per-`Run` state that would be a dangling borrow if
+    /// it outlived its `Run`; this one is the opposite -- it is owned, pointer
+    /// free `Vec<u8>` storage whose entire purpose is to outlive the `Run` that
+    /// retired it. Clearing it would silently turn every reuse back into a
+    /// `malloc`/`free` pair while leaving every test green, so
+    /// `a_pooled_buffer_survives_the_run_that_retired_it` pins it.
+    host_pool: HostPool,
 }
 
 /// Capacity, in elements, above which per-`Run` scratch is dropped instead of
@@ -4163,18 +4419,24 @@ fn absent_output_view<'a>() -> TensorMut<'a> {
 thread_local! {
     /// This thread's parked [`RunScratch`].
     ///
-    /// Thread-local for the same reason as `HOST_INTERMEDIATE_POOL`: `Compute`
-    /// runs on whichever thread ORT calls it from, and sharing would need a
-    /// lock on the hot path to buy nothing.
+    /// Thread-local because `Compute` runs on whichever thread ORT calls it
+    /// from, and sharing would need a lock on the hot path to buy nothing --
+    /// scratch and pooled storage are only ever reused by a later call on the
+    /// same thread.
     ///
-    /// Every vector is cleared when the `Run` that borrowed it leaves --
-    /// including by unwinding -- so no pointer into a finished `Run`'s ORT
-    /// values is ever retained here between calls.
+    /// Every field that can hold a pointer into a finished `Run`'s ORT values
+    /// is cleared when the `Run` that borrowed it leaves -- including by
+    /// unwinding -- so none is ever retained here between calls. `host_pool` is
+    /// the one field deliberately kept, and it is kept precisely because it
+    /// holds no pointers: only owned `Vec<u8>` storage for the next `Run` on
+    /// this thread to reuse. See [`RunScratch::clear_and_bound`].
     static RUN_SCRATCH: std::cell::RefCell<RunScratch> =
         const { std::cell::RefCell::new(RunScratch {
             inputs: Vec::new(),
             owned: Vec::new(),
             slots: Vec::new(),
+            shapes: Vec::new(),
+            host_pool: HostPool { slots: Vec::new() },
         }) };
 }
 
@@ -4247,6 +4509,7 @@ impl RunScratch {
         self.inputs.clear();
         self.owned.clear();
         self.slots.clear();
+        self.shapes.clear();
 
         if self.inputs.capacity() > SCRATCH_MAX_CAPACITY {
             self.inputs = Vec::new();
@@ -4261,30 +4524,44 @@ impl RunScratch {
             self.owned = Vec::new();
             self.slots = Vec::new();
         }
+
+        // Judged on its own, for the same spine-capacity reason as the pair
+        // above. Any heap a spilled `DimVec` (rank > INLINE_RANK) owned is
+        // already gone: `clear()` drops the elements, and that is where the
+        // out-of-line buffer is released. What this bounds is only the outer
+        // Vec's own capacity.
+        if self.shapes.capacity() > SCRATCH_MAX_CAPACITY {
+            self.shapes = Vec::new();
+        }
+
+        // `host_pool` is *not* cleared, and is not judged against
+        // `SCRATCH_MAX_CAPACITY` either. It is not per-`Run` state: it holds
+        // retired tensor storage for the next `Run` on this thread to reuse,
+        // which is the entire point of pooling, and its own bound is
+        // `HOST_INTERMEDIATE_POOL_SLOTS` applied at recycle time. Clearing it
+        // here would be a pure pessimisation that no correctness test could
+        // see.
     }
 }
 
-/// How many retired host intermediates one thread keeps for reuse.
+/// How many retired host intermediates one [`RunScratch`] keeps for reuse.
 ///
 /// A routed subgraph's live set is bounded by its widest cut, which is small
 /// for the elementwise chains this path actually sees. Eight slots cover those
 /// without letting a pathological graph pin an unbounded amount of memory: past
 /// the cap, retired buffers are simply dropped.
+///
+/// This is the pool's *only* bound. `RunScratch::clear_and_bound` deliberately
+/// leaves `host_pool` alone, so nothing else will trim it.
 const HOST_INTERMEDIATE_POOL_SLOTS: usize = 8;
 
-thread_local! {
-    /// Retired host intermediate storage, per thread.
-    ///
-    /// Thread-local rather than shared: `Compute` runs on whichever thread ORT
-    /// calls it from, and a shared pool would need a lock on the hot path to
-    /// buy nothing — buffers are only ever reused by the call that retired
-    /// them or a later call on the same thread.
-    static HOST_INTERMEDIATE_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
 /// Storage for one host intermediate of `len` bytes, reusing a retired buffer
-/// when one is large enough.
+/// from this pool when one is large enough.
+///
+/// The pool is reached through `&mut self` rather than a thread-local of its
+/// own: this runs once per buffer per node, so a thread-local here cost a
+/// `__tls_get_addr` and a `RefCell` borrow on every call. It now shares the
+/// single resolution [`with_run_scratch`] already makes for the whole `Run`.
 ///
 /// The returned bytes are initialized but **not** guaranteed to be zero when a
 /// retired buffer is reused. That is deliberate, and it is not a weakening of
@@ -4300,9 +4577,23 @@ thread_local! {
 /// Debug builds do fill reused storage, with a poison pattern rather than
 /// zeros, so a kernel that leaves part of its output unwritten fails loudly in
 /// tests instead of inheriting something plausible.
-fn take_host_intermediate(len: usize) -> Vec<u8> {
-    HOST_INTERMEDIATE_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
+/// Retired host intermediate storage belonging to one [`RunScratch`].
+///
+/// A newtype rather than a bare `Vec<Vec<u8>>` so that the pool a call site
+/// uses cannot be written by accident. The whole value of parking this in
+/// `RunScratch` is that *these particular* call sites reach *that particular*
+/// pool; with a bare vector, `take_intermediate(&mut Vec::new(), n)` type
+/// checks, silently reverts every reuse to a `malloc`/`free` pair, and leaves
+/// the suite green -- an independent review of this change found exactly that
+/// mutation. It no longer compiles.
+#[derive(Default)]
+pub(crate) struct HostPool {
+    slots: Vec<Vec<u8>>,
+}
+
+impl HostPool {
+    fn take_intermediate(&mut self, len: usize) -> Vec<u8> {
+        let pool = &mut self.slots;
         match pool.iter().position(|buf| buf.capacity() >= len) {
             Some(pos) => {
                 let mut buf = pool.swap_remove(pos);
@@ -4326,34 +4617,27 @@ fn take_host_intermediate(len: usize) -> Vec<u8> {
             }
             None => vec![0u8; len],
         }
-    })
-}
-
-/// Hand a dead host intermediate back for reuse.
-///
-/// Buffers backed by ORT scratch have an empty `data` vector — they carry a
-/// borrowed `scratch_ptr` instead — so they are dropped here rather than
-/// pooled.
-fn recycle_host_intermediate(buf: Vec<u8>) {
-    if buf.capacity() == 0 {
-        return;
     }
-    HOST_INTERMEDIATE_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if pool.len() < HOST_INTERMEDIATE_POOL_SLOTS {
-            pool.push(buf);
-        }
-    });
-}
 
-/// Empty this thread's pool.
-///
-/// Only for tests: the pool is per-thread, and libtest may run several tests on
-/// one thread, so a test that asserts *which* buffer comes back has to start
-/// from a known state rather than inherit whatever an earlier test retired.
-#[cfg(test)]
-fn drain_host_intermediate_pool() {
-    HOST_INTERMEDIATE_POOL.with(|pool| pool.borrow_mut().clear());
+    /// Hand a dead host intermediate back for reuse.
+    ///
+    /// Buffers backed by ORT scratch have an empty `data` vector — they carry a
+    /// borrowed `scratch_ptr` instead — so they are dropped here rather than
+    /// pooled.
+    fn recycle_intermediate(&mut self, buf: Vec<u8>) {
+        if buf.capacity() == 0 {
+            return;
+        }
+        if self.slots.len() < HOST_INTERMEDIATE_POOL_SLOTS {
+            self.slots.push(buf);
+        }
+    }
+
+    /// How many buffers are parked. Only the tests care.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 /// For each intermediate buffer, the highest node index that reads it, or
@@ -4434,18 +4718,25 @@ fn retirements_per_node(
 /// in, so the two agree by construction.
 fn absent_slot_strides(
     absent_slots: impl Iterator<Item = usize>,
-    shapes: &[Vec<usize>],
-) -> Vec<Vec<i64>> {
+    shapes: &[crate::dim_vec::DimVec<usize>],
+) -> Vec<crate::dim_vec::DimVec<i64>> {
     absent_slots
         .map(|slot| match shapes.get(slot) {
             Some(shape) => contiguous_strides(shape),
-            None => Vec::new(),
+            None => crate::dim_vec::DimVec::new(),
         })
         .collect()
 }
 
-fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
-    let mut strides = vec![1i64; shape.len()];
+fn contiguous_strides(shape: &[usize]) -> crate::dim_vec::DimVec<i64> {
+    // `zeroed` then set the last element, rather than filling with 1: every
+    // element except the last is overwritten by the loop below, so seeding all
+    // of them costs a pass that is immediately thrown away. A rank-0 shape has
+    // no last element and correctly yields an empty result.
+    let mut strides = crate::dim_vec::DimVec::<i64>::zeroed(shape.len());
+    if let Some(last) = strides.last_mut() {
+        *last = 1;
+    }
     for i in (0..shape.len().saturating_sub(1)).rev() {
         strides[i] = strides[i + 1] * shape[i + 1] as i64;
     }
@@ -4464,7 +4755,7 @@ fn buf_view_mut(buf: &mut IntermediateBuf) -> onnx_runtime_ep_api::tensor::Tenso
         buf.dtype,
         &buf.shape,
         &buf.strides,
-        onnx_runtime_ir::DeviceId::cpu(),
+        buf.device,
     )
 }
 
@@ -4629,6 +4920,83 @@ pub fn shared_native_rule_names_for_test() -> Vec<&'static str> {
         .collect()
 }
 
+/// Infer output shapes into reusable storage, allocating nothing on the
+/// elementwise paths the dispatch grid actually measures.
+///
+/// Not on *every* path: the shared-native arm still receives an owned
+/// `Vec<Vec<usize>>` from `infer_shared_node` and copies it in, which is
+/// strictly more work than returning it would have been. That arm is here to
+/// route a *declining* rule's fallback through the fast arms, not to save an
+/// allocation on resolve, and it is off the measured path.
+///
+/// [`infer_shapes`] hands back a fresh `Vec<Vec<usize>>` for every node of
+/// every `Run`. Callers only ever read it as a slice and drop it a few hundred
+/// instructions later, so the container is pure overhead: measured at depth
+/// 100, 277.2 Ir/node across the two allocations and their frees, plus a share
+/// of the `_int_free` line that dominates the allocator profile.
+///
+/// Only the strategies confirmed hot in that profile are reimplemented here;
+/// everything else delegates to [`infer_shapes`] verbatim and merely copies the
+/// result in. Two reasons for keeping the split that narrow. The inference
+/// rules are the correctness-critical part and there are forty of them, so
+/// duplicating them wholesale to save an allocation on a cold path would be a
+/// bad trade. And the arms that *are* duplicated are each a bounds check plus a
+/// copy, small enough to audit by eye — with
+/// `infer_shapes_into_matches_infer_shapes` standing behind them as a
+/// differential oracle so the two paths cannot drift apart silently.
+fn infer_shapes_into(
+    strategy: &ShapeInference,
+    inputs: &[TensorView<'_>],
+    out: &mut Vec<crate::dim_vec::DimVec<usize>>,
+) -> Result<(), String> {
+    use crate::dim_vec::DimVec;
+    match strategy {
+        // `Ok(vec![inputs[idx].shape.to_vec()])`, without the two allocations.
+        ShapeInference::SameAsInput(idx) => {
+            let idx = *idx;
+            if idx >= inputs.len() {
+                return Err(format!(
+                    "SameAsInput({idx}): only {} inputs present",
+                    inputs.len()
+                ));
+            }
+            out.clear();
+            out.push(DimVec::from_slice(inputs[idx].shape));
+            Ok(())
+        }
+
+        // A single operand broadcasts against nothing, so the fold in
+        // `infer_shapes` runs zero times and the answer is that operand's own
+        // shape. Two or more still have to go through `broadcast_shapes`, which
+        // allocates a fresh shape per step regardless of who calls it.
+        ShapeInference::ElementwiseBroadcast if inputs.len() == 1 => {
+            out.clear();
+            out.push(DimVec::from_slice(inputs[0].shape));
+            Ok(())
+        }
+
+        // Recurse rather than delegate, so a shared-native rule that declines
+        // still reaches the fast arms through its own fallback.
+        ShapeInference::SharedNative { node, fallback } => match infer_shared_node(node, inputs) {
+            SharedShapeResult::Resolved(shapes) => {
+                out.clear();
+                out.extend(shapes.iter().map(|s| DimVec::from_slice(s)));
+                Ok(())
+            }
+            SharedShapeResult::SymbolicOrUnknown | SharedShapeResult::Rejected(_) => {
+                infer_shapes_into(fallback, inputs, out)
+            }
+        },
+
+        other => {
+            let shapes = infer_shapes(other, inputs)?;
+            out.clear();
+            out.extend(shapes.iter().map(|s| DimVec::from_slice(s)));
+            Ok(())
+        }
+    }
+}
+
 /// Infer output shapes from the shape inference strategy and input views.
 fn infer_shapes(
     strategy: &ShapeInference,
@@ -4669,6 +5037,58 @@ fn infer_shapes(
                 ));
             }
             Ok(vec![inputs[idx].shape.to_vec()])
+        }
+
+        ShapeInference::DsaIndexSelect { top_k } => {
+            if inputs.len() != 4 {
+                return Err(format!(
+                    "DsaIndexSelect: expected 4 inputs, got {}",
+                    inputs.len()
+                ));
+            }
+            for (index, input) in inputs.iter().take(3).enumerate() {
+                if !matches!(
+                    input.dtype,
+                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
+                ) {
+                    return Err(format!(
+                        "DsaIndexSelect: input {index} must be Float32, Float16, or BFloat16"
+                    ));
+                }
+            }
+            if inputs[1].dtype != inputs[0].dtype || inputs[2].dtype != inputs[0].dtype {
+                return Err("DsaIndexSelect: query, key, and weights dtypes must match".into());
+            }
+            if inputs[3].dtype != DataType::Float32 {
+                return Err("DsaIndexSelect: attention_bias must be Float32".into());
+            }
+
+            let query = inputs[0].shape;
+            let key = inputs[1].shape;
+            let weights = inputs[2].shape;
+            let bias = inputs[3].shape;
+            if query.len() != 4 || key.len() != 3 || weights.len() != 3 || bias.len() != 4 {
+                return Err(
+                    "DsaIndexSelect: input ranks must be query=4, key=3, weights=3, bias=4".into(),
+                );
+            }
+            if query[0] != key[0]
+                || query[0] != weights[0]
+                || query[0] != bias[0]
+                || query[1] != weights[1]
+                || query[2] != weights[2]
+                || query[3] != key[2]
+                || query[1] != bias[2]
+                || key[1] != bias[3]
+            {
+                return Err("DsaIndexSelect: input dimensions are inconsistent".into());
+            }
+            if bias[1] != 1 {
+                return Err(
+                    "DsaIndexSelect: attention_bias head-broadcast dimension must be 1".into(),
+                );
+            }
+            Ok(vec![vec![query[0], 1, query[1], *top_k]])
         }
 
         ShapeInference::CausalConvWithState => {
@@ -4920,23 +5340,31 @@ fn infer_shapes(
             if inputs.is_empty() {
                 return Err("Squeeze: no inputs".into());
             }
-            let shape = inputs[0].shape;
-            let out: Vec<usize> = if axes.is_empty() {
-                shape.iter().filter(|&&d| d != 1).copied().collect()
-            } else {
-                let rank = shape.len();
-                let norm_axes: Vec<usize> = axes
+            Ok(vec![squeeze_axes_shape(inputs[0].shape, axes)?])
+        }
+
+        ShapeInference::SqueezeAllUnitDims => {
+            if inputs.is_empty() {
+                return Err("Squeeze: no inputs".into());
+            }
+            Ok(vec![
+                inputs[0]
+                    .shape
                     .iter()
-                    .map(|&a| normalise_axis(a, rank))
-                    .collect::<Result<_, _>>()?;
-                shape
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !norm_axes.contains(i))
-                    .map(|(_, &d)| d)
-                    .collect()
-            };
-            Ok(vec![out])
+                    .filter(|&&dim| dim != 1)
+                    .copied()
+                    .collect(),
+            ])
+        }
+
+        ShapeInference::SqueezeFromInput => {
+            if inputs.len() < 2 || inputs[1].is_absent() {
+                return Err(
+                    "Squeeze: axes input is present in the graph but absent at Compute".into(),
+                );
+            }
+            let axes = unsafe { read_i64_tensor(&inputs[1]) }?;
+            Ok(vec![squeeze_axes_shape(inputs[0].shape, &axes)?])
         }
 
         ShapeInference::Unsqueeze { axes } => {
@@ -5456,6 +5884,7 @@ fn infer_shapes(
         ShapeInference::Dft {
             onesided,
             axis_attr,
+            default_axis,
         } => {
             if inputs.is_empty() {
                 return Err("DFT: expected at least 1 input".into());
@@ -5479,8 +5908,10 @@ fn infer_shapes(
             // opset 20 moves `axis` into input 2; before that it is an
             // attribute defaulting to -2.
             let axis_raw = match inputs.get(2) {
-                Some(t) if !t.shape.is_empty() => read_scalar_i64(t, "DFT axis")?,
-                _ => axis_attr.unwrap_or(-2),
+                Some(t) if !t.is_absent() && t.shape.iter().product::<usize>() > 0 => {
+                    read_scalar_i64(t, "DFT axis")?
+                }
+                _ => axis_attr.unwrap_or(*default_axis),
             };
             let axis = normalize_axis(axis_raw, rank, "DFT axis")?;
             if axis == last {
@@ -5491,7 +5922,7 @@ fn infer_shapes(
 
             // `dft_length` (input 1) overrides the signal extent when present.
             let signal_len = match inputs.get(1) {
-                Some(t) if t.shape.iter().product::<usize>() > 0 => {
+                Some(t) if !t.is_absent() && t.shape.iter().product::<usize>() > 0 => {
                     let n = read_scalar_i64(t, "DFT dft_length")?;
                     usize::try_from(n)
                         .map_err(|_| format!("DFT: dft_length must be non-negative, got {n}"))?
@@ -5632,6 +6063,29 @@ fn matmul_output_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>, String> {
     }
 }
 
+/// Output shape for Squeeze with an explicit attribute- or input-carried axes list.
+fn squeeze_axes_shape(shape: &[usize], axes: &[i64]) -> Result<Vec<usize>, String> {
+    let rank = shape.len();
+    let norm_axes: Vec<usize> = axes
+        .iter()
+        .map(|&axis| normalise_axis(axis, rank))
+        .collect::<Result<_, _>>()?;
+    for &axis in &norm_axes {
+        if shape[axis] != 1 {
+            return Err(format!(
+                "Squeeze: axis {axis} has extent {}, expected 1",
+                shape[axis]
+            ));
+        }
+    }
+    Ok(shape
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !norm_axes.contains(index))
+        .map(|(_, &dim)| dim)
+        .collect())
+}
+
 /// Output shape for a reduction op.
 fn reduce_shape(
     shape: &[usize],
@@ -5680,6 +6134,14 @@ fn reduce_shape(
 /// `view.data` must point to a valid, readable region of `view.shape.iter().product()`
 /// `i64` elements.
 unsafe fn read_i64_tensor(view: &TensorView<'_>) -> Result<Vec<i64>, String> {
+    if !view.device.is_host_accessible() {
+        return Err(format!(
+            "shape operand is on {:?}, which the plugin host cannot dereference; \
+             the device EP must decline this value-driven shape rule or provide \
+             an explicit bounded metadata transfer",
+            view.device
+        ));
+    }
     if view.dtype != DataType::Int64 {
         return Err(format!("expected Int64 tensor, got {:?}", view.dtype));
     }
@@ -6184,14 +6646,18 @@ fn after() {}
     }
 
     use onnx_runtime_ep_api::tensor::{DevicePtr, TensorView};
-    use onnx_runtime_ir::{DataType, DeviceId};
+    use onnx_runtime_ir::{Attribute, DataType, DeviceId, Node, NodeId, ValueId};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn view<'a>(shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
+        typed_view(DataType::Float32, shape, strides)
+    }
+
+    fn typed_view<'a>(dtype: DataType, shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
         TensorView::new(
             DevicePtr(std::ptr::null()),
-            DataType::Float32,
+            dtype,
             shape,
             strides,
             DeviceId::cpu(),
@@ -6214,6 +6680,377 @@ fn after() {}
         inputs: &[TensorView<'_>],
     ) -> Result<Vec<Vec<usize>>, String> {
         infer_shapes(strategy, inputs)
+    }
+
+    /// Differential oracle for the allocation-free path.
+    ///
+    /// `infer_shapes_into` reimplements a handful of hot arms and delegates the
+    /// rest. That split is only safe while the two agree, and the arms it
+    /// reimplements are exactly the ones the dispatch benchmark drives -- so a
+    /// divergence would show up as wrong output shapes on the most common ops
+    /// in the suite, not on an exotic one. Asserting equality on both the `Ok`
+    /// shapes and the `Err` text keeps the fast path honest about failures too,
+    /// since a fast arm that skipped a bounds check would still "work" until it
+    /// indexed out of range.
+    #[track_caller]
+    fn assert_paths_agree(strategy: &ShapeInference, inputs: &[TensorView<'_>]) {
+        let slow = infer_shapes(strategy, inputs);
+        let mut buf = Vec::new();
+        let fast = infer_shapes_into(strategy, inputs, &mut buf);
+        match (&slow, &fast) {
+            (Ok(want), Ok(())) => {
+                let got: Vec<Vec<usize>> = buf.iter().map(|d| d.as_slice().to_vec()).collect();
+                assert_eq!(&got, want, "fast path disagreed for {strategy:?}");
+            }
+            (Err(want), Err(got)) => {
+                assert_eq!(
+                    got, want,
+                    "fast path gave a different error for {strategy:?}"
+                );
+            }
+            _ => panic!("fast/slow disagreed on success for {strategy:?}: {slow:?} vs {fast:?}"),
+        }
+    }
+
+    // ── The allocation-free path agrees with the allocating one ─────────────
+
+    /// The arms `infer_shapes_into` reimplements, including their failures.
+    #[test]
+    fn infer_shapes_into_matches_infer_shapes_on_the_fast_arms() {
+        let a = view(&[2, 3, 4], &[12, 4, 1]);
+        let b = view(&[2, 3, 4], &[12, 4, 1]);
+        let scalar = view(&[], &[]);
+
+        assert_paths_agree(&ShapeInference::SameAsInput(0), &[a, b]);
+        assert_paths_agree(&ShapeInference::SameAsInput(1), &[a, b]);
+        // Rank 0 is not a degenerate case for a buffer that stores a length.
+        assert_paths_agree(&ShapeInference::SameAsInput(0), &[scalar]);
+        // Out of range must fail identically, not index out of bounds.
+        assert_paths_agree(&ShapeInference::SameAsInput(1), &[a]);
+        assert_paths_agree(&ShapeInference::SameAsInput(0), &[]);
+
+        assert_paths_agree(&ShapeInference::ElementwiseBroadcast, &[a]);
+        assert_paths_agree(&ShapeInference::ElementwiseBroadcast, &[scalar]);
+        // Two operands fall through to the shared fold rather than the fast arm.
+        assert_paths_agree(&ShapeInference::ElementwiseBroadcast, &[a, b]);
+        assert_paths_agree(&ShapeInference::ElementwiseBroadcast, &[]);
+    }
+
+    /// A rank past `INLINE_RANK`, where `DimVec` stops being inline and starts
+    /// owning a heap buffer. The fast path must be correct on both sides of
+    /// that boundary, and the buffer must survive being reused across the
+    /// transition in either direction.
+    #[test]
+    fn infer_shapes_into_handles_ranks_that_spill_out_of_line() {
+        let wide_shape: Vec<usize> = vec![2; crate::dim_vec::INLINE_RANK + 3];
+        let wide_strides: Vec<i64> = vec![1; wide_shape.len()];
+        let wide = view(&wide_shape, &wide_strides);
+        let narrow = view(&[7], &[1]);
+
+        assert_paths_agree(&ShapeInference::SameAsInput(0), &[wide]);
+
+        // Reuse one buffer across wide -> narrow -> wide. A buffer that kept a
+        // stale length or a stale spilled allocation shows up here.
+        let mut buf = Vec::new();
+        for expect in [&wide_shape[..], &[7][..], &wide_shape[..]] {
+            let input = if expect.len() == 1 { narrow } else { wide };
+            infer_shapes_into(&ShapeInference::SameAsInput(0), &[input], &mut buf).unwrap();
+            assert_eq!(buf.len(), 1, "one output slot");
+            assert_eq!(buf[0].as_slice(), expect, "stale storage leaked through");
+        }
+    }
+
+    /// A *shorter* result after a longer one must not leave the tail of the
+    /// previous node visible.
+    ///
+    /// Every arm that writes the buffer needs its own case here, because each
+    /// one clears it separately. Driving only the `SameAsInput` arm proves only
+    /// that `SameAsInput` clears: deleting the `out.clear()` from the
+    /// delegating arm, or from the shared-native arm, survived an earlier
+    /// version of this test. Both are load-bearing in production, where the
+    /// routed path reads `output_shapes.iter().enumerate()` as the node's
+    /// output arity — a stale tail becomes a phantom output slot.
+    #[test]
+    fn every_arm_truncates_when_a_node_has_fewer_outputs() {
+        let a = view(&[2, 3], &[3, 1]);
+        assert_paths_agree(&ShapeInference::MatMul, &[a, a]);
+
+        // Two outputs, via the delegating arm, to leave a tail behind.
+        let input = view(&[1, 2, 5], &[10, 5, 1]);
+        let weight = view(&[2, 1, 3], &[3, 3, 1]);
+        let fill_two = |buf: &mut Vec<crate::dim_vec::DimVec<usize>>| {
+            infer_shapes_into(&ShapeInference::CausalConvWithState, &[input, weight], buf).unwrap();
+            assert_eq!(buf.len(), 2, "two outputs");
+        };
+
+        // Fast arm.
+        let mut buf = Vec::new();
+        fill_two(&mut buf);
+        infer_shapes_into(&ShapeInference::SameAsInput(0), &[input], &mut buf).unwrap();
+        assert_eq!(buf.len(), 1, "SameAsInput left the second slot behind");
+
+        // Delegating arm: a one-output strategy that is NOT reimplemented.
+        fill_two(&mut buf);
+        infer_shapes_into(&ShapeInference::MatMul, &[a, a], &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            1,
+            "the delegating arm left the second slot behind"
+        );
+
+        // Shared-native arm, resolving.
+        fill_two(&mut buf);
+        let (strategy, ins) = resolving_shared_native();
+        infer_shapes_into(&strategy, &ins, &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            1,
+            "the shared-native arm left the second slot behind"
+        );
+    }
+
+    /// A `SharedNative` node that resolves natively, plus its operands.
+    fn resolving_shared_native() -> (ShapeInference, [TensorView<'static>; 2]) {
+        static DATA: [f32; 3] = [0.0; 3];
+        static WANT: [i64; 2] = [1, 4];
+        static DSHAPE: [usize; 2] = [3, 1];
+        static DSTRIDE: [i64; 2] = [1, 1];
+        static WSHAPE: [usize; 1] = [2];
+        static WSTRIDE: [i64; 1] = [1];
+        let data = TensorView::new(
+            DevicePtr(DATA.as_ptr().cast()),
+            DataType::Float32,
+            &DSHAPE,
+            &DSTRIDE,
+            DeviceId::cpu(),
+        );
+        let shape_in = TensorView::new(
+            DevicePtr(WANT.as_ptr().cast()),
+            DataType::Int64,
+            &WSHAPE,
+            &WSTRIDE,
+            DeviceId::cpu(),
+        );
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "Expand",
+            vec![
+                Some(onnx_runtime_ir::ValueId(0)),
+                Some(onnx_runtime_ir::ValueId(1)),
+            ],
+            vec![onnx_runtime_ir::ValueId(2)],
+        );
+        node.version = Some(8);
+        (
+            ShapeInference::SharedNative {
+                node: Box::new(node),
+                fallback: Box::new(ShapeInference::SameAsInput(0)),
+            },
+            [data, shape_in],
+        )
+    }
+
+    /// The shared-native arm is reimplemented too, so it needs the oracle just
+    /// as much as the others -- on both sides of its branch. The `Resolved`
+    /// side is the one production actually takes for `Expand`/`Tile` with
+    /// concrete shape operands; the declining side is what routes a rule's
+    /// fallback back through the fast arms.
+    #[test]
+    fn infer_shapes_into_matches_infer_shapes_on_shared_native() {
+        let (resolving, ins) = resolving_shared_native();
+        assert_paths_agree(&resolving, &ins);
+
+        // A node no native rule knows: SymbolicOrUnknown, so the fallback runs.
+        let unknown = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "NotRegisteredAnywhere",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        let input = view(&[2, 3], &[3, 1]);
+        assert_eq!(
+            infer_shared_node(&unknown, &[input]),
+            SharedShapeResult::SymbolicOrUnknown,
+            "this test is vacuous unless the rule really declines"
+        );
+        assert_paths_agree(
+            &ShapeInference::SharedNative {
+                node: Box::new(unknown.clone()),
+                fallback: Box::new(ShapeInference::SameAsInput(0)),
+            },
+            &[input],
+        );
+        // A fallback that itself fails must surface the fallback's own error.
+        assert_paths_agree(
+            &ShapeInference::SharedNative {
+                node: Box::new(unknown),
+                fallback: Box::new(ShapeInference::SameAsInput(9)),
+            },
+            &[input],
+        );
+    }
+
+    fn dsa_index_select_node(domain: &str, version: i64, top_k: Attribute) -> Node {
+        let mut node = Node::new(
+            NodeId(0),
+            "DsaIndexSelect",
+            (0..4).map(|index| Some(ValueId(index))).collect(),
+            vec![ValueId(100)],
+        );
+        node.domain = domain.into();
+        node.version = Some(version);
+        node.attributes.insert("top_k".into(), top_k);
+        node.attributes
+            .insert("scale".into(), Attribute::Float(0.125));
+        node
+    }
+
+    fn dsa_input_shapes() -> Vec<Vec<Option<usize>>> {
+        vec![
+            vec![Some(2), Some(3), Some(4), Some(8)],
+            vec![Some(2), Some(16), Some(8)],
+            vec![Some(2), Some(3), Some(4)],
+            vec![Some(2), Some(1), Some(3), Some(16)],
+        ]
+    }
+
+    #[test]
+    fn shape_schema_resolution_selects_highest_compatible_since_version() {
+        let schemas = [(1, "v1"), (3, "v3"), (7, "v7")];
+        for (imported, expected) in [(1, "v1"), (2, "v1"), (3, "v3"), (6, "v3"), (99, "v7")] {
+            assert_eq!(resolve_shape_schema(imported, &schemas), Some(&expected));
+        }
+        assert_eq!(resolve_shape_schema(0, &schemas), None);
+    }
+
+    #[test]
+    fn dsa_index_select_resolves_v1_schema_for_later_imports() {
+        for imported_opset in [1, 2, 17] {
+            let node = dsa_index_select_node("pkg.nxrt", imported_opset, Attribute::Int(5));
+            let strategy = ShapeInference::for_node(&node, &dsa_input_shapes(), 1);
+            assert!(
+                matches!(strategy, ShapeInference::DsaIndexSelect { top_k: 5 }),
+                "imported opset {imported_opset} must resolve the sole since-version-1 schema"
+            );
+
+            let query = typed_view(DataType::BFloat16, &[2, 3, 4, 8], &[96, 32, 8, 1]);
+            let key = typed_view(DataType::BFloat16, &[2, 16, 8], &[128, 8, 1]);
+            let weights = typed_view(DataType::BFloat16, &[2, 3, 4], &[12, 4, 1]);
+            let bias = view(&[2, 1, 3, 16], &[48, 48, 16, 1]);
+            assert_eq!(
+                infer(&strategy, &[query, key, weights, bias]).unwrap(),
+                vec![vec![2, 1, 3, 5]]
+            );
+        }
+    }
+
+    #[test]
+    fn dsa_index_select_preserves_unknown_batch_and_sequence_at_capability_time() {
+        let node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(7));
+        let shapes = vec![
+            vec![None, None, Some(4), Some(8)],
+            vec![None, Some(16), Some(8)],
+            vec![None, None, Some(4)],
+            vec![None, Some(1), None, Some(16)],
+        ];
+        assert!(matches!(
+            ShapeInference::for_node(&node, &shapes, 1),
+            ShapeInference::DsaIndexSelect { top_k: 7 }
+        ));
+    }
+
+    #[test]
+    fn dsa_index_select_declines_wrong_schema_or_static_contract() {
+        let valid = dsa_input_shapes();
+        for (label, node, shapes) in [
+            (
+                "wrong domain",
+                dsa_index_select_node("com.example", 1, Attribute::Int(4)),
+                valid.clone(),
+            ),
+            (
+                "no compatible schema",
+                dsa_index_select_node("pkg.nxrt", 0, Attribute::Int(4)),
+                valid.clone(),
+            ),
+            (
+                "non-integer top_k",
+                dsa_index_select_node("pkg.nxrt", 1, Attribute::Float(4.0)),
+                valid.clone(),
+            ),
+            (
+                "zero top_k",
+                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(0)),
+                valid.clone(),
+            ),
+            (
+                "missing scale",
+                {
+                    let mut node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4));
+                    node.attributes.remove("scale");
+                    node
+                },
+                valid.clone(),
+            ),
+            (
+                "unknown attribute",
+                {
+                    let mut node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4));
+                    node.attributes.insert("axis".into(), Attribute::Int(-1));
+                    node
+                },
+                valid.clone(),
+            ),
+            (
+                "wrong rank",
+                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4)),
+                vec![
+                    vec![Some(2), Some(3), Some(32)],
+                    valid[1].clone(),
+                    valid[2].clone(),
+                    valid[3].clone(),
+                ],
+            ),
+            (
+                "static mismatch",
+                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4)),
+                vec![
+                    valid[0].clone(),
+                    vec![Some(9), Some(16), Some(8)],
+                    valid[2].clone(),
+                    valid[3].clone(),
+                ],
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ShapeInference::for_node(&node, &shapes, 1),
+                    ShapeInference::Declined { .. }
+                ),
+                "{label} must decline"
+            );
+        }
+    }
+
+    #[test]
+    fn dsa_index_select_runtime_shape_rule_rechecks_dtype_and_dimensions() {
+        let strategy = ShapeInference::DsaIndexSelect { top_k: 4 };
+        let query = view(&[1, 2, 3, 8], &[48, 24, 8, 1]);
+        let key = view(&[1, 16, 8], &[128, 8, 1]);
+        let weights = view(&[1, 2, 3], &[6, 3, 1]);
+        let bad_bias_dtype = typed_view(DataType::Float16, &[1, 1, 2, 16], &[32, 32, 16, 1]);
+        assert!(
+            infer(&strategy, &[query, key, weights, bad_bias_dtype])
+                .unwrap_err()
+                .contains("attention_bias must be Float32")
+        );
+
+        let bad_bias_shape = view(&[1, 2, 2, 16], &[64, 32, 16, 1]);
+        assert!(
+            infer(&strategy, &[query, key, weights, bad_bias_shape])
+                .unwrap_err()
+                .contains("head-broadcast dimension must be 1")
+        );
     }
 
     // ── Shapes carried in input values ───────────────────────────────────────
@@ -6476,6 +7313,107 @@ fn after() {}
     }
 
     #[test]
+    fn dft_shared_and_plugin_defaults_agree_across_opsets() {
+        let data = vec![0.0f32; 48];
+        let x = f32_data(&[1, 8, 6, 1], &[48, 6, 1, 1], &data);
+        let make_node = |version| {
+            let mut node = Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "DFT",
+                vec![Some(onnx_runtime_ir::ValueId(0))],
+                vec![onnx_runtime_ir::ValueId(1)],
+            );
+            node.version = Some(version);
+            node.attributes
+                .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
+            node
+        };
+
+        for (version, expected) in [(17, vec![1, 5, 6, 2]), (20, vec![1, 8, 4, 2])] {
+            let node = make_node(version);
+            let strategy =
+                ShapeInference::for_node(&node, &[vec![Some(1), Some(8), Some(6), Some(1)]], 1);
+            assert!(matches!(strategy, ShapeInference::SharedNative { .. }));
+            assert_eq!(infer(&strategy, &[x]).unwrap(), vec![expected]);
+            if version == 17 {
+                let ShapeInference::SharedNative { fallback, .. } = &strategy else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    infer(fallback, &[x]).unwrap(),
+                    vec![vec![1, 5, 6, 2]],
+                    "the compatibility fallback must preserve the opset-17 axis=1 default"
+                );
+            }
+        }
+
+        let mut attr_node = make_node(17);
+        attr_node
+            .attributes
+            .insert("axis".into(), onnx_runtime_ir::Attribute::Int(2));
+        let strategy =
+            ShapeInference::for_node(&attr_node, &[vec![Some(1), Some(8), Some(6), Some(1)]], 1);
+        assert_eq!(infer(&strategy, &[x]).unwrap(), vec![vec![1, 8, 4, 2]]);
+
+        let mut input_node = make_node(20);
+        input_node.inputs = vec![
+            Some(onnx_runtime_ir::ValueId(0)),
+            None,
+            Some(onnx_runtime_ir::ValueId(2)),
+        ];
+        let axis_value = [1i64];
+        let axis = i64_scalar(&axis_value, &[], &[]);
+        let absent_length = TensorView::absent(DataType::Int64);
+        let strategy = ShapeInference::for_node(
+            &input_node,
+            &[vec![Some(1), Some(8), Some(6), Some(1)], vec![], vec![]],
+            1,
+        );
+        assert_eq!(
+            infer(&strategy, &[x, absent_length, axis]).unwrap(),
+            vec![vec![1, 5, 6, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_device_axis_is_symbolic_and_never_dereferenced() {
+        let data = vec![0.0f32; 48];
+        let x = f32_data(&[1, 8, 6, 1], &[48, 6, 1, 1], &data);
+        let absent_length = TensorView::absent(DataType::Int64);
+        let device_axis = TensorView::new(
+            DevicePtr(std::ptr::dangling::<i64>().cast()),
+            DataType::Int64,
+            &[],
+            &[],
+            DeviceId::cuda(0),
+        );
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "DFT",
+            vec![
+                Some(onnx_runtime_ir::ValueId(0)),
+                None,
+                Some(onnx_runtime_ir::ValueId(2)),
+            ],
+            vec![onnx_runtime_ir::ValueId(3)],
+        );
+        node.version = Some(20);
+        node.attributes
+            .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
+        assert_eq!(
+            infer_shared_node(&node, &[x, absent_length, device_axis]),
+            SharedShapeResult::SymbolicOrUnknown
+        );
+        let strategy = ShapeInference::for_node(
+            &node,
+            &[vec![Some(1), Some(8), Some(6), Some(1)], vec![], vec![]],
+            1,
+        );
+        let error = infer(&strategy, &[x, absent_length, device_axis]).unwrap_err();
+        assert!(error.contains("host cannot read"), "{error}");
+    }
+
+    #[test]
     fn dft_real_input_produces_a_complex_last_dim() {
         // [batch=2, signal=8, real=1] -> [2, 8, 2]. The last dim must become 2
         // even though the input is real; a rule that copied it through would
@@ -6486,7 +7424,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: false,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x]
             )
@@ -6505,7 +7444,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: true,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x]
             )
@@ -6526,7 +7466,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: false,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x, len]
             )
@@ -6549,7 +7490,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: true,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x, no_len, axis_in]
             )
@@ -6567,6 +7509,7 @@ fn after() {}
             &ShapeInference::Dft {
                 onesided: false,
                 axis_attr: Some(-1),
+                default_axis: 1,
             },
             &[x],
         )
@@ -7160,8 +8103,86 @@ fn after() {}
     fn squeeze_removes_ones() {
         let s = [1usize, 3, 1, 4];
         let st = [12i64, 4, 4, 1];
-        let res = infer(&ShapeInference::Squeeze { axes: vec![] }, &[view(&s, &st)]).unwrap();
+        let res = infer(&ShapeInference::SqueezeAllUnitDims, &[view(&s, &st)]).unwrap();
         assert_eq!(res, vec![vec![3, 4]]);
+    }
+
+    #[test]
+    fn squeeze_opset13_present_axes_are_read_from_input() {
+        use onnx_runtime_ir::{Node, NodeId, ValueId};
+
+        let mut node = Node::new(
+            NodeId(0),
+            "Squeeze",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(2)],
+        );
+        node.version = Some(13);
+        let strategy =
+            ShapeInference::for_node(&node, &[vec![Some(1), Some(1), Some(3)], vec![Some(1)]], 1);
+        assert!(matches!(strategy, ShapeInference::SqueezeFromInput));
+
+        let shape = [1usize, 1, 3];
+        let strides = [3i64, 3, 1];
+        let axes = [0i64];
+        let axis_shape = [1usize];
+        let axis_strides = [1i64];
+        let result = infer(
+            &strategy,
+            &[
+                view(&shape, &strides),
+                i64_view(&axes, &axis_shape, &axis_strides),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, vec![vec![1, 3]]);
+
+        let empty_axes: [i64; 0] = [];
+        let empty_shape = [0usize];
+        let present_empty = infer(
+            &strategy,
+            &[
+                view(&shape, &strides),
+                i64_view(&empty_axes, &empty_shape, &axis_strides),
+            ],
+        )
+        .unwrap();
+        assert_eq!(present_empty, vec![shape.to_vec()]);
+    }
+
+    #[test]
+    fn squeeze_opset13_absent_axes_remove_every_unit_dimension() {
+        use onnx_runtime_ir::{Node, NodeId, ValueId};
+
+        let mut node = Node::new(
+            NodeId(0),
+            "Squeeze",
+            vec![Some(ValueId(0)), None],
+            vec![ValueId(2)],
+        );
+        node.version = Some(13);
+        let strategy =
+            ShapeInference::for_node(&node, &[vec![Some(1), Some(1), Some(3)], vec![]], 1);
+        assert!(matches!(strategy, ShapeInference::SqueezeAllUnitDims));
+
+        let shape = [1usize, 1, 3];
+        let strides = [3i64, 3, 1];
+        assert_eq!(
+            infer(&strategy, &[view(&shape, &strides)]).unwrap(),
+            vec![vec![3]]
+        );
+    }
+
+    #[test]
+    fn squeeze_explicit_empty_axes_is_a_noop() {
+        let shape = [1usize, 1, 3];
+        let strides = [3i64, 3, 1];
+        let result = infer(
+            &ShapeInference::Squeeze { axes: Vec::new() },
+            &[view(&shape, &strides)],
+        )
+        .unwrap();
+        assert_eq!(result, vec![shape.to_vec()]);
     }
 
     #[test]
@@ -7306,6 +8327,148 @@ fn after() {}
     // ── Reduction ────────────────────────────────────────────────────────────
 
     #[test]
+    fn reduction_axes_input_boundaries_match_each_operator_schema() {
+        assert_eq!(reduction_axes_input_since("NotAReduction"), None);
+        assert!(!reduction_axes_are_input("ReduceSum", 12));
+        assert!(reduction_axes_are_input("ReduceSum", 13));
+        assert!(reduction_axes_are_input("ReduceSum", 17));
+
+        for op in [
+            "ReduceMean",
+            "ReduceProd",
+            "ReduceMax",
+            "ReduceMin",
+            "ReduceL1",
+            "ReduceL2",
+            "ReduceLogSum",
+            "ReduceLogSumExp",
+            "ReduceSumSquare",
+        ] {
+            assert!(
+                !reduction_axes_are_input(op, 17),
+                "{op} must retain attribute axes through opset 17"
+            );
+            assert!(
+                reduction_axes_are_input(op, 18),
+                "{op} must read optional input[1] starting at opset 18"
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_sum_opset_13_and_17_read_present_host_axes() {
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        let axes = [1i64];
+        let axis_shape = [1usize];
+        let axis_strides = [1i64];
+
+        for opset in [13, 17] {
+            let mut node = onnx_runtime_ir::Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "ReduceSum",
+                vec![
+                    Some(onnx_runtime_ir::ValueId(0)),
+                    Some(onnx_runtime_ir::ValueId(1)),
+                ],
+                vec![onnx_runtime_ir::ValueId(2)],
+            );
+            node.version = Some(opset);
+            node.attributes
+                .insert("keepdims".into(), onnx_runtime_ir::Attribute::Int(0));
+            let strategy = ShapeInference::for_node(
+                &node,
+                &[vec![Some(2), Some(3), Some(4)], vec![Some(1)]],
+                1,
+            );
+            assert!(
+                matches!(strategy, ShapeInference::ReductionFromInput { .. }),
+                "ReduceSum opset {opset} must read axes from input[1]"
+            );
+            let result = infer(
+                &strategy,
+                &[
+                    view(&shape, &strides),
+                    i64_view(&axes, &axis_shape, &axis_strides),
+                ],
+            )
+            .unwrap();
+            assert_eq!(result, vec![vec![2, 4]]);
+        }
+    }
+
+    #[test]
+    fn reduce_sum_opset_12_keeps_attribute_axes() {
+        let mut node = onnx_runtime_ir::Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "ReduceSum",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        node.version = Some(12);
+        node.attributes
+            .insert("axes".into(), onnx_runtime_ir::Attribute::Ints(vec![1]));
+        node.attributes
+            .insert("keepdims".into(), onnx_runtime_ir::Attribute::Int(0));
+        let strategy = ShapeInference::for_node(&node, &[vec![Some(2), Some(3), Some(4)]], 1);
+        assert!(matches!(strategy, ShapeInference::Reduction { .. }));
+
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        assert_eq!(
+            infer(&strategy, &[view(&shape, &strides)]).unwrap(),
+            vec![vec![2, 4]]
+        );
+    }
+
+    #[test]
+    fn reduce_sum_opset_13_absent_and_empty_axes_keep_schema_defaults() {
+        let mut node = onnx_runtime_ir::Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "ReduceSum",
+            vec![Some(onnx_runtime_ir::ValueId(0)), None],
+            vec![onnx_runtime_ir::ValueId(2)],
+        );
+        node.version = Some(13);
+        node.attributes
+            .insert("keepdims".into(), onnx_runtime_ir::Attribute::Int(0));
+        node.attributes.insert(
+            "noop_with_empty_axes".into(),
+            onnx_runtime_ir::Attribute::Int(1),
+        );
+        let strategy =
+            ShapeInference::for_node(&node, &[vec![Some(2), Some(3), Some(4)], vec![]], 1);
+        assert!(matches!(
+            strategy,
+            ShapeInference::ReductionFromInput { .. }
+        ));
+
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        assert_eq!(
+            infer(&strategy, &[view(&shape, &strides)]).unwrap(),
+            vec![Vec::<usize>::new()],
+            "absent optional axes means reduce all regardless of noop_with_empty_axes"
+        );
+
+        let axes: [i64; 0] = [];
+        let axis_shape = [0usize];
+        let axis_strides = [1i64];
+        assert_eq!(
+            infer(
+                &strategy,
+                &[
+                    view(&shape, &strides),
+                    i64_view(&axes, &axis_shape, &axis_strides),
+                ],
+            )
+            .unwrap(),
+            vec![shape.to_vec()],
+            "present empty axes honours noop_with_empty_axes=1"
+        );
+    }
+
+    #[test]
     fn reduction_keepdims_single_axis() {
         let s = [2usize, 3, 4];
         let st = [12i64, 4, 1];
@@ -7351,6 +8514,61 @@ fn after() {}
         )
         .unwrap();
         assert_eq!(res, vec![vec![1, 1, 1]]);
+    }
+
+    #[test]
+    fn reduction_from_absent_axes_uses_reduce_all_default() {
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        let result = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: true,
+                noop_with_empty_axes: true,
+            },
+            &[view(&shape, &strides)],
+        )
+        .unwrap();
+        assert_eq!(result, vec![vec![1, 1, 1]]);
+        let scalar = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: false,
+                noop_with_empty_axes: true,
+            },
+            &[view(&shape, &strides)],
+        )
+        .unwrap();
+        assert_eq!(scalar, vec![Vec::<usize>::new()]);
+    }
+
+    #[test]
+    fn reduction_from_present_empty_axes_honours_noop_flag() {
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        let axes: [i64; 0] = [];
+        let axis_shape = [0usize];
+        let axis_strides = [1i64];
+        let inputs = [
+            view(&shape, &strides),
+            i64_view(&axes, &axis_shape, &axis_strides),
+        ];
+        let no_op = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: false,
+                noop_with_empty_axes: true,
+            },
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(no_op, vec![shape.to_vec()]);
+        let reduce_all = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: false,
+                noop_with_empty_axes: false,
+            },
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(reduce_all, vec![Vec::<usize>::new()]);
     }
 
     #[test]
@@ -7436,13 +8654,30 @@ fn after() {}
         let buf = IntermediateBuf {
             data,
             scratch_ptr: std::ptr::null_mut(),
-            shape: shape.clone(),
-            strides,
+            shape: crate::dim_vec::DimVec::from_slice(&shape),
+            strides: crate::dim_vec::DimVec::from_slice(&strides),
             dtype: DataType::Float32,
+            device: DeviceId::cpu(),
         };
         let v = buf.view();
         assert_eq!(v.shape, &shape[..]);
         assert_eq!(v.dtype, DataType::Float32);
+        assert_eq!(v.device, DeviceId::cpu());
+    }
+
+    #[test]
+    fn device_intermediate_view_preserves_residency() {
+        let buf = IntermediateBuf {
+            data: Vec::new(),
+            scratch_ptr: std::ptr::dangling_mut(),
+            shape: crate::dim_vec::DimVec::new(),
+            strides: crate::dim_vec::DimVec::new(),
+            dtype: DataType::Int64,
+            device: DeviceId::cuda(2),
+        };
+        let view = buf.view();
+        assert_eq!(view.device, DeviceId::cuda(2));
+        assert!(!view.device.is_host_accessible());
     }
 
     #[test]
@@ -7624,6 +8859,14 @@ fn after() {}
         assert_eq!(starts[sources.len()], items.len());
     }
 
+    /// Build the reusable shape storage `absent_slot_strides` now reads.
+    fn dim_shapes(shapes: &[&[usize]]) -> Vec<crate::dim_vec::DimVec<usize>> {
+        shapes
+            .iter()
+            .map(|s| crate::dim_vec::DimVec::from_slice(s))
+            .collect()
+    }
+
     /// Absent strides are keyed by absent index, not slot index.
     ///
     /// Getting this wrong is invisible for a node with a single absent output
@@ -7633,12 +8876,7 @@ fn after() {}
     /// mis-key produces a different answer rather than the same one twice.
     #[test]
     fn absent_strides_are_keyed_by_absent_index_not_slot_index() {
-        let shapes = vec![
-            vec![2usize, 3, 4],
-            vec![5usize, 6],
-            vec![7usize, 8, 9],
-            vec![10usize],
-        ];
+        let shapes = dim_shapes(&[&[2, 3, 4], &[5, 6], &[7, 8, 9], &[10]]);
         // Slots 1 and 3 are absent, so absent index 0 is slot 1 and absent
         // index 1 is slot 3.
         let got = super::absent_slot_strides([1usize, 3].into_iter(), &shapes);
@@ -7654,7 +8892,7 @@ fn after() {}
 
     #[test]
     fn a_node_with_no_absent_outputs_builds_no_absent_strides() {
-        let shapes = vec![vec![2usize, 3], vec![4usize, 5]];
+        let shapes = dim_shapes(&[&[2, 3], &[4, 5]]);
         assert!(super::absent_slot_strides(std::iter::empty(), &shapes).is_empty());
     }
 
@@ -7663,77 +8901,108 @@ fn after() {}
     /// where a panic crosses an FFI boundary.
     #[test]
     fn an_out_of_range_absent_slot_yields_empty_strides() {
-        let shapes = vec![vec![2usize, 3]];
+        let shapes = dim_shapes(&[&[2, 3]]);
         let got = super::absent_slot_strides([9usize].into_iter(), &shapes);
         assert_eq!(got, vec![Vec::<i64>::new()]);
     }
 
     #[test]
     fn recycled_intermediate_storage_is_reused_without_reallocating() {
-        super::drain_host_intermediate_pool();
+        // Each test owns its pool outright. That is not only isolation from
+        // libtest's thread reuse -- it is the same shape production uses now,
+        // so these tests exercise the real signature rather than a global the
+        // hot path no longer touches.
+        let pool = &mut super::HostPool::default();
         // The point of the pool is address reuse: a retired buffer must come
         // back on the next request of the same size, so a chain of nodes keeps
         // rewriting storage that is still in cache.
-        let first = super::take_host_intermediate(4096);
+        let first = pool.take_intermediate(4096);
         let addr = first.as_ptr() as usize;
-        super::recycle_host_intermediate(first);
-        let second = super::take_host_intermediate(4096);
+        pool.recycle_intermediate(first);
+        let second = pool.take_intermediate(4096);
         assert_eq!(second.as_ptr() as usize, addr);
         assert_eq!(second.len(), 4096);
-        super::recycle_host_intermediate(second);
     }
 
     #[test]
     fn a_recycled_buffer_serves_a_smaller_request_at_the_requested_length() {
-        super::drain_host_intermediate_pool();
-        let big = super::take_host_intermediate(8192);
+        let pool = &mut super::HostPool::default();
+        let big = pool.take_intermediate(8192);
         let addr = big.as_ptr() as usize;
-        super::recycle_host_intermediate(big);
-        let small = super::take_host_intermediate(64);
+        pool.recycle_intermediate(big);
+        let small = pool.take_intermediate(64);
         assert_eq!(small.as_ptr() as usize, addr);
         // Length is what the caller asked for — `byte_len` bounds every
         // `from_raw_parts` built from this buffer, so an over-long slice would
         // be a real out-of-bounds view.
         assert_eq!(small.len(), 64);
-        super::recycle_host_intermediate(small);
     }
 
     #[test]
     fn a_request_larger_than_every_pooled_buffer_allocates_fresh_zeroed_storage() {
-        super::drain_host_intermediate_pool();
-        let seed = super::take_host_intermediate(32);
-        super::recycle_host_intermediate(seed);
-        let big = super::take_host_intermediate(1 << 20);
+        let pool = &mut super::HostPool::default();
+        let seed = pool.take_intermediate(32);
+        pool.recycle_intermediate(seed);
+        let big = pool.take_intermediate(1 << 20);
         assert_eq!(big.len(), 1 << 20);
         assert!(big.iter().all(|b| *b == 0));
-        super::recycle_host_intermediate(big);
     }
 
     #[test]
     fn scratch_backed_buffers_are_not_pooled() {
-        super::drain_host_intermediate_pool();
+        let pool = &mut super::HostPool::default();
         // A scratch-backed IntermediateBuf carries an empty `data` vector and a
         // borrowed pointer it does not own. Pooling that empty vector would
         // fill a slot with nothing usable.
-        super::recycle_host_intermediate(Vec::new());
-        let taken = super::take_host_intermediate(16);
+        pool.recycle_intermediate(Vec::new());
+        assert_eq!(pool.len(), 0);
+        let taken = pool.take_intermediate(16);
         assert_eq!(taken.len(), 16);
         assert!(taken.capacity() >= 16);
-        super::recycle_host_intermediate(taken);
     }
 
     #[test]
     fn the_pool_is_bounded() {
-        super::drain_host_intermediate_pool();
+        let pool = &mut super::HostPool::default();
         let bufs: Vec<Vec<u8>> = (0..super::HOST_INTERMEDIATE_POOL_SLOTS * 4)
-            .map(|_| super::take_host_intermediate(128))
+            .map(|_| pool.take_intermediate(128))
             .collect();
         for b in bufs {
-            super::recycle_host_intermediate(b);
+            pool.recycle_intermediate(b);
         }
-        super::HOST_INTERMEDIATE_POOL.with(|pool| {
-            assert!(pool.borrow().len() <= super::HOST_INTERMEDIATE_POOL_SLOTS);
-        });
+        assert!(pool.len() <= super::HOST_INTERMEDIATE_POOL_SLOTS);
+    }
+
+    #[test]
+    fn a_pooled_buffer_survives_the_run_that_retired_it() {
+        // The pool now shares storage with per-`Run` scratch, every other field
+        // of which is cleared when the `Run` leaves *because* keeping it would
+        // be a dangling borrow. The pool is the one field where the opposite is
+        // true, and nothing else in the suite would notice it being cleared:
+        // reuse is invisible to every correctness assertion, so dropping it
+        // would leave the suite green and silently restore a `malloc`/`free`
+        // pair per node. This is the tripwire for that.
+        let mut scratch = super::RunScratch::default();
+        let buf = scratch.host_pool.take_intermediate(2048);
+        let addr = buf.as_ptr() as usize;
+        scratch.host_pool.recycle_intermediate(buf);
+
+        // Exactly what `ScratchGuard::drop` does at the end of a `Run`.
+        scratch.clear_and_bound();
+
+        assert_eq!(
+            scratch.host_pool.len(),
+            1,
+            "clear_and_bound discarded pooled storage that the next `Run` \
+             should have reused"
+        );
+        let after = scratch.host_pool.take_intermediate(2048);
+        assert_eq!(
+            after.as_ptr() as usize,
+            addr,
+            "the buffer survived the `Run` boundary but is no longer the one \
+             that was retired"
+        );
     }
 
     // ── CreateState / ReleaseState lifecycle ──────────────────────────────────
@@ -7923,6 +9192,124 @@ fn after() {}
     fn contiguous_strides_scalar() {
         let s = super::contiguous_strides(&[1]);
         assert_eq!(s, vec![1i64]);
+    }
+
+    /// The strides now live in a `DimVec`, which changes representation at
+    /// `INLINE_RANK`. `onnx_runtime_ir::compute_contiguous_strides` is the same
+    /// algorithm in a crate this change did not touch, so it is a genuine
+    /// oracle rather than a restatement: this walks ranks either side of the
+    /// spill boundary and demands agreement on every one.
+    ///
+    /// The sweep must include extents of **1 and 0**, not just the distinct
+    /// extents that make a transposition obvious. A stride *on* a size-1 axis
+    /// is inert — its index is always 0 — which makes it tempting to leave out.
+    /// But that axis is still a *multiplicand* for every axis outside it, so an
+    /// error there propagates into strides that are very much live. An earlier
+    /// version of this test used `i + 2` throughout and waved through a mutant
+    /// that read `(shape[i + 1] as i64).max(2)`.
+    #[test]
+    fn contiguous_strides_matches_the_ir_oracle_across_the_inline_boundary() {
+        let mut shapes: Vec<Vec<usize>> = Vec::new();
+        for rank in 0..=(crate::dim_vec::INLINE_RANK + 3) {
+            // Distinct, non-uniform extents so a transposed or off-by-one
+            // stride cannot coincide with the right answer.
+            shapes.push((0..rank).map(|i| i + 2).collect());
+        }
+        // Interior and trailing unit axes, on both sides of the spill boundary,
+        // and a zero extent.
+        shapes.extend([
+            vec![2, 1, 3],
+            vec![1, 1, 5],
+            vec![2, 1, 3, 1, 4],
+            vec![4, 1],
+            vec![1],
+            vec![2, 0, 3],
+            vec![3, 1, 4, 1, 5, 1, 9, 1, 2, 1, 6],
+            vec![1; crate::dim_vec::INLINE_RANK + 2],
+        ]);
+
+        let mut saw_inline = false;
+        let mut saw_spilled = false;
+        let mut saw_interior_unit = false;
+        for shape in &shapes {
+            let got = super::contiguous_strides(shape);
+            let want = onnx_runtime_ir::compute_contiguous_strides(shape);
+            assert_eq!(
+                got.as_slice(),
+                want.as_slice(),
+                "shape {shape:?} disagrees with the IR oracle"
+            );
+            assert_eq!(got.len(), shape.len(), "shape {shape:?} changed length");
+            if shape.len() > crate::dim_vec::INLINE_RANK {
+                saw_spilled = true;
+            } else if !shape.is_empty() {
+                saw_inline = true;
+            }
+            if shape.len() >= 3 && shape[1..shape.len() - 1].contains(&1) {
+                saw_interior_unit = true;
+            }
+        }
+        assert!(
+            saw_inline && saw_spilled,
+            "the sweep must cover both representations or it proves nothing \
+             about the boundary"
+        );
+        assert!(
+            saw_interior_unit,
+            "the sweep must exercise a size-1 interior axis, or an error \
+             confined to one propagates outward unnoticed"
+        );
+    }
+
+    /// A shape that spills must keep every dimension. Truncating at
+    /// `INLINE_RANK` would still produce a plausible-looking stride vector for
+    /// the leading dimensions, so this pins the length and the last element.
+    ///
+    /// Kept alongside the oracle sweep rather than folded into it because it
+    /// states the answer in **closed form**. The oracle is the same algorithm
+    /// by construction — that is what makes it a good check on representation
+    /// and initialisation, and a poor one on the algorithm itself.
+    #[test]
+    fn contiguous_strides_spills_rather_than_truncating() {
+        let rank = crate::dim_vec::INLINE_RANK + 2;
+        let shape: Vec<usize> = vec![2; rank];
+        let got = super::contiguous_strides(&shape);
+        assert_eq!(got.len(), rank, "a spilled shape lost dimensions");
+        assert_eq!(got[rank - 1], 1, "the innermost stride must be 1");
+        assert_eq!(got[0], 1i64 << (rank - 1), "outermost stride is wrong");
+    }
+
+    /// `view()` hands the kernel `&self.shape` and `&self.strides`. For a rank
+    /// that spilled out of line, both must arrive whole.
+    ///
+    /// This deliberately does **not** claim to prove that the routed path's
+    /// `shape: (*shape).clone()` copies rather than aliases. That property is a
+    /// compiler guarantee — `DimVec` derives `Clone`, and there is no safe
+    /// `Clone` that shares a `Vec`'s buffer — so no mutation can violate it and
+    /// a test asserting it could not fail. What is mutable, and what this pins,
+    /// is whether `view()` passes the whole slice or a truncated one.
+    #[test]
+    fn a_spilled_intermediate_buf_view_reports_every_dimension() {
+        let rank = crate::dim_vec::INLINE_RANK + 2;
+        let dims: Vec<usize> = (0..rank).map(|i| i + 2).collect();
+        let strides = super::contiguous_strides(&dims);
+        let numel: usize = dims.iter().product();
+        let buf = IntermediateBuf {
+            data: vec![0u8; numel * 4],
+            scratch_ptr: std::ptr::null_mut(),
+            shape: crate::dim_vec::DimVec::from_slice(&dims),
+            strides,
+            dtype: DataType::Float32,
+            device: DeviceId::cpu(),
+        };
+
+        let v = buf.view();
+        assert_eq!(v.shape, &dims[..], "view truncated the spilled shape");
+        assert_eq!(
+            v.strides,
+            onnx_runtime_ir::compute_contiguous_strides(&dims).as_slice(),
+            "view truncated the spilled strides"
+        );
     }
 
     // ── S2: axis bounds check ─────────────────────────────────────────────────
@@ -8130,6 +9517,7 @@ fn after() {}
             dtype: DataType::Float32,
             shape: crate::dim_vec::DimVec::zeroed(1),
             strides: crate::dim_vec::DimVec::zeroed(1),
+            device: DeviceId::cpu(),
         }
     }
 
@@ -8449,6 +9837,51 @@ fn after() {}
         });
     }
 
+    /// Every pool operation must go through the `Run`'s own pool.
+    ///
+    /// An independent review of the change that moved this pool into
+    /// `RunScratch` found a mutation that survived the entire suite: redirect
+    /// the single `take` call site to a throwaway pool. Every buffer is then
+    /// freshly allocated on every node -- the exact cost the move existed to
+    /// remove -- while the seven `recycle` sites keep filling the real pool,
+    /// which is now read by nobody. It is correctness preserving, so no
+    /// behavioural test can see it, and the unit tests below cannot either
+    /// because they own their pools and never touch these call sites.
+    ///
+    /// A newtype makes the accidental form (`&mut Vec::new()`) fail to compile.
+    /// This pins the deliberate one: **no pool operation anywhere in this file
+    /// is performed on a pool other than the one destructured from
+    /// `RunScratch`.** Stated as a ratio rather than as fixed call counts, so
+    /// that adding or removing a legitimate call site does not trip it.
+    #[test]
+    fn every_pool_operation_goes_through_the_run_scratch_pool() {
+        let prod = production_source(include_str!("compute.rs"));
+        let prod = prod.as_str();
+
+        for method in ["take_intermediate", "recycle_intermediate"] {
+            let calls = prod.matches(&format!(".{method}(")).count();
+            let via_pool = prod.matches(&format!("host_pool.{method}(")).count();
+
+            // Anti-vacuity, and the reason it is not optional: if either method
+            // is renamed, both counts fall to zero and the equality below holds
+            // trivially. The guard has to be unconditional -- a check that
+            // itself skips when the thing it guards disappears is the failure
+            // it exists to prevent.
+            assert!(
+                calls > 0,
+                "no calls to `{method}` found; this test would pass vacuously"
+            );
+            assert_eq!(
+                calls,
+                via_pool,
+                "{} call(s) to `{method}` do not use the `RunScratch` pool; a \
+                 pool built at the call site allocates on every node and no \
+                 behavioural test can see it",
+                calls - via_pool
+            );
+        }
+    }
+
     /// The `Run` path must resolve the thread-local exactly **once**. Taking
     /// the scratch out and putting it back cost two resolutions; borrowing it
     /// costs one. That is not observable from a unit test, so it is asserted
@@ -8482,18 +9915,13 @@ fn after() {}
         declared.sort_unstable();
         assert_eq!(
             declared,
-            [
-                "ENABLED",
-                "ENABLED",
-                "HOST_INTERMEDIATE_POOL",
-                "RUN_SCRATCH"
-            ],
+            ["ENABLED", "ENABLED", "RUN_SCRATCH"],
             "the set of thread-locals in compute.rs changed; a new per-`Run` \
              pool costs another __tls_get_addr on the hot path"
         );
         assert_eq!(
             prod.matches(".with(").count() + prod.matches(".try_with(").count(),
-            3,
+            1,
             "the number of thread-local resolutions in compute.rs changed"
         );
 

@@ -60,6 +60,109 @@ pub(crate) struct SlotCaptureState {
     pub(super) capture_quarantine_ops: HashSet<(String, String)>,
 }
 
+#[derive(Clone, Debug)]
+enum ProviderArtifactOutcome {
+    Unfinalized,
+    Pending(ExecutorArtifactPending),
+    Failed(String),
+    Complete,
+}
+
+/// The executor's sole authority for whether provider-owned artifacts may be
+/// used by eager execution, capture, or replay.
+#[derive(Clone, Debug)]
+pub(super) struct ProviderArtifactReadiness {
+    epoch: ExecutorArtifactReadinessEpoch,
+    outcome: ProviderArtifactOutcome,
+}
+
+impl Default for ProviderArtifactReadiness {
+    fn default() -> Self {
+        Self {
+            epoch: ExecutorArtifactReadinessEpoch::INITIAL,
+            outcome: ProviderArtifactOutcome::Unfinalized,
+        }
+    }
+}
+
+impl ProviderArtifactReadiness {
+    pub(super) fn advance_to(&mut self, epoch: ExecutorArtifactReadinessEpoch) {
+        if epoch > self.epoch {
+            self.epoch = epoch;
+            self.outcome = ProviderArtifactOutcome::Unfinalized;
+        }
+    }
+
+    pub(super) fn needs_finalization(&self) -> bool {
+        matches!(self.outcome, ProviderArtifactOutcome::Unfinalized)
+    }
+
+    /// Finalize the current specialization exactly once, then require its
+    /// outcome before any eager execution, capture, or replay.
+    pub(super) fn finalize_if_needed(
+        &mut self,
+        ep: &dyn ExecutionProvider,
+        executor: ExecutorInstanceId,
+        graph: &Graph,
+        finalized_banks: &[FinalizedExpertBank],
+    ) -> Result<()> {
+        if self.needs_finalization() {
+            match ep.finalize_executor_artifacts(executor, graph, self.epoch, finalized_banks) {
+                Ok(ExecutorArtifactFinalization::Complete) => {
+                    self.outcome = ProviderArtifactOutcome::Complete;
+                }
+                Ok(ExecutorArtifactFinalization::Pending(pending)) => {
+                    self.outcome = ProviderArtifactOutcome::Pending(pending);
+                }
+                Err(error) => {
+                    self.outcome = ProviderArtifactOutcome::Failed(error.to_string());
+                }
+            }
+        }
+        if matches!(self.outcome, ProviderArtifactOutcome::Complete)
+            && let Err(error) = ep.validate_executor_artifacts(executor)
+        {
+            self.outcome = ProviderArtifactOutcome::Failed(error.to_string());
+        }
+        self.require_complete(ep.name(), executor)
+    }
+
+    pub(super) fn require_complete(
+        &self,
+        provider: &str,
+        executor: ExecutorInstanceId,
+    ) -> Result<()> {
+        match &self.outcome {
+            ProviderArtifactOutcome::Complete => Ok(()),
+            ProviderArtifactOutcome::Unfinalized => {
+                Err(SessionError::ExecutionProviderArtifactsPending {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: "provider artifact finalization has not reached a terminal outcome"
+                        .to_string(),
+                })
+            }
+            ProviderArtifactOutcome::Pending(pending) => {
+                Err(SessionError::ExecutionProviderArtifactsPending {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: pending.reason(),
+                })
+            }
+            ProviderArtifactOutcome::Failed(reason) => {
+                Err(SessionError::ExecutionProviderArtifactFinalizationFailed {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: reason.clone(),
+                })
+            }
+        }
+    }
+}
+
 /// The compiled, runnable graph: buffers + plan + kernel cache. Owned by the
 /// public [`InferenceSession`](crate::InferenceSession).
 pub(crate) struct Executor {
@@ -388,10 +491,10 @@ pub(crate) struct Executor {
     /// Control-flow and sequence nodes always have `None` (they don't use the
     /// kernel cache).
     pub(super) kernel_bindings: Vec<Option<KernelKey>>,
-    /// Set only after the provider reports that this executor's required
-    /// artifacts are complete. A readiness-dependent `Pending` result leaves it
-    /// false so a later resolved compilation epoch invokes the same transition.
-    pub(super) provider_artifacts_finalized: bool,
+    /// Single readiness authority for this executor's provider-owned artifacts.
+    /// Its epoch advances with concrete kernel specializations; every execute,
+    /// capture, and replay path must observe `Complete` before enqueuing work.
+    pub(super) provider_artifact_readiness: ProviderArtifactReadiness,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
     /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped
