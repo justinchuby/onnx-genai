@@ -40,6 +40,7 @@ mod session;
 mod speech;
 mod sse;
 mod state;
+mod tool_protocol;
 mod types;
 mod worker;
 
@@ -47,10 +48,7 @@ pub use cli::{ServeArgs, run_serve};
 pub use models_config::{ModelSpec, ModelsConfig, from_models_dir};
 pub use multimodal::MultimodalSpecs;
 pub use registry::EvictionPolicy;
-pub use routes::{
-    ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
-    parse_tool_calls,
-};
+pub use routes::{build_generate_request, build_generate_request_with_protocol, build_prompt};
 pub use runtime_args::{
     CpuArgs, DeviceChoice, EngineArgs, decode_backend_name, parse_decode_backend, parse_device,
 };
@@ -59,6 +57,7 @@ pub use state::parse_native_device;
 pub use state::{
     AppState, OrtSessionWorkerCount, ServerConfig, default_node_id, parse_kv_cache_dtype,
 };
+pub use tool_protocol::{ToolProtocol, ToolProtocolError};
 pub use types::{
     AudioSpeechRequest, AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest,
     ChatCompletionResponse, ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageContentPart,
@@ -76,6 +75,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/status", get(routes::status))
         .route("/v1/resources", get(routes::resources))
         .route("/v1/sessions", post(routes::create_session))
+        .route("/v1/sessions/{id}/fork", post(routes::fork_session))
         .route("/v1/sessions/{id}", delete(routes::delete_session))
         .route("/v1/completions", post(routes::completions))
         .route("/v1/embeddings", post(routes::embeddings))

@@ -14,7 +14,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::schema::{WorkflowSpec, WorkflowStateScope, WorkflowStep};
+use crate::{
+    StateFinalWriter, StateReader,
+    schema::{WorkflowSpec, WorkflowStep},
+};
 
 /// How one session-scoped cell's lease reaches the next invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -90,49 +93,35 @@ impl SessionStateFacts {
 /// runtime actually uses, in the order a pass reaches them: the request binding
 /// before the pass, the loop carry on entry, the group's alias otherwise.
 pub fn classify_session_state(workflow: &WorkflowSpec) -> SessionStateFacts {
-    let carried_by_loop = loop_carried_cells(&workflow.steps);
-    let groups = workflow
-        .serving
-        .as_ref()
-        .map(|serving| &serving.state_service.groups);
-
+    let plan = crate::resolve_state_plan(workflow);
     let mut facts = SessionStateFacts::default();
-    for (cell, state) in &workflow.state {
-        if state.scope != WorkflowStateScope::Session {
-            continue;
-        }
-        let carrier = if state
-            .session
-            .as_ref()
-            .is_some_and(|lease| lease.continuation.is_some())
-        {
+    for (cell, state) in plan.session_cells() {
+        let carrier = if matches!(
+            state.final_writer,
+            Some(StateFinalWriter::Continuation { .. })
+        ) {
             Some(SessionStateCarrier::PromptContinuation)
-        } else if carried_by_loop.contains(cell) {
+        } else if state
+            .readers
+            .iter()
+            .any(|reader| matches!(reader, StateReader::LoopCarry { .. }))
+        {
             Some(SessionStateCarrier::LoopCarry)
         } else if state
-            .service_group
-            .as_deref()
-            .and_then(|group| groups.and_then(|groups| groups.get(group)))
-            .is_some_and(|group| {
-                group
-                    .ports
-                    .values()
-                    .any(|component| component.contains_key(cell))
-            })
+            .readers
+            .iter()
+            .any(|reader| matches!(reader, StateReader::ComponentPort { .. }))
         {
-            // A group that does not exist, or one whose aliases never name this
-            // cell, holds nothing — so it is not a carrier, and the validator
-            // reports the same declaration as an error.
             Some(SessionStateCarrier::StateServiceGroup)
         } else {
             None
         };
         match carrier {
             Some(carrier) => {
-                facts.carriers.insert(cell.clone(), carrier);
+                facts.carriers.insert(cell.to_string(), carrier);
             }
             None => {
-                facts.uncarried.insert(cell.clone());
+                facts.uncarried.insert(cell.to_string());
             }
         }
     }

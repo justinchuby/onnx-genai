@@ -64,6 +64,8 @@ pub const TOKENS_OUTPUT: &str = "tokens";
 pub enum BuildError {
     /// The ABI names no sequence input, so nothing drives the loop.
     NoSequenceInput,
+    /// A decoder loop needs a graph edge that produces each step's embeddings.
+    InputsEmbedsNeedsEmbeddingProducer,
     /// The ABI names no logits output, so nothing selects a token.
     NoLogitsOutput,
     /// State inputs and outputs disagree in length, so the pairs are ambiguous.
@@ -84,6 +86,13 @@ impl std::fmt::Display for BuildError {
             Self::NoSequenceInput => formatter.write_str(
                 "this decoder names neither a token input nor an inputs_embeds input, so no \
                  workflow could say what drives its generation loop",
+            ),
+            Self::InputsEmbedsNeedsEmbeddingProducer => formatter.write_str(
+                "this decoder drives its graph through inputs_embeds, but a bare decoder ABI \
+                 cannot express the per-step component that produces each embedding from the \
+                 selected token. Author a multi-component workflow that binds the embedding \
+                 producer and, when token-context state is used, its explicit token_ids \
+                 companion; do not lower this graph into a loop with a stale embedding input",
             ),
             Self::NoLogitsOutput => formatter.write_str(
                 "this decoder names no logits output, so no workflow could say what its token \
@@ -160,7 +169,9 @@ pub fn decoder_workflow(
         .to_string();
     let sequence_is_embeds = matches!(abi.sequence_source, Some(SequenceInputKind::InputsEmbeds))
         || (abi.token_input.is_none() && abi.inputs_embeds_input.is_some());
-
+    if sequence_is_embeds {
+        return Err(BuildError::InputsEmbedsNeedsEmbeddingProducer);
+    }
     // A fixed-capacity decoder states its KV through `static_cache` rather than
     // `kv_inputs`: the buffers are the same state, declared per half. Reading
     // both here is what lets one group describe either discipline instead of
@@ -236,15 +247,10 @@ pub fn decoder_workflow(
     // A graph may consume both a raw token stream and a routed pre-embedded
     // one. Declaring both is explicit, so both are carried across; only the one
     // the ABI names as the sequence source drives the loop.
-    let secondary = if sequence_is_embeds {
-        abi.token_input
-            .as_deref()
-            .map(|port| (port, token_contract(), PortRole::TokenIds))
-    } else {
-        abi.inputs_embeds_input
-            .as_deref()
-            .map(|port| (port, hidden_contract(), PortRole::InputsEmbeds))
-    };
+    let secondary = abi
+        .inputs_embeds_input
+        .as_deref()
+        .map(|port| (port, hidden_contract(), PortRole::InputsEmbeds));
     if let Some((port, contract, role)) = secondary
         && port != sequence_port
     {
@@ -449,6 +455,7 @@ pub fn decoder_workflow(
     body.push(WorkflowStep::Emit {
         value: TOKEN_VALUE.to_string(),
         output: TOKENS_OUTPUT.to_string(),
+        stream: None,
         mode: crate::schema::WorkflowEmitMode::Append,
         when: Some(ACTIVE_CELL.to_string()),
         valid_length: None,
@@ -505,23 +512,17 @@ pub fn decoder_workflow(
     let spec = WorkflowSpec {
         manifest: WorkflowManifest {
             adapter_abis: BTreeMap::new(),
-            capabilities: BTreeSet::from([
-                "bounded_state_recurrence".to_string(),
-                "workflow_ssa".to_string(),
-                "linear_effects".to_string(),
-                "typed_emit".to_string(),
-                "streaming_emit".to_string(),
-                "nested_control_flow".to_string(),
-                "loop_induction_values".to_string(),
-                "serving_service_contract".to_string(),
-            ]),
         },
+        publication_mode: crate::schema::WorkflowPublicationMode::CommitOnly,
+        publication_mode_authored: false,
         inputs: builder.inputs,
         outputs: BTreeMap::from([(
             TOKENS_OUTPUT.to_string(),
             WorkflowOutput {
                 contract: token_contract(),
                 role: WorkflowOutputRole::Tokens,
+                family: crate::schema::WorkflowOutputFamily::Materialized,
+                family_authored: false,
                 value_range: None,
                 stage: crate::schema::OutputStage::PreAdapter,
                 media: None,
@@ -682,13 +683,8 @@ pub fn iteration_variant(
     variant.components.remove(decode.0);
     variant.components.remove(selection.0);
     variant.components.insert(component.clone(), block);
-    // The re-authored emit publishes a per-row prefix, which is a capability the
-    // manifest must declare: a runtime reads the manifest to decide whether it
-    // can execute the document at all.
-    variant
-        .manifest
-        .capabilities
-        .insert("emit_valid_length".to_string());
+    // The re-authored emit carries its ragged-prefix semantics in its typed
+    // output declaration; core workflow semantics are not manifest flags.
     // The state service names the component whose ports each cell aliases. That
     // component is now the block, and leaving the decoder's name behind would
     // declare a KV group bound to something the workflow no longer declares.
@@ -803,6 +799,7 @@ fn rebuild_body(
                 steps.push(WorkflowStep::Emit {
                     value: value.clone(),
                     output: output.clone(),
+                    stream: None,
                     mode: mode.clone(),
                     when: when.clone(),
                     valid_length: Some(accepted.clone()),
@@ -1338,13 +1335,11 @@ fn layout_name(abi: &DecoderAbi) -> String {
     }
 }
 
-fn dims(names: &[&str]) -> Option<Vec<crate::schema::TensorDimension>> {
-    Some(
-        names
-            .iter()
-            .map(|name| crate::schema::TensorDimension::Symbol(name.to_string()))
-            .collect(),
-    )
+fn dims(names: &[&str]) -> Vec<crate::schema::TensorDimension> {
+    names
+        .iter()
+        .map(|name| crate::schema::TensorDimension::Symbol(name.to_string()))
+        .collect()
 }
 
 fn request_aligned() -> BatchLayout {
@@ -1354,7 +1349,6 @@ fn request_aligned() -> BatchLayout {
 fn token_contract() -> TensorContract {
     TensorContract {
         dtype: "int64".to_string(),
-        rank: 2,
         shape: dims(&["batch", "sequence"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1365,7 +1359,6 @@ fn token_contract() -> TensorContract {
 fn mask_contract() -> TensorContract {
     TensorContract {
         dtype: "int64".to_string(),
-        rank: 2,
         shape: dims(&["batch", "kv_sequence"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1376,7 +1369,6 @@ fn mask_contract() -> TensorContract {
 fn logits_contract() -> TensorContract {
     TensorContract {
         dtype: "float32".to_string(),
-        rank: 3,
         shape: dims(&["batch", "sequence", "vocabulary"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1387,7 +1379,6 @@ fn logits_contract() -> TensorContract {
 fn hidden_contract() -> TensorContract {
     TensorContract {
         dtype: "float32".to_string(),
-        rank: 3,
         shape: dims(&["batch", "sequence", "hidden"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1398,7 +1389,6 @@ fn hidden_contract() -> TensorContract {
 fn state_contract() -> TensorContract {
     TensorContract {
         dtype: "float32".to_string(),
-        rank: 4,
         shape: dims(&["batch", "kv_heads", "kv_sequence", "head_dim"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1409,7 +1399,6 @@ fn state_contract() -> TensorContract {
 fn lengths_contract() -> TensorContract {
     TensorContract {
         dtype: "int64".to_string(),
-        rank: 1,
         shape: dims(&["batch"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1420,7 +1409,6 @@ fn lengths_contract() -> TensorContract {
 fn flag_contract() -> TensorContract {
     TensorContract {
         dtype: "bool".to_string(),
-        rank: 1,
         shape: dims(&["batch"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1431,8 +1419,7 @@ fn flag_contract() -> TensorContract {
 fn scalar_contract() -> TensorContract {
     TensorContract {
         dtype: "int64".to_string(),
-        rank: 1,
-        shape: Some(vec![crate::schema::TensorDimension::Fixed(1)]),
+        shape: vec![crate::schema::TensorDimension::Fixed(1)],
         optional: false,
         batch_layout: BatchLayout::Shared,
         padding: Vec::new(),
@@ -1519,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn an_embeds_driven_decoder_roundtrips() {
+    fn an_embeds_driven_decoder_requires_an_embedding_producer() {
         let abi = DecoderAbi {
             sequence_source: Some(SequenceInputKind::InputsEmbeds),
             inputs_embeds_input: Some("inputs_embeds".to_string()),
@@ -1528,11 +1515,9 @@ mod tests {
             kv_outputs: Some(vec!["present.key".to_string()]),
             ..DecoderAbi::default()
         };
-        let read_back = roundtrips(&abi);
-        assert_eq!(read_back.inputs_embeds_input, abi.inputs_embeds_input);
         assert_eq!(
-            read_back.sequence_source,
-            Some(SequenceInputKind::InputsEmbeds)
+            decoder_workflow(&abi, "model.onnx", &DecoderFacts::default()),
+            Err(BuildError::InputsEmbedsNeedsEmbeddingProducer)
         );
     }
 
@@ -1905,20 +1890,9 @@ mod iteration_policy_tests {
         assert_eq!(spec.inputs, variant.inputs);
         assert_eq!(spec.outputs, variant.outputs);
         assert_eq!(spec.state, variant.state);
-        // The re-authored emit publishes a per-row prefix, so the manifest must
-        // declare that capability -- and must declare nothing else new.
-        let gained = variant
-            .manifest
-            .capabilities
-            .difference(&spec.manifest.capabilities)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        assert_eq!(gained, BTreeSet::from(["emit_valid_length".to_string()]));
-        assert!(
-            spec.manifest
-                .capabilities
-                .is_subset(&variant.manifest.capabilities)
-        );
+        // The re-authored emit carries its ragged-prefix semantics directly in
+        // the typed output declaration; no duplicate workflow capability flag
+        // is permitted.
         let (serving, variant_serving) = (
             spec.serving.as_ref().expect("declared"),
             variant.serving.as_ref().expect("declared"),

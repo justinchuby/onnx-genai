@@ -611,6 +611,8 @@ fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
     assert_eq!(batched.active_rows(), vec![0, 1, 2]);
 
     batched.rewind_row(1, 2).expect("rewind row 1");
+    let baseline = onnx_genai_ort::decode::BatchedDecodeSession::snapshot_row(&mut batched, 1)
+        .expect("snapshot row 1");
     let replay = batched
         .step_select(
             &[0, expected[1].input_tokens[2], 0],
@@ -621,6 +623,22 @@ fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
     let replay_row = BatchedStaticCacheDecodeSession::row_logits(&replay, 1, 0).expect("row 1");
     assert_batched_matches_individual(&replay_row, &expected[1].logits[2]);
     assert_eq!(batched.row_len(1).expect("row 1 len"), 3);
+    onnx_genai_ort::decode::BatchedDecodeSession::restore_row(&mut batched, 1, &baseline)
+        .expect("restore row 1 baseline");
+    assert_eq!(
+        batched.row_lens(),
+        &[5, 2, 4],
+        "restoring row 1 must retain both sibling cursors"
+    );
+    let retry = batched
+        .step_select(
+            &[0, expected[1].input_tokens[2], 0],
+            &[0, 2, 0],
+            &[false, true, false],
+        )
+        .expect("retry row 1");
+    let retry_row = BatchedStaticCacheDecodeSession::row_logits(&retry, 1, 0).expect("row 1");
+    assert_batched_matches_individual(&retry_row, &expected[1].logits[2]);
 
     batched.deactivate_row(2).expect("deactivate row 2");
     assert!(!batched.is_active(2).expect("row 2 active"));

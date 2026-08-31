@@ -2,18 +2,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::schema::{
     EffectTransition, WorkflowBranchEffectMerge, WorkflowCarry, WorkflowLoopCarry,
-    WorkflowLoopEffect, WorkflowNode, WorkflowSpec, WorkflowStep,
+    WorkflowLoopCarrySource, WorkflowLoopEffect, WorkflowNode, WorkflowSpec, WorkflowStep,
 };
+use crate::{ResolvedStatePlan, StateCarrySourceKind, resolve_state_plan};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledWorkflow {
     pub initial_effects: BTreeMap<String, String>,
     pub graph: WorkflowNode,
+    pub state_plan: ResolvedStatePlan,
 }
 
 pub fn compile_workflow(workflow: &WorkflowSpec) -> Result<CompiledWorkflow, String> {
+    let state_plan = resolve_state_plan(workflow);
     let mut compiler = Compiler {
         workflow,
+        state_plan: &state_plan,
         next_token: 1,
     };
     let mut domains = BTreeSet::new();
@@ -37,11 +41,13 @@ pub fn compile_workflow(workflow: &WorkflowSpec) -> Result<CompiledWorkflow, Str
     Ok(CompiledWorkflow {
         initial_effects,
         graph,
+        state_plan,
     })
 }
 
 struct Compiler<'a> {
     workflow: &'a WorkflowSpec,
+    state_plan: &'a ResolvedStatePlan,
     next_token: usize,
 }
 
@@ -231,6 +237,7 @@ impl Compiler<'_> {
                 when,
                 valid_length,
                 output,
+                stream,
                 mode,
                 axis,
             } => Ok(WorkflowNode::Emit {
@@ -238,6 +245,7 @@ impl Compiler<'_> {
                 when: when.clone(),
                 valid_length: valid_length.clone(),
                 output: output.clone(),
+                stream: stream.clone(),
                 mode: mode.clone(),
                 axis: *axis,
                 effect_name: "stream".to_string(),
@@ -251,18 +259,25 @@ impl Compiler<'_> {
         carry: &WorkflowCarry,
         effects: &mut BTreeMap<String, String>,
     ) -> Result<WorkflowLoopCarry, String> {
-        let state =
-            self.workflow.state.get(&carry.cell).ok_or_else(|| {
-                format!("workflow loop carries unknown state cell '{}'", carry.cell)
-            })?;
-        let initial = carry
-            .initial
-            .clone()
-            .unwrap_or_else(|| state.initializer.clone());
+        self.workflow
+            .state
+            .get(&carry.cell)
+            .ok_or_else(|| format!("workflow loop carries unknown state cell '{}'", carry.cell))?;
+        let source = self.state_plan.carry_source(carry).ok_or_else(|| {
+            format!(
+                "workflow loop carry '{} -> {}' has no resolved state source",
+                carry.cell, carry.next
+            )
+        })?;
         let domain = format!("state:{}", carry.cell);
         Ok(WorkflowLoopCarry {
             cell: carry.cell.clone(),
-            current: initial,
+            current: source.source.binding.clone(),
+            current_source: match source.kind {
+                StateCarrySourceKind::Initializer => WorkflowLoopCarrySource::Initializer,
+                StateCarrySourceKind::Explicit => WorkflowLoopCarrySource::Explicit,
+                StateCarrySourceKind::PriorState => WorkflowLoopCarrySource::PriorState,
+            },
             body_input: carry.cell.clone(),
             body_output: carry.next.clone(),
             next: carry.cell.clone(),

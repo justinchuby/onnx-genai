@@ -98,8 +98,13 @@ fn written_slots(cache: &[f32], row: usize) -> Vec<usize> {
 fn static_cache_writes_unequal_rows_into_one_fixed_buffer() -> anyhow::Result<()> {
     let mut engine = engine()?;
     // Row 0 starts at slot 0, row 1 at slot 3. Both take a prefill plus 2 steps.
-    let output =
-        engine.run_pipeline_outputs(request(&[1, 2, 3, 4, 5, 6], 3, &[0, 3], &[true, true], 2)?)?;
+    let output = engine.run_pipeline_retained(request(
+        &[1, 2, 3, 4, 5, 6],
+        3,
+        &[0, 3],
+        &[true, true],
+        2,
+    )?)?;
 
     assert_eq!(
         output["key_cache"].shape(),
@@ -137,7 +142,7 @@ fn static_cache_writes_unequal_rows_into_one_fixed_buffer() -> anyhow::Result<()
 #[test]
 fn static_cache_leaves_slots_below_the_cursor_untouched() -> anyhow::Result<()> {
     let mut engine = engine()?;
-    let output = engine.run_pipeline_outputs(request(&[1, 2, 3], 3, &[4], &[true], 1)?)?;
+    let output = engine.run_pipeline_retained(request(&[1, 2, 3], 3, &[4], &[true], 1)?)?;
     let keys = output["key_cache"].to_vec_f32()?;
     assert_eq!(written_slots(&keys, 0), vec![4, 5]);
     assert_eq!(output["cache_lengths"].to_vec_i64()?, vec![6]);
@@ -154,14 +159,19 @@ fn static_cache_leaves_slots_below_the_cursor_untouched() -> anyhow::Result<()> 
 #[test]
 fn static_cache_freezes_inactive_rows_and_frees_their_tail() -> anyhow::Result<()> {
     let mut engine = engine()?;
-    let baseline =
-        engine.run_pipeline_outputs(request(&[1, 2, 3, 4, 5, 6], 3, &[0, 0], &[true, true], 0)?)?;
+    let baseline = engine.run_pipeline_retained(request(
+        &[1, 2, 3, 4, 5, 6],
+        3,
+        &[0, 0],
+        &[true, true],
+        0,
+    )?)?;
     let baseline_keys = baseline["key_cache"].to_vec_f32()?;
     let baseline_lengths = baseline["cache_lengths"].to_vec_i64()?;
     assert_eq!(baseline_lengths, vec![1, 1]);
 
     // Same request, but row 1 is inactive for the loop.
-    let output = engine.run_pipeline_outputs(request(
+    let output = engine.run_pipeline_retained(request(
         &[1, 2, 3, 4, 5, 6],
         3,
         &[0, 0],
@@ -195,8 +205,8 @@ fn static_cache_freezes_inactive_rows_and_frees_their_tail() -> anyhow::Result<(
 #[test]
 fn static_cache_rewind_is_a_cursor_move() -> anyhow::Result<()> {
     let mut engine = engine()?;
-    let long = engine.run_pipeline_outputs(request(&[4, 5, 6], 3, &[0], &[true], 4)?)?;
-    let short = engine.run_pipeline_outputs(request(&[4, 5, 6], 3, &[0], &[true], 2)?)?;
+    let long = engine.run_pipeline_retained(request(&[4, 5, 6], 3, &[0], &[true], 4)?)?;
+    let short = engine.run_pipeline_retained(request(&[4, 5, 6], 3, &[0], &[true], 2)?)?;
 
     let long_keys = long["key_cache"].to_vec_f32()?;
     let short_keys = short["key_cache"].to_vec_f32()?;
@@ -221,10 +231,20 @@ fn static_cache_rewind_is_a_cursor_move() -> anyhow::Result<()> {
 #[test]
 fn static_cache_runs_are_deterministic() -> anyhow::Result<()> {
     let mut engine = engine()?;
-    let first =
-        engine.run_pipeline_outputs(request(&[1, 2, 3, 4, 5, 6], 3, &[1, 2], &[true, true], 3)?)?;
-    let second =
-        engine.run_pipeline_outputs(request(&[1, 2, 3, 4, 5, 6], 3, &[1, 2], &[true, true], 3)?)?;
+    let first = engine.run_pipeline_retained(request(
+        &[1, 2, 3, 4, 5, 6],
+        3,
+        &[1, 2],
+        &[true, true],
+        3,
+    )?)?;
+    let second = engine.run_pipeline_retained(request(
+        &[1, 2, 3, 4, 5, 6],
+        3,
+        &[1, 2],
+        &[true, true],
+        3,
+    )?)?;
     assert_eq!(
         first["key_cache"].to_vec_f32()?,
         second["key_cache"].to_vec_f32()?
@@ -249,7 +269,7 @@ fn static_cache_runs_are_deterministic() -> anyhow::Result<()> {
 fn static_cache_rejects_a_destination_outside_capacity() -> anyhow::Result<()> {
     let mut engine = engine()?;
     let Err(error) =
-        engine.run_pipeline_outputs(request(&[1, 2, 3], 3, &[CAPACITY as i64], &[true], 1)?)
+        engine.run_pipeline_retained(request(&[1, 2, 3], 3, &[CAPACITY as i64], &[true], 1)?)
     else {
         anyhow::bail!("a write past capacity must not reach the graph");
     };
@@ -269,7 +289,8 @@ fn static_cache_rejects_a_destination_outside_capacity() -> anyhow::Result<()> {
 #[test]
 fn static_cache_rejects_a_negative_destination() -> anyhow::Result<()> {
     let mut engine = engine()?;
-    let Err(error) = engine.run_pipeline_outputs(request(&[1, 2, 3], 3, &[-1], &[true], 1)?) else {
+    let Err(error) = engine.run_pipeline_retained(request(&[1, 2, 3], 3, &[-1], &[true], 1)?)
+    else {
         anyhow::bail!("a negative write destination must not reach the graph");
     };
     assert!(

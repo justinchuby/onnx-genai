@@ -28,6 +28,46 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::SessionId;
 
+/// Opaque provenance for session-fork plans prepared by one engine instance.
+///
+/// Local session ids intentionally collide across engines. This capability is
+/// minted independently for every engine construction and never serialized or
+/// exposed to callers, so a matching local id cannot authorize cross-engine
+/// state installation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionForkOrigin {
+    domain: [u8; 32],
+    generation: u64,
+}
+
+impl SessionForkOrigin {
+    pub(crate) fn new() -> Self {
+        Self {
+            domain: rand::random(),
+            generation: 0,
+        }
+    }
+
+    pub(crate) fn same_domain(self, other: Self) -> bool {
+        self.domain == other.domain
+    }
+
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_generation_for_test(self) -> Self {
+        Self {
+            domain: self.domain,
+            generation: self
+                .generation
+                .checked_add(1)
+                .expect("session-fork origin generation exhausted"),
+        }
+    }
+}
+
 /// Mints session ids that are handed out beyond one engine.
 ///
 /// One allocator owns one namespace. Ids are minted from 1 upward, which is

@@ -1,0 +1,82 @@
+schema_version: v1.6
+pipeline:
+  workflow:
+    manifest: {}
+    inputs:
+      active:
+        contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: active}
+      done:
+        contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: done}
+      accepted_len:
+        contract: {dtype: int64, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: accepted_len}
+      cache_seed:
+        contract: {dtype: float32, shape: [batch, heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: cache_seed}
+    components:
+      proposer:
+        implementation: {kind: binding}
+        ports:
+          outputs:
+            candidate_token_ids: {dtype: int64, shape: [batch, candidates], batch_layout: {kind: request_aligned, axis: 0}}
+            candidate_parents: {dtype: int64, shape: [batch, candidates], batch_layout: {kind: request_aligned, axis: 0}}
+      target:
+        implementation: {kind: binding}
+        ports:
+          inputs:
+            cache_in: {dtype: float32, shape: [batch, heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            cache_out: {dtype: float32, shape: [batch, heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            target_logits: {dtype: float32, shape: [batch, candidates, vocabulary], batch_layout: {kind: request_aligned, axis: 0}}
+    state:
+      cache:
+        contract: {dtype: float32, shape: [batch, heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        class: semantic
+        scope: invocation
+        initializer: cache_seed
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: cache
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      state_service:
+        groups:
+          cache:
+            kind: recurrent
+            layout: bnsh
+            update: {kind: replace}
+            capabilities: {rollback_positions: 8, snapshot: true, fork: true}
+            ports:
+              target:
+                cache: {input: cache_in, output: cache_out, role: key, layer: 0}
+    steps:
+    - kind: invoke
+      component: proposer
+      outputs:
+        candidate_token_ids: proposed.tokens
+        candidate_parents: proposed.parents
+speculative:
+  identity: onnx-genai.speculative
+  version: '1'
+  proposer: proposer
+  target: target
+  proposal_execution:
+    kind: candidate_tree
+    candidate_tokens: candidate_token_ids
+    topology: {kind: parent_indices, output: candidate_parents}
+  vocabulary: {kind: identical}
+  max_proposal_width: 8
+  distribution_preserving: false
+  verification:
+    target_output: {component: target, output: target_logits}
+    accepted_path: {kind: runtime, binding: accepted_prefix}
+  rollback_state: [cache]

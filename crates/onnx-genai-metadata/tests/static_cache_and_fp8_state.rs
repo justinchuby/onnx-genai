@@ -36,32 +36,24 @@ const STATIC_CACHE_WORKFLOW: &str = r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - nested_control_flow
-      - loop_induction_values
-      - serving_service_contract
+    manifest: {}
     inputs:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, prompt_sequence]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: runtime, version: '1.0', role: prompt_tokens}
         source: {kind: request}
         required: true
       request.max_iterations:
-        contract: {dtype: int64, rank: 1, shape: [1]}
+        contract: {dtype: int64, shape: [1]}
         role: {kind: runtime, version: '1.0', role: max_iterations}
         source: {kind: request}
         required: false
         default: 4
       package.capacity:
-        contract: {dtype: int64, rank: 1, shape: [1]}
+        contract: {dtype: int64, shape: [1]}
         role: {kind: opaque}
         source: {kind: literal}
         required: false
@@ -69,7 +61,6 @@ pipeline:
       package.active:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -79,7 +70,6 @@ pipeline:
       package.done:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -89,7 +79,6 @@ pipeline:
       package.accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -97,7 +86,7 @@ pipeline:
         required: false
         default: 0
       package.loop_active:
-        contract: {dtype: bool, rank: 1, shape: [1]}
+        contract: {dtype: bool, shape: [1]}
         role: {kind: opaque}
         source: {kind: literal}
         required: false
@@ -105,7 +94,6 @@ pipeline:
       package.write_indices:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -115,7 +103,6 @@ pipeline:
       package.cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -125,7 +112,6 @@ pipeline:
       package.cache:
         contract:
           dtype: DTYPE
-          rank: 3
           shape: [batch, cache_capacity, 4]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -136,7 +122,6 @@ pipeline:
       tokens:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, generated]
           batch_layout: {kind: request_aligned, axis: 0}
         role: tokens
@@ -150,64 +135,52 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape: [batch, 1]
               batch_layout: {kind: request_aligned, axis: 0}
             cache:
               dtype: DTYPE
-              rank: 3
               shape: [batch, cache_capacity, 4]
               batch_layout: {kind: request_aligned, axis: 0}
             write_indices:
               dtype: int64
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
           outputs:
             token:
               dtype: int64
-              rank: 2
               shape: [batch, 1]
               batch_layout: {kind: request_aligned, axis: 0}
             updated_cache:
               dtype: DTYPE
-              rank: 3
               shape: [batch, cache_capacity, 4]
               batch_layout: {kind: request_aligned, axis: 0}
             next_write_indices:
               dtype: int64
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             next_cache_lengths:
               dtype: int64
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             next_active:
               dtype: bool
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             next_done:
               dtype: bool
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             next_accepted_len:
               dtype: int64
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             next_loop_active:
               dtype: bool
-              rank: 1
               shape: [1]
     state:
       token:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, 1]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
@@ -216,7 +189,6 @@ pipeline:
       active:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         class: semantic
@@ -226,7 +198,6 @@ pipeline:
       done:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         class: semantic
@@ -236,7 +207,6 @@ pipeline:
       accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         class: semantic
@@ -244,14 +214,13 @@ pipeline:
         initializer: package.accepted_len
         recurrence: {kind: invariant}
       loop_active:
-        contract: {dtype: bool, rank: 1, shape: [1]}
+        contract: {dtype: bool, shape: [1]}
         scope: invocation
         initializer: package.loop_active
         recurrence: {kind: invariant}
       write_indices:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         class: semantic
@@ -261,7 +230,6 @@ pipeline:
       cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         class: semantic
@@ -271,7 +239,6 @@ pipeline:
       cache:
         contract:
           dtype: DTYPE
-          rank: 3
           shape: [batch, cache_capacity, 4]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
@@ -340,7 +307,7 @@ pipeline:
       - {cell: loop_active, next: body.loop_active}
       iteration:
         value: loop.iteration
-        contract: {dtype: int64, rank: 1, shape: [1]}
+        contract: {dtype: int64, shape: [1]}
 package:
   tokenizer:
     algorithm: bpe
@@ -361,32 +328,24 @@ const MOBIUS_STATIC_CACHE: &str = r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - nested_control_flow
-      - loop_induction_values
-      - serving_service_contract
+    manifest: {}
     inputs:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, prompt_sequence]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: runtime, version: '1.0', role: prompt_tokens}
         source: {kind: request}
         required: true
       request.max_iterations:
-        contract: {dtype: int64, rank: 1, shape: [1]}
+        contract: {dtype: int64, shape: [1]}
         role: {kind: runtime, version: '1.0', role: max_iterations}
         source: {kind: request}
         required: false
         default: 4
       package.capacity:
-        contract: {dtype: int64, rank: 1, shape: [1]}
+        contract: {dtype: int64, shape: [1]}
         role: {kind: opaque}
         source: {kind: literal}
         required: false
@@ -394,7 +353,6 @@ pipeline:
       package.active:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -404,7 +362,6 @@ pipeline:
       package.done:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -414,7 +371,6 @@ pipeline:
       package.accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -422,7 +378,7 @@ pipeline:
         required: false
         default: 0
       package.loop_active:
-        contract: {dtype: bool, rank: 1, shape: [1]}
+        contract: {dtype: bool, shape: [1]}
         role: {kind: opaque}
         source: {kind: literal}
         required: false
@@ -430,7 +386,6 @@ pipeline:
       package.write_indices:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -440,7 +395,6 @@ pipeline:
       package.cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -450,7 +404,6 @@ pipeline:
       package.cache:
         contract:
           dtype: DTYPE
-          rank: 3
           shape: [batch, cache_capacity, 4]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -461,7 +414,6 @@ pipeline:
       tokens:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, generated]
           batch_layout: {kind: request_aligned, axis: 0}
         role: tokens
@@ -473,73 +425,59 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape: [batch, 1]
               batch_layout: {kind: request_aligned, axis: 0}
             key_cache.0:
               dtype: DTYPE
-              rank: 3
               shape: [batch, cache_capacity, 4]
               batch_layout: {kind: request_aligned, axis: 0}
             value_cache.0:
               dtype: DTYPE
-              rank: 3
               shape: [batch, cache_capacity, 4]
               batch_layout: {kind: request_aligned, axis: 0}
             write_indices:
               dtype: int64
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             nonpad_kv_seqlen:
               dtype: int64
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
           outputs:
             token:
               dtype: int64
-              rank: 2
               shape: [batch, 1]
               batch_layout: {kind: request_aligned, axis: 0}
             updated_key_cache.0:
               dtype: DTYPE
-              rank: 3
               shape: [batch, cache_capacity, 4]
               batch_layout: {kind: request_aligned, axis: 0}
             updated_value_cache.0:
               dtype: DTYPE
-              rank: 3
               shape: [batch, cache_capacity, 4]
               batch_layout: {kind: request_aligned, axis: 0}
             next_write_indices:
               dtype: int64
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             next_cache_lengths:
               dtype: int64
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             next_active:
               dtype: bool
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             next_done:
               dtype: bool
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             next_accepted_len:
               dtype: int64
-              rank: 1
               shape: [batch]
               batch_layout: {kind: request_aligned, axis: 0}
             next_loop_active:
               dtype: bool
-              rank: 1
               shape: [1]
           roles:
             input_ids: token_ids
@@ -547,7 +485,6 @@ pipeline:
       token:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, 1]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
@@ -556,7 +493,6 @@ pipeline:
       active:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         class: semantic
@@ -566,7 +502,6 @@ pipeline:
       done:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         class: semantic
@@ -576,7 +511,6 @@ pipeline:
       accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         class: semantic
@@ -584,14 +518,13 @@ pipeline:
         initializer: package.accepted_len
         recurrence: {kind: invariant}
       loop_active:
-        contract: {dtype: bool, rank: 1, shape: [1]}
+        contract: {dtype: bool, shape: [1]}
         scope: invocation
         initializer: package.loop_active
         recurrence: {kind: invariant}
       write_indices:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         class: semantic
@@ -601,7 +534,6 @@ pipeline:
       cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         class: semantic
@@ -611,7 +543,6 @@ pipeline:
       key_cache:
         contract:
           dtype: DTYPE
-          rank: 3
           shape: [batch, cache_capacity, 4]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
@@ -623,7 +554,6 @@ pipeline:
       value_cache:
         contract:
           dtype: DTYPE
-          rank: 3
           shape: [batch, cache_capacity, 4]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
@@ -699,7 +629,7 @@ pipeline:
       - {cell: loop_active, next: body.loop_active}
       iteration:
         value: loop.iteration
-        contract: {dtype: int64, rank: 1, shape: [1]}
+        contract: {dtype: int64, shape: [1]}
 package:
   tokenizer:
     algorithm: bpe
@@ -1166,7 +1096,7 @@ fn matching_layers_allow_heterogeneous_key_and_value_geometry() {
             TensorDimension::Fixed(8),
         ];
         let mut value_initializer = workflow.inputs["package.cache"].clone();
-        value_initializer.contract.shape = Some(value_shape.clone());
+        value_initializer.contract.shape = value_shape.clone();
         workflow
             .inputs
             .insert("package.value_cache".to_string(), value_initializer);
@@ -1175,16 +1105,16 @@ fn matching_layers_allow_heterogeneous_key_and_value_geometry() {
             .get_mut("value_cache")
             .unwrap()
             .contract
-            .shape = Some(value_shape.clone());
+            .shape = value_shape.clone();
         workflow.state.get_mut("value_cache").unwrap().initializer =
             "package.value_cache".to_string();
         let ports = &mut workflow.components.get_mut("model").unwrap().ports;
-        ports.inputs.get_mut("value_cache.0").unwrap().shape = Some(value_shape.clone());
+        ports.inputs.get_mut("value_cache.0").unwrap().shape = value_shape.clone();
         ports
             .outputs
             .get_mut("updated_value_cache.0")
             .unwrap()
-            .shape = Some(value_shape);
+            .shape = value_shape;
     }
 
     validate_metadata(&metadata)

@@ -7,10 +7,11 @@ use onnx_genai_engine::{
 use onnx_genai_ort::{DataType, Value};
 
 fn options(max_new_tokens: usize) -> GenerateOptions {
-    let mut options = GenerateOptions::default();
-    options.max_new_tokens = max_new_tokens;
-    options.seed = Some(7);
-    options
+    GenerateOptions {
+        max_new_tokens,
+        seed: Some(7),
+        ..Default::default()
+    }
 }
 
 pub fn tiny_png() -> Vec<u8> {

@@ -123,12 +123,15 @@ test("diagnostics identify missing image value range without claiming schema val
 });
 
 test("HTML exposes all purpose-built views and user actions", () => {
-  for (const text of ["Document & capabilities", "Model, package & execution", "Workflow control-flow graph",
+  for (const text of ["Document & core conformance", "Model, package & execution", "Workflow control-flow graph",
     "Nested loop & conditional timeline", "Serving state groups & K/V aliases", "Preprocessing, tokenizer & media",
-    "Policy component help", "Adapters, speculative execution & deployment", "Capability catalogue",
+    "Policy component help", "Adapters, speculative execution & deployment", "Metadata extension registry",
+    "Core schema conformance is not a capability", "Runtime optimizations",
     "Workflow quick reference", "Export", "Print", "Reset"]) {
     assert.ok(html.includes(text), text);
   }
+  assert.ok(!html.includes("Document & capabilities"));
+  assert.ok(!html.includes("Capability catalogue"));
 });
 
 // --- Blocker 1: Mermaid labels must never let metadata inject graph/HTML syntax.

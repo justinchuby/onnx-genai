@@ -17,20 +17,17 @@ model:
   max_sequence_length: 4096      # optional; model facts, never port names
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, linear_effects, typed_emit, streaming_emit,
-                     nested_control_flow, loop_induction_values,
-                     serving_service_contract]
+    manifest: {}
 
     inputs:
       request.input_ids:          # the prompt
-        contract: {dtype: int64, rank: 2, shape: [batch, sequence],
+        contract: {dtype: int64, shape: [batch, sequence],
                    batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: runtime, version: '1.0', role: prompt_tokens}
         source: {kind: request}
         required: true
       request.max_iterations:     # generation bound
-        contract: {dtype: int64, rank: 1, shape: [1]}
+        contract: {dtype: int64, shape: [1]}
         role: {kind: runtime, version: '1.0', role: max_iterations}
         source: {kind: request}
         required: false
@@ -38,9 +35,10 @@ pipeline:
 
     outputs:
       tokens:
-        contract: {dtype: int64, rank: 2, shape: [batch, sequence],
+        contract: {dtype: int64, shape: [batch, sequence],
                    batch_layout: {kind: request_aligned, axis: 0}}
         role: tokens
+        family: { kind: materialized }
         stage: pre_adapter
 
     components:
@@ -123,9 +121,10 @@ Do not hand-write this. See [Converting a package](#converting-a-package).
    lets a single decoder keep the rich Rust sampler, paged KV, sessions and
    speculative decode — none of which has an in-graph representation.
 
-5. **Declare the capabilities you use.** Validation computes the capabilities
-   your structure requires and rejects a manifest that omits one, so the list
-   is checkable rather than decorative.
+5. **Declare semantics once, where they belong.** The schema version selects
+   core workflow conformance. An optional semantic module names its exact
+   identity and version at its typed declaration; there is no manifest
+   capability list to keep in sync.
 
 ## Conversations
 
@@ -135,7 +134,7 @@ once, in `pipeline.workflow.state`:
 ```yaml
     state:
       conversation:
-        contract: {dtype: int64, rank: 2, shape: [batch, conversation_length],
+        contract: {dtype: int64, shape: [batch, conversation_length],
                    batch_layout: {kind: request_aligned, axis: 0}}
         class: semantic
         scope: session

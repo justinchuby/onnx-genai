@@ -1298,6 +1298,26 @@ impl<'a> BatchedDecodeSession<'a> for BatchedStaticCacheDecodeSession<'a> {
     fn assign_row(&mut self, row: usize) -> Result<()> {
         BatchedStaticCacheDecodeSession::assign_row(self, row)
     }
+    fn snapshot_row(&mut self, row: usize) -> Result<crate::decode::BatchedRowSnapshot> {
+        Ok(crate::decode::BatchedRowSnapshot::new(
+            row,
+            self.row_len(row)?,
+            self.is_active(row)?,
+        ))
+    }
+    fn restore_row(
+        &mut self,
+        row: usize,
+        snapshot: &crate::decode::BatchedRowSnapshot,
+    ) -> Result<()> {
+        snapshot.validate_row(row)?;
+        self.rewind_row(row, snapshot.logical_len())?;
+        if snapshot.active() {
+            self.activate_row(row)
+        } else {
+            self.deactivate_row(row)
+        }
+    }
     fn step_select(
         &mut self,
         next_token_ids: &[i64],

@@ -5,9 +5,10 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use onnx_genai::GeneratePrompt;
 use onnx_genai_engine::GenerateConstraint;
+use onnx_genai_metadata::ToolProtocolDeclaration;
 use onnx_genai_server::{
-    AppState, ChatCompletionRequest, ServerConfig, app, build_generate_request,
-    parse_assistant_output, parse_tool_calls,
+    AppState, ChatCompletionRequest, OrtSessionWorkerCount, ServerConfig, ToolProtocol, app,
+    build_generate_request, build_generate_request_with_protocol,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -20,6 +21,13 @@ fn fixture_dir() -> PathBuf {
 async fn test_app() -> axum::Router {
     let state = AppState::load(&fixture_dir(), Some("tiny-llm".to_string())).unwrap();
     app(state)
+}
+
+async fn fixture_app(name: &str) -> axum::Router {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name);
+    app(AppState::load(&directory, Some(name.to_string())).unwrap())
 }
 
 async fn test_app_with_config(config: ServerConfig) -> axum::Router {
@@ -145,8 +153,9 @@ fn sse_data_lines(text: &str) -> Vec<&str> {
 }
 
 fn sse_json_chunks(text: &str) -> Vec<Value> {
-    sse_data_lines(text)
-        .into_iter()
+    text.split("\n\n")
+        .filter(|event| !event.lines().any(|line| line.starts_with("event: ")))
+        .filter_map(|event| event.lines().find_map(|line| line.strip_prefix("data: ")))
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).unwrap())
         .collect()
@@ -684,6 +693,205 @@ async fn session_ids_are_random_csprng_tokens() {
 }
 
 #[tokio::test]
+async fn session_fork_endpoint_returns_an_independent_child() {
+    let app = test_app().await;
+    let source = create_http_session(app.clone()).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/sessions/{source}/fork"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "position": 0 }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["object"], "session");
+    let child = body["id"].as_str().unwrap().to_string();
+    assert_ne!(source, child);
+
+    for id in [source, child] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_fork_routes_worker_local_id_collisions_without_leaking_failed_children() {
+    let app = test_app_with_config(ServerConfig {
+        ort_session_workers: OrtSessionWorkerCount::new(2).unwrap(),
+        ..ServerConfig::default()
+    })
+    .await;
+    let first = create_http_session(app.clone()).await;
+    let second = create_http_session(app.clone()).await;
+
+    async fn live_sessions(app: axum::Router) -> Vec<u64> {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_, body) = response_json(response).await;
+        body["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|worker| worker["live_sessions"].as_u64().unwrap())
+            .collect()
+    }
+
+    assert_eq!(
+        live_sessions(app.clone()).await,
+        vec![1, 1],
+        "the two client sessions must own colliding worker-local engine ids"
+    );
+
+    let rejected = post_json(
+        app.clone(),
+        &format!("/v1/sessions/{first}/fork"),
+        json!({ "position": 1 }),
+    )
+    .await;
+    let (status, body) = response_json(rejected).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.get("id").is_none(), "{body}");
+    assert_eq!(
+        live_sessions(app.clone()).await,
+        vec![1, 1],
+        "failed publication must not leak a worker child or reservation"
+    );
+
+    let first_child = post_json(
+        app.clone(),
+        &format!("/v1/sessions/{first}/fork"),
+        json!({ "position": 0 }),
+    )
+    .await;
+    let (status, first_child) = response_json(first_child).await;
+    assert_eq!(status, StatusCode::OK, "{first_child}");
+    assert_eq!(
+        live_sessions(app.clone()).await,
+        vec![2, 1],
+        "the child must stay on its source worker"
+    );
+
+    let second_child = post_json(
+        app.clone(),
+        &format!("/v1/sessions/{second}/fork"),
+        json!({ "position": 0 }),
+    )
+    .await;
+    let (status, second_child) = response_json(second_child).await;
+    assert_eq!(status, StatusCode::OK, "{second_child}");
+    assert_eq!(
+        live_sessions(app.clone()).await,
+        vec![2, 2],
+        "matching engine-local ids must route through distinct source owners"
+    );
+
+    for id in [
+        first,
+        second,
+        first_child["id"].as_str().unwrap().to_string(),
+        second_child["id"].as_str().unwrap().to_string(),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+}
+
+#[tokio::test]
+async fn session_fork_endpoint_reports_the_unsupported_participant_before_child() {
+    let app = test_app().await;
+    let source = create_http_session(app.clone()).await;
+    let generated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Session-Id", &source)
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(generated.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/sessions/{source}/fork"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "position": 0 }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("runner-owned decoder KV"),
+        "{body}"
+    );
+
+    let closed = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{source}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn sessions_are_lru_evicted_at_configured_cap() {
     let app = test_app_with_config(ServerConfig {
         max_output_tokens: 16,
@@ -982,7 +1190,10 @@ fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
     }));
 
     let Some(GenerateConstraint::Lark(grammar)) =
-        build_generate_request(&request).options.constraint
+        build_generate_request_with_protocol(&request, &declared_protocol("tagged-json"))
+            .unwrap()
+            .options
+            .constraint
     else {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
@@ -1026,7 +1237,10 @@ fn required_tool_choice_with_multiple_tools_allows_any_tool_schema() {
     }));
 
     let Some(GenerateConstraint::Lark(grammar)) =
-        build_generate_request(&request).options.constraint
+        build_generate_request_with_protocol(&request, &declared_protocol("tagged-json"))
+            .unwrap()
+            .options
+            .constraint
     else {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
@@ -1061,11 +1275,17 @@ fn auto_and_none_tool_choice_do_not_constrain_generation() {
     }));
 
     assert_eq!(
-        build_generate_request(&auto_request).options.constraint,
+        build_generate_request_with_protocol(&auto_request, &declared_protocol("tagged-json"))
+            .unwrap()
+            .options
+            .constraint,
         None
     );
     assert_eq!(
-        build_generate_request(&none_request).options.constraint,
+        build_generate_request_with_protocol(&none_request, &declared_protocol("atem-xml"))
+            .unwrap()
+            .options
+            .constraint,
         None
     );
     let GeneratePrompt::Text(prompt) = build_generate_request(&none_request).prompt else {
@@ -1075,7 +1295,7 @@ fn auto_and_none_tool_choice_do_not_constrain_generation() {
 }
 
 #[test]
-fn chat_request_with_tools_renders_tool_schema_in_prompt() {
+fn generic_request_builder_does_not_guess_a_tool_protocol() {
     let request = chat_request(json!({
         "model": "tiny-llm",
         "messages": [
@@ -1110,240 +1330,370 @@ fn chat_request_with_tools_renders_tool_schema_in_prompt() {
     let GeneratePrompt::Text(prompt) = generate_request.prompt else {
         panic!("expected text prompt");
     };
-    assert!(prompt.contains("<|tools|>"), "{prompt}");
-    assert!(prompt.contains("get_weather"), "{prompt}");
-    assert!(
-        prompt.contains("\"city\":{\"type\":\"string\"}"),
-        "{prompt}"
-    );
+    assert!(!prompt.contains("<|tools|>"), "{prompt}");
+    assert!(!prompt.contains("<atem:tools>"), "{prompt}");
     assert!(prompt.contains("<|tool|>"), "{prompt}");
     assert!(prompt.contains("tool_call_id: call_0"), "{prompt}");
 }
 
-#[test]
-fn parser_converts_qwen_tool_call_blocks_to_openai_tool_calls() {
-    let parsed = parse_assistant_output(
-        r#"Thinking...
-<tool_call>
-{"name":"read_file","arguments":{"path":"src/lib.rs"}}
-</tool_call>
-<tool_call>
-{"name":"write_file","arguments":{"path":"src/lib.rs","content":"ok"}}
-</tool_call>"#
-            .to_string(),
-        "stop",
-    );
-
-    assert_eq!(parsed.finish_reason, "tool_calls");
-    assert!(parsed.content.is_none());
-    let calls = parsed.tool_calls.unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].id, "call_0");
-    assert_eq!(calls[0].kind, "function");
-    assert_eq!(calls[0].function.name, "read_file");
-    assert_eq!(calls[0].function.arguments, r#"{"path":"src/lib.rs"}"#);
-    assert_eq!(calls[1].id, "call_1");
-    assert_eq!(calls[1].function.name, "write_file");
-    let second_args: Value = serde_json::from_str(&calls[1].function.arguments).unwrap();
-    assert_eq!(second_args["path"], "src/lib.rs");
-    assert_eq!(second_args["content"], "ok");
-}
-
-#[test]
-fn parser_keeps_qwen_single_tool_call_behavior() {
-    let calls = parse_tool_calls(
-        r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs"}}</tool_call>"#,
-    );
-
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].id, "call_0");
-    assert_eq!(calls[0].function.name, "read_file");
-    assert_eq!(calls[0].function.arguments, r#"{"path":"src/lib.rs"}"#);
-}
-
-#[test]
-fn parser_converts_llama_parameters_with_eom_terminator() {
-    let calls = parse_tool_calls(
-        r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}<|eom_id|>"#,
-    );
-
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].id, "call_0");
-    assert_eq!(calls[0].function.name, "get_weather");
-    assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
-}
-
-#[test]
-fn parser_converts_semicolon_separated_llama_calls() {
-    let calls = parse_tool_calls(
-        r#"<|python_tag|>{"name":"first","parameters":{"text":"a;b"}}; {"name":"second","parameters":{"value":2}}<|eot_id|>"#,
-    );
-
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].id, "call_0");
-    assert_eq!(calls[0].function.name, "first");
-    assert_eq!(calls[0].function.arguments, r#"{"text":"a;b"}"#);
-    assert_eq!(calls[1].id, "call_1");
-    assert_eq!(calls[1].function.name, "second");
-    assert_eq!(calls[1].function.arguments, r#"{"value":2}"#);
-}
-
-#[test]
-fn parser_converts_mistral_tool_call_array() {
-    let calls = parse_tool_calls(
-        r#"[TOOL_CALLS][{"invalid":"missing-name"},{"name":"first","arguments":{"value":1}},{"name":"second","arguments":{"value":2}}]"#,
-    );
-
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].id, "call_0");
-    assert_eq!(calls[0].function.name, "first");
-    assert_eq!(calls[1].id, "call_1");
-    assert_eq!(calls[1].function.name, "second");
-}
-
-#[test]
-fn parser_converts_atem_tool_call_blocks() {
-    let calls = parse_tool_calls(
-        r#"<atem:function_calls>
-<atem:invoke name="bash">
-<atem:parameter name="command">{"cmd":"printf ok"}</atem:parameter>
-<atem:parameter name="description">run a command</atem:parameter>
-</atem:invoke>
-</atem:function_calls>"#,
-    );
-
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].function.name, "bash");
-    let arguments: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
-    assert_eq!(arguments["command"]["cmd"], "printf ok");
-    assert_eq!(arguments["description"], "run a command");
-}
-
-#[test]
-fn parser_returns_only_atem_user_channel_content() {
-    let parsed = parse_assistant_output(
-        "<|start|>assistant to=self<|message|>private reasoning<|eom|>\
-         <|start|>assistant to=user<|message|>final answer<|eot|>"
-            .to_string(),
-        "stop",
-    );
-
-    assert_eq!(parsed.content.as_deref(), Some("final answer"));
-    assert!(parsed.tool_calls.is_none());
-}
-
-// A turn truncated inside the private reasoning channel produced no answer, so
-// the client sees empty content rather than the model's reasoning.
-#[test]
-fn parser_withholds_atem_reasoning_without_a_user_channel() {
-    let parsed = parse_assistant_output(
-        "<|start|>assistant to=self<|message|>private reasoning that ran long".to_string(),
-        "length",
-    );
-
-    assert_eq!(parsed.content.as_deref(), Some(""));
-    assert!(parsed.tool_calls.is_none());
-    assert_eq!(parsed.finish_reason, "length");
-}
-
-#[test]
-fn parser_prefers_arguments_over_parameters() {
-    let calls = parse_tool_calls(
-        r#"<|python_tag|>{"name":"choose","arguments":{"source":"arguments"},"parameters":{"source":"parameters"}}"#,
-    );
-
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].function.arguments, r#"{"source":"arguments"}"#);
-}
-
-#[test]
-fn parser_skips_malformed_tool_call_formats() {
-    assert!(parse_tool_calls(r#"<tool_call>{"name":</tool_call>"#).is_empty());
-    assert!(parse_tool_calls(r#"<|python_tag|>{"name":"broken""#).is_empty());
-    assert!(parse_tool_calls(r#"[TOOL_CALLS]{"name":"not-an-array"}"#).is_empty());
-    assert!(parse_tool_calls("").is_empty());
-    assert!(parse_tool_calls("ordinary assistant text").is_empty());
-}
-
-#[test]
-fn plain_assistant_output_preserves_content() {
-    let output = "ordinary assistant text".to_string();
-    let parsed = parse_assistant_output(output.clone(), "stop");
-
-    assert_eq!(parsed.content, Some(output));
-    assert!(parsed.tool_calls.is_none());
-    assert_eq!(parsed.finish_reason, "stop");
+fn declared_protocol(identity: &str) -> ToolProtocol {
+    ToolProtocol::from_declaration(&ToolProtocolDeclaration {
+        identity: identity.to_string(),
+        version: "v1".to_string(),
+    })
+    .unwrap()
 }
 
 #[tokio::test]
-#[ignore = "requires gitignored models/qwen2.5-0.5b real model fixture"]
-async fn qwen_real_model_tool_use_chain_end_to_end() {
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/qwen2.5-0.5b");
-    assert!(
-        model_dir.exists(),
-        "build the real model fixture with scripts/build_qwen.sh"
-    );
-    let app = app(AppState::load(&model_dir, Some("qwen2.5-0.5b".to_string())).unwrap());
-    let tool = json!({
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get current weather for a city",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string"},
-                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["location"]
-            }
-        }
-    });
-    let first_messages = json!([
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "What's the weather in Paris? Use the tool."}
-    ]);
-
-    let forced = post_chat_json(
-        app.clone(),
+async fn tool_request_without_package_declaration_fails_before_generation() {
+    let response = post_json(
+        test_app().await,
+        "/v1/chat/completions",
         json!({
-            "model": "qwen2.5-0.5b",
-            "messages": first_messages,
-            "tools": [tool.clone()],
-            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+            "model": "tiny-llm",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}]
         }),
     )
     .await;
-    assert_eq!(forced["choices"][0]["finish_reason"], "tool_calls");
-    let tool_call = forced["choices"][0]["message"]["tool_calls"][0].clone();
-    assert_eq!(tool_call["function"]["name"], "get_weather");
-    let args: Value =
-        serde_json::from_str(tool_call["function"]["arguments"].as_str().unwrap()).unwrap();
-    assert!(args["location"].is_string(), "{args}");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("before inference"), "{message}");
+    assert!(message.contains("package.tool_protocol"), "{message}");
+}
+
+#[tokio::test]
+async fn tool_result_chain_commits_typed_calls_and_accepts_reordered_results_over_http() {
+    let tools = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {"type": "object"}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "time",
+                "parameters": {"type": "object"}
+            }
+        }
+    ]);
+    let body = json!({
+        "model": "tiny-tool-call",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": tools,
+        "tool_choice": "auto",
+        "max_tokens": 2
+    });
+    let buffered = post_json(
+        fixture_app("tiny-tool-call").await,
+        "/v1/chat/completions",
+        body.clone(),
+    )
+    .await;
+    let status = buffered.status();
+    let buffered_bytes = to_bytes(buffered.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&buffered_bytes)
+    );
+    let buffered: Value = serde_json::from_slice(&buffered_bytes).unwrap();
+    let choice = &buffered["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls");
+    assert!(choice["message"]["content"].is_null());
+    let tool_calls = choice["message"]["tool_calls"]
+        .as_array()
+        .expect("typed tool calls");
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0]["id"], "call_weather");
+    assert_eq!(tool_calls[0]["function"]["name"], "weather");
+    assert_eq!(
+        tool_calls[0]["function"]["arguments"],
+        r#"{"city":"Paris"}"#
+    );
+    assert_eq!(tool_calls[1]["id"], "call_time");
+    assert_eq!(tool_calls[1]["function"]["name"], "time");
+    assert_eq!(
+        tool_calls[1]["function"]["arguments"],
+        r#"{"timezone":"UTC"}"#
+    );
+
+    let mut streamed_body = body;
+    streamed_body["stream"] = Value::Bool(true);
+    let streamed = post_json(
+        fixture_app("tiny-tool-call").await,
+        "/v1/chat/completions",
+        streamed_body,
+    )
+    .await;
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let streamed = String::from_utf8(
+        to_bytes(streamed.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let streamed_chunks = sse_json_chunks(&streamed);
+    let streamed_calls = streamed_chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["tool_calls"].as_array())
+        .map(|calls| &calls[0])
+        .collect::<Vec<_>>();
+    assert_eq!(streamed_calls.len(), 4, "{streamed}");
+    assert_eq!(streamed_calls[0]["index"], 0);
+    assert_eq!(streamed_calls[0]["id"], "call_weather");
+    assert_eq!(streamed_calls[0]["function"]["name"], "weather");
+    assert_eq!(streamed_calls[1]["index"], 0);
+    assert_eq!(
+        streamed_calls[1]["function"]["arguments"],
+        tool_calls[0]["function"]["arguments"]
+    );
+    assert_eq!(streamed_calls[2]["index"], 1);
+    assert_eq!(streamed_calls[2]["id"], "call_time");
+    assert_eq!(streamed_calls[2]["function"]["name"], "time");
+    assert_eq!(streamed_calls[3]["index"], 1);
+    assert_eq!(
+        streamed_calls[3]["function"]["arguments"],
+        tool_calls[1]["function"]["arguments"]
+    );
+    assert_eq!(
+        streamed_chunks
+            .iter()
+            .filter(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls")
+            .count(),
+        1,
+        "{streamed}"
+    );
+    assert!(!streamed.contains("<tool_call>"), "{streamed}");
+    assert!(streamed.contains("data: [DONE]"), "{streamed}");
 
     let final_response = post_chat_json(
-        app,
+        fixture_app("tiny-tool-call").await,
         json!({
-            "model": "qwen2.5-0.5b",
+            "model": "tiny-tool-call",
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "What's the weather in Paris? Use the tool."},
-                {"role": "assistant", "content": null, "tool_calls": [tool_call]},
-                {"role": "tool", "tool_call_id": "call_0", "content": "{\"temp\":18,\"unit\":\"celsius\"}"}
+                {"role": "assistant", "content": null, "tool_calls": tool_calls},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_time",
+                    "name": "time",
+                    "content": "UTC"
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "name": "weather",
+                    "content": "Paris"
+                }
             ],
-            "tools": [tool],
-            "tool_choice": "auto"
+            "max_tokens": 2
         }),
     )
     .await;
     assert_eq!(final_response["choices"][0]["finish_reason"], "stop");
-    assert!(
-        final_response["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap()
-            .contains("18"),
-        "{final_response}"
+    assert_eq!(
+        final_response["choices"][0]["message"]["content"],
+        "Results accepted."
     );
+    assert!(
+        final_response["choices"][0]["message"]
+            .get("tool_calls")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn required_no_call_fails_before_buffered_success_publication() {
+    let response = post_json(
+        fixture_app("tiny-tool-call").await,
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-tool-call",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {"type": "object"}
+                }
+            }],
+            "tool_choice": "required",
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("at least one was required"), "{message}");
+    assert!(!body.to_string().contains("\"tool_calls\""), "{body}");
+}
+
+#[tokio::test]
+async fn tool_result_history_rejections_are_actionable_before_generation() {
+    let calls = json!([
+        {
+            "id": "call_weather",
+            "type": "function",
+            "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}
+        },
+        {
+            "id": "call_time",
+            "type": "function",
+            "function": {"name": "time", "arguments": "{\"timezone\":\"UTC\"}"}
+        }
+    ]);
+    let base = json!({
+        "model": "tiny-tool-call",
+        "tools": [
+            {"type": "function", "function": {"name": "weather"}},
+            {"type": "function", "function": {"name": "time"}}
+        ],
+        "tool_choice": "auto"
+    });
+    let cases = [
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {"role": "tool", "tool_call_id": "call_unknown", "content": "nope"}
+            ]),
+            "does not match any assistant tool call",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"},
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"},
+                {"role": "tool", "tool_call_id": "call_time", "content": "UTC"}
+            ]),
+            "duplicates the result already supplied",
+        ),
+        (
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_weather",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}
+                        },
+                        {
+                            "id": "call_weather",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": "{\"city\":\"Lyon\"}"}
+                        }
+                    ]
+                }
+            ]),
+            "duplicates messages[0].tool_calls[0].id",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"}
+            ]),
+            "missing tool result(s) for 'call_time'",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "name": "time",
+                    "content": "Paris"
+                },
+                {"role": "tool", "tool_call_id": "call_time", "content": "UTC"}
+            ]),
+            "does not match tool_call_id 'call_weather' function 'weather'",
+        ),
+        (
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_weather",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": "not JSON"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"}
+            ]),
+            "function.arguments must be a JSON object",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "content": [{"type": "text", "text": "Paris"}]
+                },
+                {"role": "tool", "tool_call_id": "call_time", "content": "UTC"}
+            ]),
+            "must be a text string",
+        ),
+    ];
+
+    for (messages, expected) in cases {
+        let mut body = base.clone();
+        body["messages"] = messages;
+        let response = post_json(
+            fixture_app("tiny-tool-call").await,
+            "/v1/chat/completions",
+            body,
+        )
+        .await;
+        let (status, error) = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("before inference"), "{message}");
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn no_tools_and_none_do_not_publish_typed_tool_calls() {
+    let no_tools = post_chat_json(
+        fixture_app("tiny-tool-call").await,
+        json!({
+            "model": "tiny-tool-call",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    let none = post_chat_json(
+        fixture_app("tiny-tool-call").await,
+        json!({
+            "model": "tiny-tool-call",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "tool_choice": "none",
+            "max_tokens": 1
+        }),
+    )
+    .await;
+
+    for response in [&no_tools, &none] {
+        assert_ne!(response["choices"][0]["finish_reason"], "tool_calls");
+        assert!(
+            response["choices"][0]["message"]
+                .get("tool_calls")
+                .is_none()
+        );
+    }
 }
 
 #[tokio::test]

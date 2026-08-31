@@ -11,7 +11,7 @@
 //! taken after the command is already queued, so a second turn on a busy
 //! session would be admitted, parked behind the first, and eventually succeed —
 //! a slow success rather than the refusal
-//! [`PackageCapabilityError::ExclusiveLeaseConflict`] names. Acquiring before
+//! [`PackageExecutionError::ExclusiveLeaseConflict`] names. Acquiring before
 //! the command exists is what makes that refusal reachable with one worker.
 //!
 //! What this module is *not*: it does not run two turns, does not shard an
@@ -26,7 +26,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use onnx_genai_engine::PackageCapabilityError;
+use onnx_genai_engine::PackageExecutionError;
 
 use crate::worker::SessionPlacement;
 
@@ -163,14 +163,14 @@ impl SessionLeases {
         self: &Arc<Self>,
         binding: ModelSessionPlacement,
         session: &str,
-    ) -> Result<SessionLeaseGuard, PackageCapabilityError> {
+    ) -> Result<SessionLeaseGuard, PackageExecutionError> {
         if lock(self.shard(&binding)).insert(binding.clone()) {
             Ok(SessionLeaseGuard {
                 leases: Arc::clone(self),
                 binding,
             })
         } else {
-            Err(PackageCapabilityError::ExclusiveLeaseConflict {
+            Err(PackageExecutionError::ExclusiveLeaseConflict {
                 session: session.to_string(),
             })
         }
@@ -306,7 +306,7 @@ mod tests {
             .expect_err("a second turn on a live session is refused");
         assert_eq!(
             conflict,
-            PackageCapabilityError::ExclusiveLeaseConflict {
+            PackageExecutionError::ExclusiveLeaseConflict {
                 session: "sess-a".to_string(),
             }
         );
@@ -411,7 +411,7 @@ mod tests {
                             thread::sleep(std::time::Duration::from_millis(50));
                             drop(guard);
                         }
-                        Err(PackageCapabilityError::ExclusiveLeaseConflict { session }) => {
+                        Err(PackageExecutionError::ExclusiveLeaseConflict { session }) => {
                             assert_eq!(session, "sess-race");
                             conflicts.fetch_add(1, Ordering::SeqCst);
                         }

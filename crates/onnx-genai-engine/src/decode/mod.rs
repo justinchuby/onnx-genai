@@ -46,7 +46,7 @@ pub(crate) use metadata::{
     graph_uses_explicit_kv_length_attention, sink_tokens_from_metadata,
     sliding_window_from_metadata,
 };
-pub(crate) use state::DecodeState;
+pub(crate) use state::{DecodeState, DecodeTurnBaseline};
 #[cfg(feature = "native-backend")]
 pub(crate) use step::position_ids_from_starts;
 pub(crate) use step::{run_decode_session_logits, run_decode_step};

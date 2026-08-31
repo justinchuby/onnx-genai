@@ -22,6 +22,8 @@ pub(crate) const MISSING_ORT_SESSION: &str = "ORT backend must own a decoder ses
 /// which kind of package they loaded, which is what the old
 /// `Engine` / `PipelineEngine` split forced them to do.
 pub struct Engine {
+    /// Runtime-only authority that binds prepared session forks to this engine.
+    pub(crate) session_fork_origin: SessionForkOrigin,
     /// The interpreter that executes this package's declared workflow.
     ///
     /// Not optional: a package that declares no workflow does not load, so
@@ -173,6 +175,7 @@ impl Engine {
         // tokenization for a workflow package is served from there rather than
         // duplicated into the decode core.
         Ok(Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(workflow),
             decode_backend,
             metadata,

@@ -8,8 +8,8 @@
 - `Engine::restore_session(checkpoint)`
 - `Engine::rewind_session_by(session_id, RewindTokenCount) -> SessionPosition`
 - `Engine::rewind_session_to(session_id, SessionPosition)`
-- `Engine::session_fork_capability() -> Option<SessionForkCapability>`
-- `Engine::fork_session(&SessionForkCapability, source, SessionPosition) -> SessionId`
+- `Engine::prepare_session_fork(source, SessionPosition) -> SessionForkPlan`
+- `Engine::fork_session(SessionForkPlan) -> SessionId`
 
 `SessionCheckpoint` is a small public token-boundary handle:
 
@@ -23,10 +23,10 @@ pub struct SessionCheckpoint {
 `SessionPosition` and `RewindTokenCount` are newtypes, not bare `usize`, so
 callers must opt into absolute-vs-relative token-boundary conversion.
 
-`fork_session` is capability-gated. Current backends return `None` from
-`session_fork_capability`, so unsupported engines cannot be asked to fork through
-the typed API. The internal implementation still fail-closes if reached, rather
-than silently deep-copying KV or aliasing mutable decoder state.
+`SessionForkPlan` is a consuming capability and an inspectable participant list.
+Admission deep-clones every fallible value and validates every backend before a
+child exists. Publication rejects a stale plan if the source advanced after
+admission.
 
 ## Rewind behavior and cost model
 
@@ -68,7 +68,7 @@ releases only that session's references. Therefore:
 The engine test `cached_prefix_pages_survive_rewind_and_divergent_write` locks
 this invariant without requiring a model load.
 
-## Fork design and current gate
+## Fork design
 
 The low-level paged KV cache already supports CoW fork:
 
@@ -77,35 +77,29 @@ The low-level paged KV cache already supports CoW fork:
 - each retained page's refcount is incremented;
 - the first divergent write to a shared page allocates and copies that page only.
 
-However, engine sessions also contain decoder runner state (`DecodeState`), and
-that state is not generally cloneable or importable today. Enabling `fork_session`
-without a full runner-state story would create one of two bad outcomes:
-
-- a deep-copy fork that violates the promised CoW cost model; or
-- an aliasing fork where parent and child mutate the same decoder KV buffers.
-
-For that reason `Engine::session_fork_capability` currently returns `None`. The
-API is present so REPL/server work can target the intended surface, but no
-backend is advertised as fork-capable until it can satisfy the invariants.
+The engine-level plan also covers target/draft decode state, fixed recurrent and
+convolution bindings, token continuation, RNG/constraint boundary state,
+workflow state/effects, and output head/cursor/lineage/closure. ORT
+ZeroCopyRebind runners deep-clone exported KV into a fresh runner. Materialized
+paged KV uses CoW pages and can fork a retained earlier committed position when
+no non-position-addressable participant is present. Static/shared-buffer and
+native participants without clone/import support fail before child creation.
 
 ## Backend support matrix
 
 | Decode path | Rewind | Fork |
 |---|---|---|
-| Native single-session backend | Not supported by persistent-session APIs; `require_ort_backend` rejects it | Not supported |
-| ORT static-cache runner | Not supported; rejected before session mutation until runner rewind has a transactional prepare/commit path | Not enabled; runner state is not cloneable/importable |
-| ORT shared-buffer GQA / PastPresent runner | Not supported; rejected before session mutation until ORT PastPresent rewind can be prepared without mutating shared buffers | Not enabled; mutable shared buffers cannot be aliased safely |
-| ORT sliding-window past/present | Supported only to retained positions; evicted gaps reject cleanly before session mutation | Not enabled; fork positions before retained start must reject, and state cloning is unresolved |
-| ORT materialized paged KV without runner | Supported when paged KV metadata exists; ORT-owned KV without paged materialization rejects cleanly before session mutation | Low-level KV can CoW, but engine-level decode state still needs safe reconstruction/import |
-| Draft/speculative session state | Rewound alongside target to the aligned prefix | Not enabled |
+| Native single-session backend | Not supported by persistent-session APIs | Declined before child: no per-session native snapshot/import participant |
+| ORT static-cache/shared-buffer runner | Cursor rewind only where supported | Declined before child: fixed mutable buffers expose no clone/import |
+| ORT ZeroCopyRebind PastPresent runner | Backend-specific | Current committed position; exported KV and fixed state are cloned |
+| ORT sliding-window/materialized paged KV | Supported only to retained positions | Current or retained historical committed position; CoW pages |
+| Draft/speculative session state | Rewound alongside target | Forked as one transitive target/draft cascade when every participant admits |
+| Interpreted workflow state | Checkpoint adapter/runtime dependent | Current committed boundary; semantic values, effects, and output baselines clone together |
 
 ## REPL integration notes
 
-The REPL should call `checkpoint_session` at turn boundaries and use
-`rewind_session_to` / `restore_session` for `/undo-turn` or named checkpoint
-restore. `/fork` should first check `session_fork_capability`; with current
-backends it must report unsupported until a later engine slice enables a backend
-in the matrix above.
+The REPL should call `prepare_session_fork`, display any actionable participant
+refusal, then consume the returned plan with `fork_session`.
 
 ## Verification approach
 
@@ -135,13 +129,11 @@ and the current changes did not add or modify `unsafe` or raw-pointer code in
 TLA+ was deliberately skipped for this slice. The repository already has TLA+
 tooling under `specs/tla`, but the local environment has no Java runtime and no
 `TLA2TOOLS_JAR`. More importantly, the implemented fork behavior exercised here
-is single-threaded page-table reference counting with exact runtime assertions
-and proptest coverage; the engine-level fork is still disabled. A TLA+ model
-becomes worthwhile when enabling a real fork backend with runner import/clone
-ordering or cross-session prefix sharing beyond the current single-threaded
-`Rc`-style page accounting.
+is source-worker-local page-table reference counting plus a typed
+prepare/publish protocol with exact runtime assertions and proptest coverage.
+A TLA+ model becomes worthwhile if fork publication later spans workers or a
+distributed mutable-state protocol.
 
-Follow-up: enable runner-backed rewind only after ORT static-cache and
-shared-buffer/PastPresent runners expose a prepared rewind whose validation
-prebuilds all fallible artifacts and whose commit cannot fail after logical
-tokens or paged KV are truncated.
+Follow-up: enable static/shared-buffer and native fork only after those backends
+expose independent clone/import participants whose validation prebuilds all
+fallible artifacts.

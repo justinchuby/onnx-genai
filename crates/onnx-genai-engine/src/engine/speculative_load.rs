@@ -61,6 +61,7 @@ pub(crate) fn build_connector_bridge(
             ConnectorBridge::new(
                 Arc::new(connector),
                 model_id,
+                config.isolation.clone(),
                 chunk_size,
                 0..num_layers,
                 config.store_priority,

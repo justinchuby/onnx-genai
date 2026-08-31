@@ -1,19 +1,11 @@
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - nested_control_flow
-      - loop_induction_values
-      - typed_emit
-      - bounded_state_recurrence
+    manifest: {}
     inputs:
       request.noise:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - num_frames
@@ -32,7 +24,6 @@ pipeline:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -46,7 +37,6 @@ pipeline:
       package.false:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
         role:
@@ -58,7 +48,6 @@ pipeline:
       package.one_control:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -70,7 +59,6 @@ pipeline:
       package.history_limit:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -82,7 +70,6 @@ pipeline:
       package.cache_frames:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -94,7 +81,6 @@ pipeline:
       request.encoder_hidden_states:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - prompt_sequence
@@ -111,7 +97,6 @@ pipeline:
       package.loop_0_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -123,7 +108,6 @@ pipeline:
       package.loop_1_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -136,7 +120,6 @@ pipeline:
       video:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - 3
@@ -168,7 +151,6 @@ pipeline:
           inputs:
             sample:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -178,19 +160,16 @@ pipeline:
               - width
             step:
               dtype: int64
-              rank: 1
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - schedule_length
           outputs:
             model_input:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -207,7 +186,6 @@ pipeline:
           inputs:
             sample:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -217,7 +195,6 @@ pipeline:
               - width
             derivative:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -227,19 +204,16 @@ pipeline:
               - width
             step:
               dtype: int64
-              rank: 1
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - schedule_length
           outputs:
             next_state:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -265,14 +239,12 @@ pipeline:
           inputs:
             done:
               dtype: bool
-              rank: 1
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
           outputs:
             continue:
               dtype: bool
-              rank: 1
               shape:
               - 1
       video_latent_init:
@@ -284,7 +256,6 @@ pipeline:
           inputs:
             noise:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -295,7 +266,6 @@ pipeline:
           outputs:
             latent:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -305,7 +275,6 @@ pipeline:
               - width
             history:
               dtype: int64
-              rank: 2
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -319,21 +288,18 @@ pipeline:
           inputs:
             history:
               dtype: int64
-              rank: 2
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - history
             timestep:
               dtype: int64
-              rank: 1
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
           outputs:
             next:
               dtype: int64
-              rank: 2
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -347,7 +313,6 @@ pipeline:
           inputs:
             latent:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -358,7 +323,6 @@ pipeline:
           outputs:
             permuted:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -375,7 +339,6 @@ pipeline:
           inputs:
             latent:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -386,7 +349,6 @@ pipeline:
           outputs:
             unscaled:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -403,7 +365,6 @@ pipeline:
           inputs:
             latent:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -414,7 +375,6 @@ pipeline:
           outputs:
             count:
               dtype: int64
-              rank: 1
               shape:
               - 1
       video_decode_chunk:
@@ -426,7 +386,6 @@ pipeline:
           inputs:
             latent:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -436,14 +395,12 @@ pipeline:
               - width
             step:
               dtype: int64
-              rank: 1
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
           outputs:
             chunk:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -460,7 +417,6 @@ pipeline:
           inputs:
             latent:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -471,7 +427,6 @@ pipeline:
           outputs:
             conv_cache.conv_in:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -481,7 +436,6 @@ pipeline:
               - width
             conv_cache.conv_out:
               dtype: float32
-              rank: 5
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -499,7 +453,6 @@ pipeline:
           outputs:
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - 4
       diffusion_timesteps:
@@ -512,7 +465,6 @@ pipeline:
           outputs:
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - 3
       schedule_lookup:
@@ -524,19 +476,16 @@ pipeline:
           inputs:
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - schedule_length
             step:
               dtype: int64
-              rank: 1
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
           outputs:
             timestep:
               dtype: int64
-              rank: 1
               batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
@@ -544,7 +493,6 @@ pipeline:
       latent:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - num_frames
@@ -561,7 +509,6 @@ pipeline:
       scheduler_history:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - scheduler_history
@@ -578,7 +525,6 @@ pipeline:
       conv_cache_conv_in:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - 4
@@ -599,7 +545,6 @@ pipeline:
       conv_cache_conv_out:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - 3
@@ -620,7 +565,6 @@ pipeline:
       loop_0_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -630,7 +574,6 @@ pipeline:
       loop_1_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -722,7 +665,6 @@ pipeline:
         value: loop.iteration
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
     - kind: invoke
@@ -800,6 +742,5 @@ pipeline:
         value: decode.iteration
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch

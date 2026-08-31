@@ -176,39 +176,7 @@
 (function(){
   "use strict";
   const H=globalThis.VisualizerHelpers,$=id=>document.getElementById(id);let doc=null,sourceName="",renderedPaths=new Set();
-  const CAPABILITY_HELP=Object.fromEntries([
-    ["kv_cache","state/serving","Runtime-owned autoregressive key/value state."],
-    ["grouped_query_attention","implementation","Execution of grouped-query attention with the declared geometry and graph ABI."],
-    ["multi_head_attention","implementation","Execution of ordinary multi-head attention with the artifact's exact ABI."],
-    ["prefix_cache","state/serving","Reuse of a compatible cached prefix when all declared dependencies match."],
-    ["control_flow_loop","syntax/IR","Legacy admission of a runtime-controlled generation loop."],
-    ["image_preprocessing_program","media","Typed, declarative image transform execution."],
-    ["packed_image_outputs","media","Multiple packed image tensor outputs together with their packing metadata."],
-    ["position_program","media","Declarative construction of position IDs."],
-    ["multi_axis_positions","media","Position coordinates whose position axis has rank greater than one."],
-    ["loop_carried_state","state/serving","Legacy fixed-shape recurrent state with replace semantics."],
-    ["dual_sequence_inputs","media","One decoder invocation consumes raw-token and routed-sequence inputs together."],
-    ["workflow_ssa","syntax/IR","Typed SSA values and structural workflow execution."],
-    ["linear_effects","syntax/IR","Explicit, linearly threaded external-effect domains."],
-    ["serving_service_contract","state/serving","Generic serving controls and runtime-owned state-service groups."],
-    ["parameter_adapters","adapters","Parameter overlay or application against resolved targets."],
-    ["heterogeneous_adapter_batching","adapters","Different adapter sets and scales for different request rows in one batch."],
-    ["session_state_lease","state/serving","State whose lifetime extends across invocations under a runtime lease."],
-    ["bounded_state_recurrence","state/serving","Loop-carried state with metadata-declared bounded growth."],
-    ["advisory_state","state/serving","Droppable or resettable state that cannot change semantic correctness or output distribution."],
-    ["adaptive_proposal_budget","speculative","Runtime-visible adaptive choice of speculative proposal width."],
-    ["grammar_guidance_adapter","adapters","Stateful grammar clone, lookahead, and commit ABI."],
-    ["telemetry_adapter","adapters","Versioned timestamp and elapsed-time adapter ABI."],
-    ["nested_control_flow","syntax/IR","Loops or branches nested inside structural workflow nodes."],
-    ["loop_induction_values","syntax/IR","A typed zero-based iteration value visible to policy components."],
-    ["typed_emit","syntax/IR","Publication of a typed SSA value to a declared workflow output."],
-    ["streaming_emit","syntax/IR","Incremental event publication during execution."],
-    ["emit_valid_length","syntax/IR","Ragged valid-prefix publication from a fixed-capacity tensor."],
-    ["input_presence","syntax/IR","An observable boolean indicating whether an optional caller or application tensor was supplied."],
-    ["explicit_transfer","syntax/IR","A device-transfer node in the planner's lowered internal IR."]
-  ].map(([id,category,description])=>[id,{category,description}]));
   const sample=`schema_version: v1
-required_capabilities: [workflow_ssa, nested_control_flow, serving_service_contract, image_preprocessing_program]
 model:
   architecture: decoder
   max_sequence_length: 4096
@@ -219,36 +187,36 @@ package:
   active: [true]
 pipeline:
   workflow:
-    manifest: {adapter_abis: {onnx-genai.image-preprocess: "1"}, capabilities: [typed_emit, nested_control_flow]}
+    manifest: {adapter_abis: {onnx-genai.image-preprocess: "1"}}
     inputs:
-      request.input_ids: {contract: {dtype: int64, rank: 2, shape: [batch, prompt]}, role: {kind: runtime, role: prompt_tokens}, required: true}
-      request.image: {contract: {dtype: uint8, rank: 1, shape: [encoded_bytes]}, role: {kind: runtime, role: encoded_image}, required: true}
-      request.max_iterations: {contract: {dtype: int64, rank: 1, shape: [1]}, required: false, default: 4}
+      request.input_ids: {contract: {dtype: int64, shape: [batch, prompt]}, role: {kind: runtime, role: prompt_tokens}, required: true}
+      request.image: {contract: {dtype: uint8, shape: [encoded_bytes]}, role: {kind: runtime, role: encoded_image}, required: true}
+      request.max_iterations: {contract: {dtype: int64, shape: [1]}, required: false, default: 4}
     outputs:
-      tokens: {contract: {dtype: int64, rank: 2, shape: [batch, generated]}, role: tokens}
-      image: {contract: {dtype: float32, rank: 4, shape: [batch, 3, height, width], value_range: [-1, 1]}, role: image}
+      tokens: {contract: {dtype: int64, shape: [batch, generated]}, role: tokens, family: {kind: materialized}}
+      image: {contract: {dtype: float32, shape: [batch, 3, height, width], value_range: [-1, 1]}, role: image, family: {kind: materialized}}
     components:
       decoder:
         implementation: {kind: onnx, artifact: model.onnx}
         ports:
-          inputs: {input_ids: {dtype: int64, rank: 2, shape: [batch, 1]}, pixel_values: {dtype: float32, rank: 4, shape: [batch, 3, height, width]}, key_cache.0: {dtype: float16, rank: 4, shape: [batch, 8, cache, 64]}, value_cache.0: {dtype: float16, rank: 4, shape: [batch, 8, cache, 64]}}
-          outputs: {token: {dtype: int64, rank: 2, shape: [batch, 1]}, updated_key_cache.0: {dtype: float16, rank: 4, shape: [batch, 8, cache, 64]}, updated_value_cache.0: {dtype: float16, rank: 4, shape: [batch, 8, cache, 64]}}
+          inputs: {input_ids: {dtype: int64, shape: [batch, 1]}, pixel_values: {dtype: float32, shape: [batch, 3, height, width]}, key_cache.0: {dtype: float16, shape: [batch, 8, cache, 64]}, value_cache.0: {dtype: float16, shape: [batch, 8, cache, 64]}}
+          outputs: {token: {dtype: int64, shape: [batch, 1]}, updated_key_cache.0: {dtype: float16, shape: [batch, 8, cache, 64]}, updated_value_cache.0: {dtype: float16, shape: [batch, 8, cache, 64]}}
       image_preprocess:
         implementation: {kind: adapter, abi: onnx-genai.image-preprocess, version: "1"}
         ports:
-          inputs: {encoded: {dtype: uint8, rank: 1, shape: [encoded_bytes]}}
-          outputs: {pixel_values: {dtype: float32, rank: 4, shape: [batch, 3, height, width]}}
+          inputs: {encoded: {dtype: uint8, shape: [encoded_bytes]}}
+          outputs: {pixel_values: {dtype: float32, shape: [batch, 3, height, width]}}
       termination:
         implementation: {kind: binding}
         contract: {id: onnx-genai.termination-predicate, version: "2", parameters: {batching: per_row, inactive_rows: preserve}}
         ports:
-          inputs: {tokens: {dtype: int64, rank: 1, shape: [batch]}, eos_ids: {dtype: int64, rank: 2, shape: [batch, eos_count]}, eos_lengths: {dtype: int64, rank: 1, shape: [batch]}, iteration: {dtype: int64, rank: 1, shape: [1]}, max_iterations: {dtype: int64, rank: 1, shape: [batch]}, active: {dtype: bool, rank: 1, shape: [batch]}}
-          outputs: {done: {dtype: bool, rank: 1, shape: [batch]}, next_active: {dtype: bool, rank: 1, shape: [batch]}, continue: {dtype: bool, rank: 1, shape: [1]}}
+          inputs: {tokens: {dtype: int64, shape: [batch]}, eos_ids: {dtype: int64, shape: [batch, eos_count]}, eos_lengths: {dtype: int64, shape: [batch]}, iteration: {dtype: int64, shape: [1]}, max_iterations: {dtype: int64, shape: [batch]}, active: {dtype: bool, shape: [batch]}}
+          outputs: {done: {dtype: bool, shape: [batch]}, next_active: {dtype: bool, shape: [batch]}, continue: {dtype: bool, shape: [1]}}
       policy: {implementation: {kind: adapter, abi: onnx-genai.sampling, version: "1.0"}, ports: {inputs: {}, outputs: {}}}
     state:
-      active: {contract: {dtype: bool, rank: 1, shape: [batch]}, scope: invocation, initializer: package.active}
-      key_cache: {contract: {dtype: float16, rank: 4, shape: [batch, 8, cache, 64]}, scope: invocation, initializer: package.cache, service_group: decoder_cache}
-      value_cache: {contract: {dtype: float16, rank: 4, shape: [batch, 8, cache, 64]}, scope: invocation, initializer: package.cache, service_group: decoder_cache}
+      active: {contract: {dtype: bool, shape: [batch]}, scope: invocation, initializer: package.active}
+      key_cache: {contract: {dtype: float16, shape: [batch, 8, cache, 64]}, scope: invocation, initializer: package.cache, service_group: decoder_cache}
+      value_cache: {contract: {dtype: float16, shape: [batch, 8, cache, 64]}, scope: invocation, initializer: package.cache, service_group: decoder_cache}
     serving:
       active: active
       done: body.done
@@ -273,7 +241,7 @@ pipeline:
         termination: generation_eos
         max_iterations: request.max_iterations
         continue_when: active
-        iteration: {value: loop.iteration, contract: {dtype: int64, rank: 1, shape: [1]}}
+        iteration: {value: loop.iteration, contract: {dtype: int64, shape: [1]}}
         carried:
           - {cell: active, next: body.active}
         steps:
@@ -300,7 +268,7 @@ preprocessing:
       - {op: resize, inputs: [image.decoded], outputs: [image.resized], height: 224, width: 224}
       - {op: rescale, inputs: [image.resized], outputs: [image.pixel_values], scale: 0.00392156862745098}
     outputs:
-      - {source: image.pixel_values, name: image.pixel_values, content: pixels, contract: {dtype: float32, rank: 4, shape: [batch, 3, height, width], value_range: [0, 1]}}
+      - {source: image.pixel_values, name: image.pixel_values, content: pixels, contract: {dtype: float32, shape: [batch, 3, height, width], value_range: [0, 1]}}
 future_extension: {enabled: false, zero: 0, nothing: null, empty_text: "", empty_map: {}, empty_list: []}`;
   function el(tag,attrs={},...children){const n=document.createElement(tag);for(const [k,v] of Object.entries(attrs)){if(k==="class")n.className=v;else if(k==="dataset")Object.assign(n.dataset,v);else if(k.startsWith("on"))n.addEventListener(k.slice(2),v);else if(v!==null)n.setAttribute(k,String(v));}for(const c of children.flat()){if(c===null||c===undefined)continue;n.append(c.nodeType?c:document.createTextNode(String(c)))}return n}
   function clear(n){while(n.firstChild)n.removeChild(n.firstChild);return n}
@@ -312,22 +280,15 @@ future_extension: {enabled: false, zero: 0, nothing: null, empty_text: "", empty
     const c=el("article",{class:"card"},eyebrow?el("div",{class:"eyebrow"},eyebrow):null,el("h3",{},title));if(!H.isObj(obj)){c.append(el("div",{class:"value"},valueText(obj)));return c}
     const dl=el("dl",{class:"kv"});for(const [k,v] of Object.entries(obj)){if(H.isObj(v)||Array.isArray(v)){dl.append(el("dt",{},k),el("dd",{},chip(Array.isArray(v)?v.map(valueText).join(", "):safeJson(v))));}else dl.append(el("dt",{},k),el("dd",{class:"value"},valueText(v)))}c.append(dl);return c
   }
-  function capabilityCard(capabilities){
-    const card=el("article",{class:"card"},el("div",{class:"eyebrow"},"manifest"),el("h3",{},"Capabilities"),el("div",{class:"capability-list"}));
-    const list=card.lastChild,unique=[...new Set(capabilities.map(String))];
-    if(!unique.length){list.append(el("span",{class:"status"},"None declared"));return card}
-    unique.forEach((name,index)=>{const help=CAPABILITY_HELP[name]||{category:"extension",description:"Extension-defined capability; consult the producer or runtime documentation for its semantics."},tipId="capability-tip-"+index;list.append(el("span",{class:"capability",tabindex:"0","aria-describedby":tipId},name,el("span",{class:"capability-tooltip",id:tipId,role:"tooltip"},el("strong",{},help.category),help.description)))});
-    return card;
-  }
   function referenceCard(title,items,eyebrow="reference"){
     const list=el("div",{class:"reference-list"});for(const item of items)list.append(el("div",{class:"reference-item"},el("code",{},item.term),el("p",{},item.description)));
     return el("article",{class:"card"},el("div",{class:"eyebrow"},eyebrow),el("h3",{},title),list);
   }
   function section(title,subtitle,...children){return el("div",{class:"panel"},heading(title,subtitle),...children)}
   function renderOverview(f){
-    const root=clear($("overview")),caps=[...(Array.isArray(doc.required_capabilities)?doc.required_capabilities:[]),...(Array.isArray(f.workflow?.manifest?.capabilities)?f.workflow.manifest.capabilities:[])];
+    const root=clear($("overview"));
     const facts={schema_version:doc.schema_version??"missing",components:Object.keys(f.components).length,workflow_steps:f.steps.length,document_leaves:f.leaves.length};
-    root.append(section("Document & capabilities","High-level contract and viewer-derived inventory. Capability descriptions come from docs/genai/INFERENCE_METADATA_DECISIONS.md.",el("div",{class:"grid"},objectCard(sourceName||"Loaded document",facts,"document"),capabilityCard(caps),objectCard("Detected views",f.features,"viewer"))));
+    root.append(section("Document & core conformance","The schema version selects baseline semantics; optional modules declare exact identities at their typed fields. See docs/genai/METADATA_EXTENSION_REGISTRY.md.",el("div",{class:"grid"},objectCard(sourceName||"Loaded document",facts,"document"),objectCard("Detected views",f.features,"viewer"))));
     const modelGrid=el("div",{class:"grid"});for(const [name,value] of [["Model",f.model],["Package",f.package],["Generation",f.generation],["Quantization",doc.quantization],["Hardware",doc.hardware],["Profiles",doc.profiles||doc.profile]])if(value!==undefined&&value!==null)modelGrid.append(objectCard(name,value,name.toLowerCase()));
     if(!modelGrid.children.length)modelGrid.append(objectCard("Metadata","No dedicated model/package/performance blocks were declared."));
     root.append(section("Model, package & execution","Architecture, packaging, quantization, hardware, profiles, and generation settings.",modelGrid));
@@ -335,7 +296,7 @@ future_extension: {enabled: false, zero: 0, nothing: null, empty_text: "", empty
     box.append(el("div",{class:"diag note"},"Viewer diagnostics are portability hints, not full Rust validation. Run the authoritative ONNX GenAI CLI validator before deployment."));
     root.append(section("Diagnostics","Conservative structural hints; never a claim of schema validity.",box));
   }
-  function portList(ports){const wrap=el("div",{});for(const [name,p] of Object.entries(H.isObj(ports)?ports:{})){const shape=Array.isArray(p?.shape)?" ["+p.shape.join(", ")+"]":"";wrap.append(el("div",{class:"port"},el("strong",{},name),el("div",{class:"geometry"},(p?.dtype||"?")+" · rank "+(p?.rank??"?")+shape)))}if(!wrap.children.length)wrap.append(el("span",{class:"status"},"None declared"));return wrap}
+  function portList(ports){const wrap=el("div",{});for(const [name,p] of Object.entries(H.isObj(ports)?ports:{})){const hasShape=Array.isArray(p?.shape);const shape=hasShape?" ["+p.shape.join(", ")+"]":" (required shape missing)";wrap.append(el("div",{class:"port"},el("strong",{},name),el("div",{class:"geometry"},(p?.dtype||"?")+" · rank "+(hasShape?p.shape.length:"?")+shape)))}if(!wrap.children.length)wrap.append(el("span",{class:"status"},"None declared"));return wrap}
   async function renderGraph(container){
     const source=H.buildMermaid(doc);clear(container);try{mermaid.initialize({startOnLoad:false,securityLevel:"strict",htmlLabels:false,theme:"neutral",maxTextSize:50000,flowchart:{htmlLabels:false,useMaxWidth:true}});const result=await mermaid.render("metadataGraph"+Date.now(),source);const parsed=new DOMParser().parseFromString(result.svg,"image/svg+xml");if(parsed.querySelector("parsererror"))throw new Error("Invalid SVG output");parsed.querySelectorAll("script,foreignObject,a").forEach(n=>n.remove());parsed.querySelectorAll("*").forEach(n=>{for(const a of [...n.attributes])if(/^on/i.test(a.name)||/^(href|xlink:href)$/i.test(a.name))n.removeAttribute(a.name)});container.append(document.importNode(parsed.documentElement,true));}
     catch(err){container.append(el("div",{class:"fallback"},"Graph rendering failed; showing safe structural fallback.\n\n"+source+"\n\n"+String(err.message||err)))}
@@ -378,10 +339,8 @@ future_extension: {enabled: false, zero: 0, nothing: null, empty_text: "", empty
     root.append(section("Full recursive document","Unknown future fields render automatically. Null, false, zero, empty string, empty objects and empty lists are preserved.",el("div",{class:"tree-toolbar"},search,counter),uncovered,tree));update();
   }
   function renderReference(){
-    const root=clear($("reference")),capabilityGroups=new Map();
-    for(const [name,help] of Object.entries(CAPABILITY_HELP)){if(!capabilityGroups.has(help.category))capabilityGroups.set(help.category,[]);capabilityGroups.get(help.category).push({term:name,description:help.description})}
-    const capabilityGrid=el("div",{class:"reference-grid"});for(const [category,items] of capabilityGroups)capabilityGrid.append(referenceCard(category,items,"built-in capabilities"));
-    root.append(section("Capability catalogue","All 29 built-in identifiers from docs/genai/INFERENCE_METADATA_DECISIONS.md §4.3a. Extension-defined strings remain valid but are documented by their producer.",capabilityGrid));
+    const root=clear($("reference"));
+    root.append(section("Metadata extension registry","Core schema conformance is not a capability. Read docs/genai/METADATA_EXTENSION_REGISTRY.md for generated exact optional semantic-extension identities, versions, admission consumers, and fallback policy.",objectCard("Runtime optimizations","Continuous batching, graph capture, scheduling, placement, tiering, budgets, and kernels remain runtime policy; they are not package extension identifiers.")));
     const loopItems=[
       {term:"predicate (default)",description:"General pre-test loop. continue_when is evaluated before iteration zero; false produces a zero-trip loop. The predicate is always honored, and max_iterations remains a hard safety bound."},
       {term:"generation_eos",description:"Autoregressive generation loop whose predicate represents EOS completion. With stop_on_eos disabled, the loop ignores EOS and runs until max_iterations."},
@@ -407,7 +366,7 @@ future_extension: {enabled: false, zero: 0, nothing: null, empty_text: "", empty
     const emitModes=[
       {term:"replace",description:"Replaces the output with the emitted value."},
       {term:"append",description:"Concatenates chunks along axis, defaulting to the final axis; rank-four or deeper values must declare axis."},
-      {term:"event",description:"Publishes an incremental ordered event and requires streaming_emit."}
+      {term:"event",description:"Publishes an incremental ordered event for an output in the events family."}
     ];
     const executionRules=[
       {term:"root steps",description:"Execute once per workflow invocation, in order."},

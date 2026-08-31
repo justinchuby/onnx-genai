@@ -10,7 +10,6 @@
 //! import source, and the emitted metadata is the sole source of execution
 //! truth afterwards.
 
-use onnx_genai_metadata::capabilities as capability;
 use serde_json::{Map, Value, json};
 
 use crate::ComfyUiConfigError;
@@ -34,7 +33,6 @@ pub(crate) struct Lowering<'a> {
     carried: Vec<Value>,
     tail: Vec<Value>,
     outputs: Map<String, Value>,
-    capabilities: Vec<&'static str>,
 }
 
 impl<'a> Lowering<'a> {
@@ -50,13 +48,6 @@ impl<'a> Lowering<'a> {
             carried: Vec::new(),
             tail: Vec::new(),
             outputs: Map::new(),
-            capabilities: vec![
-                capability::WORKFLOW_SSA,
-                capability::LINEAR_EFFECTS,
-                capability::NESTED_CONTROL_FLOW,
-                capability::LOOP_INDUCTION_VALUES,
-                capability::TYPED_EMIT,
-            ],
         }
     }
 
@@ -71,12 +62,7 @@ impl<'a> Lowering<'a> {
         self.build_tail();
 
         let mut workflow = Map::new();
-        workflow.insert(
-            "manifest".to_owned(),
-            json!({
-                "capabilities": self.capabilities,
-            }),
-        );
+        workflow.insert("manifest".to_owned(), json!({}));
         workflow.insert("inputs".to_owned(), Value::Object(self.inputs));
         workflow.insert("outputs".to_owned(), Value::Object(self.outputs));
         workflow.insert("components".to_owned(), Value::Object(self.components));
@@ -100,7 +86,7 @@ impl<'a> Lowering<'a> {
         let mut document = Map::new();
         document.insert(
             "schema_version".to_owned(),
-            json!(onnx_genai_metadata::SCHEMA_VERSION),
+            json!(onnx_genai_metadata::OUTPUT_PROTOCOL_SCHEMA_VERSION.to_string()),
         );
         document.insert(
             "pipeline".to_owned(),
@@ -126,7 +112,7 @@ impl<'a> Lowering<'a> {
         );
         self.request_input(
             "request.max_iterations",
-            json!({"dtype": "int64", "rank": 1, "shape": [1]}),
+            json!({"dtype": "int64", "shape": [1]}),
             json!({"kind": "runtime", "version": "1.0", "role": "max_iterations"}),
             json!({"kind": "request"}),
             false,
@@ -144,7 +130,7 @@ impl<'a> Lowering<'a> {
         self.literal_input("package.false", row_contract("bool"), json!(false));
         self.literal_input(
             "package.loop_0_active",
-            json!({"dtype": "bool", "rank": 1, "shape": [1]}),
+            json!({"dtype": "bool", "shape": [1]}),
             json!(true),
         );
 
@@ -198,7 +184,6 @@ impl<'a> Lowering<'a> {
                 "request.time_ids",
                 json!({
                     "dtype": "float32",
-                    "rank": 2,
                     "shape": ["batch", 6],
                     "batch_layout": {"kind": "request_aligned", "axis": 0},
                 }),
@@ -313,7 +298,7 @@ impl<'a> Lowering<'a> {
             "diffusion_schedule",
             self.layout.policy("diffusion_schedule"),
             json!({}),
-            json!({"schedule": {"dtype": "float32", "rank": 1, "shape": [sigmas]}}),
+            json!({"schedule": {"dtype": "float32", "shape": [sigmas]}}),
             Some(json!({
                 "id": "onnx-genai.diffusion-schedule",
                 "version": "1",
@@ -325,7 +310,7 @@ impl<'a> Lowering<'a> {
             "diffusion_timesteps",
             self.layout.policy("diffusion_timesteps"),
             json!({}),
-            json!({"schedule": {"dtype": "float32", "rank": 1, "shape": [plan.steps as i64]}}),
+            json!({"schedule": {"dtype": "float32", "shape": [plan.steps as i64]}}),
             Some(json!({
                 "id": "onnx-genai.diffusion-schedule",
                 "version": "1",
@@ -337,7 +322,7 @@ impl<'a> Lowering<'a> {
             "schedule_lookup",
             self.layout.policy("schedule_lookup"),
             json!({
-                "schedule": {"dtype": "float32", "rank": 1, "shape": ["schedule_length"]},
+                "schedule": {"dtype": "float32", "shape": ["schedule_length"]},
                 "step": row_contract("int64"),
             }),
             json!({"timestep": row_contract("float32")}),
@@ -349,7 +334,7 @@ impl<'a> Lowering<'a> {
             json!({
                 "sample": latent_contract(),
                 "step": row_contract("int64"),
-                "schedule": {"dtype": "float32", "rank": 1, "shape": ["schedule_length"]},
+                "schedule": {"dtype": "float32", "shape": ["schedule_length"]},
             }),
             json!({"model_input": latent_contract()}),
             None,
@@ -358,14 +343,14 @@ impl<'a> Lowering<'a> {
             "continue_predicate",
             self.layout.policy("continue_predicate"),
             json!({"done": row_contract("bool")}),
-            json!({"continue": {"dtype": "bool", "rank": 1, "shape": [1]}}),
+            json!({"continue": {"dtype": "bool", "shape": [1]}}),
             None,
         );
         self.component(
             "latent_row_shape",
             self.layout.policy("latent_row_shape"),
             json!({}),
-            json!({"shape": {"dtype": "int64", "rank": 1, "shape": [3]}}),
+            json!({"shape": {"dtype": "int64", "shape": [3]}}),
             None,
         );
         self.component(
@@ -374,7 +359,7 @@ impl<'a> Lowering<'a> {
             json!({
                 "seed": row_contract("int64"),
                 "offset": row_contract("int64"),
-                "row_shape": {"dtype": "int64", "rank": 1, "shape": ["row_rank"]},
+                "row_shape": {"dtype": "int64", "shape": ["row_rank"]},
             }),
             json!({"noise": latent_contract(), "next_offset": row_contract("int64")}),
             Some(json!({
@@ -424,7 +409,6 @@ impl<'a> Lowering<'a> {
                 "encoder_hidden_states": hidden_states_contract(),
                 "pooled_embeds": {
                     "dtype": "float32",
-                    "rank": 2,
                     "shape": ["batch", "pooled"],
                     "batch_layout": {"kind": "request_aligned", "axis": 0},
                 },
@@ -517,7 +501,7 @@ impl<'a> Lowering<'a> {
                         "sample": latent_contract(),
                         "noise": latent_contract(),
                         "step": row_contract("int64"),
-                        "schedule": {"dtype": "float32", "rank": 1, "shape": ["schedule_length"]},
+                        "schedule": {"dtype": "float32", "shape": ["schedule_length"]},
                     }),
                     json!({"noisy": latent_contract()}),
                     Some(json!({
@@ -567,7 +551,7 @@ impl<'a> Lowering<'a> {
         self.state.insert(
             "loop_0_active".to_owned(),
             json!({
-                "contract": {"dtype": "bool", "rank": 1, "shape": [1]},
+                "contract": {"dtype": "bool", "shape": [1]},
                 "scope": "invocation",
                 "initializer": "package.loop_0_active",
                 "recurrence": {"kind": "invariant"},
@@ -765,7 +749,6 @@ impl<'a> Lowering<'a> {
                 "text_embeds".to_owned(),
                 json!({
                     "dtype": "float32",
-                    "rank": 2,
                     "shape": ["batch", "pooled"],
                     "batch_layout": {"kind": "request_aligned", "axis": 0},
                 }),
@@ -774,7 +757,6 @@ impl<'a> Lowering<'a> {
                 "time_ids".to_owned(),
                 json!({
                     "dtype": "float32",
-                    "rank": 2,
                     "shape": ["batch", 6],
                     "batch_layout": {"kind": "request_aligned", "axis": 0},
                 }),
@@ -872,7 +854,7 @@ impl<'a> Lowering<'a> {
         inputs.insert("step".to_owned(), row_contract("int64"));
         inputs.insert(
             "schedule".to_owned(),
-            json!({"dtype": "float32", "rank": 1, "shape": ["schedule_length"]}),
+            json!({"dtype": "float32", "shape": ["schedule_length"]}),
         );
         let mut outputs = Map::new();
         outputs.insert("next_state".to_owned(), latent_contract());
@@ -956,7 +938,7 @@ impl<'a> Lowering<'a> {
                 "noise": latent_contract(),
                 "mask": latent_mask_contract(),
                 "step": row_contract("int64"),
-                "schedule": {"dtype": "float32", "rank": 1, "shape": ["schedule_length"]},
+                "schedule": {"dtype": "float32", "shape": ["schedule_length"]},
             }),
             json!({"blended": latent_contract()}),
             Some(json!({
@@ -1020,13 +1002,19 @@ impl<'a> Lowering<'a> {
             json!({
                 "contract": image_contract(3),
                 "role": "image",
+                "family": {"kind": "materialized"},
                 "value_range": "negative_one_to_one",
                 "stage": "pre_adapter"
             }),
         );
         self.outputs.insert(
             "latent".to_owned(),
-            json!({"contract": latent_contract(), "role": "tensor", "stage": "pre_adapter"}),
+            json!({
+                "contract": latent_contract(),
+                "role": "tensor",
+                "family": {"kind": "materialized"},
+                "stage": "pre_adapter"
+            }),
         );
     }
 
@@ -1056,15 +1044,11 @@ impl<'a> Lowering<'a> {
 
     /// Declare the request-scoped adapter selection inputs a LoRA package needs.
     pub(crate) fn declare_adapter_selection(&mut self, max_adapters: usize) {
-        self.capabilities.push(capability::PARAMETER_ADAPTERS);
-        self.capabilities
-            .push(capability::HETEROGENEOUS_ADAPTER_BATCHING);
         let count = i64::try_from(max_adapters).unwrap_or(i64::MAX);
         self.request_input(
             "request.adapter_segments",
             json!({
                 "dtype": "int64",
-                "rank": 2,
                 "shape": ["batch", count],
                 "batch_layout": {"kind": "request_aligned", "axis": 0},
             }),
@@ -1085,7 +1069,6 @@ impl<'a> Lowering<'a> {
             "request.adapter_scales",
             json!({
                 "dtype": "float32",
-                "rank": 2,
                 "shape": ["batch", count],
                 "batch_layout": {"kind": "request_aligned", "axis": 0},
             }),
@@ -1120,20 +1103,18 @@ fn invoke(component: &str, inputs: Value, outputs: Value) -> Value {
 fn row_contract(dtype: &str) -> Value {
     json!({
         "dtype": dtype,
-        "rank": 1,
         "shape": ["batch"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     })
 }
 
 fn scalar_contract(dtype: &str, dimension: &str) -> Value {
-    json!({"dtype": dtype, "rank": 1, "shape": [dimension]})
+    json!({"dtype": dtype, "shape": [dimension]})
 }
 
 fn token_contract() -> Value {
     json!({
         "dtype": "int64",
-        "rank": 2,
         "shape": ["batch", "prompt_sequence"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     })
@@ -1142,7 +1123,6 @@ fn token_contract() -> Value {
 fn hidden_states_contract() -> Value {
     json!({
         "dtype": "float32",
-        "rank": 3,
         "shape": ["batch", "prompt_sequence", "hidden"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     })
@@ -1151,7 +1131,6 @@ fn hidden_states_contract() -> Value {
 fn latent_contract() -> Value {
     json!({
         "dtype": "float32",
-        "rank": 4,
         "shape": ["batch", "channels", LATENT_HEIGHT, LATENT_WIDTH],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     })
@@ -1160,7 +1139,6 @@ fn latent_contract() -> Value {
 fn latent_mask_contract() -> Value {
     json!({
         "dtype": "float32",
-        "rank": 4,
         "shape": ["batch", 1, LATENT_HEIGHT, LATENT_WIDTH],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     })
@@ -1169,7 +1147,6 @@ fn latent_mask_contract() -> Value {
 fn image_contract(channels: i64) -> Value {
     json!({
         "dtype": "float32",
-        "rank": 4,
         "shape": ["batch", channels, "height", "width"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     })
@@ -1178,7 +1155,6 @@ fn image_contract(channels: i64) -> Value {
 fn control_contract() -> Value {
     json!({
         "dtype": "float32",
-        "rank": 4,
         "shape": ["batch", "control_channels", LATENT_HEIGHT, LATENT_WIDTH],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     })

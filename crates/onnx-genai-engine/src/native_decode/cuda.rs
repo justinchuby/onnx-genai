@@ -5264,6 +5264,49 @@ impl DecodeCudaState {
             .with_context(|| format!("native CUDA row_len {row} out of range"))
     }
 
+    pub(crate) fn row_is_active(&self, row: usize) -> anyhow::Result<bool> {
+        self.row_active
+            .get(row)
+            .copied()
+            .with_context(|| format!("native CUDA row activity {row} out of range"))
+    }
+
+    /// Whether every mutable batch-row participant can be restored
+    /// independently. Fixed recurrent/convolution bindings are currently
+    /// shared device allocations without a row-slice snapshot seam, so they
+    /// must decline before a row is admitted.
+    pub(crate) fn supports_row_transactions(&self) -> bool {
+        self.fixed_state_binding_range.is_empty()
+    }
+
+    /// Restore one row's cursor, attention visibility, and activity without
+    /// changing any sibling row.
+    pub(crate) fn restore_row(
+        &mut self,
+        row: usize,
+        target_len: usize,
+        active: bool,
+    ) -> anyhow::Result<()> {
+        let current_len = self.row_len(row)?;
+        if target_len > current_len {
+            bail!(
+                "cannot restore native CUDA row {row} from length {current_len} forward to \
+                 baseline length {target_len}"
+            );
+        }
+        if target_len < current_len {
+            let word = std::mem::size_of::<i64>();
+            let row_stride = self.max_len * word;
+            let zeros = vec![0u8; (current_len - target_len) * word];
+            self.bindings[0].write_bytes(row * row_stride + target_len * word, &zeros)?;
+        }
+        self.row_lens[row] = target_len;
+        self.row_active[row] = active;
+        let logical_len = self.row_lens.iter().copied().max().unwrap_or_default();
+        self.bindings[0].set_logical_shape(vec![self.batch, logical_len])?;
+        self.set_logical_len(logical_len)
+    }
+
     /// Read the current `[batch, 1, vocab]` logits binding back to the host as
     /// one `[vocab]` f32 row per batch slot (stage 3b, #750). This is the
     /// host-logits seam the continuous-batch sampler consumes when a real

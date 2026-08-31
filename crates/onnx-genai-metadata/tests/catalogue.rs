@@ -43,21 +43,9 @@ fn every_catalogue_example_parses_and_validates() {
             .file_name()
             .is_some_and(|name| name == std::ffi::OsStr::new("01-gemma4-text-decoder.yaml"))
         {
-            let full_key = workflow.state["full_key"]
-                .contract
-                .shape
-                .as_ref()
-                .expect("full key shape");
-            let full_value = workflow.state["full_value"]
-                .contract
-                .shape
-                .as_ref()
-                .expect("full value shape");
-            let sliding_key = workflow.state["sliding_key"]
-                .contract
-                .shape
-                .as_ref()
-                .expect("sliding key shape");
+            let full_key = workflow.state["full_key"].contract.shape.as_slice();
+            let full_value = workflow.state["full_value"].contract.shape.as_slice();
+            let sliding_key = workflow.state["sliding_key"].contract.shape.as_slice();
             assert_ne!(
                 full_key[1], full_value[1],
                 "K and V head geometry must remain independently representable"
@@ -73,16 +61,8 @@ fn every_catalogue_example_parses_and_validates() {
         {
             // This checkpoint is dense (no MoE); its real heterogeneity is head
             // WIDTH — the global head_dim is larger than the local head_dim.
-            let full_key = workflow.state["full_key_0"]
-                .contract
-                .shape
-                .as_ref()
-                .expect("full key shape");
-            let sliding_key = workflow.state["sliding_key_0"]
-                .contract
-                .shape
-                .as_ref()
-                .expect("sliding key shape");
+            let full_key = workflow.state["full_key_0"].contract.shape.as_slice();
+            let sliding_key = workflow.state["sliding_key_0"].contract.shape.as_slice();
             assert_ne!(
                 full_key[3], sliding_key[3],
                 "global and local layers must keep independent head widths"
@@ -136,16 +116,8 @@ fn every_catalogue_example_parses_and_validates() {
             assert_eq!(moe.shared_expert_count, 1);
             // Heterogeneous global/local geometry in BOTH axes: the global group
             // has fewer, wider KV heads than the local group.
-            let full_key = workflow.state["full_key"]
-                .contract
-                .shape
-                .as_ref()
-                .expect("full key shape");
-            let sliding_key = workflow.state["sliding_key"]
-                .contract
-                .shape
-                .as_ref()
-                .expect("sliding key shape");
+            let full_key = workflow.state["full_key"].contract.shape.as_slice();
+            let sliding_key = workflow.state["sliding_key"].contract.shape.as_slice();
             assert_ne!(
                 full_key[1], sliding_key[1],
                 "global vs local KV head count differs"

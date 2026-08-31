@@ -423,10 +423,10 @@ reason.
   `GenerateRequest` only. `X-Session-Id` requests keep using the driver's
   per-request engine path"* (`driver.rs:814-817`). Sessionful traffic is on the
   serial path by construction.
-- **Fork is declared and disabled.** `session_fork_capability` returns `None`
-  unconditionally and `fork_session` bails with a message naming the missing
-  capability (`engine/runtime.rs:1628-1659`). The capability token in the
-  signature is the mechanism that keeps callers from asking.
+- **Fork is admitted as one typed semantic plan.** `prepare_session_fork`
+  snapshots every fallible participant before a child exists; `fork_session`
+  consumes that plan on the source worker. Unsupported runner/native state names
+  the participant, state/type, and backend before publication.
 - **Copy-on-write leases are refused at load.** The policy enum admits
   `copy_on_write` (`schema/inference_metadata.schema.json:3248-3254`) and the
   loader rejects it (`crates/onnx-genai-engine/tests/workflow_session_continuation.rs:695-702`).
@@ -1205,15 +1205,17 @@ long generations. Three consequences:
 | `rewind_session_by`, `rewind_session_to` | `session.worker` | Mutating: take the lease. Both are `&mut self` (`engine/runtime.rs:1590-1594`, `:1608-1612`) and truncate the session's KV |
 | `session_token_count`, `session_prefill_carry` | `session.worker`, read-only | These are `&self` today (`engine/runtime.rs:1742,1788`) and remain read-only queries |
 
-**What of this table is routed today.** The HTTP surface exposes exactly three
+**What of this table is routed today.** The HTTP surface exposes four
 of these operations: `create_session` (`POST /v1/sessions`), sessionful and
 sessionless `generate` (the completion routes), and `close_session`
-(`DELETE /v1/sessions/{id}`). ✅ All three follow the table as of Phase 2 —
+(`DELETE /v1/sessions/{id}`), plus `fork_session`
+(`POST /v1/sessions/{id}/fork`). They follow the table —
 close takes the lease, a sessionful generate takes it, a sessionless one does
-not — and `session_token_count`/`session_prefill_carry` remain read-only queries,
+not, and fork holds the source lease and places the child on the same worker.
+`session_token_count`/`session_prefill_carry` remain read-only queries,
 with the carry read now performed under the calling turn's own lease so it cannot
 observe a conversation another turn is rewriting. `reset_session`,
-`rewind_session_by`/`rewind_session_to`, `fork_session`, `checkpoint_session` and
+`rewind_session_by`/`rewind_session_to`, `checkpoint_session` and
 `restore_session` have **no route and no driver command**: they are `&mut Engine`
 methods reachable only from the worker thread that owns the engine, so there is
 no routing-layer caller for the lease to guard. They are not exempt from the
@@ -1284,13 +1286,10 @@ lease that spans the turn's read → write commit, it can land between them and 
 silently undone by the write-back. That is the narrow condition §11.1 identifies
 as the real lost-update case, and taking the lease is what excludes it.
 
-**Fork cannot cross shards, and today cannot happen at all.**
-`session_fork_capability` returns `None` and `fork_session` bails naming the
-missing capability (`engine/runtime.rs:1628-1659`). The capability-token
-signature is the right shape and is kept. When fork is enabled, the shard
-constraint above is not a simplification — copy-on-write over a `PageTable`
-requires source and fork in one page table, so a cross-shard fork is a deep
-copy, which is the cost fork exists to avoid.
+**Fork cannot cross shards.** `prepare_session_fork` and `fork_session` execute
+on the source worker. This is not a simplification: copy-on-write over a
+`PageTable` requires source and child in one table, while non-KV semantic state,
+effects, and output baselines are cloned before the child is published.
 
 **Checkpoint is read-only but not lease-free.** It observes the conversation, so
 it must not observe it mid-write. It does not *hold* the exclusive lease for its

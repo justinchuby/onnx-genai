@@ -14,17 +14,15 @@
 //!
 //! ## Model-agnostic by construction
 //!
-//! [`KvCacheKey::model_id`] is an **opaque** identity string. Different models
-//! produce incompatible KV, so keys from different `model_id`s never collide,
-//! but no code here (or in any backend) is allowed to branch on specific model
-//! names. Chunk hashing operates on raw token ids generically, and `chunk_size`,
-//! compression, and capabilities are configuration/parameters — never
-//! hardcoded per model.
+//! [`KvCacheKey::isolation`] partitions reuse first; [`KvCacheKey::model_id`]
+//! then separates incompatible model state inside that partition. Neither is
+//! interpreted. Chunking, compression, and capabilities are generic runtime
+//! parameters, never model-specific branches.
 
 use std::ops::Range;
 use std::time::Duration;
 
-use crate::{Device, PageId, TokenId};
+use crate::{Device, PageId, StateStorageDisposition, TokenId};
 
 /// Default token-chunk size (tokens per cached chunk), matching the design's
 /// recommended `page_size == chunk_size` alignment (DESIGN §38.8).
@@ -82,6 +80,9 @@ pub type ConnectorResult<T> = Result<T, ConnectorError>;
 /// materialized into the paged cache.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct KvCacheKey {
+    /// Runtime-selected isolation partition. Equal content is reusable only
+    /// inside this explicit session or shared tenancy boundary.
+    pub isolation: KvCacheIsolation,
     /// Opaque model identity. Different models have incompatible KV; this is
     /// never interpreted or branched on — it only namespaces the key.
     pub model_id: String,
@@ -95,6 +96,16 @@ pub struct KvCacheKey {
     pub chunk_index: u32,
     /// Number of tokens in this chunk.
     pub num_tokens: u32,
+}
+
+/// Isolation boundary for reusable KV state.
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
+pub enum KvCacheIsolation {
+    /// State is private to one runtime session.
+    Session(u64),
+    /// State may be reused by sessions in an explicitly configured tenancy or
+    /// reuse domain. The value is opaque and never interpreted.
+    SharedDomain(String),
 }
 
 /// Where the KV for a key currently lives (DESIGN §38.4).
@@ -228,6 +239,8 @@ pub struct KvStoreEntry {
     pub priority: CachePriority,
     /// Optional time-to-live.
     pub ttl: Option<Duration>,
+    /// Independent spill and recomputation permissions used by runtime policy.
+    pub disposition: StateStorageDisposition,
 }
 
 /// KV data retrieved from external storage, ready to be injected by the engine
@@ -321,8 +334,14 @@ impl TokenChunk {
     /// layer range. `model_id` is opaque (see the module docs). The chunk's
     /// cumulative prefix `hash` is carried into [`KvCacheKey::chunk_hash`], so
     /// the resulting key encodes the full preceding token context.
-    pub fn to_key(&self, model_id: impl Into<String>, layer_range: Range<usize>) -> KvCacheKey {
+    pub fn to_key(
+        &self,
+        isolation: KvCacheIsolation,
+        model_id: impl Into<String>,
+        layer_range: Range<usize>,
+    ) -> KvCacheKey {
         KvCacheKey {
+            isolation,
             model_id: model_id.into(),
             layer_range,
             chunk_hash: self.hash,
@@ -542,8 +561,8 @@ mod tests {
     fn chunk_tokens_num_tokens_via_to_key() {
         let tokens: Vec<TokenId> = (0..10).collect();
         let chunks = chunk_tokens(&tokens, 4);
-        let full = chunks[0].to_key("m", 0..1);
-        let partial = chunks[2].to_key("m", 0..1);
+        let full = chunks[0].to_key(KvCacheIsolation::Session(1), "m", 0..1);
+        let partial = chunks[2].to_key(KvCacheIsolation::Session(1), "m", 0..1);
         assert_eq!(full.num_tokens, 4);
         assert_eq!(partial.num_tokens, 2);
         assert_eq!(partial.chunk_index, 2);
@@ -625,7 +644,10 @@ mod tests {
         // Identical chunk-1 window ([200,201,202,203]) but different prefix.
         assert_eq!(ca[1].tokens, cb[1].tokens);
         assert_ne!(ca[1].hash, cb[1].hash);
-        assert_ne!(ca[1].to_key("m", 0..1), cb[1].to_key("m", 0..1));
+        assert_ne!(
+            ca[1].to_key(KvCacheIsolation::Session(1), "m", 0..1),
+            cb[1].to_key(KvCacheIsolation::Session(1), "m", 0..1)
+        );
     }
 
     #[test]
@@ -639,16 +661,26 @@ mod tests {
         let ca = chunk_tokens(&a, 4);
         let cb = chunk_tokens(&b, 4);
         // Shared prefix through chunk 1 → identical keys for chunks 0 and 1.
-        assert_eq!(ca[0].to_key("m", 0..1), cb[0].to_key("m", 0..1));
-        assert_eq!(ca[1].to_key("m", 0..1), cb[1].to_key("m", 0..1));
+        assert_eq!(
+            ca[0].to_key(KvCacheIsolation::Session(1), "m", 0..1),
+            cb[0].to_key(KvCacheIsolation::Session(1), "m", 0..1)
+        );
+        assert_eq!(
+            ca[1].to_key(KvCacheIsolation::Session(1), "m", 0..1),
+            cb[1].to_key(KvCacheIsolation::Session(1), "m", 0..1)
+        );
         // Diverge at chunk 2 → different keys.
-        assert_ne!(ca[2].to_key("m", 0..1), cb[2].to_key("m", 0..1));
+        assert_ne!(
+            ca[2].to_key(KvCacheIsolation::Session(1), "m", 0..1),
+            cb[2].to_key(KvCacheIsolation::Session(1), "m", 0..1)
+        );
     }
 
     // --- KvCacheKey Hash/Eq --------------------------------------------
 
     fn key(model: &str, layers: Range<usize>, hash: u64) -> KvCacheKey {
         KvCacheKey {
+            isolation: KvCacheIsolation::Session(1),
             model_id: model.to_string(),
             layer_range: layers,
             chunk_hash: hash,
@@ -674,6 +706,9 @@ mod tests {
         assert_ne!(base, key("model-b", 0..8, 42)); // model_id
         assert_ne!(base, key("model-a", 0..8, 43)); // chunk_hash
         assert_ne!(base, key("model-a", 8..16, 42)); // layer_range
+        let mut other_session = base.clone();
+        other_session.isolation = KvCacheIsolation::Session(2);
+        assert_ne!(base, other_session);
     }
 
     // --- NullConnector --------------------------------------------------
@@ -749,6 +784,7 @@ mod tests {
             kv_data: sample_payload(1, 1, 1, 1),
             priority: CachePriority::Opportunistic,
             ttl: None,
+            disposition: StateStorageDisposition::new(true, true),
         };
         assert!(c.store(entry).await.is_ok());
     }

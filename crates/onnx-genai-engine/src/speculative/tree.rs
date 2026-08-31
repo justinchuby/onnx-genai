@@ -32,6 +32,7 @@
 
 use crate::TokenId;
 use crate::speculative::{AcceptanceRule, argmax};
+use anyhow::Context as _;
 
 /// Shape of a speculative draft: a single linear chain, or a branching tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -71,6 +72,107 @@ pub struct SpecTree {
 }
 
 impl SpecTree {
+    /// Build a tree from the proposer-provided token vector and parent topology.
+    ///
+    /// `parents[i]` is either `None` for a root or a preceding node index. The
+    /// representation deliberately has no inferred roots, depths, or sibling
+    /// order: the parent vector is the complete topology authority.
+    pub fn from_parent_indices(
+        tokens: Vec<TokenId>,
+        parents: Vec<Option<usize>>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            tokens.len() == parents.len(),
+            "candidate-tree token count {} does not match parent topology count {}; the \
+             proposer must emit one parent entry per candidate token",
+            tokens.len(),
+            parents.len()
+        );
+        let mut nodes = Vec::with_capacity(tokens.len());
+        for (index, (token, parent)) in tokens.into_iter().zip(parents).enumerate() {
+            let depth = match parent {
+                Some(parent) => nodes
+                    .get(parent)
+                    .map(|node: &TreeNode| node.depth + 1)
+                    .with_context(|| {
+                        format!(
+                            "candidate-tree parent index {parent} for node {index} is not a \
+                             preceding candidate; emit nodes in parent-before-child order"
+                        )
+                    })?,
+                None => 0,
+            };
+            nodes.push(TreeNode {
+                token,
+                parent,
+                depth,
+            });
+        }
+        Ok(Self { nodes })
+    }
+
+    /// Build a tree from a boolean ancestor matrix emitted by the proposer.
+    ///
+    /// The diagonal is self, each row's strict ancestors form one chain, and a
+    /// parent is the deepest strict ancestor. Rejecting ambiguous or cyclic
+    /// masks is essential: selecting a convenient parent from a general graph
+    /// would turn malformed proposal data into a different candidate tree.
+    pub fn from_ancestor_mask(tokens: Vec<TokenId>, mask: &[Vec<bool>]) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            mask.len() == tokens.len(),
+            "candidate-tree ancestor mask has {} rows for {} candidate tokens",
+            mask.len(),
+            tokens.len()
+        );
+        for (row, values) in mask.iter().enumerate() {
+            anyhow::ensure!(
+                values.len() == tokens.len(),
+                "candidate-tree ancestor mask row {row} has {} columns for {} candidate tokens",
+                values.len(),
+                tokens.len()
+            );
+            anyhow::ensure!(
+                values[row],
+                "candidate-tree ancestor mask row {row} must include its self edge"
+            );
+            for (column, value) in values.iter().enumerate().skip(row + 1) {
+                anyhow::ensure!(
+                    !value,
+                    "candidate-tree ancestor mask makes later node {column} an ancestor of \
+                     node {row}; emit a parent-before-child topology"
+                );
+            }
+        }
+
+        let mut parents = Vec::with_capacity(tokens.len());
+        for node in 0..tokens.len() {
+            let ancestors = (0..node)
+                .filter(|&ancestor| mask[node][ancestor])
+                .collect::<Vec<_>>();
+            let parent = ancestors.last().copied();
+            for &ancestor in &ancestors {
+                if Some(ancestor) == parent {
+                    continue;
+                }
+                anyhow::ensure!(
+                    parent.is_some_and(|parent| mask[parent][ancestor]),
+                    "candidate-tree ancestor mask row {node} contains ancestors {ancestor} and \
+                     {} that are not on one root-to-node path",
+                    parent.unwrap_or_default()
+                );
+            }
+            parents.push(parent);
+        }
+        let tree = Self::from_parent_indices(tokens, parents)?;
+        let expected = ancestor_attention_mask(&tree);
+        anyhow::ensure!(
+            expected == mask,
+            "candidate-tree ancestor mask does not exactly encode the declared parent topology; \
+             emit either one unambiguous parent vector or a transitive ancestor mask"
+        );
+        Ok(tree)
+    }
+
     /// All nodes in flattened topological order.
     pub fn nodes(&self) -> &[TreeNode] {
         &self.nodes
@@ -199,10 +301,261 @@ fn target_decision(logits: &[f32], rule: AcceptanceRule) -> anyhow::Result<Targe
     // rejection sampling therefore accept any candidate that equals it; typical
     // acceptance additionally gates on the target probability mass.
     let accept = match rule {
-        AcceptanceRule::Greedy | AcceptanceRule::RejectionSampling => true,
+        AcceptanceRule::Greedy => true,
+        AcceptanceRule::RejectionSampling => anyhow::bail!(
+            "sampling verification requires declared proposal and target probability \
+             distributions; call verify_tree_sampling instead of accepting argmax logits"
+        ),
         AcceptanceRule::Typical { threshold } => softmax_prob(logits, index) >= threshold,
     };
     Ok(TargetDecision { token, accept })
+}
+
+/// One source of deterministic random variates for a sampling verification.
+///
+/// Supplying the variates rather than touching thread-local randomness makes
+/// cancellation/retry replay deterministic from the S3 transaction baseline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplingRandomness {
+    /// Uniform variate used by the rejection acceptance test or the bonus draw.
+    pub acceptance: f32,
+    /// Uniform variate used to sample a residual correction after rejection.
+    pub correction: f32,
+}
+
+impl SamplingRandomness {
+    fn validate(self, position: usize) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("acceptance", self.acceptance),
+            ("correction", self.correction),
+        ] {
+            anyhow::ensure!(
+                value.is_finite() && (0.0..1.0).contains(&value),
+                "sampling random {name} at candidate position {position} is {value}; \
+                 deterministic variates must be finite and in [0, 1)"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Distribution-preserving sampling inputs for a selected candidate-tree path.
+///
+/// Proposal and target rows index the same token vocabulary. Row zero scores
+/// root candidates; row `node + 1` scores the children of that node. The
+/// proposer may batch and branch arbitrarily, but it must name the exact
+/// root-to-leaf proposal path sampled from its distributions before this
+/// verifier commits anything.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeSamplingInputs {
+    pub proposal_probabilities: Vec<Vec<f32>>,
+    pub target_probabilities: Vec<Vec<f32>>,
+    pub proposed_path: Vec<usize>,
+    pub randomness: Vec<SamplingRandomness>,
+}
+
+/// Distribution-preserving tree-sampling outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeSamplingVerification {
+    pub outcome: AcceptOutcome,
+    pub plan: KvRetentionPlan,
+}
+
+/// Verify a candidate-tree path with standard speculative rejection sampling.
+///
+/// This is structurally separate from [`verify_tree`]: greedy selection only
+/// needs target logits, while sampling needs both declared distributions. On a
+/// rejection it samples from normalized `(p - q)_+`; therefore the output
+/// distribution is exactly the target distribution, not merely a sampled
+/// approximation of greedy acceptance.
+pub fn verify_tree_sampling(
+    tree: &SpecTree,
+    base_len: usize,
+    inputs: &TreeSamplingInputs,
+) -> anyhow::Result<TreeSamplingVerification> {
+    anyhow::ensure!(
+        inputs.proposal_probabilities.len() == tree.len() + 1,
+        "candidate-tree sampling requires one proposal probability row for the anchor and \
+         every candidate node; got {} rows for {} nodes",
+        inputs.proposal_probabilities.len(),
+        tree.len()
+    );
+    anyhow::ensure!(
+        inputs.target_probabilities.len() == tree.len() + 1,
+        "candidate-tree sampling requires one target probability row for the anchor and every \
+         candidate node; got {} rows for {} nodes",
+        inputs.target_probabilities.len(),
+        tree.len()
+    );
+    anyhow::ensure!(
+        inputs.randomness.len() > inputs.proposed_path.len(),
+        "candidate-tree sampling needs one random pair per proposed node plus one bonus draw; \
+         got {} pairs for a {}-node path",
+        inputs.randomness.len(),
+        inputs.proposed_path.len()
+    );
+
+    let mut accepted_nodes = Vec::new();
+    let mut previous = None;
+    for (position, &node) in inputs.proposed_path.iter().enumerate() {
+        let candidate = tree.nodes.get(node).with_context(|| {
+            format!(
+                "candidate-tree proposed path position {position} references absent node {node}"
+            )
+        })?;
+        if position == 0 {
+            anyhow::ensure!(
+                candidate.parent.is_none(),
+                "candidate-tree proposed path starts at node {node}, which is not a root"
+            );
+        } else {
+            anyhow::ensure!(
+                candidate.parent == previous,
+                "candidate-tree proposed path node {node} is not a child of preceding node {}",
+                previous.unwrap_or_default()
+            );
+        }
+        let probabilities_row = previous.map_or(0, |node| node + 1);
+        let proposal = probability_row(
+            &inputs.proposal_probabilities[probabilities_row],
+            position,
+            "proposal",
+        )?;
+        let target = probability_row(
+            &inputs.target_probabilities[probabilities_row],
+            position,
+            "target",
+        )?;
+        anyhow::ensure!(
+            proposal.len() == target.len(),
+            "candidate-tree sampling position {position} has a proposal vocabulary of {} and \
+             target vocabulary of {}; declare a vocabulary mapping or use identical vocabularies",
+            proposal.len(),
+            target.len()
+        );
+        let token = candidate.token as usize;
+        anyhow::ensure!(
+            token < proposal.len(),
+            "candidate-tree node {node} proposes token {} outside the declared probability \
+             vocabulary of {} entries",
+            candidate.token,
+            proposal.len()
+        );
+        let random = inputs.randomness[position];
+        random.validate(position)?;
+        anyhow::ensure!(
+            proposal[token] > 0.0,
+            "candidate-tree node {node} proposes token {} with zero declared proposal \
+             probability; the proposal path cannot be sampled from its own distribution",
+            candidate.token
+        );
+        let acceptance = (target[token] / proposal[token]).min(1.0);
+        if random.acceptance < acceptance {
+            accepted_nodes.push(node);
+            previous = Some(node);
+            continue;
+        }
+        let correction =
+            sample_residual(target, proposal, random.correction).with_context(|| {
+                format!(
+                    "candidate-tree rejection at node {node} has no valid target-minus-proposal \
+                 correction distribution"
+                )
+            })?;
+        let outcome = AcceptOutcome {
+            tokens: accepted_nodes
+                .iter()
+                .map(|&accepted| tree.nodes[accepted].token)
+                .chain(std::iter::once(correction))
+                .collect(),
+            nodes: accepted_nodes,
+        };
+        return Ok(TreeSamplingVerification {
+            plan: kv_retention_plan(base_len, &outcome.nodes),
+            outcome,
+        });
+    }
+
+    let row = previous.map_or(0, |node| node + 1);
+    let target = probability_row(
+        &inputs.target_probabilities[row],
+        inputs.proposed_path.len(),
+        "target",
+    )?;
+    let random = inputs.randomness[inputs.proposed_path.len()];
+    random.validate(inputs.proposed_path.len())?;
+    let bonus = sample_distribution(target, random.acceptance)?;
+    let outcome = AcceptOutcome {
+        tokens: accepted_nodes
+            .iter()
+            .map(|&node| tree.nodes[node].token)
+            .chain(std::iter::once(bonus))
+            .collect(),
+        nodes: accepted_nodes,
+    };
+    Ok(TreeSamplingVerification {
+        plan: kv_retention_plan(base_len, &outcome.nodes),
+        outcome,
+    })
+}
+
+fn probability_row<'a>(
+    probabilities: &'a [f32],
+    position: usize,
+    authority: &str,
+) -> anyhow::Result<&'a [f32]> {
+    anyhow::ensure!(
+        !probabilities.is_empty(),
+        "candidate-tree {authority} probability row at position {position} is empty"
+    );
+    let sum = probabilities.iter().try_fold(0.0f32, |sum, &value| {
+        anyhow::ensure!(
+            value.is_finite() && value >= 0.0,
+            "candidate-tree {authority} probability row at position {position} contains \
+             invalid probability {value}; probabilities must be finite and non-negative"
+        );
+        Ok::<_, anyhow::Error>(sum + value)
+    })?;
+    anyhow::ensure!(
+        (sum - 1.0).abs() <= 1e-4,
+        "candidate-tree {authority} probability row at position {position} sums to {sum}, \
+         not 1; normalize it before speculative sampling"
+    );
+    Ok(probabilities)
+}
+
+fn sample_distribution(probabilities: &[f32], uniform: f32) -> anyhow::Result<TokenId> {
+    let mut cumulative = 0.0;
+    for (token, probability) in probabilities.iter().enumerate() {
+        cumulative += probability;
+        if uniform < cumulative {
+            return TokenId::try_from(token)
+                .map_err(|_| anyhow::anyhow!("sampled token index {token} exceeds u32"));
+        }
+    }
+    let token = probabilities
+        .len()
+        .checked_sub(1)
+        .context("cannot sample an empty distribution")?;
+    TokenId::try_from(token).map_err(|_| anyhow::anyhow!("sampled token index {token} exceeds u32"))
+}
+
+fn sample_residual(target: &[f32], proposal: &[f32], uniform: f32) -> anyhow::Result<TokenId> {
+    let residual = target
+        .iter()
+        .zip(proposal)
+        .map(|(&target, &proposal)| (target - proposal).max(0.0))
+        .collect::<Vec<_>>();
+    let total: f32 = residual.iter().sum();
+    anyhow::ensure!(
+        total > 0.0 && total.is_finite(),
+        "the target-minus-proposal residual mass is {total}"
+    );
+    let normalized = residual
+        .into_iter()
+        .map(|value| value / total)
+        .collect::<Vec<_>>();
+    sample_distribution(&normalized, uniform)
 }
 
 fn softmax_prob(logits: &[f32], index: usize) -> f32 {
@@ -531,6 +884,112 @@ mod tests {
         let empty = kv_retention_plan(5, &[]);
         assert!(empty.retained_nodes.is_empty());
         assert_eq!(empty.final_len, 5);
+    }
+
+    #[test]
+    fn proposer_parent_topology_is_the_only_tree_authority() -> anyhow::Result<()> {
+        let tree = SpecTree::from_parent_indices(vec![10, 11, 12], vec![None, Some(0), Some(0)])?;
+        assert_eq!(tree.nodes()[1].depth, 1);
+        assert_eq!(tree.nodes()[2].depth, 1);
+        let error = SpecTree::from_parent_indices(vec![1, 2], vec![None, Some(1)])
+            .expect_err("a node cannot parent itself or a preceding tree cannot be inferred");
+        assert!(error.to_string().contains("parent index 1"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn ancestor_masks_must_encode_one_parent_ordered_tree() -> anyhow::Result<()> {
+        let tree = SpecTree::from_ancestor_mask(
+            vec![10, 11, 12],
+            &[
+                vec![true, false, false],
+                vec![true, true, false],
+                vec![true, false, true],
+            ],
+        )?;
+        assert_eq!(tree.nodes()[1].parent, Some(0));
+        assert_eq!(tree.nodes()[2].parent, Some(0));
+        let error =
+            SpecTree::from_ancestor_mask(vec![1, 2], &[vec![true, true], vec![false, true]])
+                .expect_err("a later ancestor would form a non-topological graph");
+        assert!(error.to_string().contains("later node 1"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_requires_probability_distributions_and_uses_residual_correction()
+    -> anyhow::Result<()> {
+        let tree = SpecTree::from_parent_indices(vec![0], vec![None])?;
+        let verification = verify_tree_sampling(
+            &tree,
+            5,
+            &TreeSamplingInputs {
+                // Root 0 is a q-sample. Target probability is smaller, so the
+                // fixed uniform rejects it and correction must sample the only
+                // positive residual token 1.
+                proposal_probabilities: vec![vec![0.5, 0.5], vec![1.0, 0.0]],
+                target_probabilities: vec![vec![0.2, 0.8], vec![0.2, 0.8]],
+                proposed_path: vec![0],
+                randomness: vec![
+                    SamplingRandomness {
+                        acceptance: 0.5,
+                        correction: 0.25,
+                    },
+                    SamplingRandomness {
+                        acceptance: 0.25,
+                        correction: 0.25,
+                    },
+                ],
+            },
+        )?;
+        assert_eq!(verification.outcome.nodes, Vec::<usize>::new());
+        assert_eq!(verification.outcome.tokens, vec![1]);
+        assert_eq!(verification.plan.final_len, 5);
+
+        let error = verify_tree_sampling(
+            &tree,
+            0,
+            &TreeSamplingInputs {
+                proposal_probabilities: vec![],
+                target_probabilities: vec![],
+                proposed_path: vec![0],
+                randomness: vec![],
+            },
+        )
+        .expect_err("sampling must never fall back to argmax without probabilities");
+        assert!(
+            error.to_string().contains("proposal probability row"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_accepts_prefix_then_samples_the_target_bonus() -> anyhow::Result<()> {
+        let tree = SpecTree::from_parent_indices(vec![0], vec![None])?;
+        let verification = verify_tree_sampling(
+            &tree,
+            3,
+            &TreeSamplingInputs {
+                proposal_probabilities: vec![vec![1.0, 0.0], vec![0.3, 0.7]],
+                target_probabilities: vec![vec![1.0, 0.0], vec![0.2, 0.8]],
+                proposed_path: vec![0],
+                randomness: vec![
+                    SamplingRandomness {
+                        acceptance: 0.0,
+                        correction: 0.0,
+                    },
+                    SamplingRandomness {
+                        acceptance: 0.5,
+                        correction: 0.0,
+                    },
+                ],
+            },
+        )?;
+        assert_eq!(verification.outcome.nodes, vec![0]);
+        assert_eq!(verification.outcome.tokens, vec![0, 1]);
+        assert_eq!(verification.plan.final_len, 4);
+        Ok(())
     }
 
     /// A deterministic reference "model": next token is a fixed function of the last

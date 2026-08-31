@@ -485,6 +485,14 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    row(
+        "tests/fixtures/tiny-llm-cursor-fallback/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
     // Its sibling's graph exactly; the one declaration that differs
     // (`aliasing: permitted`) is a state-service property, not a structural
     // one, so it must classify identically. A row that drifted from
@@ -492,6 +500,24 @@ const MATRIX: &[Row] = &[
     // recognition.
     row(
         "tests/fixtures/tiny-llm-batched/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
+    // The zero-bound second loop exercises the per-token cursor's generic
+    // fallback. It does not alter the sole decoder component or its contract.
+    row(
+        "tests/fixtures/tiny-llm-cursor-fallback/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
+    row(
+        "tests/fixtures/tiny-llm-cursor-fallback/inference_metadata.yaml",
         1,
         SingleGraph,
         Some("decoder"),
@@ -534,11 +560,11 @@ const MATRIX: &[Row] = &[
     ),
     row(
         "tests/fixtures/tiny-mtp-full/inference_metadata.yaml",
-        1,
-        SingleGraph,
+        2,
+        Composite,
         Some("decoder"),
-        true,
-        Some("decoder"),
+        false,
+        None,
     ),
     row(
         "tests/fixtures/tiny-native-engine/inference_metadata.yaml",
@@ -572,7 +598,25 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    row(
+        "tests/fixtures/tiny-tool-call/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
     // ── crate-local fixtures ─────────────────────────────────────────────────
+    // DFlash has distinct proposer and verifier graphs and is therefore not
+    // classified as a single-decoder workflow.
+    row(
+        "crates/onnx-genai-engine/tests/fixtures/dflash-admission/inference_metadata.yaml",
+        2,
+        Composite,
+        None,
+        false,
+        None,
+    ),
     // A package fixture the engine's model-package tests load.
     row(
         "crates/onnx-genai-engine/tests/fixtures/model-package-cpu/cpu/inference_metadata.yaml",
@@ -582,10 +626,47 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    // An intentionally model-less package: exact production candidate-tree
+    // admission rejects its binding-only variant before inspecting an ONNX
+    // artifact, while structural workflow recognition remains NoGraph.
+    row(
+        "crates/onnx-genai-engine/tests/fixtures/unsupported-candidate-tree/inference_metadata.yaml",
+        0,
+        NoGraph,
+        None,
+        false,
+        None,
+    ),
+    // The DFlash loader spy has two real graph components. Its verifier owns
+    // decoder state, but the package as a whole remains a composite workflow.
+    row(
+        "crates/onnx-genai-engine/tests/fixtures/dflash-admission/inference_metadata.yaml",
+        2,
+        Composite,
+        None,
+        false,
+        None,
+    ),
     // The smallest document that declares a workflow at all: its one component
     // is a `binding`, so the workflow names no graph.
     row(
         "crates/onnx-genai-metadata/tests/fixtures/north_star_minimal.yaml",
+        0,
+        NoGraph,
+        None,
+        false,
+        None,
+    ),
+    row(
+        "crates/onnx-genai-metadata/tests/fixtures/canonical_speculation/greedy_tree.yaml",
+        0,
+        NoGraph,
+        None,
+        false,
+        None,
+    ),
+    row(
+        "crates/onnx-genai-metadata/tests/fixtures/canonical_speculation/sampling_tree.yaml",
         0,
         NoGraph,
         None,
@@ -725,7 +806,9 @@ fn collect_workflows(directory: &Path, root: &Path, found: &mut BTreeSet<String>
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            if !SKIPPED.contains(&name.as_str()) {
+            let cargo_or_tool_cache = path.join("CACHEDIR.TAG").is_file();
+            let generated_target = name == "target" || name.starts_with("target-");
+            if !SKIPPED.contains(&name.as_str()) && !generated_target && !cargo_or_tool_cache {
                 collect_workflows(&path, root, found);
             }
             continue;

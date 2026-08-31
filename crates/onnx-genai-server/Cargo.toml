@@ -91,6 +91,7 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 image = { workspace = true, features = ["png"] }
 
 [dev-dependencies]
+onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.5", default-features = false, features = ["test-output-staging"] }
 onnx-runtime-virtual-memory = { workspace = true }
 tower = { workspace = true }
 tempfile = "3"

@@ -864,7 +864,7 @@ pub(crate) fn required_str<'a>(
         .ok_or_else(|| incomplete(field))
 }
 
-/// The dtype and rank of every port a decoder graph exposes.
+/// The dtype and shape of every port a decoder graph exposes.
 fn port_contracts_from_graph(
     graph: &ModelGraphInfo,
 ) -> std::collections::BTreeMap<String, onnx_genai_metadata::TensorContract> {
@@ -877,10 +877,17 @@ fn port_contracts_from_graph(
                 tensor.name.clone(),
                 onnx_genai_metadata::TensorContract {
                     dtype: tensor.dtype.clone(),
-                    rank: tensor.dimensions.len(),
-                    // The graph's own shape is authoritative; restating it here
-                    // would be a second place it could drift.
-                    shape: None,
+                    shape: tensor
+                        .dimensions
+                        .iter()
+                        .map(|dimension| match dimension {
+                            Some(extent) => onnx_genai_metadata::TensorDimension::Fixed(
+                                i64::try_from(*extent)
+                                    .expect("ONNX dimensions are non-negative signed int64"),
+                            ),
+                            None => onnx_genai_metadata::TensorDimension::Any,
+                        })
+                        .collect(),
                     optional: false,
                     batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
                     padding: Vec::new(),

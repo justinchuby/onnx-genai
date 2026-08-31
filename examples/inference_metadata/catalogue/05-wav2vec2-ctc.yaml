@@ -2,15 +2,11 @@
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - typed_emit
+    manifest: {}
     inputs:
       request.input_values:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - samples
@@ -27,7 +23,6 @@ pipeline:
       request.attention_mask:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - samples
@@ -44,7 +39,6 @@ pipeline:
       logits:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - frames
@@ -60,11 +54,11 @@ pipeline:
       frame_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
-            kind: shared
+            kind: request_aligned
+            axis: 0
         role: tensor
         stage: pre_adapter
     components:
@@ -76,7 +70,6 @@ pipeline:
           inputs:
             input_values:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - samples
@@ -85,7 +78,6 @@ pipeline:
                 axis: 0
             attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - samples
@@ -95,7 +87,6 @@ pipeline:
           outputs:
             logits:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - frames
@@ -108,11 +99,11 @@ pipeline:
                 valid_lengths: frame_lengths
             frame_lengths:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
-                kind: shared
+                kind: request_aligned
+                axis: 0
     state: {}
     steps:
     - kind: invoke

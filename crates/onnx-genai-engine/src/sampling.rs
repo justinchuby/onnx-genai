@@ -6,6 +6,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 /// Per-request random state used only by categorical sampling.
+#[derive(Clone)]
 pub(crate) struct SamplingRng {
     rng: StdRng,
 }
