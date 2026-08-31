@@ -1182,11 +1182,11 @@ fn session_tensor_contract(
         .enumerate()
         .map(|(axis, dimension)| {
             if *dimension < 0 {
-                onnx_genai_metadata::TensorDimension::Symbol(if axis == 0 {
-                    "batch".into()
+                if axis == 0 {
+                    onnx_genai_metadata::TensorDimension::Symbol("batch".into())
                 } else {
-                    format!("axis_{axis}")
-                })
+                    onnx_genai_metadata::TensorDimension::Any
+                }
             } else {
                 onnx_genai_metadata::TensorDimension::Fixed(*dimension)
             }
@@ -1194,8 +1194,7 @@ fn session_tensor_contract(
         .collect();
     Some(onnx_genai_metadata::TensorContract {
         dtype: dtype.into(),
-        rank: tensor.shape.len(),
-        shape: Some(shape),
+        shape,
         optional: false,
         batch_layout,
         padding: Vec::new(),
@@ -1290,9 +1289,9 @@ fn state_update_contracts_match(
     current.dtype == "int64"
         && update.dtype == "int64"
         && next.dtype == "int64"
-        && current.rank == 2
-        && update.rank == 2
-        && next.rank == 2
+        && current.rank() == 2
+        && update.rank() == 2
+        && next.rank() == 2
         && current.shape == update.shape
         && current.shape == next.shape
 }
@@ -1319,18 +1318,18 @@ fn batching_role_port(
         return false;
     };
     let integer = tensor.dtype.starts_with("int") || tensor.dtype.starts_with("uint");
-    let first = tensor.shape.as_deref().and_then(|shape| shape.first());
+    let first = tensor.shape.first();
     if role == "continue" {
         return tensor.dtype == "bool"
-            && tensor.rank == 1
+            && tensor.rank() == 1
             && matches!(first, Some(onnx_genai_metadata::TensorDimension::Fixed(1)));
     }
     if role == "iteration" {
         return integer
-            && tensor.rank == 1
+            && tensor.rank() == 1
             && matches!(first, Some(onnx_genai_metadata::TensorDimension::Fixed(1)));
     }
-    if tensor.rank == 0
+    if tensor.rank() == 0
         || !matches!(
             first,
             Some(onnx_genai_metadata::TensorDimension::Symbol(symbol))
@@ -1340,20 +1339,21 @@ fn batching_role_port(
         return false;
     }
     match role {
-        "active" | "done" | "next_active" => tensor.dtype == "bool" && tensor.rank == 1,
+        "active" | "done" | "next_active" => tensor.dtype == "bool" && tensor.rank() == 1,
         "logits" => {
             matches!(tensor.dtype.as_str(), "float32" | "float16" | "bfloat16")
-                && matches!(tensor.rank, 2 | 3)
+                && matches!(tensor.rank(), 2 | 3)
         }
         "temperature" | "top_p" | "min_p" => {
-            matches!(tensor.dtype.as_str(), "float32" | "float16" | "bfloat16") && tensor.rank == 1
+            matches!(tensor.dtype.as_str(), "float32" | "float16" | "bfloat16")
+                && tensor.rank() == 1
         }
         "eos_ids" => {
             (tensor.dtype.starts_with("int") || tensor.dtype.starts_with("uint"))
-                && tensor.rank == 2
+                && tensor.rank() == 2
         }
         "top_k" | "seed" | "counter" | "next_counter" | "tokens" | "token" | "eos_lengths"
-        | "max_iterations" => integer && tensor.rank == 1,
+        | "max_iterations" => integer && tensor.rank() == 1,
         "current" | "update" | "next" => true,
         _ => false,
     }
@@ -2418,15 +2418,9 @@ mod tests {
     fn batch_tensor(dtype: &str, rank: usize) -> onnx_genai_metadata::TensorContract {
         onnx_genai_metadata::TensorContract {
             dtype: dtype.into(),
-            rank,
-            shape: Some(
-                std::iter::once(onnx_genai_metadata::TensorDimension::Symbol("batch".into()))
-                    .chain(
-                        (1..rank)
-                            .map(|_| onnx_genai_metadata::TensorDimension::Symbol("axis".into())),
-                    )
-                    .collect(),
-            ),
+            shape: std::iter::once(onnx_genai_metadata::TensorDimension::Symbol("batch".into()))
+                .chain((1..rank).map(|_| onnx_genai_metadata::TensorDimension::Any))
+                .collect(),
             optional: false,
             batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
             padding: Vec::new(),
@@ -2436,8 +2430,7 @@ mod tests {
     fn singleton_tensor(dtype: &str) -> onnx_genai_metadata::TensorContract {
         onnx_genai_metadata::TensorContract {
             dtype: dtype.into(),
-            rank: 1,
-            shape: Some(vec![onnx_genai_metadata::TensorDimension::Fixed(1)]),
+            shape: vec![onnx_genai_metadata::TensorDimension::Fixed(1)],
             optional: false,
             batch_layout: onnx_genai_metadata::BatchLayout::Shared,
             padding: Vec::new(),
@@ -2460,7 +2453,6 @@ mod tests {
             serde_yaml::from_str(
                 r#"
 dtype: float32
-rank: 2
 shape: [items, hidden]
 batch_layout:
   kind: token_packed
@@ -2513,12 +2505,10 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       rows:
         contract:
           dtype: float32
-          rank: 2
           shape: [batch, 4]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
@@ -2528,7 +2518,6 @@ pipeline:
       result:
         contract:
           dtype: float32
-          rank: 2
           shape: [batch, 4]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: tensor
@@ -2918,20 +2907,13 @@ pipeline:
         }
         assert!(is_fusible_component(&sampler));
 
-        sampler.ports.outputs.get_mut("token").unwrap().shape = None;
+        sampler.ports.outputs.get_mut("token").unwrap().shape = Vec::new();
         assert!(!is_fusible_component(&sampler));
         sampler
             .ports
             .outputs
             .insert("token".into(), batch_tensor("int64", 1));
-        sampler
-            .ports
-            .inputs
-            .get_mut("logits")
-            .unwrap()
-            .shape
-            .as_mut()
-            .unwrap()[0] =
+        sampler.ports.inputs.get_mut("logits").unwrap().shape[0] =
             onnx_genai_metadata::TensorDimension::Symbol("policy.token_sampler.batch".into());
         assert!(!is_fusible_component(&sampler));
         sampler

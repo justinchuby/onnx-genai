@@ -185,8 +185,7 @@ fn migrate(
         // assuming.
         port_contracts: onnx_genai_engine::graph_port_contracts(
             &package_directory(package).join(&artifact),
-        )
-        .unwrap_or_default(),
+        )?,
     };
     let workflow = decoder_workflow(&abi, &artifact, &facts)?;
 

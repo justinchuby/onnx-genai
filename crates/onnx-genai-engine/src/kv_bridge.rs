@@ -623,6 +623,79 @@ pub(crate) fn rewind_target_state_to_len(
     )
 }
 
+/// Restore one decoder participant to an admitted atomic-turn baseline.
+///
+/// A normal rewind deliberately rejects runner-backed/fixed loop state because
+/// it has no snapshot for it. An atomic turn does: `baseline` was captured
+/// before the first mutation, so this function rewinds the position-addressable
+/// KV and restores the non-addressable bindings as one rollback operation.
+pub(crate) struct DecodeTurnRestore<'a> {
+    pub(crate) session: &'a Session,
+    pub(crate) kv_model: Option<&'a KvModelInfo>,
+    pub(crate) kv_cache: &'a mut PagedKvCache,
+    pub(crate) seq: SessionId,
+    pub(crate) tokens: &'a mut Vec<TokenId>,
+    pub(crate) decode_state: &'a mut DecodeState,
+    pub(crate) kv_token_count: &'a mut usize,
+    pub(crate) baseline_tokens: &'a [TokenId],
+    pub(crate) baseline_kv_token_count: usize,
+    pub(crate) baseline: &'a crate::decode::DecodeTurnBaseline,
+}
+
+pub(crate) fn restore_decode_turn_baseline(restore: DecodeTurnRestore<'_>) -> anyhow::Result<()> {
+    let DecodeTurnRestore {
+        session,
+        kv_model,
+        kv_cache,
+        seq,
+        tokens,
+        decode_state,
+        kv_token_count,
+        baseline_tokens,
+        baseline_kv_token_count,
+        baseline,
+    } = restore;
+    let rewind = RewindRequest::new(
+        baseline_kv_token_count,
+        RewindRunnerPolicy::AllowRunnerRewind,
+    );
+    validate_decode_state_rewind_to_len(
+        kv_model,
+        kv_cache,
+        seq,
+        decode_state,
+        *kv_token_count,
+        rewind,
+    )?;
+    if decode_state.has_runner() {
+        if decode_state.use_kv && *kv_token_count != baseline_kv_token_count {
+            kv_cache
+                .rewind_to(seq, baseline_kv_token_count)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to restore atomic-turn KV participant {seq} to \
+                         baseline position {baseline_kv_token_count}: {e}"
+                    )
+                })?;
+        }
+        decode_state.restore_turn_baseline(baseline_kv_token_count, baseline)?;
+        *kv_token_count = baseline_kv_token_count;
+    } else {
+        rewind_decode_state_to_len(
+            session,
+            kv_model,
+            kv_cache,
+            seq,
+            decode_state,
+            kv_token_count,
+            rewind,
+        )?;
+        decode_state.restore_turn_baseline(baseline_kv_token_count, baseline)?;
+    }
+    *tokens = baseline_tokens.to_vec();
+    Ok(())
+}
+
 pub(crate) fn validate_target_state_rewind_to_len(
     kv_model: Option<&KvModelInfo>,
     kv_cache: &PagedKvCache,

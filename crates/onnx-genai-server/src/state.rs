@@ -616,6 +616,41 @@ fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option
     Ok(metadata.model.and_then(|model| model.max_sequence_length))
 }
 
+fn load_tool_protocol(
+    metadata_path: Option<&Path>,
+) -> anyhow::Result<(
+    Option<crate::tool_protocol::ToolProtocol>,
+    Option<std::path::PathBuf>,
+)> {
+    let Some(metadata_path) = metadata_path else {
+        return Ok((None, None));
+    };
+    let metadata = onnx_genai_metadata::load_metadata(metadata_path)
+        .with_context(|| format!("failed to load {}", metadata_path.display()))?;
+    resolve_tool_protocol(Some(&metadata), Some(metadata_path))
+}
+
+fn resolve_tool_protocol(
+    metadata: Option<&onnx_genai_metadata::InferenceMetadata>,
+    metadata_path: Option<&Path>,
+) -> anyhow::Result<(
+    Option<crate::tool_protocol::ToolProtocol>,
+    Option<std::path::PathBuf>,
+)> {
+    let protocol = metadata
+        .and_then(|metadata| metadata.package.as_ref())
+        .and_then(|package| package.tool_protocol.as_ref())
+        .map(|declaration| {
+            crate::tool_protocol::resolve(
+                declaration,
+                metadata_path.unwrap_or_else(|| Path::new("this package's metadata")),
+            )
+        })
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok((protocol, metadata_path.map(Path::to_path_buf)))
+}
+
 /// Refuse an explicit `--max-batch > 1` that the engine's decode path cannot
 /// honor. This is the startup-time enforcement for issue #750: the native
 /// backend (and legacy / non-shared-buffer past/present ORT models) can only
@@ -700,6 +735,8 @@ pub(crate) fn build_handle_with_authorities(
     let model_directory = ModelDirectory::load(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?;
     let model_max_context = load_model_max_context(model_directory.metadata_path.as_deref())?;
+    let (tool_protocol, tool_protocol_metadata_path) =
+        load_tool_protocol(model_directory.metadata_path.as_deref())?;
     let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
     let generation_defaults = None;
@@ -755,6 +792,8 @@ pub(crate) fn build_handle_with_authorities(
         engine: engine_driver,
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
+        tool_protocol,
+        tool_protocol_metadata_path,
         model_max_context,
         generation_defaults,
         fim_config,
@@ -781,6 +820,9 @@ fn build_pipeline_handle(
         );
     }
     let image_pipeline = crate::image_generation::ImagePipelineSpec::from_pipeline(&directory.spec);
+    let metadata_path = onnx_genai_metadata::find_metadata_path(model_dir);
+    let (tool_protocol, tool_protocol_metadata_path) =
+        resolve_tool_protocol(directory.metadata.as_ref(), metadata_path.as_deref())?;
     let tokenizer_path = crate::multimodal::tokenizer_path(model_dir, &directory)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
@@ -844,6 +886,8 @@ fn build_pipeline_handle(
         engine: engine_driver,
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
+        tool_protocol,
+        tool_protocol_metadata_path,
         model_max_context,
         generation_defaults,
         fim_config: None,

@@ -1,9 +1,23 @@
 # Native backend for the universal `pipeline.workflow` runtime
 
-Status: **staged** — this document tracks the architecture and the incremental
-landing plan. The first increment (a backend-neutral component-execution seam,
-a native executor, and the `EngineDecodeBackend::Native` acceptance flip) lands
-with parity tests; the follow-up boundaries below are called out explicitly.
+Status: **implemented for the covered hermetic workflow fixtures** — this
+document tracks the architecture and the incremental landing plan. The first
+increment (a backend-neutral component-execution seam, a native executor, and
+the `EngineDecodeBackend::Native` acceptance flip) is exercised by parity
+tests; the follow-up boundaries below are called out explicitly.
+
+The delivered functional claim is deliberately narrow: Native executes the
+same interpreter for the covered single-pass, nested branch/loop/state,
+autoregressive, speculative, VLM, diffusion, video, and audio workflow
+fixtures. For those Native runs, component execution uses native
+`InferenceSession`s and the pipeline constructs zero ORT component `Session`s;
+unsupported native operators, dtypes, adapters, or providers fail closed rather
+than falling back to ORT. This is not a claim of complete native ONNX
+operator/kernel coverage, compatibility with arbitrary models or workflow
+packages, provider support beyond the resolved CPU/CUDA native devices, or
+performance parity. In particular, ORT execution islands (`IoBinding` and
+CUDA-graph capture) remain an ORT-only performance optimization; Native runs
+the covered workflow's individual components without an island.
 
 Read [`RULES.md`](../../RULES.md) first. The two rules that shape every decision
 here are **Rule 2** (no model/vendor/EP identity conditionals — behaviour is

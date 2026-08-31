@@ -95,6 +95,83 @@ fn generated_schema_preserves_all_root_constraints() {
     assert!(serialized.contains("\"hf_peft\""));
     assert!(serialized.contains("\"segments\""));
     assert!(!serialized.contains("\"adapter_ids\""));
+    let output = &schema["$defs"]["WorkflowOutput"];
+    assert!(output["properties"]["family"].is_object());
+    assert!(
+        !output["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&serde_json::json!("family"))),
+        "the nested output schema cannot condition requiredness on the root schema_version; \
+         parser and typed-admission tests enforce v1.5 while legacy documents omit family"
+    );
+    assert!(serialized.contains("\"retract\""));
+    assert!(serialized.contains("\"finalize\""));
+    assert!(
+        !serialized.contains("streaming_emit"),
+        "the redundant streaming capability must not remain in the schema"
+    );
+}
+
+#[test]
+fn generated_schema_requires_shape_and_refuses_tensor_contract_rank() {
+    let schema: serde_json::Value =
+        serde_json::from_str(&inference_metadata_schema_json().expect("schema serializes"))
+            .expect("generated schema is JSON");
+    let contract = &schema["$defs"]["TensorContract"];
+    let required = contract["required"].as_array().expect("required fields");
+
+    assert!(required.contains(&serde_json::json!("shape")));
+    assert!(contract["properties"]["rank"].is_null());
+    assert!(
+        schema["$defs"]["AudioOutputBinding"]["properties"]["rank"].is_null(),
+        "audio output tensor rank must also come only from contract.shape"
+    );
+    assert_eq!(
+        contract["additionalProperties"],
+        serde_json::json!(false),
+        "retired rank must not be accepted as an unknown extension"
+    );
+
+    let dimension = &schema["$defs"]["TensorDimension"];
+    let serialized_dimension = serde_json::to_string(dimension).expect("dimension serializes");
+    assert!(!serialized_dimension.contains("\"type\":\"null\""));
+    assert!(serialized_dimension.contains("\"type\":\"string\""));
+
+    let validator = jsonschema::validator_for(&schema).expect("generated schema compiles");
+    let example_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("examples/inference_metadata/catalogue/01-gemma4-text-decoder.yaml");
+    let yaml = fs::read_to_string(&example_path).expect("catalogue example reads");
+    let yaml_value: serde_yaml::Value =
+        serde_yaml::from_str(&yaml).expect("catalogue example is YAML");
+    let baseline = serde_json::to_value(yaml_value).expect("YAML converts to JSON");
+    assert!(
+        validator.is_valid(&baseline),
+        "the unmodified catalogue example must satisfy the generated schema"
+    );
+
+    let contract_path = "/pipeline/workflow/inputs/request.input_ids/contract";
+    let mut with_rank = baseline.clone();
+    with_rank
+        .pointer_mut(contract_path)
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("known tensor contract path")
+        .insert("rank".to_string(), serde_json::json!(2));
+    assert!(
+        !validator.is_valid(&with_rank),
+        "the generated schema must reject serialized tensor rank"
+    );
+
+    let mut without_shape = baseline;
+    without_shape
+        .pointer_mut(contract_path)
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("known tensor contract path")
+        .remove("shape");
+    assert!(
+        !validator.is_valid(&without_shape),
+        "the generated schema must reject omitted tensor shape"
+    );
 }
 
 /// The published schema refuses the retired flat `token_packed` spelling, so a

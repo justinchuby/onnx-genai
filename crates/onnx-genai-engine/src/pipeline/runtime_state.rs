@@ -36,8 +36,10 @@ use onnx_genai_ort::PipelineModels;
 
 use crate::{EngineDecodeBackend, MemoryStrategyPlan};
 
+use super::WorkflowOutputPublication;
 use super::islands::ExecutionIsland;
 use super::speculative::EmbeddingTable;
+use super::turn_transaction::CommittedOutputState;
 use super::workflow::{
     ComponentBindingKey, ComponentOutputKey, StableComponentBinding, WorkflowPerformanceCounters,
     WorkflowRunTelemetry,
@@ -126,6 +128,8 @@ pub(crate) struct WorkflowPlan {
     pub(crate) device_bridge_components: HashSet<String>,
     pub(crate) memory_strategy_plan: MemoryStrategyPlan,
     pub(crate) decode_backend: EngineDecodeBackend,
+    /// Canonical construction-time decision reused by every execution entry.
+    pub(crate) execution_admission: super::WorkflowExecutionAdmission,
     pub(crate) adapter_service: Option<onnx_genai_metadata::AdapterServiceContract>,
     pub(crate) preprocessing: Option<PreprocessingSpec>,
     /// The package's speculative compatibility contract, when it declares one.
@@ -259,12 +263,38 @@ pub(crate) struct WorkerRuntimeState {
     /// declared normalizer joins them for the same reason: it changes what the
     /// cached rows are, not merely where they live.
     pub(crate) embedding_tables: RefCell<HashMap<EmbeddingTableKey, Rc<EmbeddingTable>>>,
+    /// Immutable non-embedding initializers borrowed across components by a
+    /// declared speculative contract.
+    ///
+    /// DFlash passes the target LM head into the proposer as a read-only input.
+    /// Loading that matrix once per proposal would turn a metadata lookup into
+    /// the dominant draft cost, while copying it into the proposer artifact
+    /// would violate the declared shared-weight relationship.
+    pub(crate) shared_initializers: RefCell<HashMap<(String, String), Rc<onnx_genai_ort::Value>>>,
     /// Session-scoped workflow cells, keyed by `(session id, cell)`.
     ///
     /// Per-session state living on the owning worker: §3.2 storage under §3.3
     /// access discipline, which is exactly what §3.3 says a conversation cell
     /// is.
     pub(crate) session_state: RefCell<HashMap<(String, String), onnx_genai_ort::Value>>,
+    /// Durable effect cursors. Their payloads remain in the workflow's SSA
+    /// working set; only this transaction-addressable progression is committed.
+    pub(crate) session_effects: RefCell<HashMap<(String, String), u64>>,
+    /// Durable output heads, cursors, lineage and closure facts. Output values
+    /// stay pass-local until the enclosing transaction commits.
+    pub(crate) session_outputs:
+        RefCell<HashMap<(String, String, super::OutputStreamId), CommittedOutputState>>,
+    /// Ordered transport-neutral publications from the last committed pass.
+    /// This worker is thread-bound, so the execution plan can take the journal
+    /// immediately without a second synchronization protocol.
+    pub(crate) last_output_publications: RefCell<Vec<WorkflowOutputPublication>>,
+    /// Committed candidate-tree execution evidence. Failed/aborted turns never
+    /// replace this journal.
+    pub(crate) last_candidate_tree_block_traces:
+        RefCell<Vec<super::speculative::CandidateTreeBlockTrace>>,
+    /// DFlash execution evidence is staged with the turn and becomes visible
+    /// only after the same semantic commit as state and output.
+    pub(crate) last_dflash_block_traces: RefCell<Vec<super::speculative::DFlashBlockTrace>>,
     /// Sessions with a pass in flight, for leases declared `policy: exclusive`.
     ///
     /// Two turns of one conversation that both read the history before either
@@ -277,6 +307,10 @@ pub(crate) struct WorkerRuntimeState {
     /// The routing-layer lease that covers the decode-core path too is Phase 2
     /// and is not in this state.
     pub(crate) session_leases: RefCell<HashSet<String>>,
+    /// Monotonic committed-turn versions. A reusable execution plan records
+    /// this before binding a continuation and must be rebuilt if another turn
+    /// commits first.
+    pub(crate) session_turn_versions: RefCell<HashMap<String, u64>>,
     /// Sibling interpreters over this package's loop re-authored for another
     /// iteration policy, built on first use and keyed by the policy.
     ///
@@ -299,6 +333,7 @@ pub(crate) struct WorkerRuntimeState {
     pub(crate) counters: WorkerCounters,
     /// Mints the id of each pass this worker runs (§3.3).
     pass_ids: PassIdAllocator,
+    turn_transaction_ids: Cell<u64>,
     /// Mints CUDA graph capture ids for the component bindings above.
     graph_capture_ids: GraphCaptureIdAllocator,
     pub(crate) thread_bound: ThreadBound,
@@ -316,13 +351,21 @@ impl Default for WorkerRuntimeState {
             component_allocators: RefCell::new(HashMap::new()),
             component_outputs: RefCell::new(HashMap::new()),
             embedding_tables: RefCell::new(HashMap::new()),
+            shared_initializers: RefCell::new(HashMap::new()),
             session_state: RefCell::new(HashMap::new()),
+            session_effects: RefCell::new(HashMap::new()),
+            session_outputs: RefCell::new(HashMap::new()),
+            last_output_publications: RefCell::new(Vec::new()),
+            last_candidate_tree_block_traces: RefCell::new(Vec::new()),
+            last_dflash_block_traces: RefCell::new(Vec::new()),
             session_leases: RefCell::new(HashSet::new()),
+            session_turn_versions: RefCell::new(HashMap::new()),
             iteration_runtimes: RefCell::new(BTreeMap::new()),
             adapter_cache: RefCell::new(adapters::AdapterCache::default()),
             active_adapter_context: RefCell::new(None),
             counters: WorkerCounters::default(),
             pass_ids: PassIdAllocator::default(),
+            turn_transaction_ids: Cell::new(0),
             graph_capture_ids: GraphCaptureIdAllocator::for_component_bindings(),
             thread_bound: PhantomData,
         }
@@ -342,6 +385,13 @@ impl WorkerRuntimeState {
     /// first one.
     pub(crate) fn current_pass(&self) -> PassId {
         self.pass_ids.current()
+    }
+
+    /// Mint a transaction identity before an admitted turn can mutate state.
+    pub(crate) fn next_turn_transaction_id(&self) -> super::turn_transaction::TurnTransactionId {
+        let next = self.turn_transaction_ids.get().saturating_add(1);
+        self.turn_transaction_ids.set(next);
+        super::turn_transaction::TurnTransactionId(next)
     }
 
     /// The capture id the next component binding owns.

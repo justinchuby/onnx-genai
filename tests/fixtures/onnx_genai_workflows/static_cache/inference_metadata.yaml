@@ -1,19 +1,11 @@
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - nested_control_flow
-      - loop_induction_values
-      - serving_service_contract
+    manifest: {}
     inputs:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - prompt_sequence
@@ -30,7 +22,6 @@ pipeline:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -44,7 +35,6 @@ pipeline:
       request.write_indices:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -59,7 +49,6 @@ pipeline:
       request.active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -74,7 +63,6 @@ pipeline:
       package.capacity:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -86,7 +74,6 @@ pipeline:
       package.done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -101,7 +88,6 @@ pipeline:
       package.accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -116,7 +102,6 @@ pipeline:
       package.loop_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -129,7 +114,6 @@ pipeline:
       logits:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 1
@@ -142,7 +126,6 @@ pipeline:
       cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -153,35 +136,8 @@ pipeline:
       write_indices:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
-          batch_layout:
-            kind: request_aligned
-            axis: 0
-        role: tensor
-        stage: pre_adapter
-      key_cache:
-        contract:
-          dtype: float32
-          rank: 3
-          shape:
-          - batch
-          - cache_capacity
-          - 4
-          batch_layout:
-            kind: request_aligned
-            axis: 0
-        role: tensor
-        stage: pre_adapter
-      value_cache:
-        contract:
-          dtype: float32
-          rank: 3
-          shape:
-          - batch
-          - cache_capacity
-          - 4
           batch_layout:
             kind: request_aligned
             axis: 0
@@ -197,7 +153,6 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -206,7 +161,6 @@ pipeline:
                 axis: 0
             key_cache:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - cache_capacity
@@ -216,7 +170,6 @@ pipeline:
                 axis: 0
             value_cache:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - cache_capacity
@@ -226,7 +179,6 @@ pipeline:
                 axis: 0
             write_indices:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -234,7 +186,6 @@ pipeline:
                 axis: 0
             cache_lengths:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -243,7 +194,6 @@ pipeline:
           outputs:
             logits:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - 1
@@ -253,7 +203,6 @@ pipeline:
                 axis: 0
             updated_key_cache:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - cache_capacity
@@ -263,7 +212,6 @@ pipeline:
                 axis: 0
             updated_value_cache:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - cache_capacity
@@ -283,7 +231,6 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - prompt_sequence
@@ -292,7 +239,6 @@ pipeline:
                 axis: 0
             write_indices:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -300,13 +246,11 @@ pipeline:
                 axis: 0
             capacity:
               dtype: int64
-              rank: 1
               shape:
               - 1
           outputs:
             key_cache:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - cache_capacity
@@ -316,7 +260,6 @@ pipeline:
                 axis: 0
             value_cache:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - cache_capacity
@@ -326,7 +269,6 @@ pipeline:
                 axis: 0
             cache_lengths:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -334,7 +276,6 @@ pipeline:
                 axis: 0
             token:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -350,7 +291,6 @@ pipeline:
           inputs:
             write_indices:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -358,7 +298,6 @@ pipeline:
                 axis: 0
             cache_lengths:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -366,12 +305,10 @@ pipeline:
                 axis: 0
             capacity:
               dtype: int64
-              rank: 1
               shape:
               - 1
             active:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -380,7 +317,6 @@ pipeline:
           outputs:
             next_write_indices:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -388,7 +324,6 @@ pipeline:
                 axis: 0
             next_cache_lengths:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -396,7 +331,6 @@ pipeline:
                 axis: 0
             next_active:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -404,7 +338,6 @@ pipeline:
                 axis: 0
             next_done:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -412,7 +345,6 @@ pipeline:
                 axis: 0
             accepted_len:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -427,7 +359,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - 1
@@ -438,7 +369,6 @@ pipeline:
           outputs:
             token:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -454,7 +384,6 @@ pipeline:
           inputs:
             active:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -463,14 +392,12 @@ pipeline:
           outputs:
             continue:
               dtype: bool
-              rank: 1
               shape:
               - 1
     state:
       logits:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 1
@@ -485,7 +412,6 @@ pipeline:
       active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -499,7 +425,6 @@ pipeline:
       done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -513,7 +438,6 @@ pipeline:
       accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -527,7 +451,6 @@ pipeline:
       loop_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -537,7 +460,6 @@ pipeline:
       write_indices:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -551,7 +473,6 @@ pipeline:
       cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -565,7 +486,6 @@ pipeline:
       key_cache:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - cache_capacity
@@ -583,7 +503,6 @@ pipeline:
       value_cache:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - cache_capacity
@@ -625,9 +544,6 @@ pipeline:
               rollback_positions: 8
               snapshot: true
               fork: true
-            checkpoint:
-              adapter: onnx-genai.kv-checkpoint
-              version: '1'
             ports:
               model:
                 key_cache:
@@ -729,7 +645,6 @@ pipeline:
         value: loop.iteration
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
     - kind: emit
@@ -743,14 +658,6 @@ pipeline:
     - kind: emit
       value: write_indices
       output: write_indices
-      mode: replace
-    - kind: emit
-      value: key_cache
-      output: key_cache
-      mode: replace
-    - kind: emit
-      value: value_cache
-      output: value_cache
       mode: replace
 package:
   tokenizer:

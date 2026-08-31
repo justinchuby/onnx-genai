@@ -2,7 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::capabilities as capability;
+use crate::extensions::{
+    ADAPTERS_HF_PEFT_V1, ADAPTERS_JSON_V1, ADAPTERS_SAFETENSORS_V1, ADAPTERS_V1,
+    DFLASH_FLAT_BLOCK_V1, DFLASH_FLAT_BLOCK_V2, ExtensionConsumerSupport, ExtensionSurface,
+    GRAMMAR_GUIDANCE_V1, ORT_LORA_ADAPTER_V1, PARAMETER_OVERLAY_V1, SPECULATIVE_V1, TELEMETRY_V1,
+    TOKEN_CONTEXT_V1, admit_exact,
+};
 use crate::schema::{InferenceMetadata, PipelineSpec, WorkflowNode, WorkflowSpec, WorkflowStep};
 
 struct ContractObligation {
@@ -15,15 +20,15 @@ struct ContractObligation {
 
 const CONTRACT_OBLIGATIONS: &[ContractObligation] = &[
     ContractObligation {
-        id: "onnx-genai.grammar-guidance",
-        version: "1",
+        id: GRAMMAR_GUIDANCE_V1.identity,
+        version: GRAMMAR_GUIDANCE_V1.version,
         action: "clone",
         inputs: &["state"],
         outputs: &["next_state"],
     },
     ContractObligation {
-        id: "onnx-genai.grammar-guidance",
-        version: "1",
+        id: GRAMMAR_GUIDANCE_V1.identity,
+        version: GRAMMAR_GUIDANCE_V1.version,
         action: "lookahead",
         inputs: &["state", "tokens", "valid_length", "transition_table"],
         outputs: &[
@@ -35,314 +40,69 @@ const CONTRACT_OBLIGATIONS: &[ContractObligation] = &[
         ],
     },
     ContractObligation {
-        id: "onnx-genai.grammar-guidance",
-        version: "1",
+        id: GRAMMAR_GUIDANCE_V1.identity,
+        version: GRAMMAR_GUIDANCE_V1.version,
         action: "commit",
         inputs: &["state", "tokens", "valid_length", "transition_table"],
         outputs: &["next_state", "consumed_length"],
     },
     ContractObligation {
-        id: "onnx-genai.telemetry",
-        version: "1",
+        id: TELEMETRY_V1.identity,
+        version: TELEMETRY_V1.version,
         action: "start",
         inputs: &[],
         outputs: &["timestamp"],
     },
     ContractObligation {
-        id: "onnx-genai.telemetry",
-        version: "1",
+        id: TELEMETRY_V1.identity,
+        version: TELEMETRY_V1.version,
         action: "elapsed",
         inputs: &["timestamp"],
         outputs: &["duration_ms"],
     },
     ContractObligation {
-        id: "onnx-genai.parameter-overlay",
-        version: "1",
+        id: PARAMETER_OVERLAY_V1.identity,
+        version: PARAMETER_OVERLAY_V1.version,
         action: "apply",
         inputs: &["input"],
         outputs: &["output"],
     },
 ];
 
-const RETIRED_CONTINUOUS_BATCHING_CAPABILITY: &str = "continuous_batching";
-
-/// Capabilities this runtime supports.
-pub struct RuntimeCapabilities {
-    pub supported: Vec<String>,
-}
-
-impl Default for RuntimeCapabilities {
-    fn default() -> Self {
-        Self {
-            supported: vec![
-                capability::KV_CACHE.to_string(),
-                capability::GROUPED_QUERY_ATTENTION.to_string(),
-                capability::MULTI_HEAD_ATTENTION.to_string(),
-                capability::PREFIX_CACHE.to_string(),
-                capability::CONTROL_FLOW_LOOP.to_string(),
-                // Structural workflow capabilities. Every package now declares
-                // its execution as a workflow, including a single decoder, so a
-                // runtime that executes workflows implements these by
-                // definition. Listing them is what keeps the "declares a
-                // capability I do not implement" warning meaningful instead of
-                // firing on every load until operators learn to ignore it.
-                capability::WORKFLOW_SSA.to_string(),
-                capability::LINEAR_EFFECTS.to_string(),
-                capability::SERVING_SERVICE_CONTRACT.to_string(),
-                capability::NESTED_CONTROL_FLOW.to_string(),
-                capability::LOOP_INDUCTION_VALUES.to_string(),
-                capability::TYPED_EMIT.to_string(),
-                capability::STREAMING_EMIT.to_string(),
-            ],
-        }
-    }
-}
-
-/// Validate the metadata document and required runtime capabilities.
+/// Validate the metadata document's core schema and typed semantic invariants.
 ///
-/// Reports structural defects and unsupported capabilities together. Canonical
-/// metadata is an execution contract: callers must reject unsupported required
-/// behavior rather than silently selecting a narrower legacy execution path.
-pub fn validate(
-    metadata: &InferenceMetadata,
-    runtime: &RuntimeCapabilities,
-) -> Result<(), Vec<String>> {
-    let report = validate_structure_and_capabilities(metadata, runtime);
-    let mut errors = report.structural;
-    errors.extend(report.unsupported_capabilities);
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-/// Structural defects and unsupported capabilities, kept apart.
-///
-/// These answer different questions while remaining equally fatal at package
-/// admission. Keeping them separate lets loaders report whether the package is
-/// malformed or the runtime lacks behavior the package requires.
-#[derive(Debug, Default, Clone)]
-pub struct CapabilityReport {
-    /// The document is malformed or self-inconsistent. Always fatal.
-    pub structural: Vec<String>,
-    /// Capabilities the package declares that this runtime does not implement.
-    pub unsupported_capabilities: Vec<String>,
-}
-
-/// Validate the document, reporting structural defects separately from
-/// capabilities this runtime does not implement.
-pub fn validate_structure_and_capabilities(
-    metadata: &InferenceMetadata,
-    runtime: &RuntimeCapabilities,
-) -> CapabilityReport {
-    let structural = validate_metadata(metadata).err().unwrap_or_default();
-    let required = metadata
-        .required_capabilities
-        .iter()
-        .cloned()
-        .chain(derived_capabilities(metadata))
-        .collect::<BTreeSet<_>>();
-    let unsupported_capabilities = required
-        .into_iter()
-        .filter(|capability| !runtime.supported.contains(capability))
-        .collect();
-    CapabilityReport {
-        structural,
-        unsupported_capabilities,
-    }
-}
-
-fn metadata_only_required_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
-    let mut capabilities = BTreeSet::new();
-    if metadata.adapters.is_some() {
-        capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
-        capabilities.insert(capability::HETEROGENEOUS_ADAPTER_BATCHING.to_string());
-    }
-    capabilities
-}
-
-fn workflow_required_capabilities(
-    workflow: &WorkflowSpec,
-    compiled: Option<&WorkflowNode>,
-) -> BTreeSet<String> {
-    let mut capabilities = BTreeSet::new();
-    capabilities.insert(capability::WORKFLOW_SSA.to_string());
-    if workflow.serving.is_some() {
-        capabilities.insert(capability::SERVING_SERVICE_CONTRACT.to_string());
-    }
-    if workflow
-        .state
-        .values()
-        .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
-    {
-        capabilities.insert(capability::SESSION_STATE_LEASE.to_string());
-    }
-    if workflow.state.values().any(|state| {
-        matches!(
-            state.recurrence,
-            crate::schema::ShapeRecurrence::Bounded { .. }
-        )
-    }) {
-        capabilities.insert(capability::BOUNDED_STATE_RECURRENCE.to_string());
-    }
-    if workflow
-        .state
-        .values()
-        .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
-    {
-        capabilities.insert(capability::ADVISORY_STATE.to_string());
-    }
-    if workflow
-        .inputs
-        .values()
-        .any(|input| input.present_as.is_some())
-    {
-        capabilities.insert(capability::INPUT_PRESENCE.to_string());
-    }
-    if workflow.inputs.values().any(|input| {
-        matches!(
-            &input.role,
-            crate::schema::SemanticInputRole::Runtime {
-                role: crate::schema::RuntimeInputRole::AdapterSegments
-                    | crate::schema::RuntimeInputRole::AdapterCounts
-                    | crate::schema::RuntimeInputRole::AdapterScales
-                    | crate::schema::RuntimeInputRole::AdapterActive,
-                ..
-            }
-        )
-    }) {
-        capabilities.insert(capability::HETEROGENEOUS_ADAPTER_BATCHING.to_string());
-    }
-    if !workflow.effects.is_empty()
-        || workflow
-            .components
-            .values()
-            .any(|component| !component.effects.is_empty())
-    {
-        capabilities.insert(capability::LINEAR_EFFECTS.to_string());
-    }
-    for component in workflow.components.values() {
-        let contract_id = component
-            .contract
-            .as_ref()
-            .map(|contract| contract.id.as_str());
-        let adapter_abi = match &component.implementation {
-            crate::schema::ComponentImplementation::Adapter { abi, .. } => Some(abi.as_str()),
-            _ => None,
-        };
-        for identifier in contract_id.into_iter().chain(adapter_abi) {
-            match identifier {
-                "onnx-genai.adaptive-proposal-budget" => {
-                    capabilities.insert(capability::ADAPTIVE_PROPOSAL_BUDGET.to_string());
-                }
-                "onnx-genai.grammar-guidance" => {
-                    capabilities.insert(capability::GRAMMAR_GUIDANCE_ADAPTER.to_string());
-                }
-                "onnx-genai.telemetry" => {
-                    capabilities.insert(capability::TELEMETRY_ADAPTER.to_string());
-                }
-                "onnx-genai.parameter-overlay" => {
-                    capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
-                }
-                _ => {}
-            }
-        }
-    }
-    if let Some(compiled) = compiled {
-        collect_workflow_capabilities(compiled, &mut capabilities);
-    }
-    capabilities
-}
-
-fn metadata_required_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
-    let mut capabilities = metadata_only_required_capabilities(metadata);
-    if let Some(pipeline) = &metadata.pipeline {
-        let compiled = crate::compile_workflow(&pipeline.workflow).ok();
-        capabilities.extend(workflow_required_capabilities(
-            &pipeline.workflow,
-            compiled.as_ref().map(|compiled| &compiled.graph),
-        ));
-    }
-    capabilities
-}
-
-/// Capabilities implied by concrete metadata features.
-pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
-    let mut capabilities = metadata_required_capabilities(metadata);
-    if let Some(pipeline) = &metadata.pipeline {
-        capabilities.extend(pipeline.workflow.manifest.capabilities.iter().cloned());
-    }
-    capabilities
-}
-
-fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSet<String>) {
-    match node {
-        WorkflowNode::Sequence { nodes } => {
-            for node in nodes {
-                collect_workflow_capabilities(node, capabilities);
-            }
-        }
-        WorkflowNode::Invoke { effects, .. } => {
-            if !effects.is_empty() {
-                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
-            }
-        }
-        WorkflowNode::Loop {
-            setup,
-            body,
-            iteration,
-            effects,
-            ..
-        } => {
-            capabilities.insert(capability::NESTED_CONTROL_FLOW.to_string());
-            if iteration.is_some() {
-                capabilities.insert(capability::LOOP_INDUCTION_VALUES.to_string());
-            }
-            if !effects.is_empty() {
-                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
-            }
-            collect_workflow_capabilities(setup, capabilities);
-            collect_workflow_capabilities(body, capabilities);
-        }
-        WorkflowNode::Branch {
-            cases,
-            default,
-            effects,
-            ..
-        } => {
-            capabilities.insert(capability::NESTED_CONTROL_FLOW.to_string());
-            if !effects.is_empty() {
-                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
-            }
-            for case in cases.values() {
-                collect_workflow_capabilities(case, capabilities);
-            }
-            if let Some(default) = default {
-                collect_workflow_capabilities(default, capabilities);
-            }
-        }
-        WorkflowNode::Emit {
-            mode, valid_length, ..
-        } => {
-            capabilities.insert(capability::TYPED_EMIT.to_string());
-            if matches!(mode, crate::schema::WorkflowEmitMode::Event) {
-                capabilities.insert(capability::STREAMING_EMIT.to_string());
-            }
-            if valid_length.is_some() {
-                capabilities.insert(capability::EMIT_VALID_LENGTH.to_string());
-            }
-        }
-        WorkflowNode::Transfer { .. } => {
-            capabilities.insert(capability::EXPLICIT_TRANSFER.to_string());
-        }
-        WorkflowNode::ExecutionIsland { .. } => {}
-    }
+/// Optional semantic modules are admitted by the exact typed declaration that
+/// owns them (for example a tool protocol, adapter ABI, or speculative
+/// contract). Core workflow semantics are schema-version conformance
+/// obligations and are deliberately not negotiated here.
+pub fn validate(metadata: &InferenceMetadata) -> Result<(), Vec<String>> {
+    validate_metadata(metadata)
 }
 
 /// Validate document-level invariants independent of runtime capabilities.
 pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
+
+    if let Some(protocol) = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.tool_protocol.as_ref())
+    {
+        if protocol.identity.trim().is_empty() {
+            errors.push(
+                "package.tool_protocol.identity must name one exact non-empty protocol identity; \
+                 omit tool_protocol when the package does not support tools"
+                    .to_string(),
+            );
+        }
+        if protocol.version.trim().is_empty() {
+            errors.push(
+                "package.tool_protocol.version must name one exact non-empty protocol version; \
+                 specify the version whose rendering and envelope semantics the package uses"
+                    .to_string(),
+            );
+        }
+    }
 
     // An unreadable version is reported once, by `validate_schema_version`
     // below. Falling back to the initial version here validates the rest of the
@@ -361,22 +121,8 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
             metadata.pipeline.as_ref().map(|p| &p.workflow),
             &mut errors,
         );
-        if let Some(workflow) = metadata
-            .pipeline
-            .as_ref()
-            .map(|pipeline| &pipeline.workflow)
-        {
-            for capability in metadata_only_required_capabilities(metadata)
-                .difference(&workflow.manifest.capabilities)
-            {
-                errors.push(format!(
-                    "pipeline.workflow.manifest.capabilities is missing used capability '{capability}'"
-                ));
-            }
-        }
     }
     validate_schema_version(metadata, &mut errors);
-    validate_retired_batching_capability(metadata, &mut errors);
     validate_preprocessing_workflow(metadata, &mut errors);
     validate_token_authority(metadata, version, &mut errors);
     validate_generation_contract(metadata, &mut errors);
@@ -421,6 +167,7 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
         ));
         return;
     }
+    validate_output_protocol_version(metadata, declared, errors);
     let has_special_tokens = metadata
         .package
         .as_ref()
@@ -439,6 +186,70 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
             crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION
         ));
     }
+    let has_tool_protocol = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.tool_protocol.as_ref())
+        .is_some();
+    if has_tool_protocol && declared < crate::version::TOOL_PROTOCOL_SCHEMA_VERSION {
+        let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
+        errors.push(format!(
+            "this package declares `package.tool_protocol`, which schema version {} introduced, but \
+             declares schema_version '{spelled}' ({declared}); declare schema_version '{}' so an \
+             older reader refuses the package as a newer contract rather than guessing a tool protocol",
+            crate::version::TOOL_PROTOCOL_SCHEMA_VERSION,
+            crate::version::TOOL_PROTOCOL_SCHEMA_VERSION,
+        ));
+    }
+    if metadata.speculative.is_some()
+        && declared < crate::version::CANONICAL_SPECULATION_SCHEMA_VERSION
+    {
+        let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
+        errors.push(format!(
+            "this package declares `speculative`, which workflow-native canonical speculation \
+             schema version {} introduced, but declares schema_version '{spelled}' ({declared}); \
+             declare schema_version '{}' so older runtimes fail before mutation",
+            crate::version::CANONICAL_SPECULATION_SCHEMA_VERSION,
+            crate::version::CANONICAL_SPECULATION_SCHEMA_VERSION
+        ));
+    }
+    let has_token_context = metadata.pipeline.as_ref().is_some_and(|pipeline| {
+        pipeline.workflow.components.values().any(|component| {
+            component
+                .contract
+                .as_ref()
+                .is_some_and(|contract| contract.id == TOKEN_CONTEXT_V1.identity)
+        })
+    });
+    if has_token_context && declared < crate::version::TOKEN_CONTEXT_SCHEMA_VERSION {
+        let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
+        errors.push(format!(
+            "this package declares the {} component contract, which schema \
+             version {} introduced, but declares schema_version '{spelled}' ({declared}); declare \
+             schema_version '{}' so an older reader refuses the package instead of silently \
+             ignoring the token-identity contract",
+            TOKEN_CONTEXT_V1.wire_name(),
+            crate::version::TOKEN_CONTEXT_SCHEMA_VERSION,
+            crate::version::TOKEN_CONTEXT_SCHEMA_VERSION,
+        ));
+    }
+    let has_dflash = metadata.speculative.as_ref().is_some_and(|speculative| {
+        matches!(
+            &speculative.proposal_execution,
+            crate::schema::SpeculativeProposalExecution::DflashFlatBlock { .. }
+        )
+    });
+    if has_dflash && declared < crate::version::DFLASH_SCHEMA_VERSION {
+        let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
+        errors.push(format!(
+            "this package declares DFlash flat-block proposal semantics, which schema version {} \
+             introduced, but declares schema_version '{spelled}' ({declared}); declare \
+             schema_version '{}' so an older reader refuses the package before ignoring its \
+             target-hidden conditioning and accepted-prefix state contract",
+            crate::version::DFLASH_SCHEMA_VERSION,
+            crate::version::DFLASH_SCHEMA_VERSION,
+        ));
+    }
     let Some(feature) = batching_schema_feature(metadata) else {
         return;
     };
@@ -453,6 +264,101 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
              refused for the reason that is true"
         ));
     }
+}
+
+fn validate_output_protocol_version(
+    metadata: &InferenceMetadata,
+    version: crate::version::SchemaVersion,
+    errors: &mut Vec<String>,
+) {
+    let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+    else {
+        return;
+    };
+    if let Err(error) = crate::version::gate_feature_field(
+        version,
+        crate::version::SchemaFeature::PublicationMode,
+        "pipeline.workflow.publication_mode",
+        workflow.publication_mode_authored,
+    ) {
+        errors.push(error);
+    }
+    for (name, output) in &workflow.outputs {
+        if let Err(error) = crate::version::gate_feature_field(
+            version,
+            crate::version::SchemaFeature::OutputProtocols,
+            &format!("pipeline.workflow.outputs.{name}.family"),
+            output.family_authored,
+        ) {
+            errors.push(error);
+        }
+    }
+
+    fn validate_steps(
+        steps: &[WorkflowStep],
+        version: crate::version::SchemaVersion,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        for (index, step) in steps.iter().enumerate() {
+            let site = format!("{path}[{index}]");
+            match step {
+                WorkflowStep::Sequence { steps } => {
+                    validate_steps(steps, version, &format!("{site}.steps"), errors);
+                }
+                WorkflowStep::Loop { setup, steps, .. } => {
+                    validate_steps(setup, version, &format!("{site}.setup"), errors);
+                    validate_steps(steps, version, &format!("{site}.steps"), errors);
+                }
+                WorkflowStep::Branch { cases, default, .. } => {
+                    for (case, step) in cases {
+                        validate_steps(
+                            std::slice::from_ref(step),
+                            version,
+                            &format!("{site}.cases.{case}"),
+                            errors,
+                        );
+                    }
+                    if let Some(default) = default {
+                        validate_steps(
+                            std::slice::from_ref(default.as_ref()),
+                            version,
+                            &format!("{site}.default"),
+                            errors,
+                        );
+                    }
+                }
+                WorkflowStep::Emit { stream, mode, .. } => {
+                    if stream.is_some()
+                        && let Err(error) = crate::version::gate_feature_use(
+                            version,
+                            crate::version::SchemaFeature::OutputProtocols,
+                            &format!("{site}.stream"),
+                        )
+                    {
+                        errors.push(error);
+                    }
+                    if matches!(
+                        mode,
+                        crate::schema::WorkflowEmitMode::Retract
+                            | crate::schema::WorkflowEmitMode::Finalize
+                    ) && let Err(error) = crate::version::gate_feature_use(
+                        version,
+                        crate::version::SchemaFeature::OutputProtocols,
+                        &format!("{site}.mode"),
+                    ) {
+                        errors.push(error);
+                    }
+                }
+                WorkflowStep::Invoke { .. } => {}
+            }
+        }
+    }
+
+    validate_steps(&workflow.steps, version, "pipeline.workflow.steps", errors);
 }
 
 /// Enforce one authority for numeric token facts and one executable stop policy.
@@ -518,7 +424,17 @@ fn validate_token_authority(
     let has_eos = special_tokens.is_some_and(|tokens| !tokens.eos_token_id.is_empty());
     validate_generation_eos_steps(&workflow.steps, workflow, has_eos, errors);
 
-    if metadata.speculative.is_some() {
+    if metadata.speculative.is_some()
+        && workflow.steps.iter().any(|step| {
+            matches!(
+                step,
+                crate::schema::WorkflowStep::Loop {
+                    termination: crate::schema::WorkflowLoopTermination::GenerationEos,
+                    ..
+                }
+            )
+        })
+    {
         if !has_eos {
             errors.push(
                 "a speculative autoregressive package must declare non-empty \
@@ -645,46 +561,6 @@ fn is_termination_contract(contract: &crate::schema::ComponentContract) -> bool 
         contract.id.as_str(),
         "onnx-genai.termination-predicate" | "onnx-genai.token-policy"
     )
-}
-
-/// Reject the old opt-in spelling for an optimization the runtime derives.
-///
-/// A capability says execution would be incorrect without a behavior.
-/// Continuous batching is never required for correctness: a runtime may always
-/// execute one request at a time. Whether a resolved decode path can share a
-/// forward is derived from its graph/state contract and backend, while whether
-/// to do so is deployment policy.
-fn validate_retired_batching_capability(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
-    if metadata
-        .required_capabilities
-        .iter()
-        .any(|capability| capability == RETIRED_CONTINUOUS_BATCHING_CAPABILITY)
-    {
-        errors.push(
-            "required_capabilities contains retired capability 'continuous_batching'; remove it. \
-             Shared-forward support is derived from the workflow and resolved backend, and \
-             enabling or sizing batches is runtime policy, so single-request execution remains \
-             correct without a negotiated capability"
-                .to_string(),
-        );
-    }
-    if let Some(workflow) = metadata
-        .pipeline
-        .as_ref()
-        .map(|pipeline| &pipeline.workflow)
-        && workflow
-            .manifest
-            .capabilities
-            .iter()
-            .any(|capability| capability == RETIRED_CONTINUOUS_BATCHING_CAPABILITY)
-    {
-        errors.push(
-            "pipeline.workflow.manifest.capabilities contains retired capability \
-             'continuous_batching'; remove it. The workflow's typed batch layouts, state groups, \
-             and row-scoped ABI are the structural contract; grouping remains a runtime choice"
-                .to_string(),
-        );
-    }
 }
 
 /// The first `1.1` field this document uses, described the way a document
@@ -1116,19 +992,21 @@ fn validate_ctc_logits_contract(
     let Some(logits) = workflow.outputs.get(logits_output) else {
         return;
     };
-    if decoding.time_axis >= logits.contract.rank {
+    if decoding.time_axis >= logits.contract.rank() {
         errors.push(format!(
             "profiles.{profile_name}.decoding.time_axis {} is outside workflow output \
              '{logits_output}' rank {}",
-            decoding.time_axis, logits.contract.rank
+            decoding.time_axis,
+            logits.contract.rank()
         ));
         return;
     }
-    if decoding.class_axis >= logits.contract.rank {
+    if decoding.class_axis >= logits.contract.rank() {
         errors.push(format!(
             "profiles.{profile_name}.decoding.class_axis {} is outside workflow output \
              '{logits_output}' rank {}",
-            decoding.class_axis, logits.contract.rank
+            decoding.class_axis,
+            logits.contract.rank()
         ));
     }
     let Some(padding) = logits.contract.padding.iter().find(|padding| {
@@ -1357,11 +1235,12 @@ fn validate_preprocessing_program(
     }
     let (adapter_name, adapter) = adapters[0];
     match adapter.ports.inputs.get("encoded") {
-        Some(contract) if contract.dtype == "uint8" && contract.rank == 1 => {}
+        Some(contract) if contract.dtype == "uint8" && contract.rank() == 1 => {}
         Some(contract) => errors.push(format!(
             "workflow {kind} preprocessing adapter '{adapter_name}' input 'encoded' must be uint8 \
                  rank 1, got {} rank {}",
-            contract.dtype, contract.rank
+            contract.dtype,
+            contract.rank()
         )),
         None => errors.push(format!(
             "workflow {kind} preprocessing adapter '{adapter_name}' must declare input 'encoded'"
@@ -1481,7 +1360,7 @@ fn require_compatible_tensor_contracts(
     // entries are real, than the port it feeds would let per-request rows drift
     // out of alignment with the rest of the workflow.
     if normalize(&source.dtype) != normalize(&target.dtype)
-        || source.rank != target.rank
+        || source.rank() != target.rank()
         || source.shape != target.shape
         || source.batch_layout != target.batch_layout
         || source.padding != target.padding
@@ -1546,8 +1425,8 @@ fn validate_adapter_selection_input(
     match workflow.inputs.get(name) {
         Some(input)
             if input.contract.dtype == dtype
-                && input.contract.rank == rank
-                && input.contract.shape.as_deref().is_some_and(expected_shape)
+                && input.contract.rank() == rank
+                && expected_shape(&input.contract.shape)
                 && input.contract.batch_layout
                     == crate::schema::BatchLayout::RequestAligned { axis: 0 }
                 && input.required
@@ -1589,8 +1468,11 @@ fn validate_adapter_service(
 ) {
     if service.application_capability.trim().is_empty() {
         errors.push("adapters.application_capability must not be empty".into());
-    } else if service.application_capability != "onnx-genai.adapters@1" {
-        errors.push("adapters.application_capability must be onnx-genai.adapters@1".into());
+    } else if !ADAPTERS_V1.matches_wire_name(&service.application_capability) {
+        errors.push(format!(
+            "adapters.application_capability must be {}",
+            ADAPTERS_V1.wire_name()
+        ));
     }
     if service.cache.max_entries == 0 {
         errors.push("adapters.cache.max_entries must be greater than zero".into());
@@ -1834,17 +1716,16 @@ fn validate_adapter_service(
                 ));
             }
             let expected_loader = match weight.format {
-                crate::schema::AdapterWeightFormat::Json => "onnx-genai.adapters.json@1",
-                crate::schema::AdapterWeightFormat::OrtGenai => "onnxruntime.lora-adapter@1",
-                crate::schema::AdapterWeightFormat::HfPeft => "onnx-genai.adapters.hf-peft@1",
-                crate::schema::AdapterWeightFormat::Safetensors => {
-                    "onnx-genai.adapters.safetensors@1"
-                }
+                crate::schema::AdapterWeightFormat::Json => ADAPTERS_JSON_V1,
+                crate::schema::AdapterWeightFormat::OrtGenai => ORT_LORA_ADAPTER_V1,
+                crate::schema::AdapterWeightFormat::HfPeft => ADAPTERS_HF_PEFT_V1,
+                crate::schema::AdapterWeightFormat::Safetensors => ADAPTERS_SAFETENSORS_V1,
             };
-            if weight.loader_capability != expected_loader {
+            if !expected_loader.matches_wire_name(&weight.loader_capability) {
                 errors.push(format!(
-                    "{path}.weights[{index}].loader_capability must be {expected_loader} for format {:?}",
-                    weight.format
+                    "{path}.weights[{index}].loader_capability must be {} for format {:?}",
+                    expected_loader.wire_name(),
+                    weight.format,
                 ));
             }
             match (&weight.format, &weight.scale_encoding) {
@@ -2019,11 +1900,194 @@ fn validate_adapter_service(
     }
 }
 
+/// Validate output-level publication semantics before lowering makes the
+/// control-flow sites opaque. A family is declared once per output; a site may
+/// only select one of that family's operations.
+fn validate_output_protocols(
+    workflow: &WorkflowSpec,
+    version: crate::version::SchemaVersion,
+    errors: &mut Vec<String>,
+) {
+    if matches!(
+        workflow.publication_mode,
+        crate::schema::WorkflowPublicationMode::ProvisionalRevisions
+    ) {
+        for (name, output) in &workflow.outputs {
+            if !matches!(
+                output.family,
+                crate::schema::WorkflowOutputFamily::Revisions { version: ref revision_version }
+                    if revision_version == "1"
+            ) {
+                errors.push(format!(
+                    "pipeline.workflow.publication_mode is provisional_revisions, but output \
+                     '{name}' has family {:?}; provisional publication requires every affected \
+                     output to declare `family: {{ kind: revisions, version: \"1\" }}` so its \
+                     transaction can be reconciled without inventing inverse operations",
+                    output.family
+                ));
+            }
+        }
+    }
+    for (name, output) in &workflow.outputs {
+        if output.family_authored
+            && let crate::schema::WorkflowOutputFamily::Revisions {
+                version: revision_version,
+            } = &output.family
+            && revision_version != "1"
+        {
+            errors.push(format!(
+                "pipeline.workflow.outputs.{name}.family.version is '{revision_version}', but this runtime \
+                 implements typed revision protocol version '1'; declare the exact supported \
+                 version rather than relying on a compatible-looking revision"
+            ));
+        }
+    }
+
+    fn walk(
+        steps: &[WorkflowStep],
+        workflow: &WorkflowSpec,
+        version: crate::version::SchemaVersion,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        for (index, step) in steps.iter().enumerate() {
+            let site = format!("{path}[{index}]");
+            match step {
+                WorkflowStep::Sequence { steps } => {
+                    walk(steps, workflow, version, &format!("{site}.steps"), errors);
+                }
+                WorkflowStep::Loop { setup, steps, .. } => {
+                    walk(setup, workflow, version, &format!("{site}.setup"), errors);
+                    walk(steps, workflow, version, &format!("{site}.steps"), errors);
+                }
+                WorkflowStep::Branch { cases, default, .. } => {
+                    for (case, step) in cases {
+                        walk(
+                            std::slice::from_ref(step),
+                            workflow,
+                            version,
+                            &format!("{site}.cases.{case}"),
+                            errors,
+                        );
+                    }
+                    if let Some(default) = default {
+                        walk(
+                            std::slice::from_ref(default.as_ref()),
+                            workflow,
+                            version,
+                            &format!("{site}.default"),
+                            errors,
+                        );
+                    }
+                }
+                WorkflowStep::Emit {
+                    value,
+                    when,
+                    valid_length,
+                    output,
+                    stream,
+                    mode,
+                    axis,
+                } => {
+                    let Some(declared) = workflow.outputs.get(output) else {
+                        continue;
+                    };
+                    if stream.as_deref().is_some_and(str::is_empty) {
+                        errors.push(format!(
+                            "{site}.stream is empty for output '{output}'; name a non-empty logical \
+                             stream or omit it to select the output default"
+                        ));
+                    }
+                    let carries_payload = matches!(
+                        mode,
+                        crate::schema::WorkflowEmitMode::Replace
+                            | crate::schema::WorkflowEmitMode::Append
+                            | crate::schema::WorkflowEmitMode::Event
+                    );
+                    if carries_payload && value.is_empty() {
+                        errors.push(format!(
+                            "{site}.value is required for {mode:?} publication to output '{output}'"
+                        ));
+                    }
+                    if !carries_payload && !value.is_empty() {
+                        errors.push(format!(
+                            "{site}.value names '{value}' for payloadless {mode:?} publication to \
+                             output '{output}' stream '{}'; remove the value because this operation \
+                             cannot carry or discard a payload",
+                            stream.as_deref().unwrap_or(output)
+                        ));
+                    }
+                    if !carries_payload
+                        && (when.is_some() || valid_length.is_some() || axis.is_some())
+                    {
+                        errors.push(format!(
+                            "{site} selects {mode:?} for output '{output}', which carries no payload \
+                             and therefore cannot declare `when`, `valid_length`, or `axis`"
+                        ));
+                    }
+                    let legacy = version < crate::version::OUTPUT_PROTOCOL_SCHEMA_VERSION
+                        && !declared.family_authored;
+                    let legal = if legacy {
+                        true
+                    } else {
+                        matches!(
+                            (&declared.family, mode),
+                            (
+                                crate::schema::WorkflowOutputFamily::Materialized,
+                                crate::schema::WorkflowEmitMode::Replace
+                                    | crate::schema::WorkflowEmitMode::Append,
+                            ) | (
+                                crate::schema::WorkflowOutputFamily::Events,
+                                crate::schema::WorkflowEmitMode::Event,
+                            ) | (
+                                crate::schema::WorkflowOutputFamily::Revisions { .. },
+                                crate::schema::WorkflowEmitMode::Append
+                                    | crate::schema::WorkflowEmitMode::Replace
+                                    | crate::schema::WorkflowEmitMode::Retract
+                                    | crate::schema::WorkflowEmitMode::Finalize,
+                            )
+                        )
+                    };
+                    if !legal {
+                        errors.push(format!(
+                            "{site} selects {mode:?} for output '{output}', but its declared family \
+                             {:?} does not permit that operation",
+                            declared.family
+                        ));
+                    }
+                    if !legacy
+                        && matches!(
+                            declared.family,
+                            crate::schema::WorkflowOutputFamily::Materialized
+                        )
+                        && stream.is_some()
+                    {
+                        errors.push(format!(
+                            "{site}.stream names a stream for materialized output '{output}'; \
+                             materialized values have exactly one output head"
+                        ));
+                    }
+                }
+                WorkflowStep::Invoke { .. } => {}
+            }
+        }
+    }
+
+    walk(
+        &workflow.steps,
+        workflow,
+        version,
+        "pipeline.workflow.steps",
+        errors,
+    );
+}
+
 fn validate_workflow(
     workflow: &WorkflowSpec,
     version: crate::version::SchemaVersion,
     errors: &mut Vec<String>,
 ) {
+    validate_output_protocols(workflow, version, errors);
     let compiled = match crate::compile_workflow(workflow) {
         Ok(compiled) => compiled,
         Err(error) => {
@@ -2050,17 +2114,6 @@ fn validate_workflow(
         {
             errors.push(format!(
                 "{path} declares request_expanded.factor 0; the expansion factor must be at least 1"
-            ));
-        }
-        if contract
-            .shape
-            .as_ref()
-            .is_some_and(|shape| shape.len() != contract.rank)
-        {
-            errors.push(format!(
-                "{path} declares rank {} but has {} shape dimensions",
-                contract.rank,
-                contract.shape.as_ref().map_or(0, Vec::len)
             ));
         }
         if !matches!(
@@ -2299,6 +2352,7 @@ fn validate_workflow(
                     }
                 }
             }
+            validate_token_context_component(name, component, contract, errors);
             if let crate::schema::ComponentImplementation::Adapter { abi, version, .. } =
                 &component.implementation
             {
@@ -2309,6 +2363,7 @@ fn validate_workflow(
                         contract.id, contract.version
                     ));
                 }
+
                 let action = match contract.parameters.get("action") {
                     Some(crate::schema::ScalarValue::String(action)) => Some(action.as_str()),
                     _ => None,
@@ -2411,11 +2466,11 @@ fn validate_workflow(
             crate::schema::ShapeRecurrence::Invariant => None,
         };
         if let Some(axis) = dynamic_axis
-            && axis >= state.contract.rank
+            && axis >= state.contract.rank()
         {
             errors.push(format!(
                 "workflow state '{name}' varies on axis {axis}, outside rank {}",
-                state.contract.rank
+                state.contract.rank()
             ));
         }
         if let Some(group_name) = &state.service_group {
@@ -2430,10 +2485,10 @@ fn validate_workflow(
                 continue;
             };
             if let Some(sequence_axis) = group.sequence_axis {
-                if sequence_axis >= state.contract.rank {
+                if sequence_axis >= state.contract.rank() {
                     errors.push(format!(
                         "state service group '{group_name}' sequence_axis {sequence_axis} is outside state '{name}' rank {}",
-                        state.contract.rank
+                        state.contract.rank()
                     ));
                 }
                 if dynamic_axis.is_some_and(|axis| axis != sequence_axis) {
@@ -2475,10 +2530,42 @@ fn validate_workflow(
         .map(|serving| &serving.state_service)
     {
         for (group_name, group) in &state_service.groups {
+            validate_checkpoint_extension(group_name, group, errors);
             if group.layout.trim().is_empty() {
                 errors.push(format!(
                     "state service group '{group_name}' layout must not be empty"
                 ));
+            }
+
+            fn validate_checkpoint_extension(
+                group_name: &str,
+                group: &crate::schema::StateGroupContract,
+                errors: &mut Vec<String>,
+            ) {
+                let Some(checkpoint) = &group.checkpoint else {
+                    return;
+                };
+                let path = format!(
+                    "pipeline.workflow.serving.state_service.groups.{group_name}.checkpoint \
+                     (state kind {:?})",
+                    group.kind
+                );
+                if let Err(error) = admit_exact(
+                    ExtensionSurface::StateCheckpoint,
+                    &checkpoint.adapter,
+                    &checkpoint.version,
+                    path,
+                    ExtensionConsumerSupport::Unsupported {
+                        scope: "portable state checkpoint adapters on every backend/profile",
+                        reason: "this runtime has no portable checkpoint adapter implementation",
+                        guidance: "omit checkpoint to keep this state runtime-private; do not use session \
+                                   snapshot/fork APIs as a portable checkpoint adapter",
+                    },
+                    "Use an exact registered checkpoint adapter/version implemented by the selected runtime, \
+                     or omit checkpoint to keep the state private.",
+                ) {
+                    errors.push(error.to_string());
+                }
             }
             if let Some(logical_lengths) = &group.logical_lengths {
                 match workflow.state.get(logical_lengths) {
@@ -2491,7 +2578,7 @@ fn validate_workflow(
                             ),
                             errors,
                         );
-                        if lengths.contract.rank != 1 {
+                        if lengths.contract.rank() != 1 {
                             errors.push(format!(
                                 "state service group '{group_name}' logical_lengths state \
                                  '{logical_lengths}' must be rank one with one value per row"
@@ -2614,8 +2701,7 @@ fn validate_workflow(
                 present_as.clone(),
                 crate::schema::TensorContract {
                     dtype: "bool".to_string(),
-                    rank: 0,
-                    shape: Some(Vec::new()),
+                    shape: Vec::new(),
                     optional: false,
                     batch_layout: crate::schema::BatchLayout::Shared,
                     padding: Vec::new(),
@@ -2636,6 +2722,8 @@ fn validate_workflow(
         "pipeline.workflow.steps",
         errors,
     );
+    validate_padding_companion_provenance(&compiled.graph, workflow, errors);
+    validate_token_identity_provenance(&compiled.graph, workflow, errors);
     validate_emit_batch_layout_consistency(
         &compiled.graph,
         &value_contracts,
@@ -2656,6 +2744,7 @@ fn validate_workflow(
     validate_batch_capacity(workflow, errors);
     validate_state_lifetimes(workflow, errors);
     validate_session_continuity(workflow, errors);
+    errors.extend(crate::validate_state_plan(workflow, &compiled.state_plan));
     if let Some(serving) = &workflow.serving {
         if serving.state_service.groups.is_empty() {
             errors.push(
@@ -2702,7 +2791,7 @@ fn validate_workflow(
                 // Serving control values steer one request each. Without a
                 // request-aligned layout a runtime cannot permute them when it
                 // compacts the batch.
-                if contract.rank > 0 && contract.batch_layout.request_axis() != Some(0) {
+                if contract.rank() > 0 && contract.batch_layout.request_axis() != Some(0) {
                     errors.push(format!(
                         "pipeline.workflow.serving.{role} '{value}' must declare a \
                          request_aligned batch_layout on axis 0"
@@ -2710,13 +2799,6 @@ fn validate_workflow(
                 }
             }
         }
-    }
-
-    let used = workflow_required_capabilities(workflow, Some(&compiled.graph));
-    for capability in used.difference(&workflow.manifest.capabilities) {
-        errors.push(format!(
-            "pipeline.workflow.manifest.capabilities is missing used capability '{capability}'"
-        ));
     }
 }
 
@@ -2862,11 +2944,12 @@ fn validate_row_scoped_components(workflow: &WorkflowSpec, errors: &mut Vec<Stri
                 if !contract.batch_layout.is_row_scoped() {
                     continue;
                 }
-                if row_scope.axis >= contract.rank {
+                if row_scope.axis >= contract.rank() {
                     errors.push(format!(
                         "workflow component '{name}' declares row_scope axis {} but {direction} \
                          port '{port}' has rank {}",
-                        row_scope.axis, contract.rank
+                        row_scope.axis,
+                        contract.rank()
                     ));
                 }
                 if contract
@@ -3303,9 +3386,9 @@ fn validate_shared_companions(workflow: &WorkflowSpec, errors: &mut Vec<String>)
     //
     // This reaches the owner and nothing else. Offsets are per-request
     // meaningful and are delivered rebased, and a `valid_lengths` is already
-    // relative to the item it measures — it means the same number in any group,
-    // so a request states its own and receives the slice that indexes its own
-    // items, with nothing to rebase and no group position to leak.
+    // relative to the item it measures. A row-scoped length follows the
+    // carrier's row plan; a packed/global length stays shared. Neither exposes
+    // the invocation-private owner map.
     for (name, first) in &owners {
         let Some(input) = workflow.inputs.get(*name) else {
             continue;
@@ -3355,10 +3438,10 @@ fn validate_token_packed_layout(
     scope: &LayoutReferenceScope<'_>,
     errors: &mut Vec<String>,
 ) {
-    if axis >= contract.rank {
+    if axis >= contract.rank() {
         errors.push(format!(
             "{path} packs items along axis {axis}, outside its rank {}",
-            contract.rank
+            contract.rank()
         ));
         return;
     }
@@ -3409,11 +3492,7 @@ fn validate_token_packed_layout(
             ));
         }
     }
-    let packed_symbol = contract
-        .shape
-        .as_ref()
-        .and_then(|shape| shape.get(axis))
-        .and_then(symbol_of);
+    let packed_symbol = contract.shape.get(axis).and_then(symbol_of);
     for (index, level) in levels.iter().enumerate() {
         let owner = validate_ownership_level(path, value, index, level, scope, errors);
         // Level zero's owner has one entry per packed position, so the two are
@@ -3503,11 +3582,11 @@ fn validate_ownership_level<'a>(
                 companion_contract.dtype
             ));
         }
-        if companion_contract.rank != 1 {
+        if companion_contract.rank() != 1 {
             errors.push(format!(
                 "{path} level {index} {role} '{companion}' has rank {} but must be rank 1; it \
                  carries one entry per unit and nothing else",
-                companion_contract.rank
+                companion_contract.rank()
             ));
         }
         if !companion_contract.batch_layout.is_shared() {
@@ -3532,7 +3611,7 @@ fn validate_ownership_level<'a>(
 fn symbol_of(dimension: &crate::schema::TensorDimension) -> Option<&str> {
     match dimension {
         crate::schema::TensorDimension::Symbol(symbol) => Some(symbol.as_str()),
-        crate::schema::TensorDimension::Fixed(_) => None,
+        crate::schema::TensorDimension::Fixed(_) | crate::schema::TensorDimension::Any => None,
     }
 }
 
@@ -3540,9 +3619,8 @@ fn symbol_of(dimension: &crate::schema::TensorDimension) -> Option<&str> {
 fn extent_symbol(contract: &crate::schema::TensorContract) -> Option<&str> {
     contract
         .shape
-        .as_ref()
-        .filter(|shape| shape.len() == 1)
-        .and_then(|shape| shape.first())
+        .first()
+        .filter(|_| contract.shape.len() == 1)
         .and_then(symbol_of)
 }
 
@@ -3550,7 +3628,6 @@ fn extent_symbol(contract: &crate::schema::TensorContract) -> Option<&str> {
 fn axis_of_symbol(contract: &crate::schema::TensorContract, symbol: &str) -> Option<usize> {
     contract
         .shape
-        .as_ref()?
         .iter()
         .position(|dimension| symbol_of(dimension) == Some(symbol))
 }
@@ -3635,12 +3712,15 @@ fn validate_padding(
                 companion.dtype
             ));
         }
-        if !companion.batch_layout.is_shared() {
+        let expected_layout = valid_lengths_batch_layout(contract, axis);
+        if companion.batch_layout != expected_layout {
             errors.push(format!(
-                "{path} valid_lengths '{valid_lengths}' declares {} but must declare shared; it \
-                 has one entry per position of the axes outer to '{dimension}', which is not a \
-                 request row count",
-                companion.batch_layout.kind_name()
+                "{path} valid_lengths '{valid_lengths}' declares {} but must declare {}; it has \
+                 one entry per position of the axes outer to '{dimension}' and must preserve the \
+                 owning value's request-row layout exactly when that request axis is outer to the \
+                 padded dimension",
+                describe_batch_layout(&companion.batch_layout),
+                describe_batch_layout(&expected_layout),
             ));
         }
         validate_valid_lengths_shape(
@@ -3652,6 +3732,53 @@ fn validate_padding(
             companion,
             errors,
         );
+    }
+}
+
+/// Row-plan participation of a validity companion.
+///
+/// The companion is the prefix of the carrier ending immediately before the
+/// padded axis. If that prefix contains the carrier's request axis, each length
+/// belongs to one request position and must follow the same positional
+/// positional row plan.
+/// If it does not, the length is genuinely broadcast over the request axis and
+/// remains shared. This is decided only from the typed carrier, request-axis,
+/// and companion declarations.
+fn valid_lengths_batch_layout(
+    carrier: &crate::schema::TensorContract,
+    padded_axis: usize,
+) -> crate::schema::BatchLayout {
+    match &carrier.batch_layout {
+        crate::schema::BatchLayout::RequestAligned { axis } if *axis < padded_axis => {
+            crate::schema::BatchLayout::RequestAligned { axis: *axis }
+        }
+        crate::schema::BatchLayout::RequestExpanded { axis, factor } if *axis < padded_axis => {
+            crate::schema::BatchLayout::RequestExpanded {
+                axis: *axis,
+                factor: *factor,
+            }
+        }
+        crate::schema::BatchLayout::Shared
+        | crate::schema::BatchLayout::RequestAligned { .. }
+        | crate::schema::BatchLayout::RequestExpanded { .. }
+        | crate::schema::BatchLayout::TokenPacked { .. }
+        | crate::schema::BatchLayout::RuntimeSequenceState => crate::schema::BatchLayout::Shared,
+    }
+}
+
+fn describe_batch_layout(layout: &crate::schema::BatchLayout) -> String {
+    match layout {
+        crate::schema::BatchLayout::Shared => "shared".to_string(),
+        crate::schema::BatchLayout::RequestAligned { axis } => {
+            format!("request_aligned on axis {axis}")
+        }
+        crate::schema::BatchLayout::RequestExpanded { axis, factor } => {
+            format!("request_expanded on axis {axis} with factor {factor}")
+        }
+        crate::schema::BatchLayout::TokenPacked { axis, .. } => {
+            format!("token_packed on axis {axis}")
+        }
+        crate::schema::BatchLayout::RuntimeSequenceState => "runtime_sequence_state".to_string(),
     }
 }
 
@@ -3672,18 +3799,17 @@ fn validate_valid_lengths_shape(
     companion: &crate::schema::TensorContract,
     errors: &mut Vec<String>,
 ) {
-    if companion.rank != axis {
+    if companion.rank() != axis {
         errors.push(format!(
             "{path} valid_lengths '{valid_lengths}' has rank {} but dimension '{dimension}' is \
              axis {axis}, so it must have rank {axis}: one entry per position of the axes outer \
              to '{dimension}'",
-            companion.rank
+            companion.rank()
         ));
         return;
     }
-    let (Some(outer), Some(declared)) = (contract.shape.as_ref(), companion.shape.as_ref()) else {
-        return;
-    };
+    let outer = &contract.shape;
+    let declared = &companion.shape;
     if outer.len() <= axis || declared.len() != axis {
         return;
     }
@@ -3691,7 +3817,7 @@ fn validate_valid_lengths_shape(
         let Some(actual) = declared.get(index) else {
             continue;
         };
-        if actual != expected {
+        if !dimensions_equal_or_any(actual, expected) {
             errors.push(format!(
                 "{path} valid_lengths '{valid_lengths}' declares {} on axis {index} but the value \
                  it bounds declares {} there; the companion carries one entry per position of the \
@@ -3707,7 +3833,40 @@ fn describe_dimension(dimension: &crate::schema::TensorDimension) -> String {
     match dimension {
         crate::schema::TensorDimension::Fixed(fixed) => fixed.to_string(),
         crate::schema::TensorDimension::Symbol(symbol) => format!("'{symbol}'"),
+        crate::schema::TensorDimension::Any => "Any".to_string(),
     }
+}
+
+fn dimensions_equal_or_any(
+    left: &crate::schema::TensorDimension,
+    right: &crate::schema::TensorDimension,
+) -> bool {
+    matches!(
+        (left, right),
+        (
+            crate::schema::TensorDimension::Any,
+            crate::schema::TensorDimension::Any
+        ) | (
+            crate::schema::TensorDimension::Any,
+            crate::schema::TensorDimension::Fixed(_) | crate::schema::TensorDimension::Symbol(_)
+        ) | (
+            crate::schema::TensorDimension::Fixed(_) | crate::schema::TensorDimension::Symbol(_),
+            crate::schema::TensorDimension::Any
+        )
+    ) || left == right
+}
+
+fn dimensions_compatible(
+    left: &crate::schema::TensorDimension,
+    right: &crate::schema::TensorDimension,
+) -> bool {
+    !matches!(
+        (left, right),
+        (
+            crate::schema::TensorDimension::Fixed(left),
+            crate::schema::TensorDimension::Fixed(right)
+        ) if left != right
+    )
 }
 
 /// A declared batching capacity is a promise about the artifact's own shape, so
@@ -3754,10 +3913,7 @@ fn validate_batch_capacity(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
 fn declared_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, &str> {
     let mut symbols = BTreeMap::new();
     for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
-        let Some(shape) = &contract.shape else {
-            continue;
-        };
-        for dimension in shape {
+        for dimension in &contract.shape {
             if let Some(symbol) = symbol_of(dimension) {
                 symbols.entry(symbol).or_insert(port.as_str());
             }
@@ -3860,11 +4016,7 @@ fn validate_budgets<'a>(
 fn group_rooted_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, String> {
     let mut rooted: BTreeMap<&str, String> = BTreeMap::new();
     fn axis_symbol(contract: &crate::schema::TensorContract, axis: usize) -> Option<&str> {
-        contract
-            .shape
-            .as_ref()
-            .and_then(|shape| shape.get(axis))
-            .and_then(symbol_of)
+        contract.shape.get(axis).and_then(symbol_of)
     }
     for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
         match &contract.batch_layout {
@@ -3925,11 +4077,7 @@ fn ownership_count_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&s
             continue;
         }
         if let Some(axis) = contract.batch_layout.packed_axis()
-            && let Some(symbol) = contract
-                .shape
-                .as_ref()
-                .and_then(|shape| shape.get(axis))
-                .and_then(symbol_of)
+            && let Some(symbol) = contract.shape.get(axis).and_then(symbol_of)
         {
             counts
                 .entry(symbol)
@@ -4056,9 +4204,7 @@ fn validate_free_dimensions(
         if companions.contains(port.as_str()) {
             continue;
         }
-        let Some(shape) = &contract.shape else {
-            continue;
-        };
+        let shape = &contract.shape;
         let padded: BTreeSet<&str> = contract
             .padding
             .iter()
@@ -4426,11 +4572,11 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
         match &cell.recurrence {
             crate::schema::ShapeRecurrence::Bounded { axis, max }
             | crate::schema::ShapeRecurrence::Growing { axis, max, .. } => {
-                if *axis != cell.contract.rank.saturating_sub(1) {
+                if *axis != cell.contract.rank().saturating_sub(1) {
                     errors.push(format!(
                         "{path} continues a conversation along axis {axis}, but tokens accumulate \
                          on the final axis of a rank-{} contract",
-                        cell.contract.rank
+                        cell.contract.rank()
                     ));
                 }
                 // A continuation is not loop-carried, so its bound never reaches
@@ -4485,16 +4631,16 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
                     ));
                 }
                 if input.contract.dtype != cell.contract.dtype
-                    || input.contract.rank != cell.contract.rank
+                    || input.contract.rank() != cell.contract.rank()
                 {
                     errors.push(format!(
                         "{path}.session.continuation.prompt_input '{prompt_input}' has contract \
                          {:?}/rank {} but the cell holds {:?}/rank {}; a prefix must be the same \
                          kind of tensor as what it prefixes",
                         input.contract.dtype,
-                        input.contract.rank,
+                        input.contract.rank(),
                         cell.contract.dtype,
-                        cell.contract.rank
+                        cell.contract.rank()
                     ));
                 }
             }
@@ -4588,6 +4734,41 @@ fn workflow_component_port_binding<'a>(
     steps.iter().find_map(|step| walk(step, component, port))
 }
 
+fn workflow_component_output_binding<'a>(
+    steps: &'a [WorkflowStep],
+    component: &str,
+    port: &str,
+) -> Option<&'a str> {
+    fn walk<'a>(step: &'a WorkflowStep, component: &str, port: &str) -> Option<&'a str> {
+        match step {
+            WorkflowStep::Sequence { steps } => {
+                steps.iter().find_map(|step| walk(step, component, port))
+            }
+            WorkflowStep::Invoke {
+                component: invoked,
+                outputs,
+                ..
+            } => (invoked == component)
+                .then(|| outputs.get(port).map(String::as_str))
+                .flatten(),
+            WorkflowStep::Loop { setup, steps, .. } => setup
+                .iter()
+                .chain(steps)
+                .find_map(|step| walk(step, component, port)),
+            WorkflowStep::Branch { cases, default, .. } => cases
+                .values()
+                .find_map(|step| walk(step, component, port))
+                .or_else(|| {
+                    default
+                        .as_ref()
+                        .and_then(|step| walk(step, component, port))
+                }),
+            WorkflowStep::Emit { .. } => None,
+        }
+    }
+    steps.iter().find_map(|step| walk(step, component, port))
+}
+
 /// Every SSA value a step defines.
 fn workflow_step_produced_values(steps: &[WorkflowStep]) -> BTreeSet<String> {
     fn walk(step: &WorkflowStep, produced: &mut BTreeSet<String>) {
@@ -4650,6 +4831,25 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
         );
         return;
     };
+    if speculative.identity != SPECULATIVE_V1.identity {
+        errors.push(format!(
+            "speculative.identity '{}' is not supported; this runtime implements \
+             {}. Re-export the package with that canonical contract \
+             instead of relying on a legacy speculator sidecar",
+            speculative.identity,
+            SPECULATIVE_V1.wire_name(),
+        ));
+    }
+    if speculative.version != SPECULATIVE_V1.version {
+        errors.push(format!(
+            "speculative.version '{}' is not supported for identity '{}'; this runtime \
+             implements {}. Upgrade the runtime or re-export the \
+             package with the supported contract",
+            speculative.version,
+            speculative.identity,
+            SPECULATIVE_V1.wire_name(),
+        ));
+    }
     for (role, component) in [
         ("proposer", &speculative.proposer),
         ("target", &speculative.target),
@@ -4659,6 +4859,377 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
                 "speculative.{role} '{component}' is not a declared workflow component"
             ));
         }
+    }
+    validate_speculative_verification(workflow, speculative, errors);
+    validate_speculative_bindings(workflow, speculative, errors);
+    validate_speculative_shared_state_and_weights(workflow, speculative, errors);
+    validate_speculative_proposal_ports(workflow, speculative, errors);
+    if let crate::schema::SpeculativeProposalExecution::Chained {
+        token_embedding_input,
+        logits_output: _,
+        recurrent: _,
+        folded_carry_output: _,
+        folded_carry_seed: _,
+        token_embedding: _,
+    } = &speculative.proposal_execution
+        && let Some(proposer) = workflow.components.get(&speculative.proposer)
+        && !proposer.ports.inputs.contains_key(token_embedding_input)
+    {
+        errors.push(format!(
+            "speculative chained proposer input '{token_embedding_input}' is not an input \
+             port of component '{}'",
+            speculative.proposer
+        ));
+    }
+
+    /// Check a cross-component output reference without relying on a port-name
+    /// convention. A speculative contract uses these references for target
+    /// verification, accepted paths, and rejection-sampling probabilities.
+    fn validate_speculative_value_ref(
+        workflow: &WorkflowSpec,
+        value: &crate::schema::SpeculativeValueRef,
+        expected_component: &str,
+        expected_role: &str,
+        field: &str,
+        errors: &mut Vec<String>,
+    ) {
+        if value.component != expected_component {
+            errors.push(format!(
+                "{field} component '{}' must be speculative.{expected_role} '{expected_component}'",
+                value.component,
+            ));
+            return;
+        }
+        match workflow.components.get(&value.component) {
+            Some(component) if component.ports.outputs.contains_key(&value.output) => {}
+            Some(_) => errors.push(format!(
+                "{field} output '{}' is not an output port of component '{}'",
+                value.output, value.component
+            )),
+            None => errors.push(format!(
+                "{field} component '{}' is not a declared workflow component",
+                value.component
+            )),
+        }
+    }
+
+    fn validate_speculative_verification(
+        workflow: &WorkflowSpec,
+        speculative: &crate::schema::SpeculativeContract,
+        errors: &mut Vec<String>,
+    ) {
+        let verification = &speculative.verification;
+        validate_speculative_value_ref(
+            workflow,
+            &verification.target_output,
+            &speculative.target,
+            "target",
+            "speculative.verification.target_output",
+            errors,
+        );
+        match &verification.accepted_path {
+            crate::schema::SpeculativeAcceptedPath::Runtime { binding } => {
+                if binding.trim().is_empty() {
+                    errors.push(
+                        "speculative.verification.accepted_path.binding must name the runtime \
+                             accepted-prefix output"
+                            .to_string(),
+                    );
+                }
+            }
+            crate::schema::SpeculativeAcceptedPath::Component { value } => {
+                match workflow.components.get(&value.component) {
+                    Some(component) if component.ports.outputs.contains_key(&value.output) => {}
+                    Some(_) => errors.push(format!(
+                        "speculative.verification.accepted_path output '{}' is not an output port \
+                             of component '{}'",
+                        value.output, value.component
+                    )),
+                    None => errors.push(format!(
+                        "speculative.verification.accepted_path component '{}' is not declared",
+                        value.component
+                    )),
+                }
+            }
+        }
+        if let Some(probabilities) = &verification.probabilities {
+            validate_speculative_value_ref(
+                workflow,
+                &probabilities.proposal,
+                &speculative.proposer,
+                "proposer",
+                "speculative.verification.probabilities.proposal",
+                errors,
+            );
+            validate_speculative_value_ref(
+                workflow,
+                &probabilities.target,
+                &speculative.target,
+                "target",
+                "speculative.verification.probabilities.target",
+                errors,
+            );
+        }
+    }
+
+    fn validate_speculative_bindings(
+        workflow: &WorkflowSpec,
+        speculative: &crate::schema::SpeculativeContract,
+        errors: &mut Vec<String>,
+    ) {
+        let check = |bindings: &BTreeMap<String, String>,
+                     component_name: &str,
+                     direction: &str,
+                     field: &str,
+                     errors: &mut Vec<String>| {
+            let Some(component) = workflow.components.get(component_name) else {
+                return;
+            };
+            for (role, port) in bindings {
+                if role.trim().is_empty() {
+                    errors.push(format!("{field} contains an empty protocol role"));
+                }
+                let exists = match direction {
+                    "input" => component.ports.inputs.contains_key(port),
+                    // A target binding may identify a port that the verifier reads
+                    // or writes. Its direction is explicitly declared elsewhere by
+                    // the component ABI, so this check only proves it is real.
+                    "either" => {
+                        component.ports.inputs.contains_key(port)
+                            || component.ports.outputs.contains_key(port)
+                    }
+                    _ => false,
+                };
+                if !exists {
+                    errors.push(format!(
+                        "{field}.{role} names '{port}', which is not a declared {direction} port \
+                             of component '{component_name}'"
+                    ));
+                }
+            }
+        };
+        check(
+            &speculative.port_bindings,
+            &speculative.proposer,
+            "input",
+            "speculative.port_bindings",
+            errors,
+        );
+        check(
+            &speculative.target_port_bindings,
+            &speculative.target,
+            "either",
+            "speculative.target_port_bindings",
+            errors,
+        );
+    }
+
+    fn validate_speculative_shared_state_and_weights(
+        workflow: &WorkflowSpec,
+        speculative: &crate::schema::SpeculativeContract,
+        errors: &mut Vec<String>,
+    ) {
+        let groups = workflow
+            .serving
+            .as_ref()
+            .map(|serving| &serving.state_service.groups);
+        for group in &speculative.shared_state {
+            if groups.is_none_or(|groups| !groups.contains_key(group)) {
+                errors.push(format!(
+                    "speculative.shared_state references undeclared state-service group '{group}'"
+                ));
+            }
+        }
+        let mut weights = BTreeSet::new();
+        for weight in &speculative.shared_weights {
+            let Some(component) = workflow.components.get(&weight.component) else {
+                errors.push(format!(
+                    "speculative.shared_weights initializer '{}' names undeclared component '{}'",
+                    weight.initializer, weight.component
+                ));
+                continue;
+            };
+            if !matches!(
+                component.implementation,
+                crate::schema::ComponentImplementation::Onnx { .. }
+            ) {
+                errors.push(format!(
+                    "speculative.shared_weights initializer '{}' belongs to component '{}', which \
+                         is not an ONNX artifact and cannot own immutable ONNX initializers",
+                    weight.initializer, weight.component
+                ));
+            }
+            if weight.initializer.trim().is_empty() {
+                errors.push(format!(
+                    "speculative.shared_weights on component '{}' names an empty initializer",
+                    weight.component
+                ));
+            }
+            if !weights.insert((weight.component.as_str(), weight.initializer.as_str())) {
+                errors.push(format!(
+                    "speculative.shared_weights repeats initializer '{}' from component '{}'",
+                    weight.initializer, weight.component
+                ));
+            }
+        }
+    }
+
+    fn validate_speculative_proposal_ports(
+        workflow: &WorkflowSpec,
+        speculative: &crate::schema::SpeculativeContract,
+        errors: &mut Vec<String>,
+    ) {
+        let Some(proposer) = workflow.components.get(&speculative.proposer) else {
+            return;
+        };
+        let require_input = |port: &str, field: &str, errors: &mut Vec<String>| {
+            if !proposer.ports.inputs.contains_key(port) {
+                errors.push(format!(
+                    "{field} '{port}' is not an input port of proposer component '{}'",
+                    speculative.proposer
+                ));
+            }
+        };
+        let require_output = |port: &str, field: &str, errors: &mut Vec<String>| {
+            if !proposer.ports.outputs.contains_key(port) {
+                errors.push(format!(
+                    "{field} '{port}' is not an output port of proposer component '{}'",
+                    speculative.proposer
+                ));
+            }
+        };
+        match &speculative.proposal_execution {
+            crate::schema::SpeculativeProposalExecution::Block => {}
+            crate::schema::SpeculativeProposalExecution::Chained { .. } => {}
+            crate::schema::SpeculativeProposalExecution::DflashFlatBlock { .. } => {}
+            crate::schema::SpeculativeProposalExecution::Mtp {
+                target_hidden,
+                target_hidden_input,
+                token_embedding_input,
+                hidden_output,
+                hidden_layout,
+                hidden_size,
+                hc_mult,
+                state_output,
+                weights,
+                state,
+            } => {
+                validate_speculative_value_ref(
+                    workflow,
+                    target_hidden,
+                    &speculative.target,
+                    "target",
+                    "speculative.proposal_execution.target_hidden",
+                    errors,
+                );
+                require_input(
+                    target_hidden_input,
+                    "speculative.proposal_execution.target_hidden_input",
+                    errors,
+                );
+                require_input(
+                    token_embedding_input,
+                    "speculative.proposal_execution.token_embedding_input",
+                    errors,
+                );
+                require_output(
+                    hidden_output,
+                    "speculative.proposal_execution.hidden_output",
+                    errors,
+                );
+                if matches!(hidden_layout, crate::schema::MtpHiddenStateLayout::Bsh)
+                    && *hc_mult != 1
+                {
+                    errors.push(format!(
+                        "speculative.proposal_execution declares hidden_layout bsh with hc_mult \
+                             {hc_mult}; bsh has no lane axis, so set hc_mult to 1 or declare bshc"
+                    ));
+                }
+                if *hidden_size == 0 {
+                    errors.push(
+                        "speculative.proposal_execution.hidden_size must be greater than zero"
+                            .to_string(),
+                    );
+                }
+                if let Some(output) = state_output {
+                    require_output(
+                        output,
+                        "speculative.proposal_execution.state_output",
+                        errors,
+                    );
+                }
+                for (name, weight) in [
+                    ("embedding", &weights.embedding),
+                    ("lm_head", &weights.lm_head),
+                ] {
+                    if weight.component != speculative.target {
+                        errors.push(format!(
+                            "speculative.proposal_execution.weights.{name} must belong to target \
+                                 component '{}', not '{}'",
+                            speculative.target, weight.component
+                        ));
+                    }
+                }
+                match state {
+                    crate::schema::MtpProposalState::ProposalLocal if state_output.is_some() => {
+                        errors.push(
+                                "speculative.proposal_execution.state_output requires \
+                                 state.kind accepted_prefix; proposal_local MTP state must not survive \
+                                 the proposal block"
+                                    .to_string(),
+                            );
+                    }
+                    crate::schema::MtpProposalState::AcceptedPrefix { recurrent } => {
+                        if recurrent.is_empty() {
+                            errors.push(
+                                    "speculative.proposal_execution.state accepted_prefix must declare \
+                                     every recurrent state participant"
+                                        .to_string(),
+                                );
+                        }
+                        for binding in recurrent {
+                            if !speculative.rollback_state.contains(&binding.state) {
+                                errors.push(format!(
+                                    "speculative MTP accepted-prefix state '{}' must be listed in \
+                                         rollback_state",
+                                    binding.state
+                                ));
+                            }
+                        }
+                    }
+                    crate::schema::MtpProposalState::ProposalLocal => {}
+                }
+            }
+            crate::schema::SpeculativeProposalExecution::CandidateTree {
+                candidate_tokens,
+                topology,
+            } => {
+                require_output(
+                    candidate_tokens,
+                    "speculative.proposal_execution.candidate_tokens",
+                    errors,
+                );
+                let (kind, output) = match topology {
+                    crate::schema::CandidateTreeTopology::ParentIndices { output } => {
+                        ("parent_indices", output)
+                    }
+                    crate::schema::CandidateTreeTopology::AncestorMask { output } => {
+                        ("ancestor_mask", output)
+                    }
+                };
+                require_output(
+                    output,
+                    &format!("speculative.proposal_execution.topology.{kind}"),
+                    errors,
+                );
+            }
+        }
+    }
+    if matches!(
+        &speculative.proposal_execution,
+        crate::schema::SpeculativeProposalExecution::DflashFlatBlock { .. }
+    ) {
+        validate_dflash_flat_block(speculative, workflow, errors);
     }
     if let crate::schema::SpeculativeProposalExecution::Chained {
         token_embedding_input,
@@ -4670,13 +5241,6 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
     } = &speculative.proposal_execution
         && let Some(proposer) = workflow.components.get(&speculative.proposer)
     {
-        if !proposer.ports.inputs.contains_key(token_embedding_input) {
-            errors.push(format!(
-                "speculative chained proposer input '{token_embedding_input}' is not an input \
-                 port of component '{}'",
-                speculative.proposer
-            ));
-        }
         if !proposer.ports.outputs.contains_key(logits_output) {
             errors.push(format!(
                 "speculative chained proposer logits '{logits_output}' is not an output port of \
@@ -5014,6 +5578,609 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
     }
 }
 
+fn dflash_is_float(dtype: &str) -> bool {
+    matches!(
+        dtype,
+        "float16" | "fp16" | "bfloat16" | "bf16" | "float32" | "fp32"
+    )
+}
+
+fn dflash_output_contract<'a>(
+    workflow: &'a WorkflowSpec,
+    source: &crate::schema::SpeculativeValueRef,
+    path: &str,
+    errors: &mut Vec<String>,
+) -> Option<&'a crate::schema::TensorContract> {
+    let Some(component) = workflow.components.get(&source.component) else {
+        errors.push(format!(
+            "{path} component '{}' is not declared",
+            source.component
+        ));
+        return None;
+    };
+    let Some(contract) = component.ports.outputs.get(&source.output) else {
+        errors.push(format!(
+            "{path} output '{}' is not an output port of component '{}'",
+            source.output, source.component
+        ));
+        return None;
+    };
+    if workflow_component_output_binding(&workflow.steps, &source.component, &source.output)
+        .is_none()
+    {
+        errors.push(format!(
+            "{path} names {}::{}, but no workflow invocation binds that output; DFlash \
+             provenance must identify a value the graph actually produces",
+            source.component, source.output
+        ));
+    }
+    Some(contract)
+}
+
+fn dflash_input_contract<'a>(
+    workflow: &'a WorkflowSpec,
+    component: &str,
+    port: &str,
+    path: &str,
+    errors: &mut Vec<String>,
+) -> Option<&'a crate::schema::TensorContract> {
+    let component = workflow.components.get(component)?;
+    match component.ports.inputs.get(port) {
+        Some(contract) => Some(contract),
+        None => {
+            errors.push(format!("{path} '{port}' is not a declared input port"));
+            None
+        }
+    }
+}
+
+fn validate_dflash_flat_block(
+    speculative: &crate::schema::SpeculativeContract,
+    workflow: &WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    use crate::schema::{
+        DFlashFeatureCombination, DFlashStateCommit, DFlashStructure, SpeculativeProposalExecution,
+    };
+
+    let SpeculativeProposalExecution::DflashFlatBlock {
+        version,
+        conditioning,
+        block,
+        outputs,
+        shared_weights,
+        draft_private_state,
+        accepted_prefix_state,
+        structure,
+    } = &speculative.proposal_execution
+    else {
+        return;
+    };
+
+    match (version.as_str(), structure.as_ref()) {
+        (version, DFlashStructure::Base) if version == DFLASH_FLAT_BLOCK_V1.version => {}
+        (version, DFlashStructure::SelectorConvolutionV1 { .. })
+            if version == DFLASH_FLAT_BLOCK_V2.version => {}
+        (version, _) if version == DFLASH_FLAT_BLOCK_V1.version => errors.push(
+            "DFlash version 1 is the base flat-block contract; selector/convolution semantics \
+             require exact version '2'"
+                .to_string(),
+        ),
+        (version, _) if version == DFLASH_FLAT_BLOCK_V2.version => errors.push(
+            "DFlash version 2 requires structure.kind selector_convolution_v1; optional tensors \
+             cannot implicitly select that architecture"
+                .to_string(),
+        ),
+        (unknown, _) => errors.push(format!(
+            "unsupported DFlash flat-block contract version '{unknown}'; supported versions are \
+             {} (base) and {} (selector_convolution_v1)",
+            DFLASH_FLAT_BLOCK_V1.version, DFLASH_FLAT_BLOCK_V2.version,
+        )),
+    }
+
+    if !matches!(
+        speculative.vocabulary,
+        crate::schema::SpeculativeVocabulary::Identical
+    ) {
+        errors.push(
+            "DFlash requires vocabulary.kind identical because its candidate ids use the \
+             target's immutable embedding and output projection"
+                .to_string(),
+        );
+    }
+
+    let Some(proposer) = workflow.components.get(&speculative.proposer) else {
+        return;
+    };
+    if !matches!(
+        proposer.implementation,
+        crate::schema::ComponentImplementation::Onnx { .. }
+    ) {
+        errors.push(format!(
+            "DFlash proposer '{}' must be an ONNX component; the drafter equations cannot live \
+             in an opaque helper",
+            speculative.proposer
+        ));
+    }
+
+    let mut first_source: Option<&crate::schema::TensorContract> = None;
+    let mut fixed_hidden_total = 0i64;
+    let mut seen = BTreeSet::new();
+    for (index, source) in conditioning.sources.iter().enumerate() {
+        let path = format!("DFlash conditioning source {index}");
+        if !seen.insert((&source.component, &source.output)) {
+            errors.push(format!(
+                "{path} repeats {}::{}; repeated provenance silently weights one feature twice",
+                source.component, source.output
+            ));
+        }
+        if source.component != speculative.target {
+            errors.push(format!(
+                "{path} comes from '{}', expected target '{}'",
+                source.component, speculative.target
+            ));
+        }
+        let Some(contract) = dflash_output_contract(workflow, source, &path, errors) else {
+            continue;
+        };
+        if workflow
+            .components
+            .get(&source.component)
+            .and_then(|component| component.ports.roles.get(&source.output))
+            != Some(&crate::schema::PortRole::HiddenStates)
+        {
+            errors.push(format!(
+                "{path} {}::{} lacks the hidden_states output role; shape-compatible values are \
+                 not target-hidden provenance",
+                source.component, source.output
+            ));
+        }
+        if contract.rank() != 3 || !dflash_is_float(&contract.dtype) {
+            errors.push(format!(
+                "{path} must be floating BSH rank 3, got {}/rank {}",
+                contract.dtype,
+                contract.rank()
+            ));
+        }
+        if let Some(first) = first_source {
+            if first.shape.get(0..2) != contract.shape.get(0..2)
+                || first.batch_layout != contract.batch_layout
+            {
+                errors.push(format!(
+                    "{path} does not share the first source's batch/sequence geometry"
+                ));
+            }
+        } else {
+            first_source = Some(contract);
+        }
+        if let Some(crate::schema::TensorDimension::Fixed(width)) = contract.shape.get(2) {
+            fixed_hidden_total = fixed_hidden_total.saturating_add(*width);
+        }
+    }
+    if conditioning.sources.is_empty() {
+        errors.push("DFlash conditioning requires at least one target hidden source".to_string());
+    }
+    if !matches!(
+        conditioning.combination,
+        DFlashFeatureCombination::Concatenate { axis: 2 }
+    ) {
+        errors
+            .push("DFlash target hidden sources must concatenate on BSH hidden axis 2".to_string());
+    }
+    if let Some(input) = dflash_input_contract(
+        workflow,
+        &speculative.proposer,
+        &conditioning.proposer_input,
+        "DFlash conditioning proposer_input",
+        errors,
+    ) {
+        if input.rank() != 3 || !dflash_is_float(&input.dtype) {
+            errors.push(format!(
+                "DFlash conditioning input '{}' must be floating rank 3, got {}/rank {}",
+                conditioning.proposer_input,
+                input.dtype,
+                input.rank()
+            ));
+        }
+        if let Some(first) = first_source
+            && (first.shape.get(0..2) != input.shape.get(0..2)
+                || first.batch_layout != input.batch_layout)
+        {
+            errors.push(format!(
+                "DFlash conditioning input '{}' does not preserve target batch/sequence geometry",
+                conditioning.proposer_input
+            ));
+        }
+        if fixed_hidden_total > 0
+            && let Some(crate::schema::TensorDimension::Fixed(actual)) = input.shape.get(2)
+            && *actual != fixed_hidden_total
+        {
+            errors.push(format!(
+                "DFlash conditioning sources total width {fixed_hidden_total}, but input '{}' \
+                 declares {actual}",
+                conditioning.proposer_input
+            ));
+        }
+    }
+
+    let block_ports = [
+        (
+            "noise_embeddings_input",
+            block.noise_embeddings_input.as_str(),
+            3,
+            "floating",
+        ),
+        (
+            "masked_positions_input",
+            block.masked_positions_input.as_str(),
+            2,
+            "bool",
+        ),
+        (
+            "position_ids_input",
+            block.position_ids_input.as_str(),
+            2,
+            "int64",
+        ),
+        (
+            "attention_mask_input",
+            block.attention_mask_input.as_str(),
+            2,
+            "bool_or_int64",
+        ),
+    ];
+    for (field, port, rank, dtype) in block_ports {
+        let Some(contract) = dflash_input_contract(
+            workflow,
+            &speculative.proposer,
+            port,
+            &format!("DFlash block.{field}"),
+            errors,
+        ) else {
+            continue;
+        };
+        let dtype_ok = match dtype {
+            "floating" => dflash_is_float(&contract.dtype),
+            "bool" => contract.dtype == "bool",
+            "int64" => contract.dtype == "int64",
+            "bool_or_int64" => matches!(contract.dtype.as_str(), "bool" | "int64"),
+            _ => false,
+        };
+        if contract.rank() != rank || !dtype_ok {
+            errors.push(format!(
+                "DFlash block.{field} '{port}' must be {dtype} rank {rank}, got {}/rank {}",
+                contract.dtype,
+                contract.rank()
+            ));
+        }
+    }
+    if let (Some(noise), Some(masked)) = (
+        proposer.ports.inputs.get(&block.noise_embeddings_input),
+        proposer.ports.inputs.get(&block.masked_positions_input),
+    ) && noise.shape.get(0..2) != masked.shape.get(0..2)
+    {
+        errors.push(
+            "DFlash noise embeddings and masked positions must share [batch, block] geometry"
+                .to_string(),
+        );
+    }
+    if let (Some(positions), Some(attention)) = (
+        proposer.ports.inputs.get(&block.position_ids_input),
+        proposer.ports.inputs.get(&block.attention_mask_input),
+    ) && positions.shape != attention.shape
+    {
+        errors.push(
+            "DFlash position ids and attention mask must share [batch, context_plus_block] \
+             geometry"
+                .to_string(),
+        );
+    }
+    if block.anchor_position != 0 || block.first_candidate_position != 1 {
+        errors.push(format!(
+            "DFlash flat block must declare anchor_position 0 and first_candidate_position 1, \
+             got {} and {}",
+            block.anchor_position, block.first_candidate_position
+        ));
+    }
+
+    let candidate = proposer.ports.outputs.get(&outputs.candidate_tokens);
+    if !candidate.is_some_and(|contract| contract.rank() == 2 && contract.dtype == "int64") {
+        errors.push(format!(
+            "DFlash candidate_tokens '{}' must be an int64 rank-2 proposer output",
+            outputs.candidate_tokens
+        ));
+    }
+    let mut proposal_probabilities = None;
+    if let Some(probabilities) = &outputs.proposal_probabilities {
+        proposal_probabilities = proposer.ports.outputs.get(probabilities);
+        match proposal_probabilities {
+            Some(contract) if contract.rank() == 3 && dflash_is_float(&contract.dtype) => {
+                if let Some(candidate) = candidate
+                    && candidate.shape.get(0..2) != contract.shape.get(0..2)
+                {
+                    errors.push(format!(
+                        "DFlash candidate_tokens '{}' and proposal_probabilities \
+                         '{probabilities}' must share [batch, proposal] geometry",
+                        outputs.candidate_tokens
+                    ));
+                }
+            }
+            _ => errors.push(format!(
+                "DFlash proposal_probabilities '{probabilities}' must be a floating rank-3 \
+                 proposer output"
+            )),
+        }
+    }
+    if outputs.verifier_logits.component != speculative.target {
+        errors.push(format!(
+            "DFlash verifier logits must come from target '{}', not '{}'",
+            speculative.target, outputs.verifier_logits.component
+        ));
+    }
+    if let Some(logits) = dflash_output_contract(
+        workflow,
+        &outputs.verifier_logits,
+        "DFlash verifier_logits",
+        errors,
+    ) {
+        if logits.rank() != 3 || !dflash_is_float(&logits.dtype) {
+            errors.push(format!(
+                "DFlash verifier logits must be floating rank 3, got {}/rank {}",
+                logits.dtype,
+                logits.rank()
+            ));
+        }
+        if let Some(probabilities) = proposal_probabilities
+            && probabilities.shape.get(2) != logits.shape.get(2)
+        {
+            errors.push(
+                "DFlash proposal probabilities and verifier logits must declare one identical \
+                 vocabulary axis"
+                    .to_string(),
+            );
+        }
+    }
+
+    let embedding = &shared_weights.input_embedding;
+    for (role, component, initializer) in [
+        ("input embedding", &embedding.component, &embedding.table),
+        (
+            "output projection",
+            &shared_weights.output_projection.component,
+            &shared_weights.output_projection.initializer,
+        ),
+    ] {
+        if component != &speculative.target {
+            errors.push(format!(
+                "DFlash {role} component '{component}' must be target '{}'",
+                speculative.target
+            ));
+        }
+        let reference = crate::schema::SpeculativeInitializerRef {
+            component: component.clone(),
+            initializer: initializer.clone(),
+        };
+        if initializer.is_empty() || !speculative.shared_weights.contains(&reference) {
+            errors.push(format!(
+                "DFlash {role} initializer '{initializer}' must be non-empty and listed in \
+                 speculative.shared_weights"
+            ));
+        }
+    }
+    if let Some(input) = dflash_input_contract(
+        workflow,
+        &speculative.proposer,
+        &shared_weights.output_projection.proposer_input,
+        "DFlash shared output projection proposer_input",
+        errors,
+    ) && (input.rank() != 2 || !dflash_is_float(&input.dtype))
+    {
+        errors.push(format!(
+            "DFlash output projection input '{}' must be floating rank 2",
+            shared_weights.output_projection.proposer_input
+        ));
+    }
+
+    if accepted_prefix_state
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        != speculative.rollback_state
+    {
+        errors.push(
+            "DFlash accepted_prefix_state keys must equal speculative.rollback_state exactly"
+                .to_string(),
+        );
+    }
+    for state in draft_private_state {
+        if !speculative.rollback_state.contains(state) {
+            errors.push(format!(
+                "DFlash draft-private state '{state}' is absent from rollback_state"
+            ));
+        }
+    }
+
+    let groups = workflow
+        .serving
+        .as_ref()
+        .map(|serving| &serving.state_service.groups);
+    for component in [&speculative.proposer, &speculative.target] {
+        for (group_name, group) in groups.into_iter().flat_map(|groups| groups.iter()) {
+            let Some(aliases) = group.ports.get(component) else {
+                continue;
+            };
+            for (cell, alias) in aliases {
+                if alias.access == crate::schema::StatePortAccess::ReadWrite
+                    && !speculative.rollback_state.contains(cell)
+                {
+                    errors.push(format!(
+                        "DFlash component '{component}' mutates state '{cell}' in group \
+                         '{group_name}', but rollback_state omits it"
+                    ));
+                }
+            }
+        }
+    }
+    for (cell, commit) in accepted_prefix_state.iter() {
+        let Some(state) = workflow.state.get(cell) else {
+            errors.push(format!(
+                "DFlash accepted_prefix_state references unknown state '{cell}'"
+            ));
+            continue;
+        };
+        let group = state
+            .service_group
+            .as_deref()
+            .and_then(|name| groups.and_then(|groups| groups.get(name)));
+        let Some(group) = group else {
+            errors.push(format!(
+                "DFlash state '{cell}' has no declared state-service group"
+            ));
+            continue;
+        };
+        match commit {
+            DFlashStateCommit::Sequence { source } => {
+                if group.sequence_axis.is_none() {
+                    errors.push(format!(
+                        "DFlash fixed state '{cell}' cannot use sequence truncation; declare \
+                         prefix_snapshots"
+                    ));
+                }
+                if let Some(contract) = dflash_output_contract(
+                    workflow,
+                    source,
+                    &format!("DFlash state '{cell}' sequence source"),
+                    errors,
+                ) && !state.contract.representation_compatible_with(contract)
+                {
+                    errors.push(format!(
+                        "DFlash sequence source {}::{} is not representation-compatible with \
+                         state '{cell}'",
+                        source.component, source.output
+                    ));
+                }
+            }
+            DFlashStateCommit::PrefixSnapshots { source, axis } => {
+                if group.sequence_axis.is_some() {
+                    errors.push(format!(
+                        "DFlash sequence state '{cell}' must use sequence truncation, not a \
+                         second prefix-selection mechanism"
+                    ));
+                }
+                if !group.capabilities.snapshot {
+                    errors.push(format!(
+                        "DFlash fixed state '{cell}' requires snapshot capability"
+                    ));
+                }
+                if let Some(contract) = dflash_output_contract(
+                    workflow,
+                    source,
+                    &format!("DFlash state '{cell}' prefix snapshots"),
+                    errors,
+                ) && (*axis >= contract.rank() || contract.rank() != state.contract.rank() + 1)
+                {
+                    errors.push(format!(
+                        "DFlash prefix snapshots for state '{cell}' must add one valid axis to \
+                         state rank {}",
+                        state.contract.rank()
+                    ));
+                }
+            }
+        }
+    }
+
+    if let DFlashStructure::SelectorConvolutionV1 {
+        selector,
+        convolution,
+    } = structure.as_ref()
+    {
+        if outputs.proposal_probabilities.is_some() {
+            errors.push(
+                "DFlash version 2 uses selector.conditional_probabilities_output as the sole \
+                 proposal distribution; outputs.proposal_probabilities would create a competing \
+                 sampling authority"
+                    .to_string(),
+            );
+        }
+        if selector.selected_tokens_output != outputs.candidate_tokens {
+            errors.push(
+                "DFlash 2 selected_tokens_output must equal outputs.candidate_tokens".to_string(),
+            );
+        }
+        if selector.top_k == 0 || selector.rank == 0 {
+            errors.push(
+                "DFlash 2 selector top_k and low-rank width must both be positive".to_string(),
+            );
+        }
+        if !proposer
+            .ports
+            .outputs
+            .get(&selector.selected_tokens_output)
+            .is_some_and(|contract| contract.rank() == 2 && contract.dtype == "int64")
+        {
+            errors.push(format!(
+                "DFlash 2 selected tokens '{}' must be int64 rank 2",
+                selector.selected_tokens_output
+            ));
+        }
+        if !proposer
+            .ports
+            .outputs
+            .get(&selector.candidate_ids_output)
+            .is_some_and(|contract| {
+                contract.rank() == 3
+                    && contract.dtype == "int64"
+                    && !matches!(
+                        contract.shape.get(2),
+                        Some(crate::schema::TensorDimension::Fixed(width))
+                            if *width != selector.top_k as i64
+                    )
+            })
+        {
+            errors.push(format!(
+                "DFlash 2 candidate ids '{}' must be int64 rank 3 with trailing top_k {}",
+                selector.candidate_ids_output, selector.top_k
+            ));
+        }
+        if let Some(port) = &selector.conditional_probabilities_output
+            && !proposer.ports.outputs.get(port).is_some_and(|contract| {
+                contract.rank() == 3
+                    && dflash_is_float(&contract.dtype)
+                    && !matches!(
+                        contract.shape.get(2),
+                        Some(crate::schema::TensorDimension::Fixed(width))
+                            if *width != selector.top_k as i64
+                    )
+            })
+        {
+            errors.push(format!(
+                "DFlash 2 selector probability output '{port}' must be floating rank 3 with \
+                 trailing top_k {}",
+                selector.top_k
+            ));
+        }
+        if convolution.kernel_size < 2 || !convolution.first_position_reads_anchor {
+            errors.push(
+                "DFlash 2 convolution must have kernel_size >= 2 and explicitly read the anchor \
+                 at the first candidate position"
+                    .to_string(),
+            );
+        }
+        if convolution.group_size == 0 {
+            errors.push("DFlash 2 convolution group_size must be positive".to_string());
+        }
+        if let Some(noise) = proposer.ports.inputs.get(&block.noise_embeddings_input)
+            && let Some(crate::schema::TensorDimension::Fixed(hidden)) = noise.shape.get(2)
+            && (*hidden <= 0 || !(*hidden as usize).is_multiple_of(convolution.group_size))
+        {
+            errors.push(format!(
+                "DFlash 2 convolution group_size {} does not divide hidden width {hidden}",
+                convolution.group_size
+            ));
+        }
+    }
+}
+
 // Recursive validation threads each independent symbol/effect table explicitly.
 fn validate_emit_batch_layout_consistency(
     node: &WorkflowNode,
@@ -5179,8 +6346,9 @@ fn validate_compaction_derivability(
             let expectations = output_companions(workflow);
             let claimed = expectations.get(output.as_str());
             let is_shape_companion = contract.dtype == "int64"
-                && claimed.is_some_and(|roles| roles.iter().any(|role| role.admits(contract.rank)));
-            if contract.rank > 0
+                && claimed
+                    .is_some_and(|roles| roles.iter().any(|role| role.admits(contract.rank())));
+            if contract.rank() > 0
                 && matches!(contract.batch_layout, crate::schema::BatchLayout::Shared)
                 && workflow.serving.is_some()
                 && !is_shape_companion
@@ -5216,7 +6384,8 @@ fn validate_compaction_derivability(
                          output names as {expected}, but it is {} at rank {}; a companion is \
                          admitted into a serving workflow only at the shape the declaration \
                          naming it requires",
-                        contract.dtype, contract.rank
+                        contract.dtype,
+                        contract.rank()
                     ));
                 } else if let Some(unwritten) = unwritten.filter(|names| !names.is_empty()) {
                     errors.push(format!(
@@ -5299,12 +6468,11 @@ impl CompanionExpectation<'_> {
 /// Every value a declared output's contract names as a description of its own
 /// shape, with the shape that naming requires of it.
 ///
-/// These are `shared` by construction — a prefix-offset vector describes a whole
-/// packing, and a length vector describes one entry per position outside the
-/// dimension it bounds — so they are exactly the values the per-request emission
-/// rule above would otherwise reject. Publishing them is what makes a packed or
-/// padded result readable, so the rule that demands a row correspondence has to
-/// know which values are the mechanism by which that correspondence is stated.
+/// Prefix-offset and owner vectors are shared by construction. A validity
+/// length is shared only when its carrier's request axis is not among the axes
+/// outside the padded dimension; otherwise it is an ordinary row-scoped
+/// emitted value. The carve-out matters only for the genuinely shared cases.
+/// Publishing either form is what makes a packed or padded result readable.
 ///
 /// A name can be claimed by more than one declaration — one length vector may
 /// bound the same dimension of two outputs — so the expectations are collected
@@ -5704,22 +6872,21 @@ fn validate_workflow_node(
                 body_effects.insert(domain.clone(), merge.body_input.clone());
             }
             if let Some(iteration) = iteration {
-                if iteration.contract.dtype != "int64" || !matches!(iteration.contract.rank, 0 | 1)
+                if iteration.contract.dtype != "int64"
+                    || !matches!(iteration.contract.rank(), 0 | 1)
                 {
                     errors.push(format!(
                         "{path}.iteration must declare int64 rank 0 or rank 1, got {} rank {}",
-                        iteration.contract.dtype, iteration.contract.rank
+                        iteration.contract.dtype,
+                        iteration.contract.rank()
                     ));
                 }
-                match (iteration.contract.rank, iteration.contract.shape.as_ref()) {
-                    (0, Some(shape)) if !shape.is_empty() => errors.push(format!(
+                match iteration.contract.rank() {
+                    0 if !iteration.contract.shape.is_empty() => errors.push(format!(
                         "{path}.iteration scalar contract must have an empty shape"
                     )),
-                    (1, Some(shape)) if shape.len() != 1 => errors.push(format!(
+                    1 if iteration.contract.shape.len() != 1 => errors.push(format!(
                         "{path}.iteration rank-one broadcast contract must have one dimension"
-                    )),
-                    (1, None) => errors.push(format!(
-                        "{path}.iteration rank-one broadcast contract must declare its shape"
                     )),
                     _ => {}
                 }
@@ -6148,17 +7315,31 @@ fn validate_workflow_node(
             axis,
             effect_name,
             effect,
+            ..
         } => {
-            require_workflow_value(value, values, &format!("{path}.value"), errors);
-            validate_emit_axis(
-                value_contracts.get(value),
+            let carries_payload = matches!(
                 mode,
-                *axis,
-                valid_length.is_some(),
-                version,
-                path,
-                errors,
+                crate::schema::WorkflowEmitMode::Replace
+                    | crate::schema::WorkflowEmitMode::Append
+                    | crate::schema::WorkflowEmitMode::Event
             );
+            if carries_payload {
+                require_workflow_value(value, values, &format!("{path}.value"), errors);
+                validate_emit_axis(
+                    value_contracts.get(value),
+                    mode,
+                    *axis,
+                    valid_length.is_some(),
+                    version,
+                    path,
+                    errors,
+                );
+            } else if !value.is_empty() {
+                errors.push(format!(
+                    "{path}.value names '{value}', but {mode:?} carries no payload; remove \
+                     `value` from this control publication"
+                ));
+            }
             if let Some(when) = when {
                 require_workflow_value(when, values, &format!("{path}.when"), errors);
                 if let Some(contract) = value_contracts.get(when) {
@@ -6194,10 +7375,10 @@ fn validate_workflow_node(
                     let Some(contract) = control.and_then(|name| value_contracts.get(name)) else {
                         continue;
                     };
-                    let singleton = contract.rank == 0
-                        || (contract.rank == 1
+                    let singleton = contract.rank() == 0
+                        || (contract.rank() == 1
                             && matches!(
-                                contract.shape.as_deref().and_then(|shape| shape.first()),
+                                contract.shape.first(),
                                 Some(crate::schema::TensorDimension::Fixed(1))
                             ));
                     if !singleton {
@@ -6210,10 +7391,12 @@ fn validate_workflow_node(
             }
             if !workflow.outputs.contains_key(output) {
                 errors.push(format!("{path} emits undeclared output '{output}'"));
-            } else if let (Some(value_contract), Some(output_contract)) = (
-                value_contracts.get(value),
-                workflow.outputs.get(output).map(|output| &output.contract),
-            ) {
+            } else if carries_payload
+                && let (Some(value_contract), Some(output_contract)) = (
+                    value_contracts.get(value),
+                    workflow.outputs.get(output).map(|output| &output.contract),
+                )
+            {
                 if valid_length.is_some() {
                     require_emit_prefix_contracts(
                         value_contract,
@@ -6294,10 +7477,10 @@ fn validate_emit_axis(
         return;
     };
     if let Some(axis) = axis {
-        if axis >= contract.rank {
+        if axis >= contract.rank() {
             errors.push(format!(
                 "{path}.axis is {axis}, outside the rank {} of value it emits",
-                contract.rank
+                contract.rank()
             ));
         }
         return;
@@ -6306,11 +7489,11 @@ fn validate_emit_axis(
         return;
     }
     let incremental = matches!(mode, crate::schema::WorkflowEmitMode::Append) || length_limited;
-    if incremental && contract.rank >= 4 {
+    if incremental && contract.rank() >= 4 {
         errors.push(format!(
             "{path} grows a rank-{} output but names no axis; the default final axis is a \
              spatial extent for a value of this rank, so the axis it grows along must be stated",
-            contract.rank
+            contract.rank()
         ));
     }
 }
@@ -6326,20 +7509,12 @@ fn validate_integer_scalar_contract(
     ) {
         errors.push(format!("{path} must have an integer dtype"));
     }
-    match contract.rank {
-        0 => {
-            if contract
-                .shape
-                .as_ref()
-                .is_some_and(|shape| !shape.is_empty())
-            {
-                errors.push(format!("{path} rank-zero contract must have shape []"));
-            }
-        }
+    match contract.rank() {
+        0 => {}
         1 => {
             if !matches!(
-                contract.shape.as_deref(),
-                Some([crate::schema::TensorDimension::Fixed(1)])
+                contract.shape.as_slice(),
+                [crate::schema::TensorDimension::Fixed(1)]
             ) {
                 errors.push(format!(
                     "{path} rank-one control contract must have static shape [1]"
@@ -6459,7 +7634,7 @@ fn validate_state_update(
                 ),
                 errors,
             );
-            if cell.contract.rank != 1 {
+            if cell.contract.rank() != 1 {
                 errors.push(format!(
                     "state service group '{group_name}' write_indices state '{write_indices}' \
                      must be rank one with one destination per row"
@@ -6672,7 +7847,7 @@ fn validate_integer_control_contract(
     if !is_integer_dtype(&contract.dtype) {
         errors.push(format!("{path} must have an integer dtype"));
     }
-    if !matches!(contract.rank, 0 | 1) {
+    if !matches!(contract.rank(), 0 | 1) {
         errors.push(format!("{path} must be a scalar or rank-one tensor"));
     }
 }
@@ -6685,7 +7860,7 @@ fn validate_bool_control_contract(
     if contract.dtype != "bool" {
         errors.push(format!("{path} must have bool dtype"));
     }
-    if !matches!(contract.rank, 0 | 1) {
+    if !matches!(contract.rank(), 0 | 1) {
         errors.push(format!("{path} must be a scalar or rank-one row tensor"));
     }
 }
@@ -6698,14 +7873,14 @@ fn validate_predicate_contract(
     if contract.dtype != "bool" && !is_integer_dtype(&contract.dtype) {
         errors.push(format!("{path} must have a bool or integer dtype"));
     }
-    if !matches!(contract.rank, 0 | 1) {
+    if !matches!(contract.rank(), 0 | 1) {
         errors.push(format!(
             "{path} must be a scalar or rank-one broadcast tensor"
         ));
-    } else if contract.rank == 1
+    } else if contract.rank() == 1
         && !matches!(
-            contract.shape.as_deref(),
-            Some([crate::schema::TensorDimension::Fixed(1)])
+            contract.shape.as_slice(),
+            [crate::schema::TensorDimension::Fixed(1)]
         )
     {
         errors.push(format!(
@@ -6864,23 +8039,20 @@ fn require_emit_prefix_contracts(
     path: &str,
     errors: &mut Vec<String>,
 ) {
-    if actual.rank == 0 || declared.rank == 0 {
+    if actual.rank() == 0 || declared.rank() == 0 {
         errors.push(format!(
             "{path} valid_length requires emitted value and output contracts with rank >= 1"
         ));
         return;
     }
-    if actual.dtype != declared.dtype || actual.rank != declared.rank {
+    if actual.dtype != declared.dtype || actual.rank() != declared.rank() {
         errors.push(format!(
             "{path} has incompatible dtype or rank for prefix emission"
         ));
         return;
     }
-    let (Some(actual_shape), Some(declared_shape)) = (&actual.shape, &declared.shape) else {
-        return;
-    };
-    let prefix_axis = actual.rank.saturating_sub(1);
-    for (axis, (actual, declared)) in actual_shape.iter().zip(declared_shape).enumerate() {
+    let prefix_axis = actual.rank().saturating_sub(1);
+    for (axis, (actual, declared)) in actual.shape.iter().zip(&declared.shape).enumerate() {
         if axis != prefix_axis
             && matches!(
                 (actual, declared),
@@ -6937,28 +8109,24 @@ fn require_compatible_contracts(
         }
     }
     if normalize_dtype(&source.dtype) != normalize_dtype(&target.dtype)
-        || source.rank != target.rank
+        || source.rank() != target.rank()
     {
         errors.push(format!(
             "{path} has incompatible tensor contracts: {} rank {} -> {} rank {}",
-            source.dtype, source.rank, target.dtype, target.rank
+            source.dtype,
+            source.rank(),
+            target.dtype,
+            target.rank()
         ));
         return;
     }
-    if let (Some(source_shape), Some(target_shape)) = (&source.shape, &target.shape) {
-        for (axis, (source, target)) in source_shape.iter().zip(target_shape).enumerate() {
-            if matches!(
-                (source, target),
-                (
-                    crate::schema::TensorDimension::Fixed(_),
-                    crate::schema::TensorDimension::Fixed(_)
-                )
-            ) && source != target
-            {
-                errors.push(format!(
-                    "{path} has incompatible fixed dimension at axis {axis}"
-                ));
-            }
+    for (axis, (source, target)) in source.shape.iter().zip(&target.shape).enumerate() {
+        if !dimensions_compatible(source, target) {
+            errors.push(format!(
+                "{path} has incompatible dimensions at axis {axis}: {} -> {}",
+                describe_dimension(source),
+                describe_dimension(target)
+            ));
         }
     }
 }
@@ -6980,33 +8148,22 @@ fn require_state_contract(
         }
     }
     if normalize_dtype(&actual.dtype) != normalize_dtype(&declared.dtype)
-        || actual.rank != declared.rank
+        || actual.rank() != declared.rank()
     {
         errors.push(format!(
             "{path} is incompatible with state contract {} rank {}",
-            declared.dtype, declared.rank
+            declared.dtype,
+            declared.rank()
         ));
         return;
     }
-    let (Some(actual_shape), Some(declared_shape)) = (&actual.shape, &declared.shape) else {
-        return;
-    };
     let dynamic_axis = match recurrence {
         crate::schema::ShapeRecurrence::Growing { axis, .. } if next => Some(*axis),
         crate::schema::ShapeRecurrence::Bounded { axis, .. } => Some(*axis),
         _ => None,
     };
-    for (axis, (actual, declared)) in actual_shape.iter().zip(declared_shape).enumerate() {
-        if Some(axis) != dynamic_axis
-            && matches!(
-                (actual, declared),
-                (
-                    crate::schema::TensorDimension::Fixed(_),
-                    crate::schema::TensorDimension::Fixed(_)
-                )
-            )
-            && actual != declared
-        {
+    for (axis, (actual, declared)) in actual.shape.iter().zip(&declared.shape).enumerate() {
+        if Some(axis) != dynamic_axis && !dimensions_compatible(actual, declared) {
             errors.push(format!(
                 "{path} has incompatible state dimension at axis {axis}"
             ));
@@ -7052,6 +8209,789 @@ pub enum MetadataError {
 
 // Re-export at crate level
 pub use MetadataError as Error;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValueLineage {
+    sources: BTreeSet<String>,
+}
+
+impl ValueLineage {
+    fn one(source: impl Into<String>) -> Self {
+        Self {
+            sources: BTreeSet::from([source.into()]),
+        }
+    }
+
+    fn joined<'a>(
+        lineages: impl IntoIterator<Item = &'a Self>,
+        fallback: impl FnOnce() -> String,
+    ) -> Self {
+        let sources = lineages
+            .into_iter()
+            .flat_map(|lineage| lineage.sources.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if sources.is_empty() {
+            Self::one(fallback())
+        } else {
+            Self { sources }
+        }
+    }
+
+    fn is_unambiguous(&self) -> bool {
+        self.sources.len() == 1
+    }
+
+    fn describe(&self) -> String {
+        let sources = self
+            .sources
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" or ");
+        if self.is_unambiguous() {
+            sources
+        } else {
+            format!("ambiguous sources ({sources})")
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PaddingValueFlow {
+    lineage: ValueLineage,
+    companions: BTreeMap<usize, ValueLineage>,
+}
+
+impl PaddingValueFlow {
+    fn one(source: impl Into<String>) -> Self {
+        Self {
+            lineage: ValueLineage::one(source),
+            companions: BTreeMap::new(),
+        }
+    }
+
+    fn joined<'a>(
+        flows: impl IntoIterator<Item = &'a Self>,
+        fallback: impl FnOnce() -> String,
+    ) -> Self {
+        let flows = flows.into_iter().collect::<Vec<_>>();
+        let lineage = ValueLineage::joined(flows.iter().map(|flow| &flow.lineage), fallback);
+        let axes = flows
+            .iter()
+            .flat_map(|flow| flow.companions.keys().copied())
+            .collect::<BTreeSet<_>>();
+        let companions = axes
+            .into_iter()
+            .filter_map(|axis| {
+                let lineages = flows
+                    .iter()
+                    .map(|flow| flow.companions.get(&axis))
+                    .collect::<Option<Vec<_>>>()?;
+                Some((
+                    axis,
+                    ValueLineage::joined(lineages, || {
+                        format!("unresolved valid_lengths lineage on padded axis {axis}")
+                    }),
+                ))
+            })
+            .collect();
+        Self {
+            lineage,
+            companions,
+        }
+    }
+}
+
+/// Prove that a padded carrier and its validity companion stay paired through
+/// authored SSA dataflow.
+///
+/// Shape compatibility alone cannot distinguish the right row-length vector
+/// from another rank-one integer tensor. Workflow input padding establishes the
+/// initial pair, component output padding establishes a transformed pair, and a
+/// transfer preserves it. An invocation may consume the pair only when both
+/// bindings have the same unambiguous typed lineage. Branch/loop joins that mix
+/// different lineages fail closed before execution because no positional row
+/// plan can recover their correlation.
+fn validate_padding_companion_provenance(
+    graph: &WorkflowNode,
+    workflow: &WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    let mut flows = workflow
+        .inputs
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                PaddingValueFlow::one(format!("workflow input '{name}'")),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut initial_companions = Vec::new();
+    for (name, input) in &workflow.inputs {
+        for padding in &input.contract.padding {
+            let Some(axis) = axis_of_symbol(&input.contract, &padding.dimension) else {
+                continue;
+            };
+            let Some(companion) = flows.get(&padding.valid_lengths) else {
+                continue;
+            };
+            initial_companions.push((name.clone(), axis, companion.lineage.clone()));
+        }
+    }
+    for (name, axis, lineage) in initial_companions {
+        if let Some(flow) = flows.get_mut(&name) {
+            flow.companions.insert(axis, lineage);
+        }
+    }
+
+    walk_padding_companion_provenance(
+        graph,
+        workflow,
+        &mut flows,
+        "pipeline.workflow.steps",
+        errors,
+    );
+}
+
+fn walk_padding_companion_provenance(
+    node: &WorkflowNode,
+    workflow: &WorkflowSpec,
+    flows: &mut BTreeMap<String, PaddingValueFlow>,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    match node {
+        WorkflowNode::Sequence { nodes } => {
+            for (index, node) in nodes.iter().enumerate() {
+                walk_padding_companion_provenance(
+                    node,
+                    workflow,
+                    flows,
+                    &format!("{path}.nodes[{index}]"),
+                    errors,
+                );
+            }
+        }
+        WorkflowNode::Invoke {
+            component,
+            inputs,
+            outputs,
+            ..
+        } => {
+            let Some(declaration) = workflow.components.get(component) else {
+                return;
+            };
+            for (port, contract) in &declaration.ports.inputs {
+                let Some(carrier_name) = inputs.get(port) else {
+                    continue;
+                };
+                let Some(carrier) = flows.get(carrier_name) else {
+                    continue;
+                };
+                for padding in &contract.padding {
+                    let Some(axis) = axis_of_symbol(contract, &padding.dimension) else {
+                        continue;
+                    };
+                    let Some(companion_name) = inputs.get(&padding.valid_lengths) else {
+                        errors.push(format!(
+                            "{path}.inputs.{port} binds padded carrier '{carrier_name}', but \
+                             component '{component}' declares valid_lengths companion port '{}' \
+                             and the invocation does not bind that input; bind the typed companion \
+                             so the carrier and its row plan cannot diverge",
+                            padding.valid_lengths
+                        ));
+                        continue;
+                    };
+                    let Some(companion) = flows.get(companion_name) else {
+                        continue;
+                    };
+                    let Some(expected) = carrier.companions.get(&axis) else {
+                        errors.push(format!(
+                            "{path}.inputs.{port} binds padded carrier '{carrier_name}', but its \
+                             typed dataflow provenance does not prove a valid_lengths companion \
+                             for padded axis {axis}; preserve the carrier through transfer or \
+                             declare the transformed component output's companion before binding \
+                             it to component '{component}'"
+                        ));
+                        continue;
+                    };
+                    if !expected.is_unambiguous()
+                        || !companion.lineage.is_unambiguous()
+                        || expected != &companion.lineage
+                    {
+                        errors.push(format!(
+                            "{path}.inputs.{port} binds padded carrier '{carrier_name}' whose \
+                             valid_lengths lineage is {}, but companion port '{}' binds \
+                             '{companion_name}' from {}; bind the companion declared by the \
+                             carrier's typed padding dataflow so repeated, reordered, and shrunk \
+                             row plans cannot pair lengths with another request",
+                            expected.describe(),
+                            padding.valid_lengths,
+                            companion.lineage.describe()
+                        ));
+                    }
+                }
+            }
+
+            for (port, value) in outputs {
+                flows.insert(
+                    value.clone(),
+                    PaddingValueFlow::one(format!(
+                        "{path} component '{component}' output port '{port}'"
+                    )),
+                );
+            }
+            let mut output_companions = Vec::new();
+            for (port, value) in outputs {
+                let Some(contract) = declaration.ports.outputs.get(port) else {
+                    continue;
+                };
+                for padding in &contract.padding {
+                    let Some(axis) = axis_of_symbol(contract, &padding.dimension) else {
+                        continue;
+                    };
+                    let companion_value = outputs
+                        .get(&padding.valid_lengths)
+                        .or_else(|| inputs.get(&padding.valid_lengths))
+                        .map(String::as_str)
+                        .unwrap_or(padding.valid_lengths.as_str());
+                    let Some(companion) = flows.get(companion_value) else {
+                        continue;
+                    };
+                    output_companions.push((value.clone(), axis, companion.lineage.clone()));
+                }
+            }
+            for (value, axis, lineage) in output_companions {
+                if let Some(flow) = flows.get_mut(&value) {
+                    flow.companions.insert(axis, lineage);
+                }
+            }
+        }
+        WorkflowNode::Loop {
+            setup,
+            body,
+            iteration,
+            carried,
+            ..
+        } => {
+            walk_padding_companion_provenance(
+                setup,
+                workflow,
+                flows,
+                &format!("{path}.setup"),
+                errors,
+            );
+            let mut body_flows = flows.clone();
+            if let Some(iteration) = iteration {
+                body_flows.insert(
+                    iteration.value.clone(),
+                    PaddingValueFlow::one(format!("loop induction value '{}'", iteration.value)),
+                );
+            }
+            for carry in carried {
+                let current = flows.get(&carry.current).cloned().unwrap_or_else(|| {
+                    PaddingValueFlow::one(format!("state cell '{}'", carry.cell))
+                });
+                body_flows.insert(carry.body_input.clone(), current);
+            }
+            walk_padding_companion_provenance(
+                body,
+                workflow,
+                &mut body_flows,
+                &format!("{path}.body"),
+                errors,
+            );
+            for carry in carried {
+                let incoming = flows
+                    .get(&carry.current)
+                    .into_iter()
+                    .chain(body_flows.get(&carry.body_output));
+                flows.insert(
+                    carry.next.clone(),
+                    PaddingValueFlow::joined(incoming, || {
+                        format!("loop-carried state cell '{}'", carry.cell)
+                    }),
+                );
+            }
+        }
+        WorkflowNode::Branch {
+            cases,
+            default,
+            outputs,
+            ..
+        } => {
+            let mut case_flows = BTreeMap::new();
+            for (case, node) in cases {
+                let mut branch = flows.clone();
+                walk_padding_companion_provenance(
+                    node,
+                    workflow,
+                    &mut branch,
+                    &format!("{path}.cases[{case}]"),
+                    errors,
+                );
+                case_flows.insert(case.as_str(), branch);
+            }
+            let mut default_flows = flows.clone();
+            if let Some(default) = default {
+                walk_padding_companion_provenance(
+                    default,
+                    workflow,
+                    &mut default_flows,
+                    &format!("{path}.default"),
+                    errors,
+                );
+            }
+            for (output, merge) in outputs {
+                let incoming = merge.cases.iter().filter_map(|(case, value)| {
+                    case_flows
+                        .get(case.as_str())
+                        .and_then(|branch| branch.get(value))
+                });
+                let default_flow = merge
+                    .default
+                    .as_ref()
+                    .and_then(|value| default_flows.get(value));
+                flows.insert(
+                    output.clone(),
+                    PaddingValueFlow::joined(incoming.chain(default_flow), || {
+                        format!("branch output '{output}'")
+                    }),
+                );
+            }
+        }
+        WorkflowNode::Transfer { input, output, .. } => {
+            if let Some(flow) = flows.get(input).cloned() {
+                flows.insert(output.clone(), flow);
+            }
+        }
+        WorkflowNode::Emit { .. } | WorkflowNode::ExecutionIsland { .. } => {}
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SemanticValueOrigin {
+    token_ids: bool,
+    description: String,
+}
+
+impl SemanticValueOrigin {
+    fn token_ids(description: impl Into<String>) -> Self {
+        Self {
+            token_ids: true,
+            description: description.into(),
+        }
+    }
+
+    fn other(description: impl Into<String>) -> Self {
+        Self {
+            token_ids: false,
+            description: description.into(),
+        }
+    }
+}
+
+fn join_semantic_origins<'a>(
+    origins: impl IntoIterator<Item = &'a SemanticValueOrigin>,
+    fallback: impl FnOnce() -> String,
+) -> SemanticValueOrigin {
+    let origins = origins.into_iter().collect::<Vec<_>>();
+    if origins.is_empty() {
+        return SemanticValueOrigin::other(fallback());
+    }
+    let token_ids = origins.iter().all(|origin| origin.token_ids);
+    let description = origins
+        .iter()
+        .map(|origin| origin.description.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(" or ");
+    SemanticValueOrigin {
+        token_ids,
+        description,
+    }
+}
+
+fn port_role_name(role: crate::schema::PortRole) -> &'static str {
+    match role {
+        crate::schema::PortRole::TokenIds => "token_ids",
+        crate::schema::PortRole::InputsEmbeds => "inputs_embeds",
+        crate::schema::PortRole::AttentionMask => "attention_mask",
+        crate::schema::PortRole::PositionIds => "position_ids",
+        crate::schema::PortRole::Logits => "logits",
+        crate::schema::PortRole::HiddenStates => "hidden_states",
+        crate::schema::PortRole::EncoderHiddenStates => "encoder_hidden_states",
+        crate::schema::PortRole::AudioFeatures => "audio_features",
+    }
+}
+
+/// Prove semantic value identity through authored workflow dataflow.
+///
+/// Tensor contracts intentionally do not encode semantic identity: token IDs
+/// and position IDs are commonly shape-compatible integer tensors. Runtime
+/// prompt roles and component port roles are the authorities; control-flow
+/// aliases preserve a role only when every incoming path agrees.
+fn validate_token_identity_provenance(
+    graph: &WorkflowNode,
+    workflow: &WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    let mut origins = workflow
+        .inputs
+        .iter()
+        .map(|(name, input)| {
+            let origin = match &input.role {
+                crate::schema::SemanticInputRole::Runtime {
+                    role: crate::schema::RuntimeInputRole::PromptTokens,
+                    ..
+                } => SemanticValueOrigin::token_ids(format!(
+                    "workflow input '{name}' with runtime role prompt_tokens"
+                )),
+                crate::schema::SemanticInputRole::Runtime { role, .. } => {
+                    SemanticValueOrigin::other(format!(
+                        "workflow input '{name}' with runtime role {role:?}"
+                    ))
+                }
+                crate::schema::SemanticInputRole::Opaque => SemanticValueOrigin::other(format!(
+                    "workflow input '{name}' with opaque semantic role"
+                )),
+            };
+            (name.clone(), origin)
+        })
+        .collect::<BTreeMap<_, _>>();
+    walk_token_identity_provenance(
+        graph,
+        workflow,
+        &mut origins,
+        "pipeline.workflow.steps",
+        errors,
+    );
+}
+
+fn walk_token_identity_provenance(
+    node: &WorkflowNode,
+    workflow: &WorkflowSpec,
+    origins: &mut BTreeMap<String, SemanticValueOrigin>,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    match node {
+        WorkflowNode::Sequence { nodes } => {
+            for (index, node) in nodes.iter().enumerate() {
+                walk_token_identity_provenance(
+                    node,
+                    workflow,
+                    origins,
+                    &format!("{path}.nodes[{index}]"),
+                    errors,
+                );
+            }
+        }
+        WorkflowNode::Invoke {
+            component,
+            inputs,
+            outputs,
+            ..
+        } => {
+            let Some(declaration) = workflow.components.get(component) else {
+                return;
+            };
+            let token_ports = declaration
+                .ports
+                .inputs
+                .keys()
+                .filter(|port| {
+                    declaration.ports.roles.get(*port) == Some(&crate::schema::PortRole::TokenIds)
+                })
+                .collect::<Vec<_>>();
+            let is_token_context = declaration.contract.as_ref().is_some_and(|contract| {
+                contract.id == TOKEN_CONTEXT_V1.identity
+                    && contract.version == TOKEN_CONTEXT_V1.version
+            });
+            if is_token_context
+                && token_ports.len() == 1
+                && let Some(binding) = inputs.get(token_ports[0])
+            {
+                let origin = origins.get(binding);
+                if !origin.is_some_and(|origin| origin.token_ids) {
+                    let observed = origin.map_or_else(
+                        || format!("SSA value '{binding}' with no proved semantic source"),
+                        |origin| origin.description.clone(),
+                    );
+                    errors.push(format!(
+                        "{path} binds token-context component '{component}' token_ids port '{}' to \
+                         SSA value '{binding}', whose semantic provenance is {observed}. Bind a \
+                         value originating from runtime prompt_tokens or a component output \
+                         declared token_ids; dtype, rank, and shape cannot distinguish token \
+                         identity from position IDs",
+                        token_ports[0]
+                    ));
+                }
+            }
+            for (port, value) in outputs {
+                let origin = match declaration.ports.roles.get(port) {
+                    Some(crate::schema::PortRole::TokenIds) => SemanticValueOrigin::token_ids(
+                        format!("component '{component}' output port '{port}' declared token_ids"),
+                    ),
+                    Some(role) => SemanticValueOrigin::other(format!(
+                        "component '{component}' output port '{port}' declared {}",
+                        port_role_name(*role)
+                    )),
+                    None => SemanticValueOrigin::other(format!(
+                        "component '{component}' output port '{port}' with no semantic role"
+                    )),
+                };
+                origins.insert(value.clone(), origin);
+            }
+        }
+        WorkflowNode::Loop {
+            setup,
+            body,
+            iteration,
+            carried,
+            ..
+        } => {
+            walk_token_identity_provenance(
+                setup,
+                workflow,
+                origins,
+                &format!("{path}.setup"),
+                errors,
+            );
+            let mut body_origins = origins.clone();
+            if let Some(iteration) = iteration {
+                body_origins.insert(
+                    iteration.value.clone(),
+                    SemanticValueOrigin::other(format!(
+                        "loop induction value '{}'",
+                        iteration.value
+                    )),
+                );
+            }
+            for carry in carried {
+                let current = origins.get(&carry.current).cloned().unwrap_or_else(|| {
+                    SemanticValueOrigin::other(format!(
+                        "state cell '{}' from its typed initializer or prior session state",
+                        carry.cell
+                    ))
+                });
+                body_origins.insert(carry.body_input.clone(), current);
+            }
+            walk_token_identity_provenance(
+                body,
+                workflow,
+                &mut body_origins,
+                &format!("{path}.body"),
+                errors,
+            );
+            for carry in carried {
+                let current = origins.get(&carry.current);
+                let body_output = body_origins.get(&carry.body_output);
+                let joined = join_semantic_origins(current.into_iter().chain(body_output), || {
+                    format!("loop-carried state cell '{}'", carry.cell)
+                });
+                origins.insert(carry.next.clone(), joined);
+            }
+        }
+        WorkflowNode::Branch {
+            cases,
+            default,
+            outputs,
+            ..
+        } => {
+            let mut case_origins = BTreeMap::new();
+            for (case, node) in cases {
+                let mut branch = origins.clone();
+                walk_token_identity_provenance(
+                    node,
+                    workflow,
+                    &mut branch,
+                    &format!("{path}.cases[{case}]"),
+                    errors,
+                );
+                case_origins.insert(case.as_str(), branch);
+            }
+            let mut default_origins = origins.clone();
+            if let Some(default) = default {
+                walk_token_identity_provenance(
+                    default,
+                    workflow,
+                    &mut default_origins,
+                    &format!("{path}.default"),
+                    errors,
+                );
+            }
+            for (output, merge) in outputs {
+                let incoming = merge.cases.iter().filter_map(|(case, value)| {
+                    case_origins
+                        .get(case.as_str())
+                        .and_then(|branch| branch.get(value))
+                });
+                let default_origin = merge
+                    .default
+                    .as_ref()
+                    .and_then(|value| default_origins.get(value));
+                origins.insert(
+                    output.clone(),
+                    join_semantic_origins(incoming.chain(default_origin), || {
+                        format!("branch output '{output}' with unresolved semantic sources")
+                    }),
+                );
+            }
+        }
+        WorkflowNode::Transfer { input, output, .. } => {
+            let origin = origins.get(input).cloned().unwrap_or_else(|| {
+                SemanticValueOrigin::other(format!(
+                    "transferred SSA value '{input}' with no proved semantic source"
+                ))
+            });
+            origins.insert(output.clone(), origin);
+        }
+        WorkflowNode::Emit { .. } | WorkflowNode::ExecutionIsland { .. } => {}
+    }
+}
+
+/// Validate the portable contract used by graph-internal token-context
+/// components.
+///
+/// The contract deliberately describes only the boundary that graph structure
+/// cannot recover: an embedded sequence has lost the discrete identities needed
+/// to update a token-history state. Hashing, lookup tables, projections, gates,
+/// convolution, and residual placement remain ordinary ONNX/component
+/// semantics. This is consequently neither a model family nor an operator
+/// registry.
+fn validate_token_context_component(
+    component_name: &str,
+    component: &crate::schema::WorkflowComponent,
+    contract: &crate::schema::ComponentContract,
+    errors: &mut Vec<String>,
+) {
+    if contract.id != TOKEN_CONTEXT_V1.identity {
+        return;
+    }
+
+    if contract.version != TOKEN_CONTEXT_V1.version {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' declares unsupported contract \
+             {}@{}; supported graph ABI is {}",
+            contract.id,
+            contract.version,
+            TOKEN_CONTEXT_V1.wire_name(),
+        ));
+    }
+    if !matches!(
+        component.implementation,
+        crate::schema::ComponentImplementation::Onnx { .. }
+    ) {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' must be an ONNX component; \
+             its learned lookup and history update must be declared by ordinary graph ports and \
+             state groups, not recovered from an opaque implementation"
+        ));
+    }
+
+    let embeds = component
+        .ports
+        .roles
+        .iter()
+        .filter(|(port, role)| {
+            **role == crate::schema::PortRole::InputsEmbeds
+                && component.ports.inputs.contains_key(*port)
+        })
+        .map(|(port, _)| port.as_str())
+        .collect::<Vec<_>>();
+    let tokens = component
+        .ports
+        .roles
+        .iter()
+        .filter(|(port, role)| {
+            **role == crate::schema::PortRole::TokenIds
+                && component.ports.inputs.contains_key(*port)
+        })
+        .map(|(port, _)| port.as_str())
+        .collect::<Vec<_>>();
+    if embeds.len() != 1 {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' must declare exactly one \
+             inputs_embeds input role; found {}. The embedded sequence is the feature-injection \
+             path and cannot be guessed from a port name",
+            embeds.len()
+        ));
+        return;
+    }
+    if tokens.len() != 1 {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' consumes inputs_embeds but \
+             declares {} token_ids companion roles; declare exactly one typed token_ids input \
+             carrying the original ids. Reverse embedding lookup is forbidden",
+            tokens.len()
+        ));
+        return;
+    }
+
+    let (Some(embeds), Some(tokens)) = (
+        component.ports.inputs.get(embeds[0]),
+        component.ports.inputs.get(tokens[0]),
+    ) else {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' must declare typed input \
+             contracts for its inputs_embeds and token_ids companion ports; an inferred ONNX \
+             port list cannot prove token-history geometry before execution"
+        ));
+        return;
+    };
+    if !matches!(
+        tokens.dtype.as_str(),
+        "int32" | "int64" | "uint32" | "uint64"
+    ) {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion has dtype \
+             '{}'; token ids must use an integer dtype",
+            tokens.dtype
+        ));
+    }
+    if tokens.rank().checked_add(1) != Some(embeds.rank()) {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion has rank \
+             {}, but inputs_embeds has rank {}; token ids must match every embedding axis except \
+             the trailing feature axis",
+            tokens.rank(),
+            embeds.rank()
+        ));
+    }
+    if tokens.shape.len() + 1 != embeds.shape.len()
+        || !tokens
+            .shape
+            .iter()
+            .zip(&embeds.shape)
+            .all(|(token, embed)| token == embed)
+    {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion geometry \
+             does not match the inputs_embeds prefix; bind the original token rows and sequence \
+             positions, not a reconstructed or differently packed token tensor"
+        ));
+    }
+    if tokens.batch_layout != embeds.batch_layout {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion uses {} \
+             batching while inputs_embeds uses {}; both must follow the same row compaction and \
+             release mapping",
+            tokens.batch_layout.kind_name(),
+            embeds.batch_layout.kind_name()
+        ));
+    }
+    if tokens.padding != embeds.padding {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion padding \
+             does not match inputs_embeds; both must use the same valid-length companions so \
+             token history never absorbs padded positions"
+        ));
+    }
+}
 
 /// A component that owns attention state must say which port carries the
 /// sequence.

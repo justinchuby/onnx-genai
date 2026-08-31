@@ -51,6 +51,81 @@
 #   lock_dir_source, so a recorded row says which lock its `declared=yes` is
 #   a claim about.
 #
+# Machine-readable output: the parser contract.
+#
+#   Three grammars, and the guarantee is the same in all three: NO FIELD CAN
+#   EVER CONTAIN ITS GRAMMAR'S DELIMITER, so no escaping is required to read
+#   one back, and a naive parser is a correct parser.
+#
+#     provenance --oneline   one line, fields separated by a single SPACE
+#     provenance             one `key=value` per LINE
+#     status --porcelain     one `key=value` per LINE
+#
+#   Safety comes from refusal at emit time, not from encoding. That is the
+#   deliberate trade: an escaping grammar would be more expressive and would
+#   oblige every consumer -- awk one-liners, issue comments, other agents'
+#   scripts -- to implement an unescaper before they could read a row safely,
+#   and the ones that did not would be silently wrong. Refusal keeps the flat
+#   form flat, which is what makes this recipe safe to recommend at all:
+#
+#     hostlock.sh provenance --oneline | awk '{for(i=1;i<=NF;i++){
+#         split($i,kv,"="); m[kv[1]]=kv[2]} print m["hostlock_state"]}'
+#
+#   Guarantees, in the order a parser depends on them:
+#
+#   1. Field ORDER is fixed and every field is present on every row. A missing
+#      field is a bug, not an absent value; absence is spelled `none` or
+#      `unknown`.
+#   2. Keys match [a-z][a-z0-9_]*. Values in `--oneline` contain no
+#      whitespace. Values in the line-oriented grammars contain no newline.
+#   3. NO value in any grammar contains a control character (C0, DEL). This is
+#      about the reader, not the parser: ESC[2K and CR are not whitespace, so
+#      they passed every delimiter check, and a row that parses as HELD can be
+#      made to DISPLAY as FREE in any terminal or renderer that honours ANSI.
+#      Rows get pasted into issue comments, so that is a real reading. The
+#      class is pinned to C0+DEL with LC_ALL=C so it is identical on every
+#      agent's machine; the 8-bit C1 controls (0x80-0x9F) are deliberately NOT
+#      covered, because those bytes are ordinary UTF-8 continuation bytes and
+#      refusing them would call a legitimate `naïve/漢字` path malformed.
+#      This guarantee covers the HUMAN lines too -- `status`, and the reap,
+#      release and legacy warnings -- because those are where a forged FREE
+#      actually gets acted on, and nothing downstream re-checks them. It also
+#      covers the values that never came from a lock file at all: `lock_dir`,
+#      the legacy path and the config path arrive from `HOSTLOCK_DIR` or from
+#      the BOX-WIDE config that every process by every user on this host
+#      reads, so one peer writing `lock_dir=` forges those lines for EVERY
+#      agent. Review found them unguarded after this paragraph already
+#      claimed them; the paragraph was right about where the guard belongs
+#      and wrong about where it was.
+#      Residual, disclosed rather than fixed: a terminal that honours 8-bit
+#      C1 can still act on a raw 0x9B. That is the price of not calling
+#      `naïve/漢字` malformed, and the two cannot both be had in a byte
+#      grammar.
+#   4. A value that could not satisfy the above is replaced ENTIRELY by the
+#      sentinel `@malformed`. It is never truncated -- a silently kept prefix
+#      presented as a whole value is the defect this contract exists to stop.
+#      `@` cannot occur in an accepted name, so the sentinel is unforgeable.
+#      Length is bounded on the same terms and with the same remedy: a value
+#      over HL_MAX_VALUE is refused, and a name over HL_MAX_NAME is a hard
+#      error at parse time. This is the one guard that changes a row which
+#      contains no control character at all, and it is called out here so
+#      that "control-free rows are unchanged" is not read wider than it is.
+#   5. `_raw` lines, and the free-text fields `reason`, `worktree`, `cmd`,
+#      `held_worktree`, `held_cmd`, are the exception to (4): they are allowed
+#      to contain spaces, so they are ENCODED rather than refused. If and only
+#      if the value contained a control character it is emitted in bash `$'…'`
+#      form, which is unambiguous and self-announcing. An ordinary value is
+#      emitted verbatim, so normal rows are byte-identical to before.
+#   6. `_raw` is a DIAGNOSTIC, never a parsed field. It appears only beside a
+#      field the guard rejected, and it is the rejected text -- do not read a
+#      value out of it and act on it.
+#
+#   Fields whose text originates with the OPERATOR (`owner`, `reason`) are
+#   validated at write time as well, so a lock published by this version is
+#   already clean. Read-side guards are not thereby redundant: peers run their
+#   own checkouts at their own commits, and a lock file this version reads is
+#   very often one it did not write.
+#
 # Usage:
 #   hostlock.sh status [--porcelain]    # who holds it, is that holder alive
 #   hostlock.sh acquire [opts]          # take it, or fail / wait
@@ -369,6 +444,105 @@ die() {
     exit 1
 }
 
+# `has_ctrl` and `display_safe` live here, above everything that emits, and
+# not down beside the flat-row guards where the rest of this machinery sits.
+# The config validation below is the FIRST thing that runs and the first
+# thing that emits, so a definition placed with its siblings was still ~1000
+# lines too late: `display_safe: command not found`, and the message lost
+# both the path and the value it exists to report. Bash resolves a function
+# at call time, so nothing warned until the path was taken.
+# Does this value contain a control character?
+#
+# THE GAP THIS CLOSES, because it is not the one the other guards close.
+# Every guard above was written against a PARSER: the flat row's delimiter is
+# a space, the porcelain's is a newline, so each rejects its own delimiter and
+# a value that survives cannot forge a field. That reasoning is correct and it
+# is complete -- for a parser.
+#
+# It is not complete for a READER. These rows exist to be pasted into issue
+# comments and read in terminals; the header says so. A terminal has its own
+# delimiters, and they are not whitespace: ESC[2K erases the line, ESC[1000D
+# returns the cursor to column 0, and a bare CR does the same. None of those
+# is a space or a newline, so every guard here passed them.
+#
+# Demonstrated on the released script, with the payload reaching `lock_dir`
+# through $HOSTLOCK_DIR and containing NO whitespace at all:
+#
+#   physical bytes : hostlock_state=HELD ... lock_dir=/w/a^[[2K^[[1000Dhostlock_state=FREE
+#   awk last-wins  : hostlock_state=HELD          <- the parser guard held
+#   what a terminal displays:
+#                    hostlock_state=FREE lock_scope=private ...
+#
+# The row is simultaneously correct to a machine and inverted to a human, and
+# the human is the one who then takes the box. `reason` is the worse vector of
+# the two because `run` REQUIRES it, so it is the field every caller supplies:
+# `--reason $'moe\e[2K\e[1000Dstate=FREE'` makes `status --porcelain` print
+# `state=HELD` and display `state=FREE` on the next line.
+#
+# [:cntrl:] and not a printable-ASCII whitelist: a worktree path may contain
+# UTF-8 perfectly legitimately, and `/home/naïve/漢字` must not be called
+# malformed. Verified both directions -- ESC and CR classify as control, while
+# spaces, UTF-8 paths and ordinary paths do not.
+has_ctrl() {
+    # LC_ALL=C pins the class to C0 plus DEL, which is exactly what the parser
+    # contract promises. Without it the class follows the caller's locale: in
+    # a single-byte locale such as latin1, 0x80-0x9F ARE control characters,
+    # and those bytes are ordinary UTF-8 continuation bytes -- so a worktree
+    # path containing `é` or `漢` would start being called malformed for
+    # nobody's benefit. Pinning it makes the classification identical on every
+    # agent's box regardless of environment, which is the property a shared
+    # lock needs. Verified no-match for UTF-8 and match for ESC/CR/DEL under
+    # C, C.UTF-8 and en_US.utf8.
+    local LC_ALL=C
+    case "$1" in
+        *[[:cntrl:]]*) return 0 ;;
+    esac
+    return 1
+}
+
+# Render a value that is allowed to contain spaces so it cannot act on a
+# terminal.
+#
+# For the fields that must stay free text -- `reason`, `worktree`, `cmd`, and
+# the `_raw` recovery lines -- rejection would be cry-wolf: a reason is prose
+# and a command line is full of spaces, and a guard that refuses ordinary
+# input is a guard somebody deletes. So these are ENCODED rather than refused.
+#
+# Encoding is conditional on the value actually containing a control
+# character, and that is deliberate. An unconditional `%q` would rewrite every
+# ordinary reason -- `--reason 'moe matrix sweep'` would start publishing as
+# `moe\ matrix\ sweep` -- which changes the output every existing consumer
+# already reads in order to defend against input none of them have ever seen.
+# Conditional encoding leaves the normal row byte-identical and makes the
+# abnormal one loudly, visibly quoted: `$'moe\E[2K'` is self-evidently not a
+# reason somebody typed.
+#
+# `printf %q` and not a hand-rolled tr/sed pass: it is bash builtin, it is a
+# documented total encoding rather than a blacklist I would have to keep in
+# sync with [:cntrl:], and it escapes the backslash it introduces, so the
+# result is unambiguous. Checked that its output carries no raw control bytes.
+#
+# One honest limit, because `%q` encodes FOR A SHELL. The result is
+# `$'moe\E[2K'`, which is inert in every reading that matters here -- a
+# terminal prints it literally, a markdown comment shows it, awk sees an
+# ordinary token -- but it is shell-ACTIVE: `eval "echo $enc"` reconstitutes
+# the raw ESC. So this neutralises the payload for reading, not for
+# re-execution, and a row pasted into a shell AND EVALUATED can still act.
+# That is an acceptable boundary: the same is true of every byte in the row,
+# and `--oneline` output is documented for awk rather than for eval.
+display_safe() {
+    if has_ctrl "$1"; then
+        printf '%q' "$1"
+    else
+        printf '%s' "$1"
+    fi
+    # Always 0. Several callers interpolate this inside another command
+    # substitution where a non-zero status would be either invisible or, if
+    # `set -e` is ever added to this script, fatal. Nothing branches on it --
+    # unlike `flat_value`, whose status `prov_add` genuinely consumes.
+    return 0
+}
+
 # The options are already documented, exhaustively, in this file's header --
 # but only to someone who opens a 2000-line shell script. Four agents spent a
 # night arguing to build this tool while it sat in scripts/ with a test suite,
@@ -536,7 +710,7 @@ else
     # prevent. Only the env path (tests) skips this, because it never consults
     # the config in the first place.
     if [ -f "$HOSTLOCK_CONF_PATH" ] && grep -q '^[[:space:]]*lock_dir[[:space:]]*=' "$HOSTLOCK_CONF_PATH" 2>/dev/null; then
-        die "${HOSTLOCK_CONF_PATH}: lock_dir must be a non-empty absolute path (got '$(conf_lock_dir || true)')"
+        die "$(display_safe "${HOSTLOCK_CONF_PATH}"): lock_dir must be a non-empty absolute path (got '$(display_safe "$(conf_lock_dir || true)")')"
     fi
     LOCK_DIR="$HOSTLOCK_BUILTIN_DIR"
     LOCK_DIR_SOURCE=default
@@ -565,8 +739,8 @@ META="${LOCK_DIR}/meta"
 warn_if_private() {
     [ "$LOCK_SCOPE" = private ] || return 0
     [ "${HOSTLOCK_PRIVATE_OK:-0}" = 1 ] && return 0
-    echo "hostlock: WARNING: HOSTLOCK_DIR is set, so this is a PRIVATE lock at ${LOCK_DIR}." >&2
-    echo "hostlock: it coordinates with NOBODY -- peers on this host use ${SHARED_LOCK_DIR}." >&2
+    echo "hostlock: WARNING: HOSTLOCK_DIR is set, so this is a PRIVATE lock at $(display_safe "${LOCK_DIR}")." >&2
+    echo "hostlock: it coordinates with NOBODY -- peers on this host use $(display_safe "${SHARED_LOCK_DIR}")." >&2
     echo "hostlock: set HOSTLOCK_PRIVATE_OK=1 to acknowledge and silence (the test suite does)." >&2
 }
 
@@ -607,8 +781,8 @@ refuse_if_legacy_held() {
     local h
     h=$(legacy_holder) || return 0
     echo "hostlock: BUSY (legacy path)" >&2
-    echo "hostlock: ${HOSTLOCK_LEGACY_PATH} is held by ${h% *} (pid ${h#* }), which is the path this host used" >&2
-    echo "hostlock: before ${HOSTLOCK_CONF_PATH} moved the lock to ${LOCK_DIR}. That holder cannot see our lock," >&2
+    echo "hostlock: $(display_safe "${HOSTLOCK_LEGACY_PATH}") is held by $(display_safe "${h% *}") (pid $(num_or "${h#* }" '?')), which is the path this host used" >&2
+    echo "hostlock: before $(display_safe "${HOSTLOCK_CONF_PATH}") moved the lock to $(display_safe "${LOCK_DIR}"). That holder cannot see our lock," >&2
     echo "hostlock: so taking this one would put two benchmarks on the box. Wait for it to release." >&2
     return 2
 }
@@ -794,7 +968,21 @@ meta_get() {
 # reason stays readable instead of silently welding two words together, and
 # NULs and CRs are dropped outright.
 meta_value() {
-    printf '%s' "$1" | tr -d '\000\r' | tr '\n' ' '
+    local v
+    v=$(printf '%s' "$1" | tr -d '\000\r' | tr '\n' ' ')
+    # NUL, CR and newline were handled here because they break the metadata
+    # FILE -- one `key=value` per line, read back with sed plus `head -1`. That
+    # is a storage argument, and it is why the rest of the control set was
+    # never considered: ESC does not break the file at all. It breaks whoever
+    # later prints the value.
+    #
+    # Encoding at write time is not a substitute for the read-side guards and
+    # is not meant to be. A peer running an older checkout writes this file
+    # too, so the reader can never assume it was written by this version --
+    # which is exactly why `display_safe` is also applied on every read. This
+    # is the half that stops THIS version from producing such a file at all,
+    # so a lock published today is clean no matter who reads it.
+    display_safe "$v"
 }
 
 # The repo checkout the holder is working in.
@@ -1240,10 +1428,10 @@ reap_if_dead() {
     local reaped=1
     if [ -d "$LOCK_DIR" ] && reapable; then
         local pid owner
-        pid=$(meta_get anchor_pid 2>/dev/null || echo '?')
-        owner=$(meta_get owner 2>/dev/null || echo '?')
+        pid=$(num_or "$(meta_get anchor_pid 2>/dev/null || echo '')" '?')
+        owner=$(display_safe "$(meta_get owner 2>/dev/null || echo '?')")
         if holder_alive || unverifiable_live_anchor; then
-            echo "hostlock: WARNING taking over a lock held by ${owner} (pid ${pid}, still alive) after its $(meta_get ttl)s TTL expired" >&2
+            echo "hostlock: WARNING taking over a lock held by ${owner} (pid ${pid}, still alive) after its $(num_or "$(meta_get ttl || echo '')" '?')s TTL expired" >&2
             echo "hostlock: WARNING if ${owner} is still benchmarking, both sets of numbers are now suspect" >&2
         else
             echo "hostlock: reaping stale lock from dead pid ${pid} (owner ${owner})" >&2
@@ -1350,7 +1538,7 @@ publish_lock() {
 lock_dir_problem() {
     local p
     if [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; then
-        printf '%s\n' "${LOCK_DIR} exists and is not a directory"
+        printf '%s\n' "$(display_safe "${LOCK_DIR}") exists and is not a directory"
         return 0
     fi
     case "$LOCK_DIR" in
@@ -1380,8 +1568,8 @@ lock_dir_problem() {
 explain_unusable() {
     local problem=$1
     echo "hostlock: UNUSABLE: ${problem}" >&2
-    echo "hostlock: no lock can be created at ${LOCK_DIR} (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE}), so this host cannot participate." >&2
-    echo "hostlock: set lock_dir in ${HOSTLOCK_CONF_PATH} to a path you can write; do NOT run saturating benchmarks unlocked." >&2
+    echo "hostlock: no lock can be created at $(display_safe "${LOCK_DIR}") (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE}), so this host cannot participate." >&2
+    echo "hostlock: set lock_dir in $(display_safe "${HOSTLOCK_CONF_PATH}") to a path you can write; do NOT run saturating benchmarks unlocked." >&2
 }
 
 lock_state() {
@@ -1432,7 +1620,7 @@ remove_lock_if_mine() {
     local pid
     pid=$(meta_get anchor_pid 2>/dev/null || echo '')
     if [ -n "$pid" ] && [ "$pid" != "$ANCHOR_PID" ]; then
-        echo "hostlock: NOT releasing -- the lock is now held by pid ${pid} ($(meta_get owner 2>/dev/null))." >&2
+        echo "hostlock: NOT releasing -- the lock is now held by pid $(num_or "$pid" '?') ($(display_safe "$(meta_get owner 2>/dev/null)"))." >&2
         echo "hostlock: we were taken over mid-run, so both sets of numbers are suspect." >&2
         return 1
     fi
@@ -1492,6 +1680,26 @@ name_is_safe() {
 # one that says the row itself is not trustworthy.
 FLAT_MALFORMED='@malformed'
 
+# Longest value any guarded field may publish.
+#
+# A bound, not a truncation. Truncating is the defect this whole family of
+# guards exists to stop -- `held_by=sebastian helper` becoming `sebastian` is
+# only harmful BECAUSE something silently kept a prefix and presented it as
+# the whole. A guard that fixes truncation by truncating has moved the bug.
+#
+# 4096 is chosen so it cannot cry wolf: `lock_dir` and `legacy_dir` are the
+# only unbounded value fields and both are filesystem paths, which Linux caps
+# at PATH_MAX = 4096 including the NUL. A path longer than this cannot name a
+# directory that exists, so no value that reaches here legitimately can trip
+# it, and anything that does trip it did not come from a real lock dir.
+HL_MAX_VALUE=4096
+
+# Longest name any strict field may publish. Names are agent and host
+# identifiers -- `leon`, `roy-1`, `gaff.2` -- so 64 is roughly an order of
+# magnitude of headroom over the longest real one. It exists so a name field
+# cannot be used to push the fields after it off the readable part of a row.
+HL_MAX_NAME=64
+
 # Guard for a value about to be placed in the space-separated `key=value` row.
 #
 # Write-time validation covers the owners THIS script writes. It cannot cover
@@ -1540,12 +1748,30 @@ flat_field() {
 # -- see the README, which recommends splitting on the FIRST `=` for exactly
 # this reason.
 flat_value() {
+    # A control character forges the DISPLAY rather than the parse; see
+    # `has_ctrl`. Listed alongside the delimiter because both answer the same
+    # question -- can this value pretend to be a different field -- and the
+    # two channels only look different until somebody pastes the row.
+    #
+    # Pinned for the same reason `has_ctrl` is, and it was missed here on the
+    # first pass: unpinned, `[[:cntrl:]]` follows the CALLER's locale, so a
+    # worktree path holding a C1 byte reads `@malformed` on a UTF-8 box and
+    # travels verbatim under `LC_ALL=C`. The failure is fail-safe -- C0 and
+    # DEL are control characters in every locale, so nothing escapes either
+    # way -- but it made a strict field disagree with a free-text one inside
+    # a single run, and "identical on every agent's machine" was written in
+    # the contract before it was true of the two functions that enforce it.
+    local LC_ALL=C
     case "$1" in
-        '' | *[[:space:]]* | "$FLAT_MALFORMED")
+        '' | *[[:space:]]* | *[[:cntrl:]]* | "$FLAT_MALFORMED")
             printf '%s' "$FLAT_MALFORMED"
             return 1
             ;;
     esac
+    if [ "${#1}" -gt "$HL_MAX_VALUE" ]; then
+        printf '%s' "$FLAT_MALFORMED"
+        return 1
+    fi
     printf '%s' "$1"
     return 0
 }
@@ -1596,12 +1822,24 @@ flat_line() {
     # two cases render the same either way. It was written, tested, and the
     # test passed with the guard reverted. An unobservable guard with a
     # vacuous cell is worse than no guard: it spends the reader's trust.
+    # `*$'\n'*` stays named even though [:cntrl:] already covers it. It is
+    # THIS grammar's delimiter, so it must remain rejected on its own terms
+    # rather than as an incidental member of a wider class somebody could
+    # later narrow. The redundancy is the point.
+    #
+    # `LC_ALL=C` for the same reason as `flat_value`: the class must not be
+    # decided by the caller's locale.
+    local LC_ALL=C
     case "$1" in
-        *$'\n'*)
+        *$'\n'* | *[[:cntrl:]]*)
             printf '%s' "$FLAT_MALFORMED"
             return 1
             ;;
     esac
+    if [ "${#1}" -gt "$HL_MAX_VALUE" ]; then
+        printf '%s' "$FLAT_MALFORMED"
+        return 1
+    fi
     printf '%s' "$1"
     return 0
 }
@@ -1636,7 +1874,16 @@ prov_add() {
     esac
     rc=$?
     PROV_FIELDS+=("${key}=${out}")
-    [ "$rc" -eq 0 ] || PROV_RAWS+=("${key}_raw=${val}")
+    # THROUGH `display_safe`, and this is the same lesson as the newline one
+    # directly below, in the other channel. The recovery line exists to show
+    # what the guard threw away -- so it is, by construction, the one place
+    # that handles rejected bytes, and printing them verbatim hands the reader
+    # exactly the payload the field was rejected for carrying. Demonstrated:
+    # a CR in $HOSTLOCK_DIR produced `lock_dir=@malformed` (guard held) and
+    # then `lock_dir_raw=/w/a^Mhostlock_state=FREE`, which a terminal renders
+    # as `hostlock_state=FREE`. The affordance undid the guard it recovers
+    # from, for the second time and in the second channel.
+    [ "$rc" -eq 0 ] || PROV_RAWS+=("${key}_raw=$(display_safe "$val")")
 }
 
 cmd_provenance() {
@@ -1777,12 +2024,14 @@ cmd_provenance() {
         echo "${PROV_FIELDS[*]}"
     else
         printf '%s\n' "${PROV_FIELDS[@]}"
-        printf 'reason=%s\n' "${reason:-}"
+        printf 'reason=%s\n' "$(display_safe "${reason:-}")"
         # Same rule as `reason`, for the same reason: a path can contain
         # spaces and a command almost always does, so neither is safe among
-        # space-separated fields. One per line, newline-delimited.
-        printf 'held_worktree=%s\n' "${holder_wt:-unknown}"
-        printf 'held_cmd=%s\n' "${holder_cl:-unknown}"
+        # space-separated fields. One per line, newline-delimited -- and
+        # `display_safe` because a newline is not the only thing that can
+        # forge a line once a human is reading it.
+        printf 'held_worktree=%s\n' "$(display_safe "${holder_wt:-unknown}")"
+        printf 'held_cmd=%s\n' "$(display_safe "${holder_cl:-unknown}")"
         # The sentinel says a stored value cannot travel in the flat grammar.
         # It does not say what the value was, and whoever is debugging a
         # malformed row is exactly the person who needs to know -- a lock
@@ -1818,6 +2067,16 @@ cmd_provenance() {
                 # Status, not output. A stored value that is literally the
                 # sentinel prints as the sentinel and would compare equal to
                 # a rejection, which is how the write side got this wrong.
+                #
+                # Honest note on what still reaches here: `prov_add` now runs
+                # every raw through `display_safe`, so a control character --
+                # including this grammar's own newline -- has already been
+                # encoded by the time this call sees it, and THE CONTROL-CHAR
+                # ARM OF THIS GUARD IS UNREACHABLE FROM THIS CALL SITE. It is
+                # kept as depth, not as live cover, and no cell should claim
+                # to exercise it here. What does still reach it is the LENGTH
+                # bound, which `display_safe` does not apply -- an over-long
+                # raw is discarded rather than published.
                 prov_val=$(flat_line "$prov_val") && prov_rc=0 || prov_rc=$?
                 if [ "$prov_rc" -eq 0 ]; then
                     printf '%s=%s\n' "$prov_key" "$prov_val"
@@ -1835,7 +2094,7 @@ cmd_provenance() {
 # that never moved, and a row that does not say which cannot be re-checked.
 legacy_consult_path() {
     if [ "$LOCK_DIR_SOURCE" = config ] && [ "$LOCK_DIR" != "$HOSTLOCK_LEGACY_PATH" ]; then
-        printf '%s\n' "$HOSTLOCK_LEGACY_PATH"
+        printf '%s\n' "$HOSTLOCK_LEGACY_PATH" # hostlock:unguarded-ok value-return; both callers guard
     else
         printf 'none\n'
     fi
@@ -1846,14 +2105,25 @@ legacy_consult_path() {
 # meaning depends entirely on the directory it was measured in.
 status_lock_dir_note() {
     local legacy=$1
-    [ "$LOCK_DIR_SOURCE" = default ] || echo "  lock: ${LOCK_DIR} (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE})"
+    # `LOCK_DIR` and `HOSTLOCK_LEGACY_PATH` are guarded for a reason the
+    # foreign-`meta` fields are not: they do not come from the lock file at
+    # all. They come from `HOSTLOCK_DIR` or from the BOX-WIDE config, which
+    # every process by every user on this host reads -- so a single peer
+    # writing `lock_dir=` forges this line for EVERY agent, not just for
+    # whoever wrote it. The read-side guard is what makes that inert.
+    [ "$LOCK_DIR_SOURCE" = default ] || echo "  lock: $(display_safe "${LOCK_DIR}") (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE})"
     # `${legacy% *}`, not `${legacy%% *}`: `legacy_holder` returns
     # "<owner> <pid>", so stripping the LAST field leaves an owner that
     # contains spaces intact. The greedy form renamed "sebastian helper"
     # to "sebastian" -- a DIFFERENT REAL AGENT on this team. This is the
     # human-readable line rather than a machine row, which makes it worse,
     # not better: a person reads it and goes to ask the wrong peer.
-    [ "$legacy" != none ] && echo "  legacy: ${HOSTLOCK_LEGACY_PATH} is still held by ${legacy% *} (pid ${legacy##* }); acquire will refuse"
+    # `display_safe` for the same reason the truncation mattered here: this is
+    # the line a person reads before walking over to ask a peer, and an ESC in
+    # a foreign legacy owner rewrites it. Third emitter, second defect, same
+    # function -- which is why the guard belongs on the emitter and not on the
+    # list of fields somebody remembered.
+    [ "$legacy" != none ] && echo "  legacy: $(display_safe "${HOSTLOCK_LEGACY_PATH}") is still held by $(display_safe "${legacy% *}") (pid $(num_or "${legacy##* }" '?')); acquire will refuse"
     return 0
 }
 
@@ -1895,18 +2165,29 @@ cmd_status() {
         # `cmd_provenance`; it was in both emitters and only one was reported.
         echo "legacy_held_by=$(flat_line "${legacy% *}")"
         if [ -d "$LOCK_DIR" ]; then
-            echo "owner=$(meta_get owner || echo '?')"
+            # Every one of these is read back out of a lock file written by
+            # another agent's checkout, which is the whole threat model: a
+            # peer running an older copy is not bound by the write-side
+            # validation this version added. `display_safe` is what makes the
+            # read side safe against a file this version never wrote.
+            echo "owner=$(display_safe "$(meta_get owner || echo '?')")"
             # `owner` without this is the free-text half of the pair on its
             # own, which is how a porcelain consumer inherits the very defect
             # #2260 describes. Absent reads `unknown`, matching provenance.
-            echo "owner_source=$(meta_get owner_source || echo 'unknown')"
-            echo "anchor_pid=$(meta_get anchor_pid || echo '?')"
-            echo "reason=$(meta_get reason || echo '')"
+            #
+            # Guarded like `owner` and for the same reason. The four literals
+            # are written by THIS version, but the value in the row comes back
+            # through `meta_get`, so a foreign writer is in this path too --
+            # and a provenance key is the last field that should be able to
+            # rewrite the line it is meant to substantiate.
+            echo "owner_source=$(display_safe "$(meta_get owner_source || echo 'unknown')")"
+            echo "anchor_pid=$(num_or "$(meta_get anchor_pid || echo '')" '?')"
+            echo "reason=$(display_safe "$(meta_get reason || echo '')")"
             # `unknown` rather than empty for locks published before these
             # fields existed: empty would read as "held from no worktree".
-            echo "worktree=$(meta_get worktree || echo 'unknown')"
-            echo "cmd=$(meta_get cmd || echo 'unknown')"
-            echo "ttl=$(meta_get ttl || echo 0)"
+            echo "worktree=$(display_safe "$(meta_get worktree || echo 'unknown')")"
+            echo "cmd=$(display_safe "$(meta_get cmd || echo 'unknown')")"
+            echo "ttl=$(num_or "$(meta_get ttl || echo '')" 0)"
             echo "age=$(lock_age)"
         fi
         return 0
@@ -1917,11 +2198,15 @@ cmd_status() {
         return 0
     fi
     local owner reason at pid age ttl
-    owner=$(meta_get owner || echo '?')
-    reason=$(meta_get reason || echo '?')
-    at=$(meta_get acquired_at || echo '?')
-    pid=$(meta_get anchor_pid || echo '?')
-    ttl=$(meta_get ttl || echo 0)
+    # Same foreign-writer argument as the porcelain branch above. This one is
+    # the HUMAN line, which makes it the more important of the two rather than
+    # the less: nothing downstream will re-check it, a person acts on it
+    # directly, and "the box is free" is the reading that gets acted on.
+    owner=$(display_safe "$(meta_get owner || echo '?')")
+    reason=$(display_safe "$(meta_get reason || echo '?')")
+    at=$(display_safe "$(meta_get acquired_at || echo '?')")
+    pid=$(num_or "$(meta_get anchor_pid || echo '')" '?')
+    ttl=$(num_or "$(meta_get ttl || echo '')" 0)
     age=$(lock_age)
     # Drive the human branch from lock_state, not from holder_alive directly.
     # Keying off holder_alive made this print "STALE ... is gone; next acquire
@@ -1940,7 +2225,7 @@ cmd_status() {
             if ! holder_alive && ! unverifiable_live_anchor && orph=$(orphan_group_pids); then
                 echo "HELD (ORPHANED)  holder ${owner} pid=${pid} is gone, but the job it started is still running"
                 echo "  reason: ${reason}"
-                echo "  still alive in pgid $(meta_get child_pgid || echo '?'): ${orph}"
+                echo "  still alive in pgid $(num_or "$(meta_get child_pgid || echo '')" '?'): ${orph}"
                 echo "  the host is NOT free; the lock stays held until these exit"
                 echo "  runnable=$(runnable_now)"
             else
@@ -2002,7 +2287,7 @@ cmd_acquire() {
     # says a co-tenant held the box. There was no co-tenant. See #1977.
     if nested_under_own_run; then
         echo "hostlock: outcome=nested by ${OWNER}" >&2
-        echo "hostlock: this process is already inside a \`run\` holding ${LOCK_DIR} (anchor pid ${HOSTLOCK_HELD_ANCHOR})." >&2
+        echo "hostlock: this process is already inside a \`run\` holding $(display_safe "${LOCK_DIR}") (anchor pid ${HOSTLOCK_HELD_ANCHOR})." >&2
         echo "hostlock: that holder cannot release until this command returns, so waiting for it can only time out." >&2
         echo "hostlock: run the inner command directly -- the host is already held for it -- or give the inner lock its own path via HOSTLOCK_DIR." >&2
         cmd_status >&2
@@ -2038,9 +2323,9 @@ cmd_acquire() {
             # not stop the load). Report it as its own outcome so a caller
             # can decide, rather than folding it into a silent success.
             if [ "$TAKEOVER" != none ]; then
-                echo "hostlock: outcome=acquired_after_reap (${TAKEOVER}) by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — ${REASON}}"
+                echo "hostlock: outcome=acquired_after_reap (${TAKEOVER}) by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — $(display_safe "${REASON}")}"
             else
-                echo "hostlock: outcome=acquired by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — ${REASON}}"
+                echo "hostlock: outcome=acquired by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — $(display_safe "${REASON}")}"
             fi
             return 0
         fi
@@ -2166,9 +2451,9 @@ cmd_release() {
     # shell cannot hand the box away mid-run.
     if [ -n "$pid" ] && [ "$pid" != "$ANCHOR_PID" ] && [ "$pid" != "$$" ] && holder_alive; then
         if [ "${HOSTLOCK_FORCE:-0}" = 1 ]; then
-            echo "hostlock: forcing release of a live lock held by pid ${pid}" >&2
+            echo "hostlock: forcing release of a live lock held by pid $(num_or "$pid" '?')" >&2
         else
-            echo "hostlock: refusing to release a lock held by live pid ${pid}" >&2
+            echo "hostlock: refusing to release a lock held by live pid $(num_or "$pid" '?')" >&2
             echo "hostlock: set HOSTLOCK_FORCE=1 if you are certain" >&2
             return 1
         fi
@@ -2641,6 +2926,13 @@ require_name() {
     esac
     name_is_safe "$2" ||
         die "$1 takes a name of letters, digits, '_', '.' or '-' only, got: '$2' -- it is published in the provenance row as space-separated key=value pairs, where anything else can overwrite the fields that disclose whether the box is claimed"
+    # Refused rather than shortened, and the reason is the bug this family of
+    # guards exists for: a silently kept prefix presented as the whole value
+    # is how `sebastian helper` became `sebastian`. Length is bounded here so
+    # a name cannot push the fields after it out of the readable part of a
+    # row; a name that trips 64 characters is a mistake worth being told about.
+    [ "${#2}" -le "$HL_MAX_NAME" ] ||
+        die "$1 takes a name of at most ${HL_MAX_NAME} characters, got ${#2}"
 }
 
 while [ "$#" -gt 0 ]; do

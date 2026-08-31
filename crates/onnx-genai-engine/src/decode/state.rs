@@ -37,7 +37,166 @@ pub(crate) struct DecodeState {
     pub(super) test_runner_marker: bool,
 }
 
+/// Owned snapshot of the fixed loop-carried bindings that do not have a
+/// position-addressable KV representation.
+///
+/// The transaction layer deliberately treats these separately from paged KV:
+/// a recurrent/convolution state cannot be recovered by merely rewinding a
+/// token cursor.
+pub(crate) struct FixedLoopStateSnapshot {
+    values: HashMap<String, Value>,
+}
+
+/// The non-KV portion of a decode turn baseline.
+///
+/// Paged KV is owned by the engine and is snapshotted by its sequence position;
+/// this object owns the state that has no position in that page table. Keeping
+/// them together prevents a caller from restoring KV while accidentally
+/// retaining a newer recurrent or convolution state.
+pub(crate) struct DecodeTurnBaseline {
+    fixed_loop_state: FixedLoopStateSnapshot,
+    next_positions: Option<Vec<i64>>,
+    #[cfg(feature = "native-backend")]
+    recurrent: Option<crate::native_decode::RecurrentStateSnapshot>,
+}
+
 impl DecodeState {
+    pub(crate) fn fixed_state_names(&self) -> Vec<String> {
+        let mut names = self
+            .io
+            .state_pairs
+            .iter()
+            .map(|(input, _)| input.clone())
+            .collect::<Vec<_>>();
+        for name in self.loop_state.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Clone every mutable decoder value into a freshly constructed state for
+    /// a semantic session fork.
+    ///
+    /// `target` must come from the same engine/model configuration. Fixed
+    /// recurrent and convolution bindings are deep-cloned. A runner is admitted
+    /// only when it can export owned KV and the fresh runner can import it;
+    /// fixed shared-buffer/static-cache identities are refused before a child
+    /// sequence is created.
+    pub(crate) fn clone_for_session_fork(
+        &self,
+        mut target: DecodeState,
+        materialized_len: usize,
+        participant: &str,
+        backend: &str,
+    ) -> anyhow::Result<DecodeState> {
+        if self.has_test_runner_marker() {
+            anyhow::bail!(
+                "cannot fork participant '{participant}' state type 'runner-backed test backend' \
+                 on backend '{backend}': the backend declares no independent clone/import \
+                 capability"
+            );
+        }
+        if self.use_kv {
+            let actual = self.current_kv_len();
+            anyhow::ensure!(
+                actual == materialized_len,
+                "cannot fork participant '{participant}' on backend '{backend}': decoder KV \
+                 materialization is at token {actual}, but the committed semantic baseline is at \
+                 token {materialized_len}; materialize the complete committed prefix first"
+            );
+        }
+
+        let mut loop_state = HashMap::with_capacity(self.loop_state.len());
+        for (name, value) in &self.loop_state {
+            loop_state.insert(
+                name.clone(),
+                clone_value(value).with_context(|| {
+                    format!(
+                        "cannot fork participant '{participant}' fixed state '{name}' with dtype \
+                         {:?} on backend '{backend}'",
+                        value.dtype()
+                    )
+                })?,
+            );
+        }
+
+        match (&self.runner, &mut target.runner) {
+            (None, None) => {
+                let mut past = HashMap::with_capacity(self.past.len());
+                for (name, value) in &self.past {
+                    past.insert(
+                        name.clone(),
+                        clone_value(value).with_context(|| {
+                            format!(
+                                "cannot fork participant '{participant}' KV tensor '{name}' with \
+                                 dtype {:?} on backend '{backend}'",
+                                value.dtype()
+                            )
+                        })?,
+                    );
+                }
+                target.past = past;
+                target.kv_len = self.kv_len;
+            }
+            (Some(DecodeRunner::PastPresent(source)), Some(DecodeRunner::PastPresent(target))) => {
+                if source.mode() != DecodeKvMode::ZeroCopyRebind
+                    || target.mode() != DecodeKvMode::ZeroCopyRebind
+                {
+                    anyhow::bail!(
+                        "cannot fork participant '{participant}' state type \
+                         'past-present shared-buffer KV' on backend '{backend}': the runner owns \
+                         fixed mutable buffers with no independent export/import path; configure \
+                         zero-copy rebind KV or use a backend that implements semantic clone"
+                    );
+                }
+                if materialized_len > 0 {
+                    let exported = source.export_kv().with_context(|| {
+                        format!(
+                            "cannot export participant '{participant}' from backend '{backend}'"
+                        )
+                    })?;
+                    target
+                        .import_kv(materialized_len, exported)
+                        .with_context(|| {
+                            format!(
+                                "cannot import participant '{participant}' into an independent \
+                             backend '{backend}' runner"
+                            )
+                        })?;
+                }
+            }
+            (Some(DecodeRunner::StaticCache(_)), Some(DecodeRunner::StaticCache(_))) => {
+                anyhow::bail!(
+                    "cannot fork participant '{participant}' state type 'indexed static-cache \
+                     buffers' on backend '{backend}': the runner exposes a rewind cursor but no \
+                     independent buffer clone/import operation"
+                );
+            }
+            #[cfg(feature = "native-backend")]
+            (Some(DecodeRunner::Native(_)), Some(DecodeRunner::Native(_))) => {
+                anyhow::bail!(
+                    "cannot fork participant '{participant}' state type 'native decoder KV and \
+                     recurrent state' on backend '{backend}': native per-session snapshot/import \
+                     is not implemented"
+                );
+            }
+            _ => {
+                anyhow::bail!(
+                    "cannot fork participant '{participant}' on backend '{backend}': source and \
+                     child decoder state resolved different runner types"
+                );
+            }
+        }
+
+        target.loop_state = loop_state;
+        target.next_positions = self.next_positions.clone();
+        target.retained_kv_len = self.retained_kv_len;
+        Ok(target)
+    }
+
     /// Construct decode state from metadata or unambiguous tensor shapes.
     pub(crate) fn new_with_io(
         session: &dyn GraphIo,
@@ -442,6 +601,95 @@ impl DecodeState {
             .and_then(DecodeRunner::native_recurrent_mut)
     }
 
+    pub(crate) fn snapshot_fixed_loop_state(&self) -> anyhow::Result<FixedLoopStateSnapshot> {
+        let mut values = HashMap::with_capacity(self.loop_state.len());
+        for (name, value) in &self.loop_state {
+            values.insert(name.clone(), clone_value(value)?);
+        }
+        Ok(FixedLoopStateSnapshot { values })
+    }
+
+    pub(crate) fn restore_fixed_loop_state(
+        &mut self,
+        snapshot: &FixedLoopStateSnapshot,
+    ) -> anyhow::Result<()> {
+        let mut values = HashMap::with_capacity(snapshot.values.len());
+        for (name, value) in &snapshot.values {
+            values.insert(name.clone(), clone_value(value)?);
+        }
+        self.loop_state = values;
+        Ok(())
+    }
+
+    /// Rewind a runner while restoring fixed bindings from an atomic-turn
+    /// baseline. The ordinary public rewind refuses this because it cannot
+    /// reconstruct the erased bindings; the transaction holds that snapshot.
+    pub(crate) fn rewind_runner_to_fixed_baseline(
+        &mut self,
+        target_len: usize,
+        snapshot: &FixedLoopStateSnapshot,
+    ) -> anyhow::Result<()> {
+        let current = std::mem::take(&mut self.loop_state);
+        let rewind = self.rewind_runner(target_len);
+        if let Err(error) = rewind {
+            self.loop_state = current;
+            return Err(error);
+        }
+        self.restore_fixed_loop_state(snapshot)
+    }
+
+    /// Capture the mutable decoder bindings that a position-only KV rewind
+    /// cannot reconstruct. This is performed at turn admission, before the
+    /// first decode/prefill mutation.
+    pub(crate) fn snapshot_turn_baseline(
+        &mut self,
+        kv_token_count: usize,
+    ) -> anyhow::Result<DecodeTurnBaseline> {
+        let fixed_loop_state = self.snapshot_fixed_loop_state()?;
+        #[cfg(not(feature = "native-backend"))]
+        let _ = kv_token_count;
+        #[cfg(feature = "native-backend")]
+        let recurrent = self
+            .native_recurrent_runner_mut()
+            .filter(|_| kv_token_count > 0)
+            .map(|runner| {
+                runner.snapshot_recurrent_state().with_context(|| {
+                    "cannot admit atomic turn: native recurrent state cannot be snapshotted; \
+                     expose a snapshot/restore implementation for this decoder before mutation"
+                })
+            })
+            .transpose()?;
+        Ok(DecodeTurnBaseline {
+            fixed_loop_state,
+            next_positions: self.next_positions.clone(),
+            #[cfg(feature = "native-backend")]
+            recurrent,
+        })
+    }
+
+    /// Restore an admitted turn's non-KV decode state after its KV sequence has
+    /// been rewound to `target_len`.
+    pub(crate) fn restore_turn_baseline(
+        &mut self,
+        target_len: usize,
+        baseline: &DecodeTurnBaseline,
+    ) -> anyhow::Result<()> {
+        if self.has_runner() {
+            self.rewind_runner_to_fixed_baseline(target_len, &baseline.fixed_loop_state)?;
+        } else {
+            self.restore_fixed_loop_state(&baseline.fixed_loop_state)?;
+        }
+        #[cfg(feature = "native-backend")]
+        if let Some(snapshot) = &baseline.recurrent {
+            let runner = self.native_recurrent_runner_mut().context(
+                "cannot abort atomic turn: the native recurrent decoder participant disappeared",
+            )?;
+            runner.restore_recurrent_state(snapshot)?;
+        }
+        self.next_positions = baseline.next_positions.clone();
+        Ok(())
+    }
+
     /// Length-aware primitive behind [`rewind_kv`](Self::rewind_kv). Private:
     /// production callers go through `rewind_kv`, which passes
     /// `self.current_kv_len()` so `current_len` can never disagree with the
@@ -777,6 +1025,39 @@ mod tests {
                     .truncate_past(3, 2)
                     .expect("declining is not an error")
             );
+        }
+
+        #[test]
+        fn atomic_baseline_restores_fixed_loop_state_after_a_mutation() {
+            let mut state = state_with_past(3);
+            state.loop_state.insert(
+                "recurrent".to_string(),
+                Value::from_slice_f32(&[1.0, 2.0], &[2]).unwrap(),
+            );
+            state.next_positions = Some(vec![3]);
+            let baseline = state
+                .snapshot_turn_baseline(3)
+                .expect("the fixed-state participant snapshots at admission");
+
+            state.loop_state.insert(
+                "recurrent".to_string(),
+                Value::from_slice_f32(&[9.0, 9.0], &[2]).unwrap(),
+            );
+            state.loop_state.insert(
+                "newer".to_string(),
+                Value::from_slice_f32(&[3.0], &[1]).unwrap(),
+            );
+            state.next_positions = Some(vec![9]);
+            state
+                .restore_turn_baseline(3, &baseline)
+                .expect("an abort restores the admitted fixed-state baseline");
+
+            assert_eq!(state.loop_state.len(), 1);
+            assert_eq!(
+                state.loop_state["recurrent"].to_vec_f32().unwrap(),
+                vec![1.0, 2.0]
+            );
+            assert_eq!(state.next_positions, Some(vec![3]));
         }
 
         #[test]

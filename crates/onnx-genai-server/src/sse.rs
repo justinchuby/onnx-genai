@@ -2,6 +2,10 @@ use std::convert::Infallible;
 
 use anyhow::Context;
 use axum::response::sse::Event;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use onnx_genai_engine::pipeline::{
+    OutputFinality, TurnAbortReason, TypedRevisionOperation, WorkflowOutputPublication,
+};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
@@ -153,6 +157,147 @@ pub(crate) async fn send_completion_stream_chunk(
     tx.send(Ok(Event::default().data(serde_json::to_string(&chunk)?)))
         .await
         .context("stream receiver closed")
+}
+
+/// Render a transport-neutral publication into a buffered JSON representation.
+///
+/// This is intentionally a mechanical encoding: identity, ordering, revision
+/// lineage, and finality are already decided by the workflow runtime. Tensor
+/// bytes retain their dtype and shape instead of being interpreted as server
+/// text or a server-specific semantic event.
+pub(crate) fn buffered_workflow_publication(
+    publication: &WorkflowOutputPublication,
+) -> anyhow::Result<serde_json::Value> {
+    fn finality(finality: OutputFinality) -> &'static str {
+        match finality {
+            OutputFinality::Provisional => "provisional",
+            OutputFinality::Final => "final",
+        }
+    }
+    fn operation(operation: TypedRevisionOperation) -> &'static str {
+        match operation {
+            TypedRevisionOperation::Append => "append",
+            TypedRevisionOperation::Replace => "replace",
+            TypedRevisionOperation::Retract => "retract",
+            TypedRevisionOperation::Finalize => "finalize",
+        }
+    }
+    fn abort_reason(reason: TurnAbortReason) -> &'static str {
+        match reason {
+            TurnAbortReason::ExecutionFailure => "execution_failure",
+            TurnAbortReason::Cancellation => "cancellation",
+            TurnAbortReason::CommitFailure => "commit_failure",
+        }
+    }
+    fn payload(value: &onnx_genai_ort::Value) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "dtype": format!("{:?}", value.dtype()),
+            "shape": value.shape(),
+            "bytes": STANDARD.encode(value.to_raw_bytes()?),
+        }))
+    }
+
+    match publication {
+        WorkflowOutputPublication::Materialized {
+            output,
+            operation: publication_operation,
+            payload: publication_payload,
+            finality: publication_finality,
+        } => Ok(serde_json::json!({
+            "output": output,
+            "operation": operation(*publication_operation),
+            "payload": payload(publication_payload)?,
+            "finality": finality(*publication_finality),
+        })),
+        WorkflowOutputPublication::Event {
+            output,
+            stream,
+            sequence,
+            payload: publication_payload,
+            finality: publication_finality,
+        } => Ok(serde_json::json!({
+            "output": output,
+            "stream": stream.0,
+            "sequence": sequence.0,
+            "operation": "event",
+            "payload": payload(publication_payload)?,
+            "finality": finality(*publication_finality),
+        })),
+        WorkflowOutputPublication::Revision(envelope) => Ok(serde_json::json!({
+            "version": envelope.version,
+            "transaction": envelope.transaction.0,
+            "output": envelope.output,
+            "stream": envelope.stream.0,
+            "sequence": envelope.sequence.0,
+            "revision": envelope.revision.0,
+            "lineage": envelope.lineage.0,
+            "base": envelope.base.0,
+            "operation": operation(envelope.operation),
+            "payload": envelope.payload.as_ref().map(payload).transpose()?,
+            "finality": finality(envelope.finality),
+        })),
+        WorkflowOutputPublication::TransactionCommitted {
+            transaction,
+            baseline,
+        } => Ok(serde_json::json!({
+            "operation": "commit",
+            "transaction": transaction.0,
+            "baseline": baseline.0,
+        })),
+        WorkflowOutputPublication::AbortToBaseline {
+            transaction,
+            baseline,
+            reason,
+            streams,
+        } => Ok(serde_json::json!({
+            "operation": "abort_to_baseline",
+            "transaction": transaction.0,
+            "baseline": baseline.0,
+            "reason": abort_reason(*reason),
+            "streams": streams.iter().map(|stream| serde_json::json!({
+                "output": stream.output,
+                "stream": stream.stream.0,
+                "head": stream.head,
+                "sequence": stream.sequence,
+                "lineage": stream.lineage,
+                "closed": stream.closed,
+            })).collect::<Vec<_>>(),
+        })),
+    }
+}
+
+/// Render the same semantic record for an SSE data field. Delivery failure from
+/// the caller of this function cannot change the already committed envelope.
+#[cfg(test)]
+pub(crate) fn sse_workflow_publication_data(
+    publication: &WorkflowOutputPublication,
+) -> anyhow::Result<String> {
+    serde_json::to_string(&buffered_workflow_publication(publication)?).map_err(Into::into)
+}
+
+#[cfg(test)]
+pub(crate) fn workflow_publication_event(
+    publication: &WorkflowOutputPublication,
+) -> anyhow::Result<Event> {
+    Ok(Event::default()
+        .event("workflow_output")
+        .data(sse_workflow_publication_data(publication)?))
+}
+
+pub(crate) async fn send_workflow_publications(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    publications: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    for publication in publications {
+        tx.send(Ok(Event::default()
+            .event("workflow_output")
+            .data(serde_json::to_string(publication)?)))
+            .await
+            .context(
+                "workflow output delivery failed after semantic commit; the committed turn remains durable and will not be replayed",
+            )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn completion_chunk(
@@ -359,7 +504,15 @@ pub(crate) fn done_chunk(
 
 #[cfg(test)]
 mod reasoning_wire_tests {
-    use super::{content_chunk, reasoning_chunk};
+    use super::{
+        buffered_workflow_publication, content_chunk, reasoning_chunk, send_workflow_publications,
+        sse_workflow_publication_data, workflow_publication_event,
+    };
+    use onnx_genai_engine::pipeline::{
+        OutputFinality, OutputLineage, OutputRevision, OutputSequence, OutputStreamBaseline,
+        OutputStreamId, TurnAbortReason, TurnBaselineId, TurnTransactionId, TypedRevisionEnvelope,
+        TypedRevisionOperation, WorkflowOutputPublication,
+    };
 
     // Reasoning rides on its own `reasoning_content` key and never touches
     // `content`, so an OpenAI-compatible client that ignores the extra field
@@ -384,5 +537,197 @@ mod reasoning_wire_tests {
         let json = serde_json::to_string(&chunk).expect("serialize");
         assert!(json.contains("\"content\":\"Hi\""), "{json}");
         assert!(!json.contains("reasoning_content"), "{json}");
+    }
+
+    #[test]
+    fn buffered_and_sse_adapters_preserve_revision_envelope_order_and_finality() {
+        let publication = |stream: &str, sequence, revision, lineage, base, operation, payload| {
+            WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
+                version: "1".to_string(),
+                transaction: TurnTransactionId(9),
+                output: "answer".to_string(),
+                stream: OutputStreamId(stream.to_string()),
+                sequence: OutputSequence(sequence),
+                revision: OutputRevision(revision),
+                lineage: OutputLineage(lineage),
+                base: OutputLineage(base),
+                operation,
+                payload,
+                finality: OutputFinality::Final,
+            })
+        };
+        let payload =
+            |value| Some(onnx_genai_ort::Value::from_slice_i64(&[value], &[1]).expect("payload"));
+        let publications = [
+            publication(
+                "analysis",
+                1,
+                1,
+                1,
+                0,
+                TypedRevisionOperation::Append,
+                payload(1),
+            ),
+            publication(
+                "final",
+                1,
+                1,
+                1,
+                0,
+                TypedRevisionOperation::Replace,
+                payload(2),
+            ),
+            publication("final", 2, 2, 1, 1, TypedRevisionOperation::Finalize, None),
+            publication(
+                "analysis",
+                2,
+                2,
+                1,
+                1,
+                TypedRevisionOperation::Finalize,
+                None,
+            ),
+        ];
+        let buffered = publications
+            .iter()
+            .map(buffered_workflow_publication)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("buffered encoding");
+        let sse = publications
+            .iter()
+            .map(sse_workflow_publication_data)
+            .map(|encoded| {
+                encoded.and_then(|encoded| serde_json::from_str(&encoded).map_err(Into::into))
+            })
+            .collect::<anyhow::Result<Vec<serde_json::Value>>>()
+            .expect("SSE encoding");
+        assert_eq!(sse, buffered);
+        assert_eq!(buffered[0]["stream"], "analysis");
+        assert_eq!(buffered[1]["stream"], "final");
+        assert_eq!(buffered[2]["operation"], "finalize");
+        assert_eq!(buffered[3]["finality"], "final");
+        let _ = workflow_publication_event(&publications[0])
+            .expect("SSE event accepts the same envelope");
+    }
+
+    #[test]
+    fn sse_preserves_provisional_commit_and_abort_reconciliation_records() {
+        let revision = WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
+            version: "1".to_string(),
+            transaction: TurnTransactionId(15),
+            output: "answer".to_string(),
+            stream: OutputStreamId("analysis".to_string()),
+            sequence: OutputSequence(1),
+            revision: OutputRevision(1),
+            lineage: OutputLineage(1),
+            base: OutputLineage(0),
+            operation: TypedRevisionOperation::Append,
+            payload: Some(
+                onnx_genai_ort::Value::from_slice_i64(&[7], &[1]).expect("revision payload"),
+            ),
+            finality: OutputFinality::Provisional,
+        });
+        let committed = WorkflowOutputPublication::TransactionCommitted {
+            transaction: TurnTransactionId(15),
+            baseline: TurnBaselineId(15),
+        };
+        let aborted = WorkflowOutputPublication::AbortToBaseline {
+            transaction: TurnTransactionId(16),
+            baseline: TurnBaselineId(16),
+            reason: TurnAbortReason::Cancellation,
+            streams: vec![OutputStreamBaseline {
+                output: "answer".to_string(),
+                stream: OutputStreamId("analysis".to_string()),
+                head: 3,
+                sequence: 4,
+                lineage: 3,
+                closed: false,
+            }],
+        };
+
+        let commit_sequence = [&revision, &committed]
+            .into_iter()
+            .map(buffered_workflow_publication)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("commit sequence encodes");
+        assert_eq!(commit_sequence[0]["finality"], "provisional");
+        assert_eq!(commit_sequence[1]["operation"], "commit");
+        assert_eq!(commit_sequence[1]["transaction"], 15);
+
+        let abort_sequence = [&revision, &aborted]
+            .into_iter()
+            .map(sse_workflow_publication_data)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("abort sequence encodes");
+        let abort: serde_json::Value =
+            serde_json::from_str(&abort_sequence[1]).expect("abort is JSON");
+        assert_eq!(abort["operation"], "abort_to_baseline");
+        assert_eq!(abort["reason"], "cancellation");
+        assert_eq!(abort["streams"][0]["head"], 3);
+        assert!(
+            !abort_sequence
+                .iter()
+                .any(|event| event.contains("\"finality\":\"final\"")),
+            "an aborted provisional turn cannot gain success-shaped finality"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_commit_sse_disconnect_reports_delivery_without_replay() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let publications = vec![serde_json::json!({
+            "transaction": 9,
+            "output": "answer",
+            "stream": "analysis",
+            "sequence": 1,
+            "revision": 1,
+            "lineage": 1,
+            "operation": "append",
+            "finality": "final"
+        })];
+        let error = send_workflow_publications(&tx, &publications)
+            .await
+            .expect_err("a disconnected client must report delivery failure");
+        let message = format!("{error:#}");
+        assert!(message.contains("after semantic commit"), "{message}");
+        assert!(message.contains("will not be replayed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn post_commit_sse_backpressure_preserves_one_ordered_delivery() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(Ok(axum::response::sse::Event::default().data("earlier")))
+            .await
+            .expect("prime bounded transport");
+        let publications = vec![serde_json::json!({
+            "transaction": 9,
+            "output": "answer",
+            "stream": "final",
+            "sequence": 2,
+            "revision": 2,
+            "lineage": 1,
+            "operation": "finalize",
+            "finality": "final"
+        })];
+        let sender =
+            tokio::spawn(async move { send_workflow_publications(&tx, &publications).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !sender.is_finished(),
+            "bounded transport must apply backpressure"
+        );
+        let _earlier = rx
+            .recv()
+            .await
+            .expect("earlier event remains first")
+            .expect("earlier event is valid");
+        sender
+            .await
+            .expect("delivery task joins")
+            .expect("publication delivery resumes");
+        let delivered = rx.recv().await.expect("publication delivered once");
+        assert!(delivered.is_ok());
+        assert!(rx.try_recv().is_err(), "publication must not be replayed");
     }
 }

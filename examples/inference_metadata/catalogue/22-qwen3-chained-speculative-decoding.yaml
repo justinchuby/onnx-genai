@@ -2,78 +2,78 @@
 # consumes the previous token embedding, recycled hidden activation, and draft
 # KV state. Names in the schema remain model-agnostic; artifact paths identify
 # this concrete Qwen3 package.
-schema_version: v1
+schema_version: v1.6
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+    manifest: {}
     inputs:
       request.input_ids:
-        contract: {dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: runtime, version: '1.0', role: prompt_tokens}
         source: {kind: request}
         required: true
       request.active:
-        contract: {dtype: bool, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: active}
         required: true
       request.done:
-        contract: {dtype: bool, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: done}
         required: true
       request.accepted_len:
-        contract: {dtype: int64, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: int64, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: accepted_len}
         required: true
       request.target_cache:
-        contract: {dtype: float16, rank: 4, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: target_cache}
         required: true
       request.draft_cache:
-        contract: {dtype: float16, rank: 4, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: draft_cache}
         required: true
       request.recycled_hidden:
-        contract: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: recycled_hidden}
         required: true
     outputs:
       logits:
-        contract: {dtype: float16, rank: 3, shape: [batch, proposal, target_vocab], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, shape: [batch, proposal, target_vocab], batch_layout: {kind: request_aligned, axis: 0}}
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
     components:
       proposer:
         implementation: {kind: onnx, artifact: proposer/model.onnx.textproto}
         ports:
           inputs:
-            inputs_embeds: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
-            fused_hidden: {dtype: float16, rank: 3, shape: [batch, sequence, fused_hidden], batch_layout: {kind: request_aligned, axis: 0}}
-            recycled_hidden: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
-            past_key_values: {dtype: float16, rank: 4, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            inputs_embeds: {dtype: float16, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
+            fused_hidden: {dtype: float16, shape: [batch, sequence, fused_hidden], batch_layout: {kind: request_aligned, axis: 0}}
+            recycled_hidden: {dtype: float16, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
+            past_key_values: {dtype: float16, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
           outputs:
-            draft_logits: {dtype: float16, rank: 3, shape: [batch, sequence, draft_vocab], batch_layout: {kind: request_aligned, axis: 0}}
-            next_hidden: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
-            present_key_values: {dtype: float16, rank: 4, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            draft_logits: {dtype: float16, shape: [batch, sequence, draft_vocab], batch_layout: {kind: request_aligned, axis: 0}}
+            next_hidden: {dtype: float16, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
+            present_key_values: {dtype: float16, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
       verifier:
         implementation: {kind: onnx, artifact: verifier/model.onnx.textproto}
         ports:
           inputs:
-            input_ids: {dtype: int64, rank: 2, shape: [batch, proposal], batch_layout: {kind: request_aligned, axis: 0}}
-            past_key_values: {dtype: float16, rank: 4, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            input_ids: {dtype: int64, shape: [batch, proposal], batch_layout: {kind: request_aligned, axis: 0}}
+            past_key_values: {dtype: float16, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
           outputs:
-            logits: {dtype: float16, rank: 3, shape: [batch, proposal, target_vocab], batch_layout: {kind: request_aligned, axis: 0}}
-            present_key_values: {dtype: float16, rank: 4, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            logits: {dtype: float16, shape: [batch, proposal, target_vocab], batch_layout: {kind: request_aligned, axis: 0}}
+            present_key_values: {dtype: float16, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
           roles: {input_ids: token_ids, logits: logits}
     state:
       target_cache:
-        contract: {dtype: float16, rank: 4, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         scope: invocation
         initializer: request.target_cache
         recurrence: {kind: invariant}
@@ -81,7 +81,7 @@ pipeline:
         release_boundary: invocation
         service_group: target_cache
       draft_cache:
-        contract: {dtype: float16, rank: 4, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, shape: [batch, kv_heads, sequence, head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         scope: invocation
         initializer: request.draft_cache
         recurrence: {kind: invariant}
@@ -89,7 +89,7 @@ pipeline:
         release_boundary: invocation
         service_group: draft_cache
       recycled_hidden:
-        contract: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
         scope: invocation
         initializer: request.recycled_hidden
         recurrence: {kind: invariant}
@@ -149,6 +149,8 @@ pipeline:
               proposer:
                 recycled_hidden: {input: recycled_hidden, output: next_hidden}
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: proposer
   target: verifier
   proposal_execution:
@@ -160,8 +162,11 @@ speculative:
     - {state: recycled_hidden, input: recycled_hidden, output: next_hidden}
   port_bindings:
     target_hidden_context: fused_hidden
-  shared_weights: [target_embedding.f32]
+  shared_weights: [{component: verifier, initializer: target_embedding.f32}]
   vocabulary: {kind: mapped, artifact: draft_to_target.i64}
   max_proposal_width: 6
   distribution_preserving: true
+  verification:
+    target_output: {component: verifier, output: logits}
+    accepted_path: {kind: runtime, binding: accepted_prefix}
   rollback_state: [target_cache, draft_cache, recycled_hidden]

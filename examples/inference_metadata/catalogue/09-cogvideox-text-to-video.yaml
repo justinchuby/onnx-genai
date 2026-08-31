@@ -2,18 +2,11 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - nested_control_flow
-      - loop_induction_values
+    manifest: {}
     inputs:
       request.latent:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - 16
@@ -32,7 +25,6 @@ pipeline:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -46,7 +38,6 @@ pipeline:
       package.continue:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -58,7 +49,6 @@ pipeline:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - prompt_sequence
@@ -76,7 +66,6 @@ pipeline:
       video:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - 3
@@ -97,7 +86,6 @@ pipeline:
           inputs:
             sample:
               dtype: float32
-              rank: 5
               shape:
               - batch
               - 16
@@ -109,12 +97,10 @@ pipeline:
                 axis: 0
             step:
               dtype: int64
-              rank: 1
               shape:
               - 1
             encoder_hidden_states:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - prompt_sequence
@@ -125,7 +111,6 @@ pipeline:
           outputs:
             next_sample:
               dtype: float32
-              rank: 5
               shape:
               - batch
               - 16
@@ -143,7 +128,6 @@ pipeline:
           inputs:
             latent:
               dtype: float32
-              rank: 5
               shape:
               - batch
               - 16
@@ -156,7 +140,6 @@ pipeline:
           outputs:
             video:
               dtype: float32
-              rank: 5
               shape:
               - batch
               - 3
@@ -174,7 +157,6 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - prompt_sequence
@@ -184,7 +166,6 @@ pipeline:
           outputs:
             encoder_hidden_states:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - prompt_sequence
@@ -196,7 +177,6 @@ pipeline:
       latent:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - 16
@@ -230,7 +210,6 @@ pipeline:
         value: loop.iteration
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
       setup:

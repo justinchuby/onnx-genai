@@ -35,9 +35,9 @@ pub mod tiered;
 pub use backing_store::{DiskKvBackingStore, InMemoryKvBackingStore, KvBackingStore};
 pub use connector::{
     CachePriority, CompressionFormat, ConnectorCapabilities, ConnectorError, ConnectorHealth,
-    ConnectorResult, DEFAULT_CHUNK_SIZE, FetchedKv, KvCacheConnector, KvCacheKey, KvCacheLocation,
-    KvLayerPayload, KvPayload, KvPayloadDtype, KvStoreEntry, NullConnector, TokenChunk,
-    chunk_tokens, hash_tokens,
+    ConnectorResult, DEFAULT_CHUNK_SIZE, FetchedKv, KvCacheConnector, KvCacheIsolation, KvCacheKey,
+    KvCacheLocation, KvLayerPayload, KvPayload, KvPayloadDtype, KvStoreEntry, NullConnector,
+    TokenChunk, chunk_tokens, hash_tokens,
 };
 pub use fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8};
 pub use local_tiered::{DiskTierConfig, LocalTieredConfig, LocalTieredConnector};
@@ -56,6 +56,7 @@ pub use paged_index::{
 };
 pub use prefix_cache::PrefixCache;
 pub use telemetry::{Applicability, KvNotApplicable, KvTelemetry, KvTelemetrySnapshot};
+pub use tiered::{RuntimeTieringPolicy, StateStorageDisposition};
 
 /// Sequence identifier.
 pub type SequenceId = u64;
@@ -324,6 +325,19 @@ pub enum KvError {
     PageStoreWrongResidency { requested: Device, actual: Device },
     #[error("KV page store allocation failed: {0}")]
     PageStoreAllocationFailed(String),
+    #[error(
+        "cannot migrate state page {page_id} ({storage_types}) from {from:?} to {to:?} with \
+         backend '{backend}': {reason}; keep the current copy or configure a backend that \
+         supports this storage type and target"
+    )]
+    StateMigrationFailed {
+        page_id: PageId,
+        storage_types: String,
+        backend: &'static str,
+        from: Device,
+        to: Device,
+        reason: String,
+    },
     #[error("Invalid KV tensor shape: {0}")]
     InvalidTensorShape(&'static str),
     #[error("Unsupported KV dtype: {0}")]

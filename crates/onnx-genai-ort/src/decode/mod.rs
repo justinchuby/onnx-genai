@@ -241,21 +241,103 @@ impl BatchStepLogits {
     }
 }
 
+/// Owned admission-time baseline for one positional decode row.
+///
+/// The portable fields describe logical residency and activity. A backend with
+/// additional mutable row-owned participants attaches an opaque owned state
+/// value and restores it through the same trait that created the snapshot.
+pub struct BatchedRowSnapshot {
+    row: usize,
+    logical_len: usize,
+    active: bool,
+    backend_state: Option<Box<dyn std::any::Any>>,
+}
+
+impl std::fmt::Debug for BatchedRowSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BatchedRowSnapshot")
+            .field("row", &self.row)
+            .field("logical_len", &self.logical_len)
+            .field("active", &self.active)
+            .field("has_backend_state", &self.backend_state.is_some())
+            .finish()
+    }
+}
+
+impl BatchedRowSnapshot {
+    /// Build a row baseline whose complete backend state is represented by its
+    /// logical residency and activity.
+    pub fn new(row: usize, logical_len: usize, active: bool) -> Self {
+        Self {
+            row,
+            logical_len,
+            active,
+            backend_state: None,
+        }
+    }
+
+    /// Attach an owned backend-private participant to the portable row
+    /// baseline. Restore implementations downcast this only to the exact type
+    /// their snapshot implementation created.
+    pub fn with_backend_state<T: 'static>(
+        row: usize,
+        logical_len: usize,
+        active: bool,
+        state: T,
+    ) -> Self {
+        Self {
+            row,
+            logical_len,
+            active,
+            backend_state: Some(Box::new(state)),
+        }
+    }
+
+    /// Positional row this snapshot belongs to.
+    pub fn row(&self) -> usize {
+        self.row
+    }
+
+    /// Committed logical cache length captured at admission.
+    pub fn logical_len(&self) -> usize {
+        self.logical_len
+    }
+
+    /// Whether the row participated in shared forwards at admission.
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Borrow a backend-private snapshot participant by its exact type.
+    pub fn backend_state<T: 'static>(&self) -> Option<&T> {
+        self.backend_state.as_ref()?.downcast_ref()
+    }
+
+    /// Refuse accidental restoration into a different positional row.
+    pub fn validate_row(&self, row: usize) -> Result<()> {
+        if self.row != row {
+            return Err(OrtError::InvalidArgument(format!(
+                "batched row snapshot belongs to row {}, not requested row {row}",
+                self.row
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// KV-representation-agnostic operations a continuous-batch manager needs from a
 /// batched decode session.
 ///
 /// Both [`BatchedStaticCacheDecodeSession`] (TensorScatter static cache) and
 /// [`BatchedSharedBufferDecodeSession`] (past/present share-buffer GQA) implement
-/// this so the same `ContinuousBatchManager` can drive either backend; the native
-/// CUDA backend implements it in `onnx-genai-engine` over its host-logits seam.
+/// this so the same continuous-batch manager can drive either backend; native
+/// backends may implement it over an equivalent host-logits seam.
 ///
 /// Logits returned by `step_select`/`step_active` are per-row `Float32 [vocab]`
 /// rows carried by [`BatchStepLogits`]; `step_select` indexes them by physical
-/// batch slot (physical-row indexed), while `step_active` indexes them by active
-/// row in [`Self::active_rows`] order. The manager extracts a row with
-/// [`BatchStepLogits::take_row`], which is a copy on the ORT path and a move on
-/// the native path — neither backend is charged an extra logits copy to satisfy
-/// the shared signature.
+/// batch slot, while `step_active` indexes them by active row in
+/// [`Self::active_rows`] order.
 pub trait BatchedDecodeSession<'a> {
     /// Fixed number of physical batch rows.
     fn batch_size(&self) -> usize;
@@ -269,6 +351,14 @@ pub trait BatchedDecodeSession<'a> {
     fn deactivate_row(&mut self, row: usize) -> Result<()>;
     /// Reset a row's cursor to zero and mark it active for a new sequence.
     fn assign_row(&mut self, row: usize) -> Result<()>;
+    /// Capture every backend-owned mutable participant for one admitted row
+    /// before its first mutation. A backend that cannot restore all such state
+    /// must fail here so the caller can decline shared batching before the turn
+    /// starts.
+    fn snapshot_row(&mut self, row: usize) -> Result<BatchedRowSnapshot>;
+    /// Restore exactly one row to a snapshot produced by [`Self::snapshot_row`].
+    /// Healthy sibling rows must remain untouched.
+    fn restore_row(&mut self, row: usize, snapshot: &BatchedRowSnapshot) -> Result<()>;
     /// Advance one token for rows where `advance_rows[row]` is true and the row
     /// is active, returning physical-row-indexed `[vocab]` logits per slot.
     fn step_select(

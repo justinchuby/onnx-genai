@@ -76,18 +76,19 @@ pub struct InferenceMetadata {
     /// understand; it is not a compatibility guarantee spanning a reshape, and
     /// nothing here silently reads an old spelling as a new one. See
     /// `reject_flat_token_packed`.
+    ///
+    /// A component using `onnx-genai.token-context@1` declares at least
+    /// `v1.4`: the component-contract fields predate that version, so only the
+    /// version gate prevents a v1.3 reader from accepting the document while
+    /// silently ignoring the token-identity semantics.
+    ///
+    /// A DFlash flat-block proposal declares at least `v1.6`, so a v1.5 reader
+    /// refuses before ignoring its target-hidden provenance, probability, and
+    /// accepted-prefix state fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
 
-    /// Capability identifiers that a runtime MUST support or refuse to load the model.
-    #[serde(default)]
-    #[schemars(
-        extend("examples" = [["kv_cache", "grouped_query_attention"]]),
-        inner(length(min = 1))
-    )]
-    pub required_capabilities: Vec<String>,
-
-    /// Build-time model properties and runtime-configurable capabilities.
+    /// Build-time model properties and runtime-configurable facts.
     #[serde(default)]
     pub model: Option<ModelCapabilities>,
 

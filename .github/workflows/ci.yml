@@ -99,9 +99,9 @@ jobs:
           # part of the build, so a docs-only edit to one can break `cargo test`
           # while classifying as docs and skipping the very checks that would
           # catch it (#2077: renaming an HTML comment marker in
-          # docs/genai/INFERENCE_METADATA_DECISIONS.md panics
-          # capability_catalogue.rs, and dropping a table row fails its
-          # assert_eq -- both are pure markdown edits).
+          # docs/genai/METADATA_EXTENSION_REGISTRY.md makes
+          # extension_registry.rs fail its exact generated-content check --
+          # both are pure markdown edits).
           #
           # Derived by scanning rather than listed, so it cannot go stale when a
           # third embed is added (Rule 10). The scan is whole-file, not
@@ -223,6 +223,14 @@ jobs:
       # Deliberately unset elsewhere, so a contributor inside a 1-core container
       # still gets a stated skip instead of a red suite.
       NXRT_REQUIRE_PLACEMENT_TESTS: "1"
+      # Same asymmetry, for `kernels::matmul::x86_sgemm`'s AVX2 differential
+      # tests. Eleven of them opened with a bare `if !has_simd_x86() { return; }`
+      # -- a silent pass -- so a lane that lost AVX2, or anything setting
+      # `ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86=1`, turned all eleven into green
+      # no-ops at once, including the sole remaining falsifier for #1809's int4
+      # packing change. This lane is x86_64, so their silence is a defect here
+      # rather than a fact about somebody's laptop. See #1817.
+      NXRT_REQUIRE_SIMD_X86_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v5

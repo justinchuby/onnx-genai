@@ -456,12 +456,7 @@ fn state_seed_axes(
             continue;
         }
         seeds.insert(cell.initializer.clone(), axis);
-        if let Some(TensorDimension::Symbol(symbol)) = cell
-            .contract
-            .shape
-            .as_ref()
-            .and_then(|shape| shape.get(axis))
-        {
+        if let Some(TensorDimension::Symbol(symbol)) = cell.contract.shape.get(axis) {
             past.insert(symbol.clone());
         }
     }
@@ -479,10 +474,7 @@ fn bind_contract_symbols(
         .inputs
         .get(input)
         .with_context(|| format!("'{input}' is not a declared workflow input"))?;
-    let Some(contract_shape) = declared.contract.shape.as_ref() else {
-        return Ok(());
-    };
-    for (dimension, extent) in contract_shape.iter().zip(shape) {
+    for (dimension, extent) in declared.contract.shape.iter().zip(shape) {
         if let TensorDimension::Symbol(symbol) = dimension {
             symbols.insert(symbol.clone(), *extent);
         }
@@ -533,13 +525,10 @@ fn resolve_graph_symbols(
             let Some(input) = workflow.inputs.get(value) else {
                 continue;
             };
-            let Some(contract_shape) = input.contract.shape.as_ref() else {
-                continue;
-            };
             let Some(port_shape) = graph_input_shape(graph, port) else {
                 continue;
             };
-            for (dimension, extent) in contract_shape.iter().zip(port_shape) {
+            for (dimension, extent) in input.contract.shape.iter().zip(port_shape) {
                 if let (TensorDimension::Symbol(symbol), Some(extent)) = (dimension, extent) {
                     symbols.insert(symbol.clone(), extent);
                 }
@@ -596,10 +585,9 @@ fn resolve_shape(
     symbols: &BTreeMap<String, i64>,
     past_axis: Option<usize>,
 ) -> anyhow::Result<Vec<i64>> {
-    let Some(shape) = input.contract.shape.as_ref() else {
-        return Ok(vec![1; input.contract.rank]);
-    };
-    shape
+    input
+        .contract
+        .shape
         .iter()
         .enumerate()
         .map(|(axis, dimension)| match dimension {
@@ -614,6 +602,8 @@ fn resolve_shape(
                      on a graph port or share it with an input the caller supplies"
                 )
             }),
+            TensorDimension::Any if past_axis == Some(axis) => Ok(0),
+            TensorDimension::Any => Ok(1),
         })
         .collect()
 }

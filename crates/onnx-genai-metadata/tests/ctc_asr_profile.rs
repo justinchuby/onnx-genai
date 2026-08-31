@@ -53,12 +53,12 @@ preprocessing:
         source: audio.transform_4
         content: waveform
         dtype: float32
-        contract: { dtype: float32, rank: 2, shape: [batch, samples] }
+        contract: { dtype: float32, shape: [batch, samples] }
       - name: attention_mask
         source: audio.output_validity_mask
         content: validity_mask
         dtype: int64
-        contract: { dtype: int64, rank: 2, shape: [batch, samples] }
+        contract: { dtype: int64, shape: [batch, samples] }
 profiles:
   transcription:
     kind: transcription
@@ -80,17 +80,15 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.audio-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.audio:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
     outputs:
       logits:
         contract:
           dtype: float32
-          rank: 3
           shape: [batch, frames, vocab]
           batch_layout: { kind: request_aligned, axis: 0 }
           padding: [{ dimension: frames, valid_lengths: frame_lengths }]
@@ -99,9 +97,8 @@ pipeline:
       frame_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
-          batch_layout: { kind: shared }
+          batch_layout: { kind: request_aligned, axis: 0 }
         role: tensor
         stage: pre_adapter
     components:
@@ -112,10 +109,10 @@ pipeline:
           version: "1"
         ports:
           inputs:
-            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            encoded: { dtype: uint8, shape: [encoded_bytes] }
           outputs:
-            input_values: { dtype: float32, rank: 2, shape: [batch, samples] }
-            attention_mask: { dtype: int64, rank: 2, shape: [batch, samples] }
+            input_values: { dtype: float32, shape: [batch, samples] }
+            attention_mask: { dtype: int64, shape: [batch, samples] }
       encoder:
         implementation: { kind: onnx, artifact: encoder/model.onnx }
     steps:
@@ -336,11 +333,10 @@ fn audio_adapter_without_preprocessing_audio_metadata_is_rejected() {
     let document = r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {}
     inputs:
       request.audio:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
     components:
@@ -348,9 +344,9 @@ pipeline:
         implementation: { kind: adapter, abi: onnx-genai.audio-preprocess, version: "1" }
         ports:
           inputs:
-            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            encoded: { dtype: uint8, shape: [encoded_bytes] }
           outputs:
-            input_values: { dtype: float32, rank: 2, shape: [batch, samples] }
+            input_values: { dtype: float32, shape: [batch, samples] }
     steps:
       - kind: invoke
         component: audio_preprocess
@@ -377,14 +373,13 @@ preprocessing:
         source: audio.transform_0
         content: waveform
         dtype: float32
-        contract: { dtype: float32, rank: 2, shape: [batch, samples] }
+        contract: { dtype: float32, shape: [batch, samples] }
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {}
     inputs:
       request.audio:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
     components:
@@ -392,9 +387,9 @@ pipeline:
         implementation: { kind: adapter, abi: onnx-genai.audio-preprocess, version: "1" }
         ports:
           inputs:
-            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            encoded: { dtype: uint8, shape: [encoded_bytes] }
           outputs:
-            input_values: { dtype: float32, rank: 2, shape: [batch, samples] }
+            input_values: { dtype: float32, shape: [batch, samples] }
     steps:
       - kind: invoke
         component: audio_preprocess
@@ -552,8 +547,8 @@ fn padded_ctc_length_companion_must_be_int64_at_the_time_prefix_rank() {
     );
 
     let wrong_rank = CTC_ASR_DOCUMENT.replace(
-        "          rank: 1\n          shape: [batch]\n          batch_layout: { kind: shared }",
-        "          rank: 2\n          shape: [batch, extra]\n          batch_layout: { kind: shared }",
+        "          shape: [batch]\n          batch_layout: { kind: request_aligned, axis: 0 }",
+        "          shape: [batch, extra]\n          batch_layout: { kind: request_aligned, axis: 0 }",
     );
     let reported = errors(&wrong_rank);
     assert!(
@@ -585,8 +580,8 @@ fn padding_a_non_time_dimension_does_not_require_ctc_lengths() {
         )
         .replace("frame_lengths", "vocab_lengths")
         .replace(
-            "          rank: 1\n          shape: [batch]\n          batch_layout: { kind: shared }",
-            "          rank: 2\n          shape: [batch, frames]\n          batch_layout: { kind: shared }",
+            "          shape: [batch]\n          batch_layout: { kind: request_aligned, axis: 0 }",
+            "          shape: [batch, frames]\n          batch_layout: { kind: request_aligned, axis: 0 }",
         )
         .replace("      lengths: vocab_lengths\n", "");
     validate_metadata(&parse(&document))

@@ -167,12 +167,19 @@ components:
           dtype: int64
           rank: 1
           shape: [batch]
-          batch_layout: { kind: shared }
+          batch_layout: { kind: request_aligned, axis: 0 }
 ```
 
 The `batch` symbol roots both budgets in the assembled group. The second budget
 charges the materialized rectangle `batch × max_tiles`, not the sum of valid
 tile counts.
+
+`tile_lengths` is host-readable but row-scoped: each entry belongs to the same
+request row as the tile rectangle it bounds, so repeated, reordered, and shrunk
+row selections apply the same positional plan to both tensors. A validity
+companion is `shared` only when the carrier's request axis is not among the axes
+outer to the padded dimension (for example a scalar global bound), or when the
+carrier itself is packed/shared.
 
 `valid_lengths` is contract provenance, not necessarily the graph's mask. If the
 graph consumes a bool or additive mask, that mask is an ordinary typed port

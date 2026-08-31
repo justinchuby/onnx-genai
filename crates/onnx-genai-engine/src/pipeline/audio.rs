@@ -390,14 +390,13 @@ model:
   artifacts: []
 pipeline:
   workflow:
-    manifest:
-      capabilities: []
+    manifest: {}
     inputs: {}
     outputs:
       audio:
         role: audio
         stage: post_adapter
-        contract: {dtype: uint8, rank: 1}
+        contract: {dtype: uint8, shape: [Any]}
         media:
           delivery: buffered
           container: wav
@@ -435,20 +434,19 @@ model:
   artifacts: []
 pipeline:
   workflow:
-    manifest:
-      capabilities: []
+    manifest: {{}}
     inputs: {{}}
     outputs:
       alpha:
         role: audio
         stage: pre_adapter
-        contract: {{dtype: float32, rank: 3}}
+        contract: {{dtype: float32, shape: [Any, Any, Any]}}
         media:
 {first_media}
       omega:
         role: audio
         stage: pre_adapter
-        contract: {{dtype: float32, rank: 3}}
+        contract: {{dtype: float32, shape: [Any, Any, Any]}}
         media:
 {second_media}
     components: {{}}

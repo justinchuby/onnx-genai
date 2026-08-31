@@ -21,6 +21,7 @@ use crate::{
     models_config::ModelSpec,
     multimodal::MultimodalSpecs,
     state::{ServerConfig, ServerMemoryAuthorities, build_handle_with_authorities},
+    tool_protocol::ToolProtocol,
 };
 
 /// Policy used to choose which loaded model to evict when the loaded-model cap is
@@ -43,6 +44,12 @@ pub(crate) struct ModelHandle {
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
+    /// The exact declared tool protocol, resolved at package admission.  The
+    /// adapter itself remains server-owned.
+    pub(crate) tool_protocol: Option<ToolProtocol>,
+    /// Retained solely to make an absent declaration actionable at request
+    /// admission; it is not used to rediscover or guess a protocol.
+    pub(crate) tool_protocol_metadata_path: Option<PathBuf>,
     pub(crate) model_max_context: Option<usize>,
     /// The model author's declared generation defaults (`do_sample`,
     /// `temperature`, `top_p`, `top_k`), or `None` when the package declares
@@ -82,6 +89,8 @@ pub(crate) struct ModelHandleParts {
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
+    pub(crate) tool_protocol: Option<ToolProtocol>,
+    pub(crate) tool_protocol_metadata_path: Option<PathBuf>,
     pub(crate) model_max_context: Option<usize>,
     pub(crate) generation_defaults: Option<GenerationDefaults>,
     pub(crate) fim_config: Option<FimConfig>,
@@ -98,6 +107,8 @@ impl ModelHandle {
             mut engine,
             tokenizer,
             chat_template,
+            tool_protocol,
+            tool_protocol_metadata_path,
             model_max_context,
             generation_defaults,
             fim_config,
@@ -116,6 +127,8 @@ impl ModelHandle {
             engine,
             tokenizer,
             chat_template,
+            tool_protocol,
+            tool_protocol_metadata_path,
             model_max_context,
             generation_defaults,
             fim_config,
@@ -936,6 +949,8 @@ mod tests {
             engine: stub_engine_driver(),
             tokenizer,
             chat_template: None,
+            tool_protocol: None,
+            tool_protocol_metadata_path: None,
             model_max_context: None,
             generation_defaults: None,
             fim_config: None,
@@ -1005,6 +1020,8 @@ mod tests {
             engine: stub_engine_driver(),
             tokenizer: load_tokenizer(),
             chat_template: None,
+            tool_protocol: None,
+            tool_protocol_metadata_path: None,
             model_max_context: None,
             generation_defaults: None,
             fim_config: None,

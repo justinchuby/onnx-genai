@@ -1,0 +1,6 @@
+### 2026-08-25: ORT plugin factory owns allocator adapters through teardown
+**By:** Holden
+**What:** Device allocator adapters remain registered and owned by `ExportedFactory` until factory release. `ReleaseAllocator` atomically closes the adapter, returns every tracked `DeviceBuffer` through its owning EP exactly once, and waits on the EP's structured deferred-release queue. Duplicate releases and late defensive frees are harmless while the closed adapter is retained.
+**Why:** Dropping the pointer→`DeviceBuffer` table directly quarantined one CUDA allocation and left one 2 MiB VMM granule committed. Factory ownership gives one lifetime authority, keeps the EP/context alive through deallocation settlement, and avoids both double-free and adapter use-after-free at the FFI boundary.
+**Evidence:** PR #2183. On latest `origin/main` (`97353d5a7`), 373 plugin tests and 3/3 serial real-GPU plugin tests passed; each GPU session closed at 0 committed bytes. Removing both drain sites made the GPU test fail with 1 quarantined allocation and exactly 2,097,152 bytes still committed.
+<!-- Archived from the durable decision inbox by Scribe on 2026-08-27; original inbox content above is unchanged. -->

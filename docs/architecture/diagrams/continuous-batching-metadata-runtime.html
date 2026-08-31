@@ -1,0 +1,2075 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Continuous Batching: Metadata and Runtime Interpretation</title>
+  <style>
+    :root {
+      --navy: #163a5f;
+      --navy-dark: #0c2742;
+      --blue: #2d6b9a;
+      --blue-pale: #e8f0f8;
+      --purple: #6e4da3;
+      --purple-pale: #f0eaf8;
+      --amber: #a86600;
+      --amber-pale: #fff3d6;
+      --green: #147d53;
+      --green-pale: #ddf4e8;
+      --red: #c23b4a;
+      --red-pale: #fce4e6;
+      --staged: #94467c;
+      --staged-pale: #fae9f5;
+      --optional: #66519a;
+      --optional-pale: #edeafd;
+      --ink: #183047;
+      --muted: #526577;
+      --line: #bed0e1;
+      --panel: #f7f9fc;
+      --white: #fff;
+      --shadow: 0 1px 2px rgb(22 58 95 / 10%), 0 8px 24px rgb(22 58 95 / 6%);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: linear-gradient(180deg, #fff 0 24rem, #f5f8fc 24rem 100%);
+      font: 16px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--blue); font-weight: 650; }
+    a:hover { color: var(--navy); }
+    a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+      outline: 3px solid #f4b942;
+      outline-offset: 3px;
+    }
+    code, pre, kbd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+    code {
+      padding: .08rem .25rem;
+      border-radius: .25rem;
+      background: #edf2f7;
+      color: var(--navy-dark);
+      font-size: .92em;
+    }
+    .skip-link {
+      position: fixed;
+      z-index: 10;
+      top: .5rem;
+      left: .5rem;
+      transform: translateY(-150%);
+      padding: .6rem .85rem;
+      border-radius: .4rem;
+      background: var(--navy);
+      color: #fff;
+    }
+    .skip-link:focus { transform: translateY(0); }
+    .shell { width: min(1220px, calc(100% - 2.5rem)); margin: auto; }
+    .eyebrow {
+      margin: 0 0 .5rem;
+      color: var(--purple);
+      font-size: .78rem;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    header {
+      padding: 3.4rem 0 2.3rem;
+      border-bottom: 1px solid var(--line);
+      background:
+        radial-gradient(circle at 89% 15%, rgb(110 77 163 / 12%) 0 6rem, transparent 16rem),
+        radial-gradient(circle at 8% 5%, rgb(45 107 154 / 10%) 0 8rem, transparent 22rem);
+    }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 {
+      max-width: 18ch;
+      margin-bottom: .85rem;
+      color: var(--navy);
+      font-size: clamp(2.15rem, 5vw, 4.25rem);
+      line-height: 1.06;
+      letter-spacing: -.045em;
+    }
+    h2 {
+      margin-bottom: .55rem;
+      color: var(--navy);
+      font-size: clamp(1.5rem, 2.8vw, 2.25rem);
+      line-height: 1.17;
+      letter-spacing: -.025em;
+    }
+    h3 {
+      margin-bottom: .45rem;
+      font-size: 1.05rem;
+      line-height: 1.25;
+    }
+    .lede { max-width: 75ch; color: var(--muted); font-size: 1.14rem; }
+    .hero-answer {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 1.1rem;
+      align-items: center;
+      max-width: 925px;
+      margin: 1.65rem 0 1.2rem;
+      padding: 1.2rem 1.35rem;
+      border: 1px solid #9ecab6;
+      border-radius: .85rem;
+      background: var(--green-pale);
+      box-shadow: var(--shadow);
+    }
+    .can-badge {
+      display: grid;
+      width: 4.8rem;
+      height: 4.8rem;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--green);
+      color: #fff;
+      font-size: 1.2rem;
+      font-weight: 900;
+      letter-spacing: .06em;
+    }
+    .hero-answer strong { display: block; color: #0f5a3d; font-size: 1.3rem; }
+    .hero-answer p { margin: .25rem 0 0; }
+    .scope-note {
+      max-width: 960px;
+      margin: 0;
+      padding-left: 1rem;
+      border-left: 4px solid var(--amber);
+      color: #5e491a;
+    }
+    nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .45rem .95rem;
+      margin-top: 1.5rem;
+      font-size: .9rem;
+    }
+    nav a { color: var(--navy); text-decoration: none; }
+    main { padding: 3rem 0 4rem; }
+    section { margin: 0 0 3.5rem; scroll-margin-top: 1rem; }
+    .section-intro { max-width: 78ch; color: var(--muted); }
+    .grid-3, .grid-2 { display: grid; gap: 1.15rem; }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card, .code-card, .simulator, .trace-item, .callout {
+      border: 1px solid var(--line);
+      border-radius: .8rem;
+      background: var(--white);
+      box-shadow: var(--shadow);
+    }
+    .card { min-height: 100%; padding: 1.35rem; }
+    .card h3 { color: var(--navy); }
+    .card ul, .callout ul { margin: .55rem 0 0; padding-left: 1.2rem; }
+    .card li + li, .callout li + li { margin-top: .42rem; }
+    .label {
+      display: inline-block;
+      margin-bottom: .65rem;
+      padding: .2rem .48rem;
+      border-radius: 999px;
+      font-size: .74rem;
+      font-weight: 850;
+      letter-spacing: .075em;
+      text-transform: uppercase;
+    }
+    .label.package { color: #173e61; background: var(--blue-pale); }
+    .label.metadata { color: #472a70; background: var(--purple-pale); }
+    .label.runtime { color: #754700; background: var(--amber-pale); }
+    .label.commit { color: #0c5a3d; background: var(--green-pale); }
+    .label.risk { color: #802838; background: var(--red-pale); }
+    .ownership {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: .55rem;
+      align-items: stretch;
+      margin-top: 1.45rem;
+    }
+    .ownership-box {
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: .7rem;
+      background: var(--white);
+    }
+    .ownership-box strong { display: block; margin-bottom: .25rem; color: var(--navy); }
+    .ownership-box p { margin: 0; font-size: .9rem; }
+    .ownership-arrow {
+      align-self: center;
+      color: var(--purple);
+      font-size: 1.5rem;
+      font-weight: 900;
+    }
+    .code-card { overflow: hidden; }
+    .code-card > header {
+      padding: .95rem 1.1rem .8rem;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .code-card > header h3 { margin: 0; color: var(--navy); }
+    .code-card > header p { margin: .25rem 0 0; color: var(--muted); font-size: .87rem; }
+    pre {
+      overflow: auto;
+      margin: 0;
+      padding: 1.1rem;
+      background: #102b46;
+      color: #eaf4ff;
+      font-size: .83rem;
+      line-height: 1.55;
+      tab-size: 2;
+    }
+    pre .comment { color: #b8cae0; }
+    pre .key { color: #9fcbff; }
+    pre .value { color: #9ae6b4; }
+    .caption { margin: .8rem 1.1rem 1.05rem; color: var(--muted); font-size: .9rem; }
+    .not-metadata {
+      margin-top: 1.15rem;
+      padding: 1.2rem 1.3rem;
+      border: 1px solid #e0adb5;
+      border-left: .42rem solid var(--red);
+      border-radius: .7rem;
+      background: var(--red-pale);
+    }
+    .not-metadata h3 { color: #852c3b; }
+    .chips { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: .75rem; }
+    .chip {
+      padding: .28rem .55rem;
+      border: 1px solid #d88f9a;
+      border-radius: 999px;
+      color: #722735;
+      background: #fff;
+      font: 700 .82rem/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .simulator { padding: 1.35rem; }
+    .simulator > header {
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }
+    .simulator > header p { max-width: 70ch; margin-bottom: 1rem; color: var(--muted); }
+    .preset-row { display: flex; flex-wrap: wrap; gap: .6rem; margin: 1rem 0; }
+    button {
+      min-height: 2.45rem;
+      padding: .5rem .8rem;
+      border: 1px solid var(--navy);
+      border-radius: .45rem;
+      color: var(--navy);
+      background: #fff;
+      font: inherit;
+      font-weight: 750;
+      cursor: pointer;
+    }
+    button:hover, button[aria-pressed="true"] { color: #fff; background: var(--navy); }
+    .choice-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .85rem 1.2rem;
+      margin: 1rem 0 1.2rem;
+    }
+    fieldset {
+      min-width: 0;
+      padding: .8rem .9rem .7rem;
+      border: 1px solid var(--line);
+      border-radius: .55rem;
+    }
+    legend { padding: 0 .2rem; color: var(--navy); font-weight: 800; }
+    .choice { display: block; margin: .35rem 0; cursor: pointer; }
+    input { accent-color: var(--navy); }
+    .decision-track {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: .55rem;
+      margin: 1rem 0;
+    }
+    .decision-node {
+      padding: .75rem;
+      border: 1px solid var(--line);
+      border-radius: .55rem;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: .88rem;
+    }
+    .decision-node strong { display: block; color: var(--navy); }
+    .decision-node.active { border-color: var(--green); background: var(--green-pale); color: #14543c; }
+    .decision-node.active strong { color: #0c5a3d; }
+    .result {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: .85rem;
+      align-items: start;
+      padding: 1rem;
+      border: 1px solid #9ecab6;
+      border-radius: .65rem;
+      background: var(--green-pale);
+    }
+    .result-icon {
+      display: grid;
+      width: 2.2rem;
+      height: 2.2rem;
+      place-items: center;
+      border-radius: 50%;
+      color: #fff;
+      background: var(--green);
+      font-weight: 900;
+    }
+    .result h3 { margin: 0; color: #0e553a; }
+    .result p { margin: .25rem 0 0; }
+    .result.isolated { border-color: #e1bd75; background: var(--amber-pale); }
+    .result.isolated .result-icon { background: var(--amber); }
+    .result.isolated h3 { color: #6b450b; }
+    .result.fail { border-color: #e0adb5; background: var(--red-pale); }
+    .result.fail .result-icon { background: var(--red); }
+    .result.fail h3 { color: #7c2b39; }
+    .semantic-invariant {
+      margin: .9rem 0 0;
+      padding: .7rem .9rem;
+      border-radius: .5rem;
+      background: var(--blue-pale);
+      color: #193e5d;
+      font-size: .92rem;
+    }
+    .timeline-key {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem 1rem;
+      margin: 1.1rem 0;
+      color: var(--muted);
+      font-size: .88rem;
+    }
+    .timeline-key span::before {
+      display: inline-block;
+      width: .65rem;
+      height: .65rem;
+      margin-right: .35rem;
+      border-radius: 50%;
+      background: var(--purple);
+      content: "";
+    }
+    .timeline-key .iteration::before { background: var(--blue); }
+    .timeline-key .completion::before { background: var(--green); }
+    .trace {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .85rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: trace;
+    }
+    .trace-item {
+      position: relative;
+      min-height: 10.3rem;
+      padding: 1rem 1rem 1rem 4rem;
+      counter-increment: trace;
+    }
+    .trace-item::before {
+      position: absolute;
+      top: 1rem;
+      left: 1rem;
+      display: grid;
+      width: 2.25rem;
+      height: 2.25rem;
+      place-items: center;
+      border-radius: 50%;
+      color: #fff;
+      background: var(--purple);
+      content: counter(trace);
+      font-weight: 900;
+    }
+    .trace-item.iteration::before { background: var(--blue); }
+    .trace-item.completion::before { background: var(--green); }
+    .trace-item h3 { margin: .05rem 0 .35rem; color: var(--navy); }
+    .trace-item p { margin: 0; color: var(--muted); font-size: .92rem; }
+    .trace-item .label { margin-bottom: .45rem; font-size: .65rem; }
+    .checklist { columns: 2 19rem; gap: 2rem; margin: 1.1rem 0 0; padding-left: 1.35rem; }
+    .checklist li { break-inside: avoid; margin: 0 0 .75rem; padding-left: .25rem; }
+    .matrix-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: .7rem; background: #fff; }
+    table { width: 100%; min-width: 740px; border-collapse: collapse; }
+    th, td { padding: .9rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: #fff; background: var(--navy); font-size: .9rem; }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child { font-weight: 750; }
+    .yes { color: #0d613f; font-weight: 850; }
+    .no { color: #852c3b; font-weight: 850; }
+    .maybe { color: #754700; font-weight: 850; }
+    .misconceptions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .8rem; }
+    .misconception { padding: 1rem; border-left: 4px solid var(--amber); background: #fff; box-shadow: var(--shadow); }
+    .misconception strong { color: var(--navy); }
+    .misconception p { margin: .3rem 0 0; color: var(--muted); font-size: .92rem; }
+    .glossary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; }
+    .term { padding: .9rem; border: 1px solid var(--line); border-radius: .6rem; background: #fff; }
+    .term dt { color: var(--navy); font-weight: 850; }
+    .term dd { margin: .3rem 0 0; color: var(--muted); font-size: .9rem; }
+    details {
+      margin-top: 1rem;
+      padding: .8rem 1rem;
+      border: 1px solid var(--line);
+      border-radius: .6rem;
+      background: var(--panel);
+    }
+    summary { color: var(--navy); font-weight: 800; cursor: pointer; }
+    details p, details ul { margin: .7rem 0 .1rem; }
+    .source-panel {
+      padding: 1.2rem 1.3rem;
+      border-top: 4px solid var(--purple);
+      border-radius: .7rem;
+      background: #f5f1fa;
+    }
+    .source-panel h2 { margin-bottom: .5rem; }
+    .source-panel p:last-child { margin-bottom: 0; }
+    footer {
+      padding: 1.5rem 0 2.5rem;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: .88rem;
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    .visual-legend {
+      margin: 0 0 2rem;
+      padding: 1.1rem 1.2rem;
+      border: 1px solid #9fb8ce;
+      border-left: .45rem solid var(--navy);
+      border-radius: .8rem;
+      background: var(--white);
+      box-shadow: var(--shadow);
+    }
+    .visual-legend summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .3rem .75rem;
+      align-items: baseline;
+      color: var(--navy);
+      cursor: pointer;
+      font-size: 1.08rem;
+      font-weight: 850;
+    }
+    .visual-legend summary::marker { color: var(--purple); }
+    .legend-hint { color: var(--muted); font-size: .82rem; font-weight: 650; }
+    .visual-legend[open] summary { margin-bottom: .55rem; }
+    .visual-legend .legend-intro { margin-bottom: .85rem; color: var(--muted); font-size: .9rem; }
+    .legend-grid {
+      display: grid;
+      grid-template-columns: 1.2fr 1.15fr 1fr;
+      gap: .8rem 1.25rem;
+    }
+    .legend-group { min-width: 0; }
+    .legend-group h3 {
+      margin: 0 0 .35rem;
+      color: var(--navy);
+      font-size: .78rem;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    .legend-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .3rem .6rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      font-size: .78rem;
+    }
+    .legend-item { display: flex; gap: .35rem; align-items: center; min-width: 0; }
+    .legend-swatch {
+      width: .78rem;
+      height: .78rem;
+      flex: 0 0 auto;
+      border: 1px solid rgb(12 39 66 / 28%);
+      border-radius: .18rem;
+    }
+    .legend-swatch.metadata { background: var(--purple); }
+    .legend-swatch.runtime { background: var(--amber); }
+    .legend-swatch.state { background: var(--blue); }
+    .legend-swatch.staged { background: var(--staged); }
+    .legend-swatch.committed { background: var(--green); }
+    .legend-swatch.abort { background: var(--red); }
+    .legend-swatch.optional { background: var(--optional); }
+    .legend-symbol {
+      width: 1.25rem;
+      height: 1.25rem;
+      flex: 0 0 auto;
+      color: var(--navy);
+    }
+    .line-key { display: grid; gap: .36rem; font-size: .8rem; }
+    .line-sample {
+      display: inline-block;
+      width: 2.5rem;
+      margin-right: .35rem;
+      border-top: 3px solid var(--blue);
+      vertical-align: middle;
+    }
+    .line-sample.dashed { border-top-style: dashed; border-color: var(--amber); }
+    .line-sample.dotted { border-top-style: dotted; border-color: var(--red); }
+    .line-sample.pulse {
+      border-color: var(--purple);
+      box-shadow: 0 0 0 0 rgb(110 77 163 / 35%);
+    }
+    .phase-key { display: flex; flex-wrap: wrap; gap: .32rem; }
+    .phase-badge {
+      display: inline-block;
+      padding: .14rem .38rem;
+      border-radius: .3rem;
+      color: var(--navy-dark);
+      background: var(--blue-pale);
+      font-size: .7rem;
+      font-weight: 850;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+    }
+    .phase-badge.once { background: var(--purple-pale); color: #472a70; }
+    .phase-badge.request { background: #e8f0f8; color: #173e61; }
+    .phase-badge.iteration { background: var(--amber-pale); color: #754700; }
+    .phase-badge.row { background: var(--green-pale); color: #0c5a3d; }
+    .phase-badge.post { background: var(--staged-pale); color: #72235f; }
+    .legend-note {
+      margin: .55rem 0 0;
+      padding-top: .55rem;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: .81rem;
+    }
+    .motion-panel {
+      margin: 1.2rem 0;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: .7rem;
+      background: var(--panel);
+    }
+    .motion-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+      align-items: center;
+      margin: 1rem 0 .85rem;
+    }
+    .motion-controls button { min-height: 2.2rem; }
+    .motion-controls button[disabled] {
+      border-color: var(--line);
+      color: #7a8996;
+      background: #eef2f6;
+      cursor: not-allowed;
+    }
+    .motion-controls label {
+      display: inline-flex;
+      gap: .35rem;
+      align-items: center;
+      min-height: 2.2rem;
+      color: var(--navy);
+      font-size: .88rem;
+      font-weight: 750;
+    }
+    .motion-controls select {
+      min-height: 2.2rem;
+      border: 1px solid var(--navy);
+      border-radius: .35rem;
+      color: var(--navy);
+      background: #fff;
+      font: inherit;
+      font-weight: 700;
+    }
+    .motion-status {
+      flex: 1 1 18rem;
+      margin: 0;
+      padding: .5rem .65rem;
+      border-left: 3px solid var(--purple);
+      color: #3f315f;
+      background: var(--purple-pale);
+      font-size: .88rem;
+      font-weight: 700;
+    }
+    .flow-rail {
+      display: grid;
+      grid-template-columns: repeat(11, minmax(6.5rem, 1fr));
+      gap: .42rem;
+      overflow-x: auto;
+      padding: .3rem .1rem .75rem;
+      scroll-snap-type: x proximity;
+    }
+    .flow-node {
+      position: relative;
+      min-height: 7.1rem;
+      padding: .55rem;
+      border: 1px solid var(--line);
+      border-radius: .55rem;
+      color: var(--muted);
+      background: #fff;
+      scroll-snap-align: start;
+      font-size: .76rem;
+    }
+    .flow-node::after {
+      position: absolute;
+      z-index: 0;
+      top: 50%;
+      left: calc(100% + .04rem);
+      width: .35rem;
+      border-top: 2px solid var(--blue);
+      content: "";
+    }
+    .flow-node:last-child::after { display: none; }
+    .flow-node strong { position: relative; z-index: 1; display: block; color: var(--navy); font-size: .79rem; }
+    .flow-node .phase-badge { margin-bottom: .35rem; }
+    .flow-node.is-current {
+      z-index: 1;
+      border-color: var(--purple);
+      color: #362557;
+      background: var(--purple-pale);
+      box-shadow: 0 0 0 .22rem rgb(110 77 163 / 15%);
+    }
+    .flow-rail.motion-run .flow-node.is-current { animation: current-pulse 1.05s ease-out 2; }
+    .flow-rail.motion-run .flow-node.is-current::after { animation: flow-link .72s ease-out both; }
+    .flow-node.is-past { border-color: #9ecab6; background: var(--green-pale); }
+    .flow-node.is-current::after { border-color: var(--purple); }
+    .trace-item {
+      transition: border-color .22s ease, box-shadow .22s ease, background-color .22s ease;
+    }
+    .trace-item.is-current {
+      border-color: var(--purple);
+      background: #fdfbff;
+      box-shadow: 0 0 0 .25rem rgb(110 77 163 / 15%), var(--shadow);
+    }
+    .trace.motion-run .trace-item.is-current { animation: current-pulse 1.05s ease-out 2; }
+    .trace-item.is-past { border-color: #9ecab6; }
+    .trace-item.is-current h3 { color: var(--purple); }
+    .decision-animation {
+      margin: 1rem 0;
+      padding: .9rem;
+      border: 1px solid var(--line);
+      border-radius: .65rem;
+      background: #fff;
+    }
+    .decision-animation > p { margin: 0 0 .65rem; color: #472a70; font-size: .88rem; font-weight: 800; }
+    .decision-path {
+      display: grid;
+      grid-template-columns: minmax(7rem, 1fr) minmax(9rem, 1.2fr) minmax(8rem, 1fr);
+      gap: .75rem;
+      align-items: center;
+    }
+    .path-row-stack, .forward-stack { display: grid; gap: .35rem; }
+    .path-row, .forward, .semantic-rejoin {
+      min-height: 2rem;
+      padding: .35rem .5rem;
+      border: 1px solid var(--line);
+      border-radius: .35rem;
+      background: var(--blue-pale);
+      color: #173e61;
+      font-size: .78rem;
+      font-weight: 800;
+      text-align: center;
+    }
+    .forward { background: var(--amber-pale); color: #754700; }
+    .forward.shared { border-width: 2px; }
+    .forward.isolated { display: none; }
+    .semantic-rejoin {
+      border-color: #9ecab6;
+      background: var(--green-pale);
+      color: #0c5a3d;
+    }
+    .decision-animation[data-path="isolated"] .forward.shared { display: none; }
+    .decision-animation[data-path="isolated"] .forward.isolated { display: block; }
+    .decision-animation[data-path="fail"] .forward-stack { opacity: .5; }
+    .decision-animation[data-path="fail"] .semantic-rejoin { border-color: #e0adb5; background: var(--red-pale); color: #852c3b; }
+    .decision-animation.motion-run[data-path="shared"] .path-row {
+      animation: converge .8s cubic-bezier(.2, .8, .2, 1) both;
+    }
+    .decision-animation.motion-run[data-path="isolated"] .path-row:nth-child(1) { animation: split-up .72s ease-out both; }
+    .decision-animation.motion-run[data-path="isolated"] .path-row:nth-child(2) { animation: split-down .72s ease-out both; }
+    .decision-animation.motion-run .semantic-rejoin { animation: current-pulse .9s ease-out .55s 1 both; }
+    .simulator .result { grid-template-columns: auto 1fr; }
+    .trace-controls { margin-bottom: .25rem; }
+    .trace-controls .motion-status { flex-basis: 22rem; }
+    .animation-section .section-intro { max-width: 88ch; }
+    .rowplan-board, .transaction-board, .setup-board {
+      overflow: hidden;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: .7rem;
+      background: #fff;
+    }
+    .mapping-callout {
+      margin: 0 0 .85rem;
+      padding: .65rem .8rem;
+      border-left: 4px solid var(--purple);
+      background: var(--purple-pale);
+      color: #3f315f;
+      font-weight: 750;
+    }
+    .rowplan-columns {
+      display: grid;
+      grid-template-columns: minmax(12rem, 1fr) auto minmax(17rem, 1.45fr);
+      gap: .85rem;
+      align-items: stretch;
+    }
+    .logical-side, .destination-side {
+      padding: .75rem;
+      border: 1px solid var(--line);
+      border-radius: .55rem;
+    }
+    .logical-side h3, .destination-side h3 { margin: 0 0 .55rem; color: var(--navy); font-size: .92rem; }
+    .logical-rows, .destination-rows { display: grid; gap: .4rem; }
+    .logical-row, .destination-row {
+      padding: .42rem .5rem;
+      border: 1px solid var(--line);
+      border-radius: .35rem;
+      background: var(--blue-pale);
+      color: #173e61;
+      font-size: .81rem;
+      font-weight: 750;
+    }
+    .logical-row.skip { border-style: dashed; color: var(--muted); background: var(--panel); }
+    .rowplan-map-arrow {
+      align-self: center;
+      color: var(--purple);
+      font-size: 1.6rem;
+      font-weight: 900;
+    }
+    .carrier-list { display: grid; gap: .45rem; margin-top: .9rem; }
+    .carrier-track {
+      display: grid;
+      grid-template-columns: minmax(8rem, .75fr) minmax(10rem, 1.2fr) auto minmax(15rem, 1.5fr);
+      gap: .45rem;
+      align-items: center;
+      padding: .55rem;
+      border: 1px solid var(--line);
+      border-radius: .45rem;
+      background: var(--panel);
+      font-size: .8rem;
+    }
+    .carrier-name { color: var(--navy); font-weight: 850; }
+    .carrier-source { color: #173e61; }
+    .carrier-arrow { color: var(--purple); font-size: 1.1rem; font-weight: 900; }
+    .carrier-destination { color: #0c5a3d; font-weight: 750; }
+    .rowplan-demo[data-stage="source"] .carrier-destination { color: var(--muted); }
+    .rowplan-demo[data-stage="source"] .logical-row[data-source="2"] { border-color: var(--purple); }
+    .rowplan-demo[data-stage="gather"] .logical-row[data-source="2"],
+    .rowplan-demo[data-stage="execute"] .logical-row[data-source="2"],
+    .rowplan-demo[data-stage="scatter"] .logical-row[data-source="2"] {
+      border-color: var(--purple);
+      background: var(--purple-pale);
+      box-shadow: 0 0 0 .18rem rgb(110 77 163 / 13%);
+    }
+    .rowplan-demo.motion-run[data-stage="gather"] .carrier-arrow,
+    .rowplan-demo.motion-run[data-stage="execute"] .carrier-arrow {
+      animation: carrier-move .72s ease-out both;
+    }
+    .rowplan-demo[data-stage="scatter"] .destination-row { border-color: var(--green); background: var(--green-pale); }
+    .scatter-result {
+      margin: .85rem 0 0;
+      padding: .65rem .8rem;
+      border: 1px dotted var(--green);
+      background: var(--green-pale);
+      color: #0c5a3d;
+      font-size: .86rem;
+      font-weight: 750;
+    }
+    .transaction-board { position: relative; }
+    .transaction-key {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .45rem 1rem;
+      margin: 0 0 .8rem;
+      color: var(--muted);
+      font-size: .8rem;
+    }
+    .transaction-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .7rem;
+    }
+    .transaction-row {
+      position: relative;
+      min-height: 15.7rem;
+      padding: .8rem;
+      border: 1px solid var(--line);
+      border-top: 4px solid var(--blue);
+      border-radius: .55rem;
+      background: var(--panel);
+    }
+    .transaction-row.cancelled { border-top-color: var(--red); }
+    .transaction-row.eos { border-top-color: var(--green); }
+    .transaction-row h3 { margin: 0 0 .35rem; color: var(--navy); font-size: .95rem; }
+    .transaction-row p { margin: .25rem 0; color: var(--muted); font-size: .78rem; }
+    .state-cell, .journal-cell, .outcome-cell {
+      margin-top: .45rem;
+      padding: .45rem .5rem;
+      border: 1px solid var(--blue);
+      border-radius: .35rem;
+      background: var(--blue-pale);
+      color: #173e61;
+      font-size: .78rem;
+      font-weight: 750;
+    }
+    .journal-cell { border-color: var(--staged); background: var(--staged-pale); color: #72235f; }
+    .outcome-cell { display: none; border-color: var(--green); background: var(--green-pale); color: #0c5a3d; }
+    .transaction-row.cancelled .outcome-cell { border-color: var(--red); background: var(--red-pale); color: #852c3b; }
+    .transport-boundary {
+      display: grid;
+      place-items: center;
+      min-height: 1.35rem;
+      margin-top: .45rem;
+      border: 0;
+      border-top: 3px solid var(--navy);
+      color: var(--navy-dark);
+      font-size: .68rem;
+      font-weight: 900;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .published-cell {
+      display: none;
+      margin-top: .45rem;
+      padding: .4rem .5rem;
+      border: 1px solid var(--green);
+      border-radius: .35rem;
+      background: var(--green-pale);
+      color: #0c5a3d;
+      font-size: .78rem;
+      font-weight: 800;
+    }
+    .transaction-demo[data-stage="baseline"] .journal-cell,
+    .transaction-demo[data-stage="baseline"] .transport-boundary,
+    .transaction-demo[data-stage="baseline"] .published-cell { display: none; }
+    .transaction-demo[data-stage="staged"] .outcome-cell,
+    .transaction-demo[data-stage="staged"] .published-cell { display: none; }
+    .transaction-demo[data-stage="commit"] .outcome-cell,
+    .transaction-demo[data-stage="release"] .outcome-cell { display: block; }
+    .transaction-demo[data-stage="commit"] .published-cell,
+    .transaction-demo[data-stage="release"] .published-cell { display: block; }
+    .transaction-demo[data-stage="commit"] .cancelled .published-cell,
+    .transaction-demo[data-stage="release"] .cancelled .published-cell { display: none; }
+    .transaction-demo.motion-run[data-stage="commit"] .published-cell { animation: publish-after-commit .7s ease-out both; }
+    .slot-reuse {
+      display: none;
+      margin-top: .75rem;
+      padding: .7rem;
+      border: 2px dotted var(--green);
+      border-radius: .45rem;
+      background: #fff;
+      color: #0c5a3d;
+      font-size: .85rem;
+      font-weight: 750;
+    }
+    .transaction-demo[data-stage="release"] .slot-reuse { display: block; }
+    .setup-board { position: relative; }
+    .setup-track {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(8rem, 1fr));
+      gap: .45rem;
+      overflow-x: auto;
+      padding-bottom: .55rem;
+    }
+    .setup-node {
+      position: relative;
+      min-height: 7.65rem;
+      padding: .65rem;
+      border: 1px solid var(--line);
+      border-radius: .5rem;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: .79rem;
+    }
+    .setup-node::after {
+      position: absolute;
+      top: 50%;
+      left: calc(100% + .04rem);
+      width: .36rem;
+      border-top: 2px solid var(--blue);
+      content: "";
+    }
+    .setup-node:last-child::after { display: none; }
+    .setup-node h3 { margin: 0 0 .28rem; color: var(--navy); font-size: .9rem; }
+    .setup-node p { margin: 0; font-size: .76rem; }
+    .setup-node.optional {
+      border-style: dashed;
+      border-color: var(--optional);
+      background: var(--optional-pale);
+    }
+    .setup-demo[data-graph="false"] .setup-node.optional {
+      border-style: dotted;
+      opacity: .62;
+    }
+    .setup-node.is-active {
+      border-color: var(--purple);
+      background: var(--purple-pale);
+      box-shadow: 0 0 0 .2rem rgb(110 77 163 / 14%);
+    }
+    .setup-demo.motion-run .setup-node.is-active { animation: current-pulse 1.05s ease-out 2; }
+    .setup-node.is-past { border-color: #9ecab6; background: var(--green-pale); }
+    .setup-node.optional.is-active { border-color: var(--optional); background: var(--optional-pale); }
+    .setup-note {
+      margin: .8rem 0 0;
+      padding: .7rem .8rem;
+      border-left: 4px dashed var(--optional);
+      background: var(--optional-pale);
+      color: #44366e;
+      font-size: .86rem;
+    }
+    .print-only { display: none; }
+    body.reduce-motion *, body.reduce-motion *::before, body.reduce-motion *::after {
+      scroll-behavior: auto !important;
+      transition: none !important;
+      animation: none !important;
+    }
+    @keyframes current-pulse {
+      0% { box-shadow: 0 0 0 0 rgb(110 77 163 / 32%); }
+      100% { box-shadow: 0 0 0 .52rem rgb(110 77 163 / 0%); }
+    }
+    @keyframes converge {
+      0% { transform: translateX(-1.4rem); opacity: .4; }
+      100% { transform: translateX(0); opacity: 1; }
+    }
+    @keyframes split-up {
+      0% { transform: translateY(.6rem); opacity: .45; }
+      100% { transform: translateY(0); opacity: 1; }
+    }
+    @keyframes split-down {
+      0% { transform: translateY(-.6rem); opacity: .45; }
+      100% { transform: translateY(0); opacity: 1; }
+    }
+    @keyframes carrier-move {
+      0% { transform: translateX(-.55rem); opacity: .35; }
+      100% { transform: translateX(0); opacity: 1; }
+    }
+    @keyframes flow-link {
+      0% { opacity: .2; transform: scaleX(.1); transform-origin: left; }
+      100% { opacity: 1; transform: scaleX(1); transform-origin: left; }
+    }
+    @keyframes publish-after-commit {
+      0% { transform: translateY(-.45rem); opacity: .2; }
+      100% { transform: translateY(0); opacity: 1; }
+    }
+    @media (max-width: 900px) {
+      .grid-3, .glossary { grid-template-columns: 1fr; }
+      .ownership { grid-template-columns: 1fr; }
+      .ownership-arrow { justify-self: center; transform: rotate(90deg); }
+      .choice-grid, .trace, .misconceptions { grid-template-columns: 1fr; }
+      .decision-track { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .legend-grid, .transaction-grid { grid-template-columns: 1fr; }
+      .rowplan-columns { grid-template-columns: 1fr; }
+      .rowplan-map-arrow { justify-self: center; transform: rotate(90deg); }
+      .decision-path { grid-template-columns: 1fr; }
+      .path-row-stack { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .forward-stack { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .forward.shared { grid-column: 1 / -1; }
+    }
+    @media (max-width: 620px) {
+      .shell { width: min(100% - 1.3rem, 1220px); }
+      header { padding-top: 2.2rem; }
+      .hero-answer { grid-template-columns: 1fr; }
+      .can-badge { width: 3.4rem; height: 3.4rem; }
+      .grid-2 { grid-template-columns: 1fr; }
+      .decision-track { grid-template-columns: 1fr; }
+      .trace-item { min-height: auto; }
+      .legend-list { grid-template-columns: 1fr; }
+      .visual-legend summary { align-items: flex-start; }
+      .motion-controls { align-items: stretch; }
+      .motion-controls label { justify-content: space-between; }
+      .motion-status { flex-basis: 100%; }
+      .carrier-track { grid-template-columns: 1fr; gap: .22rem; }
+      .carrier-arrow { transform: rotate(90deg); }
+      .path-row-stack, .forward-stack { grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+    }
+    @media (forced-colors: active) {
+      .visual-legend, .flow-node, .trace-item, .decision-animation, .rowplan-board, .transaction-board, .setup-board,
+      .logical-row, .destination-row, .carrier-track, .transaction-row, .state-cell, .journal-cell, .outcome-cell,
+      .published-cell, .setup-node {
+        border-color: CanvasText;
+        forced-color-adjust: auto;
+      }
+      .flow-node.is-current, .trace-item.is-current, .setup-node.is-active { outline: 3px solid Highlight; outline-offset: 2px; }
+    }
+    @media print {
+      body { background: #fff; font-size: 11pt; }
+      .skip-link, nav, .preset-row, .motion-controls { display: none; }
+      .card, .code-card, .simulator, .trace-item, .callout { box-shadow: none; }
+      .visual-legend { box-shadow: none; }
+      .visual-legend:not([open]) .legend-content { display: block !important; }
+      .visual-legend summary::after { content: " (expanded in print)"; }
+      .flow-rail, .setup-track { overflow: visible; }
+      .flow-node, .setup-node, .trace-item { break-inside: avoid; }
+      .transaction-demo .journal-cell, .transaction-demo .transport-boundary, .transaction-demo .outcome-cell,
+      .transaction-demo .published-cell, .transaction-demo .slot-reuse { display: block !important; }
+      .print-only { display: block; }
+      section { break-inside: avoid; }
+      a { color: var(--navy); text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to explanation</a>
+  <header>
+    <div class="shell">
+      <p class="eyebrow">Architecture explainer · portable semantics vs runtime policy</p>
+      <h1>Continuous batching without hidden scheduler semantics</h1>
+      <p class="lede">A manager-friendly guide to what a model package can prove, what an execution backend can implement, and what the runtime may decide at the moment work arrives.</p>
+      <div class="hero-answer" aria-label="The key answer">
+        <div class="can-badge" aria-hidden="true">CAN</div>
+        <div>
+          <strong>Metadata says CAN; runtime decides WHETHER/WHEN.</strong>
+          <p>Support means shared live-row execution is semantically legal. It is an optional optimization—not a requirement to co-batch every compatible request. When isolated execution is semantically valid, lack of a shared forward declines only that optimization; it does not reject the package.</p>
+        </div>
+        <aside class="callout" style="margin-top: 1.15rem; padding: 1.05rem 1.25rem;">
+          <span class="label runtime">Backend reality</span>
+          <p style="margin-bottom: 0;">A backend may offer a shared forward, selected-row gather/scatter, both, or neither. If it cannot preserve the declared shared semantics, the runtime takes the isolated path <strong>before mutation</strong>. The package remains loadable whenever that isolated execution is valid.</p>
+        </aside>
+      </div>
+      <p class="scope-note"><strong>Boundary:</strong> metadata carries portable legality and ABI facts. The runtime owns request identity, physical slots, queues, admission, fairness, active-row selection, padding/packing choice, memory placement, graph capture, resource budgets, capacity, backfill, and the performance/latency policy that chooses shared or isolated execution.</p>
+      <nav aria-label="Page sections">
+        <a href="#three-lenses">Three lenses</a>
+        <a href="#metadata">Metadata examples</a>
+        <a href="#simulator">Decision simulator</a>
+        <a href="#trace">Runtime trace</a>
+        <a href="#rowplan-animation">RowPlan motion</a>
+        <a href="#transaction-animation">Row transactions</a>
+        <a href="#authors">Author checklist</a>
+        <a href="#matrix">Decision matrix</a>
+        <a href="#sources">Sources</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main-content" class="shell">
+    <details class="visual-legend">
+      <summary id="visual-legend-title">How to read the interactive diagrams <span class="legend-hint">Open the color, symbol, line, and phase key</span></summary>
+      <div class="legend-content">
+        <p class="legend-intro">Every animation changes a documented semantic state; it never adds a scheduler rule to package metadata.</p>
+        <div class="legend-grid">
+        <div class="legend-group">
+          <h3>Colors</h3>
+          <ul class="legend-list">
+            <li class="legend-item"><span class="legend-swatch metadata" aria-hidden="true"></span><span>Core metadata / conformance</span></li>
+            <li class="legend-item"><span class="legend-swatch runtime" aria-hidden="true"></span><span>Runtime policy</span></li>
+            <li class="legend-item"><span class="legend-swatch state" aria-hidden="true"></span><span>Semantic state</span></li>
+            <li class="legend-item"><span class="legend-swatch staged" aria-hidden="true"></span><span>Provisional / staged output</span></li>
+            <li class="legend-item"><span class="legend-swatch committed" aria-hidden="true"></span><span>Committed output</span></li>
+            <li class="legend-item"><span class="legend-swatch abort" aria-hidden="true"></span><span>Abort / error</span></li>
+            <li class="legend-item"><span class="legend-swatch optional" aria-hidden="true"></span><span>Optional optimization</span></li>
+          </ul>
+        </div>
+        <div class="legend-group">
+          <h3>Shapes</h3>
+          <ul class="legend-list">
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M7 9h10M7 14h6" stroke="currentColor" stroke-width="2"/></svg><span>Package</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 12h6M12 9v6" stroke="currentColor" stroke-width="2"/></svg><span>Logical row</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="3" width="14" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 8h8M8 12h8M8 16h8" stroke="currentColor" stroke-width="2"/></svg><span>Physical slot</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 10h8M8 14h5" stroke="currentColor" stroke-width="2"/></svg><span>State cell</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M14 3v5h4M9 13h6M9 17h6" stroke="currentColor" stroke-width="2"/></svg><span>Output journal</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4v10l-8 4-8-4V7z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="2" fill="currentColor"/></svg><span>Graph / component</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18" stroke="currentColor" stroke-width="3"/><path d="M5 8h5M14 16h5" stroke="currentColor" stroke-width="2"/></svg><span>Transport boundary</span></li>
+          </ul>
+        </div>
+        <div class="legend-group">
+          <h3>Lines and phases</h3>
+          <div class="line-key">
+            <span><i class="line-sample" aria-hidden="true"></i>Solid: semantic dataflow</span>
+            <span><i class="line-sample dashed" aria-hidden="true"></i>Dashed: runtime choice / optimization</span>
+            <span><i class="line-sample dotted" aria-hidden="true"></i>Dotted: rollback / storage reuse</span>
+            <span><i class="line-sample pulse" aria-hidden="true"></i>One brief pulse: current execution</span>
+          </div>
+          <div class="phase-key" aria-label="Phase badge meanings">
+            <span class="phase-badge once">one-time</span>
+            <span class="phase-badge request">per request</span>
+            <span class="phase-badge iteration">per iteration</span>
+            <span class="phase-badge row">per row</span>
+            <span class="phase-badge post">post-commit</span>
+          </div>
+        </div>
+        </div>
+        <p class="legend-note"><strong>Logical row</strong> means request-visible semantic ownership. <strong>Physical slot</strong> means reusable runtime-private storage. A RowPlan selects positions; it never gives metadata a request ID or a slot identity.</p>
+      </div>
+    </details>
+    <section id="three-lenses" aria-labelledby="three-lenses-title">
+      <p class="eyebrow">The essential split</p>
+      <h2 id="three-lenses-title">One semantic contract, three owners</h2>
+      <p class="section-intro">The model/package makes row behavior observable; metadata makes it portable and checkable; the runtime turns the proof into a safe execution plan. None of those layers needs to name a model family, operator, vendor, request ID, or scheduler policy.</p>
+      <div class="grid-3">
+        <article class="card">
+          <span class="label package">A · model / package</span>
+          <h3>Make row semantics explicit</h3>
+          <ul>
+            <li>Give each request-visible input, state carrier, effect carrier, and output a structurally derivable row relationship—with no hidden cross-row coupling.</li>
+            <li>Expose cross-invocation state through typed contracts; do not hide it in a singleton or global side channel.</li>
+            <li>Ensure select, duplicate, reorder, compact, and release preserve row-local meaning—also for companions.</li>
+            <li>Either define safe inactive-row behavior or permit exact active-row execution.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <span class="label metadata">B · metadata</span>
+          <h3>Declare legality and dataflow</h3>
+          <ul>
+            <li>Declare request axes, row-scoped carriers, state/output/effect behavior, and companion relationships.</li>
+            <li>Declare positional selection semantics, including legal repeated source positions for clone/fork operations.</li>
+            <li>Describe valid inactive rows and legal compaction/release behavior.</li>
+            <li>Describe semantic backend requirements—never a scheduling instruction.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <span class="label runtime">C · runtime</span>
+          <h3>Plan and execute work</h3>
+          <ul>
+            <li>Map logical requests to transient rows/slots, admit work, select compatible live rows, and choose a path.</li>
+            <li>Build one canonical row plan; gather, transfer, execute, scatter, and stage output from that plan.</li>
+            <li>Commit successful rows independently; restore cancelled/failed rows without poisoning healthy siblings.</li>
+            <li>Release, backfill, cache, capture, and allocate only as policy permits.</li>
+          </ul>
+        </article>
+      </div>
+      <div class="ownership" aria-label="Ownership flow">
+        <div class="ownership-box">
+          <strong>Package fact</strong>
+          <p>“These values are row-separable and this state update has this meaning.”</p>
+        </div>
+        <div class="ownership-arrow" aria-hidden="true">→</div>
+        <div class="ownership-box">
+          <strong>Metadata proof</strong>
+          <p>“A conforming runtime may permute these carriers positionally.”</p>
+        </div>
+        <div class="ownership-arrow" aria-hidden="true">→</div>
+        <div class="ownership-box">
+          <strong>Runtime choice</strong>
+          <p>“For this workload and backend, share now—or run independently.”</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="metadata" aria-labelledby="metadata-title">
+      <p class="eyebrow">What changes in the declaration</p>
+      <h2 id="metadata-title">Metadata describes row semantics, not a scheduler</h2>
+      <p class="section-intro">The current S6 surface already has stable layout vocabulary such as <code>shared</code>, <code>request_aligned</code>, <code>token_packed</code>, and <code>runtime_sequence_state</code>; stateful row-scoped components use <code>row_scope</code>. The examples below distinguish those real terms from a portable conceptual contract. They intentionally do not propose a new <code>continuous_batching: true</code> flag.</p>
+      <div class="grid-2">
+        <article class="code-card">
+          <header>
+            <h3>Per-contribution declaration: no shared grouping permission</h3>
+            <p>Current vocabulary excerpt; <code>request_aligned</code> says where rows are, not that independent work may be grouped.</p>
+          </header>
+          <pre aria-label="YAML showing a request-aligned non-batched declaration"><span class="comment"># No batch_capacity assertion: invoke once per contribution.</span>
+<span class="key">components</span>:
+  <span class="key">encoder</span>:
+    <span class="key">implementation</span>: { <span class="key">kind</span>: <span class="value">onnx</span>, <span class="key">artifact</span>: <span class="value">encoder.onnx</span> }
+    <span class="comment"># batch_capacity intentionally absent</span>
+    <span class="key">ports</span>:
+      <span class="key">inputs</span>:
+        <span class="key">features</span>:
+          <span class="key">dtype</span>: <span class="value">float32</span>
+          <span class="key">rank</span>: <span class="value">3</span>
+          <span class="key">batch_layout</span>: { <span class="key">kind</span>: <span class="value">request_aligned</span>, <span class="key">axis</span>: <span class="value">0</span> }</pre>
+          <p class="caption">The row axis is still valuable: it keeps inputs and eventual outputs attributable. But the safe interpretation is isolated invocation unless a separate, valid grouped-execution contract is present.</p>
+        </article>
+        <article class="code-card">
+          <header>
+            <h3>Continuous-batching-capable declaration</h3>
+            <p>Conceptual map using stable current vocabulary where available; labels such as “companion group” are explanatory, not proposed field names.</p>
+          </header>
+          <pre aria-label="Conceptual YAML for shared live-row legality"><span class="comment"># Conceptual, portable contract map — not a new schema.</span>
+<span class="key">row-scoped carriers</span>:
+  <span class="key">tokens / positions / active / RNG</span>:
+    <span class="key">batch_layout</span>: { <span class="key">kind</span>: <span class="value">request_aligned</span>, <span class="key">axis</span>: <span class="value">0</span> }
+  <span class="key">KV + recurrent state</span>:
+    <span class="key">state_service</span>: <span class="value">typed, row-local update contract</span>
+  <span class="key">logits / emitted tokens / effects</span>:
+    <span class="key">positional behavior</span>: <span class="value">row-aligned; publish after commit</span>
+
+<span class="key">component grouping assertion</span>:
+  <span class="comment"># Current schema calls this batch_capacity. It expresses</span>
+  <span class="comment"># grouped-vs-solo equivalence constraints, never a queue width.</span>
+  <span class="key">same output semantics</span>: <span class="value">yes</span>
+  <span class="key">selection</span>: <span class="value">positional; reorder / shrink / duplicate allowed</span>
+  <span class="key">companions</span>: <span class="value">follow the same RowPlan exactly once</span>
+  <span class="key">inactive rows</span>: <span class="value">neutralized or excluded exactly</span>
+  <span class="key">release</span>: <span class="value">legal after per-row commit / abort</span></pre>
+          <p class="caption">For a grouped component, the current <code>batch_capacity</code> spelling is an artifact equivalence/bounds assertion. It is not a fixed deployment batch size, queue limit, fairness rule, or performance threshold.</p>
+        </article>
+      </div>
+      <aside class="not-metadata" aria-labelledby="not-metadata-title">
+        <span class="label risk">Strict exclusion</span>
+        <h3 id="not-metadata-title">Never serialize scheduler identity or policy into metadata</h3>
+        <p>These are runtime-private facts. They vary per deployment and per iteration, so putting them in a portable package would make its semantics accidentally depend on one scheduler.</p>
+        <div class="chips" aria-label="Values that are not metadata">
+          <span class="chip">request_id</span>
+          <span class="chip">physical slot</span>
+          <span class="chip">queue</span>
+          <span class="chip">fairness</span>
+          <span class="chip">batch capacity</span>
+          <span class="chip">backfill</span>
+          <span class="chip">scheduler</span>
+          <span class="chip">performance thresholds</span>
+          <span class="chip">deployment batch size</span>
+        </div>
+      </aside>
+    </section>
+
+    <section id="simulator" aria-labelledby="simulator-title">
+      <p class="eyebrow">Try the policy boundary</p>
+      <h2 id="simulator-title">Decision simulator: same semantics, different execution paths</h2>
+      <div class="simulator">
+        <header>
+          <p>Use the radio controls or the presets. The simulator keeps package semantics separate from runtime policy: a missing shared forward is not itself a package-load failure if isolated execution remains valid.</p>
+        </header>
+        <div class="preset-row" aria-label="Path presets">
+          <button type="button" data-preset="shared" aria-pressed="true">Shared path example</button>
+          <button type="button" data-preset="isolated">Isolated path example</button>
+          <button type="button" data-preset="fail">True semantic failure</button>
+        </div>
+        <form id="path-form">
+          <div class="choice-grid">
+            <fieldset>
+              <legend>1. Metadata proves row semantics?</legend>
+              <label class="choice"><input type="radio" name="metadata" value="valid" checked> Valid / complete</label>
+              <label class="choice"><input type="radio" name="metadata" value="missing"> Missing or invalid</label>
+            </fieldset>
+            <fieldset>
+              <legend>2. Backend can run a shared forward?</legend>
+              <label class="choice"><input type="radio" name="backend" value="shared" checked> Yes</label>
+              <label class="choice"><input type="radio" name="backend" value="isolated"> No / not ready</label>
+            </fieldset>
+            <fieldset>
+              <legend>3. Runtime policy for this moment?</legend>
+              <label class="choice"><input type="radio" name="policy" value="shared" checked> Prefer shared execution</label>
+              <label class="choice"><input type="radio" name="policy" value="isolated"> Prefer latency or isolation</label>
+            </fieldset>
+            <fieldset>
+              <legend>4. Are live rows compatible now?</legend>
+              <label class="choice"><input type="radio" name="compatibility" value="compatible" checked> Yes</label>
+              <label class="choice"><input type="radio" name="compatibility" value="incompatible"> No: split or isolate them</label>
+            </fieldset>
+            <fieldset>
+              <legend>5. Can each participant run in isolation?</legend>
+              <label class="choice"><input type="radio" name="isolated" value="valid" checked> Yes</label>
+              <label class="choice"><input type="radio" name="isolated" value="invalid"> No: a required semantic participant is unsupported</label>
+            </fieldset>
+          </div>
+        </form>
+        <div class="decision-track" aria-label="Shared-path decision stages">
+          <div class="decision-node" data-node="metadata"><strong>Legality</strong>Row semantics valid</div>
+          <div class="decision-node" data-node="backend"><strong>Capability</strong>Shared forward available</div>
+          <div class="decision-node" data-node="compatibility"><strong>Compatibility</strong>Live rows fit now</div>
+          <div class="decision-node" data-node="execute"><strong>Execution</strong>Choose a safe path</div>
+        </div>
+        <div id="decision-animation" class="decision-animation" data-path="shared" aria-label="Animated execution arrangement">
+          <p>Metadata says <strong>CAN</strong>. Runtime decides <strong>WHETHER / WHEN</strong>; both valid paths rejoin at the same per-row semantic result and commit boundary.</p>
+          <div class="decision-path">
+            <div class="path-row-stack" aria-label="Compatible logical rows">
+              <div class="path-row">Logical row L0</div>
+              <div class="path-row">Logical row L1</div>
+              <div class="path-row">Logical row L2</div>
+            </div>
+            <div class="forward-stack" aria-label="Runtime-selected forward path">
+              <div class="forward shared">One shared forward</div>
+              <div class="forward isolated">Isolated forward L0</div>
+              <div class="forward isolated">Isolated forward L1</div>
+              <div class="forward isolated">Isolated forward L2</div>
+            </div>
+            <div class="semantic-rejoin">Equivalent row-local semantic result<br>→ independent commit</div>
+          </div>
+        </div>
+        <div id="simulation-result" class="result" role="status" aria-live="polite" aria-atomic="true">
+          <div class="result-icon" aria-hidden="true">✓</div>
+          <div>
+            <h3>Shared live-row path</h3>
+            <p>Valid metadata, a shared-capable backend, and compatible live rows let the runtime co-execute this iteration.</p>
+          </div>
+        </div>
+        <p class="semantic-invariant"><strong>Invariant:</strong> shared and isolated paths must produce the same declared per-request state, effects, and output semantics. The difference is execution arrangement, not the meaning of a request or its committed result.</p>
+      </div>
+    </section>
+
+    <section id="trace" aria-labelledby="trace-title">
+      <p class="eyebrow">Conceptual code trace</p>
+      <h2 id="trace-title">From package load to row-local completion</h2>
+      <p class="section-intro">This timeline gives ownership and ordering, not a claim that every backend has the same implementation. The <code>RowPlan</code> is transient and positional: destination row <em>i</em> selects a source position. It may reorder, shrink, or repeat a position; it never carries a request ID or physical slot.</p>
+      <div class="motion-panel">
+        <div id="lifecycle-controls" class="motion-controls trace-controls" aria-label="Lifecycle animation controls">
+          <button id="lifecycle-play" type="button" aria-pressed="false">Play</button>
+          <button id="lifecycle-previous" type="button">Previous</button>
+          <button id="lifecycle-next" type="button">Next</button>
+          <button id="lifecycle-reset" type="button">Reset</button>
+          <label for="lifecycle-speed">Speed
+            <select id="lifecycle-speed">
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="2">2×</option>
+            </select>
+          </label>
+          <button id="reduce-motion" type="button" aria-pressed="false">Reduce motion: off</button>
+          <p id="lifecycle-status" class="motion-status" role="status" aria-live="polite" aria-atomic="true">Step 0 of 10 · One-time · Parse package metadata and resolve portable plans.</p>
+        </div>
+        <p class="section-intro">Play never starts automatically. Use the buttons—or Left/Right, Home, and End while this control group has focus—to examine a deterministic flow one phase at a time.</p>
+        <div id="lifecycle-flow" class="flow-rail" role="list" aria-label="Animated lifecycle data and control flow">
+          <div class="flow-node" data-flow-step="0" role="listitem"><span class="phase-badge once">one-time</span><strong>Parse metadata</strong>Schema, version, row and companion contracts.</div>
+          <div class="flow-node" data-flow-step="1" role="listitem"><span class="phase-badge once">one-time</span><strong>Preflight</strong>Reject a true unsupported semantic requirement before mutation.</div>
+          <div class="flow-node" data-flow-step="2" role="listitem"><span class="phase-badge request">per request</span><strong>Request / loop setup</strong>Prepare once; capture its committed baseline.</div>
+          <div class="flow-node" data-flow-step="3" role="listitem"><span class="phase-badge iteration">per iteration</span><strong>Choose path</strong>Runtime selects shared or isolated work now.</div>
+          <div class="flow-node" data-flow-step="4" role="listitem"><span class="phase-badge iteration">per iteration</span><strong>RowPlan</strong>Positionally reorder, duplicate, or shrink live rows.</div>
+          <div class="flow-node" data-flow-step="5" role="listitem"><span class="phase-badge iteration">per iteration</span><strong>Allocate / gather / transfer</strong>Move every companion; optional graph capture may apply.</div>
+          <div class="flow-node" data-flow-step="6" role="listitem"><span class="phase-badge iteration">per iteration</span><strong>Execute</strong>One shared forward or valid isolated forwards.</div>
+          <div class="flow-node" data-flow-step="7" role="listitem"><span class="phase-badge iteration">per iteration</span><strong>Scatter / stage</strong>Return state and journals to logical ownership.</div>
+          <div class="flow-node" data-flow-step="8" role="listitem"><span class="phase-badge row">per row</span><strong>Commit / abort</strong>Commit one row; restore a failed row's S3 baseline.</div>
+          <div class="flow-node" data-flow-step="9" role="listitem"><span class="phase-badge post">post-commit</span><strong>Release / backfill</strong>Publish then clear ownership; reuse storage only cleanly.</div>
+          <div class="flow-node" data-flow-step="10" role="listitem"><span class="phase-badge request">per request</span><strong>Multi-turn continuation</strong>Continue from committed semantic state.</div>
+        </div>
+      </div>
+      <div class="timeline-key" aria-label="Timeline work categories">
+        <span>One-time / per-request setup</span>
+        <span class="iteration">Per batch iteration</span>
+        <span class="completion">Completion / recovery</span>
+      </div>
+      <ol id="lifecycle-trace" class="trace">
+        <li class="trace-item" data-lifecycle-step="0">
+          <span class="label metadata">0 · load once</span>
+          <h3>Parse, version, and resolve plans</h3>
+          <p>Parse metadata, check schema/version, validate contracts, and resolve generalized state, output, effect, and loop plans. A package cannot be accepted by guessing hidden semantics.</p>
+        </li>
+        <li class="trace-item" data-lifecycle-step="1">
+          <span class="label metadata">1 · preflight</span>
+          <h3>Admit before mutation</h3>
+          <p>Validate axes, carriers, companion closure, inactive-row semantics, and backend requirements. A true unsupported semantic requirement fails before allocation or mutation; lack of shared optimization capability does not.</p>
+        </li>
+        <li class="trace-item" data-lifecycle-step="2">
+          <span class="label package">2 · per request</span>
+          <h3>Prepare one request exactly once</h3>
+          <p>Preprocess prompt/media, capture the S3 committed baseline, initialize or restore semantic state, and reserve state/output journals. Run the authored <code>loop.setup</code> exactly once at loop entry—not “only when it is empty.”</p>
+        </li>
+        <li class="trace-item iteration" data-lifecycle-step="3">
+          <span class="label runtime">3 · policy</span>
+          <h3>Form compatible live rows</h3>
+          <p>The runtime schedules compatible work and chooses shared or isolated execution according to backend capability, workload, resources, latency/performance policy, and current compatibility.</p>
+        </li>
+        <li class="trace-item iteration" data-lifecycle-step="4">
+          <span class="label runtime">4 · transient plan</span>
+          <h3>Build one canonical RowPlan</h3>
+          <p>Map logical rows to selected source positions. The plan supports reorder, duplicate, and shrink. Immutable prepared inputs remain authoritative, so retry/abort never depends on a partially rewritten working buffer.</p>
+        </li>
+        <li class="trace-item iteration" data-lifecycle-step="5">
+          <span class="label runtime">5 · movement</span>
+          <h3>Gather and move every carrier once</h3>
+          <p>Allocate destination views/buffers; select row-scoped input, state, effect, output, RNG, and constraint carriers exactly once; apply the same plan to companions; transfer explicitly to device. Capture/replay is optional and only when eligible.</p>
+        </li>
+        <li class="trace-item iteration" data-lifecycle-step="6">
+          <span class="label package">6 · forward</span>
+          <h3>Execute shared or isolated</h3>
+          <p>Run one shared forward or one isolated forward per row. Inactive rows obey their declared neutral/freeze behavior, or are absent from an exact active-row invocation. No other row’s state or output may change.</p>
+        </li>
+        <li class="trace-item iteration" data-lifecycle-step="7">
+          <span class="label runtime">7 · provisional results</span>
+          <h3>Scatter, update, and stage</h3>
+          <p>Map outputs and state updates back to logical rows. Stage effects and S4 output publications in per-row journals; do not expose an uncommitted token, media result, or effect to transport.</p>
+        </li>
+        <li class="trace-item completion" data-lifecycle-step="8">
+          <span class="label commit">8 · row transaction</span>
+          <h3>Commit or abort independently</h3>
+          <p>Via S3, successful rows commit. A failed or cancelled row restores its own committed baseline and discards provisional S4 work. Healthy sibling rows remain eligible to continue.</p>
+        </li>
+        <li class="trace-item completion" data-lifecycle-step="9">
+          <span class="label runtime">9 · lifecycle policy</span>
+          <h3>Emit, release, and optionally backfill</h3>
+          <p>Publish committed results to transport, release EOS/completed rows, clear ownership, then optionally admit new work or reuse storage. Backfill and slot reuse are runtime policy only.</p>
+        </li>
+        <li class="trace-item completion" data-lifecycle-step="10">
+          <span class="label package">10 · next turn</span>
+          <h3>Continue from semantic state</h3>
+          <p>A multi-turn request reuses committed semantic state. A prefix cache may accelerate reconstruction, but it is a separate optimization—not session identity, request identity, or proof of batching.</p>
+        </li>
+      </ol>
+      <details>
+        <summary>Why “gather every carrier exactly once” matters</summary>
+        <p>Applying different permutations to an attention mask, position input, RNG state, grammar constraint, LoRA selection, K/V state, or emitted output is a silent cross-request corruption bug. A canonical row plan gives every row-scoped carrier the same positional basis; preflight verifies extents before a partial move.</p>
+      </details>
+    </section>
+
+    <section id="rowplan-animation" class="animation-section" aria-labelledby="rowplan-animation-title">
+      <p class="eyebrow">Positional movement, not request identity</p>
+      <h2 id="rowplan-animation-title">RowPlan moves every companion together</h2>
+      <p class="section-intro">This concrete selected-row example uses <code>RowPlan = [2, 2, 0]</code>. It reorders source row 2 before source row 0, duplicates row 2 with defined clone/fork behavior, and shrinks the current live selection by leaving source row 1 out. It does not make a physical slot part of metadata.</p>
+      <div id="rowplan-demo" class="rowplan-demo" data-stage="source">
+        <div class="motion-controls" aria-label="RowPlan animation controls">
+          <button id="rowplan-play" type="button" aria-pressed="false">Play mapping</button>
+          <button id="rowplan-previous" type="button">Previous</button>
+          <button id="rowplan-next" type="button">Next</button>
+          <button id="rowplan-reset" type="button">Reset</button>
+          <p id="rowplan-status" class="motion-status" role="status" aria-live="polite" aria-atomic="true">Stage 0 of 3 · Source logical rows are authoritative.</p>
+        </div>
+        <div class="rowplan-board">
+          <p class="mapping-callout"><strong>One plan, four carrier classes:</strong> the same positional selection is applied once to request inputs, semantic state, RNG / constraints, and effects / output journals.</p>
+          <div class="rowplan-columns">
+            <div class="logical-side">
+              <h3>Source logical rows</h3>
+              <div class="logical-rows">
+                <div class="logical-row" data-source="0">L0 · prompt A · committed state A</div>
+                <div class="logical-row skip" data-source="1">L1 · prompt B · not selected (shrink)</div>
+                <div class="logical-row" data-source="2">L2 · prompt C · committed state C</div>
+              </div>
+            </div>
+            <div class="rowplan-map-arrow" aria-hidden="true">→</div>
+            <div class="destination-side">
+              <h3>Destination live rows from <code>[2, 2, 0]</code></h3>
+              <div class="destination-rows">
+                <div class="destination-row">D0 ← L2 · first selected copy</div>
+                <div class="destination-row">D1 ← L2 · clone / fork copy</div>
+                <div class="destination-row">D2 ← L0 · reordered copy</div>
+              </div>
+            </div>
+          </div>
+          <div class="carrier-list" aria-label="Companion carriers sharing RowPlan 2, 2, 0">
+            <div class="carrier-track"><span class="carrier-name">Request inputs</span><span class="carrier-source">L0 A · L1 B · L2 C</span><span class="carrier-arrow" aria-hidden="true">→</span><span class="carrier-destination">D0 C · D1 C clone · D2 A</span></div>
+            <div class="carrier-track"><span class="carrier-name">Semantic state</span><span class="carrier-source">L0 S3-A · L1 S3-B · L2 S3-C</span><span class="carrier-arrow" aria-hidden="true">→</span><span class="carrier-destination">D0 S3-C · D1 S3-C clone · D2 S3-A</span></div>
+            <div class="carrier-track"><span class="carrier-name">RNG / constraints</span><span class="carrier-source">L0 R-A · L1 R-B · L2 R-C</span><span class="carrier-arrow" aria-hidden="true">→</span><span class="carrier-destination">D0 R-C · D1 R-C clone · D2 R-A</span></div>
+            <div class="carrier-track"><span class="carrier-name">Effects / output journals</span><span class="carrier-source">L0 J-A · L1 J-B · L2 J-C</span><span class="carrier-arrow" aria-hidden="true">→</span><span class="carrier-destination">D0 J-C · D1 J-C clone · D2 J-A</span></div>
+          </div>
+          <p class="scatter-result">Scatter returns results to logical ownership: D0 → L2, D1 → defined fork L2′, D2 → L0. L1 remains untouched because it was not selected. No carrier receives a different permutation.</p>
+        </div>
+        <p class="print-only"><strong>Static sequence:</strong> source logical rows → gather all four carrier classes by <code>[2, 2, 0]</code> → execute → scatter results to L2, defined fork L2′, and L0.</p>
+      </div>
+    </section>
+
+    <section id="transaction-animation" class="animation-section" aria-labelledby="transaction-animation-title">
+      <p class="eyebrow">Per-row atomic turn</p>
+      <h2 id="transaction-animation-title">Staged output crosses transport only after each row commits</h2>
+      <p class="section-intro">Three concurrent live rows can reach different outcomes without leaking state or output. The boundary is per logical row: an abort restores that row’s S3 baseline, while healthy siblings commit independently. A completed physical slot becomes reusable storage only after ownership is cleared.</p>
+      <div id="transaction-demo" class="transaction-demo" data-stage="baseline">
+        <div class="motion-controls" aria-label="Per-row transaction animation controls">
+          <button id="transaction-play" type="button" aria-pressed="false">Play transaction</button>
+          <button id="transaction-previous" type="button">Previous</button>
+          <button id="transaction-next" type="button">Next</button>
+          <button id="transaction-reset" type="button">Reset</button>
+          <p id="transaction-status" class="motion-status" role="status" aria-live="polite" aria-atomic="true">Stage 0 of 3 · Each live row starts from its own committed S3 baseline.</p>
+        </div>
+        <div class="transaction-board">
+          <p class="transaction-key"><span class="phase-badge row">per row</span> S3 is committed semantic state. S4 journals are provisional. The solid line is the transport boundary; the dotted outline is safe storage reuse.</p>
+          <div class="transaction-grid">
+            <article class="transaction-row">
+              <h3>Logical L0 · physical slot S0</h3>
+              <p>Healthy row continues after its own turn.</p>
+              <div class="state-cell">S3 baseline: sequence 10</div>
+              <div class="journal-cell">S4 journal: token 41 and event staged</div>
+              <div class="transport-boundary">Transport boundary · blocked while staged</div>
+              <div class="published-cell">Committed token 41 / event → transport</div>
+              <div class="outcome-cell">COMMIT · S3 advances to sequence 11</div>
+            </article>
+            <article class="transaction-row cancelled">
+              <h3>Logical L1 · physical slot S1</h3>
+              <p>Cancellation affects this row alone.</p>
+              <div class="state-cell">S3 baseline: sequence 31</div>
+              <div class="journal-cell">S4 journal: token 77 and event staged</div>
+              <div class="transport-boundary">Transport boundary · blocked while staged</div>
+              <div class="published-cell">No publication: journal discarded</div>
+              <div class="outcome-cell">ABORT · discard S4; restore S3 sequence 31</div>
+            </article>
+            <article class="transaction-row eos">
+              <h3>Logical L2 · physical slot S2</h3>
+              <p>Healthy row commits, reaches EOS, then releases.</p>
+              <div class="state-cell">S3 baseline: sequence 4</div>
+              <div class="journal-cell">S4 journal: token 52 and EOS staged</div>
+              <div class="transport-boundary">Transport boundary · blocked while staged</div>
+              <div class="published-cell">Committed token 52 / EOS → transport</div>
+              <div class="outcome-cell">COMMIT · EOS makes release eligible</div>
+            </article>
+          </div>
+          <div class="slot-reuse">Post-commit only: L2 releases and clears S2 (dotted reuse boundary). A new logical L3 may occupy S2 with a <strong>fresh baseline</strong>; it inherits neither L2 state nor its journal.</div>
+        </div>
+        <p class="print-only"><strong>Static sequence:</strong> baseline → staged journals blocked at transport → L0/L2 commit and publish while L1 aborts and restores S3 → L2 releases; L3 may reuse clean S2.</p>
+      </div>
+    </section>
+
+    <section id="setup-animation" class="animation-section" aria-labelledby="setup-animation-title">
+      <p class="eyebrow">Runtime memory and movement</p>
+      <h2 id="setup-animation-title">Reserve, gather, transfer, execute, then scatter</h2>
+      <p class="section-intro">These are runtime mechanics around the semantic contract. Allocation and transfer are explicit; graph capture is shown because it can optimize a stable execution shape, not because metadata requires capture or a particular backend strategy.</p>
+      <div id="setup-demo" class="setup-demo" data-stage="reserve" data-graph="true">
+        <div class="motion-controls" aria-label="Memory and setup animation controls">
+          <button id="setup-play" type="button" aria-pressed="false">Play setup</button>
+          <button id="setup-previous" type="button">Previous</button>
+          <button id="setup-next" type="button">Next</button>
+          <button id="setup-reset" type="button">Reset</button>
+          <label class="choice"><input id="setup-graph" type="checkbox" checked> Show optional graph capture / replay</label>
+          <p id="setup-status" class="motion-status" role="status" aria-live="polite" aria-atomic="true">Stage 0 of 5 · Reserve capacity under runtime policy.</p>
+        </div>
+        <div class="setup-board">
+          <div class="setup-track" aria-label="Memory setup stages">
+            <article class="setup-node" data-setup-step="0"><span class="phase-badge request">per request</span><h3>Reserve</h3><p>Admit under runtime capacity policy; logical ownership remains separate from storage.</p></article>
+            <article class="setup-node" data-setup-step="1"><span class="phase-badge iteration">per iteration</span><h3>Allocate + gather</h3><p>Allocate destination views and gather every selected companion by the RowPlan.</p></article>
+            <article class="setup-node" data-setup-step="2"><span class="phase-badge iteration">per iteration</span><h3>Host → device</h3><p>Transfer the gathered carrier set explicitly to the execution device.</p></article>
+            <article class="setup-node optional" data-setup-step="3"><span class="phase-badge iteration">optional</span><h3>Capture / replay graph</h3><p>Eligible runtime optimization; direct execution remains valid when skipped.</p></article>
+            <article class="setup-node" data-setup-step="4"><span class="phase-badge iteration">per iteration</span><h3>Execute</h3><p>Run the selected shared or isolated forward while preserving row-local semantics.</p></article>
+            <article class="setup-node" data-setup-step="5"><span class="phase-badge iteration">per iteration</span><h3>Scatter + stage</h3><p>Return state/output to logical rows; journal effects until the per-row commit.</p></article>
+          </div>
+          <p class="setup-note"><strong>Graph capture/replay is optional:</strong> it is a runtime optimization chosen only when eligible. Metadata declares portable legality and ABI facts; it does not require graph capture, reserve a slot, or dictate a transfer policy.</p>
+        </div>
+        <p class="print-only"><strong>Static sequence:</strong> reserve → allocate/gather → explicit host-to-device transfer → optional graph capture/replay or direct execute → execute → scatter/stage.</p>
+      </div>
+    </section>
+
+    <section id="authors" aria-labelledby="authors-title">
+      <p class="eyebrow">What model authors actually change</p>
+      <h2 id="authors-title">Checklist: prove the structural properties</h2>
+      <p class="section-intro">The ONNX graph math sometimes already has these properties. In that case the change can be metadata/exporter work only. Other packages need graph-signature or state-layout changes before their behavior is row-separable and safely portable.</p>
+      <ul class="checklist">
+        <li>Use dynamic/request batch axes and row-aligned inputs/outputs wherever requests contribute independently.</li>
+        <li>Expose position, mask, valid-length, and state inputs when they are semantically necessary; do not reconstruct them from a hidden slot convention.</li>
+        <li>Expose all cross-invocation state as typed state. There must be no hidden singleton/global state that makes one row influence another.</li>
+        <li>Make state updates row-local. A batch-wide reduction or cross-row attention needs an explicit safe structural contract, not an assumption that it will be harmless.</li>
+        <li>Neutralize padded/inactive rows, freeze them as declared, or allow runtime selection of only exact active rows.</li>
+        <li>Keep companions together: lengths, masks, positions, offsets/owners, routing, RNG, constraints, and state/output/effect carriers must follow the same selection.</li>
+        <li>Support deterministic positional select/reorder/duplicate/compact/release. Repeated selection must have defined clone/fork behavior.</li>
+        <li>Ensure the backend/component accepts selected or compacted rows; otherwise the runtime must select the isolated path before mutation.</li>
+        <li>Demonstrate that grouped execution is deterministic and equivalent to isolated execution for each request’s declared results.</li>
+      </ul>
+      <aside class="callout" style="margin-top: 1.2rem; padding: 1.1rem 1.25rem;">
+        <span class="label commit">Practical implication</span>
+        <p style="margin-bottom: 0;">A dynamic batch dimension alone is not enough. It permits a larger tensor shape, but it does not establish row-local state, companion alignment, inactive-row behavior, transaction isolation, or an implementation that can safely select live rows.</p>
+      </aside>
+    </section>
+
+    <section id="matrix" aria-labelledby="matrix-title">
+      <p class="eyebrow">Executive decision table</p>
+      <h2 id="matrix-title">What happens in each capability combination?</h2>
+      <div class="matrix-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Package / metadata proof</th>
+              <th scope="col">Backend shared forward</th>
+              <th scope="col">Runtime decision</th>
+              <th scope="col">Correct outcome</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="yes">Supports</span> shared row semantics</td>
+              <td><span class="yes">Supports</span></td>
+              <td>Chooses shared; rows are compatible</td>
+              <td><strong>Continuous batching.</strong> Gather/execute/scatter by one positional plan, then commit per row.</td>
+            </tr>
+            <tr>
+              <td><span class="yes">Supports</span> shared row semantics</td>
+              <td><span class="yes">Supports</span></td>
+              <td>Chooses isolation for latency, resources, or policy</td>
+              <td><strong>Valid isolated execution.</strong> The package remains correct; the optional optimization is declined.</td>
+            </tr>
+            <tr>
+              <td><span class="yes">Supports</span> shared row semantics</td>
+              <td><span class="no">Lacks</span> a shared forward</td>
+              <td>Must not pretend it is shared</td>
+              <td><strong>Isolated fallback.</strong> Decline the optimization before mutation; retain package load and semantic execution.</td>
+            </tr>
+            <tr>
+              <td><span class="no">Does not prove</span> safe shared rows</td>
+              <td><span class="maybe">Irrelevant</span></td>
+              <td>No shared path</td>
+              <td><strong>No shared execution.</strong> Run isolated if executable; do not infer missing row semantics from a model name or shape.</td>
+            </tr>
+            <tr>
+              <td>Requires a semantic participant</td>
+              <td>Participant unsupported even in isolation</td>
+              <td>Cannot preserve the declared contract</td>
+              <td><strong>Fail before mutation.</strong> This is a semantic failure, not a batching-capability failure.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="misconceptions-title">
+      <p class="eyebrow">Guardrails</p>
+      <h2 id="misconceptions-title">Common misconceptions</h2>
+      <div class="misconceptions">
+        <article class="misconception"><strong>“Metadata schedules.”</strong><p>No. It proves what can be moved and executed safely. Queuing, admission, fairness, and timing stay runtime-private.</p></article>
+        <article class="misconception"><strong>“Batching capability means a fixed batch size.”</strong><p>No. Structural legality is distinct from a deployment’s current capacity, resource budget, or chosen width.</p></article>
+        <article class="misconception"><strong>“Padding is continuous batching.”</strong><p>No. Padding is one possible representation. It does not prove state isolation, live-row compaction, or safe output publication.</p></article>
+        <article class="misconception"><strong>“A prefix cache is batching.”</strong><p>No. It is a reuse optimization. It neither defines session identity nor proves that two live requests can share a forward pass.</p></article>
+        <article class="misconception"><strong>“<code>loop.setup</code> must be empty.”</strong><p>No. Authored setup may establish real state; it runs once at loop entry, including before a zero-trip loop, rather than once per iteration.</p></article>
+        <article class="misconception"><strong>“Physical slots are semantic row IDs.”</strong><p>No. Slots are runtime storage. Metadata operates on positional row relationships; runtime maps those positions back to logical requests.</p></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="glossary-title">
+      <p class="eyebrow">Shared vocabulary</p>
+      <h2 id="glossary-title">Glossary and legend</h2>
+      <dl class="glossary">
+        <div class="term"><dt>Logical row</dt><dd>The request-local semantic row a client observes. It survives compaction even if its physical storage changes.</dd></div>
+        <div class="term"><dt>Physical slot</dt><dd>Runtime-private storage position. It is not serialized and has no package-level identity.</dd></div>
+        <div class="term"><dt>RowPlan</dt><dd>A transient positional mapping from destination rows to selected source rows. It may repeat a source for a clone/fork.</dd></div>
+        <div class="term"><dt>Companion</dt><dd>A value such as a mask, length, offset, owner, position, or constraint whose row semantics must move with its primary value.</dd></div>
+        <div class="term"><dt>S3 baseline</dt><dd>The per-row committed semantic checkpoint used to restore a cancelled or failed turn.</dd></div>
+        <div class="term"><dt>S4 journal</dt><dd>Provisional outputs/effects staged until the associated row commits; never exposed as a committed result early.</dd></div>
+        <div class="term"><dt>Shared forward</dt><dd>One backend invocation advancing more than one compatible live row while preserving each row’s independent semantics.</dd></div>
+        <div class="term"><dt>Isolated path</dt><dd>One valid execution per request/row. It is a correct fallback, not evidence that metadata failed.</dd></div>
+        <div class="term"><dt>Inactive-row behavior</dt><dd>The declared neutral/freeze semantics for a retained inactive row, or the guarantee that exact active-row selection is used instead.</dd></div>
+      </dl>
+    </section>
+
+    <section id="sources" aria-labelledby="sources-title">
+      <div class="source-panel">
+        <p class="eyebrow">Source of truth and scope</p>
+        <h2 id="sources-title">Read this as a portable target, informed by current S6 behavior</h2>
+        <p>The normative design source is <a href="../../genai/INFERENCE_METADATA_DECISIONS.md#8-batching-varlen-and-paged-attention">Inference Metadata Decisions §8 (batching, varlen, and paged attention)</a>, especially its layout vocabulary, no-row-identity rule, compaction derivability, mandatory row ABI, and runtime-minted selection. Its <a href="../../genai/INFERENCE_METADATA_DECISIONS.md#61-structural-ir">loop semantics</a>, <a href="../../genai/INFERENCE_METADATA_DECISIONS.md#62-values-and-effects">values/effects</a>, <a href="../../genai/INFERENCE_METADATA_DECISIONS.md#64-workflow-output-publication-and-revisions">output-publication/revision</a>, and <a href="../../genai/INFERENCE_METADATA_DECISIONS.md#12-state">generalized-state</a> / <a href="../../genai/INFERENCE_METADATA_DECISIONS.md#125-sessions">session transaction</a> sections define the broader state and commit boundary. The current grouped-component surface is detailed in <a href="../../genai/ENCODER_BATCHING.md">Encoder Batching</a>.</p>
+        <p>Implementation references are evidence, not a ceiling on the portable target: <a href="../../../crates/onnx-genai-metadata/src/schema/ir.rs">metadata layout/schema types</a>, <a href="../../../crates/onnx-genai-engine/src/pipeline/row_state.rs">the positional RowPlan and RowScopedState ABI</a>, and <a href="../../../crates/onnx-genai-engine/src/batched.rs">the runtime-derived shared-forward capability report</a>. For visual language and the wider workflow trace, see the companion <a href="metadata-manager-architecture.svg">architecture diagram</a> and <a href="metadata-workflow-execution-trace.svg">execution trace</a> added by the merged diagram PR #2306.</p>
+        <p><strong>How to view:</strong> download or open this HTML file locally in a browser. GitHub’s source view shows the file but does not execute its interactive controls.</p>
+      </div>
+    </section>
+  </main>
+  <footer>
+    <div class="shell">Legend: <span class="label package">package fact</span> <span class="label metadata">metadata / legality</span> <span class="label runtime">runtime policy</span> <span class="label commit">committed lifecycle</span> · Self-contained: no external scripts, stylesheets, fonts, or preview services.</div>
+  </footer>
+  <script>
+    (() => {
+      "use strict";
+      const byId = id => document.getElementById(id);
+      const clamp = (value, maximum) => Math.max(0, Math.min(value, maximum));
+      const reduceMotionButton = byId("reduce-motion");
+      const systemReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+      let explicitlyReducedMotion = false;
+      const isReducedMotion = () => explicitlyReducedMotion || systemReducedMotion.matches;
+      const restartMotion = roots => {
+        roots.forEach(root => root.classList.remove("motion-run"));
+        if (isReducedMotion()) return;
+        roots.forEach(root => {
+          void root.offsetWidth;
+          root.classList.add("motion-run");
+        });
+      };
+
+      const lifecycleFrames = [
+        ["One-time", "Parse package metadata and resolve portable plans."],
+        ["One-time", "Preflight validates row semantics before allocation or mutation."],
+        ["Per request", "Prepare the request and run loop.setup exactly once."],
+        ["Per iteration", "Runtime chooses a shared or isolated path for live rows now."],
+        ["Per iteration", "Build the transient positional RowPlan."],
+        ["Per iteration", "Allocate, gather companions, transfer, and optionally capture."],
+        ["Per iteration", "Execute one shared forward or valid isolated forwards."],
+        ["Per iteration", "Scatter state and stage output/effects in per-row journals."],
+        ["Per row", "Commit a successful row or abort and restore its S3 baseline."],
+        ["Post-commit", "Publish, release, clear ownership, and optionally backfill."],
+        ["Per request", "Continue a multi-turn request from committed semantic state."]
+      ];
+      const lifecycleFlow = byId("lifecycle-flow");
+      const lifecycleTrace = byId("lifecycle-trace");
+      const lifecycleStatus = byId("lifecycle-status");
+      const lifecyclePlay = byId("lifecycle-play");
+      const lifecyclePrevious = byId("lifecycle-previous");
+      const lifecycleNext = byId("lifecycle-next");
+      const lifecycleReset = byId("lifecycle-reset");
+      const lifecycleSpeed = byId("lifecycle-speed");
+      const lifecycleItems = [...document.querySelectorAll("[data-lifecycle-step]")];
+      const lifecycleNodes = [...document.querySelectorAll("[data-flow-step]")];
+      let lifecycleIndex = 0;
+      let lifecycleTimer = null;
+      let lifecyclePlaying = false;
+
+      const stopLifecycle = () => {
+        if (lifecycleTimer !== null) {
+          window.clearTimeout(lifecycleTimer);
+          lifecycleTimer = null;
+        }
+        lifecyclePlaying = false;
+        lifecyclePlay.textContent = "Play";
+        lifecyclePlay.setAttribute("aria-pressed", "false");
+      };
+      const renderLifecycle = (animate = false) => {
+        lifecycleItems.forEach(item => {
+          const itemIndex = Number(item.dataset.lifecycleStep);
+          item.classList.toggle("is-current", itemIndex === lifecycleIndex);
+          item.classList.toggle("is-past", itemIndex < lifecycleIndex);
+        });
+        lifecycleNodes.forEach(node => {
+          const nodeIndex = Number(node.dataset.flowStep);
+          node.classList.toggle("is-current", nodeIndex === lifecycleIndex);
+          node.classList.toggle("is-past", nodeIndex < lifecycleIndex);
+        });
+        const [phase, detail] = lifecycleFrames[lifecycleIndex];
+        lifecycleStatus.textContent = `Step ${lifecycleIndex} of ${lifecycleFrames.length - 1} · ${phase} · ${detail}`;
+        lifecyclePrevious.disabled = lifecycleIndex === 0;
+        lifecycleNext.disabled = lifecycleIndex === lifecycleFrames.length - 1;
+        if (animate) restartMotion([lifecycleFlow, lifecycleTrace]);
+      };
+      const setLifecycle = (index, animate = true) => {
+        lifecycleIndex = clamp(index, lifecycleFrames.length - 1);
+        renderLifecycle(animate);
+      };
+      const scheduleLifecycle = () => {
+        if (!lifecyclePlaying) return;
+        if (lifecycleIndex >= lifecycleFrames.length - 1) {
+          stopLifecycle();
+          lifecycleStatus.textContent = `${lifecycleStatus.textContent} Playback complete.`;
+          return;
+        }
+        lifecycleTimer = window.setTimeout(() => {
+          lifecycleTimer = null;
+          setLifecycle(lifecycleIndex + 1);
+          scheduleLifecycle();
+        }, Math.round(1600 / Number(lifecycleSpeed.value)));
+      };
+      const toggleLifecycle = () => {
+        if (lifecyclePlaying) {
+          stopLifecycle();
+          return;
+        }
+        if (isReducedMotion()) {
+          setLifecycle(lifecycleFrames.length - 1, false);
+          lifecycleStatus.textContent = `${lifecycleStatus.textContent} Reduced motion advances playback without transitions.`;
+          return;
+        }
+        if (lifecycleIndex >= lifecycleFrames.length - 1) setLifecycle(0);
+        lifecyclePlaying = true;
+        lifecyclePlay.textContent = "Pause";
+        lifecyclePlay.setAttribute("aria-pressed", "true");
+        restartMotion([lifecycleFlow, lifecycleTrace]);
+        scheduleLifecycle();
+      };
+      lifecyclePlay.addEventListener("click", toggleLifecycle);
+      lifecyclePrevious.addEventListener("click", () => {
+        stopLifecycle();
+        setLifecycle(lifecycleIndex - 1);
+      });
+      lifecycleNext.addEventListener("click", () => {
+        stopLifecycle();
+        setLifecycle(lifecycleIndex + 1);
+      });
+      lifecycleReset.addEventListener("click", () => {
+        stopLifecycle();
+        setLifecycle(0);
+      });
+      lifecycleSpeed.addEventListener("change", () => {
+        if (lifecyclePlaying) {
+          stopLifecycle();
+          lifecyclePlaying = true;
+          lifecyclePlay.textContent = "Pause";
+          lifecyclePlay.setAttribute("aria-pressed", "true");
+          scheduleLifecycle();
+        }
+      });
+      byId("lifecycle-controls").addEventListener("keydown", event => {
+        const keyActions = {
+          ArrowLeft: () => lifecyclePrevious.click(),
+          ArrowRight: () => lifecycleNext.click(),
+          Home: () => {
+            stopLifecycle();
+            setLifecycle(0);
+          },
+          End: () => {
+            stopLifecycle();
+            setLifecycle(lifecycleFrames.length - 1);
+          }
+        };
+        if (keyActions[event.key]) {
+          event.preventDefault();
+          keyActions[event.key]();
+        }
+      });
+
+      const form = document.getElementById("path-form");
+      const result = document.getElementById("simulation-result");
+      const presets = document.querySelectorAll("[data-preset]");
+      const nodes = document.querySelectorAll("[data-node]");
+      const decisionAnimation = byId("decision-animation");
+      const decisionCaption = decisionAnimation.querySelector("p");
+
+      const selected = name => new FormData(form).get(name);
+
+      const setChoice = (name, value) => {
+        const control = form.querySelector(`input[name="${name}"][value="${value}"]`);
+        if (control) control.checked = true;
+      };
+
+      const paintNodes = active => {
+        nodes.forEach(node => node.classList.toggle("active", active.includes(node.dataset.node)));
+      };
+
+      const showResult = (kind, title, detail, activeNodes, animate) => {
+        result.className = `result ${kind}`;
+        result.replaceChildren();
+        const icon = document.createElement("div");
+        icon.className = "result-icon";
+        icon.setAttribute("aria-hidden", "true");
+        icon.textContent = kind === "fail" ? "!" : kind === "isolated" ? "→" : "✓";
+        const copy = document.createElement("div");
+        const heading = document.createElement("h3");
+        heading.textContent = title;
+        const paragraph = document.createElement("p");
+        paragraph.textContent = detail;
+        copy.append(heading, paragraph);
+        result.append(icon, copy);
+        paintNodes(activeNodes);
+        const path = kind || "shared";
+        decisionAnimation.dataset.path = path;
+        decisionCaption.textContent = path === "fail"
+          ? "A required participant is unsupported even in isolation: reject before mutation; do not invent a shared path."
+          : "Metadata says CAN. Runtime decides WHETHER / WHEN; both valid paths rejoin at the same per-row semantic result and commit boundary.";
+        if (animate) restartMotion([decisionAnimation]);
+      };
+
+      const update = (animate = true) => {
+        const metadata = selected("metadata");
+        const backend = selected("backend");
+        const policy = selected("policy");
+        const compatibility = selected("compatibility");
+        const isolated = selected("isolated");
+
+        if (metadata === "valid" && backend === "shared" && policy === "shared" && compatibility === "compatible") {
+          showResult(
+            "",
+            "Shared live-row path",
+            "The runtime may form a compatible live batch, apply one RowPlan to all row-scoped carriers, run a shared forward, then scatter and commit each logical row independently.",
+            ["metadata", "backend", "compatibility", "execute"],
+            animate
+          );
+        } else if (isolated === "valid") {
+          const reason = metadata !== "valid"
+            ? "Shared safety is not proven, so the runtime does not attempt co-execution."
+            : backend !== "shared"
+              ? "This backend lacks a shared forward, so it declines only the optimization before mutation."
+              : compatibility !== "compatible"
+                ? "The currently live rows are incompatible, so runtime policy splits or isolates them rather than forcing a shared call."
+              : "Runtime policy chooses latency or isolation for this compatible package.";
+          showResult(
+            "isolated",
+            "Valid isolated path",
+            `${reason} Each request executes with the same declared state, effect, and output semantics.`,
+            metadata === "valid" ? ["metadata", "execute"] : ["execute"],
+            animate
+          );
+        } else {
+          showResult(
+            "fail",
+            "Fail before mutation",
+            "A required semantic participant cannot execute even in isolation. This is a true contract failure—not a reason to encode scheduler policy or slot identity in metadata.",
+            [],
+            animate
+          );
+        }
+      };
+
+      const applyPreset = preset => {
+        if (preset === "shared") {
+          setChoice("metadata", "valid");
+          setChoice("backend", "shared");
+          setChoice("policy", "shared");
+          setChoice("compatibility", "compatible");
+          setChoice("isolated", "valid");
+        } else if (preset === "isolated") {
+          setChoice("metadata", "valid");
+          setChoice("backend", "isolated");
+          setChoice("policy", "isolated");
+          setChoice("compatibility", "compatible");
+          setChoice("isolated", "valid");
+        } else {
+          setChoice("metadata", "missing");
+          setChoice("backend", "isolated");
+          setChoice("policy", "isolated");
+          setChoice("compatibility", "incompatible");
+          setChoice("isolated", "invalid");
+        }
+        presets.forEach(button => button.setAttribute("aria-pressed", String(button.dataset.preset === preset)));
+        update();
+      };
+
+      form.addEventListener("change", () => {
+        presets.forEach(button => button.setAttribute("aria-pressed", "false"));
+        update();
+      });
+      presets.forEach(button => button.addEventListener("click", () => applyPreset(button.dataset.preset)));
+      update(false);
+
+      const steppers = [];
+      const createStepper = ({
+        rootId, playId, previousId, nextId, resetId, statusId, stages, describe, playLabel,
+        activeSelector, activeAttribute
+      }) => {
+        const root = byId(rootId);
+        const play = byId(playId);
+        const previous = byId(previousId);
+        const next = byId(nextId);
+        const reset = byId(resetId);
+        const status = byId(statusId);
+        const stageItems = activeSelector ? [...root.querySelectorAll(activeSelector)] : [];
+        let index = 0;
+        let playing = false;
+        let timer = null;
+        const stop = () => {
+          if (timer !== null) {
+            window.clearTimeout(timer);
+            timer = null;
+          }
+          playing = false;
+          play.textContent = playLabel;
+          play.setAttribute("aria-pressed", "false");
+        };
+        const render = (animate = false) => {
+          root.dataset.stage = stages[index];
+          stageItems.forEach(item => {
+            const itemIndex = Number(item.dataset[activeAttribute]);
+            item.classList.toggle("is-active", itemIndex === index);
+            item.classList.toggle("is-past", itemIndex < index);
+          });
+          status.textContent = `Stage ${index} of ${stages.length - 1} · ${describe(index)}`;
+          previous.disabled = index === 0;
+          next.disabled = index === stages.length - 1;
+          if (animate) restartMotion([root]);
+        };
+        const set = (value, animate = true) => {
+          index = clamp(value, stages.length - 1);
+          render(animate);
+        };
+        const schedule = () => {
+          if (!playing) return;
+          if (index >= stages.length - 1) {
+            stop();
+            status.textContent = `${status.textContent} Playback complete.`;
+            return;
+          }
+          timer = window.setTimeout(() => {
+            timer = null;
+            set(index + 1);
+            schedule();
+          }, 1450);
+        };
+        const toggle = () => {
+          if (playing) {
+            stop();
+            return;
+          }
+          if (isReducedMotion()) {
+            set(stages.length - 1, false);
+            status.textContent = `${status.textContent} Reduced motion advances playback without transitions.`;
+            return;
+          }
+          if (index >= stages.length - 1) set(0);
+          playing = true;
+          play.textContent = `Pause ${playLabel.toLowerCase()}`;
+          play.setAttribute("aria-pressed", "true");
+          restartMotion([root]);
+          schedule();
+        };
+        play.addEventListener("click", toggle);
+        previous.addEventListener("click", () => {
+          stop();
+          set(index - 1);
+        });
+        next.addEventListener("click", () => {
+          stop();
+          set(index + 1);
+        });
+        reset.addEventListener("click", () => {
+          stop();
+          set(0);
+        });
+        [play, previous, next, reset].forEach(control => control.addEventListener("keydown", event => {
+          if (event.key === "Home" || event.key === "End") {
+            event.preventDefault();
+            stop();
+            set(event.key === "Home" ? 0 : stages.length - 1);
+          }
+        }));
+        render(false);
+        const api = { stop, render: () => render(false) };
+        steppers.push(api);
+        return api;
+      };
+
+      createStepper({
+        rootId: "rowplan-demo",
+        playId: "rowplan-play",
+        previousId: "rowplan-previous",
+        nextId: "rowplan-next",
+        resetId: "rowplan-reset",
+        statusId: "rowplan-status",
+        stages: ["source", "gather", "execute", "scatter"],
+        playLabel: "Play mapping",
+        describe: index => [
+          "Source logical rows are authoritative.",
+          "Gather all four carrier classes by one positional plan: [2, 2, 0].",
+          "Destination live rows execute with the gathered companion closure.",
+          "Scatter results back to L2, defined fork L2′, and L0; L1 remains untouched."
+        ][index]
+      });
+      createStepper({
+        rootId: "transaction-demo",
+        playId: "transaction-play",
+        previousId: "transaction-previous",
+        nextId: "transaction-next",
+        resetId: "transaction-reset",
+        statusId: "transaction-status",
+        stages: ["baseline", "staged", "commit", "release"],
+        playLabel: "Play transaction",
+        describe: index => [
+          "Each live row starts from its own committed S3 baseline.",
+          "All tokens and events are staged in S4 journals; transport remains blocked.",
+          "L0 and L2 commit and publish; cancelled L1 discards S4 and restores S3.",
+          "L2 reaches EOS, clears S2, and permits clean backfill without state inheritance."
+        ][index]
+      });
+      const setupStepper = createStepper({
+        rootId: "setup-demo",
+        playId: "setup-play",
+        previousId: "setup-previous",
+        nextId: "setup-next",
+        resetId: "setup-reset",
+        statusId: "setup-status",
+        stages: ["reserve", "gather", "transfer", "graph", "execute", "scatter"],
+        playLabel: "Play setup",
+        activeSelector: "[data-setup-step]",
+        activeAttribute: "setupStep",
+        describe: index => {
+          const graphEnabled = byId("setup-graph").checked;
+          const descriptions = [
+            "Reserve capacity under runtime policy.",
+            "Allocate destination views and gather the entire companion closure.",
+            "Transfer gathered values explicitly from host to device.",
+            graphEnabled
+              ? "Use eligible optional graph capture/replay as a runtime optimization."
+              : "Skip graph capture; direct execution remains semantically valid.",
+            "Run the selected shared or isolated forward.",
+            "Scatter state/output to logical rows and stage effects until commit."
+          ];
+          return descriptions[index];
+        }
+      });
+      byId("setup-graph").addEventListener("change", event => {
+        byId("setup-demo").dataset.graph = String(event.target.checked);
+        setupStepper.render();
+      });
+
+      const stopAllPlayback = () => {
+        stopLifecycle();
+        steppers.forEach(stepper => stepper.stop());
+      };
+      const renderAllWithoutMotion = () => {
+        renderLifecycle(false);
+        steppers.forEach(stepper => stepper.render());
+        decisionAnimation.classList.remove("motion-run");
+      };
+      const updateReducedMotionControl = () => {
+        document.body.classList.toggle("reduce-motion", explicitlyReducedMotion);
+        reduceMotionButton.setAttribute("aria-pressed", String(explicitlyReducedMotion));
+        reduceMotionButton.textContent = `Reduce motion: ${explicitlyReducedMotion ? "on" : "off"}`;
+      };
+      reduceMotionButton.addEventListener("click", () => {
+        explicitlyReducedMotion = !explicitlyReducedMotion;
+        stopAllPlayback();
+        updateReducedMotionControl();
+        renderAllWithoutMotion();
+      });
+      const handleSystemMotionChange = () => {
+        if (systemReducedMotion.matches) stopAllPlayback();
+        renderAllWithoutMotion();
+      };
+      if (systemReducedMotion.addEventListener) {
+        systemReducedMotion.addEventListener("change", handleSystemMotionChange);
+      } else {
+        systemReducedMotion.addListener(handleSystemMotionChange);
+      }
+      updateReducedMotionControl();
+      renderLifecycle(false);
+    })();
+  </script>
+</body>
+</html>
