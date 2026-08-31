@@ -2,7 +2,7 @@ schema_version: v1.3
 package:
   tokenizer:
     special_tokens:
-      eos_token_id: [3]
+      eos_token_id: [26]
   tool_protocol:
     identity: tagged-json
     version: v1

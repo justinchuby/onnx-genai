@@ -8,7 +8,8 @@
 
 use crate::version::{
     CANONICAL_SPECULATION_SCHEMA_VERSION, DFLASH_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION,
-    SchemaVersion, TOKEN_CONTEXT_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
+    PUBLICATION_MODE_SCHEMA_VERSION, SchemaVersion, TOKEN_CONTEXT_SCHEMA_VERSION,
+    TOOL_PROTOCOL_SCHEMA_VERSION,
 };
 
 /// One immutable identifier/version pair.
@@ -463,6 +464,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
     (
         CANONICAL_SPECULATION_SCHEMA_VERSION,
         "the typed canonical speculative declaration surface (the selected proposer remains an extension)",
+    ),
+    (
+        PUBLICATION_MODE_SCHEMA_VERSION,
+        "the workflow declares `commit_only` or `provisional_revisions`, and the runtime reconciles revisions transactionally with one typed `commit` or `abort_to_baseline` outcome",
     ),
 ];
 

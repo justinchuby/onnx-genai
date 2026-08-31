@@ -1,14 +1,15 @@
 use onnx_genai_metadata::{
     extensions::{
-        ATEM_XML_V1, BUILTIN_EXTENSIONS, DFLASH_FLAT_BLOCK_V1, ExtensionAdmissionError,
-        ExtensionConsumerSupport, ExtensionSurface, FallbackClass, KV_CHECKPOINT_V1,
-        SPECULATIVE_V1, SupportStatus, TAGGED_JSON_V1, TOKEN_CONTEXT_V1, admit_exact,
-        extension_registry_markdown, find,
+        ATEM_XML_V1, BUILTIN_EXTENSIONS, CORE_CONFORMANCE, DFLASH_FLAT_BLOCK_V1,
+        ExtensionAdmissionError, ExtensionConsumerSupport, ExtensionSurface, FallbackClass,
+        KV_CHECKPOINT_V1, SPECULATIVE_V1, SupportStatus, TAGGED_JSON_V1, TOKEN_CONTEXT_V1,
+        admit_exact, extension_registry_markdown, find,
     },
     inference_metadata_schema_json, parse_metadata,
     version::{
-        CANONICAL_SPECULATION_SCHEMA_VERSION, DFLASH_SCHEMA_VERSION, TOKEN_CONTEXT_SCHEMA_VERSION,
-        TOOL_PROTOCOL_SCHEMA_VERSION,
+        CANONICAL_SPECULATION_SCHEMA_VERSION, DFLASH_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION,
+        PUBLICATION_MODE_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, SchemaVersion,
+        TOKEN_CONTEXT_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
     },
 };
 
@@ -88,6 +89,59 @@ fn registry_lists_exact_current_optional_semantic_extensions() {
             .expect("registered DFlash")
             .schema_floor,
         DFLASH_SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn core_conformance_covers_every_supported_schema_floor() {
+    assert_eq!(
+        INITIAL_SCHEMA_VERSION.major, SUPPORTED_SCHEMA_VERSION.major,
+        "the current minor-version catalogue assumes one supported major"
+    );
+    let expected = (INITIAL_SCHEMA_VERSION.minor..=SUPPORTED_SCHEMA_VERSION.minor)
+        .map(|minor| SchemaVersion::new(SUPPORTED_SCHEMA_VERSION.major, minor))
+        .collect::<Vec<_>>();
+    let catalogued = CORE_CONFORMANCE
+        .iter()
+        .map(|(version, obligations)| {
+            assert!(
+                !obligations.trim().is_empty(),
+                "{version} must name its mandatory reader obligations"
+            );
+            *version
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        catalogued, expected,
+        "every schema floor accepted by this reader must have exactly one ordered core-conformance row"
+    );
+}
+
+#[test]
+fn publication_mode_is_mandatory_core_conformance() {
+    let obligation = CORE_CONFORMANCE
+        .iter()
+        .find_map(|(version, obligations)| {
+            (*version == PUBLICATION_MODE_SCHEMA_VERSION).then_some(*obligations)
+        })
+        .expect("publication-mode floor has a core-conformance row");
+    for required in [
+        "`commit_only`",
+        "`provisional_revisions`",
+        "reconciles revisions transactionally",
+        "`commit`",
+        "`abort_to_baseline`",
+    ] {
+        assert!(
+            obligation.contains(required),
+            "publication-mode obligation must contain {required}: {obligation}"
+        );
+    }
+    assert!(
+        BUILTIN_EXTENSIONS
+            .iter()
+            .all(|descriptor| descriptor.declaration != "pipeline.workflow.publication_mode"),
+        "publication_mode is core schema conformance, not an optional semantic extension"
     );
 }
 

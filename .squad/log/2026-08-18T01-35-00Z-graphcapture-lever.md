@@ -1,3 +1,0 @@
-# Session log — graph-capture lever arc
-
-At 2026-08-18T01:35:00Z, Scribe consolidated the DeepSeek-V2-Lite MoE graph-capture/QMoE occupancy arc. Decisions recorded: native V2-Lite eager baseline ~55.6 tok/s; ORT CUDA cannot run int4 QMoE on GPU and falls back to CPU experts (~0.20 tok/s); QMoE gate/up occupancy is a byte-identical default-OFF GO with ~+1% E2E; V2-Lite CUDA graph-capture unlock is a topology-gated GO with Wallace/Rachael validation gates and projected ~82–86 tok/s conservative upside. Older decode inbox drops were deduped against archived/current standing and removed from the inbox.

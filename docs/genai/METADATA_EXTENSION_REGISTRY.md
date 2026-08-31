@@ -15,6 +15,7 @@ A reader that accepts a schema version must implement that version's typed SSA/d
 | `v1.4` | the typed token-context declaration surface (the module remains an extension) |
 | `v1.5` | output families, stream identities, and typed revision operations |
 | `v1.6` | the typed canonical speculative declaration surface (the selected proposer remains an extension) |
+| `v1.7` | the workflow declares `commit_only` or `provisional_revisions`, and the runtime reconciles revisions transactionally with one typed `commit` or `abort_to_baseline` outcome |
 
 ## Optional semantic extensions
 

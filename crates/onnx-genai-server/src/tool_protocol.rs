@@ -4,7 +4,10 @@
 //! runtime's implementation of that declaration; a package never names an
 //! adapter, parser library, or model family.
 
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use onnx_genai_engine::{GenerateConstraint, ToolCallPolicy};
 use onnx_genai_metadata::{
@@ -174,6 +177,7 @@ fn validate_untrusted_request_values(
     version: &str,
 ) -> Result<(), ToolProtocolError> {
     let tools = request.tools.as_deref().unwrap_or_default();
+    let mut offered_tool_names = BTreeSet::new();
     if tools.len() > MAX_TOOL_CALLS {
         return Err(ToolProtocolError(format!(
             "tool request rejected before inference for {identity}@{version}: at most {MAX_TOOL_CALLS} tools may be offered"
@@ -181,7 +185,44 @@ fn validate_untrusted_request_values(
     }
     for (index, tool) in tools.iter().enumerate() {
         validate_tool(tool, index, identity, version)?;
+        if !offered_tool_names.insert(tool.function.name.as_str()) {
+            return Err(ToolProtocolError(format!(
+                "tool request rejected before inference for {identity}@{version}: tools[{index}].function.name '{}' duplicates an earlier offered tool name",
+                tool.function.name
+            )));
+        }
     }
+    validate_tool_call_history(request, identity, version, &offered_tool_names)?;
+    if let Some(ToolChoice::Specific(choice)) = &request.tool_choice
+        && (choice.function.name.is_empty() || choice.function.name.len() > MAX_TOOL_NAME_BYTES)
+    {
+        return Err(ToolProtocolError(format!(
+            "tool request rejected before inference for {identity}@{version}: tool_choice.function.name must contain 1 to {MAX_TOOL_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the caller-owned call/result history before a turn can reach the
+/// engine. A result is associated by its typed call ID, never by its position
+/// beside other calls or results.
+fn validate_tool_call_history(
+    request: &ChatCompletionRequest,
+    identity: &str,
+    version: &str,
+    offered_tool_names: &BTreeSet<&str>,
+) -> Result<(), ToolProtocolError> {
+    #[derive(Clone)]
+    struct PendingCall {
+        name: String,
+        message_index: usize,
+        call_index: usize,
+    }
+
+    let mut issued = BTreeMap::<String, (usize, usize)>::new();
+    let mut pending = BTreeMap::<String, PendingCall>::new();
+    let mut received = BTreeMap::<String, usize>::new();
+
     for (index, message) in request.messages.iter().enumerate() {
         if message
             .tool_call_id
@@ -210,31 +251,161 @@ fn validate_untrusted_request_values(
                 "tool request rejected before inference for {identity}@{version}: messages[{index}].name must contain 1 to {MAX_TOOL_NAME_BYTES} bytes"
             )));
         }
-        if let Some(calls) = &message.tool_calls {
-            if calls.len() > MAX_TOOL_CALLS {
-                return Err(ToolProtocolError(format!(
-                    "tool request rejected before inference for {identity}@{version}: messages[{index}].tool_calls may contain at most {MAX_TOOL_CALLS} calls"
-                )));
+
+        match message.role.as_str() {
+            "assistant" => {
+                if message.tool_call_id.is_some() {
+                    return Err(ToolProtocolError(format!(
+                        "tool request rejected before inference for {identity}@{version}: messages[{index}].tool_call_id is only valid on a tool result"
+                    )));
+                }
+                let Some(calls) = &message.tool_calls else {
+                    continue;
+                };
+                if calls.is_empty() || calls.len() > MAX_TOOL_CALLS {
+                    return Err(ToolProtocolError(format!(
+                        "tool request rejected before inference for {identity}@{version}: messages[{index}].tool_calls must contain 1 to {MAX_TOOL_CALLS} calls"
+                    )));
+                }
+                for (call_index, call) in calls.iter().enumerate() {
+                    validate_history_call(
+                        call,
+                        index,
+                        call_index,
+                        identity,
+                        version,
+                        offered_tool_names,
+                    )?;
+                    if let Some((first_message, first_call)) =
+                        issued.insert(call.id.clone(), (index, call_index))
+                    {
+                        return Err(ToolProtocolError(format!(
+                            "tool request rejected before inference for {identity}@{version}: messages[{index}].tool_calls[{call_index}].id '{}' duplicates messages[{first_message}].tool_calls[{first_call}].id",
+                            call.id
+                        )));
+                    }
+                    pending.insert(
+                        call.id.clone(),
+                        PendingCall {
+                            name: call.function.name.clone(),
+                            message_index: index,
+                            call_index,
+                        },
+                    );
+                }
             }
-            for (call_index, call) in calls.iter().enumerate() {
-                if call.id.is_empty()
-                    || call.id.len() > MAX_TOOL_CALL_ID_BYTES
-                    || call.function.name.is_empty()
-                    || call.function.name.len() > MAX_TOOL_NAME_BYTES
-                    || call.function.arguments.len() > MAX_TOOL_PAYLOAD_BYTES
+            "tool" => {
+                if message.tool_calls.is_some() {
+                    return Err(ToolProtocolError(format!(
+                        "tool request rejected before inference for {identity}@{version}: messages[{index}].tool_calls belongs on an assistant message, not a tool result"
+                    )));
+                }
+                let Some(call_id) = message.tool_call_id.as_deref() else {
+                    return Err(ToolProtocolError(format!(
+                        "tool request rejected before inference for {identity}@{version}: messages[{index}] is a tool result and requires tool_call_id"
+                    )));
+                };
+                if !matches!(
+                    message.content.as_ref(),
+                    Some(crate::types::ChatMessageContent::Text(_))
+                ) {
+                    return Err(ToolProtocolError(format!(
+                        "tool request rejected before inference for {identity}@{version}: messages[{index}].content for tool_call_id '{call_id}' must be a text string"
+                    )));
+                }
+                let Some(call) = pending.remove(call_id) else {
+                    let reason = if let Some(result_index) = received.get(call_id) {
+                        format!(
+                            "duplicates the result already supplied at messages[{result_index}]"
+                        )
+                    } else if issued.contains_key(call_id) {
+                        "does not answer an outstanding call".to_string()
+                    } else {
+                        "does not match any assistant tool call".to_string()
+                    };
+                    return Err(ToolProtocolError(format!(
+                        "tool request rejected before inference for {identity}@{version}: messages[{index}].tool_call_id '{call_id}' {reason}"
+                    )));
+                };
+                if let Some(name) = message.name.as_deref()
+                    && name != call.name
                 {
                     return Err(ToolProtocolError(format!(
-                        "tool request rejected before inference for {identity}@{version}: messages[{index}].tool_calls[{call_index}] has an empty or oversized id, name, or arguments value"
+                        "tool request rejected before inference for {identity}@{version}: messages[{index}].name '{name}' does not match tool_call_id '{call_id}' function '{}'",
+                        call.name
+                    )));
+                }
+                received.insert(call_id.to_string(), index);
+            }
+            _ => {
+                if message.tool_calls.is_some() {
+                    return Err(ToolProtocolError(format!(
+                        "tool request rejected before inference for {identity}@{version}: messages[{index}].tool_calls is only valid on an assistant message"
+                    )));
+                }
+                if message.tool_call_id.is_some() {
+                    return Err(ToolProtocolError(format!(
+                        "tool request rejected before inference for {identity}@{version}: messages[{index}].tool_call_id is only valid on a tool result"
                     )));
                 }
             }
         }
     }
-    if let Some(ToolChoice::Specific(choice)) = &request.tool_choice
-        && (choice.function.name.is_empty() || choice.function.name.len() > MAX_TOOL_NAME_BYTES)
+
+    if !pending.is_empty() {
+        let calls = pending
+            .iter()
+            .map(|(id, call)| {
+                format!(
+                    "'{id}' from messages[{}].tool_calls[{}]",
+                    call.message_index, call.call_index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ToolProtocolError(format!(
+            "tool request rejected before inference for {identity}@{version}: missing tool result(s) for {calls}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_history_call(
+    call: &crate::types::ChatMessageToolCall,
+    message_index: usize,
+    call_index: usize,
+    identity: &str,
+    version: &str,
+    offered_tool_names: &BTreeSet<&str>,
+) -> Result<(), ToolProtocolError> {
+    let field = format!("messages[{message_index}].tool_calls[{call_index}]");
+    if call.kind != "function" {
+        return Err(ToolProtocolError(format!(
+            "tool request rejected before inference for {identity}@{version}: {field}.type must be \"function\""
+        )));
+    }
+    if call.id.is_empty()
+        || call.id.len() > MAX_TOOL_CALL_ID_BYTES
+        || call.function.name.is_empty()
+        || call.function.name.len() > MAX_TOOL_NAME_BYTES
+        || call.function.arguments.len() > MAX_TOOL_PAYLOAD_BYTES
     {
         return Err(ToolProtocolError(format!(
-            "tool request rejected before inference for {identity}@{version}: tool_choice.function.name must contain 1 to {MAX_TOOL_NAME_BYTES} bytes"
+            "tool request rejected before inference for {identity}@{version}: {field} has an empty or oversized id, name, or arguments value"
+        )));
+    }
+    if !offered_tool_names.is_empty() && !offered_tool_names.contains(call.function.name.as_str()) {
+        return Err(ToolProtocolError(format!(
+            "tool request rejected before inference for {identity}@{version}: {field}.function.name '{}' was not offered in tools",
+            call.function.name
+        )));
+    }
+    if !matches!(
+        serde_json::from_str::<serde_json::Value>(&call.function.arguments),
+        Ok(serde_json::Value::Object(_))
+    ) {
+        return Err(ToolProtocolError(format!(
+            "tool request rejected before inference for {identity}@{version}: {field}.function.arguments must be a JSON object"
         )));
     }
     Ok(())
@@ -547,5 +718,70 @@ mod tests {
             atem.output_constraint(&request).unwrap(),
             ToolOutputConstraint::Set(None)
         ));
+    }
+
+    #[test]
+    fn declared_adapters_match_reordered_tool_results_by_id() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "fixture",
+            "tools": [
+                {"type": "function", "function": {"name": "weather"}},
+                {"type": "function", "function": {"name": "time"}}
+            ],
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_weather",
+                            "type": "function",
+                            "function": {
+                                "name": "weather",
+                                "arguments": "{\"city\":\"Paris\"}"
+                            }
+                        },
+                        {
+                            "id": "call_time",
+                            "type": "function",
+                            "function": {
+                                "name": "time",
+                                "arguments": "{\"timezone\":\"UTC\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_time",
+                    "name": "time",
+                    "content": "UTC"
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "name": "weather",
+                    "content": "Paris"
+                }
+            ]
+        }))
+        .unwrap();
+
+        for identity in ["tagged-json", "atem-xml"] {
+            let protocol = protocol(identity);
+            validate_request(&request, Some(&protocol), None)
+                .unwrap_or_else(|error| panic!("{identity} rejected valid tool results: {error}"));
+            let rendered = protocol.render(&request).unwrap();
+            assert!(
+                rendered
+                    .fallback_prefix
+                    .contains(if identity == "tagged-json" {
+                        "<|tools|>"
+                    } else {
+                        "<atem:tools>"
+                    }),
+                "{identity} rendered the wrong tools marker"
+            );
+        }
     }
 }

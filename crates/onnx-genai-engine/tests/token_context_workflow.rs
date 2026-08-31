@@ -1,13 +1,16 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::Context as _;
 use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
+    DevicePolicy, Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
     PipelineGenerateRequest, SessionForkParticipantKind, SessionPosition,
 };
 use onnx_genai_ort::{DataType, Value};
+use serde::Deserialize;
 
 #[derive(Clone, Copy)]
 struct Geometry {
@@ -75,6 +78,75 @@ const ALTERNATE: Geometry = Geometry {
     eos_token_id: 100,
 };
 
+#[derive(Clone, Deserialize)]
+struct ModelWeights {
+    multipliers: Vec<i64>,
+    head_vocab_sizes: Vec<i64>,
+    head_offsets: Vec<i64>,
+    ngram_embedding: Vec<f32>,
+    key_weights: Vec<f32>,
+    value_weights: Vec<f32>,
+    norm_key: Vec<f32>,
+    norm_query: Vec<f32>,
+    norm_conv: Vec<f32>,
+    conv_weights: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct ReferenceGeometry {
+    vocab_size: u64,
+    ngram_size: usize,
+    heads_per_ngram: usize,
+    hc_count: usize,
+    hidden_size: usize,
+    ple_embed_dim: usize,
+    ple_layer_index: usize,
+    conv_kernel: usize,
+    conv_dilation: usize,
+    ngram_vocab_size_base: usize,
+    seed: u64,
+    eos_token_id: i64,
+}
+
+impl ReferenceGeometry {
+    fn assert_matches(&self, geometry: Geometry) {
+        assert_eq!(self.vocab_size, geometry.vocab_size);
+        assert_eq!(self.ngram_size, geometry.ngram_size);
+        assert_eq!(self.heads_per_ngram, geometry.heads_per_ngram);
+        assert_eq!(self.hc_count, geometry.hc_count);
+        assert_eq!(self.hidden_size, geometry.hidden_size);
+        assert_eq!(self.ple_embed_dim, geometry.ngram_heads());
+        assert_eq!(self.ple_layer_index, 0);
+        assert_eq!(self.conv_kernel, geometry.conv_kernel);
+        assert_eq!(self.conv_dilation, geometry.conv_dilation);
+        assert_eq!(self.ngram_vocab_size_base, geometry.table_base);
+        assert_eq!(self.seed, geometry.seed);
+        assert_eq!(self.eos_token_id, geometry.eos_token_id);
+    }
+}
+
+#[derive(Deserialize)]
+struct BoundaryReference {
+    chunks: Vec<Vec<i64>>,
+    hidden_states: Vec<f32>,
+    token_history: Vec<i64>,
+    conv_history: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct QwenPleReference {
+    provenance: serde_json::Value,
+    authoritative_config: serde_json::Value,
+    synthetic_geometry: ReferenceGeometry,
+    weights: ModelWeights,
+    cases: std::collections::BTreeMap<String, BoundaryReference>,
+}
+
+fn qwen_ple_reference() -> QwenPleReference {
+    serde_json::from_str(include_str!("fixtures/qwen4_exp_ple_reference.json"))
+        .expect("checked-in Qwen4-Exp PLE reference fixture parses")
+}
+
 fn package(geometry: Geometry) -> anyhow::Result<PathBuf> {
     static NEXT_PACKAGE: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -87,6 +159,38 @@ fn package(geometry: Geometry) -> anyhow::Result<PathBuf> {
     fs::create_dir_all(&root)?;
     fs::write(root.join("inference_metadata.yaml"), metadata(geometry))?;
     fs::write(root.join("token-context.onnx.textproto"), model(geometry))?;
+    Ok(root)
+}
+
+fn reference_package(geometry: Geometry, weights: &ModelWeights) -> anyhow::Result<PathBuf> {
+    static NEXT_REFERENCE_PACKAGE: AtomicU64 = AtomicU64::new(0);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-fixtures/token-context")
+        .join(format!(
+            "{}-authoritative-reference-{}",
+            geometry.name,
+            NEXT_REFERENCE_PACKAGE.fetch_add(1, Ordering::Relaxed)
+        ));
+    fs::create_dir_all(&root)?;
+    let document = metadata(geometry)
+        .replacen("      token_context:\n", "      lexical_injector:\n", 1)
+        .replace(
+            "        component: token_context\n",
+            "        component: lexical_injector\n",
+        )
+        .replace(
+            "              token_context:\n",
+            "              lexical_injector:\n",
+        )
+        .replace(
+            "        batch_capacity: { uniform_dimensions: [sequence] }\n",
+            "",
+        );
+    fs::write(root.join("inference_metadata.yaml"), document)?;
+    fs::write(
+        root.join("token-context.onnx.textproto"),
+        model_with_weights(geometry, weights),
+    )?;
     Ok(root)
 }
 
@@ -697,28 +801,73 @@ fn head_tables(geometry: Geometry) -> (Vec<i64>, Vec<i64>, usize) {
     (sizes, offsets, total)
 }
 
+fn synthetic_weights(geometry: Geometry) -> ModelWeights {
+    let channels = geometry.channels();
+    let heads = geometry.ngram_heads();
+    let (table_sizes, offsets, table_rows) = head_tables(geometry);
+    ModelWeights {
+        multipliers: multipliers(geometry),
+        head_vocab_sizes: table_sizes,
+        head_offsets: offsets,
+        ngram_embedding: (0..table_rows)
+            .map(|index| ((index % 23) as f32 - 11.0) / 16.0)
+            .collect(),
+        key_weights: (0..heads * channels)
+            .map(|index| ((index * 7 % 19) as f32 - 9.0) / 32.0)
+            .collect(),
+        value_weights: (0..heads * geometry.hidden_size)
+            .map(|index| ((index * 11 % 17) as f32 - 8.0) / 24.0)
+            .collect(),
+        norm_key: (0..channels)
+            .map(|index| ((index * 3 % 17) as f32 - 8.0) / 32.0)
+            .collect(),
+        norm_query: (0..channels)
+            .map(|index| ((index * 5 % 19) as f32 - 9.0) / 40.0)
+            .collect(),
+        norm_conv: (0..channels)
+            .map(|index| ((index * 7 % 23) as f32 - 11.0) / 48.0)
+            .collect(),
+        conv_weights: (0..channels * geometry.conv_kernel)
+            .map(|index| {
+                let tap = index % geometry.conv_kernel;
+                (0.5f32).powi(tap as i32 + 1) * if tap.is_multiple_of(2) { 1.0 } else { -1.0 }
+            })
+            .collect(),
+    }
+}
+
 fn model(geometry: Geometry) -> String {
+    let mut weights = synthetic_weights(geometry);
+    // Generic lifecycle fixtures predate the pinned Qwen reference and retain
+    // identity RMSNorm scales; reference_package supplies the learned scales.
+    weights.norm_key.fill(0.0);
+    weights.norm_query.fill(0.0);
+    weights.norm_conv.fill(0.0);
+    model_with_weights(geometry, &weights)
+}
+
+fn model_with_weights(geometry: Geometry, weights: &ModelWeights) -> String {
     let channels = geometry.channels();
     let heads = geometry.ngram_heads();
     let context = geometry.context_len();
     let conv_history = geometry.conv_history_len();
-    let (table_sizes, offsets, table_rows) = head_tables(geometry);
-    let embedding = (0..table_rows)
-        .map(|index| ((index % 23) as f32 - 11.0) / 16.0)
-        .collect::<Vec<_>>();
-    let key_weights = (0..heads * channels)
-        .map(|index| ((index * 7 % 19) as f32 - 9.0) / 32.0)
-        .collect::<Vec<_>>();
-    let value_weights = (0..heads * geometry.hidden_size)
-        .map(|index| ((index * 11 % 17) as f32 - 8.0) / 24.0)
-        .collect::<Vec<_>>();
-    let conv_weights = (0..channels * geometry.conv_kernel)
-        .map(|index| {
-            let tap = index % geometry.conv_kernel;
-            (0.5f32).powi(tap as i32 + 1) * if tap.is_multiple_of(2) { 1.0 } else { -1.0 }
-        })
-        .collect::<Vec<_>>();
-
+    assert_eq!(weights.multipliers.len(), geometry.ngram_size);
+    assert_eq!(weights.head_vocab_sizes.len(), heads);
+    assert_eq!(weights.head_offsets.len(), heads);
+    assert_eq!(weights.key_weights.len(), heads * channels);
+    assert_eq!(weights.value_weights.len(), heads * geometry.hidden_size);
+    assert_eq!(weights.norm_key.len(), channels);
+    assert_eq!(weights.norm_query.len(), channels);
+    assert_eq!(weights.norm_conv.len(), channels);
+    assert_eq!(weights.conv_weights.len(), channels * geometry.conv_kernel);
+    assert_eq!(
+        weights
+            .head_offsets
+            .last()
+            .zip(weights.head_vocab_sizes.last())
+            .map(|(offset, size)| offset + size),
+        Some(weights.ngram_embedding.len() as i64)
+    );
     let mut graph = String::from("ir_version: 8\ngraph {\n  name: \"token_context\"\n");
     graph.push_str(&value_info(
         "token_ids",
@@ -808,6 +957,7 @@ fn model(geometry: Geometry) -> String {
         &[0, 0, channels as i64],
     ));
     graph.push_str(&initializer_f32("epsilon", &[], &[1.0e-6]));
+    graph.push_str(&initializer_f32("one_f32", &[], &[1.0]));
     graph.push_str(&initializer_i64(
         "eos_token_id",
         &[],
@@ -818,27 +968,46 @@ fn model(geometry: Geometry) -> String {
         &[],
         &[(geometry.hidden_size as f32).sqrt()],
     ));
-    graph.push_str(&initializer_i64("table_sizes", &[heads], &table_sizes));
-    graph.push_str(&initializer_i64("table_offsets", &[heads], &offsets));
+    graph.push_str(&initializer_i64(
+        "table_sizes",
+        &[heads],
+        &weights.head_vocab_sizes,
+    ));
+    graph.push_str(&initializer_i64(
+        "table_offsets",
+        &[heads],
+        &weights.head_offsets,
+    ));
     graph.push_str(&initializer_f32(
         "ngram_embedding",
-        &[table_rows, 1],
-        &embedding,
+        &[weights.ngram_embedding.len(), 1],
+        &weights.ngram_embedding,
     ));
     graph.push_str(&initializer_f32(
         "key_weights",
         &[heads, channels],
-        &key_weights,
+        &weights.key_weights,
     ));
     graph.push_str(&initializer_f32(
         "value_weights",
         &[heads, geometry.hidden_size],
-        &value_weights,
+        &weights.value_weights,
     ));
+    for (name, values) in [
+        ("norm_key_weight", &weights.norm_key),
+        ("norm_query_weight", &weights.norm_query),
+        ("norm_conv_weight", &weights.norm_conv),
+    ] {
+        graph.push_str(&initializer_f32(
+            name,
+            &[geometry.hc_count, geometry.hidden_size],
+            values,
+        ));
+    }
     graph.push_str(&initializer_f32(
         "conv_weights",
         &[channels, 1, geometry.conv_kernel],
-        &conv_weights,
+        &weights.conv_weights,
     ));
 
     graph.push_str(&node("Shape", &["token_ids"], "token_ids_shape", ""));
@@ -932,8 +1101,7 @@ fn model(geometry: Geometry) -> String {
             "",
         ));
     }
-    let multiplier_values = multipliers(geometry);
-    for (index, multiplier) in multiplier_values.iter().enumerate() {
+    for (index, multiplier) in weights.multipliers.iter().enumerate() {
         graph.push_str(&initializer_i64(
             &format!("multiplier_{index}"),
             &[],
@@ -1079,6 +1247,21 @@ fn model(geometry: Geometry) -> String {
         graph.push_str(&node(
             "Div",
             &[&format!("{prefix}_grouped"), &format!("{prefix}_scale")],
+            &format!("{prefix}_unit_normed"),
+            "",
+        ));
+        graph.push_str(&node(
+            "Add",
+            &[&format!("norm_{prefix}_weight"), "one_f32"],
+            &format!("{prefix}_learned_scale"),
+            "",
+        ));
+        graph.push_str(&node(
+            "Mul",
+            &[
+                &format!("{prefix}_unit_normed"),
+                &format!("{prefix}_learned_scale"),
+            ],
             &format!("{prefix}_normed"),
             "",
         ));
@@ -1153,6 +1336,18 @@ fn model(geometry: Geometry) -> String {
     graph.push_str(&node(
         "Div",
         &["conv_grouped", "conv_scale"],
+        "conv_unit_normed_grouped",
+        "",
+    ));
+    graph.push_str(&node(
+        "Add",
+        &["norm_conv_weight", "one_f32"],
+        "conv_learned_scale",
+        "",
+    ));
+    graph.push_str(&node(
+        "Mul",
+        &["conv_unit_normed_grouped", "conv_learned_scale"],
         "conv_normed_grouped",
         "",
     ));
@@ -1422,6 +1617,70 @@ fn assert_close(left: &[f32], right: &[f32]) {
     }
 }
 
+fn assert_not_close(left: &[f32], right: &[f32], reason: &str) {
+    assert_eq!(left.len(), right.len());
+    assert!(
+        left.iter()
+            .zip(right)
+            .any(|(left, right)| (left - right).abs() > 1.0e-5),
+        "{reason}"
+    );
+}
+
+fn assert_norm_weight_routing(geometry: Geometry, weights: &ModelWeights, graph: &str) {
+    let dims = [geometry.hc_count, geometry.hidden_size];
+    for (stream, values) in [
+        ("key", &weights.norm_key),
+        ("query", &weights.norm_query),
+        ("conv", &weights.norm_conv),
+    ] {
+        assert!(
+            values.iter().all(|weight| *weight != 0.0),
+            "norm_{stream} must use non-identity learned weights"
+        );
+        assert!(
+            graph.contains(&initializer_f32(
+                &format!("norm_{stream}_weight"),
+                &dims,
+                values,
+            )),
+            "norm_{stream} initializer must contain its own learned weights"
+        );
+        assert!(
+            graph.contains(&node(
+                "Add",
+                &[&format!("norm_{stream}_weight"), "one_f32"],
+                &format!("{stream}_learned_scale"),
+                "",
+            )),
+            "norm_{stream} must form the pinned 1 + weight learned scale"
+        );
+    }
+    assert_ne!(weights.norm_key, weights.norm_query);
+    assert_ne!(weights.norm_key, weights.norm_conv);
+    assert_ne!(weights.norm_query, weights.norm_conv);
+    for (stream, unit_normed) in [
+        ("key", "key_unit_normed"),
+        ("query", "query_unit_normed"),
+        ("conv", "conv_unit_normed_grouped"),
+    ] {
+        let output = if stream == "conv" {
+            "conv_normed_grouped".to_string()
+        } else {
+            format!("{stream}_normed")
+        };
+        assert!(
+            graph.contains(&node(
+                "Mul",
+                &[unit_normed, &format!("{stream}_learned_scale")],
+                &output,
+                "",
+            )),
+            "norm_{stream} learned scale must route only to the {stream} stream"
+        );
+    }
+}
+
 fn assert_token_context_outputs_equal(
     left: &std::collections::HashMap<String, Value>,
     right: &std::collections::HashMap<String, Value>,
@@ -1442,6 +1701,138 @@ fn assert_token_context_outputs_equal(
         left["valid_lengths"].to_vec_i64()?,
         right["valid_lengths"].to_vec_i64()?
     );
+    Ok(())
+}
+
+#[test]
+fn qwen4_exp_reference_generator_is_deterministic_and_in_sync() -> anyhow::Result<()> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/generate_qwen4_exp_ple_reference.py");
+    let output = Command::new("python3")
+        .arg(&script)
+        .output()
+        .with_context(|| format!("run {}", script.display()))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "reference generator failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        include_bytes!("fixtures/qwen4_exp_ple_reference.json"),
+        "checked-in vectors are stale; rerun {}",
+        script.display()
+    );
+    Ok(())
+}
+
+#[test]
+fn qwen4_exp_reference_vectors_match_full_chunked_and_decode_workflow_boundaries()
+-> anyhow::Result<()> {
+    let reference = qwen_ple_reference();
+    let geometry = QWEN_REDUCED;
+    reference.synthetic_geometry.assert_matches(geometry);
+    assert_eq!(
+        reference.provenance["qwen_release_commit"],
+        "69885871a64393807d988b27b1b5e380e8f28526"
+    );
+    assert_eq!(
+        reference.provenance["model_config_revision"],
+        "de4b8e4d43b917e7706784d8bb445c9af86a3540"
+    );
+    assert_eq!(
+        reference.provenance["transformers_implementation_commit"],
+        "fc5c5bde8e656dad91cbf34e61940d984b1c7b91"
+    );
+    assert_eq!(
+        reference.authoritative_config["ple_layer_ids"],
+        serde_json::json!([2])
+    );
+    assert_eq!(reference.authoritative_config["ngram_size"], 3);
+    assert_eq!(reference.authoritative_config["heads_per_ngram"], 8);
+    assert_eq!(reference.authoritative_config["hc_count"], 4);
+    assert_eq!(reference.authoritative_config["ple_conv_kernel_size"], 4);
+    assert_eq!(
+        reference.authoritative_config["conv_dilation_equals_ngram_size"],
+        3
+    );
+    assert!(
+        reference.provenance["claim"]
+            .as_str()
+            .is_some_and(|claim| claim.contains("not official checkpoint weight parity"))
+    );
+
+    let graph = model_with_weights(geometry, &reference.weights);
+    assert_norm_weight_routing(geometry, &reference.weights, &graph);
+    let root = reference_package(geometry, &reference.weights)?;
+    let document = fs::read_to_string(root.join("inference_metadata.yaml"))?;
+    assert!(document.contains("lexical_injector:"));
+    assert!(!document.contains("batch_capacity:"));
+    let mut engine = Engine::from_dir(
+        &root,
+        EngineConfig {
+            device_policy: DevicePolicy::Cpu,
+            ..EngineConfig::default()
+        },
+    )?;
+
+    for name in ["full", "chunked", "decode"] {
+        let expected = &reference.cases[name];
+        let chunks = expected
+            .chunks
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let (hidden, token_history, conv_history) = outputs(&mut engine, geometry, name, &chunks)?;
+        assert_close(&hidden, &expected.hidden_states);
+        assert_eq!(token_history, expected.token_history);
+        assert_close(&conv_history, &expected.conv_history);
+    }
+    let full = &reference.cases["full"];
+    for name in ["chunked", "decode"] {
+        let boundary = &reference.cases[name];
+        assert_close(&boundary.hidden_states, &full.hidden_states);
+        assert_eq!(boundary.token_history, full.token_history);
+        assert_close(&boundary.conv_history, &full.conv_history);
+    }
+    for (stream, weights) in [
+        ("key", {
+            let mut weights = reference.weights.clone();
+            weights.norm_key.fill(0.0);
+            weights
+        }),
+        ("query", {
+            let mut weights = reference.weights.clone();
+            weights.norm_query.fill(0.0);
+            weights
+        }),
+        ("conv", {
+            let mut weights = reference.weights.clone();
+            weights.norm_conv.fill(0.0);
+            weights
+        }),
+    ] {
+        let root = reference_package(geometry, &weights)?;
+        let mut engine = Engine::from_dir(
+            &root,
+            EngineConfig {
+                device_policy: DevicePolicy::Cpu,
+                ..EngineConfig::default()
+            },
+        )?;
+        let chunks = full.chunks.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let (hidden, _, _) = outputs(
+            &mut engine,
+            geometry,
+            &format!("identity-norm-{stream}"),
+            &chunks,
+        )?;
+        assert_not_close(
+            &hidden,
+            &full.hidden_states,
+            &format!("omitting norm_{stream}'s learned scale must change the reference output"),
+        );
+    }
     Ok(())
 }
 

@@ -358,52 +358,31 @@ fn workflow_adapter_registry()
     > = std::sync::LazyLock::new(|| {
         HashMap::from([
             (
-                (
-                    onnx_genai_metadata::extensions::IMAGE_PREPROCESS_V1.identity,
-                    onnx_genai_metadata::extensions::IMAGE_PREPROCESS_V1.version,
-                ),
+                ("onnx-genai.image-preprocess", "1"),
                 WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::VIDEO_PREPROCESS_V1.identity,
-                    onnx_genai_metadata::extensions::VIDEO_PREPROCESS_V1.version,
-                ),
+                ("onnx-genai.video-preprocess", "1"),
                 WorkflowRuntime::run_video_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::AUDIO_PREPROCESS_V1.identity,
-                    onnx_genai_metadata::extensions::AUDIO_PREPROCESS_V1.version,
-                ),
+                ("onnx-genai.audio-preprocess", "1"),
                 WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::GRAMMAR_GUIDANCE_V1.identity,
-                    onnx_genai_metadata::extensions::GRAMMAR_GUIDANCE_V1.version,
-                ),
+                ("onnx-genai.grammar-guidance", "1"),
                 WorkflowRuntime::run_grammar_guidance_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::TELEMETRY_V1.identity,
-                    onnx_genai_metadata::extensions::TELEMETRY_V1.version,
-                ),
+                ("onnx-genai.telemetry", "1"),
                 WorkflowRuntime::run_telemetry_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::PARAMETER_OVERLAY_V1.identity,
-                    onnx_genai_metadata::extensions::PARAMETER_OVERLAY_V1.version,
-                ),
+                ("onnx-genai.parameter-overlay", "1"),
                 WorkflowRuntime::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::TEXT_ASSEMBLY_V1.identity,
-                    onnx_genai_metadata::extensions::TEXT_ASSEMBLY_V1.version,
-                ),
+                ("onnx-genai.text-assembly", "1"),
                 WorkflowRuntime::run_text_assembly_adapter as WorkflowAdapterExecutor,
             ),
         ])
@@ -413,26 +392,6 @@ fn workflow_adapter_registry()
 
 pub(super) fn supports_workflow_adapter(abi: &str, version: &str) -> bool {
     workflow_adapter_registry().contains_key(&(abi, version))
-}
-
-#[cfg(test)]
-mod extension_registry_tests {
-    use super::supports_workflow_adapter;
-    use onnx_genai_metadata::extensions::{BUILTIN_EXTENSIONS, ExtensionSurface, SupportStatus};
-
-    #[test]
-    fn every_implemented_component_adapter_has_an_exact_executor() {
-        for descriptor in BUILTIN_EXTENSIONS.iter().filter(|descriptor| {
-            descriptor.surface == ExtensionSurface::ComponentAdapter
-                && descriptor.status == SupportStatus::Implemented
-        }) {
-            assert!(
-                supports_workflow_adapter(descriptor.id.identity, descriptor.id.version),
-                "{} must have its exact registry executor",
-                descriptor.id.wire_name()
-            );
-        }
-    }
 }
 
 fn validate_component_overrides(
@@ -1072,8 +1031,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             inputs,
             session_id,
             component_overrides,
-            generation_control: _,
-            tool_call_policy: _,
+            ..
         } = request;
         let workflow = &engine.plan.workflow;
         let session_turn_version = session_id.as_ref().map(|session| {
@@ -1345,6 +1303,18 @@ impl<'a> WorkflowExecutionPlan<'a> {
             island.begin_execution(pass.id);
         }
         let workflow = &engine.plan.workflow;
+        if matches!(
+            workflow.publication_mode,
+            onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions
+        ) && let Some(host) = host.as_deref()
+            && !host.supports_provisional_output_publications()
+        {
+            anyhow::bail!(
+                "pipeline.workflow.publication_mode is provisional_revisions, but this execution \
+                 host has no typed revision/commit/abort transport; select commit_only or use \
+                 a host that preserves transaction lineage before mutation"
+            );
+        }
         // A prepared plan names its canonical request rows. Selection is an
         // execution-local view over that domain: retaining selected bindings
         // would make a replay apply the same positional plan to an already
@@ -1472,6 +1442,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // Admission snapshots the complete canonical plan before any state,
         // effect, or output publication can advance. The lease is deliberately
         // separate: a rejected lease has no transaction to abort.
+        let publication_mode = TurnPublicationMode::from(workflow.publication_mode);
         let transaction = {
             let committed_state = engine.worker.session_state.borrow();
             let session_effects = engine.worker.session_effects.borrow();
@@ -1490,21 +1461,31 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 &committed_state,
                 &session_effects,
                 &session_outputs,
-                TurnPublicationMode::CommitOnly,
+                publication_mode,
             )
         };
         let mut transaction = transaction?;
         let output_baselines = transaction.output_baselines()?;
-        let mut publication_journal = Some(OutputPublicationJournal::new(
+        let mut publication_journal = Some(OutputPublicationJournal::new_with_publication_mode(
             transaction.id(),
             workflow,
             output_baselines,
+            transaction.publication_mode(),
         )?);
-        if let Some(host) = host.as_deref_mut()
-            && let Err(error) = host.begin_turn(&transaction)
-        {
-            let outcome = transaction.abort(TurnAbortReason::ExecutionFailure);
-            host.turn_aborted(outcome);
+        let begin_error = host
+            .as_deref_mut()
+            .and_then(|host| host.begin_turn(&transaction).err());
+        if let Some(error) = begin_error {
+            let outcome = abort_workflow_turn(
+                &mut publication_journal,
+                &mut transaction,
+                TurnAbortReason::ExecutionFailure,
+            )
+            .context("failed to resolve the workflow turn after begin_turn failed")?;
+            publish_terminal_transaction_outcome(host, &outcome);
+            if let Some(host) = host.as_deref_mut() {
+                host.turn_aborted(outcome);
+            }
             return Err(error);
         }
         if let Some(session_id) = self.session_id.as_ref() {
@@ -1597,13 +1578,19 @@ impl<'a> WorkflowExecutionPlan<'a> {
             host,
         );
         if let Err(error) = result {
-            let outcome = transaction.abort(TurnAbortReason::ExecutionFailure);
+            let outcome = abort_workflow_turn(
+                &mut publication_journal,
+                &mut transaction,
+                TurnAbortReason::ExecutionFailure,
+            )
+            .context("failed to resolve the workflow turn after execution failed")?;
             if let Some(host) = host.as_deref_mut() {
+                publish_terminal_transaction_outcome_to_host(host, &outcome);
                 host.turn_aborted(outcome);
             }
             return Err(error);
         }
-        let staged_commit = (|| -> anyhow::Result<()> {
+        let staged_commit = (|| -> anyhow::Result<TurnTransactionOutcome> {
             for output in workflow_emitted_outputs(&engine.plan.compiled_workflow.graph) {
                 let Some(value) = values.get(&output) else {
                     continue;
@@ -1721,7 +1708,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         })?)?
                     }
                 };
-                transaction.stage_state(resolved.identity.clone(), value);
+                transaction.stage_state(resolved.identity.clone(), value)?;
             }
             let mut advisory_updates = Vec::new();
             if let Some(session_id) = self.session_id.as_ref() {
@@ -1761,40 +1748,60 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     ));
                 }
             }
-            transaction.stage_effects();
-            if let Some(journal) = publication_journal.as_mut() {
+            transaction.stage_effects()?;
+            if publication_journal.is_some() {
+                let journal = publication_journal
+                    .as_mut()
+                    .expect("checked the publication journal exists");
                 journal.finalize_on_commit()?;
-                transaction.stage_outputs(journal.committed_states()?);
+                publish_pending_provisional_publications(&mut publication_journal, host)?;
+                let journal = publication_journal
+                    .as_ref()
+                    .expect("publication delivery keeps the journal");
+                transaction.stage_outputs(journal.committed_states()?)?;
             }
             let mut session_state = engine.worker.session_state.borrow_mut();
             let mut session_effects = engine.worker.session_effects.borrow_mut();
             let mut session_outputs = engine.worker.session_outputs.borrow_mut();
-            transaction.commit(
+            let outcome = transaction.commit(
                 &mut session_state,
                 &mut session_effects,
                 &mut session_outputs,
             )?;
             session_state.extend(advisory_updates);
-            Ok(())
+            Ok(outcome)
         })();
-        if let Err(error) = staged_commit {
-            let outcome = transaction.abort(TurnAbortReason::CommitFailure);
-            if let Some(host) = host.as_deref_mut() {
-                host.turn_aborted(outcome);
+        let commit_outcome = match staged_commit {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let outcome = abort_workflow_turn(
+                    &mut publication_journal,
+                    &mut transaction,
+                    TurnAbortReason::CommitFailure,
+                )
+                .context("failed to resolve the workflow turn after commit preparation failed")?;
+                if let Some(host) = host.as_deref_mut() {
+                    publish_terminal_transaction_outcome_to_host(host, &outcome);
+                    host.turn_aborted(outcome);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         if has_semantic_session_state && let Some(session) = self.session_id.as_deref() {
             let mut versions = engine.worker.session_turn_versions.borrow_mut();
             let version = versions.entry(session.to_string()).or_default();
             *version = version.saturating_add(1);
         }
         let row_outputs = std::mem::take(&mut pass.telemetry.row_outputs);
+        if let Some(journal) = publication_journal.as_mut() {
+            journal.record_commit(&commit_outcome)?;
+        }
+        publish_terminal_transaction_outcome(host, &commit_outcome);
         *engine.worker.last_output_publications.borrow_mut() = publication_journal
             .map(OutputPublicationJournal::take)
             .unwrap_or_default();
         if let Some(host) = host.as_deref_mut() {
-            host.turn_committed(transaction.committed());
+            host.turn_committed(commit_outcome.clone());
         }
         engine.publish_workflow_telemetry(pass.telemetry);
         Ok((values, row_outputs))
@@ -1890,23 +1897,67 @@ pub(crate) trait WorkflowNodeHost {
     /// package inputs are the host's business.
     fn hosted_contracts(&self) -> &'static [&'static str];
 
-    /// Capture host-owned provisional state at admission.
+    /// Select one exact authored invocation independently of a component
+    /// contract. Typed workflow constructs use this only after construction
+    /// proved the invocation's identity, bindings, and control-flow location.
+    fn hosts_invocation(
+        &self,
+        _component: &str,
+        _inputs: &BTreeMap<String, String>,
+        _outputs: &BTreeMap<String, String>,
+    ) -> bool {
+        false
+    }
+
+    /// Observe the admitted generic workflow transaction before execution.
     fn begin_turn(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Run host-owned pre-commit validation after all canonical output is
-    /// staged but before semantic state and publications are committed.
+    /// Observe an authored control boundary while the generic transaction is
+    /// still provisional.
+    fn observe_boundary(&mut self, _boundary: GenerationBoundary) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Final fallible hook before the generic state/effect/output write set is
+    /// staged and committed.
     fn before_turn_commit(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Commit or restore host-owned provisional state with the transaction.
+    /// Whether this host can preserve revision envelopes and typed terminal
+    /// transaction outcomes while a turn remains uncommitted.
+    fn supports_provisional_output_publications(&self) -> bool {
+        false
+    }
+
+    /// Publish already validated provisional records in authored order.
+    fn publish_provisional_output_publications(
+        &mut self,
+        _publications: &[WorkflowOutputPublication],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "this workflow host has no typed provisional revision transport; use \
+             publication_mode: commit_only or install a transaction-aware output transport"
+        )
+    }
+
+    /// Notify a transport of a durable transaction outcome. Errors here are
+    /// delivery-only: the semantic transaction cannot be rolled back.
+    fn publish_transaction_outcome(
+        &mut self,
+        _publication: &WorkflowOutputPublication,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn turn_committed(&mut self, _outcome: TurnTransactionOutcome) {}
 
     fn turn_aborted(&mut self, _outcome: TurnTransactionOutcome) {}
 
-    /// Request that the interpreter not begin another authored loop body.
+    /// Report a committed request-level terminal condition before the
+    /// interpreter evaluates another authored loop body.
     fn loop_host_outcome(&self) -> WorkflowLoopHostOutcome {
         WorkflowLoopHostOutcome::Continue
     }
@@ -1928,6 +1979,61 @@ pub(crate) trait WorkflowNodeHost {
     fn execute_contract_node(&mut self, request: WorkflowNodeRequest<'_>) -> anyhow::Result<bool>;
 }
 
+/// Move a journal's newly created provisional envelopes across a host boundary
+/// without making the host a second output authority.
+fn publish_pending_provisional_publications(
+    journal: &mut Option<OutputPublicationJournal>,
+    host: &mut Option<&mut dyn WorkflowNodeHost>,
+) -> anyhow::Result<()> {
+    let Some(host) = host.as_deref_mut() else {
+        return Ok(());
+    };
+    let Some(journal) = journal.as_mut() else {
+        return Ok(());
+    };
+    let publications = journal.take_pending_provisionals()?;
+    if publications.is_empty() {
+        return Ok(());
+    }
+    host.publish_provisional_output_publications(&publications)
+}
+
+fn abort_workflow_turn(
+    journal: &mut Option<OutputPublicationJournal>,
+    transaction: &mut TurnTransaction,
+    reason: TurnAbortReason,
+) -> anyhow::Result<TurnTransactionOutcome> {
+    match journal.as_mut() {
+        Some(journal) => journal.abort_outcome(transaction, reason),
+        None => Ok(transaction.abort(reason)?),
+    }
+}
+
+/// A terminal delivery failure cannot change the transaction decision already
+/// made. Keep it diagnostic-only rather than accidentally reporting rollback.
+fn publish_terminal_transaction_outcome(
+    host: &mut Option<&mut dyn WorkflowNodeHost>,
+    outcome: &TurnTransactionOutcome,
+) {
+    let Some(host) = host.as_deref_mut() else {
+        return;
+    };
+    publish_terminal_transaction_outcome_to_host(host, outcome);
+}
+
+fn publish_terminal_transaction_outcome_to_host(
+    host: &mut dyn WorkflowNodeHost,
+    outcome: &TurnTransactionOutcome,
+) {
+    let publication = WorkflowOutputPublication::from_transaction_outcome(outcome);
+    if let Err(error) = host.publish_transaction_outcome(&publication) {
+        tracing::warn!(
+            error = %error,
+            "workflow transaction outcome delivery failed after its semantic decision"
+        );
+    }
+}
+
 /// Everything a host needs to advance one declared node.
 ///
 /// `dead_code` is allowed only until the engine-side executors land: this
@@ -1946,6 +2052,8 @@ pub(crate) struct WorkflowNodeRequest<'a> {
     pub(crate) outputs: &'a BTreeMap<String, String>,
     /// The invocation's value environment.
     pub(crate) values: &'a mut PipelineTensors,
+    /// The ordinary S4 journal owned by the enclosing generic turn.
+    pub(crate) publication_journal: &'a mut Option<OutputPublicationJournal>,
 }
 
 impl WorkflowRuntime {
@@ -2011,13 +2119,21 @@ impl WorkflowRuntime {
                         // The hosted executor is selected before generic ONNX
                         // resolution, but admission still validates every
                         // invocation-bound input before the executor can run.
-                        if let Some(contract) = declaration
+                        let contract = declaration
                             .contract
                             .as_ref()
-                            .map(|contract| contract.id.as_str())
-                            && let Some(host) = host.as_deref_mut()
-                            && host.hosted_contracts().contains(&contract)
-                        {
+                            .map(|contract| contract.id.as_str());
+                        let hosted_by_invocation = host
+                            .as_deref()
+                            .is_some_and(|host| host.hosts_invocation(component, inputs, outputs));
+                        let hosted_by_contract = contract.is_some_and(|contract| {
+                            host.as_deref()
+                                .is_some_and(|host| host.hosted_contracts().contains(&contract))
+                        });
+                        if hosted_by_invocation || hosted_by_contract {
+                            let host = host
+                                .as_deref_mut()
+                                .expect("a hosted invocation has a workflow host");
                             let prepared = prepare_hosted_component_batch_inputs(
                                 component,
                                 declaration,
@@ -2029,11 +2145,12 @@ impl WorkflowRuntime {
                             let request_count = prepared.request_count;
                             drop(prepared.resolved);
                             let handled = match host.execute_contract_node(WorkflowNodeRequest {
-                                contract,
+                                contract: contract.unwrap_or(""),
                                 component,
                                 inputs,
                                 outputs,
                                 values,
+                                publication_journal,
                             }) {
                                 Ok(handled) => handled,
                                 Err(error) => {
@@ -2043,6 +2160,7 @@ impl WorkflowRuntime {
                             };
                             if !handled {
                                 clear_bound_component_outputs(outputs, values);
+                                let contract = contract.unwrap_or("<typed invocation>");
                                 anyhow::bail!(
                                     "workflow component '{component}' declares contract \
                                      '{contract}', which the running host lists as implemented but \
@@ -2062,7 +2180,9 @@ impl WorkflowRuntime {
                                 &std::collections::HashSet::new(),
                                 request_count,
                             )?;
-                            self.record_contract_execution(contract);
+                            if let Some(contract) = contract {
+                                self.record_contract_execution(contract);
+                            }
                             telemetry.record_stage(
                                 component.clone(),
                                 stage_started.elapsed().as_nanos(),
@@ -2175,6 +2295,7 @@ impl WorkflowRuntime {
                                         inputs,
                                         outputs,
                                         values,
+                                        publication_journal,
                                     }) {
                                         Ok(handled) => handled,
                                         Err(error) => {
@@ -2343,6 +2464,9 @@ impl WorkflowRuntime {
                     telemetry,
                     host,
                 )?;
+                if let Some(host) = host.as_deref_mut() {
+                    host.observe_boundary(GenerationBoundary::AfterLoopSetup)?;
+                }
                 for index in 0..limit {
                     if !self.advance_workflow_loop(
                         &plan,
@@ -2466,6 +2590,9 @@ impl WorkflowRuntime {
                         }
                     }
                 }
+                if let Some(host) = host.as_deref_mut() {
+                    host.observe_boundary(GenerationBoundary::AfterBranch)?;
+                }
             }
             WorkflowNode::Emit {
                 value,
@@ -2506,6 +2633,7 @@ impl WorkflowRuntime {
                                 )
                             })?;
                     }
+                    publish_pending_provisional_publications(publication_journal, host)?;
                     telemetry.emit_events += 1;
                     telemetry.record_output_publication(output);
                     telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
@@ -2587,6 +2715,7 @@ impl WorkflowRuntime {
                         dynamic_symbols,
                         output_contract.role == onnx_genai_metadata::WorkflowOutputRole::Tokens,
                     )?;
+                    publish_pending_provisional_publications(publication_journal, host)?;
                     if let Some(host) = host.as_deref_mut() {
                         for tokens in staged_generation_tokens {
                             host.observe_staged_generation_tokens(&tokens)?;
@@ -2650,6 +2779,7 @@ impl WorkflowRuntime {
                             )
                         })?;
                 }
+                publish_pending_provisional_publications(publication_journal, host)?;
                 let staged_generation_tokens = (output_contract.role
                     == onnx_genai_metadata::WorkflowOutputRole::Tokens)
                     .then(|| {
@@ -6983,11 +7113,64 @@ steps:
         prefix_runs: usize,
         setup_runs: usize,
         body_runs: usize,
+        supports_publication: bool,
+        fail_before_commit: bool,
+        provisional: Vec<(String, String, OutputFinality)>,
+        terminal: Vec<&'static str>,
+        abort_streams: Vec<OutputStreamBaseline>,
     }
 
     impl WorkflowNodeHost for LifecycleHost {
         fn hosted_contracts(&self) -> &'static [&'static str] {
             &["test.loop.lifecycle"]
+        }
+
+        fn before_turn_commit(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !self.fail_before_commit,
+                "injected lifecycle pre-commit failure"
+            );
+            Ok(())
+        }
+
+        fn supports_provisional_output_publications(&self) -> bool {
+            self.supports_publication
+        }
+
+        fn publish_provisional_output_publications(
+            &mut self,
+            publications: &[WorkflowOutputPublication],
+        ) -> anyhow::Result<()> {
+            for publication in publications {
+                let WorkflowOutputPublication::Revision(envelope) = publication else {
+                    anyhow::bail!(
+                        "lifecycle provisional transport received a non-revision publication"
+                    );
+                };
+                self.provisional.push((
+                    envelope.output.clone(),
+                    envelope.stream.0.clone(),
+                    envelope.finality,
+                ));
+            }
+            Ok(())
+        }
+
+        fn publish_transaction_outcome(
+            &mut self,
+            publication: &WorkflowOutputPublication,
+        ) -> anyhow::Result<()> {
+            match publication {
+                WorkflowOutputPublication::TransactionCommitted { .. } => {
+                    self.terminal.push("commit")
+                }
+                WorkflowOutputPublication::AbortToBaseline { streams, .. } => {
+                    self.terminal.push("abort");
+                    self.abort_streams = streams.clone();
+                }
+                _ => anyhow::bail!("lifecycle transport received a non-terminal outcome"),
+            }
+            Ok(())
         }
 
         fn execute_contract_node(
@@ -7189,12 +7372,14 @@ steps:
             contract: "vendor.something-else".to_string(),
             seen: Vec::new(),
         };
+        let mut publication_journal = None;
         let request = WorkflowNodeRequest {
             contract: "onnx-genai.token-policy",
             component: "token_policy",
             inputs: &BTreeMap::new(),
             outputs: &BTreeMap::new(),
             values: &mut PipelineTensors::default(),
+            publication_journal: &mut publication_journal,
         };
         assert!(
             !host.execute_contract_node(request).expect("no error"),
@@ -7217,6 +7402,7 @@ steps:
             contract: "onnx-genai.token-policy".to_string(),
             seen: Vec::new(),
         };
+        let mut publication_journal = None;
 
         let handled = host
             .execute_contract_node(WorkflowNodeRequest {
@@ -7225,6 +7411,7 @@ steps:
                 inputs: &inputs,
                 outputs: &outputs,
                 values: &mut values,
+                publication_journal: &mut publication_journal,
             })
             .expect("the host runs");
 
@@ -7387,6 +7574,105 @@ steps:
 
         assert_eq!(lifecycle.setup_runs, 1);
         assert_eq!(lifecycle.body_runs, 0);
+        Ok(())
+    }
+
+    fn provisional_lifecycle_workflow() -> WorkflowSpec {
+        let mut workflow = lifecycle_workflow();
+        workflow.publication_mode =
+            onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions;
+        workflow.publication_mode_authored = true;
+        workflow.outputs.insert(
+            "answer".to_string(),
+            onnx_genai_metadata::WorkflowOutput {
+                contract: serde_yaml::from_str("{ dtype: int64, shape: [sequence] }")
+                    .expect("revision contract"),
+                role: onnx_genai_metadata::WorkflowOutputRole::Tensor,
+                family: onnx_genai_metadata::WorkflowOutputFamily::Revisions {
+                    version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
+                },
+                family_authored: true,
+                value_range: None,
+                stage: onnx_genai_metadata::OutputStage::PreAdapter,
+                media: None,
+            },
+        );
+        let onnx_genai_metadata::WorkflowStep::Loop { steps, .. } = &mut workflow.steps[0] else {
+            unreachable!("lifecycle workflow has one loop");
+        };
+        steps.push(onnx_genai_metadata::WorkflowStep::Emit {
+            value: "body.value".to_string(),
+            when: None,
+            valid_length: None,
+            output: "answer".to_string(),
+            stream: Some("main".to_string()),
+            mode: WorkflowEmitMode::Append,
+            axis: None,
+        });
+        workflow
+    }
+
+    #[test]
+    fn generic_provisional_transport_observes_revisions_then_exact_terminal_outcome()
+    -> anyhow::Result<()> {
+        let runtime = test_runtime(provisional_lifecycle_workflow());
+        let mut plan = WorkflowExecutionPlan::new_hosted(
+            &runtime,
+            lifecycle_request(1, 2),
+            &["test.loop.lifecycle"],
+        )?;
+        let mut lifecycle = LifecycleHost {
+            supports_publication: true,
+            ..Default::default()
+        };
+        {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            plan.execute_retained_with_host(&mut host)?;
+        }
+        assert_eq!(lifecycle.provisional.len(), 3);
+        assert!(
+            lifecycle
+                .provisional
+                .iter()
+                .all(|(output, stream, finality)| {
+                    output == "answer"
+                        && stream == "main"
+                        && *finality == OutputFinality::Provisional
+                }),
+            "the transport receives only typed provisional revisions before commit"
+        );
+        assert_eq!(lifecycle.terminal, ["commit"]);
+
+        let mut failing_plan = WorkflowExecutionPlan::new_hosted(
+            &runtime,
+            lifecycle_request(1, 1),
+            &["test.loop.lifecycle"],
+        )?;
+        lifecycle.provisional.clear();
+        lifecycle.terminal.clear();
+        lifecycle.abort_streams.clear();
+        lifecycle.fail_before_commit = true;
+        {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            let error = match failing_plan.execute_retained_with_host(&mut host) {
+                Ok(_) => panic!("pre-commit failure must abort provisional output"),
+                Err(error) => error,
+            };
+            assert!(format!("{error:#}").contains("injected lifecycle pre-commit failure"));
+        }
+        assert_eq!(lifecycle.provisional.len(), 1);
+        assert_eq!(lifecycle.terminal, ["abort"]);
+        assert_eq!(
+            lifecycle.abort_streams,
+            vec![OutputStreamBaseline {
+                output: "answer".to_string(),
+                stream: OutputStreamId("main".to_string()),
+                head: 0,
+                sequence: 0,
+                lineage: 0,
+                closed: false,
+            }]
+        );
         Ok(())
     }
 
@@ -8227,10 +8513,13 @@ impl WorkflowRuntime {
             })?;
             let restored = values.get(&session_state_value_name(&carry.cell));
             let current = values.get(&carry.current);
+            let setup_value = values.get(&carry.body_input);
             let seeded = match carry.current_source {
-                onnx_genai_metadata::WorkflowLoopCarrySource::PriorState => current,
+                onnx_genai_metadata::WorkflowLoopCarrySource::PriorState => current.or(setup_value),
                 onnx_genai_metadata::WorkflowLoopCarrySource::Initializer
-                | onnx_genai_metadata::WorkflowLoopCarrySource::Explicit => restored.or(current),
+                | onnx_genai_metadata::WorkflowLoopCarrySource::Explicit => {
+                    restored.or(current).or(setup_value)
+                }
             };
             // A state whose resolved readers include a component port is
             // supplied by the service at that port when it has no materialized

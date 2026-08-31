@@ -507,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn token_boundaries_match_one_canonical_decode() -> anyhow::Result<()> {
+    fn token_boundaries_match_single_decode_result() -> anyhow::Result<()> {
         let tokenizer = Tokenizer::from_file(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../tests/fixtures/tiny-llm/tokenizer.json"),

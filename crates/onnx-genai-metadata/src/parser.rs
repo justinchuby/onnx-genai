@@ -346,6 +346,19 @@ fn gate_output_protocol_features(
     document: &serde_yaml::Value,
     version: crate::version::SchemaVersion,
 ) -> Result<(), crate::MetadataError> {
+    let workflow = document
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("workflow"));
+    if let Some(workflow) = workflow {
+        let publication_mode = workflow.get("publication_mode");
+        crate::version::gate_feature_field(
+            version,
+            crate::version::SchemaFeature::PublicationMode,
+            "pipeline.workflow.publication_mode",
+            publication_mode.is_some_and(|mode| !mode.is_null()),
+        )
+        .map_err(crate::MetadataError::Parse)?;
+    }
     if let Some(outputs) = document
         .get("pipeline")
         .and_then(|pipeline| pipeline.get("workflow"))
