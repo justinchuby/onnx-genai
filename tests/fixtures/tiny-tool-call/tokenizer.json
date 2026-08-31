@@ -4,6 +4,24 @@
   "padding": null,
   "added_tokens": [
     {
+      "id": 2,
+      "content": "<bos>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "<eos>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
       "id": 26,
       "content": "<tool-eos>",
       "single_word": false,
@@ -118,14 +136,14 @@
       "unused-19": 19,
       "unused-20": 20,
       "unused-21": 21,
-      "unused-22": 22,
+      "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>": 22,
       "unused-23": 23,
       "unused-24": 24,
       "unused-25": 25,
       "<tool-eos>": 26,
-      "unused-27": 27,
-      "unused-28": 28,
-      "unused-29": 29,
+      "ordinary": 27,
+      "assistant": 28,
+      "text": 29,
       "unused-30": 30,
       "unused-31": 31
     },
