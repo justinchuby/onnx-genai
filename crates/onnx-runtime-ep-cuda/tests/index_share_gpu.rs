@@ -1051,7 +1051,7 @@ fn run_gpu_capture_replay(
     };
 
     // A fresh generation starts un-poisoned.
-    runtime.reset_capture_error()?;
+    unsafe { runtime.reset_capture_error_for_isolated_test() }?;
 
     // Warmup: an eager execute compiles/caches every NVRTC kernel and sizes the
     // pooled scratch before capture. Only after this does the kernel advertise
@@ -1418,7 +1418,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
         )]
     };
 
-    runtime.reset_capture_error().expect("reset latch");
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.expect("reset latch");
 
     // Warmup with the valid indices: sizes scratch, primes NVRTC, makes capture
     // eligible, and (eager) does not poison the latch.
@@ -1503,7 +1503,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
         0,
         "an out-of-range index in a captured replay must latch the capture-error word"
     );
-    runtime.reset_capture_error().expect("reset latch");
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.expect("reset latch");
 
     ep.deallocate(out_buffer).expect("free out");
     if let Some(buffer) = workspace_buffer {

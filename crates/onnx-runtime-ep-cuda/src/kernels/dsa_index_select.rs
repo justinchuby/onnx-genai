@@ -891,7 +891,9 @@ impl DsaIndexSelectKernel {
         self.runtime.drain_for_unmap()?;
         self.warmed.store(true, Ordering::Release);
         self.runtime.reset_graph()?;
-        self.runtime.reset_capture_error()?;
+        // SAFETY: this isolated GPU probe owns the runtime and has no session
+        // validation generation.
+        unsafe { self.runtime.reset_capture_error_for_isolated_test() }?;
         self.runtime.begin_graph_capture(&[self])?;
         if let Err(error) = self.launch_pipeline(
             query_ptr,

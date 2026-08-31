@@ -3866,11 +3866,34 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.runtime.has_owned_graph(token)
     }
 
+    fn register_device_validation_owner(
+        &self,
+        owner: onnx_runtime_ep_api::DeviceValidationOwner,
+    ) -> Result<()> {
+        self.runtime.register_device_validation_owner(owner)
+    }
+
+    fn unregister_device_validation_owner(
+        &self,
+        owner: onnx_runtime_ep_api::DeviceValidationOwner,
+    ) -> Result<()> {
+        self.runtime.unregister_device_validation_owner(owner)
+    }
+
     fn begin_device_validation(
         &self,
         owner: onnx_runtime_ep_api::DeviceValidationOwner,
     ) -> Result<onnx_runtime_ep_api::DeviceValidationToken> {
         self.runtime.begin_device_validation(owner)
+    }
+
+    fn add_device_validation_recipient(
+        &self,
+        submission: onnx_runtime_ep_api::DeviceValidationToken,
+        recipient: onnx_runtime_ep_api::DeviceValidationOwner,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        self.runtime
+            .add_device_validation_recipient(submission, recipient)
     }
 
     fn defers_device_validation(&self) -> bool {

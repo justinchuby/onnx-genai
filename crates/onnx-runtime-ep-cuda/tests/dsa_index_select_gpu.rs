@@ -484,7 +484,7 @@ fn run_gpu_capture_replay(
     };
 
     // A fresh generation starts un-poisoned.
-    runtime.reset_capture_error()?;
+    unsafe { runtime.reset_capture_error_for_isolated_test() }?;
 
     // Warmup: an eager execute compiles/caches the NVRTC kernel and sizes the
     // persistent scratch before capture. Only after this does the kernel
@@ -1697,7 +1697,7 @@ fn bench_config(
             .collect()
     };
 
-    runtime.reset_capture_error().expect("reset capture error");
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.expect("reset capture error");
     // Warmup compiles the NVRTC kernel and sizes the persistent workspace.
     {
         let mut out_views = make_out_views(&mut out_buffers);

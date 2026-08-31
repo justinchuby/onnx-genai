@@ -948,6 +948,7 @@ impl Executor {
             graph_slot: DeviceGraphSlot::Primary,
             graph_owner: DeviceGraphOwner::new(),
             validation_owner: DeviceValidationOwner::new(),
+            validation_owner_registered: false,
             pending_device_validation: None,
             weight_handles,
             expert_region_candidates,
@@ -1152,6 +1153,9 @@ impl Executor {
             }
         }
 
+        exec.ep
+            .register_device_validation_owner(exec.validation_owner)?;
+        exec.validation_owner_registered = true;
         Ok(exec)
     }
 

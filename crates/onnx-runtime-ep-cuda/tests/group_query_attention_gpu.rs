@@ -2236,7 +2236,7 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
 
     let mut capture_invalid = |bad_seqlens: Option<i32>, bad_position: Option<i64>| -> u32 {
         // Explicit host reset returns the latch to a clean slate for each case.
-        runtime.reset_capture_error().unwrap();
+        unsafe { runtime.reset_capture_error_for_isolated_test() }.unwrap();
         overwrite(&ep, &seqlens, &valid_seqlens).unwrap();
         overwrite(&ep, &positions, &valid_positions).unwrap();
         execute_in_place_packed_f32_gqa(
@@ -2337,7 +2337,7 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
     );
 
     // Leave the latch clean for any later kernel sharing this runtime.
-    runtime.reset_capture_error().unwrap();
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.unwrap();
 
     for buffer in [
         output, positions, sin, cos, total, seqlens, cache_v, cache_k, packed,
@@ -2403,7 +2403,7 @@ fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
     let mut eager_output = ep.allocate(output_bytes, 256).unwrap();
 
     let cache_bytes = 20 * std::mem::size_of::<f32>();
-    runtime.reset_capture_error().unwrap();
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.unwrap();
 
     // Warm the fixed decode signature, then capture it.
     execute_in_place_packed_f32_gqa(
@@ -2529,7 +2529,7 @@ fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
 
     // Explicit host reset clears the latch; a fresh in-range replay resumes
     // normal operation and advances the KV cache again.
-    runtime.reset_capture_error().unwrap();
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.unwrap();
     assert_eq!(runtime.check_capture_error().unwrap(), 0);
     runtime.replay_graph().unwrap();
     runtime.synchronize().unwrap();
@@ -2541,7 +2541,7 @@ fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
     );
 
     let _ = runtime.reset_graph();
-    runtime.reset_capture_error().unwrap();
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.unwrap();
 
     for buffer in [
         eager_output,

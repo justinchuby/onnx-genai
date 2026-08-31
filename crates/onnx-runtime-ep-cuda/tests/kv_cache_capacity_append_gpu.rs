@@ -414,7 +414,7 @@ fn kv_capacity_append_latches_capture_error_on_out_of_capacity_position_without_
         expected,
         "an out-of-capacity replay must not have written anywhere"
     );
-    runtime.reset_capture_error().unwrap();
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.unwrap();
     assert_eq!(runtime.check_capture_error().unwrap(), 0);
 
     // Replay #3: negative position — the other half of the bounds check.
@@ -430,7 +430,7 @@ fn kv_capacity_append_latches_capture_error_on_out_of_capacity_position_without_
         expected,
         "a negative-position replay must not have written anywhere"
     );
-    runtime.reset_capture_error().unwrap();
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.unwrap();
 
     // Replay #4: back to a valid row proves the latch reset lets the *same*
     // captured graph keep serving correct, clean replays afterward.

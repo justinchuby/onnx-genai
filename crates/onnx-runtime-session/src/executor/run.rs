@@ -21,15 +21,19 @@ impl Executor {
     pub(super) fn begin_device_validation_submission(
         &mut self,
     ) -> Result<DeviceValidationSubmission> {
-        if self
-            .pending_device_validation
-            .as_ref()
-            .is_some_and(|receipt| receipt.is_consumed())
-        {
-            self.pending_device_validation = None;
-        }
         let submission = DeviceValidationSubmission::begin(&self.ep, self.validation_owner)?;
-        self.pending_device_validation = Some(submission.receipt());
+        self.pending_device_validation = Some(submission.token());
+        Ok(submission)
+    }
+
+    pub(super) fn begin_device_validation_submission_for_bindings(
+        &mut self,
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceValidationSubmission> {
+        let submission = self.begin_device_validation_submission()?;
+        for binding in bindings {
+            submission.add_recipient(binding)?;
+        }
         Ok(submission)
     }
 
@@ -44,7 +48,7 @@ impl Executor {
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
     ) -> Result<ScopedOutputs> {
-        match self.run_scoped_mode(inputs, outer_scope, external, RunMode::Eager)? {
+        match self.run_scoped_mode(inputs, outer_scope, external, RunMode::Eager, None)? {
             ScopedRunResult::Executed(outputs) => Ok(outputs),
             ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
         }
@@ -56,6 +60,7 @@ impl Executor {
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
         mode: RunMode,
+        validation_submission: Option<DeviceValidationSubmission>,
     ) -> Result<ScopedRunResult> {
         // Distinguish the outermost (top-level graph) run from nested
         // control-flow subgraph runs so the phase profiler can attribute
@@ -79,11 +84,10 @@ impl Executor {
         let mut validation_submission = if nested {
             None
         } else {
-            // At most one deferred generation may be outstanding on a shared
-            // provider. A later submission is refused until the previous
-            // generation has been consumed, so no reset can erase an unseen
-            // asynchronous failure.
-            Some(self.begin_device_validation_submission()?)
+            match validation_submission {
+                Some(submission) => Some(submission),
+                None => Some(self.begin_device_validation_submission()?),
+            }
         };
         self.reset_run_state()?;
 
@@ -164,12 +168,11 @@ impl Executor {
         // so the latch read observes every kernel from this request.
         self.ep.sync()?;
         let flags = match self.pending_device_validation.take() {
-            Some(receipt) if receipt.is_consumed() => 0,
-            Some(receipt) => match receipt.consume_after_sync() {
+            Some(token) => match self.ep.consume_device_validation_error(token) {
                 Ok(flags) => flags,
                 Err(error) => {
-                    self.pending_device_validation = Some(receipt);
-                    return Err(error);
+                    self.pending_device_validation = Some(token);
+                    return Err(error.into());
                 }
             },
             None => 0,

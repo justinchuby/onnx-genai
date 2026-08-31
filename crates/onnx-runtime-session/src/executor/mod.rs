@@ -50,11 +50,11 @@ use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
-    DevicePtr, DevicePtrMut, DeviceValidationOwner, EpError, ExecutionProvider, ExternalMmapRegion,
-    Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
-    lazy_weight_candidates,
+    DevicePtr, DevicePtrMut, DeviceValidationOwner, DeviceValidationToken, EpError,
+    ExecutionProvider, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput, KernelMatch,
+    LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline, TensorBacking,
+    TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
+    WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -81,13 +81,11 @@ use crate::error::{Result, SessionError};
 use crate::sequence::{
     ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
-use crate::tensor::{
-    DeviceBindingSpec, DeviceIoBinding, DeviceValidationReceipt, SharedTensorBuffer, Tensor,
-};
+use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor};
 
 pub(super) struct DeviceValidationSubmission {
     ep: Arc<dyn ExecutionProvider>,
-    receipt: Arc<DeviceValidationReceipt>,
+    token: DeviceValidationToken,
     active: bool,
 }
 
@@ -99,13 +97,24 @@ impl DeviceValidationSubmission {
         let token = ep.begin_device_validation(owner)?;
         Ok(Self {
             ep: Arc::clone(ep),
-            receipt: DeviceValidationReceipt::new(Arc::clone(ep), token),
+            token,
             active: true,
         })
     }
 
-    pub(super) fn receipt(&self) -> Arc<DeviceValidationReceipt> {
-        Arc::clone(&self.receipt)
+    pub(super) fn token(&self) -> DeviceValidationToken {
+        self.token
+    }
+
+    pub(super) fn add_recipient(&self, binding: &mut DeviceIoBinding) -> Result<()> {
+        if binding.output_name().is_none() {
+            return Ok(());
+        }
+        let token = self
+            .ep
+            .add_device_validation_recipient(self.token, binding.validation_owner())?;
+        binding.set_device_validation(token);
+        Ok(())
     }
 
     pub(super) fn disarm(&mut self) {
@@ -118,11 +127,11 @@ impl Drop for DeviceValidationSubmission {
         if !self.active {
             return;
         }
-        let result = self
-            .ep
-            .sync()
-            .map_err(SessionError::from)
-            .and_then(|()| self.receipt.consume_after_sync());
+        let result = self.ep.sync().map_err(SessionError::from).and_then(|()| {
+            self.ep
+                .consume_device_validation_error(self.token)
+                .map_err(SessionError::from)
+        });
         match result {
             Ok(0) => {}
             Ok(flags) => eprintln!(
@@ -828,11 +837,8 @@ impl Drop for Executor {
                 false
             }
         };
-        if safe_to_release
-            && let Some(receipt) = &self.pending_device_validation
-            && !receipt.is_consumed()
-        {
-            match receipt.consume_after_sync() {
+        if safe_to_release && let Some(token) = self.pending_device_validation {
+            match self.ep.consume_device_validation_error(token) {
                 Ok(0) => {}
                 Ok(flags) => eprintln!(
                     "[onnx-runtime-session] executor drop consumed its deferred validation \
@@ -905,6 +911,20 @@ impl Drop for Executor {
             }
         }
         self.shared_buffers.clear();
+        if self.validation_owner_registered {
+            if let Err(error) = self
+                .ep
+                .unregister_device_validation_owner(self.validation_owner)
+            {
+                eprintln!(
+                    "[onnx-runtime-session] executor drop could not unregister validation owner \
+                     {}: {error}",
+                    self.validation_owner.get()
+                );
+            } else {
+                self.validation_owner_registered = false;
+            }
+        }
     }
 }
 

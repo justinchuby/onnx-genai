@@ -104,7 +104,17 @@ impl DeviceGraphOwner {
     /// Mint a process-unique owner identity. Identities are never reused.
     pub fn new() -> Self {
         static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT_OWNER.fetch_add(1, Ordering::Relaxed))
+        let owner = NEXT_OWNER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .unwrap_or_else(|_| {
+                panic!(
+                    "device validation owner identity space exhausted; refusing to wrap and \
+                     create an ABA collision"
+                )
+            });
+        Self(owner)
     }
 
     /// Stable process-local numeric identity.
@@ -1568,14 +1578,40 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Begin one top-level device-validation generation owned by `owner`.
     ///
-    /// Providers with deferred validation may reject this call while a previous
-    /// generation remains unconsumed. The returned token is the only authority
-    /// that may consume this submission's result.
+    /// Owners are registered once at executor/binding setup. Providers with
+    /// deferred validation may reject this call while a previous generation is
+    /// still executing. The returned token is the submitting executor's exact
+    /// authority for this generation.
+    fn register_device_validation_owner(&self, _owner: DeviceValidationOwner) -> Result<()> {
+        Ok(())
+    }
+
+    /// Retire one executor/binding validation owner at teardown.
+    fn unregister_device_validation_owner(&self, _owner: DeviceValidationOwner) -> Result<()> {
+        Ok(())
+    }
+
+    /// Begin one top-level device-validation generation owned by `owner`.
     fn begin_device_validation(
         &self,
         owner: DeviceValidationOwner,
     ) -> Result<DeviceValidationToken> {
         Ok(DeviceValidationToken::new(owner, 0))
+    }
+
+    /// Add one pre-registered output binding as an exact recipient of the
+    /// active submission. The returned token is sticky in that binding's
+    /// owner-scoped slot until the binding participates in a later submission
+    /// or is unregistered.
+    fn add_device_validation_recipient(
+        &self,
+        submission: DeviceValidationToken,
+        recipient: DeviceValidationOwner,
+    ) -> Result<DeviceValidationToken> {
+        Ok(DeviceValidationToken::new(
+            recipient,
+            submission.generation(),
+        ))
     }
 
     /// Whether top-level execution defers validation until a host-visible read.

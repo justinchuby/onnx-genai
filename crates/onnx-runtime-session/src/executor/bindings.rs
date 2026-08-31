@@ -961,12 +961,22 @@ impl Executor {
                 "execution with persistent device bindings/state",
             ));
         }
+        let validation_submission =
+            self.begin_device_validation_submission_for_bindings(bindings)?;
         let external = self.prepare_external_bindings(bindings)?;
-        let result = self.run_scoped(inputs, &HashMap::new(), &external);
+        let result = self.run_scoped_mode(
+            inputs,
+            &HashMap::new(),
+            &external,
+            RunMode::Eager,
+            Some(validation_submission),
+        );
         self.scratch_external_bindings = external;
         self.release_step_workspace()?;
-        let outputs = result?;
-        self.attach_pending_device_validation(bindings);
+        let outputs = match result? {
+            ScopedRunResult::Executed(outputs) => outputs,
+            ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
+        };
         outputs
             .into_iter()
             .map(|output| match output {
@@ -1023,7 +1033,8 @@ impl Executor {
             self.reset_device_graph()?;
         }
         let external = self.prepare_external_bindings(bindings)?;
-        let result = self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture);
+        let result =
+            self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture, None);
         self.scratch_external_bindings = external;
         self.release_step_workspace()?;
         match result? {
@@ -1106,7 +1117,8 @@ impl Executor {
             .as_ref()
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
-            let mut validation_submission = self.begin_device_validation_submission()?;
+            let mut validation_submission =
+                self.begin_device_validation_submission_for_bindings(bindings)?;
             if let Err(replay_error) = self.ep.replay_owned_device_graph(token) {
                 let validation = self.finish_device_validation_boundary();
                 validation_submission.disarm();
@@ -1119,20 +1131,24 @@ impl Executor {
                 };
             }
             validation_submission.disarm();
-            self.attach_pending_device_validation(bindings);
             return Ok(true);
         }
+        let validation_submission =
+            self.begin_device_validation_submission_for_bindings(bindings)?;
         let external = self.prepare_external_bindings(bindings)?;
-        let result = self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay);
+        let result = self.run_scoped_mode(
+            &[],
+            &HashMap::new(),
+            &external,
+            RunMode::Replay,
+            Some(validation_submission),
+        );
         self.scratch_external_bindings = external;
         self.release_step_workspace()?;
         match result? {
             // `run_scoped_mode` clears `capture_schedule` when a branch flip
             // retired the graph this step; report that so the caller re-arms.
-            ScopedRunResult::Executed(_) => {
-                self.attach_pending_device_validation(bindings);
-                Ok(self.cap().capture_schedule.is_some())
-            }
+            ScopedRunResult::Executed(_) => Ok(self.cap().capture_schedule.is_some()),
             ScopedRunResult::NotCapturable(reason) => {
                 self.reset_device_graph()?;
                 Err(SessionError::Internal(format!(
@@ -1218,8 +1234,11 @@ impl Executor {
 
     pub(crate) fn check_device_capture_error(&self) -> Result<u32> {
         self.ep.sync()?;
-        match &self.pending_device_validation {
-            Some(receipt) => receipt.consume_after_sync(),
+        match self.pending_device_validation {
+            Some(token) => self
+                .ep
+                .consume_device_validation_error(token)
+                .map_err(SessionError::from),
             None => Ok(0),
         }
     }
@@ -1319,21 +1338,6 @@ impl Executor {
     ) -> Result<ExternalBindings> {
         let external = std::mem::take(&mut self.scratch_external_bindings);
         self.refill_external_bindings(external, bindings, false)
-    }
-
-    fn attach_pending_device_validation(&self, bindings: &mut [DeviceIoBinding]) {
-        let Some(receipt) = self
-            .pending_device_validation
-            .as_ref()
-            .filter(|receipt| !receipt.is_consumed())
-        else {
-            return;
-        };
-        for binding in bindings {
-            if binding.output_name().is_some() {
-                binding.set_device_validation(Arc::clone(receipt));
-            }
-        }
     }
 
     /// As [`Self::prepare_external_bindings`], but when `plan_capacity` is set the

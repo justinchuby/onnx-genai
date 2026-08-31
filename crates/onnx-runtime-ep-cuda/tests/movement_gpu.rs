@@ -295,7 +295,7 @@ fn captured_gather_and_reduce_axes_latch_dynamic_bounds_changes() {
         0
     );
     assert!(runtime.reset_graph().unwrap());
-    runtime.reset_capture_error().unwrap();
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.unwrap();
 
     let mut reduce_graph = Graph::new();
     reduce_graph.opset_imports.insert(String::new(), 13);
@@ -368,7 +368,7 @@ fn captured_gather_and_reduce_axes_latch_dynamic_bounds_changes() {
         0
     );
     assert!(runtime.reset_graph().unwrap());
-    runtime.reset_capture_error().unwrap();
+    unsafe { runtime.reset_capture_error_for_isolated_test() }.unwrap();
 
     for buffer in [
         data_buffer,
