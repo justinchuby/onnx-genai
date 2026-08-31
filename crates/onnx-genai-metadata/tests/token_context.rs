@@ -8,11 +8,11 @@ use std::collections::BTreeMap;
 
 use onnx_genai_metadata::{
     BatchLayout, ComponentContract, ComponentImplementation, InferenceMetadata, PaddedDimension,
-    PortRole, RuntimeCapabilities, RuntimeInputRole, SemanticInputRole, ShapeRecurrence,
-    StateCheckpointContract, StateGroupCapabilities, StateKind, StatePortAlias, StateSemanticRole,
-    StateUpdate, TensorContract, TensorDimension, WorkflowComponent, WorkflowInput,
-    WorkflowInputSource, WorkflowStateScope, WorkflowStep, classify_session_state,
-    resolve_state_plan, validate_metadata, validate_structure_and_capabilities,
+    PortRole, RuntimeInputRole, SemanticInputRole, ShapeRecurrence, StateGroupCapabilities,
+    StateKind, StatePortAlias, StateSemanticRole, StateUpdate, TensorContract, TensorDimension,
+    WorkflowBranchOutput, WorkflowComponent, WorkflowInput, WorkflowInputSource,
+    WorkflowStateScope, WorkflowStep, classify_session_state, resolve_state_plan,
+    validate_metadata,
 };
 
 const TOKEN_CONTEXT_CONTRACT: &str = "onnx-genai.token-context";
@@ -41,14 +41,6 @@ fn fixture() -> InferenceMetadata {
         .as_mut()
         .expect("catalogue fixture has pipeline")
         .workflow;
-    workflow
-        .manifest
-        .capabilities
-        .insert("session_state_lease".to_string());
-    workflow
-        .manifest
-        .capabilities
-        .insert("token_context".to_string());
     workflow
         .inputs
         .get_mut("request.hidden_states")
@@ -175,10 +167,7 @@ fn fixture() -> InferenceMetadata {
         fork: true,
         cascade: Default::default(),
     };
-    token_group.checkpoint = Some(StateCheckpointContract {
-        adapter: "onnx-genai.tensor-checkpoint".to_string(),
-        version: "1".to_string(),
-    });
+    token_group.checkpoint = None;
     token_group.ports = BTreeMap::from([(
         "model".to_string(),
         BTreeMap::from([(
@@ -209,10 +198,7 @@ fn fixture() -> InferenceMetadata {
         .groups
         .get_mut("causal_conv_history")
         .expect("convolution state group exists")
-        .checkpoint = Some(StateCheckpointContract {
-        adapter: "onnx-genai.tensor-checkpoint".to_string(),
-        version: "1".to_string(),
-    });
+        .checkpoint = None;
     serving
         .state_service
         .groups
@@ -351,43 +337,10 @@ fn token_context_requires_new_reader_and_runtime_admission() {
         }),
         "{errors:#?}"
     );
-
-    let mut missing_manifest = fixture();
-    missing_manifest
-        .pipeline
-        .as_mut()
-        .expect("pipeline")
-        .workflow
-        .manifest
-        .capabilities
-        .remove("token_context");
-    let errors =
-        validate_metadata(&missing_manifest).expect_err("the semantic capability is required");
-    assert!(
-        errors.iter().any(|error| {
-            error.contains("manifest.capabilities")
-                && error.contains("missing used capability 'token_context'")
-        }),
-        "{errors:#?}"
-    );
-
-    let mut runtime = RuntimeCapabilities::default();
-    runtime
-        .supported
-        .retain(|capability| capability != "token_context");
-    let report = validate_structure_and_capabilities(&fixture(), &runtime);
-    assert!(report.structural.is_empty(), "{:#?}", report.structural);
-    assert!(
-        report
-            .unsupported_capabilities
-            .contains(&"token_context".to_string()),
-        "{:#?}",
-        report.unsupported_capabilities
-    );
 }
 
 #[test]
-fn token_context_invoke_rejects_shape_compatible_position_id_provenance() {
+fn token_context_invoke_rejects_shape_compatible_transformed_position_id_provenance() {
     let mut metadata = fixture();
     let workflow = &mut metadata.pipeline.as_mut().expect("pipeline").workflow;
     workflow.components.insert(
@@ -451,6 +404,130 @@ fn token_context_invoke_rejects_shape_compatible_position_id_provenance() {
 }
 
 #[test]
+fn token_context_invoke_rejects_ambiguous_branch_provenance() {
+    let mut metadata = fixture();
+    let workflow = &mut metadata.pipeline.as_mut().expect("pipeline").workflow;
+    workflow.inputs.insert(
+        "choose_tokens".to_string(),
+        WorkflowInput {
+            contract: TensorContract {
+                dtype: "bool".to_string(),
+                shape: vec![TensorDimension::Fixed(1)],
+                optional: false,
+                batch_layout: BatchLayout::Shared,
+                padding: Vec::new(),
+            },
+            role: SemanticInputRole::Opaque,
+            source: WorkflowInputSource::Application {
+                name: "choose_tokens".to_string(),
+            },
+            required: true,
+            default: None,
+            present_as: None,
+            externally_suppliable: false,
+        },
+    );
+    for (name, output_role) in [
+        ("token_alias", PortRole::TokenIds),
+        ("position_alias", PortRole::PositionIds),
+    ] {
+        workflow.components.insert(
+            name.to_string(),
+            WorkflowComponent {
+                implementation: ComponentImplementation::Binding,
+                ports: onnx_genai_metadata::ComponentPorts {
+                    inputs: BTreeMap::from([(
+                        "value".to_string(),
+                        contract("int64", &["batch", "sequence"]),
+                    )]),
+                    outputs: BTreeMap::from([(
+                        "value".to_string(),
+                        contract("int64", &["batch", "sequence"]),
+                    )]),
+                    roles: BTreeMap::from([("value".to_string(), output_role)]),
+                },
+                contract: None,
+                application_overridable: false,
+                effects: Vec::new(),
+                row_scope: None,
+                cache_affects_state: Default::default(),
+                batch_capacity: None,
+            },
+        );
+    }
+    workflow.steps.insert(
+        0,
+        WorkflowStep::Branch {
+            predicate: "choose_tokens".to_string(),
+            cases: BTreeMap::from([
+                (
+                    "true".to_string(),
+                    WorkflowStep::Invoke {
+                        component: "token_alias".to_string(),
+                        inputs: BTreeMap::from([(
+                            "value".to_string(),
+                            "request.token_ids".to_string(),
+                        )]),
+                        outputs: BTreeMap::from([(
+                            "value".to_string(),
+                            "branch.token_ids".to_string(),
+                        )]),
+                    },
+                ),
+                (
+                    "false".to_string(),
+                    WorkflowStep::Invoke {
+                        component: "position_alias".to_string(),
+                        inputs: BTreeMap::from([(
+                            "value".to_string(),
+                            "request.token_ids".to_string(),
+                        )]),
+                        outputs: BTreeMap::from([(
+                            "value".to_string(),
+                            "branch.position_ids".to_string(),
+                        )]),
+                    },
+                ),
+            ]),
+            default: None,
+            outputs: BTreeMap::from([(
+                "ambiguous.ids".to_string(),
+                WorkflowBranchOutput {
+                    cases: BTreeMap::from([
+                        ("true".to_string(), "branch.token_ids".to_string()),
+                        ("false".to_string(), "branch.position_ids".to_string()),
+                    ]),
+                    default: None,
+                },
+            )]),
+        },
+    );
+    let model_inputs = workflow
+        .steps
+        .iter_mut()
+        .find_map(|step| match step {
+            WorkflowStep::Invoke {
+                component, inputs, ..
+            } if component == "model" => Some(inputs),
+            _ => None,
+        })
+        .expect("model invoke");
+    model_inputs.insert("token_ids".to_string(), "ambiguous.ids".to_string());
+
+    let errors =
+        validate_metadata(&metadata).expect_err("mixed token/position provenance is ambiguous");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("ambiguous.ids")
+                && error.contains("token_ids")
+                && error.contains("position_ids")
+                && error.contains("cannot distinguish token identity from position IDs")
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
 fn graph_internal_token_context_uses_generic_ports_and_state_groups() {
     let metadata = fixture();
     validate_metadata(&metadata).expect("token-context fixture validates");
@@ -486,8 +563,8 @@ fn graph_internal_token_context_uses_generic_ports_and_state_groups() {
                 .groups
                 .get(history)
                 .and_then(|group| group.checkpoint.as_ref())
-                .is_some(),
-            "{history} declares portable checkpoint handling"
+                .is_none(),
+            "{history} uses core runtime snapshot/fork semantics, not a portable checkpoint adapter"
         );
         assert_eq!(
             carriers.carrier(history),

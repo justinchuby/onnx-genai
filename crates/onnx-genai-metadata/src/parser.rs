@@ -296,6 +296,44 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     // retired spelling is only ever found by recognizing its shape.
     reject_flat_token_packed(document, String::new())
         .and_then(|_| reject_retired_batching_hints(document))
+        .and_then(|_| reject_retired_capability_declarations(document))
+}
+
+/// Refuse the retired capability lists with their true migration path.
+///
+/// Core schema conformance is selected by `schema_version`, and optional
+/// semantic modules already name their exact identity/version at the typed
+/// declaration that owns them. Keeping a second list would allow those two
+/// answers to disagree and would incorrectly make runtime optimizations look
+/// package-required.
+fn reject_retired_capability_declarations(
+    document: &serde_yaml::Value,
+) -> Result<(), crate::MetadataError> {
+    if document.get("required_capabilities").is_some() {
+        return Err(crate::MetadataError::Parse(
+            "`required_capabilities` is retired. Core SSA, shape, state, output, and validation \
+             semantics are selected by `schema_version`, not negotiated flags. Declare an \
+             optional semantic module only at its typed identity/version surface (for example \
+             `package.tool_protocol`, a component contract/adapter ABI, or `speculative`). \
+             Runtime optimizations such as batching are never package requirements."
+                .to_string(),
+        ));
+    }
+    if document
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("workflow"))
+        .and_then(|workflow| workflow.get("manifest"))
+        .and_then(|manifest| manifest.get("capabilities"))
+        .is_some()
+    {
+        return Err(crate::MetadataError::Parse(
+            "`pipeline.workflow.manifest.capabilities` is retired. The typed workflow itself \
+             defines core conformance; remove this duplicate list. Declare optional semantic \
+             extensions at their owning identity/version field, never as a workflow flag."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Apply the canonical output-protocol version gate to the untyped document.
@@ -308,6 +346,19 @@ fn gate_output_protocol_features(
     document: &serde_yaml::Value,
     version: crate::version::SchemaVersion,
 ) -> Result<(), crate::MetadataError> {
+    let workflow = document
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("workflow"));
+    if let Some(workflow) = workflow {
+        let publication_mode = workflow.get("publication_mode");
+        crate::version::gate_feature_field(
+            version,
+            crate::version::SchemaFeature::PublicationMode,
+            "pipeline.workflow.publication_mode",
+            publication_mode.is_some_and(|mode| !mode.is_null()),
+        )
+        .map_err(crate::MetadataError::Parse)?;
+    }
     if let Some(outputs) = document
         .get("pipeline")
         .and_then(|pipeline| pipeline.get("workflow"))

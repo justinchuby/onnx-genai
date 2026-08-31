@@ -39,6 +39,7 @@ mod output;
 mod row_state;
 mod runtime_state;
 pub mod speculative;
+mod tool_protocol;
 mod turn_transaction;
 mod workflow;
 
@@ -59,11 +60,16 @@ pub use output::{
     TypedRevisionEnvelope, TypedRevisionOperation, WorkflowOutputPublication,
 };
 pub use row_state::{RowPlan, RowScopedState, RowTable, check_selection, gather_rows};
+pub use tool_protocol::{
+    GenerationStopReason, StagedOutputCheckpoint, StagedOutputObservation,
+    StagedOutputObservationError, ToolCallStagedOutputObserver,
+};
 pub(crate) use turn_transaction::TurnTransaction;
 pub use turn_transaction::{
-    OutputPublicationBaseline, TurnAbortReason, TurnBaselineId, TurnCommittedBaseline,
-    TurnPublicationMode, TurnStateBaseline, TurnTransactionAdmissionError, TurnTransactionId,
-    TurnTransactionOutcome,
+    OutputPublicationBaseline, OutputStreamBaseline, TurnAbortReason, TurnBaselineId,
+    TurnCommittedBaseline, TurnPublicationMode, TurnStateBaseline, TurnTransactionAdmissionError,
+    TurnTransactionCommitError, TurnTransactionId, TurnTransactionOutcome,
+    TurnTransactionResolution, TurnTransactionResolutionError,
 };
 pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
@@ -88,9 +94,11 @@ const GENERATION_COMMITTED: u8 = 3;
 /// cancellation or a caller-provided execution guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationBoundary {
+    AfterLoopSetup,
     BeforeProposer,
     AfterProposer,
     AfterVerifier,
+    AfterBranch,
     BeforeAcceptedPathCommit,
     BeforeAcceptedPrefixCommit,
     BeforeSemanticCommit,
@@ -110,9 +118,11 @@ pub struct GenerationControlUnsupported {
 impl std::fmt::Display for GenerationBoundary {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::AfterLoopSetup => "after loop setup",
             Self::BeforeProposer => "before proposer execution",
             Self::AfterProposer => "after proposer execution",
             Self::AfterVerifier => "after verifier execution",
+            Self::AfterBranch => "after branch join",
             Self::BeforeAcceptedPathCommit => "before accepted-path commit",
             Self::BeforeAcceptedPrefixCommit => "before accepted-prefix commit",
             Self::BeforeSemanticCommit => "before semantic commit",
@@ -337,7 +347,7 @@ mod dflash_constructor_admission_tests {
     }
 
     fn assert_not_dflash_refusal(error: anyhow::Error) {
-        assert!(crate::engine::package_capability_error(&error).is_none());
+        assert!(crate::engine::package_execution_error(&error).is_none());
     }
 
     #[test]
@@ -381,6 +391,8 @@ pub(crate) struct WorkflowSessionForkSnapshot {
 /// A request for the universal workflow interpreter.
 pub struct PipelineGenerateRequest {
     pub request: GenerateRequest,
+    /// Transport-neutral policy for interpreting generated tool-call output.
+    pub tool_call_policy: crate::ToolCallPolicy,
     /// Application tensors keyed by a declared package input or application source name.
     pub inputs: PipelineTensors,
     /// Identity used by session-scoped workflow state cells.
@@ -396,6 +408,7 @@ impl PipelineGenerateRequest {
     pub fn new(request: GenerateRequest) -> Self {
         Self {
             request,
+            tool_call_policy: crate::ToolCallPolicy::Disabled,
             inputs: HashMap::new(),
             session_id: None,
             component_overrides: HashMap::new(),
@@ -425,6 +438,11 @@ impl PipelineGenerateRequest {
 
     pub fn with_generation_control(mut self, control: GenerationControl) -> Self {
         self.generation_control = Some(control);
+        self
+    }
+
+    pub fn with_tool_call_policy(mut self, policy: crate::ToolCallPolicy) -> Self {
+        self.tool_call_policy = policy;
         self
     }
 }
@@ -1100,12 +1118,10 @@ impl WorkflowRuntime {
     pub(crate) fn reject_dflash_raw_execution(&self, operation: &str) -> anyhow::Result<()> {
         self.require_execution_admitted()?;
         if self.is_dflash() {
-            return Err(
-                crate::engine::PackageCapabilityError::DFlashRawWorkflowApi {
-                    operation: operation.to_string(),
-                }
-                .into(),
-            );
+            return Err(crate::engine::PackageExecutionError::DFlashRawWorkflowApi {
+                operation: operation.to_string(),
+            }
+            .into());
         }
         Ok(())
     }
@@ -1232,6 +1248,14 @@ impl WorkflowRuntime {
             .keys()
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn session_effect_cursor(&self, session_id: &str, effect: &str) -> Option<u64> {
+        self.worker
+            .session_effects
+            .borrow()
+            .get(&(session_id.to_string(), effect.to_string()))
+            .copied()
     }
 
     pub(crate) fn output_names(&self) -> Vec<String> {
@@ -2134,8 +2158,7 @@ opset_import { domain: "" version: 13 }
                 r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {{}}
     inputs:
       logits:
         contract: {{ dtype: float32, shape: [{BATCH}, {VOCAB}] }}
@@ -2923,8 +2946,8 @@ mod state_split_contracts {
             anyhow::bail!("a second holder of an exclusive lease must be refused");
         };
         assert!(matches!(
-            refused.downcast_ref::<crate::engine::PackageCapabilityError>(),
-            Some(crate::engine::PackageCapabilityError::ExclusiveLeaseConflict { session })
+            refused.downcast_ref::<crate::engine::PackageExecutionError>(),
+            Some(crate::engine::PackageExecutionError::ExclusiveLeaseConflict { session })
                 if session == "session-a"
         ));
         // A different conversation is not blocked by this one.

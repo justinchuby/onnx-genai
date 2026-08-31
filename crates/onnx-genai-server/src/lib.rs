@@ -48,10 +48,7 @@ pub use cli::{ServeArgs, run_serve};
 pub use models_config::{ModelSpec, ModelsConfig, from_models_dir};
 pub use multimodal::MultimodalSpecs;
 pub use registry::EvictionPolicy;
-pub use routes::{
-    ParsedAssistantOutput, build_generate_request, build_generate_request_with_protocol,
-    build_prompt, parse_assistant_output,
-};
+pub use routes::{build_generate_request, build_generate_request_with_protocol, build_prompt};
 pub use runtime_args::{
     CpuArgs, DeviceChoice, EngineArgs, decode_backend_name, parse_decode_backend, parse_device,
 };
@@ -60,7 +57,7 @@ pub use state::parse_native_device;
 pub use state::{
     AppState, OrtSessionWorkerCount, ServerConfig, default_node_id, parse_kv_cache_dtype,
 };
-pub use tool_protocol::{ToolCallStream, ToolParseOutcome, ToolProtocol, ToolProtocolError};
+pub use tool_protocol::{ToolProtocol, ToolProtocolError};
 pub use types::{
     AudioSpeechRequest, AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest,
     ChatCompletionResponse, ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageContentPart,

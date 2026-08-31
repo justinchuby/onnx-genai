@@ -1,5 +1,4 @@
 {
-  "required_capabilities": ["kv_cache", "grouped_query_attention"],
   "model": {
     "attention": {
       "type": "grouped_query",

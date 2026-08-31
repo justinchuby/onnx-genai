@@ -7,9 +7,8 @@ use onnx_genai::GeneratePrompt;
 use onnx_genai_engine::GenerateConstraint;
 use onnx_genai_metadata::ToolProtocolDeclaration;
 use onnx_genai_server::{
-    AppState, ChatCompletionRequest, OrtSessionWorkerCount, ServerConfig, ToolCallStream,
-    ToolParseOutcome, ToolProtocol, app, build_generate_request,
-    build_generate_request_with_protocol, parse_assistant_output,
+    AppState, ChatCompletionRequest, OrtSessionWorkerCount, ServerConfig, ToolProtocol, app,
+    build_generate_request, build_generate_request_with_protocol,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -22,6 +21,13 @@ fn fixture_dir() -> PathBuf {
 async fn test_app() -> axum::Router {
     let state = AppState::load(&fixture_dir(), Some("tiny-llm".to_string())).unwrap();
     app(state)
+}
+
+async fn fixture_app(name: &str) -> axum::Router {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name);
+    app(AppState::load(&directory, Some(name.to_string())).unwrap())
 }
 
 async fn test_app_with_config(config: ServerConfig) -> axum::Router {
@@ -1358,404 +1364,336 @@ async fn tool_request_without_package_declaration_fails_before_generation() {
     assert!(message.contains("package.tool_protocol"), "{message}");
 }
 
-#[test]
-fn declared_tagged_json_protocol_converts_multiple_calls_to_openai() {
-    let protocol = declared_protocol("tagged-json");
-    let parsed = parse_assistant_output(
-        Some(&protocol),
-        None,
-        r#"<tool_call>
-{"name":"read_file","arguments":{"path":"src/lib.rs"}}
-</tool_call>
-<tool_call>
-{"name":"write_file","arguments":{"path":"src/lib.rs","content":"ok"}}
-</tool_call>"#
-            .to_string(),
-        "stop",
-    )
-    .expect("valid tagged JSON call");
-
-    assert_eq!(parsed.finish_reason, "tool_calls");
-    assert!(parsed.content.is_none());
-    let calls = parsed.tool_calls.unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].id, "call_0");
-    assert_eq!(calls[0].kind, "function");
-    assert_eq!(calls[0].function.name, "read_file");
-    assert_eq!(calls[0].function.arguments, r#"{"path":"src/lib.rs"}"#);
-    assert_eq!(calls[1].id, "call_1");
-    assert_eq!(calls[1].function.name, "write_file");
-    let second_args: Value = serde_json::from_str(&calls[1].function.arguments).unwrap();
-    assert_eq!(second_args["path"], "src/lib.rs");
-    assert_eq!(second_args["content"], "ok");
-}
-
-#[test]
-fn declared_atem_xml_protocol_converts_escaped_values_to_openai() {
-    let protocol = declared_protocol("atem-xml");
-    let mut stream = ToolCallStream::default();
-    let outcome = stream.push(
-        &protocol,
-        r#"<atem:invoke name="bash">
-<atem:parameter name="command">{"cmd":"printf ok"}</atem:parameter>
-<atem:parameter name="description">"run a &lt; safe command"</atem:parameter>
-</atem:invoke>"#,
-    );
-    let ToolParseOutcome::Complete(calls) = outcome else {
-        panic!("expected a complete declared ATEM envelope");
-    };
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].function.name, "bash");
-    let arguments: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
-    assert_eq!(arguments["command"]["cmd"], "printf ok");
-    assert_eq!(arguments["description"], "run a < safe command");
-}
-
-#[test]
-fn declared_atem_xml_request_uses_its_adapter_across_generation_and_parse() {
-    let request = chat_request(json!({
-        "model": "declared-atem-package",
-        "messages": [{"role": "user", "content": "run the weather tool"}],
-        "tools": [{
+#[tokio::test]
+async fn tool_result_chain_commits_typed_calls_and_accepts_reordered_results_over_http() {
+    let tools = json!([
+        {
             "type": "function",
             "function": {
                 "name": "weather",
-                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+                "parameters": {"type": "object"}
             }
-        }],
-        "tool_choice": {"type": "function", "function": {"name": "weather"}},
-        "response_format": {"type": "json_object"}
-    }));
-    let protocol = declared_protocol("atem-xml");
-
-    let generation = build_generate_request_with_protocol(&request, &protocol)
-        .expect("the declared package selects its adapter");
-    assert_eq!(
-        generation.options.constraint, None,
-        "ATEM explicitly declares no JSON grammar rather than inheriting tagged-json"
-    );
-    let GeneratePrompt::Text(prompt) = generation.prompt else {
-        panic!("the fallback production prompt is text");
-    };
-    assert!(prompt.contains("<atem:tools>"), "{prompt}");
-    assert!(!prompt.contains("<|tools|>"), "{prompt}");
-
-    let parsed = parse_assistant_output(
-        Some(&protocol),
-        Some(&request),
-        "<atem:invoke name=\"weather\"><atem:parameter name=\"city\">\"Paris\"</atem:parameter></atem:invoke>"
-            .to_string(),
-        "stop",
-    )
-    .expect("the generated ATEM envelope must parse through the same adapter");
-    assert_eq!(parsed.finish_reason, "tool_calls");
-    assert_eq!(parsed.tool_calls.unwrap()[0].function.name, "weather");
-}
-
-#[test]
-fn parser_returns_only_atem_user_channel_content() {
-    let parsed = parse_assistant_output(
-        None,
-        None,
-        "<|start|>assistant to=self<|message|>private reasoning<|eom|>\
-         <|start|>assistant to=user<|message|>final answer<|eot|>"
-            .to_string(),
-        "stop",
-    )
-    .expect("ordinary ATEM user content");
-
-    assert_eq!(parsed.content.as_deref(), Some("final answer"));
-    assert!(parsed.tool_calls.is_none());
-}
-
-// A turn truncated inside the private reasoning channel produced no answer, so
-// the client sees empty content rather than the model's reasoning.
-#[test]
-fn parser_withholds_atem_reasoning_without_a_user_channel() {
-    let parsed = parse_assistant_output(
-        None,
-        None,
-        "<|start|>assistant to=self<|message|>private reasoning that ran long".to_string(),
-        "length",
-    )
-    .expect("ordinary truncated ATEM reasoning");
-
-    assert_eq!(parsed.content.as_deref(), Some(""));
-    assert!(parsed.tool_calls.is_none());
-    assert_eq!(parsed.finish_reason, "length");
-}
-
-#[test]
-fn declared_protocol_reports_incomplete_and_malformed_envelopes() {
-    let protocol = declared_protocol("tagged-json");
-    let mut stream = ToolCallStream::default();
-    assert!(matches!(
-        stream.push(&protocol, "<tool_call>{\"name\":\"read\"}"),
-        ToolParseOutcome::Incomplete
-    ));
-    let mut stream = ToolCallStream::default();
-    assert!(matches!(
-        stream.push(&protocol, "<tool_call>{\"name\":}</tool_call>"),
-        ToolParseOutcome::Malformed(_)
-    ));
-}
-
-#[test]
-fn declared_protocol_envelope_failures_are_not_assistant_content() {
-    for (identity, output, failure) in [
-        (
-            "tagged-json",
-            "<tool_call>{\"name\":\"read\"}",
-            "incomplete",
-        ),
-        (
-            "atem-xml",
-            "<atem:invoke name=\"read\"><atem:parameter name=\"path\">",
-            "incomplete",
-        ),
-        (
-            "tagged-json",
-            "<tool_call>{\"name\":}</tool_call>",
-            "malformed",
-        ),
-        (
-            "atem-xml",
-            "<atem:invoke><atem:parameter name=\"path\">x</atem:parameter></atem:invoke>",
-            "malformed",
-        ),
-    ] {
-        let error = parse_assistant_output(
-            Some(&declared_protocol(identity)),
-            None,
-            output.to_string(),
-            "stop",
-        )
-        .expect_err("declared malformed or incomplete envelopes must fail closed")
-        .to_string();
-        assert!(error.contains(&format!("{identity}@v1")), "{error}");
-        assert!(error.contains(failure), "{error}");
-        assert!(error.contains("buffered generation boundary"), "{error}");
-    }
-}
-
-#[test]
-fn buffered_atem_route_rejects_text_outside_the_envelope_sequence() {
-    let protocol = declared_protocol("atem-xml");
-    let call = r#"<atem:invoke name="read"></atem:invoke>"#;
-    for (output, reason) in [
-        (format!("junk{call}"), "before the first invoke envelope"),
-        (
-            format!("{call}junk"),
-            "trailing text after an invoke envelope",
-        ),
-        (
-            format!("junk{call}junk"),
-            "before the first invoke envelope",
-        ),
-    ] {
-        let error = parse_assistant_output(Some(&protocol), None, output, "stop")
-            .expect_err("text outside a declared ATEM envelope sequence must fail closed")
-            .to_string();
-        assert!(error.contains("atem-xml@v1"), "{error}");
-        assert!(error.contains("malformed envelope"), "{error}");
-        assert!(error.contains("buffered generation boundary"), "{error}");
-        assert!(error.contains(reason), "{error}");
-    }
-}
-
-#[test]
-fn buffered_atem_route_accepts_surrounding_whitespace_and_multiple_calls() {
-    let protocol = declared_protocol("atem-xml");
-    let output = " \n<atem:invoke name=\"read\"></atem:invoke>\t\
-                  <atem:invoke name=\"write\"><atem:parameter name=\"path\">\
-                  \"src/lib.rs\"</atem:parameter></atem:invoke>\r\n"
-        .to_string();
-    let parsed = parse_assistant_output(Some(&protocol), None, output, "stop")
-        .expect("whitespace around and between ATEM envelopes is legal");
-    let calls = parsed.tool_calls.expect("two parsed tool calls");
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].function.name, "read");
-    assert_eq!(calls[1].function.name, "write");
-}
-
-#[test]
-fn declared_protocol_preserves_ordinary_no_call_assistant_text() {
-    for identity in ["tagged-json", "atem-xml"] {
-        let output = "ordinary assistant text".to_string();
-        let parsed = parse_assistant_output(
-            Some(&declared_protocol(identity)),
-            None,
-            output.clone(),
-            "stop",
-        )
-        .expect("a non-envelope is ordinary assistant text");
-        assert_eq!(parsed.content, Some(output));
-        assert!(matches!(parsed.tool_parse, ToolParseOutcome::NoCall));
-    }
-}
-
-#[test]
-fn buffered_declared_protocol_enforces_required_and_specific_tool_choice() {
-    for identity in ["tagged-json", "atem-xml"] {
-        let protocol = declared_protocol(identity);
-        let required = chat_request(json!({
-            "model": "fixture",
-            "messages": [{"role": "user", "content": "weather?"}],
-            "tools": [{"type": "function", "function": {"name": "weather"}}],
-            "tool_choice": "required"
-        }));
-        let error = parse_assistant_output(
-            Some(&protocol),
-            Some(&required),
-            "ordinary assistant text".to_string(),
-            "stop",
-        )
-        .expect_err("required tool choice must reject a terminal no-call")
-        .to_string();
-        assert!(error.contains(&format!("{identity}@v1")), "{error}");
-        assert!(error.contains("tool_choice required"), "{error}");
-        assert!(error.contains("no tool call"), "{error}");
-
-        let specific = chat_request(json!({
-            "model": "fixture",
-            "messages": [{"role": "user", "content": "weather?"}],
-            "tools": [
-                {"type": "function", "function": {"name": "weather"}},
-                {"type": "function", "function": {"name": "calendar"}}
-            ],
-            "tool_choice": {"type": "function", "function": {"name": "weather"}}
-        }));
-        let error = parse_assistant_output(
-            Some(&protocol),
-            Some(&specific),
-            "ordinary assistant text".to_string(),
-            "stop",
-        )
-        .expect_err("specific tool choice must reject a terminal no-call")
-        .to_string();
-        assert!(error.contains(&format!("{identity}@v1")), "{error}");
-        assert!(error.contains("weather"), "{error}");
-        assert!(error.contains("no tool call"), "{error}");
-
-        let mismatched = match identity {
-            "tagged-json" => {
-                r#"<tool_call>{"name":"calendar","arguments":{}}</tool_call>"#.to_string()
-            }
-            "atem-xml" => r#"<atem:invoke name="calendar"></atem:invoke>"#.to_string(),
-            _ => unreachable!(),
-        };
-        let error = parse_assistant_output(Some(&protocol), Some(&specific), mismatched, "stop")
-            .expect_err("specific tool choice must reject a different parsed function")
-            .to_string();
-        assert!(error.contains(&format!("{identity}@v1")), "{error}");
-        assert!(error.contains("weather"), "{error}");
-        assert!(error.contains("calendar"), "{error}");
-    }
-}
-
-#[test]
-fn buffered_declared_protocol_preserves_auto_and_none_no_call_behavior() {
-    for identity in ["tagged-json", "atem-xml"] {
-        for mode in ["auto", "none"] {
-            let protocol = declared_protocol(identity);
-            let request = chat_request(json!({
-                "model": "fixture",
-                "messages": [{"role": "user", "content": "weather?"}],
-                "tools": [{"type": "function", "function": {"name": "weather"}}],
-                "tool_choice": mode
-            }));
-            let parsed = parse_assistant_output(
-                Some(&protocol),
-                Some(&request),
-                "ordinary assistant text".to_string(),
-                "stop",
-            )
-            .expect("auto and none permit ordinary assistant content");
-            assert!(matches!(parsed.tool_parse, ToolParseOutcome::NoCall));
-        }
-    }
-}
-
-#[test]
-fn plain_assistant_output_preserves_content() {
-    let output = "ordinary assistant text".to_string();
-    let parsed = parse_assistant_output(None, None, output.clone(), "stop");
-    let parsed = parsed.expect("ordinary assistant content");
-
-    assert_eq!(parsed.content, Some(output));
-    assert!(parsed.tool_calls.is_none());
-    assert_eq!(parsed.finish_reason, "stop");
-}
-
-#[tokio::test]
-#[ignore = "requires gitignored models/qwen2.5-0.5b real model fixture"]
-async fn qwen_real_model_tool_use_chain_end_to_end() {
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/qwen2.5-0.5b");
-    assert!(
-        model_dir.exists(),
-        "build the real model fixture with scripts/build_qwen.sh"
-    );
-    let app = app(AppState::load(&model_dir, Some("qwen2.5-0.5b".to_string())).unwrap());
-    let tool = json!({
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get current weather for a city",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string"},
-                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["location"]
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "time",
+                "parameters": {"type": "object"}
             }
         }
-    });
-    let first_messages = json!([
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "What's the weather in Paris? Use the tool."}
     ]);
-
-    let forced = post_chat_json(
-        app.clone(),
-        json!({
-            "model": "qwen2.5-0.5b",
-            "messages": first_messages,
-            "tools": [tool.clone()],
-            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
-        }),
+    let body = json!({
+        "model": "tiny-tool-call",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": tools,
+        "tool_choice": "auto",
+        "max_tokens": 2
+    });
+    let buffered = post_json(
+        fixture_app("tiny-tool-call").await,
+        "/v1/chat/completions",
+        body.clone(),
     )
     .await;
-    assert_eq!(forced["choices"][0]["finish_reason"], "tool_calls");
-    let tool_call = forced["choices"][0]["message"]["tool_calls"][0].clone();
-    assert_eq!(tool_call["function"]["name"], "get_weather");
-    let args: Value =
-        serde_json::from_str(tool_call["function"]["arguments"].as_str().unwrap()).unwrap();
-    assert!(args["location"].is_string(), "{args}");
+    let status = buffered.status();
+    let buffered_bytes = to_bytes(buffered.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&buffered_bytes)
+    );
+    let buffered: Value = serde_json::from_slice(&buffered_bytes).unwrap();
+    let choice = &buffered["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls");
+    assert!(choice["message"]["content"].is_null());
+    let tool_calls = choice["message"]["tool_calls"]
+        .as_array()
+        .expect("typed tool calls");
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0]["id"], "call_weather");
+    assert_eq!(tool_calls[0]["function"]["name"], "weather");
+    assert_eq!(
+        tool_calls[0]["function"]["arguments"],
+        r#"{"city":"Paris"}"#
+    );
+    assert_eq!(tool_calls[1]["id"], "call_time");
+    assert_eq!(tool_calls[1]["function"]["name"], "time");
+    assert_eq!(
+        tool_calls[1]["function"]["arguments"],
+        r#"{"timezone":"UTC"}"#
+    );
+
+    let mut streamed_body = body;
+    streamed_body["stream"] = Value::Bool(true);
+    let streamed = post_json(
+        fixture_app("tiny-tool-call").await,
+        "/v1/chat/completions",
+        streamed_body,
+    )
+    .await;
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let streamed = String::from_utf8(
+        to_bytes(streamed.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let streamed_chunks = sse_json_chunks(&streamed);
+    let streamed_calls = streamed_chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["tool_calls"].as_array())
+        .map(|calls| &calls[0])
+        .collect::<Vec<_>>();
+    assert_eq!(streamed_calls.len(), 4, "{streamed}");
+    assert_eq!(streamed_calls[0]["index"], 0);
+    assert_eq!(streamed_calls[0]["id"], "call_weather");
+    assert_eq!(streamed_calls[0]["function"]["name"], "weather");
+    assert_eq!(streamed_calls[1]["index"], 0);
+    assert_eq!(
+        streamed_calls[1]["function"]["arguments"],
+        tool_calls[0]["function"]["arguments"]
+    );
+    assert_eq!(streamed_calls[2]["index"], 1);
+    assert_eq!(streamed_calls[2]["id"], "call_time");
+    assert_eq!(streamed_calls[2]["function"]["name"], "time");
+    assert_eq!(streamed_calls[3]["index"], 1);
+    assert_eq!(
+        streamed_calls[3]["function"]["arguments"],
+        tool_calls[1]["function"]["arguments"]
+    );
+    assert_eq!(
+        streamed_chunks
+            .iter()
+            .filter(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls")
+            .count(),
+        1,
+        "{streamed}"
+    );
+    assert!(!streamed.contains("<tool_call>"), "{streamed}");
+    assert!(streamed.contains("data: [DONE]"), "{streamed}");
 
     let final_response = post_chat_json(
-        app,
+        fixture_app("tiny-tool-call").await,
         json!({
-            "model": "qwen2.5-0.5b",
+            "model": "tiny-tool-call",
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "What's the weather in Paris? Use the tool."},
-                {"role": "assistant", "content": null, "tool_calls": [tool_call]},
-                {"role": "tool", "tool_call_id": "call_0", "content": "{\"temp\":18,\"unit\":\"celsius\"}"}
+                {"role": "assistant", "content": null, "tool_calls": tool_calls},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_time",
+                    "name": "time",
+                    "content": "UTC"
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "name": "weather",
+                    "content": "Paris"
+                }
             ],
-            "tools": [tool],
-            "tool_choice": "auto"
+            "max_tokens": 2
         }),
     )
     .await;
     assert_eq!(final_response["choices"][0]["finish_reason"], "stop");
-    assert!(
-        final_response["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap()
-            .contains("18"),
-        "{final_response}"
+    assert_eq!(
+        final_response["choices"][0]["message"]["content"],
+        "Results accepted."
     );
+    assert!(
+        final_response["choices"][0]["message"]
+            .get("tool_calls")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn required_no_call_fails_before_buffered_success_publication() {
+    let response = post_json(
+        fixture_app("tiny-tool-call").await,
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-tool-call",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {"type": "object"}
+                }
+            }],
+            "tool_choice": "required",
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("at least one was required"), "{message}");
+    assert!(!body.to_string().contains("\"tool_calls\""), "{body}");
+}
+
+#[tokio::test]
+async fn tool_result_history_rejections_are_actionable_before_generation() {
+    let calls = json!([
+        {
+            "id": "call_weather",
+            "type": "function",
+            "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}
+        },
+        {
+            "id": "call_time",
+            "type": "function",
+            "function": {"name": "time", "arguments": "{\"timezone\":\"UTC\"}"}
+        }
+    ]);
+    let base = json!({
+        "model": "tiny-tool-call",
+        "tools": [
+            {"type": "function", "function": {"name": "weather"}},
+            {"type": "function", "function": {"name": "time"}}
+        ],
+        "tool_choice": "auto"
+    });
+    let cases = [
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {"role": "tool", "tool_call_id": "call_unknown", "content": "nope"}
+            ]),
+            "does not match any assistant tool call",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"},
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"},
+                {"role": "tool", "tool_call_id": "call_time", "content": "UTC"}
+            ]),
+            "duplicates the result already supplied",
+        ),
+        (
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_weather",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}
+                        },
+                        {
+                            "id": "call_weather",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": "{\"city\":\"Lyon\"}"}
+                        }
+                    ]
+                }
+            ]),
+            "duplicates messages[0].tool_calls[0].id",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"}
+            ]),
+            "missing tool result(s) for 'call_time'",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "name": "time",
+                    "content": "Paris"
+                },
+                {"role": "tool", "tool_call_id": "call_time", "content": "UTC"}
+            ]),
+            "does not match tool_call_id 'call_weather' function 'weather'",
+        ),
+        (
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_weather",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": "not JSON"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"}
+            ]),
+            "function.arguments must be a JSON object",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "content": [{"type": "text", "text": "Paris"}]
+                },
+                {"role": "tool", "tool_call_id": "call_time", "content": "UTC"}
+            ]),
+            "must be a text string",
+        ),
+    ];
+
+    for (messages, expected) in cases {
+        let mut body = base.clone();
+        body["messages"] = messages;
+        let response = post_json(
+            fixture_app("tiny-tool-call").await,
+            "/v1/chat/completions",
+            body,
+        )
+        .await;
+        let (status, error) = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("before inference"), "{message}");
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn no_tools_and_none_do_not_publish_typed_tool_calls() {
+    let no_tools = post_chat_json(
+        fixture_app("tiny-tool-call").await,
+        json!({
+            "model": "tiny-tool-call",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    let none = post_chat_json(
+        fixture_app("tiny-tool-call").await,
+        json!({
+            "model": "tiny-tool-call",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "tool_choice": "none",
+            "max_tokens": 1
+        }),
+    )
+    .await;
+
+    for response in [&no_tools, &none] {
+        assert_ne!(response["choices"][0]["finish_reason"], "tool_calls");
+        assert!(
+            response["choices"][0]["message"]
+                .get("tool_calls")
+                .is_none()
+        );
+    }
 }
 
 #[tokio::test]

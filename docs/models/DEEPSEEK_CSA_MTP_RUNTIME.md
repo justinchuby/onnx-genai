@@ -662,19 +662,15 @@ Emission policy:
 4. otherwise emit the current dense fallback and do not claim native CSA;
 5. a `native_csa_required` export option rejects instead of silently
    producing a dense package; and
-6. package metadata records:
+6. package metadata records the selected graph ABI and state semantics, not a
+   runtime capability string.
 
-```yaml
-required_capabilities:
-  - compressed_sparse_attention_v1
-  - sparse_attention_cache_layout_v1
-```
-
-The runtime's current default capability list contains only KV cache, GQA,
-MHA, prefix cache, and continuous batching
-([validation lines 7-23](../../crates/onnx-genai-metadata/src/validation.rs#L7-L23)).
-CSA capability strings must be added only when the complete load/execute/rewind
-path exists.
+CSA kernel availability is a backend execution property. It may select a dense
+or generic implementation only when that preserves the declared graph
+semantics; it is not a package extension requirement. A new portable semantic
+module would instead require an exact typed identity/version and pre-mutation
+admission as described by the
+[metadata extension registry](../genai/METADATA_EXTENSION_REGISTRY.md).
 
 ## 6. Proposed iterative MTP orchestration
 

@@ -90,9 +90,6 @@ impl Engine {
                     .map(|component| (component.to_string(), runs))
             })
             .collect::<std::collections::BTreeMap<_, _>>();
-        if !recorded.is_empty() {
-            return recorded;
-        }
         let Some(diagnostic) = self.candidate_tree_diagnostic() else {
             return recorded;
         };
@@ -100,8 +97,11 @@ impl Engine {
         if blocks == 0 {
             return recorded;
         }
-        let runs = u64::try_from(blocks).unwrap_or(u64::MAX).saturating_add(1);
-        std::collections::BTreeMap::from([(diagnostic.proposer, runs), (diagnostic.target, runs)])
+        let runs = u64::try_from(blocks).unwrap_or(u64::MAX).saturating_mul(2);
+        let mut recorded = recorded;
+        recorded.insert(diagnostic.proposer, runs);
+        recorded.insert(diagnostic.target, runs);
+        recorded
     }
 
     /// How many components the package's declared workflow names.
@@ -223,10 +223,22 @@ impl Engine {
     pub fn generate_with_pipeline_callbacks(
         &mut self,
         request: PipelineGenerateRequest,
+        on_admitted: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_pipeline_tool_policy_callbacks(request, on_admitted, callback)
+    }
+
+    pub fn generate_with_pipeline_tool_policy_callbacks(
+        &mut self,
+        request: PipelineGenerateRequest,
         mut on_admitted: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.require_workflow_execution_admitted()?;
+        // Fail closed on the exact declared protocol before scheduler
+        // admission, workflow session binding, or specialized driver state.
+        let _ = self.tool_call_observer(&request.tool_call_policy)?;
         if request.generation_control.is_some()
             && self
                 .workflow_runtime()
@@ -248,15 +260,22 @@ impl Engine {
         // request that asked for none of it.
         let prompt_only = request.inputs.is_empty() && request.component_overrides.is_empty();
         if prompt_only && self.holds_decode_core() {
+            let tool_call_policy = request.tool_call_policy.clone();
             return match request.session_id.as_deref().and_then(|id| id.parse().ok()) {
                 Some(session) if self.sessions.contains_key(&session) => self
-                    .generate_in_session_with_callbacks(
+                    .generate_in_session_with_tool_policy_callbacks(
                         session,
                         request.request,
+                        tool_call_policy,
                         on_admitted,
                         callback,
                     ),
-                _ => self.generate_with_callbacks(request.request, on_admitted, callback),
+                _ => self.generate_with_tool_policy_callbacks(
+                    request.request,
+                    tool_call_policy,
+                    on_admitted,
+                    callback,
+                ),
             };
         }
         // Everything that reaches here runs the declared workflow: a
@@ -332,14 +351,33 @@ impl Engine {
         }
         let options = request.request.options.clone();
         let tokenizer = runtime.package_tokenizer();
+        let mut observer = self.tool_call_observer(&request.tool_call_policy)?;
         if runtime.candidate_tree_diagnostic().is_some() {
-            return runtime.run_candidate_tree_generation(&options, request, tokenizer, callback);
+            return runtime.run_candidate_tree_generation(
+                &options,
+                request,
+                tokenizer,
+                observer.as_mut(),
+                callback,
+            );
         }
         if runtime.dflash_diagnostic().is_some() {
-            return runtime.run_dflash_generation(&options, request, tokenizer, callback);
+            return runtime.run_dflash_generation(
+                &options,
+                request,
+                tokenizer,
+                observer.as_mut(),
+                callback,
+            );
         }
         crate::pipeline::generation::run_declared_generation(
-            runtime, &options, tokenizer, request, None, callback,
+            runtime,
+            &options,
+            tokenizer,
+            request,
+            None,
+            observer.as_mut(),
+            callback,
         )
     }
 
@@ -418,6 +456,12 @@ impl Engine {
 
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
         WorkflowRuntime::workflow_performance_diagnostic(&self.workflow)
+    }
+
+    /// Committed cursor for one workflow effect domain in a session.
+    pub fn workflow_session_effect_cursor(&self, session_id: &str, effect: &str) -> Option<u64> {
+        self.workflow_runtime()
+            .session_effect_cursor(session_id, effect)
     }
 
     pub fn adapter_lifecycle_diagnostic(&self) -> crate::pipeline::AdapterLifecycleDiagnostic {
@@ -559,7 +603,6 @@ mod tests {
         let mut runtime = crate::pipeline::generation::test_decoder_runtime()?;
         runtime.set_execution_admission_for_test(WorkflowExecutionAdmission::DFlashUnavailable {
             version: "1".to_string(),
-            capability: onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK,
         });
         let governor = crate::engine::EngineResourceGovernor::new(
             ResourceLimits::default(),
@@ -578,14 +621,12 @@ mod tests {
 
     fn assert_dflash_refusal(error: anyhow::Error) {
         let capability =
-            crate::engine::package_capability_error(&error).expect("refusal stays typed");
+            crate::engine::package_execution_error(&error).expect("refusal stays typed");
         assert!(matches!(
             capability,
-            crate::engine::PackageCapabilityError::DFlashExecutionUnavailable {
+            crate::engine::PackageExecutionError::DFlashExecutionUnavailable {
                 ref version,
-                ref capability,
             } if version == "1"
-                && capability == onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK
         ));
     }
 

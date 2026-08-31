@@ -140,7 +140,6 @@ tokenizer, or adapter bytes must not require rewriting the semantic contract.
 
 ```yaml
 schema_version: v1          # required
-required_capabilities: []   # capabilities the reader must implement
 model: {...}                # package-wide baked facts (attention geometry, vocab, MoE, sharding)
 quantization: {...}         # model-weight quantization intent
 pipeline: {workflow: {...}} # the executable workflow: the only graph ABI
@@ -155,10 +154,10 @@ hardware_requirements: {...}
 
 `schema_version` versions the workflow syntax together with the rest of the
 document. The workflow manifest therefore carries only facts that are not
-already authoritative elsewhere, such as adapter ABI versions and declared
-capabilities. It does not repeat a workflow `ir_version`, and it does not copy
-ONNX opset imports: every ONNX artifact carries its own exact domain/version
-map, including the case where different components use different opsets.
+already authoritative elsewhere, such as adapter ABI versions. It does not
+repeat a workflow `ir_version`, core conformance flags, or ONNX opset imports:
+every ONNX artifact carries its own exact domain/version map, including the case
+where different components use different opsets.
 
 `pipeline.workflow` is the **sole serialized expression of a package's
 executable graph ABI**, for every package, including one that ships a single
@@ -240,8 +239,8 @@ Metadata has five different naming classes. They are not interchangeable:
 | **Reserved schema field** | This specification and generated JSON Schema. | `pipeline`, `workflow`, `inputs`, `contract`, `dtype`, `state`, `recurrence`, `special_tokens`. | Unknown keys fail because typed core objects deny unknown fields. A producer cannot add `workflow.my_option` or `contract.vendor_hint`. |
 | **Package-local identifier/reference** | The package author, within the map or scope that owns it. | Keys under `workflow.inputs`, `outputs`, `components`, `state`, `effects`, `serving.state_service.groups`, `profiles`, adapter artifacts, and branch cases; SSA value names; component and state-group references. | The spelling is author-defined, but every reference must resolve, names must be unique in their scope, and the runtime must not infer semantics from the spelling. |
 | **Artifact-defined name** | The referenced artifact. | ONNX input/output and initializer names used by component ports, invoke bindings, optional inputs, state aliases, and adapter targets. | Must match the artifact exactly. It is not a portable semantic vocabulary and must never be guessed from a model family. |
-| **Extensible semantic identifier** | A registered producer/runtime extension, normally owner-qualified and versioned. | Capability strings, adapter ABI keys, component contract IDs, adapter application/loader IDs, checkpoint adapter IDs, constraint dialects, profile kinds, and extensible operation/vocabulary strings. | Built-ins have normative semantics. Unknown extensions may parse where the schema declares an extension branch, but execution must fail closed unless the runtime implements that exact identifier/version. |
-| **Ordinary data value** | Package contents or request contract. | Artifact locations, source URIs, revisions, symbolic dimension labels, provenance labels, and numeric bounds. | Treated as data under the surrounding reserved field; it does not create a new schema field or runtime capability. |
+| **Extensible semantic identifier** | A registered producer/runtime extension, normally owner-qualified and versioned. | Adapter ABI keys, component contract IDs, adapter application/loader IDs, checkpoint adapter IDs, constraint dialects, profile kinds, and extensible operation/vocabulary strings. | Built-ins have normative semantics. Unknown extensions may parse where the schema declares an extension branch, but execution must fail closed unless the runtime implements that exact identifier/version. |
+| **Ordinary data value** | Package contents or request contract. | Artifact locations, source URIs, revisions, symbolic dimension labels, provenance labels, and numeric bounds. | Treated as data under the surrounding reserved field; it does not create a new schema field or an optimization policy. |
 
 Two rules prevent ambiguity:
 
@@ -273,21 +272,27 @@ This is the only ignorable surface. Unknown *core* fields still fail. A strict
 reader can therefore load a package that carries a newer optional profile
 without either guessing or refusing.
 
-### 4.3a Capability admission
+### 4.3a Core conformance and extension admission
 
-A capability identifier names versioned semantic behavior required for correct
-execution. It is not a model name, implementation preference, deployment policy,
-or feature-enable request. Required identifiers and versions **MUST** be selected
-exactly; an unsupported or ambiguous requirement **MUST** fail before execution.
+`schema_version` selects core reader conformance. A reader that accepts a
+version **MUST** implement its typed SSA/dataflow, shape/rank, state,
+transaction, output, and validation semantics. These are not capability flags:
+the package **MUST NOT** redundantly advertise or negotiate them.
 
-Requirements that follow from workflow structure **MUST** be derived rather than
-duplicated as manually authored flags. Extension identifiers are permitted only
-on declared extension surfaces and remain fail-closed. Component contracts,
-adapter ABIs, and state bounds keep their own identities and do not become
-capabilities merely because a runtime implements them.
+An independently implemented optional semantic module is declared only at its
+typed identity/version surface (for example `package.tool_protocol`, a component
+contract or adapter ABI, a checkpoint adapter, or `speculative`). The reader
+**MUST** select that exact pair or fail before execution; names, model families,
+backends, and fallback guesses never select one. The generated
+[`METADATA_EXTENSION_REGISTRY.md`](METADATA_EXTENSION_REGISTRY.md) lists every
+built-in extension, schema floor, declaration surface, admission consumer, and
+support status.
 
-Output publication is governed by the declared output protocol and ordinary
-`emit`; it has no separate streaming or transport-delivery capability.
+Output publication is core output-protocol conformance governed by a declared
+output family and ordinary `emit`; it has no separate streaming or transport
+capability. Continuous batching, graph capture, scheduling, placement, storage
+tiering, budgets, and kernels are runtime policy: when semantics permit, the
+runtime may decline them and use a generic or isolated path.
 
 ### 4.4 Semantic identity
 
@@ -427,10 +432,23 @@ payload where applicable. Unknown versions or operations, illegal bases,
 duplicate `finalize`, post-finalize updates, and family/operation mismatches
 **MUST** fail closed.
 
+Schema v1.7 adds the required workflow-level
+`publication_mode: commit_only | provisional_revisions`. It applies to the
+entire admitted turn, not to an individual output: `provisional_revisions`
+**MUST** declare the typed revision family at every affected output, and its
+transport **MUST** preserve each envelope followed by exactly one typed
+`commit` or `abort_to_baseline` transaction outcome. The abort outcome names
+the transaction and the exact admission `(output, stream, head, sequence,
+lineage, closed)` baseline for every affected stream. A buffering or
+specialized transport that cannot preserve those records **MUST** refuse this
+mode before mutation; it must not manufacture inverse revisions.
+
 `abort_to_baseline` is a typed turn/transaction outcome, not a
 revision-envelope operation. It identifies the aborted transaction and its
 recorded committed baseline, and invalidates every provisional publication
-owned by that transaction.
+owned by that transaction. `commit` is the corresponding transaction outcome:
+it makes earlier provisional records durable without rewriting their ordering
+or payload.
 
 `finalize` closes one revision stream early. It is optional and remains
 provisional until the enclosing turn commits. Successful turn commit finalizes
@@ -1051,7 +1069,7 @@ Commit atomically advances every participating state, effect, and output head.
 Abort, cancellation, execution failure, or commit failure restores/retracts the
 whole turn to its recorded baseline. `commit_only` exposes nothing before commit;
 `provisional_revisions` may expose typed provisional publications and the typed
-`abort_to_baseline` turn/transaction outcome defined in
+`commit`/`abort_to_baseline` turn/transaction outcomes defined in
 [§6.4](#64-workflow-output-publication-and-revisions). A participant unable to
 join the transaction causes admission to fail before mutation. An exclusive
 lease is a concurrency primitive, not the transaction itself.
@@ -1152,6 +1170,10 @@ update, lifecycle, compaction, checkpoint/fork, and rollback behavior.
 Full-sequence, chunked-prefill, and decode execution **MUST** agree at equivalent
 boundaries. Geometry and table contents are package facts; placement, sharding,
 offload, prefetch, and memory budgets are runtime policy.
+
+The checked-in Qwen4-Exp equation/vector provenance is documented in
+[`QWEN4_EXP_PLE_REFERENCE.md`](QWEN4_EXP_PLE_REFERENCE.md). It is deterministic
+synthetic-weight conformance evidence, not an official-checkpoint parity claim.
 
 ---
 
@@ -1526,11 +1548,18 @@ This server currently supplies these exact v1 adapters:
 For both adapters, explicit IDs are preserved and absent IDs become stable
 `call_<index>` values in envelope order. Duplicate IDs, empty/oversized names
 or IDs, excess calls, non-whitespace envelope interstitials, invalid JSON, and
-text outside XML parameters are malformed. Before an opening envelope parsing
-is `NoCall`; after an unclosed opening envelope it is `Incomplete`; a complete,
-valid sequence is `Complete`. Feeding the same UTF-8 output in arbitrary chunks
-MUST produce the same typed result as feeding it at once. This server caps each
-rendered or parsed protocol payload at 64 KiB and each collection at 32 calls.
+text outside XML parameters are malformed. Neither v1 protocol declares an
+unambiguous end marker for a sequence containing one or more adjacent calls.
+Before an opening envelope parsing is `NoCall`; after an unclosed opening
+envelope it is `Incomplete`; one or more closed envelopes are `CompleteSoFar`
+and remain nonterminal because another adjacent envelope may follow. Only an
+independent declared generation terminal boundary (EOS, stop sequence, committed
+budget, or context limit) applies parser `finish` and produces
+`TerminalComplete`. A host integration, including #2326, **MUST** stop on
+`TerminalComplete` or that finish boundary, never on `CompleteSoFar` or a chunk
+boundary. Feeding the same UTF-8 output in arbitrary chunks MUST produce the
+same typed result as feeding it at once. This server caps the whole accumulated
+rendered or parsed protocol sequence at 64 KiB and each collection at 32 calls.
 At the buffered-generation and SSE-streaming boundaries, `Incomplete` and
 `Malformed` are typed protocol failures that name the declared identity/version
 and boundary; they are never returned as assistant content. `NoCall` remains
@@ -1539,6 +1568,14 @@ ordinary assistant content.
 All caller-provided tool data, template values, and model-produced envelopes are
 untrusted structured input and **MUST** be bounded and validated. Metadata grants
 no authority to execute or select tools.
+
+On a later caller turn, every assistant call ID is unique and every `role: tool`
+result supplies one outstanding `tool_call_id`; results associate by that typed
+ID, not by array position. A duplicate, unknown, or missing result ID, a
+result `name` that disagrees with its call, a non-`function` call, non-object
+call arguments, or a non-text result fails before inference with the message
+path. Tool execution remains caller-owned: the server validates and renders
+results but never invokes a declared function.
 
 ---
 
@@ -1650,8 +1687,7 @@ specification.
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     effects:
       decode:
         retry: idempotent
@@ -1857,13 +1893,14 @@ pipeline:
       logits:
         contract:
           shape: [batch, frames, vocab]
+          batch_layout: { kind: request_aligned, axis: 0 }
           padding:
             - { dimension: frames, valid_lengths: frame_lengths }
       frame_lengths:
         contract:
           dtype: int64
           shape: [batch]
-          batch_layout: { kind: shared }
+          batch_layout: { kind: request_aligned, axis: 0 }
 profiles:
   transcription:
     outputs:

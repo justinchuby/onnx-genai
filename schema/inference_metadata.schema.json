@@ -2729,7 +2729,7 @@
           "type": "string"
         },
         "valid_lengths": {
-          "description": "Value giving how many leading entries of `dimension` are real, one entry\nper position of the axes outer to it.\n\nIt resolves in the namespace of the contract's owner: a sibling port for\na component port, a workflow value for a workflow input, output, or\nstate cell.",
+          "description": "Value giving how many leading entries of `dimension` are real, one entry\nper position of the axes outer to it.\n\nWhen those outer axes include the owning value's request axis, this\ncompanion declares the same request-aligned/request-expanded layout and\nfollows the same positional row plan. When the padded dimension is\noutside the request axis, the companion is genuinely broadcast and\ndeclares `shared`.\n\nIt resolves in the namespace of the contract's owner: a sibling port for\na component port, a workflow value for a workflow input, output, or\nstate cell.",
           "minLength": 1,
           "type": "string"
         }
@@ -5685,14 +5685,6 @@
           },
           "default": {},
           "type": "object"
-        },
-        "capabilities": {
-          "default": [],
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "uniqueItems": true
         }
       },
       "type": "object"
@@ -5818,6 +5810,21 @@
         }
       ]
     },
+    "WorkflowPublicationMode": {
+      "description": "Publication visibility selected for every output in a workflow turn.\n\n`provisional_revisions` is deliberately not a generic streaming switch.\nIt is valid only when every declared output uses the versioned revision\nfamily, allowing a consumer to reconcile one transaction atomically.",
+      "oneOf": [
+        {
+          "const": "commit_only",
+          "description": "Outputs become externally observable only after the turn commits.",
+          "type": "string"
+        },
+        {
+          "const": "provisional_revisions",
+          "description": "Revision envelopes may be published before commit and are reconciled by\nthe transaction's commit or abort-to-baseline outcome.",
+          "type": "string"
+        }
+      ]
+    },
     "WorkflowSpec": {
       "additionalProperties": false,
       "description": "Sound, component-centric workflow IR. Tensor math lives in invoked components.",
@@ -5852,6 +5859,10 @@
           },
           "default": {},
           "type": "object"
+        },
+        "publication_mode": {
+          "$ref": "#/$defs/WorkflowPublicationMode",
+          "description": "Visibility of output publications while an admitted turn is still open.\n\nThis is one workflow-wide transaction decision, rather than a property\nof an individual emit: one turn has one commit or abort outcome that\nreconciles every output stream together."
         },
         "serving": {
           "anyOf": [
@@ -6228,7 +6239,7 @@
           "type": "null"
         }
       ],
-      "description": "Build-time model properties and runtime-configurable capabilities."
+      "description": "Build-time model properties and runtime-configurable facts."
     },
     "package": {
       "anyOf": [
@@ -6280,21 +6291,6 @@
         }
       ],
       "description": "Model weight quantization intent, independent of the packed representation."
-    },
-    "required_capabilities": {
-      "default": [],
-      "description": "Capability identifiers that a runtime MUST support or refuse to load the model.",
-      "examples": [
-        [
-          "kv_cache",
-          "grouped_query_attention"
-        ]
-      ],
-      "items": {
-        "minLength": 1,
-        "type": "string"
-      },
-      "type": "array"
     },
     "schema_version": {
       "description": "Schema version of this inference-metadata document, e.g. `\"v1.1\"`.\n\nCanonically `\"v<major>.<minor>\"`, matching the `v1` that every writer in\nthis repository already stamps. Absence means the initial `v1.0`\ncontract, as do the spellings `\"v1\"`, `\"1\"`, `\"1.0\"` and `\"v1.0\"` that\npredate a canonical form; readers normalize before comparing, so all of\nthem keep loading and `\"1.1\"` is an accepted synonym for `\"v1.1\"`. A\ndocument that uses nothing new keeps stamping what it already stamped —\nrewriting an existing spelling would change the package's semantic\nidentity to say something no reader distinguishes. Bump the major only\nfor breaking schema changes, and the minor whenever a document may carry\na field an older reader would not know.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed — every structure here denies\nunknown fields — so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.\n\nThat is a statement about *additive* fields, and it is not a promise that\nthis schema never reshapes one it already had. It does, while it is\npre-release: `token_packed` moved its `offsets` and `owner` into a\n`levels` chain in v1.1, and a document written against the flat spelling\ndoes not load at any version. A version says which fields a reader must\nunderstand; it is not a compatibility guarantee spanning a reshape, and\nnothing here silently reads an old spelling as a new one. See\n`reject_flat_token_packed`.\n\nA component using `onnx-genai.token-context@1` declares at least\n`v1.4`: the component-contract fields predate that version, so only the\nversion gate prevents a v1.3 reader from accepting the document while\nsilently ignoring the token-identity semantics.\n\nA DFlash flat-block proposal declares at least `v1.6`, so a v1.5 reader\nrefuses before ignoring its target-hidden provenance, probability, and\naccepted-prefix state fields.",

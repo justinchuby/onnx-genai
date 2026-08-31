@@ -512,16 +512,9 @@ pub fn decoder_workflow(
     let spec = WorkflowSpec {
         manifest: WorkflowManifest {
             adapter_abis: BTreeMap::new(),
-            capabilities: BTreeSet::from([
-                "bounded_state_recurrence".to_string(),
-                "workflow_ssa".to_string(),
-                "linear_effects".to_string(),
-                "typed_emit".to_string(),
-                "nested_control_flow".to_string(),
-                "loop_induction_values".to_string(),
-                "serving_service_contract".to_string(),
-            ]),
         },
+        publication_mode: crate::schema::WorkflowPublicationMode::CommitOnly,
+        publication_mode_authored: false,
         inputs: builder.inputs,
         outputs: BTreeMap::from([(
             TOKENS_OUTPUT.to_string(),
@@ -690,13 +683,8 @@ pub fn iteration_variant(
     variant.components.remove(decode.0);
     variant.components.remove(selection.0);
     variant.components.insert(component.clone(), block);
-    // The re-authored emit publishes a per-row prefix, which is a capability the
-    // manifest must declare: a runtime reads the manifest to decide whether it
-    // can execute the document at all.
-    variant
-        .manifest
-        .capabilities
-        .insert("emit_valid_length".to_string());
+    // The re-authored emit carries its ragged-prefix semantics in its typed
+    // output declaration; core workflow semantics are not manifest flags.
     // The state service names the component whose ports each cell aliases. That
     // component is now the block, and leaving the decoder's name behind would
     // declare a KV group bound to something the workflow no longer declares.
@@ -1902,20 +1890,9 @@ mod iteration_policy_tests {
         assert_eq!(spec.inputs, variant.inputs);
         assert_eq!(spec.outputs, variant.outputs);
         assert_eq!(spec.state, variant.state);
-        // The re-authored emit publishes a per-row prefix, so the manifest must
-        // declare that capability -- and must declare nothing else new.
-        let gained = variant
-            .manifest
-            .capabilities
-            .difference(&spec.manifest.capabilities)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        assert_eq!(gained, BTreeSet::from(["emit_valid_length".to_string()]));
-        assert!(
-            spec.manifest
-                .capabilities
-                .is_subset(&variant.manifest.capabilities)
-        );
+        // The re-authored emit carries its ragged-prefix semantics directly in
+        // the typed output declaration; no duplicate workflow capability flag
+        // is permitted.
         let (serving, variant_serving) = (
             spec.serving.as_ref().expect("declared"),
             variant.serving.as_ref().expect("declared"),

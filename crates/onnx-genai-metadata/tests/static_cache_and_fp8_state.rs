@@ -36,14 +36,7 @@ const STATIC_CACHE_WORKFLOW: &str = r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - nested_control_flow
-      - loop_induction_values
-      - serving_service_contract
+    manifest: {}
     inputs:
       request.input_ids:
         contract:
@@ -335,14 +328,7 @@ const MOBIUS_STATIC_CACHE: &str = r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - nested_control_flow
-      - loop_induction_values
-      - serving_service_contract
+    manifest: {}
     inputs:
       request.input_ids:
         contract:

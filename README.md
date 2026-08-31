@@ -92,6 +92,11 @@ cargo build --release -p onnx-genai-cli
   "Write a short Rust hello-world program."
 ```
 
+The final positional prompt is the canonical form. `--prompt` is also
+supported when it reads more clearly with other options:
+`onnx-genai generate MODEL --prompt "your prompt"`. Supply exactly one prompt,
+not both forms.
+
 When `--max-new-tokens` is omitted, `generate` and `run` use whatever budget
 remains in the model's effective context window, stopping on EOS, a stop
 sequence, or context length. Sampling flags such as `--temperature 0.7`,
@@ -196,7 +201,8 @@ modalities on any package that declares one:
 ```
 
 The argument after `generate` is a local model package directory, not a
-Hugging Face repository ID, and the prompt is the final positional argument.
+Hugging Face repository ID. The prompt is canonically the final positional
+argument, or it may be supplied with `--prompt`; do not supply both forms.
 For the audited
 `justinchuby/qwen2.5-0.5b-instruct-onnx-genai` package, pass ordinary user text
 without `--raw` so the CLI applies that package's ChatML template. Use `--raw`

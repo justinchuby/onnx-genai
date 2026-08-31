@@ -38,8 +38,7 @@ const PADDED_VISION_ENCODER: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    manifest: {}
     inputs:
       pixel_values:
         contract:
@@ -50,7 +49,7 @@ pipeline:
         role: { kind: opaque }
         source: { kind: application, name: pixel_values }
       tile_lengths:
-        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: tile_lengths }
       prompt:
@@ -77,7 +76,7 @@ pipeline:
               shape: [batch, max_tiles, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
               padding: [{ dimension: max_tiles, valid_lengths: lengths }]
-            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
+            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
             features: { dtype: float32, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
       splice:
@@ -110,8 +109,7 @@ const PACKED_VISION_ENCODER: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    manifest: {}
     inputs:
       image_pixels:
         contract:
@@ -242,6 +240,25 @@ fn a_padded_encoder_declares_its_capacity_and_its_validity() {
     assert_eq!(padding.len(), 1);
     assert_eq!(padding[0].dimension, "max_tiles");
     assert_eq!(padding[0].valid_lengths, "tile_lengths");
+}
+
+#[test]
+fn a_padded_carrier_rejects_a_shape_compatible_companion_from_another_row_lineage() {
+    let document = PADDED_VISION_ENCODER
+        .replace(
+            "      prompt:\n",
+            "      other_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: other_lengths }\n      prompt:\n",
+        )
+        .replace(
+            "inputs: { pixels: pixel_values, lengths: tile_lengths }",
+            "inputs: { pixels: pixel_values, lengths: other_lengths }",
+        );
+    assert_reports(
+        &document,
+        "binds padded carrier 'pixel_values' whose valid_lengths lineage is workflow input \
+         'tile_lengths', but companion port 'lengths' binds 'other_lengths' from workflow input \
+         'other_lengths'",
+    );
 }
 
 #[test]
@@ -485,8 +502,8 @@ fn a_valid_lengths_companion_must_name_a_declared_value() {
 #[test]
 fn a_valid_lengths_companion_counts_with_integers() {
     let document = PADDED_VISION_ENCODER.replace(
-        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
-        "      tile_lengths:\n        contract: { dtype: bool, shape: [batch], batch_layout: { kind: shared } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }",
+        "      tile_lengths:\n        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }",
     );
     assert_reports(
         &document,
@@ -496,16 +513,73 @@ fn a_valid_lengths_companion_counts_with_integers() {
 }
 
 #[test]
-fn a_valid_lengths_companion_is_read_on_the_host_not_gathered() {
+fn a_row_scoped_valid_lengths_companion_follows_the_carriers_row_plan() {
     let document = PADDED_VISION_ENCODER.replace(
-        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
         "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
     );
     assert_reports(
         &document,
-        "valid_lengths 'tile_lengths' declares request_aligned but must declare shared; it has \
-         one entry per position of the axes outer to 'max_tiles'",
+        "valid_lengths 'tile_lengths' declares shared but must declare request_aligned on axis 0; \
+         it has one entry per position of the axes outer to 'max_tiles'",
     );
+}
+
+#[test]
+fn a_row_scoped_valid_lengths_companion_rejects_the_wrong_request_axis() {
+    let document = PADDED_VISION_ENCODER.replace(
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 1 } }",
+    );
+    assert_reports(
+        &document,
+        "valid_lengths 'tile_lengths' declares request_aligned on axis 1 but must declare \
+         request_aligned on axis 0",
+    );
+}
+
+#[test]
+fn a_broadcast_valid_lengths_companion_has_no_request_axis_to_follow() {
+    let metadata = parse(
+        r#"
+schema_version: v1.1
+pipeline:
+  workflow:
+    manifest: {}
+    inputs:
+      globally_bounded_rows:
+        contract:
+          dtype: float32
+          shape: [global_extent, batch, hidden]
+          batch_layout: { kind: request_aligned, axis: 1 }
+          padding: [{ dimension: global_extent, valid_lengths: global_length }]
+        role: { kind: opaque }
+        source: { kind: application, name: globally_bounded_rows }
+      global_length:
+        contract: { dtype: int64, shape: [], batch_layout: { kind: shared } }
+        role: { kind: opaque }
+        source: { kind: application, name: global_length }
+    outputs: {}
+    components:
+      consume:
+        implementation: { kind: binding }
+        ports:
+          inputs:
+            values:
+              dtype: float32
+              shape: [global_extent, batch, hidden]
+              batch_layout: { kind: request_aligned, axis: 1 }
+              padding: [{ dimension: global_extent, valid_lengths: length }]
+            length: { dtype: int64, shape: [], batch_layout: { kind: shared } }
+    steps:
+      - kind: invoke
+        component: consume
+        inputs: { values: globally_bounded_rows, length: global_length }
+        outputs: {}
+"#,
+    );
+    validate_metadata(&metadata)
+        .expect("a scalar outside the carrier's request axis is genuinely broadcast");
 }
 
 #[test]
@@ -525,8 +599,8 @@ fn a_valid_lengths_companion_stops_where_the_dimension_it_bounds_begins() {
     // A length applies to a whole slice, so the axes inner to the padded one are
     // not indexed and the companion's rank is the padded axis itself.
     let document = PADDED_VISION_ENCODER.replace(
-        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
-        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: request_aligned, axis: 0 } }",
     );
     assert_reports(
         &document,
@@ -538,8 +612,8 @@ fn a_valid_lengths_companion_stops_where_the_dimension_it_bounds_begins() {
 #[test]
 fn a_valid_lengths_companion_matches_the_axes_outer_to_the_padded_one() {
     let document = PADDED_VISION_ENCODER.replace(
-        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
-        "      tile_lengths:\n        contract: { dtype: int64, shape: [rows], batch_layout: { kind: shared } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [rows], batch_layout: { kind: request_aligned, axis: 0 } }",
     );
     assert_reports(
         &document,
@@ -1055,7 +1129,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.image-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.image:
         contract: { dtype: uint8, shape: [encoded_bytes] }
@@ -1173,12 +1246,11 @@ preprocessing:
         source: video.frame_counts
         content: valid_lengths
         dtype: int64
-        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
 pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.video-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.video:
         contract: { dtype: uint8, shape: [encoded_bytes] }
@@ -1205,7 +1277,7 @@ pipeline:
               shape: [batch, frames, channels, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
               padding: [{ dimension: frames, valid_lengths: video.frame_lengths }]
-            frame_lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
+            frame_lengths: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
       video_encoder:
         implementation: { kind: onnx, artifact: video_encoder.onnx }
         batch_capacity:
@@ -1220,7 +1292,7 @@ pipeline:
               shape: [batch, frames, channels, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
               padding: [{ dimension: frames, valid_lengths: lengths }]
-            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
+            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
             embeddings: { dtype: float32, shape: [batch, video_tokens, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
       decoder:
@@ -1325,7 +1397,7 @@ fn uniformity_is_required_of_temporal_and_spatial_dimensions_alike() {
             "          uniform_dimensions: [frames, channels, height, width]\n",
         )
         .replace(
-            "              padding: [{ dimension: frames, valid_lengths: lengths }]\n            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n",
+            "              padding: [{ dimension: frames, valid_lengths: lengths }]\n            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n",
             "",
         )
         .replace(
@@ -1394,8 +1466,7 @@ const NESTED_VIDEO_ENCODER: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     inputs:
       pixel_values:
         contract:
@@ -1537,8 +1608,7 @@ const FIXED_FRAME_VIDEO_ENCODER: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     inputs:
       pixel_values:
         contract:
@@ -1877,8 +1947,7 @@ const PACKED_EMIT_WORKFLOW: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+    manifest: {}
     serving:
       active: active
       done: done
@@ -2094,8 +2163,7 @@ const LEGACY_TRAJECTORY_APPEND: &str = r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     inputs:
       latent:
         contract: { dtype: float32, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
@@ -2181,8 +2249,7 @@ const PADDED_EMIT_WORKFLOW: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+    manifest: {}
     serving:
       active: active
       done: done
@@ -2245,7 +2312,7 @@ pipeline:
         role: { kind: opaque }
         source: { kind: application, name: pixel_values }
       tile_lengths:
-        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: tile_lengths }
     outputs:
@@ -2258,7 +2325,7 @@ pipeline:
         role: tensor
         stage: pre_adapter
       tile_lengths:
-        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tensor
         stage: pre_adapter
     components:
@@ -2271,7 +2338,7 @@ pipeline:
               shape: [batch, max_tiles, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
               padding: [{ dimension: max_tiles, valid_lengths: lengths }]
-            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
+            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
             features:
               dtype: float32
@@ -2353,25 +2420,14 @@ fn a_packed_output_still_refuses_a_length_for_the_older_reason() {
 }
 
 #[test]
-fn a_validity_companion_may_be_emitted_by_a_serving_workflow() {
-    // A length vector is `shared` for the same reason an offsets vector is: it
-    // has one entry per position outside the dimension it bounds, which is a
-    // statement about the whole result rather than one row of it. The serving
-    // rule makes room for exactly the values that describe a declared output's
-    // shape, and for nothing else — an unrelated `shared` result is still a
-    // per-request answer with no way back to a request.
-    let document = PADDED_EMIT_WORKFLOW
-        .replace(
-            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
-            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      unrelated:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
-        )
-        .replace(
-            "      - kind: emit\n        value: tile_lengths\n        output: tile_lengths\n        mode: replace\n",
-            "      - kind: emit\n        value: tile_lengths\n        output: tile_lengths\n        mode: replace\n      - kind: emit\n        value: tile_lengths\n        output: unrelated\n        mode: replace\n",
-        );
-    assert_reports(
-        &document,
-        "emits per-request value 'tile_lengths' without a declared batch_layout",
+fn a_row_scoped_validity_companion_may_be_emitted_by_a_serving_workflow() {
+    let metadata = parse(PADDED_EMIT_WORKFLOW);
+    validate_metadata(&metadata).expect("the row-scoped length is an ordinary emitted value");
+    assert_eq!(
+        metadata.pipeline.expect("pipeline").workflow.outputs["tile_lengths"]
+            .contract
+            .batch_layout,
+        BatchLayout::RequestAligned { axis: 0 }
     );
 }
 
@@ -2383,7 +2439,7 @@ fn a_padded_emit_cannot_hide_the_lengths_that_bound_it() {
     // only account of the padding that exists.
     let document = PADDED_EMIT_WORKFLOW
         .replace(
-            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: tensor\n        stage: pre_adapter\n",
             "",
         )
         .replace(
@@ -2528,8 +2584,7 @@ const FLAT_TOKEN_PACKED: &str = r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    manifest: {}
     inputs:
       image_pixels:
         contract:
@@ -2734,19 +2789,6 @@ pipeline:
             "the refusal must explain why no capability replaces it: {message}"
         );
     }
-
-    let metadata = parse("required_capabilities: [continuous_batching]\n");
-    assert_reports(
-        "required_capabilities: [continuous_batching]\n",
-        "retired capability 'continuous_batching'",
-    );
-    assert!(
-        metadata
-            .required_capabilities
-            .iter()
-            .any(|capability| capability == "continuous_batching"),
-        "the semantic validator test must exercise the typed in-memory path"
-    );
 }
 
 #[test]
@@ -2768,20 +2810,20 @@ fn published_schema_omits_retired_batching_hints() {
 fn two_padded_dimensions() -> String {
     PADDED_EMIT_WORKFLOW
         .replace(
-            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n",
-            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n      patch_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: patch_lengths }\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n      patch_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: patch_lengths }\n",
         )
         .replace(
             "      features:\n        contract:\n          dtype: float32\n          shape: [batch, max_tiles, hidden]\n          batch_layout: { kind: request_aligned, axis: 0 }\n          padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]\n",
             "      features:\n        contract:\n          dtype: float32\n          shape: [batch, max_tiles, max_patches, hidden]\n          batch_layout: { kind: request_aligned, axis: 0 }\n          padding:\n            - { dimension: max_tiles, valid_lengths: tile_lengths }\n            - { dimension: max_patches, valid_lengths: patch_lengths }\n",
         )
         .replace(
-            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
-            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      patch_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: tensor\n        stage: pre_adapter\n      patch_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: tensor\n        stage: pre_adapter\n",
         )
         .replace(
-            "            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n",
-            "            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n            patch_lens: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n",
+            "            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n",
+            "            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n            patch_lens: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: request_aligned, axis: 0 } }\n",
         )
         .replace(
             "            features:\n              dtype: float32\n              shape: [batch, max_tiles, hidden]\n              batch_layout: { kind: request_aligned, axis: 0 }\n              padding: [{ dimension: max_tiles, valid_lengths: lengths }]\n",
@@ -2858,27 +2900,26 @@ fn a_packed_result_may_also_be_padded_on_the_axes_it_does_not_pack() {
 
 #[test]
 fn a_companion_is_admitted_at_its_own_rank_and_not_at_another_kinds() {
-    // The carve-out is keyed by what the naming declaration requires, so being
-    // named as a companion is not by itself enough. A length for a padded axis 2
-    // declared rank 1 is not a companion that happens to be short — it cannot
-    // index the positions it claims to describe.
-    let document = two_padded_dimensions()
+    // Packed carriers have no request axis, so their validity companions are
+    // genuinely shared and exercise the serving carve-out. Being named as a
+    // companion is not enough: a length for padded axis 2 declared rank 1
+    // cannot index the positions it claims to describe.
+    let document = packed_two_padded_dimensions()
         .replace(
-            "{ dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
-            "{ dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
+            "{ dtype: int64, shape: [items, max_tiles], batch_layout: { kind: shared } }",
+            "{ dtype: int64, shape: [items], batch_layout: { kind: shared } }",
         )
         .replace(
-            "patch_lens: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
-            "patch_lens: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
+            "patch_lens: { dtype: int64, shape: [items, max_tiles], batch_layout: { kind: shared } }",
+            "patch_lens: { dtype: int64, shape: [items], batch_layout: { kind: shared } }",
         );
     assert_reports(
         &document,
         "names as a padded dimension's valid_lengths at rank 2, but it is int64 at rank 1",
     );
     // The negative half is the one that matters. Falling through to the generic
-    // serving message would advise a `request_aligned` layout, which a companion
-    // MUST NOT declare -- advice that turns a package with one wrong number into
-    // a package that is wrong in a second, harder way.
+    // serving message would advise a request axis, which a companion of a
+    // token-packed carrier must not declare.
     assert!(
         !errors(&document)
             .iter()
@@ -2894,7 +2935,7 @@ fn a_declared_companion_that_no_step_writes_is_not_published() {
     // writes them satisfies the letter of "publishes them" while handing the
     // caller a padded tensor and an empty vector, which is the failure the
     // obligation exists to prevent.
-    let document = two_padded_dimensions().replace(
+    let document = packed_two_padded_dimensions().replace(
         "      - kind: emit\n        value: patch_lengths\n        output: patch_lengths\n        mode: replace\n",
         "",
     );
@@ -2952,10 +2993,10 @@ fn a_shared_result_that_describes_nothing_is_still_refused() {
     // so it is worth restating what it did not widen to. A `shared` rank-2
     // result that no declared output names is a per-request answer with no way
     // back to a request, whatever its rank.
-    let document = two_padded_dimensions()
+    let document = packed_two_padded_dimensions()
         .replace(
-            "      patch_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
-            "      patch_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      unrelated:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      patch_lengths:\n        contract: { dtype: int64, shape: [items, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      patch_lengths:\n        contract: { dtype: int64, shape: [items, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      unrelated:\n        contract: { dtype: int64, shape: [items, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
         )
         .replace(
             "      - kind: emit\n        value: patch_lengths\n        output: patch_lengths\n        mode: replace\n",
@@ -2979,7 +3020,7 @@ fn a_companion_of_a_result_nobody_produces_describes_nothing() {
     // the other side: the payload must be produced for the companion to be
     // admitted, and the companion must be produced for the payload to be legal.
     // Answering the two differently would be answering one question twice.
-    let document = two_padded_dimensions().replace(
+    let document = packed_two_padded_dimensions().replace(
         "      - kind: emit\n        value: image_features\n        output: features\n        mode: replace\n",
         "",
     );
@@ -3031,7 +3072,7 @@ fn an_emit_length_is_still_the_ordinary_way_to_publish_a_ragged_result() {
             "      - kind: emit\n        value: image_features\n        output: features\n        valid_length: accepted_len\n        mode: replace\n",
         )
         .replace(
-            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: tensor\n        stage: pre_adapter\n",
             "",
         );
     assert!(
