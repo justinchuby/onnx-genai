@@ -66,9 +66,10 @@ pub use tool_protocol::{
 };
 pub(crate) use turn_transaction::TurnTransaction;
 pub use turn_transaction::{
-    OutputPublicationBaseline, TurnAbortReason, TurnBaselineId, TurnCommittedBaseline,
-    TurnPublicationMode, TurnStateBaseline, TurnTransactionAdmissionError, TurnTransactionId,
-    TurnTransactionOutcome,
+    OutputPublicationBaseline, OutputStreamBaseline, TurnAbortReason, TurnBaselineId,
+    TurnCommittedBaseline, TurnPublicationMode, TurnStateBaseline, TurnTransactionAdmissionError,
+    TurnTransactionCommitError, TurnTransactionId, TurnTransactionOutcome,
+    TurnTransactionResolution, TurnTransactionResolutionError,
 };
 pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
@@ -93,9 +94,11 @@ const GENERATION_COMMITTED: u8 = 3;
 /// cancellation or a caller-provided execution guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationBoundary {
+    AfterLoopSetup,
     BeforeProposer,
     AfterProposer,
     AfterVerifier,
+    AfterBranch,
     BeforeAcceptedPathCommit,
     BeforeAcceptedPrefixCommit,
     BeforeSemanticCommit,
@@ -115,9 +118,11 @@ pub struct GenerationControlUnsupported {
 impl std::fmt::Display for GenerationBoundary {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::AfterLoopSetup => "after loop setup",
             Self::BeforeProposer => "before proposer execution",
             Self::AfterProposer => "after proposer execution",
             Self::AfterVerifier => "after verifier execution",
+            Self::AfterBranch => "after branch join",
             Self::BeforeAcceptedPathCommit => "before accepted-path commit",
             Self::BeforeAcceptedPrefixCommit => "before accepted-prefix commit",
             Self::BeforeSemanticCommit => "before semantic commit",
@@ -1243,6 +1248,14 @@ impl WorkflowRuntime {
             .keys()
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn session_effect_cursor(&self, session_id: &str, effect: &str) -> Option<u64> {
+        self.worker
+            .session_effects
+            .borrow()
+            .get(&(session_id.to_string(), effect.to_string()))
+            .copied()
     }
 
     pub(crate) fn output_names(&self) -> Vec<String> {

@@ -1365,19 +1365,29 @@ async fn tool_request_without_package_declaration_fails_before_generation() {
 }
 
 #[tokio::test]
-async fn buffered_and_sse_routes_commit_all_adjacent_model_generated_calls() {
-    let body = json!({
-        "model": "tiny-tool-call",
-        "messages": [{"role": "user", "content": "hello"}],
-        "tools": [{
+async fn tool_result_chain_commits_typed_calls_and_accepts_reordered_results_over_http() {
+    let tools = json!([
+        {
             "type": "function",
             "function": {
                 "name": "weather",
                 "parameters": {"type": "object"}
             }
-        }],
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "time",
+                "parameters": {"type": "object"}
+            }
+        }
+    ]);
+    let body = json!({
+        "model": "tiny-tool-call",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": tools,
         "tool_choice": "auto",
-        "max_tokens": 3
+        "max_tokens": 2
     });
     let buffered = post_json(
         fixture_app("tiny-tool-call").await,
@@ -1397,18 +1407,21 @@ async fn buffered_and_sse_routes_commit_all_adjacent_model_generated_calls() {
     let choice = &buffered["choices"][0];
     assert_eq!(choice["finish_reason"], "tool_calls");
     assert!(choice["message"]["content"].is_null());
+    let tool_calls = choice["message"]["tool_calls"]
+        .as_array()
+        .expect("typed tool calls");
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0]["id"], "call_weather");
+    assert_eq!(tool_calls[0]["function"]["name"], "weather");
     assert_eq!(
-        choice["message"]["tool_calls"][0]["function"]["name"],
-        "weather"
-    );
-    assert_eq!(
-        choice["message"]["tool_calls"][0]["function"]["arguments"],
+        tool_calls[0]["function"]["arguments"],
         r#"{"city":"Paris"}"#
     );
-    assert_eq!(choice["message"]["tool_calls"].as_array().unwrap().len(), 3);
+    assert_eq!(tool_calls[1]["id"], "call_time");
+    assert_eq!(tool_calls[1]["function"]["name"], "time");
     assert_eq!(
-        choice["message"]["tool_calls"][2]["function"]["arguments"],
-        r#"{"city":"Berlin"}"#
+        tool_calls[1]["function"]["arguments"],
+        r#"{"timezone":"UTC"}"#
     );
 
     let mut streamed_body = body;
@@ -1427,21 +1440,73 @@ async fn buffered_and_sse_routes_commit_all_adjacent_model_generated_calls() {
             .to_vec(),
     )
     .unwrap();
-    assert!(
-        streamed.contains("\"finish_reason\":\"tool_calls\""),
-        "{streamed}"
+    let streamed_chunks = sse_json_chunks(&streamed);
+    let streamed_calls = streamed_chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["tool_calls"].as_array())
+        .map(|calls| &calls[0])
+        .collect::<Vec<_>>();
+    assert_eq!(streamed_calls.len(), 4, "{streamed}");
+    assert_eq!(streamed_calls[0]["index"], 0);
+    assert_eq!(streamed_calls[0]["id"], "call_weather");
+    assert_eq!(streamed_calls[0]["function"]["name"], "weather");
+    assert_eq!(streamed_calls[1]["index"], 0);
+    assert_eq!(
+        streamed_calls[1]["function"]["arguments"],
+        tool_calls[0]["function"]["arguments"]
     );
-    assert!(streamed.contains("\"name\":\"weather\""), "{streamed}");
-    assert!(
-        streamed.contains("\\\"city\\\":\\\"Paris\\\""),
-        "{streamed}"
+    assert_eq!(streamed_calls[2]["index"], 1);
+    assert_eq!(streamed_calls[2]["id"], "call_time");
+    assert_eq!(streamed_calls[2]["function"]["name"], "time");
+    assert_eq!(streamed_calls[3]["index"], 1);
+    assert_eq!(
+        streamed_calls[3]["function"]["arguments"],
+        tool_calls[1]["function"]["arguments"]
     );
-    assert!(
-        streamed.contains("\\\"city\\\":\\\"Berlin\\\""),
+    assert_eq!(
+        streamed_chunks
+            .iter()
+            .filter(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls")
+            .count(),
+        1,
         "{streamed}"
     );
     assert!(!streamed.contains("<tool_call>"), "{streamed}");
     assert!(streamed.contains("data: [DONE]"), "{streamed}");
+
+    let final_response = post_chat_json(
+        fixture_app("tiny-tool-call").await,
+        json!({
+            "model": "tiny-tool-call",
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": tool_calls},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_time",
+                    "name": "time",
+                    "content": "UTC"
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "name": "weather",
+                    "content": "Paris"
+                }
+            ],
+            "max_tokens": 2
+        }),
+    )
+    .await;
+    assert_eq!(final_response["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        final_response["choices"][0]["message"]["content"],
+        "Results accepted."
+    );
+    assert!(
+        final_response["choices"][0]["message"]
+            .get("tool_calls")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1473,74 +1538,162 @@ async fn required_no_call_fails_before_buffered_success_publication() {
 }
 
 #[tokio::test]
-#[ignore = "requires gitignored models/qwen2.5-0.5b real model fixture"]
-async fn qwen_real_model_tool_use_chain_end_to_end() {
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/qwen2.5-0.5b");
-    assert!(
-        model_dir.exists(),
-        "build the real model fixture with scripts/build_qwen.sh"
-    );
-    let app = app(AppState::load(&model_dir, Some("qwen2.5-0.5b".to_string())).unwrap());
-    let tool = json!({
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get current weather for a city",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string"},
-                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["location"]
-            }
+async fn tool_result_history_rejections_are_actionable_before_generation() {
+    let calls = json!([
+        {
+            "id": "call_weather",
+            "type": "function",
+            "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}
+        },
+        {
+            "id": "call_time",
+            "type": "function",
+            "function": {"name": "time", "arguments": "{\"timezone\":\"UTC\"}"}
         }
-    });
-    let first_messages = json!([
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "What's the weather in Paris? Use the tool."}
     ]);
+    let base = json!({
+        "model": "tiny-tool-call",
+        "tools": [
+            {"type": "function", "function": {"name": "weather"}},
+            {"type": "function", "function": {"name": "time"}}
+        ],
+        "tool_choice": "auto"
+    });
+    let cases = [
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {"role": "tool", "tool_call_id": "call_unknown", "content": "nope"}
+            ]),
+            "does not match any assistant tool call",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"},
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"},
+                {"role": "tool", "tool_call_id": "call_time", "content": "UTC"}
+            ]),
+            "duplicates the result already supplied",
+        ),
+        (
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_weather",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}
+                        },
+                        {
+                            "id": "call_weather",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": "{\"city\":\"Lyon\"}"}
+                        }
+                    ]
+                }
+            ]),
+            "duplicates messages[0].tool_calls[0].id",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"}
+            ]),
+            "missing tool result(s) for 'call_time'",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "name": "time",
+                    "content": "Paris"
+                },
+                {"role": "tool", "tool_call_id": "call_time", "content": "UTC"}
+            ]),
+            "does not match tool_call_id 'call_weather' function 'weather'",
+        ),
+        (
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_weather",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": "not JSON"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_weather", "content": "Paris"}
+            ]),
+            "function.arguments must be a JSON object",
+        ),
+        (
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": calls.clone()},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "content": [{"type": "text", "text": "Paris"}]
+                },
+                {"role": "tool", "tool_call_id": "call_time", "content": "UTC"}
+            ]),
+            "must be a text string",
+        ),
+    ];
 
-    let forced = post_chat_json(
-        app.clone(),
+    for (messages, expected) in cases {
+        let mut body = base.clone();
+        body["messages"] = messages;
+        let response = post_json(
+            fixture_app("tiny-tool-call").await,
+            "/v1/chat/completions",
+            body,
+        )
+        .await;
+        let (status, error) = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("before inference"), "{message}");
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn no_tools_and_none_do_not_publish_typed_tool_calls() {
+    let no_tools = post_chat_json(
+        fixture_app("tiny-tool-call").await,
         json!({
-            "model": "qwen2.5-0.5b",
-            "messages": first_messages,
-            "tools": [tool.clone()],
-            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+            "model": "tiny-tool-call",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
         }),
     )
     .await;
-    assert_eq!(forced["choices"][0]["finish_reason"], "tool_calls");
-    let tool_call = forced["choices"][0]["message"]["tool_calls"][0].clone();
-    assert_eq!(tool_call["function"]["name"], "get_weather");
-    let args: Value =
-        serde_json::from_str(tool_call["function"]["arguments"].as_str().unwrap()).unwrap();
-    assert!(args["location"].is_string(), "{args}");
-
-    let final_response = post_chat_json(
-        app,
+    let none = post_chat_json(
+        fixture_app("tiny-tool-call").await,
         json!({
-            "model": "qwen2.5-0.5b",
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "What's the weather in Paris? Use the tool."},
-                {"role": "assistant", "content": null, "tool_calls": [tool_call]},
-                {"role": "tool", "tool_call_id": "call_0", "content": "{\"temp\":18,\"unit\":\"celsius\"}"}
-            ],
-            "tools": [tool],
-            "tool_choice": "auto"
+            "model": "tiny-tool-call",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "tool_choice": "none",
+            "max_tokens": 1
         }),
     )
     .await;
-    assert_eq!(final_response["choices"][0]["finish_reason"], "stop");
-    assert!(
-        final_response["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap()
-            .contains("18"),
-        "{final_response}"
-    );
+
+    for response in [&no_tools, &none] {
+        assert_ne!(response["choices"][0]["finish_reason"], "tool_calls");
+        assert!(
+            response["choices"][0]["message"]
+                .get("tool_calls")
+                .is_none()
+        );
+    }
 }
 
 #[tokio::test]

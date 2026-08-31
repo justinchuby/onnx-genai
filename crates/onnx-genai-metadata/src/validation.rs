@@ -278,6 +278,14 @@ fn validate_output_protocol_version(
     else {
         return;
     };
+    if let Err(error) = crate::version::gate_feature_field(
+        version,
+        crate::version::SchemaFeature::PublicationMode,
+        "pipeline.workflow.publication_mode",
+        workflow.publication_mode_authored,
+    ) {
+        errors.push(error);
+    }
     for (name, output) in &workflow.outputs {
         if let Err(error) = crate::version::gate_feature_field(
             version,
@@ -1900,6 +1908,26 @@ fn validate_output_protocols(
     version: crate::version::SchemaVersion,
     errors: &mut Vec<String>,
 ) {
+    if matches!(
+        workflow.publication_mode,
+        crate::schema::WorkflowPublicationMode::ProvisionalRevisions
+    ) {
+        for (name, output) in &workflow.outputs {
+            if !matches!(
+                output.family,
+                crate::schema::WorkflowOutputFamily::Revisions { version: ref revision_version }
+                    if revision_version == "1"
+            ) {
+                errors.push(format!(
+                    "pipeline.workflow.publication_mode is provisional_revisions, but output \
+                     '{name}' has family {:?}; provisional publication requires every affected \
+                     output to declare `family: {{ kind: revisions, version: \"1\" }}` so its \
+                     transaction can be reconciled without inventing inverse operations",
+                    output.family
+                ));
+            }
+        }
+    }
     for (name, output) in &workflow.outputs {
         if output.family_authored
             && let crate::schema::WorkflowOutputFamily::Revisions {
@@ -2696,6 +2724,7 @@ fn validate_workflow(
         "pipeline.workflow.steps",
         errors,
     );
+    validate_padding_companion_provenance(&compiled.graph, workflow, errors);
     validate_token_identity_provenance(&compiled.graph, workflow, errors);
     validate_emit_batch_layout_consistency(
         &compiled.graph,
@@ -3359,9 +3388,9 @@ fn validate_shared_companions(workflow: &WorkflowSpec, errors: &mut Vec<String>)
     //
     // This reaches the owner and nothing else. Offsets are per-request
     // meaningful and are delivered rebased, and a `valid_lengths` is already
-    // relative to the item it measures — it means the same number in any group,
-    // so a request states its own and receives the slice that indexes its own
-    // items, with nothing to rebase and no group position to leak.
+    // relative to the item it measures. A row-scoped length follows the
+    // carrier's row plan; a packed/global length stays shared. Neither exposes
+    // the invocation-private owner map.
     for (name, first) in &owners {
         let Some(input) = workflow.inputs.get(*name) else {
             continue;
@@ -3685,23 +3714,15 @@ fn validate_padding(
                 companion.dtype
             ));
         }
-        let companion_keeps_request_axis = contract
-            .batch_layout
-            .request_axis()
-            .is_some_and(|request_axis| request_axis < axis);
-        let expected_layout = if companion_keeps_request_axis {
-            &contract.batch_layout
-        } else {
-            &crate::schema::BatchLayout::Shared
-        };
-        if &companion.batch_layout != expected_layout {
+        let expected_layout = valid_lengths_batch_layout(contract, axis);
+        if companion.batch_layout != expected_layout {
             errors.push(format!(
                 "{path} valid_lengths '{valid_lengths}' declares {} but must declare {}; it has \
                  one entry per position of the axes outer to '{dimension}' and must preserve the \
                  owning value's request-row layout exactly when that request axis is outer to the \
                  padded dimension",
-                companion.batch_layout.kind_name(),
-                expected_layout.kind_name(),
+                describe_batch_layout(&companion.batch_layout),
+                describe_batch_layout(&expected_layout),
             ));
         }
         validate_valid_lengths_shape(
@@ -3713,6 +3734,53 @@ fn validate_padding(
             companion,
             errors,
         );
+    }
+}
+
+/// Row-plan participation of a validity companion.
+///
+/// The companion is the prefix of the carrier ending immediately before the
+/// padded axis. If that prefix contains the carrier's request axis, each length
+/// belongs to one request position and must follow the same positional
+/// positional row plan.
+/// If it does not, the length is genuinely broadcast over the request axis and
+/// remains shared. This is decided only from the typed carrier, request-axis,
+/// and companion declarations.
+fn valid_lengths_batch_layout(
+    carrier: &crate::schema::TensorContract,
+    padded_axis: usize,
+) -> crate::schema::BatchLayout {
+    match &carrier.batch_layout {
+        crate::schema::BatchLayout::RequestAligned { axis } if *axis < padded_axis => {
+            crate::schema::BatchLayout::RequestAligned { axis: *axis }
+        }
+        crate::schema::BatchLayout::RequestExpanded { axis, factor } if *axis < padded_axis => {
+            crate::schema::BatchLayout::RequestExpanded {
+                axis: *axis,
+                factor: *factor,
+            }
+        }
+        crate::schema::BatchLayout::Shared
+        | crate::schema::BatchLayout::RequestAligned { .. }
+        | crate::schema::BatchLayout::RequestExpanded { .. }
+        | crate::schema::BatchLayout::TokenPacked { .. }
+        | crate::schema::BatchLayout::RuntimeSequenceState => crate::schema::BatchLayout::Shared,
+    }
+}
+
+fn describe_batch_layout(layout: &crate::schema::BatchLayout) -> String {
+    match layout {
+        crate::schema::BatchLayout::Shared => "shared".to_string(),
+        crate::schema::BatchLayout::RequestAligned { axis } => {
+            format!("request_aligned on axis {axis}")
+        }
+        crate::schema::BatchLayout::RequestExpanded { axis, factor } => {
+            format!("request_expanded on axis {axis} with factor {factor}")
+        }
+        crate::schema::BatchLayout::TokenPacked { axis, .. } => {
+            format!("token_packed on axis {axis}")
+        }
+        crate::schema::BatchLayout::RuntimeSequenceState => "runtime_sequence_state".to_string(),
     }
 }
 
@@ -6402,12 +6470,11 @@ impl CompanionExpectation<'_> {
 /// Every value a declared output's contract names as a description of its own
 /// shape, with the shape that naming requires of it.
 ///
-/// These are `shared` by construction — a prefix-offset vector describes a whole
-/// packing, and a length vector describes one entry per position outside the
-/// dimension it bounds — so they are exactly the values the per-request emission
-/// rule above would otherwise reject. Publishing them is what makes a packed or
-/// padded result readable, so the rule that demands a row correspondence has to
-/// know which values are the mechanism by which that correspondence is stated.
+/// Prefix-offset and owner vectors are shared by construction. A validity
+/// length is shared only when its carrier's request axis is not among the axes
+/// outside the padded dimension; otherwise it is an ordinary row-scoped
+/// emitted value. The carve-out matters only for the genuinely shared cases.
+/// Publishing either form is what makes a packed or padded result readable.
 ///
 /// A name can be claimed by more than one declaration — one length vector may
 /// bound the same dimension of two outputs — so the expectations are collected
@@ -8318,6 +8385,367 @@ pub enum MetadataError {
 
 // Re-export at crate level
 pub use MetadataError as Error;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValueLineage {
+    sources: BTreeSet<String>,
+}
+
+impl ValueLineage {
+    fn one(source: impl Into<String>) -> Self {
+        Self {
+            sources: BTreeSet::from([source.into()]),
+        }
+    }
+
+    fn joined<'a>(
+        lineages: impl IntoIterator<Item = &'a Self>,
+        fallback: impl FnOnce() -> String,
+    ) -> Self {
+        let sources = lineages
+            .into_iter()
+            .flat_map(|lineage| lineage.sources.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if sources.is_empty() {
+            Self::one(fallback())
+        } else {
+            Self { sources }
+        }
+    }
+
+    fn is_unambiguous(&self) -> bool {
+        self.sources.len() == 1
+    }
+
+    fn describe(&self) -> String {
+        let sources = self
+            .sources
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" or ");
+        if self.is_unambiguous() {
+            sources
+        } else {
+            format!("ambiguous sources ({sources})")
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PaddingValueFlow {
+    lineage: ValueLineage,
+    companions: BTreeMap<usize, ValueLineage>,
+}
+
+impl PaddingValueFlow {
+    fn one(source: impl Into<String>) -> Self {
+        Self {
+            lineage: ValueLineage::one(source),
+            companions: BTreeMap::new(),
+        }
+    }
+
+    fn joined<'a>(
+        flows: impl IntoIterator<Item = &'a Self>,
+        fallback: impl FnOnce() -> String,
+    ) -> Self {
+        let flows = flows.into_iter().collect::<Vec<_>>();
+        let lineage = ValueLineage::joined(flows.iter().map(|flow| &flow.lineage), fallback);
+        let axes = flows
+            .iter()
+            .flat_map(|flow| flow.companions.keys().copied())
+            .collect::<BTreeSet<_>>();
+        let companions = axes
+            .into_iter()
+            .filter_map(|axis| {
+                let lineages = flows
+                    .iter()
+                    .map(|flow| flow.companions.get(&axis))
+                    .collect::<Option<Vec<_>>>()?;
+                Some((
+                    axis,
+                    ValueLineage::joined(lineages, || {
+                        format!("unresolved valid_lengths lineage on padded axis {axis}")
+                    }),
+                ))
+            })
+            .collect();
+        Self {
+            lineage,
+            companions,
+        }
+    }
+}
+
+/// Prove that a padded carrier and its validity companion stay paired through
+/// authored SSA dataflow.
+///
+/// Shape compatibility alone cannot distinguish the right row-length vector
+/// from another rank-one integer tensor. Workflow input padding establishes the
+/// initial pair, component output padding establishes a transformed pair, and a
+/// transfer preserves it. An invocation may consume the pair only when both
+/// bindings have the same unambiguous typed lineage. Branch/loop joins that mix
+/// different lineages fail closed before execution because no positional row
+/// plan can recover their correlation.
+fn validate_padding_companion_provenance(
+    graph: &WorkflowNode,
+    workflow: &WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    let mut flows = workflow
+        .inputs
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                PaddingValueFlow::one(format!("workflow input '{name}'")),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut initial_companions = Vec::new();
+    for (name, input) in &workflow.inputs {
+        for padding in &input.contract.padding {
+            let Some(axis) = axis_of_symbol(&input.contract, &padding.dimension) else {
+                continue;
+            };
+            let Some(companion) = flows.get(&padding.valid_lengths) else {
+                continue;
+            };
+            initial_companions.push((name.clone(), axis, companion.lineage.clone()));
+        }
+    }
+    for (name, axis, lineage) in initial_companions {
+        if let Some(flow) = flows.get_mut(&name) {
+            flow.companions.insert(axis, lineage);
+        }
+    }
+
+    walk_padding_companion_provenance(
+        graph,
+        workflow,
+        &mut flows,
+        "pipeline.workflow.steps",
+        errors,
+    );
+}
+
+fn walk_padding_companion_provenance(
+    node: &WorkflowNode,
+    workflow: &WorkflowSpec,
+    flows: &mut BTreeMap<String, PaddingValueFlow>,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    match node {
+        WorkflowNode::Sequence { nodes } => {
+            for (index, node) in nodes.iter().enumerate() {
+                walk_padding_companion_provenance(
+                    node,
+                    workflow,
+                    flows,
+                    &format!("{path}.nodes[{index}]"),
+                    errors,
+                );
+            }
+        }
+        WorkflowNode::Invoke {
+            component,
+            inputs,
+            outputs,
+            ..
+        } => {
+            let Some(declaration) = workflow.components.get(component) else {
+                return;
+            };
+            for (port, contract) in &declaration.ports.inputs {
+                let Some(carrier_name) = inputs.get(port) else {
+                    continue;
+                };
+                let Some(carrier) = flows.get(carrier_name) else {
+                    continue;
+                };
+                for padding in &contract.padding {
+                    let Some(axis) = axis_of_symbol(contract, &padding.dimension) else {
+                        continue;
+                    };
+                    let Some(companion_name) = inputs.get(&padding.valid_lengths) else {
+                        errors.push(format!(
+                            "{path}.inputs.{port} binds padded carrier '{carrier_name}', but \
+                             component '{component}' declares valid_lengths companion port '{}' \
+                             and the invocation does not bind that input; bind the typed companion \
+                             so the carrier and its row plan cannot diverge",
+                            padding.valid_lengths
+                        ));
+                        continue;
+                    };
+                    let Some(companion) = flows.get(companion_name) else {
+                        continue;
+                    };
+                    let Some(expected) = carrier.companions.get(&axis) else {
+                        errors.push(format!(
+                            "{path}.inputs.{port} binds padded carrier '{carrier_name}', but its \
+                             typed dataflow provenance does not prove a valid_lengths companion \
+                             for padded axis {axis}; preserve the carrier through transfer or \
+                             declare the transformed component output's companion before binding \
+                             it to component '{component}'"
+                        ));
+                        continue;
+                    };
+                    if !expected.is_unambiguous()
+                        || !companion.lineage.is_unambiguous()
+                        || expected != &companion.lineage
+                    {
+                        errors.push(format!(
+                            "{path}.inputs.{port} binds padded carrier '{carrier_name}' whose \
+                             valid_lengths lineage is {}, but companion port '{}' binds \
+                             '{companion_name}' from {}; bind the companion declared by the \
+                             carrier's typed padding dataflow so repeated, reordered, and shrunk \
+                             row plans cannot pair lengths with another request",
+                            expected.describe(),
+                            padding.valid_lengths,
+                            companion.lineage.describe()
+                        ));
+                    }
+                }
+            }
+
+            for (port, value) in outputs {
+                flows.insert(
+                    value.clone(),
+                    PaddingValueFlow::one(format!(
+                        "{path} component '{component}' output port '{port}'"
+                    )),
+                );
+            }
+            let mut output_companions = Vec::new();
+            for (port, value) in outputs {
+                let Some(contract) = declaration.ports.outputs.get(port) else {
+                    continue;
+                };
+                for padding in &contract.padding {
+                    let Some(axis) = axis_of_symbol(contract, &padding.dimension) else {
+                        continue;
+                    };
+                    let companion_value = outputs
+                        .get(&padding.valid_lengths)
+                        .or_else(|| inputs.get(&padding.valid_lengths))
+                        .map(String::as_str)
+                        .unwrap_or(padding.valid_lengths.as_str());
+                    let Some(companion) = flows.get(companion_value) else {
+                        continue;
+                    };
+                    output_companions.push((value.clone(), axis, companion.lineage.clone()));
+                }
+            }
+            for (value, axis, lineage) in output_companions {
+                if let Some(flow) = flows.get_mut(&value) {
+                    flow.companions.insert(axis, lineage);
+                }
+            }
+        }
+        WorkflowNode::Loop {
+            setup,
+            body,
+            iteration,
+            carried,
+            ..
+        } => {
+            walk_padding_companion_provenance(
+                setup,
+                workflow,
+                flows,
+                &format!("{path}.setup"),
+                errors,
+            );
+            let mut body_flows = flows.clone();
+            if let Some(iteration) = iteration {
+                body_flows.insert(
+                    iteration.value.clone(),
+                    PaddingValueFlow::one(format!("loop induction value '{}'", iteration.value)),
+                );
+            }
+            for carry in carried {
+                let current = flows.get(&carry.current).cloned().unwrap_or_else(|| {
+                    PaddingValueFlow::one(format!("state cell '{}'", carry.cell))
+                });
+                body_flows.insert(carry.body_input.clone(), current);
+            }
+            walk_padding_companion_provenance(
+                body,
+                workflow,
+                &mut body_flows,
+                &format!("{path}.body"),
+                errors,
+            );
+            for carry in carried {
+                let incoming = flows
+                    .get(&carry.current)
+                    .into_iter()
+                    .chain(body_flows.get(&carry.body_output));
+                flows.insert(
+                    carry.next.clone(),
+                    PaddingValueFlow::joined(incoming, || {
+                        format!("loop-carried state cell '{}'", carry.cell)
+                    }),
+                );
+            }
+        }
+        WorkflowNode::Branch {
+            cases,
+            default,
+            outputs,
+            ..
+        } => {
+            let mut case_flows = BTreeMap::new();
+            for (case, node) in cases {
+                let mut branch = flows.clone();
+                walk_padding_companion_provenance(
+                    node,
+                    workflow,
+                    &mut branch,
+                    &format!("{path}.cases[{case}]"),
+                    errors,
+                );
+                case_flows.insert(case.as_str(), branch);
+            }
+            let mut default_flows = flows.clone();
+            if let Some(default) = default {
+                walk_padding_companion_provenance(
+                    default,
+                    workflow,
+                    &mut default_flows,
+                    &format!("{path}.default"),
+                    errors,
+                );
+            }
+            for (output, merge) in outputs {
+                let incoming = merge.cases.iter().filter_map(|(case, value)| {
+                    case_flows
+                        .get(case.as_str())
+                        .and_then(|branch| branch.get(value))
+                });
+                let default_flow = merge
+                    .default
+                    .as_ref()
+                    .and_then(|value| default_flows.get(value));
+                flows.insert(
+                    output.clone(),
+                    PaddingValueFlow::joined(incoming.chain(default_flow), || {
+                        format!("branch output '{output}'")
+                    }),
+                );
+            }
+        }
+        WorkflowNode::Transfer { input, output, .. } => {
+            if let Some(flow) = flows.get(input).cloned() {
+                flows.insert(output.clone(), flow);
+            }
+        }
+        WorkflowNode::Emit { .. } | WorkflowNode::ExecutionIsland { .. } => {}
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SemanticValueOrigin {

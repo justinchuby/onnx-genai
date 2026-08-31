@@ -2762,7 +2762,7 @@
           "type": "string"
         },
         "valid_lengths": {
-          "description": "Value giving how many leading entries of `dimension` are real, one entry\nper position of the axes outer to it.\n\nIt resolves in the namespace of the contract's owner: a sibling port for\na component port, a workflow value for a workflow input, output, or\nstate cell.",
+          "description": "Value giving how many leading entries of `dimension` are real, one entry\nper position of the axes outer to it.\n\nWhen those outer axes include the owning value's request axis, this\ncompanion declares the same request-aligned/request-expanded layout and\nfollows the same positional row plan. When the padded dimension is\noutside the request axis, the companion is genuinely broadcast and\ndeclares `shared`.\n\nIt resolves in the namespace of the contract's owner: a sibling port for\na component port, a workflow value for a workflow input, output, or\nstate cell.",
           "minLength": 1,
           "type": "string"
         }
@@ -5913,6 +5913,21 @@
         }
       ]
     },
+    "WorkflowPublicationMode": {
+      "description": "Publication visibility selected for every output in a workflow turn.\n\n`provisional_revisions` is deliberately not a generic streaming switch.\nIt is valid only when every declared output uses the versioned revision\nfamily, allowing a consumer to reconcile one transaction atomically.",
+      "oneOf": [
+        {
+          "const": "commit_only",
+          "description": "Outputs become externally observable only after the turn commits.",
+          "type": "string"
+        },
+        {
+          "const": "provisional_revisions",
+          "description": "Revision envelopes may be published before commit and are reconciled by\nthe transaction's commit or abort-to-baseline outcome.",
+          "type": "string"
+        }
+      ]
+    },
     "WorkflowSpec": {
       "additionalProperties": false,
       "description": "Sound, component-centric workflow IR. Tensor math lives in invoked components.",
@@ -5947,6 +5962,10 @@
           },
           "default": {},
           "type": "object"
+        },
+        "publication_mode": {
+          "$ref": "#/$defs/WorkflowPublicationMode",
+          "description": "Visibility of output publications while an admitted turn is still open.\n\nThis is one workflow-wide transaction decision, rather than a property\nof an individual emit: one turn has one commit or abort outcome that\nreconciles every output stream together."
         },
         "serving": {
           "anyOf": [

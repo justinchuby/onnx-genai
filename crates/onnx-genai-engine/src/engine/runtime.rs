@@ -184,8 +184,13 @@ impl DecoderTurnParticipant {
         })
     }
 
-    pub(crate) fn committed(&self) -> crate::pipeline::TurnTransactionOutcome {
-        self.turn.committed()
+    pub(crate) fn commit(
+        mut self,
+    ) -> Result<
+        crate::pipeline::TurnTransactionOutcome,
+        crate::pipeline::TurnTransactionResolutionError,
+    > {
+        self.turn.commit_runtime_participant()
     }
 
     /// Publish commit-only token output after all decoder participants have
@@ -212,7 +217,7 @@ impl DecoderTurnParticipant {
     }
 
     pub(crate) fn abort(
-        self,
+        mut self,
         engine: &mut Engine,
         session_id: SessionId,
         state: &mut EngineSession,
@@ -259,7 +264,7 @@ impl DecoderTurnParticipant {
                  execution; retain the admitted draft session until the turn resolves"
             ),
         }
-        Ok(self.turn.abort(reason))
+        Ok(self.turn.abort(reason)?)
     }
 }
 
@@ -304,12 +309,17 @@ impl NativeDecoderTurnParticipant {
         })
     }
 
-    fn committed(&self) -> crate::pipeline::TurnTransactionOutcome {
-        self.turn.committed()
+    fn commit(
+        mut self,
+    ) -> Result<
+        crate::pipeline::TurnTransactionOutcome,
+        crate::pipeline::TurnTransactionResolutionError,
+    > {
+        self.turn.commit_runtime_participant()
     }
 
     fn abort(
-        self,
+        mut self,
         engine: &mut Engine,
         reason: crate::pipeline::TurnAbortReason,
     ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
@@ -336,7 +346,7 @@ impl NativeDecoderTurnParticipant {
             }
         }
         let _ = self.active_before;
-        Ok(self.turn.abort(reason))
+        Ok(self.turn.abort(reason)?)
     }
 }
 
@@ -964,7 +974,7 @@ impl Engine {
         );
         let result = match result {
             Ok(result) => {
-                let _outcome = turn.committed();
+                let _outcome = turn.commit()?;
                 Ok(result)
             }
             Err(error) => {
@@ -1956,7 +1966,7 @@ impl Engine {
         });
         let result = match result {
             Ok(result) => {
-                let _outcome = turn.committed();
+                let _outcome = turn.commit()?;
                 if !exceeded_context_limit(state.tokens.len(), max_context)
                     && let Err(error) =
                         self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())
@@ -3137,7 +3147,7 @@ impl Engine {
         })();
         let result = match result {
             Ok(()) => {
-                let _outcome = active.turn.committed();
+                let _outcome = active.turn.commit()?;
                 if !exceeded_context_limit(active.state.tokens.len(), active.max_context)
                     && let Err(error) = self.insert_cached_prefixes(
                         active.session_id,
@@ -3676,7 +3686,7 @@ impl Engine {
         });
         let result = match result {
             Ok(result) => {
-                let _outcome = turn.committed();
+                let _outcome = turn.commit()?;
                 Ok(result)
             }
             Err(error) => {

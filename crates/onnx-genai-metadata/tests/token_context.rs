@@ -10,8 +10,9 @@ use onnx_genai_metadata::{
     BatchLayout, ComponentContract, ComponentImplementation, InferenceMetadata, PaddedDimension,
     PortRole, RuntimeInputRole, SemanticInputRole, ShapeRecurrence, StateGroupCapabilities,
     StateKind, StatePortAlias, StateSemanticRole, StateUpdate, TensorContract, TensorDimension,
-    WorkflowComponent, WorkflowInput, WorkflowInputSource, WorkflowStateScope, WorkflowStep,
-    classify_session_state, resolve_state_plan, validate_metadata,
+    WorkflowBranchOutput, WorkflowComponent, WorkflowInput, WorkflowInputSource,
+    WorkflowStateScope, WorkflowStep, classify_session_state, resolve_state_plan,
+    validate_metadata,
 };
 
 const TOKEN_CONTEXT_CONTRACT: &str = "onnx-genai.token-context";
@@ -339,7 +340,7 @@ fn token_context_requires_new_reader_and_runtime_admission() {
 }
 
 #[test]
-fn token_context_invoke_rejects_shape_compatible_position_id_provenance() {
+fn token_context_invoke_rejects_shape_compatible_transformed_position_id_provenance() {
     let mut metadata = fixture();
     let workflow = &mut metadata.pipeline.as_mut().expect("pipeline").workflow;
     workflow.components.insert(
@@ -395,6 +396,130 @@ fn token_context_invoke_rejects_shape_compatible_position_id_provenance() {
             error.contains("token-context component 'model'")
                 && error.contains("token_ids port 'token_ids'")
                 && error.contains("derived.position_ids")
+                && error.contains("position_ids")
+                && error.contains("cannot distinguish token identity from position IDs")
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn token_context_invoke_rejects_ambiguous_branch_provenance() {
+    let mut metadata = fixture();
+    let workflow = &mut metadata.pipeline.as_mut().expect("pipeline").workflow;
+    workflow.inputs.insert(
+        "choose_tokens".to_string(),
+        WorkflowInput {
+            contract: TensorContract {
+                dtype: "bool".to_string(),
+                shape: vec![TensorDimension::Fixed(1)],
+                optional: false,
+                batch_layout: BatchLayout::Shared,
+                padding: Vec::new(),
+            },
+            role: SemanticInputRole::Opaque,
+            source: WorkflowInputSource::Application {
+                name: "choose_tokens".to_string(),
+            },
+            required: true,
+            default: None,
+            present_as: None,
+            externally_suppliable: false,
+        },
+    );
+    for (name, output_role) in [
+        ("token_alias", PortRole::TokenIds),
+        ("position_alias", PortRole::PositionIds),
+    ] {
+        workflow.components.insert(
+            name.to_string(),
+            WorkflowComponent {
+                implementation: ComponentImplementation::Binding,
+                ports: onnx_genai_metadata::ComponentPorts {
+                    inputs: BTreeMap::from([(
+                        "value".to_string(),
+                        contract("int64", &["batch", "sequence"]),
+                    )]),
+                    outputs: BTreeMap::from([(
+                        "value".to_string(),
+                        contract("int64", &["batch", "sequence"]),
+                    )]),
+                    roles: BTreeMap::from([("value".to_string(), output_role)]),
+                },
+                contract: None,
+                application_overridable: false,
+                effects: Vec::new(),
+                row_scope: None,
+                cache_affects_state: Default::default(),
+                batch_capacity: None,
+            },
+        );
+    }
+    workflow.steps.insert(
+        0,
+        WorkflowStep::Branch {
+            predicate: "choose_tokens".to_string(),
+            cases: BTreeMap::from([
+                (
+                    "true".to_string(),
+                    WorkflowStep::Invoke {
+                        component: "token_alias".to_string(),
+                        inputs: BTreeMap::from([(
+                            "value".to_string(),
+                            "request.token_ids".to_string(),
+                        )]),
+                        outputs: BTreeMap::from([(
+                            "value".to_string(),
+                            "branch.token_ids".to_string(),
+                        )]),
+                    },
+                ),
+                (
+                    "false".to_string(),
+                    WorkflowStep::Invoke {
+                        component: "position_alias".to_string(),
+                        inputs: BTreeMap::from([(
+                            "value".to_string(),
+                            "request.token_ids".to_string(),
+                        )]),
+                        outputs: BTreeMap::from([(
+                            "value".to_string(),
+                            "branch.position_ids".to_string(),
+                        )]),
+                    },
+                ),
+            ]),
+            default: None,
+            outputs: BTreeMap::from([(
+                "ambiguous.ids".to_string(),
+                WorkflowBranchOutput {
+                    cases: BTreeMap::from([
+                        ("true".to_string(), "branch.token_ids".to_string()),
+                        ("false".to_string(), "branch.position_ids".to_string()),
+                    ]),
+                    default: None,
+                },
+            )]),
+        },
+    );
+    let model_inputs = workflow
+        .steps
+        .iter_mut()
+        .find_map(|step| match step {
+            WorkflowStep::Invoke {
+                component, inputs, ..
+            } if component == "model" => Some(inputs),
+            _ => None,
+        })
+        .expect("model invoke");
+    model_inputs.insert("token_ids".to_string(), "ambiguous.ids".to_string());
+
+    let errors =
+        validate_metadata(&metadata).expect_err("mixed token/position provenance is ambiguous");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("ambiguous.ids")
+                && error.contains("token_ids")
                 && error.contains("position_ids")
                 && error.contains("cannot distinguish token identity from position IDs")
         }),

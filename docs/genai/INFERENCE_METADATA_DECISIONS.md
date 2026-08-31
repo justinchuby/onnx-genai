@@ -433,10 +433,23 @@ payload where applicable. Unknown versions or operations, illegal bases,
 duplicate `finalize`, post-finalize updates, and family/operation mismatches
 **MUST** fail closed.
 
+Schema v1.7 adds the required workflow-level
+`publication_mode: commit_only | provisional_revisions`. It applies to the
+entire admitted turn, not to an individual output: `provisional_revisions`
+**MUST** declare the typed revision family at every affected output, and its
+transport **MUST** preserve each envelope followed by exactly one typed
+`commit` or `abort_to_baseline` transaction outcome. The abort outcome names
+the transaction and the exact admission `(output, stream, head, sequence,
+lineage, closed)` baseline for every affected stream. A buffering or
+specialized transport that cannot preserve those records **MUST** refuse this
+mode before mutation; it must not manufacture inverse revisions.
+
 `abort_to_baseline` is a typed turn/transaction outcome, not a
 revision-envelope operation. It identifies the aborted transaction and its
 recorded committed baseline, and invalidates every provisional publication
-owned by that transaction.
+owned by that transaction. `commit` is the corresponding transaction outcome:
+it makes earlier provisional records durable without rewriting their ordering
+or payload.
 
 `finalize` closes one revision stream early. It is optional and remains
 provisional until the enclosing turn commits. Successful turn commit finalizes
@@ -1102,7 +1115,7 @@ Commit atomically advances every participating state, effect, and output head.
 Abort, cancellation, execution failure, or commit failure restores/retracts the
 whole turn to its recorded baseline. `commit_only` exposes nothing before commit;
 `provisional_revisions` may expose typed provisional publications and the typed
-`abort_to_baseline` turn/transaction outcome defined in
+`commit`/`abort_to_baseline` turn/transaction outcomes defined in
 [§6.4](#64-workflow-output-publication-and-revisions). A participant unable to
 join the transaction causes admission to fail before mutation. An exclusive
 lease is a concurrency primitive, not the transaction itself.
@@ -1203,6 +1216,10 @@ update, lifecycle, compaction, checkpoint/fork, and rollback behavior.
 Full-sequence, chunked-prefill, and decode execution **MUST** agree at equivalent
 boundaries. Geometry and table contents are package facts; placement, sharding,
 offload, prefetch, and memory budgets are runtime policy.
+
+The checked-in Qwen4-Exp equation/vector provenance is documented in
+[`QWEN4_EXP_PLE_REFERENCE.md`](QWEN4_EXP_PLE_REFERENCE.md). It is deterministic
+synthetic-weight conformance evidence, not an official-checkpoint parity claim.
 
 ---
 
@@ -1598,6 +1615,14 @@ All caller-provided tool data, template values, and model-produced envelopes are
 untrusted structured input and **MUST** be bounded and validated. Metadata grants
 no authority to execute or select tools.
 
+On a later caller turn, every assistant call ID is unique and every `role: tool`
+result supplies one outstanding `tool_call_id`; results associate by that typed
+ID, not by array position. A duplicate, unknown, or missing result ID, a
+result `name` that disagrees with its call, a non-`function` call, non-object
+call arguments, or a non-text result fails before inference with the message
+path. Tool execution remains caller-owned: the server validates and renders
+results but never invokes a declared function.
+
 ---
 
 ## 16. Distributed execution
@@ -1914,13 +1939,14 @@ pipeline:
       logits:
         contract:
           shape: [batch, frames, vocab]
+          batch_layout: { kind: request_aligned, axis: 0 }
           padding:
             - { dimension: frames, valid_lengths: frame_lengths }
       frame_lengths:
         contract:
           dtype: int64
           shape: [batch]
-          batch_layout: { kind: shared }
+          batch_layout: { kind: request_aligned, axis: 0 }
 profiles:
   transcription:
     outputs:

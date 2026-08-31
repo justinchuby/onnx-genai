@@ -39,7 +39,7 @@ impl fmt::Display for SchemaVersion {
 pub const INITIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
 
 /// The newest version this build can read.
-pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 6);
+pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 7);
 
 /// The version that first carried encoder batching, padding, ownership levels,
 /// and the video preprocessing program.
@@ -64,16 +64,21 @@ pub const DFLASH_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 6);
 /// envelopes.
 pub const OUTPUT_PROTOCOL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 5);
 
+/// The version that made transaction-scoped publication visibility explicit.
+pub const PUBLICATION_MODE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 7);
+
 /// A serialized feature whose presence is bounded by one schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaFeature {
     OutputProtocols,
+    PublicationMode,
 }
 
 impl SchemaFeature {
     pub const fn minimum_version(self) -> SchemaVersion {
         match self {
             Self::OutputProtocols => OUTPUT_PROTOCOL_SCHEMA_VERSION,
+            Self::PublicationMode => PUBLICATION_MODE_SCHEMA_VERSION,
         }
     }
 
@@ -81,6 +86,22 @@ impl SchemaFeature {
         match self {
             Self::OutputProtocols => {
                 "workflow output families, logical streams, and typed revision operations"
+            }
+            Self::PublicationMode => {
+                "workflow transaction publication mode and typed commit/abort reconciliation"
+            }
+        }
+    }
+
+    const fn declaration(self) -> &'static str {
+        match self {
+            Self::OutputProtocols => {
+                "Declare exactly one of `{ kind: materialized }`, `{ kind: events }`, or \
+                 `{ kind: revisions, version: \"1\" }`"
+            }
+            Self::PublicationMode => {
+                "Declare `publication_mode: commit_only` or \
+                 `publication_mode: provisional_revisions`"
             }
         }
     }
@@ -99,13 +120,22 @@ pub fn gate_feature_use(
     if version >= required {
         return Ok(());
     }
-    Err(format!(
-        "{path} is not legal in authored schema version {version}; {} require minimum schema \
-         version {required}. Remove the v1.5-only declaration to retain legacy output semantics, \
-         or migrate/re-emit the package with `schema_version: \"{required}\"` and explicit output \
-         families",
-        feature.description()
-    ))
+    match feature {
+        SchemaFeature::OutputProtocols => Err(format!(
+            "{path} is not legal in authored schema version {version}; {} require minimum schema \
+             version {required}. Remove the v1.5-only declaration to retain legacy output \
+             semantics, or migrate/re-emit the package with `schema_version: \"{required}\"` and \
+             explicit output families",
+            feature.description()
+        )),
+        SchemaFeature::PublicationMode => Err(format!(
+            "{path} is not legal in authored schema version {version}; \
+             `pipeline.workflow.publication_mode` begins and is required in schema version \
+             {required}. Remove `pipeline.workflow.publication_mode` to keep a pre-{required} \
+             document, or upgrade `schema_version` to \"{required}\" and author a valid mode \
+             (`commit_only` or `provisional_revisions`)"
+        )),
+    }
 }
 
 /// Bidirectional gate for a field that became mandatory when its feature was
@@ -121,9 +151,9 @@ pub fn gate_feature_field(
         (false, true) => gate_feature_use(version, feature, path),
         (true, false) => Err(format!(
             "{path} is required in authored schema version {version}; {} begin at schema version \
-             {required}. Declare exactly one of `{{ kind: materialized }}`, \
-             `{{ kind: events }}`, or `{{ kind: revisions, version: \"1\" }}`",
-            feature.description()
+             {required}. {}.",
+            feature.description(),
+            feature.declaration()
         )),
         _ => Ok(()),
     }
@@ -223,7 +253,7 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.6");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.7");
         assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
@@ -262,9 +292,9 @@ mod tests {
 
     #[test]
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
-        let error = gate(Some("1.7")).expect_err("1.7 is newer than this build");
+        let error = gate(Some("1.8")).expect_err("1.8 is newer than this build");
         assert!(
-            error.contains("declares inference-metadata schema version v1.7"),
+            error.contains("declares inference-metadata schema version v1.8"),
             "{error}"
         );
         assert!(
@@ -297,7 +327,11 @@ mod tests {
             gate(Some("1.5")).expect("1.5"),
             OUTPUT_PROTOCOL_SCHEMA_VERSION
         );
-        assert_eq!(gate(Some("1.6")).expect("1.6"), SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(
+            gate(Some("1.6")).expect("1.6"),
+            CANONICAL_SPECULATION_SCHEMA_VERSION
+        );
+        assert_eq!(gate(Some("1.7")).expect("1.7"), SUPPORTED_SCHEMA_VERSION);
     }
 
     #[test]
@@ -317,12 +351,13 @@ mod tests {
             true,
         )
         .expect_err("older schema cannot opt into a later field");
-        assert!(
-            below.contains(path)
-                && below.contains("v1.4")
-                && below.contains("v1.5")
-                && below.contains("migrate/re-emit"),
-            "{below}"
+        assert_eq!(
+            below,
+            "pipeline.workflow.outputs.answer.family is not legal in authored schema version \
+             v1.4; workflow output families, logical streams, and typed revision operations \
+             require minimum schema version v1.5. Remove the v1.5-only declaration to retain \
+             legacy output semantics, or migrate/re-emit the package with `schema_version: \
+             \"v1.5\"` and explicit output families"
         );
 
         let missing = gate_feature_field(
@@ -343,5 +378,43 @@ mod tests {
             true,
         )
         .expect("v1.5 accepts its authored field");
+    }
+
+    #[test]
+    fn publication_mode_gate_is_bidirectional() {
+        let path = "pipeline.workflow.publication_mode";
+        gate_feature_field(
+            SchemaVersion::new(1, 6),
+            SchemaFeature::PublicationMode,
+            path,
+            false,
+        )
+        .expect("a legacy workflow omits the later field");
+        let below = gate_feature_field(
+            SchemaVersion::new(1, 6),
+            SchemaFeature::PublicationMode,
+            path,
+            true,
+        )
+        .expect_err("v1.6 cannot opt into the v1.7 field");
+        assert_eq!(
+            below,
+            "pipeline.workflow.publication_mode is not legal in authored schema version v1.6; \
+             `pipeline.workflow.publication_mode` begins and is required in schema version v1.7. \
+             Remove `pipeline.workflow.publication_mode` to keep a pre-v1.7 document, or upgrade \
+             `schema_version` to \"v1.7\" and author a valid mode (`commit_only` or \
+             `provisional_revisions`)"
+        );
+        let missing = gate_feature_field(
+            SchemaVersion::new(1, 7),
+            SchemaFeature::PublicationMode,
+            path,
+            false,
+        )
+        .expect_err("v1.7 must state its publication mode");
+        assert!(
+            missing.contains(path) && missing.contains("publication_mode"),
+            "{missing}"
+        );
     }
 }

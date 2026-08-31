@@ -90,6 +90,12 @@ pub struct PaddedDimension {
     /// Value giving how many leading entries of `dimension` are real, one entry
     /// per position of the axes outer to it.
     ///
+    /// When those outer axes include the owning value's request axis, this
+    /// companion declares the same request-aligned/request-expanded layout and
+    /// follows the same positional row plan. When the padded dimension is
+    /// outside the request axis, the companion is genuinely broadcast and
+    /// declares `shared`.
+    ///
     /// It resolves in the namespace of the contract's owner: a sibling port for
     /// a component port, a workflow value for a workflow input, output, or
     /// state cell.
@@ -412,7 +418,7 @@ pub enum DeviceKind {
 }
 
 /// Sound, component-centric workflow IR. Tensor math lives in invoked components.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowSpec {
     pub manifest: WorkflowManifest,
@@ -420,6 +426,18 @@ pub struct WorkflowSpec {
     pub inputs: BTreeMap<String, WorkflowInput>,
     #[serde(default)]
     pub outputs: BTreeMap<String, WorkflowOutput>,
+    /// Visibility of output publications while an admitted turn is still open.
+    ///
+    /// This is one workflow-wide transaction decision, rather than a property
+    /// of an individual emit: one turn has one commit or abort outcome that
+    /// reconciles every output stream together.
+    #[serde(default, skip_serializing_if = "workflow_publication_is_commit_only")]
+    pub publication_mode: WorkflowPublicationMode,
+    /// Whether `publication_mode` was explicitly authored rather than supplied
+    /// by the pre-v1.7 compatibility default.
+    #[doc(hidden)]
+    #[schemars(skip)]
+    pub publication_mode_authored: bool,
     pub components: BTreeMap<String, WorkflowComponent>,
     #[serde(default)]
     pub state: BTreeMap<String, WorkflowStateCell>,
@@ -429,6 +447,112 @@ pub struct WorkflowSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serving: Option<ServingServiceContract>,
     pub steps: Vec<WorkflowStep>,
+}
+
+fn workflow_publication_is_commit_only(mode: &WorkflowPublicationMode) -> bool {
+    *mode == WorkflowPublicationMode::CommitOnly
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowSpecWire {
+    manifest: WorkflowManifest,
+    #[serde(default)]
+    inputs: BTreeMap<String, WorkflowInput>,
+    #[serde(default)]
+    outputs: BTreeMap<String, WorkflowOutput>,
+    #[serde(default)]
+    publication_mode: AuthoredWorkflowPublicationMode,
+    components: BTreeMap<String, WorkflowComponent>,
+    #[serde(default)]
+    state: BTreeMap<String, WorkflowStateCell>,
+    #[serde(default)]
+    effects: BTreeMap<String, EffectContract>,
+    #[serde(default)]
+    serving: Option<ServingServiceContract>,
+    steps: Vec<WorkflowStep>,
+}
+
+#[derive(Default)]
+struct AuthoredWorkflowPublicationMode {
+    value: WorkflowPublicationMode,
+    authored: bool,
+}
+
+impl<'de> Deserialize<'de> for AuthoredWorkflowPublicationMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self {
+            value: WorkflowPublicationMode::deserialize(deserializer)?,
+            authored: true,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkflowSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkflowSpecWire::deserialize(deserializer)?;
+        Ok(Self {
+            manifest: wire.manifest,
+            inputs: wire.inputs,
+            outputs: wire.outputs,
+            publication_mode: wire.publication_mode.value,
+            publication_mode_authored: wire.publication_mode.authored,
+            components: wire.components,
+            state: wire.state,
+            effects: wire.effects,
+            serving: wire.serving,
+            steps: wire.steps,
+        })
+    }
+}
+
+impl Serialize for WorkflowSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+
+        let fields =
+            7 + usize::from(self.publication_mode_authored) + usize::from(self.serving.is_some());
+        let mut workflow = serializer.serialize_struct("WorkflowSpec", fields)?;
+        workflow.serialize_field("manifest", &self.manifest)?;
+        workflow.serialize_field("inputs", &self.inputs)?;
+        workflow.serialize_field("outputs", &self.outputs)?;
+        if self.publication_mode_authored {
+            workflow.serialize_field("publication_mode", &self.publication_mode)?;
+        }
+        workflow.serialize_field("components", &self.components)?;
+        workflow.serialize_field("state", &self.state)?;
+        workflow.serialize_field("effects", &self.effects)?;
+        if let Some(serving) = &self.serving {
+            workflow.serialize_field("serving", serving)?;
+        }
+        workflow.serialize_field("steps", &self.steps)?;
+        workflow.end()
+    }
+}
+
+/// Publication visibility selected for every output in a workflow turn.
+///
+/// `provisional_revisions` is deliberately not a generic streaming switch.
+/// It is valid only when every declared output uses the versioned revision
+/// family, allowing a consumer to reconcile one transaction atomically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPublicationMode {
+    /// Outputs become externally observable only after the turn commits.
+    #[default]
+    CommitOnly,
+    /// Revision envelopes may be published before commit and are reconciled by
+    /// the transaction's commit or abort-to-baseline outcome.
+    ProvisionalRevisions,
 }
 
 /// Declared semantics of one external effect domain.

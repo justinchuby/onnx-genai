@@ -90,9 +90,6 @@ impl Engine {
                     .map(|component| (component.to_string(), runs))
             })
             .collect::<std::collections::BTreeMap<_, _>>();
-        if !recorded.is_empty() {
-            return recorded;
-        }
         let Some(diagnostic) = self.candidate_tree_diagnostic() else {
             return recorded;
         };
@@ -100,8 +97,11 @@ impl Engine {
         if blocks == 0 {
             return recorded;
         }
-        let runs = u64::try_from(blocks).unwrap_or(u64::MAX).saturating_add(1);
-        std::collections::BTreeMap::from([(diagnostic.proposer, runs), (diagnostic.target, runs)])
+        let runs = u64::try_from(blocks).unwrap_or(u64::MAX).saturating_mul(2);
+        let mut recorded = recorded;
+        recorded.insert(diagnostic.proposer, runs);
+        recorded.insert(diagnostic.target, runs);
+        recorded
     }
 
     /// How many components the package's declared workflow names.
@@ -456,6 +456,12 @@ impl Engine {
 
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
         WorkflowRuntime::workflow_performance_diagnostic(&self.workflow)
+    }
+
+    /// Committed cursor for one workflow effect domain in a session.
+    pub fn workflow_session_effect_cursor(&self, session_id: &str, effect: &str) -> Option<u64> {
+        self.workflow_runtime()
+            .session_effect_cursor(session_id, effect)
     }
 
     pub fn adapter_lifecycle_diagnostic(&self) -> crate::pipeline::AdapterLifecycleDiagnostic {
