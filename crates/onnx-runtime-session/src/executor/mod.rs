@@ -87,8 +87,16 @@ use crate::tensor::{
 
 pub(super) struct DeviceValidationSubmission {
     ep: Arc<dyn ExecutionProvider>,
-    receipt: Arc<DeviceValidationReceipt>,
+    receipt: DeviceValidationReceipt,
     active: bool,
+}
+
+#[cfg(all(test, feature = "gpu-tests"))]
+static DEVICE_VALIDATION_SUBMISSION_CENSUS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(test, feature = "gpu-tests"))]
+pub(super) fn device_validation_submission_census() -> u64 {
+    DEVICE_VALIDATION_SUBMISSION_CENSUS.load(Ordering::Relaxed)
 }
 
 impl DeviceValidationSubmission {
@@ -97,15 +105,17 @@ impl DeviceValidationSubmission {
         owner: DeviceValidationOwner,
     ) -> Result<Self> {
         let token = ep.begin_device_validation(owner)?;
+        #[cfg(all(test, feature = "gpu-tests"))]
+        DEVICE_VALIDATION_SUBMISSION_CENSUS.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             ep: Arc::clone(ep),
-            receipt: DeviceValidationReceipt::new(Arc::clone(ep), token),
+            receipt: DeviceValidationReceipt::new(token),
             active: true,
         })
     }
 
-    pub(super) fn receipt(&self) -> Arc<DeviceValidationReceipt> {
-        Arc::clone(&self.receipt)
+    pub(super) fn receipt(&self) -> DeviceValidationReceipt {
+        DeviceValidationReceipt::new(self.receipt.token())
     }
 
     pub(super) fn disarm(&mut self) {
@@ -122,7 +132,7 @@ impl Drop for DeviceValidationSubmission {
             .ep
             .sync()
             .map_err(SessionError::from)
-            .and_then(|()| self.receipt.consume_after_sync());
+            .and_then(|()| self.receipt.consume_after_sync(self.ep.as_ref()));
         match result {
             Ok(0) => {}
             Ok(flags) => eprintln!(
@@ -832,7 +842,7 @@ impl Drop for Executor {
             && let Some(receipt) = &self.pending_device_validation
             && !receipt.is_consumed()
         {
-            match receipt.consume_after_sync() {
+            match receipt.consume_after_sync(self.ep.as_ref()) {
                 Ok(0) => {}
                 Ok(flags) => eprintln!(
                     "[onnx-runtime-session] executor drop consumed its deferred validation \

@@ -128,6 +128,8 @@ struct DeferredValidationEp {
     resets: Arc<AtomicUsize>,
     reset_failure_at: Arc<AtomicUsize>,
     validation_state: Arc<std::sync::Mutex<Option<onnx_runtime_ep_api::DeviceValidationToken>>>,
+    completed_validation:
+        Arc<std::sync::Mutex<Option<(onnx_runtime_ep_api::DeviceValidationToken, u32)>>>,
     next_validation_generation: Arc<AtomicU64>,
     validation_consume_attempts: Arc<AtomicUsize>,
     sync_calls: Arc<AtomicUsize>,
@@ -151,6 +153,7 @@ impl DeferredValidationEp {
             resets: Arc::new(AtomicUsize::new(0)),
             reset_failure_at: Arc::new(AtomicUsize::new(0)),
             validation_state: Arc::new(std::sync::Mutex::new(None)),
+            completed_validation: Arc::new(std::sync::Mutex::new(None)),
             next_validation_generation: Arc::new(AtomicU64::new(1)),
             validation_consume_attempts: Arc::new(AtomicUsize::new(0)),
             sync_calls: Arc::new(AtomicUsize::new(0)),
@@ -286,6 +289,11 @@ impl ExecutionProvider for DeferredValidationEp {
     ) -> onnx_runtime_ep_api::Result<u32> {
         self.validation_consume_attempts
             .fetch_add(1, Ordering::Relaxed);
+        if let Some((completed, flags)) = *self.completed_validation.lock().unwrap()
+            && completed == token
+        {
+            return Ok(flags);
+        }
         let mut active = self.validation_state.lock().unwrap();
         match *active {
             Some(expected) if expected == token => {}
@@ -310,10 +318,14 @@ impl ExecutionProvider for DeferredValidationEp {
         let result = self
             .check_validation_latch()
             .and_then(|flags| self.reset_validation_latch().map(|()| flags));
-        if result.is_ok() {
-            *active = None;
+        match result {
+            Ok(flags) => {
+                *active = None;
+                *self.completed_validation.lock().unwrap() = Some((token, flags));
+                Ok(flags)
+            }
+            Err(error) => Err(error),
         }
-        result
     }
 
     fn reset_owned_device_graph(
@@ -588,6 +600,47 @@ fn foreign_binding_executor_drop_and_reset_cannot_consume_owned_validation() {
         );
         assert!(ep.validation_state.lock().unwrap().is_none());
     }
+}
+
+#[test]
+fn completed_owner_teardown_cannot_consume_new_foreign_validation() {
+    let ep = Arc::new(DeferredValidationEp::new());
+    let (mut completed_owner, mut completed_bindings) =
+        deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+    let (mut pending_owner, mut pending_bindings) =
+        deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+
+    completed_owner
+        .run_with_device_bindings(&[], &mut completed_bindings)
+        .expect("the first owner submits one deferred failing generation");
+    let first = completed_bindings[1].read_bytes_range(0, 4).unwrap_err();
+    assert!(first.to_string().contains("flags=0x40"));
+
+    ep.fail_next.store(true, Ordering::Relaxed);
+    pending_owner
+        .run_with_device_bindings(&[], &mut pending_bindings)
+        .expect("the second owner submits after the first result was consumed");
+    let active = ep
+        .validation_state
+        .lock()
+        .unwrap()
+        .expect("the second owner's token must be pending");
+    assert_eq!(active.owner(), pending_owner.validation_owner);
+
+    drop(completed_owner);
+    assert_eq!(
+        ep.validation_state
+            .lock()
+            .unwrap()
+            .expect("completed-owner teardown must preserve the new active token"),
+        active
+    );
+
+    let second = pending_bindings[1].read_bytes_range(0, 4).unwrap_err();
+    assert!(
+        second.to_string().contains("flags=0x40"),
+        "the newer owner's unseen failure must survive old-owner teardown: {second}"
+    );
 }
 
 #[test]
@@ -6025,8 +6078,17 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         .run_with_device_bindings(&[], &mut bindings)
         .unwrap();
     bindings[2].read_bytes_range(0, 4).unwrap();
-    let (_, positive_allocations) = count_host_allocations(|| vec![0u8; 1]);
-    assert!(positive_allocations > 0, "host-allocation falsifier");
+    let (_, positive_allocations) =
+        count_host_allocations(|| std::hint::black_box(Box::new([0xa5u8; 64])));
+    let positive_allocation_sizes = HOST_ALLOCATION_SIZES.with(Cell::get);
+    assert_eq!(
+        positive_allocations, 1,
+        "host-allocation positive control must observe exactly the intentional Box allocation"
+    );
+    assert_eq!(
+        positive_allocation_sizes[0], 64,
+        "host-allocation positive control must report the intentional 64-byte allocation"
+    );
     let lock_before = runtime.graph_lifecycle_lock_acquisition_count();
     runtime.test_acquire_graph_lifecycle_lock().unwrap();
     assert!(
@@ -6095,9 +6157,15 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     let synchronizations = runtime.forced_synchronization_count();
     let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
     let locks = runtime.graph_lifecycle_lock_acquisition_count();
+    let eager_census = device_validation_submission_census();
     let (warmed, host_allocations) =
         count_host_allocations(|| executor.run_with_device_bindings(&[], &mut bindings));
     warmed.unwrap();
+    assert_eq!(
+        device_validation_submission_census(),
+        eager_census + 1,
+        "warmed production path must submit exactly one validation generation"
+    );
     assert_eq!(
         host_allocations,
         0,
@@ -6118,20 +6186,51 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     );
     bindings[2].read_bytes_range(0, 4).unwrap();
 
+    let capture_census = device_validation_submission_census();
     assert!(matches!(
         executor
             .try_capture_with_device_bindings(&[], &mut bindings)
             .unwrap(),
         DeviceGraphCaptureResult::Captured(_)
     ));
+    assert_eq!(
+        device_validation_submission_census(),
+        capture_census + 1,
+        "capture setup must submit exactly one validation generation"
+    );
+
+    let captured_path_census = device_validation_submission_census();
+    let (captured_path, capture_host_allocations) =
+        count_host_allocations(|| executor.replay_device_graph(&mut bindings));
+    assert!(captured_path.unwrap());
+    assert_eq!(
+        device_validation_submission_census(),
+        captured_path_census + 1,
+        "the first production launch through the installed capture must submit exactly one \
+         validation generation"
+    );
+    assert_eq!(
+        capture_host_allocations,
+        0,
+        "first production captured launch allocations after capture setup: {:?}",
+        HOST_ALLOCATION_SIZES.with(Cell::get)
+    );
+    bindings[2].read_bytes_range(0, 4).unwrap();
+
     let allocations = runtime.allocation_counts();
     let transfers = runtime.transfer_counts();
     let synchronizations = runtime.forced_synchronization_count();
     let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
     let locks = runtime.graph_lifecycle_lock_acquisition_count();
+    let replay_census = device_validation_submission_census();
     let (replayed, host_allocations) =
         count_host_allocations(|| executor.replay_device_graph(&mut bindings));
     assert!(replayed.unwrap());
+    assert_eq!(
+        device_validation_submission_census(),
+        replay_census + 1,
+        "production graph replay must submit exactly one validation generation"
+    );
     assert_eq!(
         host_allocations,
         0,
@@ -6149,6 +6248,12 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         runtime.graph_lifecycle_lock_acquisition_count(),
         locks,
         "production graph replay lifecycle locks"
+    );
+    eprintln!(
+        "validation_no_work positive_control_allocations={positive_allocations} \
+         positive_control_sizes={positive_allocation_sizes:?} warmed_allocations=0 \
+         captured_launch_allocations=0 replay_allocations=0 \
+         submissions=warmed:1,capture_setup:1,captured_launch:1,replay:1"
     );
 }
 
@@ -6446,6 +6551,46 @@ fn shared_cuda_provider_foreign_teardown_preserves_owned_validation_error() {
             );
         }
     }
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn completed_cuda_owner_teardown_cannot_consume_new_foreign_validation() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let (mut completed_owner, mut completed_bindings, runtime) =
+        sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+    let (mut pending_owner, mut pending_bindings, _) =
+        sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+    let flags = 0x40u32.to_ne_bytes();
+
+    completed_owner
+        .run_with_device_bindings(&[], &mut completed_bindings)
+        .unwrap();
+    // SAFETY: GPU-test-only fault injection into the live validation word,
+    // ordered after the first owner's submission.
+    unsafe {
+        runtime.htod(&flags, runtime.capture_error_ptr()).unwrap();
+    }
+    let first = completed_bindings[2].read_bytes_range(0, 4).unwrap_err();
+    assert!(first.to_string().contains("flags=0x40"));
+
+    pending_owner
+        .run_with_device_bindings(&[], &mut pending_bindings)
+        .unwrap();
+    // SAFETY: the same live word now belongs to the second owner's exact
+    // generation; old-owner teardown must not read or clear it.
+    unsafe {
+        runtime.htod(&flags, runtime.capture_error_ptr()).unwrap();
+    }
+    drop(completed_owner);
+
+    let second = pending_bindings[2].read_bytes_range(0, 4).unwrap_err();
+    assert!(
+        second.to_string().contains("flags=0x40"),
+        "newer owner failure must survive completed-owner teardown: {second}"
+    );
 }
 
 #[cfg(feature = "gpu-tests")]

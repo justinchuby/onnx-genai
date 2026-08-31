@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -49,24 +49,84 @@ pub struct CudaTransferCounts {
     pub async_host_to_device: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ActiveDeviceValidation {
-    Pending(DeviceValidationToken),
-    Consuming(DeviceValidationToken),
+const DEVICE_VALIDATION_IDLE: u8 = 0;
+const DEVICE_VALIDATION_OPENING: u8 = 1;
+const DEVICE_VALIDATION_PENDING: u8 = 2;
+const DEVICE_VALIDATION_CONSUMING: u8 = 3;
+// Output bindings cache a consumed result inline. This fixed ring only bridges
+// the interval in which sibling bindings and executor teardown still carry the
+// same token; it replaces an unbounded map or per-submission shared allocation.
+const DEVICE_VALIDATION_COMPLETED_SLOTS: usize = 64;
+
+#[derive(Debug)]
+struct CompletedDeviceValidation {
+    owner: AtomicU64,
+    flags: AtomicU32,
+    generation: AtomicU64,
+}
+
+impl Default for CompletedDeviceValidation {
+    fn default() -> Self {
+        Self {
+            owner: AtomicU64::new(0),
+            flags: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct DeviceValidationState {
-    next_generation: u64,
-    active: Option<ActiveDeviceValidation>,
+    next_generation: AtomicU64,
+    phase: AtomicU8,
+    active_owner: AtomicU64,
+    active_generation: AtomicU64,
+    completed: [CompletedDeviceValidation; DEVICE_VALIDATION_COMPLETED_SLOTS],
 }
 
 impl Default for DeviceValidationState {
     fn default() -> Self {
         Self {
-            next_generation: 1,
-            active: None,
+            next_generation: AtomicU64::new(1),
+            phase: AtomicU8::new(DEVICE_VALIDATION_IDLE),
+            active_owner: AtomicU64::new(0),
+            active_generation: AtomicU64::new(0),
+            completed: std::array::from_fn(|_| CompletedDeviceValidation::default()),
         }
+    }
+}
+
+impl DeviceValidationState {
+    fn active_identity(&self) -> (u64, u64) {
+        (
+            self.active_owner.load(Ordering::Relaxed),
+            self.active_generation.load(Ordering::Relaxed),
+        )
+    }
+
+    fn completed_result(&self, token: DeviceValidationToken) -> Option<u32> {
+        let slot = &self.completed[token.generation() as usize % DEVICE_VALIDATION_COMPLETED_SLOTS];
+        // These fields form one logical record. Sequential consistency keeps a
+        // reader that still sees the old generation from accepting owner/flags
+        // from a concurrent slot reuse.
+        let generation = slot.generation.load(Ordering::SeqCst);
+        if generation != token.generation() {
+            return None;
+        }
+        let owner = slot.owner.load(Ordering::SeqCst);
+        let flags = slot.flags.load(Ordering::SeqCst);
+        if slot.generation.load(Ordering::SeqCst) != generation || owner != token.owner().get() {
+            return None;
+        }
+        Some(flags)
+    }
+
+    fn record_completed(&self, token: DeviceValidationToken, flags: u32) {
+        let slot = &self.completed[token.generation() as usize % DEVICE_VALIDATION_COMPLETED_SLOTS];
+        slot.generation.store(0, Ordering::SeqCst);
+        slot.owner.store(token.owner().get(), Ordering::SeqCst);
+        slot.flags.store(flags, Ordering::SeqCst);
+        slot.generation.store(token.generation(), Ordering::SeqCst);
     }
 }
 
@@ -669,7 +729,7 @@ pub struct CudaRuntime {
     /// Exactly one provider-wide deferred validation generation may be
     /// outstanding. Its executor owner and generation are retained here so a
     /// foreign binding, reset, or executor teardown cannot consume or clear it.
-    validation_state: Mutex<DeviceValidationState>,
+    validation_state: DeviceValidationState,
     /// When set, the public [`CudaRuntime::synchronize`] becomes a no-op so the
     /// redundant trailing per-op eager device syncs (issued by kernels on the
     /// `!capturing` branch) are elided and launches pipeline on the in-order EP
@@ -896,7 +956,7 @@ impl CudaRuntime {
             fences: Mutex::new(HashMap::new()),
             next_fence_id: AtomicU64::new(1),
             capture_error: 0,
-            validation_state: Mutex::new(DeviceValidationState::default()),
+            validation_state: DeviceValidationState::default(),
             defer_eager_sync: AtomicBool::new(
                 // On by default; only an explicit falsey value restores the old
                 // always-sync eager path (escape hatch for debugging).
@@ -1064,71 +1124,139 @@ impl CudaRuntime {
         &self,
         owner: DeviceValidationOwner,
     ) -> Result<DeviceValidationToken> {
-        let mut state = self.validation_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep: device validation ownership lock is poisoned".into())
-        })?;
-        if let Some(active) = state.active {
-            let token = match active {
-                ActiveDeviceValidation::Pending(token)
-                | ActiveDeviceValidation::Consuming(token) => token,
-            };
+        if self
+            .validation_state
+            .phase
+            .compare_exchange(
+                DEVICE_VALIDATION_IDLE,
+                DEVICE_VALIDATION_OPENING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            let phase = self.validation_state.phase.load(Ordering::Acquire);
+            if phase == DEVICE_VALIDATION_OPENING {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: deferred device validation submission is already opening; \
+                     retry owner={} after the current submission boundary",
+                    owner.get()
+                )));
+            }
+            let (active_owner, active_generation) = self.validation_state.active_identity();
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep: previous deferred device validation is still pending (owner={} \
                  generation={}); consume that owner's bound output or finish its request \
                  boundary before submitting owner={}",
-                token.owner().get(),
-                token.generation(),
+                active_owner,
+                active_generation,
                 owner.get()
             )));
         }
-        let generation = state.next_generation;
-        state.next_generation = generation.checked_add(1).ok_or_else(|| {
-            EpError::KernelFailed(
-                "cuda_ep: device validation generation space exhausted; rebuild the provider"
-                    .into(),
-            )
-        })?;
-        self.reset_capture_error()?;
+        let generation = match self.validation_state.next_generation.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |generation| generation.checked_add(1),
+        ) {
+            Ok(generation) => generation,
+            Err(_) => {
+                self.validation_state
+                    .phase
+                    .store(DEVICE_VALIDATION_IDLE, Ordering::Release);
+                return Err(EpError::KernelFailed(
+                    "cuda_ep: device validation generation space exhausted; rebuild the provider"
+                        .into(),
+                ));
+            }
+        };
+        if let Err(error) = self.reset_capture_error() {
+            self.validation_state
+                .phase
+                .store(DEVICE_VALIDATION_IDLE, Ordering::Release);
+            return Err(error);
+        }
         let token = DeviceValidationToken::new(owner, generation);
-        state.active = Some(ActiveDeviceValidation::Pending(token));
+        self.validation_state
+            .active_owner
+            .store(owner.get(), Ordering::Relaxed);
+        self.validation_state
+            .active_generation
+            .store(generation, Ordering::Relaxed);
+        self.validation_state
+            .phase
+            .store(DEVICE_VALIDATION_PENDING, Ordering::Release);
         Ok(token)
     }
 
     /// Consume exactly `token` after the caller established a host boundary.
     /// Foreign and stale tokens fail without reading or clearing the latch.
     pub(crate) fn consume_device_validation(&self, token: DeviceValidationToken) -> Result<u32> {
-        {
-            let mut state = self.validation_state.lock().map_err(|_| {
-                EpError::KernelFailed(
-                    "cuda_ep: device validation ownership lock is poisoned".into(),
-                )
-            })?;
-            match state.active {
-                Some(ActiveDeviceValidation::Pending(active)) if active == token => {
-                    state.active = Some(ActiveDeviceValidation::Consuming(token));
+        if let Some(flags) = self.validation_state.completed_result(token) {
+            return Ok(flags);
+        }
+        loop {
+            match self.validation_state.phase.load(Ordering::Acquire) {
+                DEVICE_VALIDATION_PENDING => {
+                    let (active_owner, active_generation) = self.validation_state.active_identity();
+                    if active_owner != token.owner().get()
+                        || active_generation != token.generation()
+                    {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep: validation token owner={} generation={} cannot consume \
+                             active owner={} generation={}; only the submitting executor or its \
+                             bound output may consume this result",
+                            token.owner().get(),
+                            token.generation(),
+                            active_owner,
+                            active_generation
+                        )));
+                    }
+                    if self
+                        .validation_state
+                        .phase
+                        .compare_exchange(
+                            DEVICE_VALIDATION_PENDING,
+                            DEVICE_VALIDATION_CONSUMING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
                 }
-                Some(ActiveDeviceValidation::Pending(active)) => {
+                DEVICE_VALIDATION_CONSUMING => {
+                    let (active_owner, active_generation) = self.validation_state.active_identity();
+                    if active_owner == token.owner().get()
+                        && active_generation == token.generation()
+                    {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep: validation owner={active_owner} \
+                             generation={active_generation} is already being consumed"
+                        )));
+                    }
                     return Err(EpError::KernelFailed(format!(
                         "cuda_ep: validation token owner={} generation={} cannot consume active \
                          owner={} generation={}; only the submitting executor or its bound output \
                          may consume this result",
                         token.owner().get(),
                         token.generation(),
-                        active.owner().get(),
-                        active.generation()
+                        active_owner,
+                        active_generation
                     )));
                 }
-                Some(ActiveDeviceValidation::Consuming(active)) => {
+                DEVICE_VALIDATION_OPENING => {
                     return Err(EpError::KernelFailed(format!(
-                        "cuda_ep: validation owner={} generation={} is already being consumed; \
-                         requested owner={} generation={}",
-                        active.owner().get(),
-                        active.generation(),
+                        "cuda_ep: validation token owner={} generation={} cannot be consumed while \
+                         another submission is opening",
                         token.owner().get(),
                         token.generation()
                     )));
                 }
-                None => {
+                DEVICE_VALIDATION_IDLE => {
+                    if let Some(flags) = self.validation_state.completed_result(token) {
+                        return Ok(flags);
+                    }
                     return Err(EpError::KernelFailed(format!(
                         "cuda_ep: validation token owner={} generation={} is stale or was never \
                          submitted",
@@ -1136,17 +1264,27 @@ impl CudaRuntime {
                         token.generation()
                     )));
                 }
+                phase => {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep: device validation state has invalid phase {phase}"
+                    )));
+                }
             }
         }
         let result = self
             .check_capture_error()
             .and_then(|flags| self.reset_capture_error().map(|()| flags));
-        let mut state = self.validation_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep: device validation ownership lock is poisoned".into())
-        })?;
         match &result {
-            Ok(_) => state.active = None,
-            Err(_) => state.active = Some(ActiveDeviceValidation::Pending(token)),
+            Ok(flags) => {
+                self.validation_state.record_completed(token, *flags);
+                self.validation_state
+                    .phase
+                    .store(DEVICE_VALIDATION_IDLE, Ordering::Release);
+            }
+            Err(_) => self
+                .validation_state
+                .phase
+                .store(DEVICE_VALIDATION_PENDING, Ordering::Release),
         }
         result
     }

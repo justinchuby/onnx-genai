@@ -1586,6 +1586,9 @@ pub trait ExecutionProvider: Send + Sync {
     /// Consume the exact top-level device-validation generation after a host
     /// synchronization boundary. Implementations must reject a foreign, stale,
     /// or concurrently consumed token without clearing the active result.
+    /// Re-consuming an exact recently completed token must return its cached
+    /// result idempotently so sibling output bindings and executor teardown
+    /// observe the same sticky outcome without shared per-submission allocation.
     fn consume_device_validation_error(&self, _token: DeviceValidationToken) -> Result<u32> {
         Ok(0)
     }

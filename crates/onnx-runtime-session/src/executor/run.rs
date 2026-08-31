@@ -21,13 +21,6 @@ impl Executor {
     pub(super) fn begin_device_validation_submission(
         &mut self,
     ) -> Result<DeviceValidationSubmission> {
-        if self
-            .pending_device_validation
-            .as_ref()
-            .is_some_and(|receipt| receipt.is_consumed())
-        {
-            self.pending_device_validation = None;
-        }
         let submission = DeviceValidationSubmission::begin(&self.ep, self.validation_owner)?;
         self.pending_device_validation = Some(submission.receipt());
         Ok(submission)
@@ -165,7 +158,7 @@ impl Executor {
         self.ep.sync()?;
         let flags = match self.pending_device_validation.take() {
             Some(receipt) if receipt.is_consumed() => 0,
-            Some(receipt) => match receipt.consume_after_sync() {
+            Some(receipt) => match receipt.consume_after_sync(self.ep.as_ref()) {
                 Ok(flags) => flags,
                 Err(error) => {
                     self.pending_device_validation = Some(receipt);

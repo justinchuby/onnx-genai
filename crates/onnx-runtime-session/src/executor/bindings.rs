@@ -1219,7 +1219,7 @@ impl Executor {
     pub(crate) fn check_device_capture_error(&self) -> Result<u32> {
         self.ep.sync()?;
         match &self.pending_device_validation {
-            Some(receipt) => receipt.consume_after_sync(),
+            Some(receipt) => receipt.consume_after_sync(self.ep.as_ref()),
             None => Ok(0),
         }
     }
@@ -1331,7 +1331,7 @@ impl Executor {
         };
         for binding in bindings {
             if binding.output_name().is_some() {
-                binding.set_device_validation(Arc::clone(receipt));
+                binding.set_device_validation(receipt.token());
             }
         }
     }

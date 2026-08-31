@@ -23,7 +23,8 @@
 //! owning execution provider's host-copy API, so the rest of the crate — the
 //! executor and the public API — is safe Rust over the EP contract.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use onnx_runtime_ep_api::{
     DeviceBuffer, DeviceGraphToken, DeviceValidationToken, ExecutionProvider,
@@ -319,47 +320,48 @@ impl ExternalMemorySpec {
     }
 }
 
-/// An externally owned persistent device allocation bound to a graph input and
-/// optionally aliased by a graph output.
+/// Exact authority for one deferred-validation generation.
+///
+/// The token and sticky local result live inline: constructing or copying
+/// authority into an output binding performs no heap allocation or locking.
+/// The provider's bounded completed-result table makes separate receipts for
+/// sibling outputs and executor teardown idempotent.
 pub(crate) struct DeviceValidationReceipt {
-    ep: Arc<dyn ExecutionProvider>,
     token: DeviceValidationToken,
-    result: Mutex<Option<u32>>,
+    result: AtomicU64,
 }
 
 impl DeviceValidationReceipt {
-    pub(crate) fn new(ep: Arc<dyn ExecutionProvider>, token: DeviceValidationToken) -> Arc<Self> {
-        Arc::new(Self {
-            ep,
+    const UNCONSUMED: u64 = u64::MAX;
+
+    pub(crate) const fn new(token: DeviceValidationToken) -> Self {
+        Self {
             token,
-            result: Mutex::new(None),
-        })
+            result: AtomicU64::new(Self::UNCONSUMED),
+        }
     }
 
-    pub(crate) fn consume_after_sync(&self) -> Result<u32> {
-        let mut result = self.result.lock().map_err(|_| {
-            SessionError::Internal(format!(
-                "device validation receipt owner={} generation={} is poisoned",
-                self.token.owner().get(),
-                self.token.generation()
-            ))
-        })?;
-        if let Some(flags) = *result {
-            return Ok(flags);
+    pub(crate) fn consume_after_sync(&self, ep: &dyn ExecutionProvider) -> Result<u32> {
+        let result = self.result.load(Ordering::Acquire);
+        if result != Self::UNCONSUMED {
+            return Ok(result as u32);
         }
-        let flags = self.ep.consume_device_validation_error(self.token)?;
-        *result = Some(flags);
+        let flags = ep.consume_device_validation_error(self.token)?;
+        self.result.store(u64::from(flags), Ordering::Release);
         Ok(flags)
     }
 
     pub(crate) fn is_consumed(&self) -> bool {
-        self.result
-            .lock()
-            .map(|result| result.is_some())
-            .unwrap_or(false)
+        self.result.load(Ordering::Acquire) != Self::UNCONSUMED
+    }
+
+    pub(crate) const fn token(&self) -> DeviceValidationToken {
+        self.token
     }
 }
 
+/// An externally owned persistent device allocation bound to a graph input and
+/// optionally aliased by a graph output.
 pub struct DeviceIoBinding {
     input_name: String,
     bind_input: bool,
@@ -380,7 +382,7 @@ pub struct DeviceIoBinding {
     device_graph_token: Option<DeviceGraphToken>,
     /// Exact deferred-validation generation whose output was submitted into
     /// this binding. Foreign bindings never receive this receipt.
-    device_validation: Option<Arc<DeviceValidationReceipt>>,
+    device_validation: Option<DeviceValidationReceipt>,
 }
 
 impl DeviceIoBinding {
@@ -611,8 +613,8 @@ impl DeviceIoBinding {
         self.device_graph_token = Some(token);
     }
 
-    pub(crate) fn set_device_validation(&mut self, receipt: Arc<DeviceValidationReceipt>) {
-        self.device_validation = Some(receipt);
+    pub(crate) fn set_device_validation(&mut self, token: DeviceValidationToken) {
+        self.device_validation = Some(DeviceValidationReceipt::new(token));
     }
 
     pub fn set_logical_shape(&mut self, shape: Vec<usize>) -> Result<()> {
@@ -830,7 +832,7 @@ impl DeviceIoBinding {
         let Some(receipt) = &self.device_validation else {
             return Ok(());
         };
-        let flags = receipt.consume_after_sync()?;
+        let flags = receipt.consume_after_sync(self.allocator.as_ref())?;
         if flags != 0 {
             return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
                 "{}: device validation failed (flags=0x{flags:x})",
@@ -1059,7 +1061,7 @@ impl Drop for DeviceIoBinding {
                 && let Some(receipt) = &self.device_validation
                 && !receipt.is_consumed()
             {
-                match receipt.consume_after_sync() {
+                match receipt.consume_after_sync(self.allocator.as_ref()) {
                     Ok(0) => {}
                     Ok(flags) => eprintln!(
                         "[onnx-runtime-session] device binding drop consumed its deferred \
