@@ -2,11 +2,10 @@
 # consumes the previous token embedding, recycled hidden activation, and draft
 # KV state. Names in the schema remain model-agnostic; artifact paths identify
 # this concrete Qwen3 package.
-schema_version: v1
+schema_version: v1.6
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+    manifest: {}
     inputs:
       request.input_ids:
         contract: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
@@ -150,6 +149,8 @@ pipeline:
               proposer:
                 recycled_hidden: {input: recycled_hidden, output: next_hidden}
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: proposer
   target: verifier
   proposal_execution:
@@ -161,8 +162,11 @@ speculative:
     - {state: recycled_hidden, input: recycled_hidden, output: next_hidden}
   port_bindings:
     target_hidden_context: fused_hidden
-  shared_weights: [target_embedding.f32]
+  shared_weights: [{component: verifier, initializer: target_embedding.f32}]
   vocabulary: {kind: mapped, artifact: draft_to_target.i64}
   max_proposal_width: 6
   distribution_preserving: true
+  verification:
+    target_output: {component: verifier, output: logits}
+    accepted_path: {kind: runtime, binding: accepted_prefix}
   rollback_state: [target_cache, draft_cache, recycled_hidden]

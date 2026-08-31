@@ -4,7 +4,7 @@ use anyhow::Context;
 use axum::response::sse::Event;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use onnx_genai_engine::pipeline::{
-    OutputFinality, TypedRevisionOperation, WorkflowOutputPublication,
+    OutputFinality, TurnAbortReason, TypedRevisionOperation, WorkflowOutputPublication,
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -182,6 +182,13 @@ pub(crate) fn buffered_workflow_publication(
             TypedRevisionOperation::Finalize => "finalize",
         }
     }
+    fn abort_reason(reason: TurnAbortReason) -> &'static str {
+        match reason {
+            TurnAbortReason::ExecutionFailure => "execution_failure",
+            TurnAbortReason::Cancellation => "cancellation",
+            TurnAbortReason::CommitFailure => "commit_failure",
+        }
+    }
     fn payload(value: &onnx_genai_ort::Value) -> anyhow::Result<serde_json::Value> {
         Ok(serde_json::json!({
             "dtype": format!("{:?}", value.dtype()),
@@ -228,6 +235,33 @@ pub(crate) fn buffered_workflow_publication(
             "operation": operation(envelope.operation),
             "payload": envelope.payload.as_ref().map(payload).transpose()?,
             "finality": finality(envelope.finality),
+        })),
+        WorkflowOutputPublication::TransactionCommitted {
+            transaction,
+            baseline,
+        } => Ok(serde_json::json!({
+            "operation": "commit",
+            "transaction": transaction.0,
+            "baseline": baseline.0,
+        })),
+        WorkflowOutputPublication::AbortToBaseline {
+            transaction,
+            baseline,
+            reason,
+            streams,
+        } => Ok(serde_json::json!({
+            "operation": "abort_to_baseline",
+            "transaction": transaction.0,
+            "baseline": baseline.0,
+            "reason": abort_reason(*reason),
+            "streams": streams.iter().map(|stream| serde_json::json!({
+                "output": stream.output,
+                "stream": stream.stream.0,
+                "head": stream.head,
+                "sequence": stream.sequence,
+                "lineage": stream.lineage,
+                "closed": stream.closed,
+            })).collect::<Vec<_>>(),
         })),
     }
 }
@@ -475,9 +509,9 @@ mod reasoning_wire_tests {
         sse_workflow_publication_data, workflow_publication_event,
     };
     use onnx_genai_engine::pipeline::{
-        OutputFinality, OutputLineage, OutputRevision, OutputSequence, OutputStreamId,
-        TurnTransactionId, TypedRevisionEnvelope, TypedRevisionOperation,
-        WorkflowOutputPublication,
+        OutputFinality, OutputLineage, OutputRevision, OutputSequence, OutputStreamBaseline,
+        OutputStreamId, TurnAbortReason, TurnBaselineId, TurnTransactionId, TypedRevisionEnvelope,
+        TypedRevisionOperation, WorkflowOutputPublication,
     };
 
     // Reasoning rides on its own `reasoning_content` key and never touches
@@ -574,6 +608,68 @@ mod reasoning_wire_tests {
         assert_eq!(buffered[3]["finality"], "final");
         let _ = workflow_publication_event(&publications[0])
             .expect("SSE event accepts the same envelope");
+    }
+
+    #[test]
+    fn sse_preserves_provisional_commit_and_abort_reconciliation_records() {
+        let revision = WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
+            version: "1".to_string(),
+            transaction: TurnTransactionId(15),
+            output: "answer".to_string(),
+            stream: OutputStreamId("analysis".to_string()),
+            sequence: OutputSequence(1),
+            revision: OutputRevision(1),
+            lineage: OutputLineage(1),
+            base: OutputLineage(0),
+            operation: TypedRevisionOperation::Append,
+            payload: Some(
+                onnx_genai_ort::Value::from_slice_i64(&[7], &[1]).expect("revision payload"),
+            ),
+            finality: OutputFinality::Provisional,
+        });
+        let committed = WorkflowOutputPublication::TransactionCommitted {
+            transaction: TurnTransactionId(15),
+            baseline: TurnBaselineId(15),
+        };
+        let aborted = WorkflowOutputPublication::AbortToBaseline {
+            transaction: TurnTransactionId(16),
+            baseline: TurnBaselineId(16),
+            reason: TurnAbortReason::Cancellation,
+            streams: vec![OutputStreamBaseline {
+                output: "answer".to_string(),
+                stream: OutputStreamId("analysis".to_string()),
+                head: 3,
+                sequence: 4,
+                lineage: 3,
+                closed: false,
+            }],
+        };
+
+        let commit_sequence = [&revision, &committed]
+            .into_iter()
+            .map(buffered_workflow_publication)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("commit sequence encodes");
+        assert_eq!(commit_sequence[0]["finality"], "provisional");
+        assert_eq!(commit_sequence[1]["operation"], "commit");
+        assert_eq!(commit_sequence[1]["transaction"], 15);
+
+        let abort_sequence = [&revision, &aborted]
+            .into_iter()
+            .map(sse_workflow_publication_data)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("abort sequence encodes");
+        let abort: serde_json::Value =
+            serde_json::from_str(&abort_sequence[1]).expect("abort is JSON");
+        assert_eq!(abort["operation"], "abort_to_baseline");
+        assert_eq!(abort["reason"], "cancellation");
+        assert_eq!(abort["streams"][0]["head"], 3);
+        assert!(
+            !abort_sequence
+                .iter()
+                .any(|event| event.contains("\"finality\":\"final\"")),
+            "an aborted provisional turn cannot gain success-shaped finality"
+        );
     }
 
     #[tokio::test]

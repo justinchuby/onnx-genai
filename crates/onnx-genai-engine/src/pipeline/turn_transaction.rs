@@ -53,6 +53,22 @@ pub struct OutputPublicationBaseline {
     pub payload: Option<Value>,
 }
 
+/// The transport-safe portion of an output stream's admission baseline.
+///
+/// Payload bytes deliberately do not select rollback: a receiver restores its
+/// own prior content by this stream identity and these immutable cursors. This
+/// keeps map traversal, payload shape, and output ordering out of the
+/// transaction reconciliation contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputStreamBaseline {
+    pub output: String,
+    pub stream: OutputStreamId,
+    pub head: u64,
+    pub sequence: u64,
+    pub lineage: u64,
+    pub closed: bool,
+}
+
 impl std::fmt::Debug for OutputPublicationBaseline {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -89,7 +105,7 @@ pub enum TurnAbortReason {
 /// This is intentionally not an output revision operation.  Its identity
 /// points at the transaction and complete baseline that own every provisional
 /// state/effect/output advance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnTransactionOutcome {
     Committed {
         transaction: TurnTransactionId,
@@ -99,7 +115,48 @@ pub enum TurnTransactionOutcome {
         transaction: TurnTransactionId,
         baseline: TurnBaselineId,
         reason: TurnAbortReason,
+        /// Every stream that can have been affected by this admitted turn,
+        /// including dynamically named streams with the empty baseline.
+        streams: Vec<OutputStreamBaseline>,
     },
+}
+
+/// The sole terminal decision made for an admitted turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnTransactionResolution {
+    Committed,
+    Aborted,
+}
+
+impl std::fmt::Display for TurnTransactionResolution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Committed => formatter.write_str("committed"),
+            Self::Aborted => formatter.write_str("aborted"),
+        }
+    }
+}
+
+/// A caller attempted to mutate or resolve a turn after its terminal decision.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "turn transaction {transaction:?} is already {resolution}; cannot {operation}. \
+     Admit a new turn before staging or resolving more work"
+)]
+pub struct TurnTransactionResolutionError {
+    pub transaction: TurnTransactionId,
+    pub resolution: TurnTransactionResolution,
+    pub operation: &'static str,
+}
+
+/// Commit can fail either because the turn was already resolved or while
+/// preparing its complete atomic write set.
+#[derive(Debug, thiserror::Error)]
+pub enum TurnTransactionCommitError {
+    #[error(transparent)]
+    Resolved(#[from] TurnTransactionResolutionError),
+    #[error(transparent)]
+    Prepare(#[from] anyhow::Error),
 }
 
 /// Publication visibility selected at admission.
@@ -108,9 +165,20 @@ pub enum TurnPublicationMode {
     /// Outputs remain in the transaction's working set until commit.
     #[default]
     CommitOnly,
-    /// Reserved for the typed revision protocol.  It must be rejected before
-    /// mutation if its sink cannot retract by transaction identity.
+    /// Output publication uses the typed revision protocol and a terminal
+    /// transaction outcome for deterministic reconciliation.
     ProvisionalRevisions,
+}
+
+impl From<onnx_genai_metadata::WorkflowPublicationMode> for TurnPublicationMode {
+    fn from(value: onnx_genai_metadata::WorkflowPublicationMode) -> Self {
+        match value {
+            onnx_genai_metadata::WorkflowPublicationMode::CommitOnly => Self::CommitOnly,
+            onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions => {
+                Self::ProvisionalRevisions
+            }
+        }
+    }
 }
 
 /// Typed admission failure, distinct from an exclusive-lease rejection.
@@ -121,11 +189,6 @@ pub enum TurnTransactionAdmissionError {
          writer in the canonical state plan; join its writers before executing"
     )]
     MissingFinalWriter { state: String },
-    #[error(
-        "cannot admit provisional output mode: output '{output}' has no transaction-addressable \
-         retraction sink; use commit_only or install a typed revision sink before executing"
-    )]
-    UnretractableProvisionalOutput { output: String },
     #[error(
         "cannot admit an atomic turn: failed to snapshot semantic session state '{state}': \
          {message}"
@@ -165,6 +228,7 @@ pub(crate) struct TurnTransaction {
     staged_effects: BTreeMap<String, u64>,
     staged_outputs: BTreeMap<(String, OutputStreamId), CommittedOutputState>,
     publication_mode: TurnPublicationMode,
+    resolution: Option<TurnTransactionResolution>,
 }
 
 impl TurnTransaction {
@@ -186,6 +250,7 @@ impl TurnTransaction {
             staged_effects: BTreeMap::new(),
             staged_outputs: BTreeMap::new(),
             publication_mode: TurnPublicationMode::CommitOnly,
+            resolution: None,
         }
     }
 
@@ -251,15 +316,6 @@ impl TurnTransaction {
         let outputs = outputs
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
-        for output in &outputs {
-            if publication_mode == TurnPublicationMode::ProvisionalRevisions {
-                return Err(
-                    TurnTransactionAdmissionError::UnretractableProvisionalOutput {
-                        output: output.clone(),
-                    },
-                );
-            }
-        }
         if let Some(session) = session {
             for ((owner, output, stream), committed) in session_outputs {
                 if owner != session || !outputs.contains(output) {
@@ -313,7 +369,19 @@ impl TurnTransaction {
             staged_effects,
             staged_outputs,
             publication_mode,
+            resolution: None,
         })
+    }
+
+    fn ensure_open(&self, operation: &'static str) -> Result<(), TurnTransactionResolutionError> {
+        match self.resolution {
+            None => Ok(()),
+            Some(resolution) => Err(TurnTransactionResolutionError {
+                transaction: self.baseline.transaction,
+                resolution,
+                operation,
+            }),
+        }
     }
 
     pub(crate) fn baseline_state(&self, state: &str) -> Option<&TurnStateBaseline> {
@@ -327,6 +395,14 @@ impl TurnTransaction {
         self.baseline.transaction
     }
 
+    pub(crate) fn baseline_id(&self) -> TurnBaselineId {
+        self.baseline.id
+    }
+
+    pub(crate) fn publication_mode(&self) -> TurnPublicationMode {
+        self.publication_mode
+    }
+
     pub(crate) fn output_baselines(
         &self,
     ) -> anyhow::Result<BTreeMap<(String, OutputStreamId), OutputPublicationBaseline>> {
@@ -337,9 +413,15 @@ impl TurnTransaction {
             .collect()
     }
 
-    pub(crate) fn stage_state(&mut self, state: StateIdentity, value: Value) {
+    pub(crate) fn stage_state(
+        &mut self,
+        state: StateIdentity,
+        value: Value,
+    ) -> Result<(), TurnTransactionResolutionError> {
+        self.ensure_open("stage semantic state")?;
         self.staged_states
             .insert(state, TurnStateBaseline::Present(value));
+        Ok(())
     }
 
     /// Replace the complete per-stream output write set resolved by the
@@ -348,14 +430,31 @@ impl TurnTransaction {
     pub(crate) fn stage_outputs(
         &mut self,
         outputs: BTreeMap<(String, OutputStreamId), CommittedOutputState>,
-    ) {
+    ) -> Result<(), TurnTransactionResolutionError> {
+        self.ensure_open("stage output publication state")?;
         self.staged_outputs = outputs;
+        Ok(())
     }
 
-    pub(crate) fn stage_effects(&mut self) {
+    pub(crate) fn stage_effects(&mut self) -> Result<(), TurnTransactionResolutionError> {
+        self.ensure_open("stage effect cursors")?;
         for cursor in self.staged_effects.values_mut() {
             *cursor = cursor.saturating_add(1);
         }
+        Ok(())
+    }
+
+    /// Resolve a runtime-owned participant whose durable state is committed by
+    /// its enclosing owner rather than the workflow maps below.
+    pub(crate) fn commit_runtime_participant(
+        &mut self,
+    ) -> Result<TurnTransactionOutcome, TurnTransactionResolutionError> {
+        self.ensure_open("commit runtime participant")?;
+        self.resolution = Some(TurnTransactionResolution::Committed);
+        Ok(TurnTransactionOutcome::Committed {
+            transaction: self.baseline.transaction,
+            baseline: self.baseline.id,
+        })
     }
 
     /// Prepare participant-scoped writes, reserve every map before mutation,
@@ -367,8 +466,10 @@ impl TurnTransaction {
         session_state: &mut HashMap<(String, String), Value>,
         session_effects: &mut HashMap<(String, String), u64>,
         session_outputs: &mut HashMap<(String, String, OutputStreamId), CommittedOutputState>,
-    ) -> anyhow::Result<TurnTransactionOutcome> {
+    ) -> Result<TurnTransactionOutcome, TurnTransactionCommitError> {
+        self.ensure_open("commit durable state")?;
         let Some(session) = &self.session else {
+            self.resolution = Some(TurnTransactionResolution::Committed);
             return Ok(TurnTransactionOutcome::Committed {
                 transaction: self.baseline.transaction,
                 baseline: self.baseline.id,
@@ -424,26 +525,56 @@ impl TurnTransaction {
         for (key, state) in output_writes {
             session_outputs.insert(key, state);
         }
+        self.resolution = Some(TurnTransactionResolution::Committed);
         Ok(TurnTransactionOutcome::Committed {
             transaction: self.baseline.transaction,
             baseline: self.baseline.id,
         })
     }
 
-    pub(crate) fn committed(&self) -> TurnTransactionOutcome {
-        TurnTransactionOutcome::Committed {
-            transaction: self.baseline.transaction,
-            baseline: self.baseline.id,
-        }
+    pub(crate) fn abort(
+        &mut self,
+        reason: TurnAbortReason,
+    ) -> Result<TurnTransactionOutcome, TurnTransactionResolutionError> {
+        let streams = self.baseline.outputs.keys().cloned().collect::<Vec<_>>();
+        self.abort_for_streams(reason, streams)
     }
 
-    pub(crate) fn abort(&self, reason: TurnAbortReason) -> TurnTransactionOutcome {
-        let _ = self.publication_mode;
-        TurnTransactionOutcome::AbortToBaseline {
+    /// Build the one abort outcome for the streams the publication authority
+    /// actually touched. A stream first introduced by this turn had no durable
+    /// entry at admission, so its exact baseline is the empty cursor state.
+    pub(crate) fn abort_for_streams(
+        &mut self,
+        reason: TurnAbortReason,
+        streams: impl IntoIterator<Item = (String, OutputStreamId)>,
+    ) -> Result<TurnTransactionOutcome, TurnTransactionResolutionError> {
+        self.ensure_open("abort to the admitted baseline")?;
+        let mut streams = streams
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|(output, stream)| {
+                let baseline = self.baseline.outputs.get(&(output.clone(), stream.clone()));
+                OutputStreamBaseline {
+                    output,
+                    stream,
+                    head: baseline.map_or(0, |value| value.head),
+                    sequence: baseline.map_or(0, |value| value.cursor),
+                    lineage: baseline.map_or(0, |value| value.lineage),
+                    closed: baseline.is_some_and(|value| value.closed),
+                }
+            })
+            .collect::<Vec<_>>();
+        streams.sort_by(|left, right| {
+            (&left.output, &left.stream).cmp(&(&right.output, &right.stream))
+        });
+        self.resolution = Some(TurnTransactionResolution::Aborted);
+        Ok(TurnTransactionOutcome::AbortToBaseline {
             transaction: self.baseline.transaction,
             baseline: self.baseline.id,
             reason,
-        }
+            streams,
+        })
     }
 }
 
@@ -530,6 +661,29 @@ mod tests {
         })
     }
 
+    fn assert_resolution_error(
+        error: TurnTransactionResolutionError,
+        transaction: u64,
+        resolution: TurnTransactionResolution,
+        operation: &'static str,
+    ) {
+        assert_eq!(
+            error,
+            TurnTransactionResolutionError {
+                transaction: TurnTransactionId(transaction),
+                resolution,
+                operation,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "turn transaction TurnTransactionId({transaction}) is already {resolution}; \
+                 cannot {operation}. Admit a new turn before staging or resolving more work"
+            )
+        );
+    }
+
     #[test]
     fn commit_advances_complete_effect_and_output_write_set() -> anyhow::Result<()> {
         let mut states = HashMap::new();
@@ -552,11 +706,11 @@ mod tests {
             &outputs,
             TurnPublicationMode::CommitOnly,
         )?;
-        turn.stage_effects();
+        turn.stage_effects()?;
         turn.stage_outputs(BTreeMap::from([(
             ("tokens".to_string(), OutputStreamId("text".to_string())),
             output_state(5, 6, 7, false),
-        )]));
+        )]))?;
         assert_eq!(
             turn.commit(&mut states, &mut effects, &mut outputs)?,
             TurnTransactionOutcome::Committed {
@@ -581,7 +735,7 @@ mod tests {
 
     #[test]
     fn abort_is_a_transaction_outcome_not_an_output_operation() -> anyhow::Result<()> {
-        let turn = TurnTransaction::admit(
+        let mut turn = TurnTransaction::admit(
             TurnTransactionId(11),
             None,
             &ResolvedStatePlan::default(),
@@ -593,19 +747,20 @@ mod tests {
             TurnPublicationMode::CommitOnly,
         )?;
         assert_eq!(
-            turn.abort(TurnAbortReason::Cancellation),
+            turn.abort(TurnAbortReason::Cancellation)?,
             TurnTransactionOutcome::AbortToBaseline {
                 transaction: TurnTransactionId(11),
                 baseline: TurnBaselineId(11),
                 reason: TurnAbortReason::Cancellation,
+                streams: Vec::new(),
             }
         );
         Ok(())
     }
 
     #[test]
-    fn provisional_mode_is_refused_before_any_mutation() {
-        let error = TurnTransaction::admit(
+    fn provisional_mode_preserves_the_admission_baseline() -> anyhow::Result<()> {
+        let mut turn = TurnTransaction::admit(
             TurnTransactionId(1),
             Some("session"),
             &ResolvedStatePlan::default(),
@@ -615,13 +770,26 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             TurnPublicationMode::ProvisionalRevisions,
-        )
-        .expect_err("an unretractable provisional output must fail admission");
-        assert!(matches!(
-            error,
-            TurnTransactionAdmissionError::UnretractableProvisionalOutput { output }
-            if output == "tokens"
-        ));
+        )?;
+        let TurnTransactionOutcome::AbortToBaseline { streams, .. } = turn.abort_for_streams(
+            TurnAbortReason::Cancellation,
+            [("tokens".to_string(), OutputStreamId("named".to_string()))],
+        )?
+        else {
+            unreachable!("abort always has a baseline");
+        };
+        assert_eq!(
+            streams,
+            vec![OutputStreamBaseline {
+                output: "tokens".to_string(),
+                stream: OutputStreamId("named".to_string()),
+                head: 0,
+                sequence: 0,
+                lineage: 0,
+                closed: false,
+            }]
+        );
+        Ok(())
     }
 
     #[test]
@@ -658,14 +826,45 @@ mod tests {
                 ("answer".to_string(), OutputStreamId("retry".to_string())),
                 output_state_with_payload(1, 2, 1, true, 10)?,
             ),
-        ]));
+        ]))?;
+        let TurnTransactionOutcome::AbortToBaseline {
+            transaction,
+            baseline,
+            reason,
+            streams,
+        } = aborted.abort_for_streams(
+            TurnAbortReason::Cancellation,
+            [
+                ("answer".to_string(), OutputStreamId("analysis".to_string())),
+                ("answer".to_string(), OutputStreamId("retry".to_string())),
+            ],
+        )?
+        else {
+            unreachable!("an aborted turn has a typed baseline");
+        };
+        assert_eq!(transaction, TurnTransactionId(31));
+        assert_eq!(baseline, TurnBaselineId(31));
+        assert_eq!(reason, TurnAbortReason::Cancellation);
         assert_eq!(
-            aborted.abort(TurnAbortReason::Cancellation),
-            TurnTransactionOutcome::AbortToBaseline {
-                transaction: TurnTransactionId(31),
-                baseline: TurnBaselineId(31),
-                reason: TurnAbortReason::Cancellation,
-            }
+            streams,
+            vec![
+                OutputStreamBaseline {
+                    output: "answer".to_string(),
+                    stream: OutputStreamId("analysis".to_string()),
+                    head: 2,
+                    sequence: 3,
+                    lineage: 2,
+                    closed: false,
+                },
+                OutputStreamBaseline {
+                    output: "answer".to_string(),
+                    stream: OutputStreamId("retry".to_string()),
+                    head: 0,
+                    sequence: 0,
+                    lineage: 0,
+                    closed: false,
+                },
+            ]
         );
         assert_eq!(
             (
@@ -712,7 +911,7 @@ mod tests {
                 ("answer".to_string(), OutputStreamId("retry".to_string())),
                 output_state_with_payload(1, 2, 1, true, 10)?,
             ),
-        ]));
+        ]))?;
         committed.commit(&mut states, &mut effects, &mut outputs)?;
         assert_eq!(
             (
@@ -734,6 +933,186 @@ mod tests {
                     .to_vec_i64()?,
             ),
             (6, true, vec![60], 4, true, 1, true, vec![10])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn abort_resolves_once_and_rejects_every_later_stage_or_terminal_action() -> anyhow::Result<()>
+    {
+        let mut states = HashMap::new();
+        let mut effects = HashMap::from([(("session".to_string(), "grammar".to_string()), 4)]);
+        let mut outputs = HashMap::from([(
+            key("session", "answer", "answer"),
+            output_state_with_payload(2, 2, 2, false, 7)?,
+        )]);
+        let durable_before = (
+            effects.clone(),
+            outputs[&key("session", "answer", "answer")].head,
+            outputs[&key("session", "answer", "answer")]
+                .payload
+                .as_ref()
+                .expect("baseline payload")
+                .to_raw_bytes()?,
+        );
+        let mut turn = TurnTransaction::admit(
+            TurnTransactionId(41),
+            Some("session"),
+            &ResolvedStatePlan::default(),
+            ["grammar".to_string()],
+            ["answer".to_string()],
+            &states,
+            &effects,
+            &outputs,
+            TurnPublicationMode::CommitOnly,
+        )?;
+
+        assert!(matches!(
+            turn.abort(TurnAbortReason::Cancellation)?,
+            TurnTransactionOutcome::AbortToBaseline { .. }
+        ));
+        assert_resolution_error(
+            turn.stage_state(
+                StateIdentity("memory".to_string()),
+                Value::from_slice_i64(&[9], &[1])?,
+            )
+            .expect_err("abort must close state staging"),
+            41,
+            TurnTransactionResolution::Aborted,
+            "stage semantic state",
+        );
+        assert_resolution_error(
+            turn.stage_effects()
+                .expect_err("abort must close effect staging"),
+            41,
+            TurnTransactionResolution::Aborted,
+            "stage effect cursors",
+        );
+        assert_resolution_error(
+            turn.stage_outputs(BTreeMap::new())
+                .expect_err("abort must close output staging"),
+            41,
+            TurnTransactionResolution::Aborted,
+            "stage output publication state",
+        );
+        let TurnTransactionCommitError::Resolved(error) = turn
+            .commit(&mut states, &mut effects, &mut outputs)
+            .expect_err("abort must close commit")
+        else {
+            panic!("post-abort commit returned a non-resolution error");
+        };
+        assert_resolution_error(
+            error,
+            41,
+            TurnTransactionResolution::Aborted,
+            "commit durable state",
+        );
+        assert_resolution_error(
+            turn.abort(TurnAbortReason::ExecutionFailure)
+                .expect_err("repeated abort must fail"),
+            41,
+            TurnTransactionResolution::Aborted,
+            "abort to the admitted baseline",
+        );
+        assert_eq!(
+            (
+                effects,
+                outputs[&key("session", "answer", "answer")].head,
+                outputs[&key("session", "answer", "answer")]
+                    .payload
+                    .as_ref()
+                    .expect("unchanged payload")
+                    .to_raw_bytes()?,
+            ),
+            durable_before,
+            "post-abort misuse must leave durable authority byte-for-byte unchanged"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn commit_resolves_once_and_rejects_every_later_stage_or_abort() -> anyhow::Result<()> {
+        let mut states = HashMap::new();
+        let mut effects = HashMap::from([(("session".to_string(), "grammar".to_string()), 4)]);
+        let mut outputs = HashMap::from([(
+            key("session", "answer", "answer"),
+            output_state_with_payload(2, 2, 2, false, 7)?,
+        )]);
+        let mut turn = TurnTransaction::admit(
+            TurnTransactionId(42),
+            Some("session"),
+            &ResolvedStatePlan::default(),
+            ["grammar".to_string()],
+            ["answer".to_string()],
+            &states,
+            &effects,
+            &outputs,
+            TurnPublicationMode::CommitOnly,
+        )?;
+        turn.stage_effects()?;
+        turn.stage_outputs(BTreeMap::from([(
+            ("answer".to_string(), OutputStreamId("answer".to_string())),
+            output_state_with_payload(3, 3, 3, true, 8)?,
+        )]))?;
+        assert!(matches!(
+            turn.commit(&mut states, &mut effects, &mut outputs)?,
+            TurnTransactionOutcome::Committed { .. }
+        ));
+        let durable_after = (
+            effects.clone(),
+            outputs[&key("session", "answer", "answer")].head,
+            outputs[&key("session", "answer", "answer")]
+                .payload
+                .as_ref()
+                .expect("committed payload")
+                .to_raw_bytes()?,
+        );
+
+        assert_resolution_error(
+            turn.stage_effects()
+                .expect_err("commit must close effect staging"),
+            42,
+            TurnTransactionResolution::Committed,
+            "stage effect cursors",
+        );
+        assert_resolution_error(
+            turn.stage_outputs(BTreeMap::new())
+                .expect_err("commit must close output staging"),
+            42,
+            TurnTransactionResolution::Committed,
+            "stage output publication state",
+        );
+        assert_resolution_error(
+            turn.abort(TurnAbortReason::Cancellation)
+                .expect_err("commit must close abort"),
+            42,
+            TurnTransactionResolution::Committed,
+            "abort to the admitted baseline",
+        );
+        let TurnTransactionCommitError::Resolved(error) = turn
+            .commit(&mut states, &mut effects, &mut outputs)
+            .expect_err("repeated commit must fail")
+        else {
+            panic!("repeated commit returned a non-resolution error");
+        };
+        assert_resolution_error(
+            error,
+            42,
+            TurnTransactionResolution::Committed,
+            "commit durable state",
+        );
+        assert_eq!(
+            (
+                effects,
+                outputs[&key("session", "answer", "answer")].head,
+                outputs[&key("session", "answer", "answer")]
+                    .payload
+                    .as_ref()
+                    .expect("unchanged committed payload")
+                    .to_raw_bytes()?,
+            ),
+            durable_after,
+            "post-commit misuse must leave durable authority byte-for-byte unchanged"
         );
         Ok(())
     }

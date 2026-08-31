@@ -8,14 +8,7 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - nested_control_flow
-      - loop_induction_values
-      - serving_service_contract
+    manifest: {}
     inputs:
       request.input_ids:
         contract:
@@ -104,7 +97,6 @@ pipeline:
           shape: [batch, generated]
           batch_layout: {kind: request_aligned, axis: 0}
         role: tokens
-        family: { kind: materialized }
         stage: pre_adapter
     components:
       model:

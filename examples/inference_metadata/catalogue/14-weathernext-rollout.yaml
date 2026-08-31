@@ -2,14 +2,7 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - serving_service_contract
-      - session_state_lease
-      - nested_control_flow
+    manifest: {}
     inputs:
       request.active:
         contract:
@@ -126,7 +119,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
-        family: { kind: materialized }
         stage: pre_adapter
     components:
       model:

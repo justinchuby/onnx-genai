@@ -55,14 +55,6 @@ pipeline:
     manifest:
       adapter_abis:
         onnx-genai.image-preprocess: '1'
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - nested_control_flow
-      - loop_induction_values
-      - serving_service_contract
-      - input_presence
     inputs:
       request.prompt_tokens:
         contract:
@@ -329,7 +321,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
-        family: { kind: materialized }
         stage: pre_adapter
       image:
         contract:
@@ -344,7 +335,6 @@ pipeline:
             axis: 0
         role: image
         value_range: negative_one_to_one
-        family: { kind: materialized }
         stage: pre_adapter
     components:
       embedding:

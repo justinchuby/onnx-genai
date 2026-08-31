@@ -4,8 +4,7 @@ const AUDIO_WORKFLOW: &str = r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     inputs: {}
     outputs:
       audio:
@@ -76,14 +75,7 @@ fn hierarchical_audio_workflow_admits_nested_frame_codebook_and_flow_loops() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-        - workflow_ssa
-        - linear_effects
-        - nested_control_flow
-        - loop_induction_values
-        - loop_carried_state
-        - typed_emit
+    manifest: {}
     inputs:
       active:
         contract: { dtype: bool, shape: [] }
@@ -231,9 +223,6 @@ pipeline:
     let metadata: InferenceMetadata =
         serde_yaml::from_str(document).expect("hierarchical audio workflow parses");
     validate_metadata(&metadata).expect("hierarchical audio workflow validates");
-    let capabilities = onnx_genai_metadata::derived_capabilities(&metadata);
-    assert!(capabilities.contains("nested_control_flow"));
-    assert!(capabilities.contains("loop_induction_values"));
 
     let workflow = &metadata.pipeline.expect("pipeline").workflow;
     let frame_loop = &workflow.steps[0];

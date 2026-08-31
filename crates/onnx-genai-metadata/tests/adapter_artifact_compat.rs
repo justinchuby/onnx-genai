@@ -80,8 +80,7 @@ adapters:
       bindings: [{ target: projection, weight_key: projection }]
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, parameter_adapters, heterogeneous_adapter_batching]
+    manifest: {}
     inputs:
       request.lora_segments:
         contract: { dtype: int64, shape: [batch, 2],

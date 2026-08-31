@@ -1,13 +1,7 @@
 schema_version: v1.5
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - nested_control_flow
-      - loop_induction_values
-      - typed_emit
+    manifest: {}
     inputs:
       request.input_ids:
         contract:

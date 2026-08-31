@@ -3,9 +3,6 @@
 # Every concrete number here is model DATA carried in the fixture; none of it is
 # baked into the schema or runtime. No model-family name appears anywhere.
 schema_version: v1
-required_capabilities:
-  - image_preprocessing_program
-  - packed_image_outputs
 preprocessing:
   image:
     transforms:

@@ -184,8 +184,13 @@ impl DecoderTurnParticipant {
         })
     }
 
-    pub(crate) fn committed(&self) -> crate::pipeline::TurnTransactionOutcome {
-        self.turn.committed()
+    pub(crate) fn commit(
+        mut self,
+    ) -> Result<
+        crate::pipeline::TurnTransactionOutcome,
+        crate::pipeline::TurnTransactionResolutionError,
+    > {
+        self.turn.commit_runtime_participant()
     }
 
     /// Publish commit-only token output after all decoder participants have
@@ -212,7 +217,7 @@ impl DecoderTurnParticipant {
     }
 
     pub(crate) fn abort(
-        self,
+        mut self,
         engine: &mut Engine,
         session_id: SessionId,
         state: &mut EngineSession,
@@ -259,7 +264,7 @@ impl DecoderTurnParticipant {
                  execution; retain the admitted draft session until the turn resolves"
             ),
         }
-        Ok(self.turn.abort(reason))
+        Ok(self.turn.abort(reason)?)
     }
 }
 
@@ -304,12 +309,17 @@ impl NativeDecoderTurnParticipant {
         })
     }
 
-    fn committed(&self) -> crate::pipeline::TurnTransactionOutcome {
-        self.turn.committed()
+    fn commit(
+        mut self,
+    ) -> Result<
+        crate::pipeline::TurnTransactionOutcome,
+        crate::pipeline::TurnTransactionResolutionError,
+    > {
+        self.turn.commit_runtime_participant()
     }
 
     fn abort(
-        self,
+        mut self,
         engine: &mut Engine,
         reason: crate::pipeline::TurnAbortReason,
     ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
@@ -336,7 +346,7 @@ impl NativeDecoderTurnParticipant {
             }
         }
         let _ = self.active_before;
-        Ok(self.turn.abort(reason))
+        Ok(self.turn.abort(reason)?)
     }
 }
 
@@ -695,6 +705,36 @@ impl Engine {
             .context("this package declares no tokenizer, so it cannot tokenize or decode text")
     }
 
+    pub(crate) fn tool_call_observer(
+        &self,
+        policy: &ToolCallPolicy,
+    ) -> anyhow::Result<Option<crate::pipeline::ToolCallStagedOutputObserver>> {
+        if !policy.observes_output() {
+            return Ok(None);
+        }
+        if let ToolCallPolicy::Specific { function } = policy {
+            anyhow::ensure!(
+                !function.is_empty(),
+                "specific tool-call policy requires a non-empty function name"
+            );
+        }
+        let declaration = self
+            .metadata
+            .package
+            .as_ref()
+            .and_then(|package| package.tool_protocol.as_ref())
+            .context(
+                "tool-call generation was requested, but package.tool_protocol is absent; declare \
+                 one exact supported identity/version pair or disable tool-call observation",
+            )?;
+        let protocol = onnx_genai_metadata::ToolProtocol::from_declaration(declaration)
+            .map_err(anyhow::Error::new)?;
+        Ok(Some(crate::pipeline::ToolCallStagedOutputObserver::new(
+            protocol,
+            policy.clone(),
+        )))
+    }
+
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         self.max_context_for_request(options)
     }
@@ -703,6 +743,7 @@ impl Engine {
     fn generate_native_cold_with_callback(
         &mut self,
         mut request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -712,6 +753,16 @@ impl Engine {
         reject_native_request_speculation(&request.options)?;
         request.options.validate()?;
         let mut options = request.options;
+        if matches!(options.speculative_mode, Some(SpeculativeMode::Mtp(_)))
+            && !options.selects_greedily()
+        {
+            self.metadata
+                .speculative
+                .as_ref()
+                .context("native MTP mode was selected without a canonical speculative contract")?
+                .admit_sampling()
+                .map_err(anyhow::Error::msg)?;
+        }
         self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
@@ -719,7 +770,14 @@ impl Engine {
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
-        let speculation_plan = native_speculation_plan(&options, &chain);
+        let mut tool_observer = self.tool_call_observer(&tool_call_policy)?;
+        // Speculation is an optimization. Until its accepted-token callback can
+        // carry a normal host stop, tool-aware requests use the ordinary
+        // declared loop rather than losing transactional observation.
+        let speculation_plan = tool_observer
+            .is_none()
+            .then(|| native_speculation_plan(&options, &chain))
+            .flatten();
         let scheduler_session_id = self.next_native_session_id();
         let scheduled = self.admit_generate_request_with_scheduler(
             scheduler_session_id,
@@ -856,12 +914,13 @@ impl Engine {
                     .native_session
                     .as_mut()
                     .context("native decoder session is unavailable")?;
-                native_session.generate_with_callback(
+                native_session.generate_with_callback_and_staged_observer(
                     &prompt_tokens,
                     &options,
                     &chain,
                     tokenizer,
                     runtime,
+                    tool_observer.as_mut(),
                     Some(&mut stage_token),
                 )
             }
@@ -876,7 +935,7 @@ impl Engine {
         );
         let result = match result {
             Ok(result) => {
-                let _outcome = turn.committed();
+                let _outcome = turn.commit()?;
                 Ok(result)
             }
             Err(error) => {
@@ -900,6 +959,7 @@ impl Engine {
     fn generate_native_cold_with_callback(
         &mut self,
         _request: GenerateRequest,
+        _tool_call_policy: ToolCallPolicy,
         _admission_callback: Option<&mut dyn FnMut()>,
         _callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1120,7 +1180,27 @@ impl Engine {
             request.with_session_id(session_id.to_string()),
             on_admitted,
             callback,
-        )?;
+        );
+        let delivery_commit = result
+            .as_ref()
+            .err()
+            .and_then(|error| {
+                error
+                    .downcast_ref::<crate::pipeline::speculative::CandidateTreeOutputDeliveryError>(
+                    )
+            })
+            .map(|error| error.committed_tokens);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(committed) = delivery_commit
+                    && let Some(count) = self.workflow_sessions.get_mut(&session_id)
+                {
+                    *count = count.saturating_add(committed);
+                }
+                return Err(error);
+            }
+        };
         // A package that declares its conversation knows how long it is; asking
         // it is what keeps `session_token_count` the same number a decode-core
         // session reports — prompt and generated tokens both — rather than the
@@ -1154,14 +1234,16 @@ impl Engine {
     /// publishes the same `tokens` output. What it does not have is a fused
     /// session to route the decode step to, so it invokes the component the
     /// package names.
-    fn generate_interpreted(
+    fn generate_interpreted_with_tool_policy(
         &mut self,
         request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
         on_admitted: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.generate_with_pipeline_callbacks(
-            crate::pipeline::PipelineGenerateRequest::new(request),
+            crate::pipeline::PipelineGenerateRequest::new(request)
+                .with_tool_call_policy(tool_call_policy),
             on_admitted,
             callback,
         )
@@ -1421,14 +1503,42 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.reject_undispatched_dflash_generation()?;
+        self.generate_with_tool_policy_callbacks(
+            request,
+            ToolCallPolicy::Disabled,
+            admission_callback,
+            token_callback,
+        )
+    }
+
+    /// Generate with a transport-neutral tool-call policy.
+    ///
+    /// When enabled, token callbacks are commit-only: protocol parsing and
+    /// request-policy validation complete inside the semantic transaction
+    /// before any generated output is delivered.
+    pub fn generate_with_tool_policy_callbacks(
+        &mut self,
+        request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.require_workflow_execution_admitted()?;
+        // Resolve the exact protocol and request policy before a cold path can
+        // allocate its short-lived session or admit scheduler state.
+        let _ = self.tool_call_observer(&tool_call_policy)?;
         // One entry point, one interpreter, one declared loop. What varies is
         // whether this runtime holds the fused decode session that implements
         // the package's declared `autoregressive-decode` step. Without one, the
         // interpreter invokes every declared component from the artifact the
         // package names — the same loop, the same emits, the same stop.
         if !self.holds_decode_core() {
-            return self.generate_interpreted(request, admission_callback, token_callback);
+            return self.generate_interpreted_with_tool_policy(
+                request,
+                tool_call_policy,
+                admission_callback,
+                token_callback,
+            );
         }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
@@ -1442,6 +1552,7 @@ impl Engine {
             if request.options.cold_start || native_spec_requested {
                 let result = self.generate_native_cold_with_callback(
                     request,
+                    tool_call_policy,
                     admission_callback,
                     token_callback,
                 );
@@ -1452,6 +1563,7 @@ impl Engine {
             return self.generate_native_in_session_with_callbacks(
                 session_id,
                 request,
+                tool_call_policy,
                 admission_callback,
                 token_callback,
             );
@@ -1461,17 +1573,20 @@ impl Engine {
             {
                 return self.generate_native_cold_with_callback(
                     request,
+                    tool_call_policy,
                     admission_callback,
                     token_callback,
                 );
             }
         }
+
         let session_id = self.create_session()?;
         let result = self.generate_in_session_with_priority_and_callback(
             session_id,
             request,
             Priority::Normal,
             None,
+            tool_call_policy,
             admission_callback,
             token_callback,
         );
@@ -1481,6 +1596,29 @@ impl Engine {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
         }
+    }
+
+    /// Generate through the ordinary Engine surface with a request-scoped
+    /// cancellation authority and transaction checkpoints.
+    pub fn generate_with_control_callbacks(
+        &mut self,
+        request: GenerateRequest,
+        control: crate::pipeline::GenerationControl,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.holds_decode_core() {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_with_control_callbacks",
+                runtime: "the fused decode backend",
+            }
+            .into());
+        }
+        self.generate_with_pipeline_callbacks(
+            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+            admission_callback,
+            token_callback,
+        )
     }
 
     /// Generate text in a persistent session, reusing the session's accumulated KV state.
@@ -1500,7 +1638,13 @@ impl Engine {
         priority: Priority,
     ) -> anyhow::Result<GenerateResult> {
         self.generate_in_session_with_priority_and_callback(
-            session_id, request, priority, None, None, None,
+            session_id,
+            request,
+            priority,
+            None,
+            ToolCallPolicy::Disabled,
+            None,
+            None,
         )
     }
 
@@ -1516,6 +1660,7 @@ impl Engine {
             request,
             Priority::Normal,
             None,
+            ToolCallPolicy::Disabled,
             None,
             callback,
         )
@@ -1529,11 +1674,55 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_tool_policy_callbacks(
+            session_id,
+            request,
+            ToolCallPolicy::Disabled,
+            admission_callback,
+            token_callback,
+        )
+    }
+
+    /// Continue a session with transport-neutral tool-call observation.
+    pub fn generate_in_session_with_tool_policy_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         self.generate_in_session_with_priority_and_callback(
             session_id,
             request,
             Priority::Normal,
             None,
+            tool_call_policy,
+            admission_callback,
+            token_callback,
+        )
+    }
+
+    /// Continue an interpreted workflow session with request-scoped
+    /// cancellation and transaction checkpoints.
+    pub fn generate_in_session_with_control_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        control: crate::pipeline::GenerationControl,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.holds_decode_core() {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_in_session_with_control_callbacks",
+                runtime: "the fused decode backend",
+            }
+            .into());
+        }
+        self.generate_in_workflow_session(
+            session_id,
+            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
             admission_callback,
             token_callback,
         )
@@ -1558,21 +1747,24 @@ impl Engine {
             request,
             Priority::Normal,
             Some(sampler),
+            ToolCallPolicy::Disabled,
             None,
             None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_in_session_with_priority_and_callback(
         &mut self,
         session_id: SessionId,
         request: GenerateRequest,
         priority: Priority,
         mut custom_sampler: Option<Box<dyn Sampler>>,
+        tool_call_policy: ToolCallPolicy,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.reject_undispatched_dflash_generation()?;
+        self.require_workflow_execution_admitted()?;
         // A package with no decode core keeps its conversation in the
         // session-scoped cells its workflow declares. Routing here rather than
         // in one of the wrappers above is what makes every `generate_in_session`
@@ -1586,7 +1778,8 @@ impl Engine {
             );
             return self.generate_in_workflow_session(
                 session_id,
-                crate::pipeline::PipelineGenerateRequest::new(request),
+                crate::pipeline::PipelineGenerateRequest::new(request)
+                    .with_tool_call_policy(tool_call_policy),
                 admission_callback,
                 callback,
             );
@@ -1602,10 +1795,12 @@ impl Engine {
             return self.generate_native_in_session_with_callbacks(
                 session_id,
                 request,
+                tool_call_policy,
                 admission_callback,
                 callback,
             );
         }
+        let mut tool_observer = self.tool_call_observer(&tool_call_policy)?;
         request.options.validate()?;
         let mut options = request.options.clone();
         self.apply_eos_defaults(&mut options)?;
@@ -1663,7 +1858,10 @@ impl Engine {
             let has_custom_sampler = custom_sampler.is_some();
             loop_state.custom_sampler = custom_sampler.take();
 
-            if self.should_use_speculative(&options) && !has_custom_sampler {
+            if tool_observer.is_none()
+                && self.should_use_speculative(&options)
+                && !has_custom_sampler
+            {
                 return self.generate_speculative_loop(crate::speculative::SpeculativeLoopState {
                     session_id,
                     state: &mut state,
@@ -1705,7 +1903,7 @@ impl Engine {
             // -- one forward pass, KV stays its business -- and the token
             // policy beside it is the single sampling/stopping implementation,
             // shared with every other package.
-            crate::pipeline::generation::generate_with_decode_core(
+            crate::pipeline::generation::generate_with_decode_core_and_staged_observer(
                 runtime,
                 &mut backend,
                 &mut loop_state,
@@ -1716,6 +1914,7 @@ impl Engine {
                     tokenizer,
                     max_context,
                 },
+                tool_observer.as_mut(),
                 None,
             )
         })()
@@ -1728,7 +1927,7 @@ impl Engine {
         });
         let result = match result {
             Ok(result) => {
-                let _outcome = turn.committed();
+                let _outcome = turn.commit()?;
                 if !exceeded_context_limit(state.tokens.len(), max_context)
                     && let Err(error) =
                         self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())
@@ -1821,6 +2020,7 @@ impl Engine {
                                 arrival.request.request,
                                 arrival.request.priority,
                                 None,
+                                ToolCallPolicy::Disabled,
                                 None,
                                 None,
                             )
@@ -1970,7 +2170,7 @@ impl Engine {
                 // package cannot do, or whether the server failed. Matching on
                 // prose would make that a guess, and it was being reported as a
                 // 500 for a package that is simply stateless.
-                return Err(PackageCapabilityError::NoSessionState.into());
+                return Err(PackageExecutionError::NoSessionState.into());
             }
             let id = self.workflow_session_ids.mint();
             self.workflow_sessions.insert(id, 0);
@@ -2908,7 +3108,7 @@ impl Engine {
         })();
         let result = match result {
             Ok(()) => {
-                let _outcome = active.turn.committed();
+                let _outcome = active.turn.commit()?;
                 if !exceeded_context_limit(active.state.tokens.len(), active.max_context)
                     && let Err(error) = self.insert_cached_prefixes(
                         active.session_id,
@@ -3098,6 +3298,7 @@ impl Engine {
                 .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
             token_ids: generated_tokens.to_vec(),
             finish_reason,
+            tool_calls: Vec::new(),
             prefix_cache_hit_len,
             logprobs: logprobs.map(<[crate::config::TokenLogprob]>::to_vec),
             budget_cap: None,
@@ -3196,6 +3397,7 @@ impl Engine {
         &mut self,
         session_id: SessionId,
         request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -3209,6 +3411,7 @@ impl Engine {
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let mut tool_observer = self.tool_call_observer(&tool_call_policy)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
                 "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"
@@ -3412,13 +3615,14 @@ impl Engine {
                     resume_from = prompt_tokens.len().saturating_sub(1);
                 }
 
-                native.generate_incremental_with_callback(
+                native.generate_incremental_with_callback_and_staged_observer(
                     &prompt_tokens,
                     resume_from,
                     &options,
                     &chain,
                     tokenizer,
                     runtime,
+                    tool_observer.as_mut(),
                     Some(&mut stage_token),
                 )?
             };
@@ -3443,7 +3647,7 @@ impl Engine {
         });
         let result = match result {
             Ok(result) => {
-                let _outcome = turn.committed();
+                let _outcome = turn.commit()?;
                 Ok(result)
             }
             Err(error) => {
@@ -3912,8 +4116,8 @@ mod tests {
             .expect_err("a package publishing tokens with no session state cannot hold a session");
 
         assert_eq!(
-            crate::engine::package_capability_error(&error),
-            Some(PackageCapabilityError::NoSessionState),
+            crate::engine::package_execution_error(&error),
+            Some(PackageExecutionError::NoSessionState),
             "the refusal must be the typed one a front end reads for its status code, \
              not prose that happens to say something similar: {error}"
         );

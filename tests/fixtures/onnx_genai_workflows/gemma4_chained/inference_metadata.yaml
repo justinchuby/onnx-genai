@@ -9,14 +9,13 @@
 # shared_kv.{full,sliding}_attention.{key,value} -> logits + projected_state
 # (folded carry). No own KV, no present.*. Greedy / logits-emit (external
 # argmax), standard ops only (ORT ∩ native CPU EP). Both graphs are FLOAT (f32).
-schema_version: v1
+schema_version: v1.6
 model:
   vocab_size: 32
   max_sequence_length: 16
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract, bounded_state_recurrence]
+    manifest: {}
     inputs:
       request.active:
         contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
@@ -286,6 +285,8 @@ pipeline:
                 past_key_values.0.key: {input: shared_kv.sliding_attention.key, access: read_only, role: key}
                 past_key_values.0.value: {input: shared_kv.sliding_attention.value, access: read_only, role: value}
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: assistant
   target: target
   proposal_execution:
@@ -305,4 +306,7 @@ speculative:
   vocabulary: {kind: identical}
   max_proposal_width: 4
   distribution_preserving: true
+  verification:
+    target_output: {component: target, output: logits}
+    accepted_path: {kind: runtime, binding: accepted_prefix}
   rollback_state: [past_key_values.0.key, past_key_values.0.value, past_key_values.1.key, past_key_values.1.value]

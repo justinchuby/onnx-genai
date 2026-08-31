@@ -27,8 +27,16 @@ impl Engine {
     ///
     /// Runtime construction is the canonical admission boundary. This reads
     /// the same stored typed decision; it never reclassifies metadata.
-    pub(crate) fn reject_undispatched_dflash_generation(&self) -> anyhow::Result<()> {
+    pub(crate) fn require_workflow_execution_admitted(&self) -> anyhow::Result<()> {
         self.workflow.require_execution_admitted()
+    }
+
+    fn reject_candidate_tree_raw_workflow_api(&self, operation: &str) -> anyhow::Result<()> {
+        self.workflow.reject_candidate_tree_raw_execution(operation)
+    }
+
+    fn reject_dflash_raw_workflow_api(&self, operation: &str) -> anyhow::Result<()> {
+        self.workflow.reject_dflash_raw_execution(operation)
     }
 
     /// How many device→host materializations this runtime has performed.
@@ -71,7 +79,8 @@ impl Engine {
     /// an ONNX component shows that component's invocations here and no
     /// contract executions at all.
     pub fn component_invocations(&self) -> std::collections::BTreeMap<String, u64> {
-        self.workflow
+        let recorded = self
+            .workflow
             .workflow_performance_diagnostic()
             .last_stage_runs
             .into_iter()
@@ -80,7 +89,19 @@ impl Engine {
                     .strip_prefix("component:")
                     .map(|component| (component.to_string(), runs))
             })
-            .collect()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let Some(diagnostic) = self.candidate_tree_diagnostic() else {
+            return recorded;
+        };
+        let blocks = self.workflow.last_candidate_tree_block_trace_count();
+        if blocks == 0 {
+            return recorded;
+        }
+        let runs = u64::try_from(blocks).unwrap_or(u64::MAX).saturating_mul(2);
+        let mut recorded = recorded;
+        recorded.insert(diagnostic.proposer, runs);
+        recorded.insert(diagnostic.target, runs);
+        recorded
     }
 
     /// How many components the package's declared workflow names.
@@ -136,7 +157,8 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_candidate_tree_raw_workflow_api("Engine::run_pipeline")?;
+        self.reject_dflash_raw_workflow_api("Engine::run_pipeline")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline(request)
     }
@@ -148,7 +170,8 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<WorkflowExecutionPlan<'_>> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_candidate_tree_raw_workflow_api("Engine::prepare_pipeline")?;
+        self.reject_dflash_raw_workflow_api("Engine::prepare_pipeline")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         WorkflowExecutionPlan::new(self.workflow_runtime(), request)
     }
@@ -157,7 +180,8 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_candidate_tree_raw_workflow_api("Engine::run_pipeline_outputs")?;
+        self.reject_dflash_raw_workflow_api("Engine::run_pipeline_outputs")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline_outputs(request)
     }
@@ -178,7 +202,8 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_candidate_tree_raw_workflow_api("Engine::run_pipeline_retained")?;
+        self.reject_dflash_raw_workflow_api("Engine::run_pipeline_retained")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline_retained(request)
     }
@@ -198,10 +223,35 @@ impl Engine {
     pub fn generate_with_pipeline_callbacks(
         &mut self,
         request: PipelineGenerateRequest,
+        on_admitted: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_pipeline_tool_policy_callbacks(request, on_admitted, callback)
+    }
+
+    pub fn generate_with_pipeline_tool_policy_callbacks(
+        &mut self,
+        request: PipelineGenerateRequest,
         mut on_admitted: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.reject_undispatched_dflash_generation()?;
+        self.require_workflow_execution_admitted()?;
+        // Fail closed on the exact declared protocol before scheduler
+        // admission, workflow session binding, or specialized driver state.
+        let _ = self.tool_call_observer(&request.tool_call_policy)?;
+        if request.generation_control.is_some()
+            && self
+                .workflow_runtime()
+                .candidate_tree_diagnostic()
+                .is_none()
+            && self.workflow_runtime().dflash_diagnostic().is_none()
+        {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_with_pipeline_callbacks",
+                runtime: "a workflow without a specialized speculative driver",
+            }
+            .into());
+        }
         // A request that binds no tensors is a prompt, and a prompt is served
         // by the ordinary entry point — which admits through the scheduler,
         // reuses a cached prefix, and routes the declared decode step to the
@@ -210,15 +260,22 @@ impl Engine {
         // request that asked for none of it.
         let prompt_only = request.inputs.is_empty() && request.component_overrides.is_empty();
         if prompt_only && self.holds_decode_core() {
+            let tool_call_policy = request.tool_call_policy.clone();
             return match request.session_id.as_deref().and_then(|id| id.parse().ok()) {
                 Some(session) if self.sessions.contains_key(&session) => self
-                    .generate_in_session_with_callbacks(
+                    .generate_in_session_with_tool_policy_callbacks(
                         session,
                         request.request,
+                        tool_call_policy,
                         on_admitted,
                         callback,
                     ),
-                _ => self.generate_with_callbacks(request.request, on_admitted, callback),
+                _ => self.generate_with_tool_policy_callbacks(
+                    request.request,
+                    tool_call_policy,
+                    on_admitted,
+                    callback,
+                ),
             };
         }
         // Everything that reaches here runs the declared workflow: a
@@ -294,8 +351,33 @@ impl Engine {
         }
         let options = request.request.options.clone();
         let tokenizer = runtime.package_tokenizer();
+        let mut observer = self.tool_call_observer(&request.tool_call_policy)?;
+        if runtime.candidate_tree_diagnostic().is_some() {
+            return runtime.run_candidate_tree_generation(
+                &options,
+                request,
+                tokenizer,
+                observer.as_mut(),
+                callback,
+            );
+        }
+        if runtime.dflash_diagnostic().is_some() {
+            return runtime.run_dflash_generation(
+                &options,
+                request,
+                tokenizer,
+                observer.as_mut(),
+                callback,
+            );
+        }
         crate::pipeline::generation::run_declared_generation(
-            runtime, &options, tokenizer, request, None, callback,
+            runtime,
+            &options,
+            tokenizer,
+            request,
+            None,
+            observer.as_mut(),
+            callback,
         )
     }
 
@@ -310,6 +392,8 @@ impl Engine {
     }
 
     pub fn models(&self) -> anyhow::Result<&PipelineModels> {
+        self.reject_candidate_tree_raw_workflow_api("Engine::models")?;
+        self.reject_dflash_raw_workflow_api("Engine::models")?;
         Ok(self.workflow_runtime().models())
     }
 
@@ -341,7 +425,8 @@ impl Engine {
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<crate::pipeline::WorkflowExecutionPlan<'_>> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_candidate_tree_raw_workflow_api("Engine::prepare_workflow_execution")?;
+        self.reject_dflash_raw_workflow_api("Engine::prepare_workflow_execution")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime().prepare_workflow_execution(request)
     }
@@ -371,6 +456,12 @@ impl Engine {
 
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
         WorkflowRuntime::workflow_performance_diagnostic(&self.workflow)
+    }
+
+    /// Committed cursor for one workflow effect domain in a session.
+    pub fn workflow_session_effect_cursor(&self, session_id: &str, effect: &str) -> Option<u64> {
+        self.workflow_runtime()
+            .session_effect_cursor(session_id, effect)
     }
 
     pub fn adapter_lifecycle_diagnostic(&self) -> crate::pipeline::AdapterLifecycleDiagnostic {
@@ -409,70 +500,35 @@ impl Engine {
         self.workflow_runtime().dflash_diagnostic()
     }
 
+    pub fn candidate_tree_diagnostic(
+        &self,
+    ) -> Option<crate::pipeline::speculative::CandidateTreeDiagnostic> {
+        self.workflow_runtime().candidate_tree_diagnostic()
+    }
+
+    pub fn take_candidate_tree_block_traces(
+        &mut self,
+    ) -> Vec<crate::pipeline::speculative::CandidateTreeBlockTrace> {
+        self.workflow_runtime_mut()
+            .take_candidate_tree_block_traces()
+    }
+
+    /// Take execution evidence from the last committed DFlash turn.
+    ///
+    /// Aborted turns publish no traces, matching state, output, and contract
+    /// execution visibility.
+    pub fn take_dflash_block_traces(
+        &mut self,
+    ) -> Vec<crate::pipeline::speculative::DFlashBlockTrace> {
+        self.workflow_runtime_mut().take_dflash_block_traces()
+    }
+
     pub fn propose_chained(
         &self,
         run: &PipelineTensors,
         options: crate::pipeline::speculative::ChainedProposalOptions,
     ) -> anyhow::Result<crate::pipeline::speculative::ChainedProposal> {
         self.workflow_runtime().propose_chained(run, options)
-    }
-
-    pub fn propose_dflash(
-        &self,
-        run: &PipelineTensors,
-        options: crate::pipeline::speculative::DFlashProposalOptions,
-    ) -> anyhow::Result<crate::pipeline::speculative::DFlashProposal> {
-        self.reject_undispatched_dflash_generation()?;
-        self.workflow_runtime().propose_dflash(run, options)
-    }
-
-    pub fn verify_dflash(
-        &self,
-        verified: &PipelineTensors,
-        proposal: &crate::pipeline::speculative::DFlashProposal,
-        mode: crate::pipeline::speculative::DFlashVerificationMode,
-    ) -> anyhow::Result<crate::pipeline::speculative::DFlashAcceptance> {
-        self.reject_undispatched_dflash_generation()?;
-        self.workflow_runtime()
-            .verify_dflash(verified, proposal, mode)
-    }
-
-    pub fn begin_dflash_state_transaction(
-        &self,
-        current: &PipelineTensors,
-    ) -> anyhow::Result<crate::pipeline::speculative::DFlashStateTransaction> {
-        self.reject_undispatched_dflash_generation()?;
-        self.workflow_runtime()
-            .begin_dflash_state_transaction(current)
-    }
-
-    pub fn commit_dflash_state_transaction(
-        &self,
-        transaction: crate::pipeline::speculative::DFlashStateTransaction,
-        current: &mut PipelineTensors,
-        proposal: &crate::pipeline::speculative::DFlashProposal,
-        verified: &PipelineTensors,
-        acceptance: &crate::pipeline::speculative::DFlashAcceptance,
-    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
-        self.reject_undispatched_dflash_generation()?;
-        self.workflow_runtime().commit_dflash_state_transaction(
-            transaction,
-            current,
-            proposal,
-            verified,
-            acceptance,
-        )
-    }
-
-    pub fn abort_dflash_state_transaction(
-        &self,
-        transaction: crate::pipeline::speculative::DFlashStateTransaction,
-        current: &mut PipelineTensors,
-        reason: crate::pipeline::TurnAbortReason,
-    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
-        self.reject_undispatched_dflash_generation()?;
-        self.workflow_runtime()
-            .abort_dflash_state_transaction(transaction, current, reason)
     }
 
     pub fn accept_chained_proposal(
@@ -547,7 +603,6 @@ mod tests {
         let mut runtime = crate::pipeline::generation::test_decoder_runtime()?;
         runtime.set_execution_admission_for_test(WorkflowExecutionAdmission::DFlashUnavailable {
             version: "1".to_string(),
-            capability: onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK,
         });
         let governor = crate::engine::EngineResourceGovernor::new(
             ResourceLimits::default(),
@@ -566,14 +621,12 @@ mod tests {
 
     fn assert_dflash_refusal(error: anyhow::Error) {
         let capability =
-            crate::engine::package_capability_error(&error).expect("refusal stays typed");
+            crate::engine::package_execution_error(&error).expect("refusal stays typed");
         assert!(matches!(
             capability,
-            crate::engine::PackageCapabilityError::DFlashExecutionUnavailable {
+            crate::engine::PackageExecutionError::DFlashExecutionUnavailable {
                 ref version,
-                ref capability,
             } if version == "1"
-                && capability == onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK
         ));
     }
 
@@ -644,26 +697,6 @@ mod tests {
                 .err()
                 .expect("prepare_workflow_execution must refuse"),
         );
-        assert_dflash_refusal(
-            engine
-                .propose_dflash(
-                    &PipelineTensors::new(),
-                    crate::pipeline::speculative::DFlashProposalOptions {
-                        anchor_token: 1,
-                        width: 1,
-                        context_start_position: 0,
-                        mode: crate::pipeline::speculative::DFlashProposalMode::Greedy,
-                        eos_token_ids: Vec::new(),
-                    },
-                )
-                .expect_err("manual proposal must refuse"),
-        );
-        assert_dflash_refusal(
-            engine
-                .begin_dflash_state_transaction(&PipelineTensors::new())
-                .expect_err("manual state transaction must refuse"),
-        );
-
         assert!(
             !admitted,
             "refusal must precede scheduler admission callback"

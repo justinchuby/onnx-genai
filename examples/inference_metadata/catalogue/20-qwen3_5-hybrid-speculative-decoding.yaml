@@ -5,14 +5,10 @@
 # linear accumulator, and causal-convolution history to the same accepted
 # position. No group may commit or roll back independently. The independent
 # proposer is recomputed from committed tokens and owns no persistent state.
-schema_version: v1
+schema_version: v1.6
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - typed_emit
-      - serving_service_contract
+    manifest: {}
     inputs:
       request.active:
         contract:
@@ -284,11 +280,16 @@ pipeline:
                   output: next_conv_state
                   layer: 1
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: proposer
   target: target_decoder
   vocabulary: {kind: identical}
   max_proposal_width: 4
   distribution_preserving: true
+  verification:
+    target_output: {component: target_decoder, output: logits}
+    accepted_path: {kind: runtime, binding: accepted_prefix}
   rollback_state:
   - attention_key
   - attention_value

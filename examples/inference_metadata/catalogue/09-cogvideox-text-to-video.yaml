@@ -2,13 +2,7 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - nested_control_flow
-      - loop_induction_values
+    manifest: {}
     inputs:
       request.latent:
         contract:
@@ -82,7 +76,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: video
-        family: { kind: materialized }
         stage: pre_adapter
     components:
       denoiser:

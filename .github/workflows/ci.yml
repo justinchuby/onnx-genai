@@ -99,9 +99,9 @@ jobs:
           # part of the build, so a docs-only edit to one can break `cargo test`
           # while classifying as docs and skipping the very checks that would
           # catch it (#2077: renaming an HTML comment marker in
-          # docs/genai/INFERENCE_METADATA_DECISIONS.md panics
-          # capability_catalogue.rs, and dropping a table row fails its
-          # assert_eq -- both are pure markdown edits).
+          # docs/genai/METADATA_EXTENSION_REGISTRY.md makes
+          # extension_registry.rs fail its exact generated-content check --
+          # both are pure markdown edits).
           #
           # Derived by scanning rather than listed, so it cannot go stale when a
           # third embed is added (Rule 10). The scan is whole-file, not

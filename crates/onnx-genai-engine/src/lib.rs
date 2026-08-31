@@ -52,12 +52,12 @@ pub use engine::{
     KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
     MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
-    OrtEngineWorkerFactory, OrtSessionWorkerLoadError, PackageCapabilityError,
+    OrtEngineWorkerFactory, OrtSessionWorkerLoadError, PackageExecutionError,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount, SamplingOverrides,
     ScheduledGenerateArrival, SessionCheckpoint, SessionForkError, SessionForkParticipant,
     SessionForkParticipantKind, SessionForkPlan, SessionId, SessionPosition, SessionPrefillCarry,
-    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig,
-    package_capability_error, parse_device_policy, parse_resource_limit,
+    SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern, WeightPlacementReport,
+    XtcConfig, package_execution_error, parse_device_policy, parse_resource_limit,
     resolve_device_vram_limit_bytes,
 };
 pub use fim::{FimConfig, FimFormat};
@@ -176,8 +176,11 @@ pub struct VmmArenaStats {
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
     AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio,
+    GenerationBoundary, GenerationControl, GenerationControlUnsupported, GenerationStopReason,
     PipelineGenerateRequest, PipelineTensors, RowPlan, RowScopedState, RowTable,
-    WorkflowSessionCheckpoint, is_missing_required_input, validate_pipeline_backend_request,
+    StagedOutputCheckpoint, StagedOutputObservation, StagedOutputObservationError,
+    ToolCallStagedOutputObserver, WorkflowSessionCheckpoint, is_missing_required_input,
+    validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{

@@ -10,7 +10,6 @@
 //! import source, and the emitted metadata is the sole source of execution
 //! truth afterwards.
 
-use onnx_genai_metadata::capabilities as capability;
 use serde_json::{Map, Value, json};
 
 use crate::ComfyUiConfigError;
@@ -34,7 +33,6 @@ pub(crate) struct Lowering<'a> {
     carried: Vec<Value>,
     tail: Vec<Value>,
     outputs: Map<String, Value>,
-    capabilities: Vec<&'static str>,
 }
 
 impl<'a> Lowering<'a> {
@@ -50,13 +48,6 @@ impl<'a> Lowering<'a> {
             carried: Vec::new(),
             tail: Vec::new(),
             outputs: Map::new(),
-            capabilities: vec![
-                capability::WORKFLOW_SSA,
-                capability::LINEAR_EFFECTS,
-                capability::NESTED_CONTROL_FLOW,
-                capability::LOOP_INDUCTION_VALUES,
-                capability::TYPED_EMIT,
-            ],
         }
     }
 
@@ -71,12 +62,7 @@ impl<'a> Lowering<'a> {
         self.build_tail();
 
         let mut workflow = Map::new();
-        workflow.insert(
-            "manifest".to_owned(),
-            json!({
-                "capabilities": self.capabilities,
-            }),
-        );
+        workflow.insert("manifest".to_owned(), json!({}));
         workflow.insert("inputs".to_owned(), Value::Object(self.inputs));
         workflow.insert("outputs".to_owned(), Value::Object(self.outputs));
         workflow.insert("components".to_owned(), Value::Object(self.components));
@@ -1058,9 +1044,6 @@ impl<'a> Lowering<'a> {
 
     /// Declare the request-scoped adapter selection inputs a LoRA package needs.
     pub(crate) fn declare_adapter_selection(&mut self, max_adapters: usize) {
-        self.capabilities.push(capability::PARAMETER_ADAPTERS);
-        self.capabilities
-            .push(capability::HETEROGENEOUS_ADAPTER_BATCHING);
         let count = i64::try_from(max_adapters).unwrap_or(i64::MAX);
         self.request_input(
             "request.adapter_segments",

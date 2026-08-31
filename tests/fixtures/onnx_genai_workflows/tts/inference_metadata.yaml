@@ -1,15 +1,7 @@
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - nested_control_flow
-      - loop_induction_values
-      - typed_emit
-      - serving_service_contract
-      - bounded_state_recurrence
+    manifest: {}
     inputs:
       request.prompt_tokens:
         contract:
@@ -224,7 +216,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: audio
-        family: { kind: materialized }
         stage: post_adapter
     components:
       talker:

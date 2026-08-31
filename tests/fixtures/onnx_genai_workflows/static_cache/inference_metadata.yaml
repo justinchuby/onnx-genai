@@ -1,14 +1,7 @@
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
-      - nested_control_flow
-      - loop_induction_values
-      - serving_service_contract
+    manifest: {}
     inputs:
       request.input_ids:
         contract:
@@ -129,7 +122,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
-        family: { kind: materialized }
         stage: pre_adapter
       cache_lengths:
         contract:
@@ -140,7 +132,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
-        family: { kind: materialized }
         stage: pre_adapter
       write_indices:
         contract:
@@ -151,33 +142,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
-        family: { kind: materialized }
-        stage: pre_adapter
-      key_cache:
-        contract:
-          dtype: float32
-          shape:
-          - batch
-          - cache_capacity
-          - 4
-          batch_layout:
-            kind: request_aligned
-            axis: 0
-        role: tensor
-        family: { kind: materialized }
-        stage: pre_adapter
-      value_cache:
-        contract:
-          dtype: float32
-          shape:
-          - batch
-          - cache_capacity
-          - 4
-          batch_layout:
-            kind: request_aligned
-            axis: 0
-        role: tensor
-        family: { kind: materialized }
         stage: pre_adapter
     components:
       model:
@@ -580,9 +544,6 @@ pipeline:
               rollback_positions: 8
               snapshot: true
               fork: true
-            checkpoint:
-              adapter: onnx-genai.kv-checkpoint
-              version: '1'
             ports:
               model:
                 key_cache:
@@ -697,14 +658,6 @@ pipeline:
     - kind: emit
       value: write_indices
       output: write_indices
-      mode: replace
-    - kind: emit
-      value: key_cache
-      output: key_cache
-      mode: replace
-    - kind: emit
-      value: value_cache
-      output: value_cache
       mode: replace
 package:
   tokenizer:

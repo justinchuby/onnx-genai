@@ -1,0 +1,152 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 2,
+      "content": "<bos>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "<eos>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 26,
+      "content": "<tool-eos>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "WhitespaceSplit"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "SpecialToken": {
+          "id": "<bos>",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "<eos>",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "SpecialToken": {
+          "id": "<bos>",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "<eos>",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "<eos>",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {
+      "<bos>": {
+        "id": "<bos>",
+        "ids": [
+          2
+        ],
+        "tokens": [
+          "<bos>"
+        ]
+      },
+      "<eos>": {
+        "id": "<eos>",
+        "ids": [
+          3
+        ],
+        "tokens": [
+          "<eos>"
+        ]
+      }
+    }
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<pad>": 0,
+      "<unk>": 1,
+      "<bos>": 2,
+      "<eos>": 3,
+      "<|assistant|>": 4,
+      "<tool_call>{\"id\":\"call_weather\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>": 5,
+      "unused-6": 6,
+      "Results accepted.": 7,
+      "unused-8": 8,
+      "unused-9": 9,
+      "unused-10": 10,
+      "unused-11": 11,
+      "unused-12": 12,
+      "unused-13": 13,
+      "unused-14": 14,
+      "<tool_call>{\"id\":\"call_time\",\"name\":\"time\",\"arguments\":{\"timezone\":\"UTC\"}}</tool_call>": 15,
+      "unused-16": 16,
+      "unused-17": 17,
+      "unused-18": 18,
+      "unused-19": 19,
+      "unused-20": 20,
+      "unused-21": 21,
+      "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>": 22,
+      "unused-23": 23,
+      "unused-24": 24,
+      "unused-25": 25,
+      "<tool-eos>": 26,
+      "ordinary": 27,
+      "assistant": 28,
+      "text": 29,
+      "unused-30": 30,
+      "unused-31": 31
+    },
+    "unk_token": "<unk>"
+  }
+}

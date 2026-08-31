@@ -4,9 +4,6 @@
 # component ports and roles, and the state_service group that owns the KV
 # cache. A single decoder is not a special package shape — it is a workflow
 # with one ONNX component and one runtime-bound token policy.
-required_capabilities:
-- kv_cache
-- multi_head_attention
 model:
   attention:
     type: multi_head
@@ -18,14 +15,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-      - bounded_state_recurrence
-      - linear_effects
-      - loop_induction_values
-      - nested_control_flow
-      - serving_service_contract
-      - typed_emit
-      - workflow_ssa
     inputs:
       application.attention_mask:
         contract:
@@ -171,7 +160,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tokens
-        family: { kind: materialized }
         stage: pre_adapter
     components:
       decoder:

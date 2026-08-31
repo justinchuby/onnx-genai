@@ -1,11 +1,7 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
+    manifest: {}
     inputs:
       request.waveform:
         contract:
@@ -36,7 +32,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: audio
-        family: { kind: materialized }
         stage: post_adapter
     components:
       encoder:

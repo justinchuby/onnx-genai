@@ -194,8 +194,10 @@ impl Engine {
     /// decode core is the registered executor for
     /// `onnx-genai.autoregressive-decode`: one fused session that owns paged
     /// KV, the device sampling fast paths and a captured graph. It can stand in
-    /// for a declared decode step only when that step is the package's *whole*
-    /// graph, because it loads one model directory and holds one session.
+    /// for a declared decode step only when that step is the package's whole
+    /// workflow graph. A canonical MTP proposer is excluded from that count
+    /// because the speculative driver, not the workflow interpreter, executes
+    /// it.
     ///
     /// It does not re-derive that shape. `contracted_single_decoder` is layer 2
     /// of the one classification in `onnx-genai-metadata`: layer 1 (this
@@ -210,10 +212,36 @@ impl Engine {
     /// the package names. There is no second generation path either way — only
     /// a faster executor for one declared step, when that step is one this
     /// runtime registered an executor for.
-    fn decode_core_covers(workflow: &onnx_genai_metadata::WorkflowSpec) -> bool {
-        onnx_genai_metadata::classify_workflow(workflow)
+    fn decode_core_covers(
+        workflow: &onnx_genai_metadata::WorkflowSpec,
+        speculative: Option<&onnx_genai_metadata::SpeculativeContract>,
+    ) -> bool {
+        if onnx_genai_metadata::classify_workflow(workflow)
             .contracted_single_decoder()
             .is_some()
+        {
+            return true;
+        }
+        let Some(speculative) = speculative else {
+            return false;
+        };
+        if !matches!(
+            speculative.proposal_execution,
+            onnx_genai_metadata::SpeculativeProposalExecution::Mtp { .. }
+        ) {
+            return false;
+        }
+
+        let mut target_workflow = workflow.clone();
+        if target_workflow
+            .components
+            .remove(&speculative.proposer)
+            .is_none()
+        {
+            return false;
+        }
+        onnx_genai_metadata::classify_workflow(&target_workflow).contracted_single_decoder()
+            == Some(speculative.target.as_str())
     }
 
     /// Freeze the immutable resources needed by additional ORT workers.
@@ -307,34 +335,57 @@ impl Engine {
         })
     }
 
-    /// The workflow a package declares, read from the package.
+    /// Whether the decode core covers the workflow the package declares.
     ///
     /// Nothing is synthesized: a package from before the workflow existed is
     /// refused rather than repaired, because inventing one at load would mean
     /// the package on disk says one thing and the runtime executes another.
-    pub(crate) fn declared_workflow(
+    pub(crate) fn decode_core_covers_declared_workflow(
         model_dir: &Path,
-    ) -> anyhow::Result<onnx_genai_metadata::WorkflowSpec> {
+        backend: EngineDecodeBackend,
+    ) -> anyhow::Result<bool> {
         // An authored package answers from its own metadata. Only a package
         // that ships none needs the `genai_config.json` importer, which converts
         // that foreign format into this project's one representation — and which
         // needs a resolvable model directory, something a composite workflow
         // package (components in subdirectories) deliberately does not present.
         let metadata = if onnx_genai_metadata::find_metadata_path(model_dir).is_some() {
-            Some(
-                onnx_genai_metadata::load_metadata_package(model_dir)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?,
-            )
+            let mut capability_error = None;
+            let directory =
+                match onnx_genai_ort::PipelineModelDirectory::load_with_metadata_preflight(
+                    model_dir,
+                    |metadata| {
+                        crate::pipeline::WorkflowExecutionAdmission::from_metadata(
+                            metadata, backend,
+                        )
+                        .require_supported()
+                        .map_err(|error| {
+                            capability_error = Some(error.clone());
+                            onnx_genai_ort::OrtError::InvalidArgument(error.to_string())
+                        })
+                    },
+                ) {
+                    Ok(directory) => directory,
+                    Err(_) if capability_error.is_some() => {
+                        return Err(capability_error.expect("guarded by is_some").into());
+                    }
+                    Err(error) => return Err(anyhow::anyhow!("{error}")),
+                };
+            let workflow = directory.spec.workflow;
+            let decode_core_covers = Self::decode_core_covers(
+                &workflow,
+                directory
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.speculative.as_ref()),
+            );
+            return Ok(decode_core_covers);
         } else {
             onnx_genai_ort::ModelDirectory::load(model_dir)
                 .ok()
                 .and_then(|directory| load_inference_metadata(&directory).ok())
         };
-        if let Some(metadata) = &metadata {
-            crate::pipeline::WorkflowExecutionAdmission::from_metadata(metadata)
-                .require_supported()?;
-        }
-        metadata
+        let workflow = metadata
             .as_ref()
             .and_then(|metadata| metadata.pipeline.as_ref())
             .map(|pipeline| pipeline.workflow.clone())
@@ -350,7 +401,13 @@ impl Engine {
                     model_dir.display(),
                     model_dir.display()
                 )
-            })
+            })?;
+        Ok(Self::decode_core_covers(
+            &workflow,
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.speculative.as_ref()),
+        ))
     }
 
     /// Adopt the package's declared workflow as the one this runtime executes.
@@ -415,8 +472,7 @@ impl Engine {
     /// executor for the package's declared decode step, which is a question
     /// about the contract that step names.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
-        let workflow = Self::declared_workflow(model_dir)?;
-        if !Self::decode_core_covers(&workflow) {
+        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
             return Self::from_interpreted_dir(model_dir, config, SessionOptions::default(), None);
         }
         Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)
@@ -428,8 +484,7 @@ impl Engine {
         config: EngineConfig,
         provider: Arc<dyn MemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
-        let workflow = Self::declared_workflow(model_dir)?;
-        if !Self::decode_core_covers(&workflow) {
+        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
             return Self::from_interpreted_dir(
                 model_dir,
                 config,
@@ -452,8 +507,7 @@ impl Engine {
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
-        let workflow = Self::declared_workflow(model_dir)?;
-        if !Self::decode_core_covers(&workflow) {
+        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
             return Self::from_interpreted_dir(model_dir, config, session_options, None);
         }
         Self::from_dir_impl(model_dir, config, session_options, true, None)
@@ -700,9 +754,53 @@ impl Engine {
         // Stage: runtime KV-cache allocation, granted by the governor built above.
         let kv_cache = allocate_kv_cache(&config, kv_model.as_ref(), &governor)?;
 
-        // Stage: speculative-assistant loading (mode resolution then per-mode heads).
+        // Stage: speculative-assistant loading. The configuration selects
+        // whether an MTP optimization is wanted; every MTP graph/state/weight
+        // fact comes from the package's canonical contract.
+        let canonical_mtp = metadata.speculative.as_ref().is_some_and(|contract| {
+            matches!(
+                contract.proposal_execution,
+                onnx_genai_metadata::SpeculativeProposalExecution::Mtp { .. }
+            )
+        });
+        let mtp_requested = matches!(&config.speculative_mode, SpeculativeMode::Mtp(_));
+        let mtp_auto_enabled = matches!(&config.speculative_mode, SpeculativeMode::None)
+            && metadata
+                .speculative
+                .as_ref()
+                .is_some_and(|contract| contract.distribution_preserving);
+        if mtp_requested && !canonical_mtp {
+            anyhow::bail!(
+                "MTP was requested through runtime configuration, but this package declares no \
+                 canonical MTP proposal contract. Runtime configuration controls enablement and \
+                 width only; re-export `inference_metadata` with \
+                 speculative.proposal_execution.kind: mtp."
+            );
+        }
         let (speculative_mode, resolved_mtp_config) =
-            resolve_speculative_mode(config.speculative_mode.clone(), draft.is_some())?;
+            if canonical_mtp && (mtp_requested || mtp_auto_enabled) {
+                let vocab_size = metadata
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.vocab_size)
+                    .filter(|&value| value > 0)
+                    .context(
+                        "canonical MTP speculation requires model.vocab_size; declare the target \
+                     vocabulary in package metadata",
+                    )?;
+                let resolved = ResolvedMtpConfig::from_canonical_metadata(
+                    &metadata,
+                    &model_directory.root,
+                    vocab_size,
+                    config.num_speculative_tokens,
+                )?;
+                (
+                    SpeculativeMode::Mtp(resolved.public_config.clone()),
+                    Some(resolved),
+                )
+            } else {
+                resolve_speculative_mode(config.speculative_mode.clone(), draft.is_some())?
+            };
         let mtp = load_mtp_model(
             resolved_mtp_config,
             &session,
@@ -840,7 +938,7 @@ impl Engine {
         // serialized representation and gains no second writable statement of
         // its own ports. An ABI that already names a hidden output wins, and a
         // directory that declares no MTP sidecar is left exactly as it was.
-        if let Some(seeded) = mtp_seeded_decoder_io(&metadata, &model_directory.root) {
+        if let Some(seeded) = mtp_seeded_decoder_io(&metadata) {
             metadata.set_derived_decoder_io(seeded);
         }
         let tokenizer = {
@@ -1410,7 +1508,22 @@ impl Engine {
             Environment::new("onnx-genai-engine")
                 .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
         });
-        // Sidecar-declared MTP self-speculation: the pure-attention MTP head
+        if matches!(&config.speculative_mode, SpeculativeMode::Mtp(_))
+            && !metadata.speculative.as_ref().is_some_and(|contract| {
+                matches!(
+                    contract.proposal_execution,
+                    onnx_genai_metadata::SpeculativeProposalExecution::Mtp { .. }
+                )
+            })
+        {
+            anyhow::bail!(
+                "MTP was requested through runtime configuration, but this package declares no \
+                 canonical MTP proposal contract. Runtime configuration controls enablement and \
+                 width only; re-export `inference_metadata` with \
+                 speculative.proposal_execution.kind: mtp."
+            );
+        }
+        // Workflow-native MTP self-speculation: the pure-attention MTP head
         // loads on the ORT `environment` (ORT CUDA EP), seeded from the native
         // hybrid target's declared hidden output. Yields `None` for every
         // non-MTP model, preserving the plain native load path exactly.
@@ -1420,6 +1533,13 @@ impl Engine {
             &environment,
             session_options,
             native_device,
+            config.num_speculative_tokens,
+            matches!(&config.speculative_mode, SpeculativeMode::Mtp(_))
+                || (matches!(&config.speculative_mode, SpeculativeMode::None)
+                    && metadata
+                        .speculative
+                        .as_ref()
+                        .is_some_and(|contract| contract.distribution_preserving)),
         )?;
         // A model runs at most one proposer kind; shared-KV drafting and MTP are
         // mutually exclusive, so at most one of these may be anything but
@@ -1546,16 +1666,15 @@ fn maybe_fill_hybrid_io_from_graph(
 /// the model directory declares an MTP sidecar that names one, so every other
 /// model keeps exactly the ABI it resolved.
 #[cfg(feature = "native-backend")]
-fn mtp_seeded_decoder_io(
-    metadata: &InferenceMetadata,
-    model_root: &Path,
-) -> Option<onnx_genai_metadata::DecoderAbi> {
+fn mtp_seeded_decoder_io(metadata: &InferenceMetadata) -> Option<onnx_genai_metadata::DecoderAbi> {
     let io = metadata.decoder_io()?;
-    let descriptor = onnx_genai_metadata::detect_speculator(model_root)?;
-    let onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
+    let speculative = metadata.speculative.as_ref()?;
+    let onnx_genai_metadata::SpeculativeProposalExecution::Mtp { target_hidden, .. } =
+        &speculative.proposal_execution
+    else {
         return None;
     };
-    decoder_io_seeded_with(io, &spec.target_hidden_output)
+    decoder_io_seeded_with(io, &target_hidden.output)
 }
 
 /// Name `target_hidden_output` as the ABI's hidden output, or decline.
@@ -1613,6 +1732,20 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
         return onnx_genai_metadata::load_metadata(metadata_path)
             .map_err(|e| anyhow::anyhow!("Failed to load metadata: {e}"));
     }
+    if let Some(legacy) =
+        onnx_genai_metadata::inspect_legacy_speculator_for_migration(&model_directory.root)
+            .map_err(|error| anyhow::anyhow!("Failed to inspect legacy speculation: {error}"))?
+    {
+        anyhow::bail!(
+            "package '{}' declares legacy speculative sidecar configuration ({:?}) but no \
+             workflow-native `inference_metadata` declaration. Legacy sidecars are importer \
+             input only and are never runtime authority. Re-export the package with \
+             `schema_version: v1.6` and `speculative: {{ identity: onnx-genai.speculative, \
+             version: '1', ... }}`; preserve the legacy descriptor only as migration evidence.",
+            model_directory.root.display(),
+            legacy.proposal_type,
+        );
+    }
     if let Some(compat) = genai_config_compat_metadata_from_model_path(
         model_directory.genai_config_path.as_deref(),
         &model_directory.model_path,
@@ -1628,75 +1761,43 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
 
 /// Admit metadata for the bare-decoder decode path.
 ///
-/// Structural defects mean the document does not describe a runnable model, so
-/// they stay fatal.
-///
-/// Declared capabilities split on one question: **does the capability describe
-/// the document, or does it prescribe computation this path must perform?**
-///
-/// *Descriptive* capabilities are derived from the workflow manifest —
-/// `workflow_ssa`, `serving_service_contract`, `bounded_state_recurrence`,
-/// `typed_emit`, `emit_valid_length`, `linear_effects`,
-/// `loop_induction_values`, `nested_control_flow`. The canonical package
-/// describes a workflow; this path derives its IO from the graph and never
-/// interprets that manifest, so refusing to load over one rejects packages that
-/// decode correctly. Measured: a package declaring all eight loads, decodes,
-/// and produces a coherent token stream whose first token matches the same
-/// model exported without a workflow manifest. Report and continue.
-///
-/// *Prescriptive* capabilities are derived from `metadata.adapters` — a
-/// concrete weight overlay, not a description. This path never reads
-/// `metadata.adapters`, so decoding anyway would silently emit **base-model
-/// output** rather than the adapted output the package asks for. That is wrong
-/// output, not degraded output, and the caller has no way to notice. These stay
-/// fatal.
+/// Schema-version conformance is validated directly. A bare decoder may not
+/// silently skip a separately declared adapter component or adapter service:
+/// either would produce base-model output rather than the package semantics.
+/// The extension identity/version comes from the owning typed declaration, not
+/// from a second capability list.
 fn admit_inference_metadata(metadata: &InferenceMetadata) -> anyhow::Result<()> {
-    use onnx_genai_metadata::capabilities as capability;
+    onnx_genai_metadata::validate_metadata(metadata)
+        .map_err(|errors| anyhow::anyhow!("Invalid inference metadata: {errors:?}"))?;
 
-    let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-    let report = onnx_genai_metadata::validate_structure_and_capabilities(metadata, &runtime_caps);
-    if !report.structural.is_empty() {
-        anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
-    }
+    let extension = metadata
+        .adapters
+        .as_ref()
+        .map(|service| {
+            service.application_capability.split_once('@').map_or_else(
+                || service.application_capability.clone(),
+                |(identity, version)| format!("{identity}@{version}"),
+            )
+        })
+        .or_else(|| {
+            metadata.pipeline.as_ref().and_then(|pipeline| {
+                pipeline.workflow.components.values().find_map(|component| {
+                    let onnx_genai_metadata::ComponentImplementation::Adapter {
+                        abi, version, ..
+                    } = &component.implementation
+                    else {
+                        return None;
+                    };
+                    Some(format!("{abi}@{version}"))
+                })
+            })
+        });
 
-    // Capabilities that prescribe computation this path cannot perform. Keyed
-    // on the derived capability name rather than on `metadata.adapters`,
-    // because these are also derived from the workflow spec: a component whose
-    // adapter ABI or contract id is `onnx-genai.parameter-overlay`, or an input
-    // carrying an adapter-segment/count/scale role, yields them with
-    // `metadata.adapters` unset. Checking the service would miss exactly those
-    // workflow-declared overlays, which carry the identical wrong-output risk.
-    const PRESCRIPTIVE: &[&str] = &[
-        capability::PARAMETER_ADAPTERS,
-        capability::HETEROGENEOUS_ADAPTER_BATCHING,
-    ];
-
-    let (prescriptive, descriptive): (Vec<_>, Vec<_>) = report
-        .unsupported_capabilities
-        .iter()
-        .partition(|capability| PRESCRIPTIVE.contains(&capability.as_str()));
-
-    if !prescriptive.is_empty() {
+    if let Some(extension) = extension {
         anyhow::bail!(
-            "inference metadata requires capabilities this decode path cannot perform: {}; \
-             decoding anyway would silently emit base-model output instead of the output the \
-             package describes",
-            prescriptive
-                .iter()
-                .map(|capability| capability.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    if !descriptive.is_empty() {
-        tracing::warn!(
-            "inference metadata declares capabilities this runtime does not implement: {}; \
-             continuing because the decode path does not interpret the workflow manifest",
-            descriptive
-                .iter()
-                .map(|capability| capability.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "the bare decoder cannot execute required semantic extension {extension}; \
+             decoding would silently emit base-model output instead of the package semantics. \
+             Use the workflow runtime that admits this exact extension."
         );
     }
     Ok(())
@@ -1707,9 +1808,8 @@ fn resolve_metadata_and_decode_path(
     shared_kv: crate::decode::SharedKvOffer,
     capture_requested: bool,
 ) -> anyhow::Result<MetadataResolution> {
-    // Canonical metadata is the sole execution contract. Structural defects are
-    // fatal; declared workflow capabilities are reported and do not block the
-    // bare-decoder path (see `admit_inference_metadata`).
+    // Canonical metadata is the sole execution contract. Core conformance and
+    // required semantic extensions are admitted before decode-path selection.
     admit_inference_metadata(&metadata)?;
 
     let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
@@ -2806,14 +2906,14 @@ fn build_mtp_model_from_resolved(
     })
 }
 
-/// Resolve and build a native-backend MTP proposer from a model directory's
-/// inference metadata, mirroring [`load_native_shared_kv_proposer`].
+/// Resolve and build a native-backend MTP proposer from the package's
+/// workflow-native declaration.
 ///
 /// Returns the loaded [`MtpModel`] (the pure-attention MTP head runs on the ORT
 /// `environment`; only the hybrid GDN target needs the native EP) together with
 /// the [`SpeculativeMode::Mtp`] the engine should adopt. Yields `None` /
-/// [`SpeculativeMode::None`] when the metadata advertises no MTP speculator, so
-/// non-speculative models keep their exact existing load path.
+/// [`SpeculativeMode::None`] when the declaration selects another proposal
+/// form, so non-MTP models keep their exact existing load path.
 #[cfg(feature = "native-backend")]
 fn load_native_mtp_proposer(
     metadata: &InferenceMetadata,
@@ -2821,23 +2921,20 @@ fn load_native_mtp_proposer(
     environment: &Environment,
     session_options: &SessionOptions,
     native_device: crate::native_decode::NativeDecodeDevice,
+    requested_drafts: usize,
+    enabled: bool,
 ) -> anyhow::Result<(Option<MtpModel>, SpeculativeMode)> {
-    // The package's workflow describes the *target* graph; the draft head is a
-    // separate artifact the model directory declares for itself in `config.json`.
-    // Discovery is therefore the signal here, and a directory that declares no
-    // speculator simply loads unspeculated.
-    let Some(descriptor) = onnx_genai_metadata::detect_speculator(&model_directory.root) else {
+    if !enabled {
+        return Ok((None, SpeculativeMode::None));
+    }
+    let Some(speculative) = metadata.speculative.as_ref() else {
         return Ok((None, SpeculativeMode::None));
     };
-    let spec = match descriptor.proposer {
-        onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) => spec,
-        // A declaration that cannot be read is an authoring error worth
-        // surfacing. Any other proposer kind is simply not this loader's
-        // business and leaves the native path unspeculated.
-        onnx_genai_metadata::SpeculatorProposerStatus::Unknown(reason) => {
-            anyhow::bail!("Invalid native MTP sidecar metadata: {reason}")
-        }
-        _ => return Ok((None, SpeculativeMode::None)),
+    if !matches!(
+        speculative.proposal_execution,
+        onnx_genai_metadata::SpeculativeProposalExecution::Mtp { .. }
+    ) {
+        return Ok((None, SpeculativeMode::None));
     };
     // The native target exposes no ORT `Session` to interrogate for the target
     // vocabulary (that is the point of the native EP). The head borrows the
@@ -2853,7 +2950,12 @@ fn load_native_mtp_proposer(
             "native MTP speculation requires the target vocabulary size; declare \
              `model.vocab_size` in the package metadata",
         )?;
-    let resolved = ResolvedMtpConfig::from_sidecar_descriptor(&spec, vocab_size);
+    let resolved = ResolvedMtpConfig::from_canonical_metadata(
+        metadata,
+        &model_directory.root,
+        vocab_size,
+        requested_drafts,
+    )?;
     validate_resolved_mtp_config(&resolved)?;
     validate_native_mtp_hidden_output(&model_directory.model_path, &resolved)?;
     // The pure-attention MTP head runs as an ORT session; when the native target
@@ -3099,41 +3201,28 @@ mod metadata_admission_tests {
     use super::*;
 
     #[test]
-    fn unsupported_declared_capability_is_reported_but_does_not_block_decode() {
-        let metadata: InferenceMetadata =
-            serde_yaml::from_str("schema_version: v1\nrequired_capabilities: [vendor.future]\n")
-                .expect("metadata parses");
+    fn candidate_tree_contract_is_refused_before_model_or_session_loading() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unsupported-candidate-tree");
 
-        admit_inference_metadata(&metadata).expect(
-            "an unimplemented declared capability must not block a package that decodes correctly",
+        let Err(error) = Engine::from_dir(&fixture, EngineConfig::default()) else {
+            panic!("a declared candidate tree must never fall through to plain generation");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("candidate-tree") && message.contains("onnx-genai.speculative@1"),
+            "the refusal must identify the exact canonical declaration: {message}"
         );
-    }
-
-    #[test]
-    fn workflow_manifest_capabilities_do_not_block_the_bare_decoder() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            r#"
-schema_version: v1
-pipeline:
-  workflow:
-    manifest:
-      capabilities: [workflow_ssa]
-    components:
-      decoder:
-        implementation: { kind: binding }
-        ports: {}
-    steps:
-      - kind: invoke
-        component: decoder
-"#,
-        )
-        .expect("metadata parses");
-
-        // The canonical package describes a workflow; the decode path derives
-        // its IO from the graph and never interprets the manifest, so a
-        // capability the runtime has not implemented is not a reason to refuse.
-        admit_inference_metadata(&metadata)
-            .expect("a workflow manifest must not block the bare decode path");
+        assert!(
+            message.contains("cannot execute the declared candidate-tree variant")
+                && message.contains("silently running plain, MTP, or DFlash generation"),
+            "the refusal must explain why no model/session was loaded: {message}"
+        );
+        assert!(
+            !message.contains("model.onnx"),
+            "the candidate-tree admission guard must run before this fixture's intentionally \
+             absent model artifact is inspected: {message}"
+        );
     }
 
     #[test]
@@ -3143,8 +3232,7 @@ pipeline:
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {}
     components:
       decoder:
         implementation: { kind: binding }
@@ -3168,9 +3256,8 @@ pipeline:
 
     #[test]
     fn declared_adapters_fail_closed_because_this_path_cannot_apply_them() {
-        // An adapter overlay is prescriptive, not descriptive: this path never
-        // reads `metadata.adapters`, so loading anyway would silently emit
-        // base-model output instead of the adapted output the package asks for.
+        // The adapter service is a required semantic extension. This path
+        // cannot execute it, so decoding as the base model is forbidden.
         let metadata: InferenceMetadata = serde_yaml::from_str(
             r#"
 schema_version: v1
@@ -3228,27 +3315,23 @@ adapters:
              {error}"
         );
         assert!(
-            error.contains("cannot perform") && error.contains("base-model output"),
+            error.contains("required semantic extension onnx-genai.adapters@1")
+                && error.contains("base-model output"),
             "{error}"
         );
     }
 
     #[test]
     fn workflow_declared_parameter_overlay_also_fails_closed_without_an_adapter_service() {
-        // The prescriptive capabilities are ALSO derived from the workflow spec
-        // (`workflow_required_capabilities`: a component whose adapter ABI or
-        // contract id is `onnx-genai.parameter-overlay` yields
-        // `parameter_adapters`), with `metadata.adapters` unset. This is the
-        // case that makes the explicit capability list correct and a
-        // `metadata.adapters.is_some()` check wrong -- keying off the service
-        // would let a workflow-declared overlay through with only a warning.
+        // A component adapter carries its own exact ABI/version. It remains a
+        // required semantic extension even when no top-level adapter service is
+        // present, so this bare path cannot pass it through as base-model work.
         let metadata: InferenceMetadata = serde_yaml::from_str(
             r#"
 schema_version: v1
 pipeline:
   workflow:
     manifest:
-      capabilities: [workflow_ssa, parameter_adapters]
       adapter_abis:
         onnx-genai.parameter-overlay: "1"
     components:
@@ -3279,7 +3362,8 @@ pipeline:
              {error}"
         );
         assert!(
-            error.contains("parameter_adapters") && error.contains("base-model output"),
+            error.contains("required semantic extension onnx-genai.parameter-overlay@1")
+                && error.contains("base-model output"),
             "{error}"
         );
     }
@@ -3455,7 +3539,7 @@ mod decode_core_coverage_tests {
         ));
 
         for (name, workflow) in corpus {
-            if Engine::decode_core_covers(&workflow) {
+            if Engine::decode_core_covers(&workflow, None) {
                 assert!(
                     onnx_genai_metadata::is_single_decoder_workflow(&workflow),
                     "{name}: the loader chose the fused executor for a package the metadata, CLI \
@@ -3474,7 +3558,7 @@ mod decode_core_coverage_tests {
     fn the_loader_declines_a_decode_contract_with_no_roles() {
         let mut workflow = single_decoder_workflow();
         assert!(
-            Engine::decode_core_covers(&workflow),
+            Engine::decode_core_covers(&workflow, None),
             "the unmodified fixture is exactly what the decode core covers",
         );
         workflow
@@ -3484,7 +3568,7 @@ mod decode_core_coverage_tests {
             .ports
             .roles = std::collections::BTreeMap::new();
         assert!(
-            !Engine::decode_core_covers(&workflow),
+            !Engine::decode_core_covers(&workflow, None),
             "a component naming the decode step without the roles that resolve its ABI must not \
              be handed to the fused executor",
         );

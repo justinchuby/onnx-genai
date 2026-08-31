@@ -4,11 +4,6 @@ pipeline:
     manifest:
       adapter_abis:
         onnx-genai.parameter-overlay: '1'
-      capabilities:
-      - workflow_ssa
-      - typed_emit
-      - parameter_adapters
-      - heterogeneous_adapter_batching
     inputs:
       request.active:
         contract:
@@ -93,7 +88,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
-        family: { kind: materialized }
         stage: pre_adapter
     components:
       decoder:

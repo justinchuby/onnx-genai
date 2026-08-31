@@ -2828,6 +2828,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
             session_id: None,
             lease: None,
             request: Box::new(build_generate_request(&slow_request)),
+            tool_call_policy: onnx_genai_engine::ToolCallPolicy::Disabled,
             admission: slow_admission,
             events: slow_tx,
             permit: crate::driver::WorkerPermit::untracked(slow_permit),
@@ -2835,7 +2836,12 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .await
         .unwrap();
     let fast_rx = driver
-        .generate(None, build_generate_request(&fast_request), None)
+        .generate(
+            None,
+            build_generate_request(&fast_request),
+            onnx_genai_engine::ToolCallPolicy::Disabled,
+            None,
+        )
         .await
         .unwrap();
 
@@ -2887,6 +2893,7 @@ async fn native_driver_sessions_generate_through_server_path() {
                     .expect("a session with no turn in flight is leasable"),
             ),
             request,
+            onnx_genai_engine::ToolCallPolicy::Disabled,
             None,
         )
         .await
@@ -4234,10 +4241,6 @@ fn workflow_package_without_conversation(scratch: &tempfile::TempDir) -> PathBuf
         .expect("workflow declares state")
         .remove("conversation")
         .expect("the fixture declares a conversation");
-    let capabilities = document["pipeline"]["workflow"]["manifest"]["capabilities"]
-        .as_array_mut()
-        .expect("the manifest declares capabilities");
-    capabilities.retain(|capability| capability.as_str() != Some("session_state_lease"));
     std::fs::write(
         &metadata,
         serde_yaml::to_string(&document).expect("serialize metadata"),
@@ -5778,19 +5781,18 @@ async fn a_cancelled_client_does_not_leak_its_session_lease() {
 /// edit collapsing them onto one code.
 #[test]
 fn capability_refusals_map_to_the_status_their_variant_means() {
-    use onnx_genai_engine::PackageCapabilityError;
+    use onnx_genai_engine::PackageExecutionError;
 
     let no_state = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::NoSessionState,
+        PackageExecutionError::NoSessionState,
     ));
     let response = crate::routes::generation_failure(no_state);
     assert_eq!(response.status, StatusCode::CONFLICT);
     assert_eq!(response.kind, "conflict_error");
 
     let dflash = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::DFlashExecutionUnavailable {
+        PackageExecutionError::DFlashExecutionUnavailable {
             version: "1".to_string(),
-            capability: onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK.to_string(),
         },
     ));
     let response = crate::routes::generation_failure(dflash);
@@ -5798,8 +5800,29 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert_eq!(response.kind, "conflict_error");
     assert!(response.message.contains("onnx-genai.dflash-flat-block@1"));
 
+    let candidate_tree = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageExecutionError::CandidateTreeExecutionUnavailable {
+            version: "2".to_string(),
+            reason: "unsupported verifier ABI".to_string(),
+        },
+    ));
+    let response = crate::routes::generation_failure(candidate_tree);
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.kind, "conflict_error");
+    assert!(response.message.contains("onnx-genai.speculative@2"));
+
+    let dflash_raw = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageExecutionError::DFlashRawWorkflowApi {
+            operation: "run_pipeline".to_string(),
+        },
+    ));
+    let response = crate::routes::generation_failure(dflash_raw);
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(response.kind, "invalid_request_error");
+    assert!(response.message.contains("run_pipeline"));
+
     let busy = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::ExclusiveLeaseConflict {
+        PackageExecutionError::ExclusiveLeaseConflict {
             session: "shared".to_string(),
         },
     ));
@@ -5810,7 +5833,7 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert!(response.message.contains("shared"));
 
     let over_bound = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::ConversationOverBound {
+        PackageExecutionError::ConversationOverBound {
             cell: "conversation".to_string(),
             requested: 12,
             bound: 6,
@@ -5821,7 +5844,7 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert_eq!(response.kind, "invalid_request_error");
     assert_eq!(
         response.message,
-        PackageCapabilityError::ConversationOverBound {
+        PackageExecutionError::ConversationOverBound {
             cell: "conversation".to_string(),
             requested: 12,
             bound: 6,

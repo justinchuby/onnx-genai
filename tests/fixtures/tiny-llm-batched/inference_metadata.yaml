@@ -10,14 +10,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-      - bounded_state_recurrence
-      - linear_effects
-      - loop_induction_values
-      - nested_control_flow
-      - serving_service_contract
-      - typed_emit
-      - workflow_ssa
     inputs:
       application.attention_mask:
         contract:
@@ -163,7 +155,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tokens
-        family: { kind: materialized }
         stage: pre_adapter
     components:
       decoder:

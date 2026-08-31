@@ -2,10 +2,7 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - typed_emit
+    manifest: {}
     inputs:
       request.query:
         contract:
@@ -101,7 +98,6 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
-        family: { kind: materialized }
         stage: pre_adapter
     components:
       tensor_scatter:

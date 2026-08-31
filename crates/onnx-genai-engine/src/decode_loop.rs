@@ -321,6 +321,7 @@ pub(crate) fn finish_result(
             .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
         token_ids: generated_tokens.to_vec(),
         finish_reason,
+        tool_calls: Vec::new(),
         prefix_cache_hit_len,
         logprobs: logprobs.map(<[TokenLogprob]>::to_vec),
         budget_cap: None,
@@ -500,6 +501,26 @@ mod tests {
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
         Tokenizer::from_file(&fixture).map_err(Into::into)
+    }
+
+    fn tool_protocol_tokenizer() -> anyhow::Result<Tokenizer> {
+        Tokenizer::from_file(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-tool-call/tokenizer.json"),
+        )
+        .map_err(Into::into)
+    }
+
+    fn generated_tokens(tokenizer: &Tokenizer, text: &str) -> anyhow::Result<Vec<TokenId>> {
+        let tokens = tokenizer.encode(text)?;
+        Ok(tokens
+            .into_iter()
+            .filter(|token| {
+                tokenizer
+                    .decode(&[*token])
+                    .is_ok_and(|piece| !piece.is_empty())
+            })
+            .collect())
     }
 
     #[test]
@@ -758,6 +779,178 @@ mod tests {
         assert_eq!(plain.token_ids, streamed.token_ids);
         assert_eq!(plain.text, streamed.text);
         assert_eq!(streamed_ids, streamed.token_ids);
+        Ok(())
+    }
+
+    fn logits_for_tokens(tokens: &[TokenId]) -> Vec<Vec<f32>> {
+        let width = tokens.iter().copied().max().unwrap_or_default() as usize + 1;
+        tokens
+            .iter()
+            .map(|token| {
+                let mut logits = vec![f32::NEG_INFINITY; width];
+                logits[*token as usize] = 0.0;
+                logits
+            })
+            .collect()
+    }
+
+    fn tagged_json_observer(
+        policy: crate::ToolCallPolicy,
+    ) -> crate::pipeline::ToolCallStagedOutputObserver {
+        crate::pipeline::ToolCallStagedOutputObserver::new(
+            onnx_genai_metadata::ToolProtocol::from_declaration(
+                &onnx_genai_metadata::ToolProtocolDeclaration {
+                    identity: "tagged-json".to_string(),
+                    version: "v1".to_string(),
+                },
+            )
+            .expect("supported protocol"),
+            policy,
+        )
+    }
+
+    #[test]
+    fn production_generation_host_waits_for_boundary_and_commits_every_adjacent_call()
+    -> anyhow::Result<()> {
+        let tokenizer = tool_protocol_tokenizer()?;
+        let envelope = r#"<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>"#;
+        let one_call = generated_tokens(&tokenizer, envelope)?;
+        let tokens = [one_call.as_slice(), one_call.as_slice()].concat();
+        assert_eq!(tokenizer.decode(&tokens)?, format!("{envelope} {envelope}"));
+        let options = GenerateOptions {
+            max_new_tokens: tokens.len(),
+            greedy: true,
+            temperature: 0.0,
+            stop_on_eos: false,
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None, false)?;
+        let mut backend =
+            MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
+        let mut state = DecodeLoopState::new(0, options.seed, None);
+        let mut observer = tagged_json_observer(crate::ToolCallPolicy::Auto);
+        let mut delivered = Vec::new();
+        let mut callback = |token: GenerateToken| {
+            delivered.push(token.token_id);
+            Ok(())
+        };
+
+        let result = crate::pipeline::generation::generate_with_decode_core_and_staged_observer(
+            &canonical_runtime(),
+            &mut backend,
+            &mut state,
+            &[],
+            crate::pipeline::generation::GenerationRequest {
+                options: &options,
+                chain: &chain,
+                tokenizer: &tokenizer,
+                max_context: None,
+            },
+            Some(&mut observer),
+            Some(&mut callback),
+        )?;
+
+        assert_eq!(result.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(result.token_ids, tokens);
+        assert_eq!(backend.next_logits, 2);
+        assert_eq!(delivered, result.token_ids);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "weather");
+        assert_eq!(result.tool_calls[1].name, "weather");
+        assert_eq!(result.tool_calls[0].id, "call_0");
+        assert_eq!(result.tool_calls[1].id, "call_1");
+        assert_eq!(result.tool_calls[0].arguments, r#"{"city":"Paris"}"#);
+        Ok(())
+    }
+
+    #[test]
+    fn production_generation_host_aborts_policy_failure_without_callback() -> anyhow::Result<()> {
+        let tokenizer = tool_protocol_tokenizer()?;
+        let tokens = generated_tokens(&tokenizer, "ordinary assistant text")?;
+        assert_eq!(tokenizer.decode(&tokens)?, "ordinary assistant text");
+        let options = GenerateOptions {
+            max_new_tokens: tokens.len(),
+            greedy: true,
+            temperature: 0.0,
+            stop_on_eos: false,
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None, false)?;
+        let mut backend =
+            MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
+        let mut state = DecodeLoopState::new(0, options.seed, None);
+        let mut observer = tagged_json_observer(crate::ToolCallPolicy::Required);
+        let mut delivered = Vec::new();
+        let mut callback = |token: GenerateToken| {
+            delivered.push(token.token_id);
+            Ok(())
+        };
+
+        let error = crate::pipeline::generation::generate_with_decode_core_and_staged_observer(
+            &canonical_runtime(),
+            &mut backend,
+            &mut state,
+            &[],
+            crate::pipeline::generation::GenerationRequest {
+                options: &options,
+                chain: &chain,
+                tokenizer: &tokenizer,
+                max_context: None,
+            },
+            Some(&mut observer),
+            Some(&mut callback),
+        )
+        .expect_err("required no-call output must fail before publication");
+        let error = format!("{error:#}");
+
+        assert!(error.contains("at least one was required"), "{error}");
+        assert!(delivered.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_callback_failure_is_post_commit_and_not_replayed() -> anyhow::Result<()> {
+        let tokenizer = tool_protocol_tokenizer()?;
+        let envelope = r#"<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>"#;
+        let tokens = generated_tokens(&tokenizer, envelope)?;
+        let options = GenerateOptions {
+            max_new_tokens: tokens.len(),
+            greedy: true,
+            temperature: 0.0,
+            stop_on_eos: false,
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None, false)?;
+        let mut backend =
+            MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
+        let mut state = DecodeLoopState::new(0, options.seed, None);
+        let mut observer = tagged_json_observer(crate::ToolCallPolicy::Auto);
+        let mut deliveries = 0;
+        let mut callback = |_token: GenerateToken| {
+            deliveries += 1;
+            anyhow::bail!("receiver disconnected")
+        };
+
+        let error = crate::pipeline::generation::generate_with_decode_core_and_staged_observer(
+            &canonical_runtime(),
+            &mut backend,
+            &mut state,
+            &[],
+            crate::pipeline::generation::GenerationRequest {
+                options: &options,
+                chain: &chain,
+                tokenizer: &tokenizer,
+                max_context: None,
+            },
+            Some(&mut observer),
+            Some(&mut callback),
+        )
+        .expect_err("post-commit delivery failure remains visible");
+
+        assert!(format!("{error:#}").contains("receiver disconnected"));
+        assert_eq!(deliveries, 1);
+        assert_eq!(backend.committed, tokens);
+        assert_eq!(observer.committed_calls().len(), 1);
         Ok(())
     }
 }
