@@ -34,6 +34,9 @@
 //!
 //! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled.
 
+mod common;
+
+use common::reset_capture_error_for_isolated_test;
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMetadata, TensorMut,
@@ -1051,7 +1054,7 @@ fn run_gpu_capture_replay(
     };
 
     // A fresh generation starts un-poisoned.
-    unsafe { runtime.reset_capture_error_for_isolated_test() }?;
+    reset_capture_error_for_isolated_test(runtime)?;
 
     // Warmup: an eager execute compiles/caches every NVRTC kernel and sizes the
     // pooled scratch before capture. Only after this does the kernel advertise
@@ -1418,7 +1421,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
         )]
     };
 
-    unsafe { runtime.reset_capture_error_for_isolated_test() }.expect("reset latch");
+    reset_capture_error_for_isolated_test(runtime).expect("reset latch");
 
     // Warmup with the valid indices: sizes scratch, primes NVRTC, makes capture
     // eligible, and (eager) does not poison the latch.
@@ -1503,7 +1506,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
         0,
         "an out-of-range index in a captured replay must latch the capture-error word"
     );
-    unsafe { runtime.reset_capture_error_for_isolated_test() }.expect("reset latch");
+    reset_capture_error_for_isolated_test(runtime).expect("reset latch");
 
     ep.deallocate(out_buffer).expect("free out");
     if let Some(buffer) = workspace_buffer {

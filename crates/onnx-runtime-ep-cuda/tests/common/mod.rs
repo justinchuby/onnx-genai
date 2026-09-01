@@ -28,8 +28,8 @@ use onnx_runtime_ep_api::{
     TensorMut, TensorView, WorkspaceAllocation, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ep_cuda::{CudaExecutionProvider, CudaRuntime};
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
@@ -480,6 +480,20 @@ pub fn require_cuda() -> CudaExecutionProvider {
             "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
         ),
     }
+}
+
+#[cfg(feature = "gpu-tests")]
+pub fn reset_capture_error_for_isolated_test(
+    runtime: &CudaRuntime,
+) -> onnx_runtime_ep_api::Result<()> {
+    // SAFETY: GPU integration tests serialize access and do not open a session
+    // validation generation around their isolated raw-latch probes.
+    unsafe { runtime.reset_capture_error_for_isolated_test() }
+}
+
+#[cfg(not(feature = "gpu-tests"))]
+pub fn reset_capture_error_for_isolated_test(_: &CudaRuntime) -> onnx_runtime_ep_api::Result<()> {
+    panic!("isolated CUDA latch reset requires the gpu-tests feature")
 }
 
 /// Construct a raw CUDA context for the current visible device or panic.

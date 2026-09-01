@@ -649,6 +649,29 @@ impl RawCudaFunction {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    doc = r#"
+The isolated capture-error reset is intentionally absent from ordinary builds.
+The runtime type remains publicly usable while the test-only mutation does not:
+
+```
+use onnx_runtime_ep_cuda::CudaRuntime;
+
+fn accepts_runtime(_: &CudaRuntime) {}
+```
+
+```compile_fail,E0599
+use onnx_runtime_ep_cuda::CudaRuntime;
+
+fn production_cannot_reset_capture_error(runtime: &CudaRuntime) {
+    unsafe {
+        runtime.reset_capture_error_for_isolated_test().unwrap();
+    }
+}
+```
+"#
+)]
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -1778,6 +1801,7 @@ impl CudaRuntime {
     ///
     /// # Safety
     /// The caller must prove no validation generation is active.
+    #[cfg(any(test, feature = "gpu-tests"))]
     #[doc(hidden)]
     pub unsafe fn reset_capture_error_for_isolated_test(&self) -> Result<()> {
         let resetting = validation_word(ValidationPhase::Resetting, 0);
