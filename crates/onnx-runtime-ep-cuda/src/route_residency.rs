@@ -54,11 +54,16 @@
 //! # Default off / byte-identical
 //!
 //! Gated by the existing [`COARSE_RESIDENCY_ENABLE_ENV`]
-//! (`coarse_residency_profile_enabled()`). When off — the shipped default —
-//! this returns [`RouteWindowConsumeOutcome::Disabled`] before reading the
-//! snapshot or touching any allocator, so ordinary inference (telemetry
-//! disarmed *and* this gate off: two independent default-off switches) is
-//! byte-identical.
+//! (`coarse_residency_profile_enabled()`). The CUDA provider resolves that
+//! configuration once at construction and executor artifact finalization
+//! records `Disabled`, `Declined`, or `Required { owner }`; a disabled or
+//! declined request never enters the route boundary. Changing the process
+//! environment requires rebuilding the provider/executor rather than silently
+//! changing an already-warmed request path. When off — the shipped default —
+//! this low-level consumer also returns
+//! [`RouteWindowConsumeOutcome::Disabled`] before reading the snapshot or
+//! touching any allocator, so ordinary inference (telemetry disarmed *and*
+//! this gate off: two independent default-off switches) is byte-identical.
 //!
 //! # Window ordering the caller owns
 //!
@@ -72,13 +77,13 @@
 //!
 //! # Production status (honest)
 //!
-//! Like `coarse_residency::apply_residency_plan_at_boundary` when it shipped
-//! (Slice 5), this consumer has **no live decode-loop call site yet**: wiring
-//! it into a running session's request boundary is the next slice. It ships
-//! here as the production seam — reachable, default-off, and proven by the
-//! GPU tests in `tests/route_residency_consume_gpu.rs` — so the telemetry the
-//! producer already accumulates has a real, tested consumer to drive the
-//! #1854 transition.
+//! The session executor calls the provider boundary once per top-level
+//! required request, after synchronizing and consuming that exact owner's
+//! validation receipt. Provider artifact finalization resolves the capability
+//! before the request path: `Disabled` and `Declined` perform no route-state
+//! lock, producer read, telemetry work, allocation, or synchronization;
+//! `Required { owner }` preserves the ordered snapshot → consume → reset
+//! transition and fails closed if its owner-scoped boundary is absent.
 //!
 //! [`TelemetrySnapshot`]: crate::kernels::expert_route_telemetry::TelemetrySnapshot
 //! [`consume_and_validate`]: crate::kernels::expert_route_telemetry::consume_and_validate
@@ -179,13 +184,7 @@ fn prepare_route_window(
     catalogs: &HashMap<ValueId, WeightRegionCatalog>,
     device_count: usize,
 ) -> Prepared {
-    // 1. Default-off gate. Read before the snapshot so a disarmed/disabled
-    //    build never inspects telemetry or touches an allocator.
-    if !coarse_residency_profile_enabled() {
-        return Prepared::Early(RouteWindowConsumeOutcome::Disabled);
-    }
-
-    // 2. Proven safe boundary. Reuse the existing residency authority rather
+    // 1. Proven safe boundary. Reuse the existing residency authority rather
     //    than duplicating capture/admission/guard tracking. This is the "no
     //    remap during capture/replay" and "boundary-only, never per-token"
     //    gate; `apply_coarse_residency_plan` re-verifies it immediately before
@@ -194,7 +193,7 @@ fn prepare_route_window(
         return Prepared::Early(RouteWindowConsumeOutcome::RejectedNotSafeBoundary { reason });
     }
 
-    // 3. Validate the completed window with the producer's own consumer
+    // 2. Validate the completed window with the producer's own consumer
     //    reference (fail-closed identity/epoch/poison/overflow contract).
     match consume_and_validate(
         &snapshot.header,
@@ -284,6 +283,44 @@ pub fn consume_route_window_at_boundary(
     device_ordinal: i32,
     expert_groups: &[ExpertWeightGroup],
 ) -> RouteWindowConsumeOutcome {
+    if !coarse_residency_profile_enabled() {
+        return RouteWindowConsumeOutcome::Disabled;
+    }
+    consume_resolved_route_window_at_boundary(
+        residency,
+        snapshot,
+        expected_epoch,
+        expected_request,
+        expected_device,
+        bank_values,
+        boundary,
+        catalogs,
+        allocators,
+        device_pool,
+        host_pool,
+        device_count,
+        device_ordinal,
+        expert_groups,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_resolved_route_window_at_boundary(
+    residency: &CudaWeightResidency,
+    snapshot: &TelemetrySnapshot,
+    expected_epoch: u32,
+    expected_request: u32,
+    expected_device: u32,
+    bank_values: &[ValueId],
+    boundary: LazyWeightBoundary,
+    catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+    allocators: &HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    device_pool: &Arc<PhysicalHandlePool>,
+    host_pool: &Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expert_groups: &[ExpertWeightGroup],
+) -> RouteWindowConsumeOutcome {
     match prepare_route_window(
         residency,
         snapshot,
@@ -332,6 +369,49 @@ pub fn consume_route_window_at_boundary(
 #[cfg(any(test, feature = "gpu-tests"))]
 #[allow(clippy::too_many_arguments)]
 pub fn consume_route_window_at_boundary_with_phase8_faults(
+    runtime: &Arc<crate::runtime::CudaRuntime>,
+    residency: &CudaWeightResidency,
+    snapshot: &TelemetrySnapshot,
+    expected_epoch: u32,
+    expected_request: u32,
+    expected_device: u32,
+    bank_values: &[ValueId],
+    boundary: LazyWeightBoundary,
+    catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+    allocators: &HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    device_pool: &Arc<PhysicalHandlePool>,
+    host_pool: &Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expert_groups: &[ExpertWeightGroup],
+    phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
+) -> RouteWindowConsumeOutcome {
+    if !coarse_residency_profile_enabled() {
+        return RouteWindowConsumeOutcome::Disabled;
+    }
+    consume_resolved_route_window_at_boundary_with_phase8_faults(
+        runtime,
+        residency,
+        snapshot,
+        expected_epoch,
+        expected_request,
+        expected_device,
+        bank_values,
+        boundary,
+        catalogs,
+        allocators,
+        device_pool,
+        host_pool,
+        device_count,
+        device_ordinal,
+        expert_groups,
+        phase8_faults,
+    )
+}
+
+#[cfg(any(test, feature = "gpu-tests"))]
+#[allow(clippy::too_many_arguments)]
+fn consume_resolved_route_window_at_boundary_with_phase8_faults(
     runtime: &Arc<crate::runtime::CudaRuntime>,
     residency: &CudaWeightResidency,
     snapshot: &TelemetrySnapshot,
@@ -402,11 +482,12 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
 // binding. The binding carries the producer window source plus every
 // already-existing authority handle the consumer needs; the EP override drives
 // snapshot → consume → reset exactly once per boundary and records the typed
-// outcome here. Production installs no binding yet (honest "reachable seam" —
-// matching how 7A/7B shipped), so the override is a lock + `None` check when the
-// gate is on and a bare env read
-// when it is off. The Slice-7C GPU tests install a binding and exercise the
-// whole matrix through this same override.
+// outcome here. Artifact finalization resolves a typed disabled/declined/required
+// capability before request execution. Production installs no binding yet
+// (honest "reachable seam" — matching how 7A/7B shipped), so disabled and
+// declined requests never enter the override or touch route state. The Slice-7C
+// GPU tests install a binding and exercise the whole matrix through this same
+// override.
 // ---------------------------------------------------------------------------
 
 /// The producer half of one route-telemetry window, abstracted so the boundary
@@ -871,9 +952,10 @@ fn window_was_consumed(outcome: &RouteWindowConsumeOutcome) -> bool {
 /// boundary neither snapshots nor resets. Reuses only the merged #1971 consumer
 /// and #1854 lifecycle; adds no mapping, allocation, or host sync of its own.
 ///
-/// The caller (the CUDA EP override) has already checked the default-off gate
-/// and that a binding is installed, so reaching here means the consumer runs.
-pub fn run_route_residency_boundary(
+/// The caller (the CUDA EP override) reaches this only from a pre-resolved
+/// `Required { owner }` capability and after finding that owner's installed
+/// binding, so no process configuration is re-read on the request path.
+pub(crate) fn run_route_residency_boundary(
     binding: &RouteResidencyBoundary,
     diag: &RouteResidencyDiagnostics,
 ) -> Result<()> {
@@ -896,7 +978,7 @@ pub fn run_route_residency_boundary(
         return Ok(());
     };
 
-    let outcome = consume_route_window_at_boundary(
+    let outcome = consume_resolved_route_window_at_boundary(
         &binding.residency,
         &snapshot,
         binding.expected_epoch(),
@@ -928,7 +1010,7 @@ pub fn run_route_residency_boundary(
 /// range-precisely and quarantines exactly like a real driver failure. Same
 /// ordering and reset discipline as production; only the apply path differs.
 #[cfg(any(test, feature = "gpu-tests"))]
-pub fn run_route_residency_boundary_with_phase8_faults(
+pub(crate) fn run_route_residency_boundary_with_phase8_faults(
     runtime: &Arc<crate::runtime::CudaRuntime>,
     binding: &RouteResidencyBoundary,
     diag: &RouteResidencyDiagnostics,
@@ -950,7 +1032,7 @@ pub fn run_route_residency_boundary_with_phase8_faults(
         return Ok(());
     };
 
-    let outcome = consume_route_window_at_boundary_with_phase8_faults(
+    let outcome = consume_resolved_route_window_at_boundary_with_phase8_faults(
         runtime,
         &binding.residency,
         &snapshot,

@@ -109,11 +109,54 @@ pub enum ExecutorArtifactFinalization {
     /// terminal outcome: installed, disabled, or structurally declined. Later
     /// kernel specializations may reuse the executor-owned producer identity
     /// without reinstalling.
-    Complete,
+    Complete {
+        /// Resolved request-boundary behavior for this executor. The executor
+        /// retains this proof and never re-queries provider state on a request.
+        route_residency: ExecutorRouteResidency,
+    },
     /// A readiness-dependent producer is not available yet. Nothing terminal
     /// was latched. Execution and capture remain forbidden, and the executor
     /// may invoke the transition again only after its readiness epoch advances.
     Pending(ExecutorArtifactPending),
+}
+
+/// Resolved route-residency behavior for one executor.
+///
+/// This is produced only by artifact finalization, before request execution.
+/// The hot path consumes this value directly, so the default-off and declined
+/// paths cannot acquire provider locks, inspect producer registries, or perform
+/// telemetry work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutorRouteResidency {
+    /// Route residency is disabled by resolved provider configuration.
+    #[default]
+    Disabled,
+    /// Route residency was enabled, but this executor structurally declined
+    /// installation and therefore owns no request boundary.
+    Declined,
+    /// This executor owns a live request boundary that must run after its exact
+    /// validation receipt is consumed.
+    Required { owner: ExecutorInstanceId },
+}
+
+impl ExecutorRouteResidency {
+    #[must_use]
+    pub fn required_for(owner: ExecutorInstanceId) -> Self {
+        Self::Required { owner }
+    }
+
+    #[must_use]
+    pub fn owner(self) -> Option<ExecutorInstanceId> {
+        match self {
+            Self::Required { owner } => Some(owner),
+            Self::Disabled | Self::Declined => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_required(self) -> bool {
+        self.owner().is_some()
+    }
 }
 
 /// Tie-break policy for [`ExecutionProvider::device_argmax`] when two or more
@@ -1830,13 +1873,6 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
-    /// Whether `executor` has route-residency state that must be consumed at
-    /// the synchronized request boundary rather than deferred to an output
-    /// binding read.
-    fn requires_route_residency_request_boundary(&self, _executor: ExecutorInstanceId) -> bool {
-        false
-    }
-
     /// Authoritative transition for "all provider artifacts required by this
     /// executor's resolved compilation are finalized."
     ///
@@ -1857,7 +1893,9 @@ pub trait ExecutionProvider: Send + Sync {
         _graph: &Graph,
         _readiness: ExecutorArtifactReadinessEpoch,
     ) -> Result<ExecutorArtifactFinalization> {
-        Ok(ExecutorArtifactFinalization::Complete)
+        Ok(ExecutorArtifactFinalization::Complete {
+            route_residency: ExecutorRouteResidency::Disabled,
+        })
     }
 
     /// Drain exactly the artifacts owned by `executor`.

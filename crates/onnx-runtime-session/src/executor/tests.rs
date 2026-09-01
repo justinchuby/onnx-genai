@@ -138,6 +138,7 @@ struct DeferredValidationEp {
     route_boundary_before_sync: Arc<AtomicBool>,
     route_boundary_before_validation: Arc<AtomicBool>,
     route_boundary_required: Arc<AtomicBool>,
+    return_foreign_route_owner: Arc<AtomicBool>,
     route_boundary_executors: Arc<std::sync::Mutex<Vec<ExecutorInstanceId>>>,
     route_lifecycle_events: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
@@ -172,6 +173,7 @@ impl DeferredValidationEp {
             route_boundary_before_sync: Arc::new(AtomicBool::new(false)),
             route_boundary_before_validation: Arc::new(AtomicBool::new(false)),
             route_boundary_required: Arc::new(AtomicBool::new(false)),
+            return_foreign_route_owner: Arc::new(AtomicBool::new(false)),
             route_boundary_executors: Arc::new(std::sync::Mutex::new(Vec::new())),
             route_lifecycle_events: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
@@ -465,9 +467,45 @@ impl ExecutionProvider for DeferredValidationEp {
         Ok(())
     }
 
-    fn requires_route_residency_request_boundary(&self, _executor: ExecutorInstanceId) -> bool {
-        self.route_boundary_required.load(Ordering::Relaxed)
+    fn finalize_executor_artifacts(
+        &self,
+        executor: ExecutorInstanceId,
+        _graph: &Graph,
+        _readiness: ExecutorArtifactReadinessEpoch,
+    ) -> onnx_runtime_ep_api::Result<ExecutorArtifactFinalization> {
+        Ok(ExecutorArtifactFinalization::Complete {
+            route_residency: if self.route_boundary_required.load(Ordering::Relaxed) {
+                let owner = if self.return_foreign_route_owner.load(Ordering::Relaxed) {
+                    ExecutorInstanceId::fresh()
+                } else {
+                    executor
+                };
+                ExecutorRouteResidency::required_for(owner)
+            } else {
+                ExecutorRouteResidency::Disabled
+            },
+        })
     }
+}
+
+#[test]
+fn route_residency_finalization_rejects_foreign_resolved_owner() {
+    let ep = DeferredValidationEp::new();
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
+    ep.return_foreign_route_owner.store(true, Ordering::Relaxed);
+    let executor = ExecutorInstanceId::fresh();
+    let mut readiness = ProviderArtifactReadiness::default();
+
+    let error = readiness
+        .finalize_if_needed(&ep, executor, &Graph::new())
+        .expect_err("a provider cannot resolve another executor's route boundary");
+    assert!(
+        error.to_string().contains("returned route-residency owner")
+            && error
+                .to_string()
+                .contains(&format!("executor {}", executor.get())),
+        "unexpected foreign-owner diagnostic: {error}"
+    );
 }
 
 impl DeferredValidationEp {
@@ -6255,7 +6293,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     let mut executor = Executor::build(
         sealed_bqmoe_session_graph(),
         Arc::new(WeightStore::new()),
-        cuda,
+        Arc::clone(&cuda) as Arc<dyn ExecutionProvider>,
     )
     .unwrap();
     let first = executor.run(&[("x", &input), ("router", &router)]).unwrap()[0].to_vec_f32();
@@ -6357,6 +6395,13 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         runtime.graph_lifecycle_lock_acquisition_count() > lock_before,
         "graph-lock falsifier"
     );
+    let route_lock_before = cuda.route_state_lock_acquisition_count();
+    cuda.test_acquire_route_state_lock();
+    assert_eq!(
+        cuda.route_state_lock_acquisition_count(),
+        route_lock_before + 1,
+        "route-state lock falsifier must observe the intentional acquisition"
+    );
     let alloc_before = runtime.allocation_counts();
     let transfer_before = runtime.transfer_counts();
     let sync_before = runtime.forced_synchronization_count();
@@ -6414,48 +6459,76 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     );
     drop(preparation_control);
 
-    let allocations = runtime.allocation_counts();
-    let transfers = runtime.transfer_counts();
-    let synchronizations = runtime.forced_synchronization_count();
-    let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
-    let locks = runtime.graph_lifecycle_lock_acquisition_count();
-    let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
-    let submissions = runtime.validation_submission_count();
-    let (warmed, host_allocations) =
-        count_host_allocations(|| executor.run_with_device_bindings(&[], &mut bindings));
-    warmed.unwrap();
+    let route_locks = cuda.route_state_lock_acquisition_count();
+    let route_boundary_calls = cuda.route_request_boundary_call_count();
+    let route_diag = (
+        cuda.route_residency_diagnostics().boundaries(),
+        cuda.route_residency_diagnostics().applied(),
+        cuda.route_residency_diagnostics().rejected(),
+        cuda.route_residency_diagnostics().empty(),
+    );
+    const MEASURED_REQUESTS: u64 = 8;
+    let mut host_allocations = 0;
+    let mut output_prefix = [0u8; 4];
+    for _ in 0..MEASURED_REQUESTS {
+        let allocations = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        let synchronizations = runtime.forced_synchronization_count();
+        let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+        let locks = runtime.graph_lifecycle_lock_acquisition_count();
+        let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
+        let submissions = runtime.validation_submission_count();
+        let (_, request_allocations) = count_host_allocations(|| {
+            executor
+                .run_with_device_bindings(&[], &mut bindings)
+                .unwrap();
+        });
+        host_allocations += request_allocations;
+        assert_eq!(runtime.allocation_counts(), allocations);
+        assert_eq!(runtime.transfer_counts(), transfers);
+        assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+        assert_eq!(
+            onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
+            preparation
+        );
+        assert_eq!(runtime.graph_lifecycle_lock_acquisition_count(), locks);
+        assert_eq!(
+            runtime.validation_registry_lock_acquisition_count(),
+            validation_registry_locks
+        );
+        assert_eq!(runtime.validation_submission_count() - submissions, 1);
+        bindings[2].read_bytes_into(&mut output_prefix).unwrap();
+    }
     assert_eq!(
         host_allocations,
         0,
         "warmed production Executor allocations: {:?}",
         HOST_ALLOCATION_SIZES.with(Cell::get)
     );
-    assert_eq!(runtime.allocation_counts(), allocations);
-    assert_eq!(runtime.transfer_counts(), transfers);
-    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
     assert_eq!(
-        onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
-        preparation
+        cuda.route_state_lock_acquisition_count(),
+        route_locks,
+        "default-off warmed requests must acquire zero route-state locks"
     );
     assert_eq!(
-        runtime.graph_lifecycle_lock_acquisition_count(),
-        locks,
-        "warmed production Executor graph locks"
+        cuda.route_request_boundary_call_count(),
+        route_boundary_calls,
+        "default-off warmed requests must not enter the route boundary"
     );
     assert_eq!(
-        runtime.validation_registry_lock_acquisition_count(),
-        validation_registry_locks,
-        "warmed production Executor validation-registry locks"
-    );
-    assert_eq!(
-        runtime.validation_submission_count() - submissions,
-        1,
-        "warmed production measurement must execute exactly one real validation submission"
+        (
+            cuda.route_residency_diagnostics().boundaries(),
+            cuda.route_residency_diagnostics().applied(),
+            cuda.route_residency_diagnostics().rejected(),
+            cuda.route_residency_diagnostics().empty(),
+        ),
+        route_diag,
+        "default-off warmed requests must perform no producer or telemetry work"
     );
     eprintln!(
-        "validation-allocation warmed-production allocations={host_allocations} submissions=1"
+        "route-default-off warmed-production requests={MEASURED_REQUESTS} \
+         allocations={host_allocations} route_locks=0 boundary_calls=0"
     );
-    bindings[2].read_bytes_range(0, 4).unwrap();
 
     assert!(matches!(
         executor
@@ -6470,6 +6543,8 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     let locks = runtime.graph_lifecycle_lock_acquisition_count();
     let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
     let submissions = runtime.validation_submission_count();
+    let route_locks = cuda.route_state_lock_acquisition_count();
+    let route_boundary_calls = cuda.route_request_boundary_call_count();
     let (replayed, host_allocations) =
         count_host_allocations(|| executor.replay_device_graph(&mut bindings));
     assert!(replayed.unwrap());
@@ -6501,50 +6576,66 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         1,
         "first captured launch measurement must execute exactly one real submission"
     );
+    assert_eq!(cuda.route_state_lock_acquisition_count(), route_locks);
+    assert_eq!(
+        cuda.route_request_boundary_call_count(),
+        route_boundary_calls
+    );
     eprintln!(
         "validation-allocation first-captured-launch allocations={host_allocations} submissions=1"
     );
     bindings[2].read_bytes_range(0, 4).unwrap();
 
-    let allocations = runtime.allocation_counts();
-    let transfers = runtime.transfer_counts();
-    let synchronizations = runtime.forced_synchronization_count();
-    let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
-    let locks = runtime.graph_lifecycle_lock_acquisition_count();
-    let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
-    let submissions = runtime.validation_submission_count();
-    let (replayed, host_allocations) =
-        count_host_allocations(|| executor.replay_device_graph(&mut bindings));
-    assert!(replayed.unwrap());
+    let route_locks = cuda.route_state_lock_acquisition_count();
+    let route_boundary_calls = cuda.route_request_boundary_call_count();
+    let mut host_allocations = 0;
+    for _ in 0..MEASURED_REQUESTS {
+        let allocations = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        let synchronizations = runtime.forced_synchronization_count();
+        let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+        let locks = runtime.graph_lifecycle_lock_acquisition_count();
+        let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
+        let submissions = runtime.validation_submission_count();
+        let (_, replay_allocations) = count_host_allocations(|| {
+            assert!(executor.replay_device_graph(&mut bindings).unwrap());
+        });
+        host_allocations += replay_allocations;
+        assert_eq!(runtime.allocation_counts(), allocations);
+        assert_eq!(runtime.transfer_counts(), transfers);
+        assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+        assert_eq!(
+            onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
+            preparation
+        );
+        assert_eq!(runtime.graph_lifecycle_lock_acquisition_count(), locks);
+        assert_eq!(
+            runtime.validation_registry_lock_acquisition_count(),
+            validation_registry_locks
+        );
+        assert_eq!(runtime.validation_submission_count() - submissions, 1);
+        bindings[2].read_bytes_into(&mut output_prefix).unwrap();
+    }
     assert_eq!(
         host_allocations,
         0,
         "production graph replay allocations: {:?}",
         HOST_ALLOCATION_SIZES.with(Cell::get)
     );
-    assert_eq!(runtime.allocation_counts(), allocations);
-    assert_eq!(runtime.transfer_counts(), transfers);
-    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
     assert_eq!(
-        onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
-        preparation
+        cuda.route_state_lock_acquisition_count(),
+        route_locks,
+        "default-off graph replay must acquire zero route-state locks"
     );
     assert_eq!(
-        runtime.graph_lifecycle_lock_acquisition_count(),
-        locks,
-        "production graph replay lifecycle locks"
+        cuda.route_request_boundary_call_count(),
+        route_boundary_calls,
+        "default-off graph replay must not enter the route boundary"
     );
-    assert_eq!(
-        runtime.validation_registry_lock_acquisition_count(),
-        validation_registry_locks,
-        "production graph replay validation-registry locks"
+    eprintln!(
+        "route-default-off replay requests={MEASURED_REQUESTS} allocations={host_allocations} \
+         route_locks=0 boundary_calls=0"
     );
-    assert_eq!(
-        runtime.validation_submission_count() - submissions,
-        1,
-        "graph replay measurement must execute exactly one real submission"
-    );
-    eprintln!("validation-allocation replay allocations={host_allocations} submissions=1");
 }
 
 #[cfg(feature = "gpu-tests")]

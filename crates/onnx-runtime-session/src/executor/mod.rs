@@ -52,10 +52,10 @@ use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
     ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
-    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExternalMmapRegion, Kernel,
-    KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight,
-    StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle,
-    WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExecutorRouteResidency, ExternalMmapRegion,
+    Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
+    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
+    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
     lazy_weight_candidates,
 };
 use smallvec::SmallVec;

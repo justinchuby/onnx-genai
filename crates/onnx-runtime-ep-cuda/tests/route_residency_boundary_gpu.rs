@@ -1319,12 +1319,18 @@ fn builder_assembles_firing_binding_from_graph_banks() {
     assert_eq!(pat_fc1, got_fc1, "fc1 content corrupted");
     assert_eq!(pat_fc2, got_fc2, "fc2 content corrupted");
 
-    // Draining removes the binding: the consumer is inert again.
+    // Draining removes the binding. A caller that still claims the boundary is
+    // required must fail closed rather than silently treating retirement as
+    // default-off.
     gate_on();
     provider.drain_route_residency_boundary();
-    provider
+    let error = provider
         .consume_route_residency_at_boundary()
-        .expect("drained boundary Ok");
+        .expect_err("a drained required boundary must fail closed");
+    assert!(
+        error.to_string().contains("no live owner-scoped boundary"),
+        "drained-boundary diagnostic: {error}"
+    );
     assert_eq!(
         source.snapshot_calls(),
         2,
@@ -1385,10 +1391,16 @@ fn try_install_fail_closed_installs_nothing() {
     );
     assert_eq!(outcome, RouteResidencyInstallOutcome::OffloadDisabled);
     assert_eq!(diag.declines(), 1, "offload-disabled decline recorded");
-    // Nothing installed: a gate-on boundary runs no consumer.
-    provider
+    // Nothing installed: a caller that nevertheless claims a required
+    // boundary fails closed. Production requests consume the resolved
+    // `Declined` capability and never enter this method.
+    let error = provider
         .consume_route_residency_at_boundary()
-        .expect("no-binding boundary Ok");
+        .expect_err("a missing required boundary must fail closed");
+    assert!(
+        error.to_string().contains("no live owner-scoped boundary"),
+        "missing-boundary diagnostic: {error}"
+    );
     assert_eq!(diag.boundaries(), 0, "no binding was installed");
 
     // Gate off -> GateDisabled before any discovery/allocation.
@@ -1470,9 +1482,13 @@ fn try_install_on_offload_authority_installs_and_fires() {
         "dense-only graph must be a typed reject, got {rejected:?}"
     );
     assert_eq!(diag.installs(), 0, "reject installs nothing");
-    provider
+    let error = provider
         .consume_route_residency_at_boundary()
-        .expect("post-reject boundary Ok");
+        .expect_err("a rejected installation cannot satisfy a required boundary");
+    assert!(
+        error.to_string().contains("no live owner-scoped boundary"),
+        "rejected-install diagnostic: {error}"
+    );
     assert_eq!(diag.boundaries(), 0, "no binding installed after reject");
 
     // A valid two-bank graph installs a real binding through the EP seam.
@@ -1516,9 +1532,13 @@ fn try_install_on_offload_authority_installs_and_fires() {
 
     // Teardown drains the binding (mirrors `shutdown`).
     provider.drain_route_residency_boundary();
-    provider
+    let error = provider
         .consume_route_residency_at_boundary()
-        .expect("drained boundary Ok");
+        .expect_err("a drained required boundary must fail closed");
+    assert!(
+        error.to_string().contains("no live owner-scoped boundary"),
+        "drained-boundary diagnostic: {error}"
+    );
     assert_eq!(
         source.snapshot_calls(),
         1,

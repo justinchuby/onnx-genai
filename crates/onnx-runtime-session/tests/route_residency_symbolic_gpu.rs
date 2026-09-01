@@ -226,10 +226,10 @@ fn run_symbolic_qmoe(
 #[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
 fn symbolic_qmoe_finalizes_after_real_compile_and_shared_ep_state_is_isolated() {
     let _guard = GPU_SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let _gate = GateGuard::enable();
     let Some(provider) = provider_or_skip() else {
         return;
     };
-    let _gate = GateGuard::enable();
 
     let ep: Arc<dyn ExecutionProvider> = provider.clone();
     let model = symbolic_fixture_qmoe_model();
@@ -351,10 +351,10 @@ fn symbolic_qmoe_finalizes_after_real_compile_and_shared_ep_state_is_isolated() 
 #[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
 fn static_qmoe_build_uses_same_finalization_transition() {
     let _guard = GPU_SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let _gate = GateGuard::enable();
     let Some(provider) = provider_or_skip() else {
         return;
     };
-    let _gate = GateGuard::enable();
     let ep: Arc<dyn ExecutionProvider> = provider.clone();
     let session = InferenceSession::builder()
         .model_bytes(&static_qmoe_model())

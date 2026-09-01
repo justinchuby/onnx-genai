@@ -122,6 +122,9 @@ impl Executor {
         // provider terminal outcome. Pending or failed finalization returns
         // before buffers are bound and before eager, capture, or replay work.
         self.ensure_provider_artifacts_ready(&resolved)?;
+        let route_residency = self
+            .provider_artifact_readiness
+            .route_residency(self.ep.name(), self.instance_id)?;
         let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
         let measure_activation_plan = !nested
             && mode == RunMode::Eager
@@ -154,10 +157,8 @@ impl Executor {
                     .outputs
                     .iter()
                     .all(|output| external.outputs.contains_key(output))
-                && !self
-                    .ep
-                    .requires_route_residency_request_boundary(self.instance_id);
-            self.finish_device_validation(defer_until_binding_read)
+                && !route_residency.is_required();
+            self.finish_device_validation(defer_until_binding_read, route_residency)
         };
         if let Some(submission) = validation_submission.as_mut() {
             submission.disarm();
@@ -174,20 +175,31 @@ impl Executor {
         }
     }
 
-    fn finish_device_validation(&mut self, defer_until_binding_read: bool) -> Result<()> {
+    fn finish_device_validation(
+        &mut self,
+        defer_until_binding_read: bool,
+        route_residency: ExecutorRouteResidency,
+    ) -> Result<()> {
         if defer_until_binding_read && self.ep.defers_device_validation() {
             return Ok(());
         }
-        self.finish_device_validation_boundary()
+        self.finish_device_validation_boundary_with(route_residency)
     }
 
     pub(crate) fn finish_device_validation_boundary(&mut self) -> Result<()> {
+        let route_residency = self
+            .provider_artifact_readiness
+            .route_residency(self.ep.name(), self.instance_id)?;
+        self.finish_device_validation_boundary_with(route_residency)
+    }
+
+    fn finish_device_validation_boundary_with(
+        &mut self,
+        route_residency: ExecutorRouteResidency,
+    ) -> Result<()> {
         // This is the one request-level host boundary for deferred eager work
         // and for captured replay. The CUDA EP's explicit sync is unconditional,
         // so the latch read observes every kernel from this request.
-        let route_boundary_required = self
-            .ep
-            .requires_route_residency_request_boundary(self.instance_id);
         self.ep.sync()?;
         let flags = match self.pending_device_validation.take() {
             Some(token) => match self.ep.consume_device_validation_error(
@@ -202,7 +214,7 @@ impl Executor {
                     return Err(error.into());
                 }
             },
-            None if route_boundary_required => {
+            None if route_residency.is_required() => {
                 return Err(EpError::KernelFailed(format!(
                     "{}: route-residency boundary for executor {} is missing its \
                      owner-scoped device-validation receipt",
@@ -222,8 +234,10 @@ impl Executor {
                 // else (issue #1810 Slice 7C). Non-residency EPs use the no-op
                 // default and the CUDA EP is gated off by default, so this is
                 // byte-identical unless a provider opts in.
-                self.ep
-                    .consume_route_residency_at_boundary_for_executor(self.instance_id)?;
+                if let Some(owner) = route_residency.owner() {
+                    self.ep
+                        .consume_route_residency_at_boundary_for_executor(owner)?;
+                }
                 Ok(())
             }
             flags => Err(EpError::KernelFailed(format!(

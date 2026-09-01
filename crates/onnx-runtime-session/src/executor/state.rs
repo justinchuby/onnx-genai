@@ -67,7 +67,9 @@ enum ProviderArtifactOutcome {
     Unfinalized,
     Pending(ExecutorArtifactPending),
     Failed(String),
-    Complete,
+    Complete {
+        route_residency: ExecutorRouteResidency,
+    },
 }
 
 /// The executor's sole authority for whether provider-owned artifacts may be
@@ -109,8 +111,17 @@ impl ProviderArtifactReadiness {
     ) -> Result<()> {
         if self.needs_finalization() {
             match ep.finalize_executor_artifacts(executor, graph, self.epoch) {
-                Ok(ExecutorArtifactFinalization::Complete) => {
-                    self.outcome = ProviderArtifactOutcome::Complete;
+                Ok(ExecutorArtifactFinalization::Complete { route_residency }) => {
+                    self.outcome = match route_residency.owner() {
+                        Some(owner) if owner != executor => {
+                            ProviderArtifactOutcome::Failed(format!(
+                                "provider returned route-residency owner {} for executor {}",
+                                owner.get(),
+                                executor.get()
+                            ))
+                        }
+                        _ => ProviderArtifactOutcome::Complete { route_residency },
+                    };
                 }
                 Ok(ExecutorArtifactFinalization::Pending(pending)) => {
                     self.outcome = ProviderArtifactOutcome::Pending(pending);
@@ -129,7 +140,7 @@ impl ProviderArtifactReadiness {
         executor: ExecutorInstanceId,
     ) -> Result<()> {
         match &self.outcome {
-            ProviderArtifactOutcome::Complete => Ok(()),
+            ProviderArtifactOutcome::Complete { .. } => Ok(()),
             ProviderArtifactOutcome::Unfinalized => {
                 Err(SessionError::ExecutionProviderArtifactsPending {
                     provider: provider.to_string(),
@@ -155,6 +166,18 @@ impl ProviderArtifactReadiness {
                     reason: reason.clone(),
                 })
             }
+        }
+    }
+
+    pub(super) fn route_residency(
+        &self,
+        provider: &str,
+        executor: ExecutorInstanceId,
+    ) -> Result<ExecutorRouteResidency> {
+        self.require_complete(provider, executor)?;
+        match self.outcome {
+            ProviderArtifactOutcome::Complete { route_residency } => Ok(route_residency),
+            _ => unreachable!("require_complete accepted only a complete outcome"),
         }
     }
 }

@@ -60,9 +60,9 @@ pub use provider::{
     ArgmaxTieBreak, BoundBufferOwnership, CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner,
     DeviceGraphSlot, DeviceGraphToken, DeviceValidationOwner, DeviceValidationRegistration,
     DeviceValidationToken, EpConfig, EpId, ExecutionProvider, ExecutorArtifactFinalization,
-    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId, Fence,
-    HostToDeviceCopier, RawDeviceAllocationSiteStats, SealedDeviceAllocation,
-    StructuralCaptureDecline, WorkspaceAllocation,
+    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
+    ExecutorRouteResidency, Fence, HostToDeviceCopier, RawDeviceAllocationSiteStats,
+    SealedDeviceAllocation, StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{

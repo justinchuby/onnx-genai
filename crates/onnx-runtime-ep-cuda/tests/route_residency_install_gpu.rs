@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
     ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
-    ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
+    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExecutorRouteResidency,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
@@ -258,9 +258,13 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
     println!(
         "\n=== enabled_build_binds_real_producer_and_declines_without_per_bank_reservation ==="
     );
+    gate_on();
     let provider = match offload_provider_or_skip("enabled") {
         Some(p) => p,
-        None => return,
+        None => {
+            gate_off();
+            return;
+        }
     };
 
     let (graph, node_id, members) = qmoe_graph();
@@ -277,8 +281,6 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
             .is_none(),
         "nothing retained before an enabled build"
     );
-
-    gate_on();
 
     // Compile the QMoE node through the EP's factory: the executing kernel
     // registers itself as the EP-owned producer (goal 2, no test double).
@@ -301,7 +303,9 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
         provider
             .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(1),)
             .expect("finalize compiled executor"),
-        ExecutorArtifactFinalization::Complete
+        ExecutorArtifactFinalization::Complete {
+            route_residency: ExecutorRouteResidency::Declined,
+        }
     );
     let status = provider.route_residency_executor_status(executor);
     assert_eq!(status.finalization_attempts, 1);
@@ -321,7 +325,9 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
         provider
             .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(2),)
             .expect("finalize specialized executor"),
-        ExecutorArtifactFinalization::Complete
+        ExecutorArtifactFinalization::Complete {
+            route_residency: ExecutorRouteResidency::Declined,
+        }
     );
     assert_eq!(
         provider
@@ -371,16 +377,18 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
 #[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
 fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
     let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    gate_on();
     let provider = match offload_provider_or_skip("readiness") {
         Some(provider) => Arc::new(provider),
-        None => return,
+        None => {
+            gate_off();
+            return;
+        }
     };
     let (graph, node_id, _) = qmoe_graph();
     let graph = Arc::new(graph);
     let executor = ExecutorInstanceId::fresh();
     let foreign_executor = ExecutorInstanceId::fresh();
-    gate_on();
-
     let declines_before = provider.route_residency_diagnostics().declines();
     assert_eq!(
         provider
@@ -455,7 +463,9 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
                             ExecutorArtifactReadinessEpoch::new(2),
                         )
                         .expect("concurrent finalization"),
-                    ExecutorArtifactFinalization::Complete
+                    ExecutorArtifactFinalization::Complete {
+                        route_residency: ExecutorRouteResidency::Declined,
+                    }
                 );
             });
         }
@@ -498,14 +508,16 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
 #[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
 fn block_quantized_moe_without_producer_is_terminal_not_pending() {
     let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    gate_on();
     let provider = match offload_provider_or_skip("bqmoe-terminal") {
         Some(provider) => provider,
-        None => return,
+        None => {
+            gate_off();
+            return;
+        }
     };
     let (graph, node_id) = block_quantized_moe_graph();
     let executor = ExecutorInstanceId::fresh();
-    gate_on();
-
     let valid_shapes = vec![
         vec![1, 32],
         vec![1, 2],
@@ -541,7 +553,9 @@ fn block_quantized_moe_without_producer_is_terminal_not_pending() {
         provider
             .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(1),)
             .expect("unsupported producer capability is a typed decline"),
-        ExecutorArtifactFinalization::Complete
+        ExecutorArtifactFinalization::Complete {
+            route_residency: ExecutorRouteResidency::Declined,
+        }
     );
     let status = provider.route_residency_executor_status(executor);
     assert_eq!(status.finalization_attempts, 1);
@@ -560,7 +574,9 @@ fn block_quantized_moe_without_producer_is_terminal_not_pending() {
         provider
             .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(2),)
             .expect("terminal decline remains idempotent"),
-        ExecutorArtifactFinalization::Complete
+        ExecutorArtifactFinalization::Complete {
+            route_residency: ExecutorRouteResidency::Declined,
+        }
     );
     assert_eq!(
         provider
@@ -606,12 +622,35 @@ fn disabled_build_installs_and_retains_nothing() {
     );
 
     gate_off();
+    let locks_before_finalization = provider.route_state_lock_acquisition_count();
     assert_eq!(
         provider
             .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(1),)
             .expect("default-off finalization"),
-        ExecutorArtifactFinalization::Complete
+        ExecutorArtifactFinalization::Complete {
+            route_residency: ExecutorRouteResidency::Disabled,
+        }
     );
+    assert_eq!(
+        provider.route_state_lock_acquisition_count(),
+        locks_before_finalization,
+        "resolved default-off capability must return before the route-state lock"
+    );
+    gate_on();
+    assert_eq!(
+        provider
+            .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(2),)
+            .expect("late process-env changes do not mutate resolved provider configuration"),
+        ExecutorArtifactFinalization::Complete {
+            route_residency: ExecutorRouteResidency::Disabled,
+        }
+    );
+    assert_eq!(
+        provider.route_state_lock_acquisition_count(),
+        locks_before_finalization,
+        "late env changes cannot reopen route state or add a lock to the disabled provider"
+    );
+    gate_off();
 
     let diag = provider.route_residency_diagnostics();
     assert_eq!(diag.installs(), 0, "default-off installs nothing");

@@ -14,8 +14,8 @@ use std::sync::{
 use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider,
     ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
-    ExecutorInstanceId, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata, TensorMut,
-    TensorView, ViewOutput, WorkspaceRequirement,
+    ExecutorInstanceId, ExecutorRouteResidency, Fence, Kernel, KernelMatch, Result as EpResult,
+    TensorMetadata, TensorMut, TensorView, ViewOutput, WorkspaceRequirement,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{
@@ -336,7 +336,9 @@ impl ExecutionProvider for HostDownloadCountingEp {
                 TestArtifactFinalization::ReadyPendingFailedReady
             )
         {
-            return Ok(ExecutorArtifactFinalization::Complete);
+            return Ok(ExecutorArtifactFinalization::Complete {
+                route_residency: ExecutorRouteResidency::Disabled,
+            });
         }
         assert!(
             self.kernel_compiles
@@ -398,7 +400,9 @@ impl ExecutionProvider for HostDownloadCountingEp {
                     .lock()
                     .unwrap()
                     .insert(executor, graph.num_nodes());
-                Ok(ExecutorArtifactFinalization::Complete)
+                Ok(ExecutorArtifactFinalization::Complete {
+                    route_residency: ExecutorRouteResidency::Disabled,
+                })
             }
         }
     }

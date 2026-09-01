@@ -26,14 +26,6 @@ impl ExecutionProvider for CudaDecliningAbs {
             .consume_route_residency_at_boundary_for_executor(executor)
     }
 
-    fn requires_route_residency_request_boundary(
-        &self,
-        executor: onnx_runtime_ep_api::ExecutorInstanceId,
-    ) -> bool {
-        self.inner
-            .requires_route_residency_request_boundary(executor)
-    }
-
     fn name(&self) -> &str {
         "cuda_except_abs"
     }
