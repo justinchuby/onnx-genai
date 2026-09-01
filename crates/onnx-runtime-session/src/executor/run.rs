@@ -153,7 +153,10 @@ impl Executor {
                     .graph
                     .outputs
                     .iter()
-                    .all(|output| external.outputs.contains_key(output));
+                    .all(|output| external.outputs.contains_key(output))
+                && !self
+                    .ep
+                    .requires_route_residency_request_boundary(self.instance_id);
             self.finish_device_validation(defer_until_binding_read)
         };
         if let Some(submission) = validation_submission.as_mut() {
@@ -173,7 +176,6 @@ impl Executor {
 
     fn finish_device_validation(&mut self, defer_until_binding_read: bool) -> Result<()> {
         if defer_until_binding_read && self.ep.defers_device_validation() {
-            self.ep.consume_route_residency_at_boundary()?;
             return Ok(());
         }
         self.finish_device_validation_boundary()
@@ -183,6 +185,9 @@ impl Executor {
         // This is the one request-level host boundary for deferred eager work
         // and for captured replay. The CUDA EP's explicit sync is unconditional,
         // so the latch read observes every kernel from this request.
+        let route_boundary_required = self
+            .ep
+            .requires_route_residency_request_boundary(self.instance_id);
         self.ep.sync()?;
         let flags = match self.pending_device_validation.take() {
             Some(token) => match self.ep.consume_device_validation_error(
@@ -197,6 +202,15 @@ impl Executor {
                     return Err(error.into());
                 }
             },
+            None if route_boundary_required => {
+                return Err(EpError::KernelFailed(format!(
+                    "{}: route-residency boundary for executor {} is missing its \
+                     owner-scoped device-validation receipt",
+                    self.ep.name(),
+                    self.instance_id.get()
+                ))
+                .into());
+            }
             None => 0,
         };
         match flags {
@@ -205,9 +219,9 @@ impl Executor {
                 // captured replay have completed (the sync above), the stream is
                 // no longer capturing, and the device validation latch is clean.
                 // Consume any completed route-telemetry window here and nowhere
-                // else (issue #1810 Slice 7C). Every EP declares this explicitly;
-                // non-residency EPs return Ok(()) and the CUDA EP is gated off by
-                // default, so this is byte-identical unless a provider opts in.
+                // else (issue #1810 Slice 7C). Non-residency EPs use the no-op
+                // default and the CUDA EP is gated off by default, so this is
+                // byte-identical unless a provider opts in.
                 self.ep
                     .consume_route_residency_at_boundary_for_executor(self.instance_id)?;
                 Ok(())

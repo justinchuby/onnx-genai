@@ -397,13 +397,14 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
 // The consumer above is pure host glue but takes ~14 arguments and names CUDA
 // types the EP-agnostic executor cannot. So the single production call site
 // (`Executor::finish_device_validation` → `ExecutionProvider::
-// consume_route_residency_at_boundary`) reaches it through the CUDA EP, which
-// owns one optional `RouteResidencyBoundary` binding. The binding carries the
-// producer window source plus every already-existing authority handle the
-// consumer needs; the EP override drives snapshot → consume → reset exactly
-// once per boundary and records the typed outcome here. Production installs no
-// binding yet (honest "reachable seam" — matching how 7A/7B shipped), so the
-// override is a lock + `None` check when the gate is on and a bare env read
+// consume_route_residency_at_boundary_for_executor`) reaches it through the
+// CUDA EP, which owns one optional executor-scoped `RouteResidencyBoundary`
+// binding. The binding carries the producer window source plus every
+// already-existing authority handle the consumer needs; the EP override drives
+// snapshot → consume → reset exactly once per boundary and records the typed
+// outcome here. Production installs no binding yet (honest "reachable seam" —
+// matching how 7A/7B shipped), so the override is a lock + `None` check when the
+// gate is on and a bare env read
 // when it is off. The Slice-7C GPU tests install a binding and exercise the
 // whole matrix through this same override.
 // ---------------------------------------------------------------------------
@@ -796,6 +797,7 @@ impl RouteResidencyDiagnostics {
     }
 
     /// Record that a real binding was installed for `banks` bank values.
+    #[cfg(any(test, feature = "gpu-tests"))]
     pub(crate) fn record_install(&self, banks: usize) {
         self.installs.fetch_add(1, Ordering::Relaxed);
         self.set_install_reason(format!("installed binding over {banks} bank value(s)"));

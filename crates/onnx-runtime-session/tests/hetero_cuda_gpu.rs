@@ -18,8 +18,20 @@ struct CudaDecliningAbs {
 }
 
 impl ExecutionProvider for CudaDecliningAbs {
-    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
-        self.inner.consume_route_residency_at_boundary()
+    fn consume_route_residency_at_boundary_for_executor(
+        &self,
+        executor: onnx_runtime_ep_api::ExecutorInstanceId,
+    ) -> EpResult<()> {
+        self.inner
+            .consume_route_residency_at_boundary_for_executor(executor)
+    }
+
+    fn requires_route_residency_request_boundary(
+        &self,
+        executor: onnx_runtime_ep_api::ExecutorInstanceId,
+    ) -> bool {
+        self.inner
+            .requires_route_residency_request_boundary(executor)
     }
 
     fn name(&self) -> &str {

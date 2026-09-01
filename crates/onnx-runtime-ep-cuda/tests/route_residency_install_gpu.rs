@@ -161,16 +161,57 @@ fn qmoe_graph() -> (Graph, NodeId, Vec<ValueId>) {
 }
 
 fn block_quantized_moe_graph() -> (Graph, NodeId) {
+    const ROWS: usize = 1;
+    const HIDDEN: usize = 32;
+    const EXPERTS: usize = 2;
+    const INTERMEDIATE: usize = 32;
+    const MXFP4_QK: usize = 32;
+    const MXFP4_BLOCK_BYTES: usize = 17;
+
     let mut graph = Graph::new();
     graph.opset_imports.insert("pkg.nxrt".into(), 1);
-    let input = graph.create_named_value("hidden", DataType::Float32, static_shape([4]));
-    let router = graph.create_named_value("router_probs", DataType::Float32, static_shape([4]));
-    let weight = inline_u8_initializer(&mut graph, "experts");
-    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    let input = graph.create_named_value("hidden", DataType::Float32, static_shape([ROWS, HIDDEN]));
+    graph.add_input(input);
+    let router = graph.create_named_value(
+        "router_probs",
+        DataType::Float32,
+        static_shape([ROWS, EXPERTS]),
+    );
+    graph.add_input(router);
+    let weight_shape = [EXPERTS, INTERMEDIATE, HIDDEN / MXFP4_QK, MXFP4_BLOCK_BYTES];
+    let fc1_weight =
+        graph.create_named_value("fc1_experts", DataType::Uint8, static_shape(weight_shape));
+    graph.set_initializer(
+        fc1_weight,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Uint8,
+            weight_shape.to_vec(),
+            vec![0u8; weight_shape.iter().product()],
+        )),
+    );
+    let fc2_weight =
+        graph.create_named_value("fc2_experts", DataType::Uint8, static_shape(weight_shape));
+    graph.set_initializer(
+        fc2_weight,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Uint8,
+            weight_shape.to_vec(),
+            vec![0u8; weight_shape.iter().product()],
+        )),
+    );
+    let output =
+        graph.create_named_value("output", DataType::Float32, static_shape([ROWS, HIDDEN]));
     let mut node = Node::new(
         NodeId(0),
         "BlockQuantizedMoE",
-        vec![Some(input), Some(router), Some(weight)],
+        vec![
+            Some(input),
+            Some(router),
+            Some(fc1_weight),
+            None,
+            Some(fc2_weight),
+            None,
+        ],
         vec![output],
     );
     node.domain = "pkg.nxrt".to_string();
@@ -337,6 +378,7 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
     let (graph, node_id, _) = qmoe_graph();
     let graph = Arc::new(graph);
     let executor = ExecutorInstanceId::fresh();
+    let foreign_executor = ExecutorInstanceId::fresh();
     gate_on();
 
     let declines_before = provider.route_residency_diagnostics().declines();
@@ -381,6 +423,25 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
     );
 
     let _kernel = compile_qmoe_through_ep(&provider, executor, &graph, node_id);
+    assert!(
+        provider
+            .route_telemetry_sources(foreign_executor)
+            .is_empty(),
+        "a sibling executor cannot observe the owner's registered producer"
+    );
+    assert_eq!(
+        provider
+            .finalize_executor_artifacts(
+                foreign_executor,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(2),
+            )
+            .expect("foreign owner remains a readiness miss"),
+        ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProducerUnavailable {
+            node: node_id
+        }),
+        "another executor's real producer cannot satisfy this owner"
+    );
     std::thread::scope(|scope| {
         for _ in 0..2 {
             let provider = Arc::clone(&provider);
@@ -413,6 +474,13 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
         ))
     ));
 
+    provider.drain_executor_artifacts(foreign_executor);
+    assert!(
+        provider
+            .route_telemetry_producer(executor, node_id)
+            .is_some(),
+        "draining a sibling executor cannot tear down the owner's producer"
+    );
     provider.drain_executor_artifacts(executor);
     provider.drain_executor_artifacts(executor);
     let drained = provider.route_residency_executor_status(executor);
@@ -438,9 +506,32 @@ fn block_quantized_moe_without_producer_is_terminal_not_pending() {
     let executor = ExecutorInstanceId::fresh();
     gate_on();
 
+    let valid_shapes = vec![
+        vec![1, 32],
+        vec![1, 2],
+        vec![2, 32, 1, 17],
+        vec![],
+        vec![2, 32, 1, 17],
+        vec![],
+    ];
     let _kernel = provider
-        .get_kernel_for_executor(executor, graph.node(node_id), &[], 1)
-        .expect("compile the real BlockQuantizedMoE kernel");
+        .get_kernel_for_executor(executor, graph.node(node_id), &valid_shapes, 1)
+        .expect("production-shape BlockQuantizedMoE passes parser and kernel admission");
+    let mut malformed_shapes = valid_shapes.clone();
+    malformed_shapes[4][3] = 16;
+    let malformed = match provider.get_kernel_for_executor(
+        ExecutorInstanceId::fresh(),
+        graph.node(node_id),
+        &malformed_shapes,
+        1,
+    ) {
+        Ok(_) => panic!("malformed fc2 block width must fail before readiness classification"),
+        Err(error) => error,
+    };
+    assert!(
+        malformed.to_string().contains("fc2"),
+        "mutation control must fail at fc2 shape admission: {malformed}"
+    );
     assert!(
         provider.route_telemetry_sources(executor).is_empty(),
         "BlockQuantizedMoE compilation has no executor-scoped producer publication path"

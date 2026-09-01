@@ -136,6 +136,10 @@ struct DeferredValidationEp {
     graph_reset_calls: Arc<AtomicUsize>,
     route_boundary_calls: Arc<AtomicUsize>,
     route_boundary_before_sync: Arc<AtomicBool>,
+    route_boundary_before_validation: Arc<AtomicBool>,
+    route_boundary_required: Arc<AtomicBool>,
+    route_boundary_executors: Arc<std::sync::Mutex<Vec<ExecutorInstanceId>>>,
+    route_lifecycle_events: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
 #[derive(Default)]
@@ -166,6 +170,10 @@ impl DeferredValidationEp {
             graph_reset_calls: Arc::new(AtomicUsize::new(0)),
             route_boundary_calls: Arc::new(AtomicUsize::new(0)),
             route_boundary_before_sync: Arc::new(AtomicBool::new(false)),
+            route_boundary_before_validation: Arc::new(AtomicBool::new(false)),
+            route_boundary_required: Arc::new(AtomicBool::new(false)),
+            route_boundary_executors: Arc::new(std::sync::Mutex::new(Vec::new())),
+            route_lifecycle_events: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -175,6 +183,7 @@ impl DeferredValidationEp {
     ) -> onnx_runtime_ep_api::Result<u32> {
         self.validation_consume_attempts
             .fetch_add(1, Ordering::Relaxed);
+        self.route_lifecycle_events.lock().unwrap().push("receipt");
         let mut state = self.validation_state.lock().unwrap();
         if let Some(Some((generation, flags))) = state.owners.get(&token.owner())
             && *generation == token.generation()
@@ -307,6 +316,7 @@ impl ExecutionProvider for DeferredValidationEp {
         self.sync_calls.fetch_add(1, Ordering::Relaxed);
         self.synchronized_executions
             .store(self.executions.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.route_lifecycle_events.lock().unwrap().push("sync");
         Ok(())
     }
 
@@ -433,20 +443,30 @@ impl ExecutionProvider for DeferredValidationEp {
         Ok(true)
     }
 
-    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
-        // The production Slice-7C boundary caller lands here once per top-level
-        // request, after `sync()`. Record the call and prove the request-level
-        // synchronization boundary was crossed first (mirrors the latch check
-        // above): if the sync counter has not caught up to executions, the
-        // boundary fired too early.
+    fn consume_route_residency_at_boundary_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> onnx_runtime_ep_api::Result<()> {
         if self.synchronized_executions.load(Ordering::Relaxed)
             != self.executions.load(Ordering::Relaxed)
         {
             self.route_boundary_before_sync
                 .store(true, Ordering::Relaxed);
         }
+        let mut events = self.route_lifecycle_events.lock().unwrap();
+        if !events.ends_with(&["sync", "receipt"]) {
+            self.route_boundary_before_validation
+                .store(true, Ordering::Relaxed);
+        }
+        events.push("boundary");
+        drop(events);
+        self.route_boundary_executors.lock().unwrap().push(executor);
         self.route_boundary_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn requires_route_residency_request_boundary(&self, _executor: ExecutorInstanceId) -> bool {
+        self.route_boundary_required.load(Ordering::Relaxed)
     }
 }
 
@@ -919,6 +939,71 @@ fn device_bound_validation_is_deferred_until_a_partial_host_read() {
 }
 
 #[test]
+fn route_residency_owner_boundary_forces_device_bound_receipt_synchronization() {
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.fail_next.store(false, Ordering::Relaxed);
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
+    let (mut executor, mut bindings) =
+        deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+    let owner = executor.instance_id;
+
+    let outputs = executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("healthy owner-scoped request");
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].is_none());
+    assert_eq!(ep.sync_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.validation_consume_attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.route_boundary_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        ep.route_lifecycle_events.lock().unwrap().as_slice(),
+        &["sync", "receipt", "boundary"]
+    );
+    assert_eq!(
+        ep.route_boundary_executors.lock().unwrap().as_slice(),
+        &[owner]
+    );
+    assert!(!ep.route_boundary_before_sync.load(Ordering::Relaxed));
+    assert!(!ep.route_boundary_before_validation.load(Ordering::Relaxed));
+
+    ep.fail_next.store(true, Ordering::Relaxed);
+    let error = executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect_err("failed exact-owner receipt must fail the request");
+    assert!(
+        error.to_string().contains("device validation failed"),
+        "unexpected typed validation failure: {error}"
+    );
+    assert_eq!(
+        ep.route_boundary_calls.load(Ordering::Relaxed),
+        1,
+        "a failed owner receipt must prevent route-boundary consumption"
+    );
+}
+
+#[test]
+fn route_residency_boundary_rejects_missing_owner_receipt() {
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
+    let (mut executor, _bindings) = deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+
+    let error = executor
+        .finish_device_validation_boundary()
+        .expect_err("a route boundary without an owner receipt must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("missing its owner-scoped device-validation receipt"),
+        "unexpected missing-receipt error: {error}"
+    );
+    assert_eq!(
+        ep.route_boundary_calls.load(Ordering::Relaxed),
+        0,
+        "an unscoped/manual boundary cannot run without an owner receipt"
+    );
+}
+
+#[test]
 fn route_residency_boundary_fires_once_per_top_level_run_after_sync() {
     // Slice-7C reachability: the boundary consumer must be driven from the real
     // request lifecycle exactly once per top-level `run`, and only after the
@@ -940,8 +1025,10 @@ fn route_residency_boundary_fires_once_per_top_level_run_after_sync() {
     // The boundary only fires on a clean validation latch, so keep every request
     // healthy (the failing-latch path is covered by the request-local test).
     ep.fail_next.store(false, Ordering::Relaxed);
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
     let boundary_calls = Arc::clone(&ep.route_boundary_calls);
     let before_sync = Arc::clone(&ep.route_boundary_before_sync);
+    let before_validation = Arc::clone(&ep.route_boundary_before_validation);
     let mut executor = Executor::build(
         graph,
         Arc::new(WeightStore::new()),
@@ -962,6 +1049,18 @@ fn route_residency_boundary_fires_once_per_top_level_run_after_sync() {
     assert!(
         !before_sync.load(Ordering::Relaxed),
         "the boundary consumer must run only after the request synchronization boundary"
+    );
+    assert!(
+        !before_validation.load(Ordering::Relaxed),
+        "the boundary consumer must run only after exact receipt consumption"
+    );
+    assert!(
+        ep.route_boundary_executors
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|owner| *owner == executor.instance_id),
+        "every boundary must carry the exact executor owner"
     );
 }
 
@@ -1013,6 +1112,7 @@ fn route_residency_boundary_skips_nested_control_flow_runs() {
 
     let ep = Arc::new(DeferredValidationEp::new());
     ep.fail_next.store(false, Ordering::Relaxed);
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
     let boundary_calls = Arc::clone(&ep.route_boundary_calls);
     let executions = Arc::clone(&ep.executions);
     let before_sync = Arc::clone(&ep.route_boundary_before_sync);
@@ -4049,10 +4149,6 @@ impl KvCapacityAppendTestEp {
 }
 
 impl ExecutionProvider for KvCapacityAppendTestEp {
-    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
-        Ok(())
-    }
-
     fn name(&self) -> &str {
         "kv_capacity_append_test_ep"
     }
@@ -4956,10 +5052,6 @@ impl WeightDeliveryEp {
 }
 
 impl ExecutionProvider for WeightDeliveryEp {
-    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
-        Ok(())
-    }
-
     fn name(&self) -> &str {
         if self.lazy {
             "nxrt_test_ep"

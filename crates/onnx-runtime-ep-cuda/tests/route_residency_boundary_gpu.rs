@@ -4,7 +4,8 @@
 //! Slice 7B (`route_residency_consume_gpu.rs`) proved the raw consumer
 //! (`consume_route_window_at_boundary`) drives a real VMM transition. Slice 7C
 //! wires that consumer into the real request lifecycle: the session executor
-//! calls `ExecutionProvider::consume_route_residency_at_boundary` once per
+//! calls `ExecutionProvider::consume_route_residency_at_boundary_for_executor`
+//! once per
 //! top-level request at the single coarse safe boundary
 //! (`Executor::finish_device_validation`, after `sync()`), and the CUDA EP
 //! override drives snapshot → consume → reset through an installed
@@ -48,9 +49,7 @@ use onnx_runtime_cuda_memory::virtual_memory::{PhysicalHandlePool, PhysicalLocat
 use onnx_runtime_cuda_memory::vmm_allocator::{
     CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV, CudaVmmAllocator,
 };
-use onnx_runtime_ep_api::{
-    ExecutionProvider, ExpertWeightGroup, LazyWeightBoundary, Result, expert_weight_groups,
-};
+use onnx_runtime_ep_api::{ExpertWeightGroup, LazyWeightBoundary, Result, expert_weight_groups};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
 use onnx_runtime_ep_cuda::kernels::expert_route_telemetry::{
@@ -147,6 +146,53 @@ impl RouteTelemetrySource for WindowSource {
 // ---------------------------------------------------------------------------
 
 static GPU_SERIAL: Mutex<()> = Mutex::new(());
+
+#[cfg(not(feature = "gpu-tests"))]
+trait RouteResidencyGpuTestSupport {
+    fn install_route_residency_boundary(&self, boundary: Arc<RouteResidencyBoundary>);
+    fn try_install_route_residency_binding(
+        &self,
+        graph: &Graph,
+        sources: &HashMap<NodeId, Arc<dyn RouteTelemetrySource>>,
+        catalogs: HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+        allocators: HashMap<ValueId, Arc<CudaVmmAllocator>>,
+        device_pool: Arc<PhysicalHandlePool>,
+        host_pool: Arc<PhysicalHandlePool>,
+        expected_request: u32,
+        initial_epoch: u32,
+    ) -> RouteResidencyInstallOutcome;
+    fn drain_route_residency_boundary(&self);
+    fn consume_route_residency_at_boundary(&self) -> Result<()>;
+}
+
+#[cfg(not(feature = "gpu-tests"))]
+impl RouteResidencyGpuTestSupport for CudaExecutionProvider {
+    fn install_route_residency_boundary(&self, _boundary: Arc<RouteResidencyBoundary>) {
+        panic!("route-residency GPU test support requires feature `gpu-tests`")
+    }
+
+    fn try_install_route_residency_binding(
+        &self,
+        _graph: &Graph,
+        _sources: &HashMap<NodeId, Arc<dyn RouteTelemetrySource>>,
+        _catalogs: HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+        _allocators: HashMap<ValueId, Arc<CudaVmmAllocator>>,
+        _device_pool: Arc<PhysicalHandlePool>,
+        _host_pool: Arc<PhysicalHandlePool>,
+        _expected_request: u32,
+        _initial_epoch: u32,
+    ) -> RouteResidencyInstallOutcome {
+        panic!("route-residency GPU test support requires feature `gpu-tests`")
+    }
+
+    fn drain_route_residency_boundary(&self) {
+        panic!("route-residency GPU test support requires feature `gpu-tests`")
+    }
+
+    fn consume_route_residency_at_boundary(&self) -> Result<()> {
+        panic!("route-residency GPU test support requires feature `gpu-tests`")
+    }
+}
 
 fn provider_or_skip(label: &str) -> Option<CudaExecutionProvider> {
     match CudaExecutionProvider::new(0) {

@@ -1816,39 +1816,25 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(0)
     }
 
-    /// Consume any completed coarse-boundary route-telemetry window and apply
-    /// the resulting per-expert residency plan through the provider's existing
-    /// coarse-residency lifecycle (issue #1810 Slice 7C).
+    /// Consume this executor's completed route-telemetry window.
     ///
-    /// This is a required part of the EP lifecycle contract — there is no
-    /// compatibility default, so every provider states its boundary behaviour
-    /// explicitly. Session executors call it **once per top-level request**, at
-    /// the single request-level host boundary that runs after [`Self::sync`] —
-    /// i.e. after every kernel and captured replay from the request has
-    /// completed and the stream is no longer capturing. It is never called per
-    /// token, per replay, or from a nested control-flow subgraph run.
-    ///
-    /// An EP with no coarse-residency lifecycle (every stock EP, and the CUDA EP
-    /// whenever device weight offload or the coarse-residency profile is
-    /// disabled — the shipped default) returns `Ok(())` and does nothing here.
-    /// A provider that participates must remain fail-closed and must perform no
-    /// mapping change during capture/replay — it reuses its own already-validated
-    /// safe-boundary authority to decide whether the boundary is safe before it
-    /// consumes or resets anything, and surfaces a typed outcome to its own
-    /// diagnostics rather than failing silently.
-    fn consume_route_residency_at_boundary(&self) -> Result<()>;
-
-    /// Executor-scoped form of
-    /// [`Self::consume_route_residency_at_boundary`].
-    ///
-    /// The default delegates to the historical unscoped hook. A provider that
-    /// can be shared by sibling executors overrides this method so one
-    /// executor's request boundary cannot consume another executor's producer.
+    /// The session invokes this only after synchronizing device work and
+    /// consuming the exact owner-scoped deferred-validation receipt. The
+    /// executor identity is mandatory: providers must not consult unscoped or
+    /// process-global producer state to satisfy this boundary. Non-participating
+    /// providers have no route lifecycle and keep the no-op default.
     fn consume_route_residency_at_boundary_for_executor(
         &self,
         _executor: ExecutorInstanceId,
     ) -> Result<()> {
-        self.consume_route_residency_at_boundary()
+        Ok(())
+    }
+
+    /// Whether `executor` has route-residency state that must be consumed at
+    /// the synchronized request boundary rather than deferred to an output
+    /// binding read.
+    fn requires_route_residency_request_boundary(&self, _executor: ExecutorInstanceId) -> bool {
+        false
     }
 
     /// Authoritative transition for "all provider artifacts required by this
@@ -2426,10 +2412,6 @@ mod tests {
         }
 
         impl ExecutionProvider for WorkspaceDeallocationEp {
-            fn consume_route_residency_at_boundary(&self) -> Result<()> {
-                Ok(())
-            }
-
             fn name(&self) -> &str {
                 "workspace-deallocation-test"
             }

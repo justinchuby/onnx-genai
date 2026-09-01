@@ -49,9 +49,9 @@ use onnx_runtime_ep_api::{
     LazyWeight, OpRegistry, PagedWeight, Result, SealedDeviceAllocation, WorkspaceAllocation, deny,
     structural_input_bytes,
 };
-use onnx_runtime_ir::{
-    DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
-};
+#[cfg(any(test, feature = "gpu-tests"))]
+use onnx_runtime_ir::ValueId;
+use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout};
 use onnx_runtime_memory_governor::{
     AllocationChargeMode, AllocationIdentity, AllocationPublication, AllocationReleaseOutcome,
     AllocationRequest, AllocationSettlementStatus, AllocationSettlementToken,
@@ -67,9 +67,11 @@ use crate::deferred_release::{
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
+#[cfg(any(test, feature = "gpu-tests"))]
+use crate::route_residency::build_route_residency_boundary;
 use crate::route_residency::{
     RouteResidencyBindingReject, RouteResidencyBoundary, RouteResidencyDiagnostics,
-    RouteResidencyInstallOutcome, build_route_residency_boundary,
+    RouteResidencyInstallOutcome,
 };
 use crate::runtime::{CudaRuntime, cuptr};
 use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy, PrefillRoute};
@@ -1848,19 +1850,21 @@ impl CudaExecutionProvider {
         &self.csa_metrics
     }
 
-    /// Install the legacy unscoped Slice-7C route-residency test binding.
+    /// Install an unscoped Slice-7C route-residency test binding.
     ///
     /// Once installed, the coarse safe-boundary consumer (driven from
-    /// [`ExecutionProvider::consume_route_residency_at_boundary`] at
+    /// [`ExecutionProvider::consume_route_residency_at_boundary_for_executor`] at
     /// `Executor::finish_device_validation`) will, *when the default-off gate is
     /// enabled*, snapshot → consume → reset this bank's window exactly once per
     /// request boundary. Production uses executor-scoped finalization instead;
     /// this is `#[doc(hidden)]` and retained only for Slice-7C wiring tests.
+    #[cfg(any(test, feature = "gpu-tests"))]
     #[doc(hidden)]
     pub fn install_route_residency_boundary(&self, boundary: Arc<RouteResidencyBoundary>) {
         self.install_route_residency_boundary_for_executor(ExecutorInstanceId::UNSCOPED, boundary);
     }
 
+    #[cfg(any(test, feature = "gpu-tests"))]
     fn install_route_residency_boundary_for_executor(
         &self,
         executor: ExecutorInstanceId,
@@ -1955,7 +1959,7 @@ impl CudaExecutionProvider {
     /// kinds are structural, terminal declines. Every structural outcome is
     /// idempotent. The shipped default-off path returns before touching the
     /// executor-state map.
-    pub fn finalize_route_residency_for_executor(
+    fn finalize_route_residency_for_executor(
         &self,
         executor: ExecutorInstanceId,
         graph: &Graph,
@@ -2039,7 +2043,7 @@ impl CudaExecutionProvider {
     /// This is the production seam Slice 7C's caller was waiting for: it runs
     /// once, after the model's weights/catalog are fully loaded and *before*
     /// decode capture, and installs a real binding so
-    /// [`ExecutionProvider::consume_route_residency_at_boundary`] has something
+    /// [`ExecutionProvider::consume_route_residency_at_boundary_for_executor`] has something
     /// to drive when the feature is enabled. It is fail-closed at every step and
     /// records the typed outcome in [`route_residency_diagnostics`]:
     ///
@@ -2060,6 +2064,7 @@ impl CudaExecutionProvider {
     /// node/values. The binding is single-authority per EP/request/device: a
     /// second successful install replaces the first.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, feature = "gpu-tests"))]
     pub fn try_install_route_residency_binding(
         &self,
         graph: &Graph,
@@ -2119,11 +2124,18 @@ impl CudaExecutionProvider {
     }
 
     /// Drain the legacy unscoped test binding.
+    #[cfg(any(test, feature = "gpu-tests"))]
     pub fn drain_route_residency_boundary(&self) {
         self.drain_route_residency_for_executor(ExecutorInstanceId::UNSCOPED);
     }
 
-    pub fn drain_route_residency_for_executor(&self, executor: ExecutorInstanceId) {
+    #[cfg(any(test, feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub fn consume_route_residency_at_boundary(&self) -> Result<()> {
+        self.consume_route_residency_for_executor(ExecutorInstanceId::UNSCOPED)
+    }
+
+    fn drain_route_residency_for_executor(&self, executor: ExecutorInstanceId) {
         let should_remove_sources = {
             let mut states = self
                 .route_executors
@@ -2195,7 +2207,8 @@ impl CudaExecutionProvider {
         crate::route_residency::run_route_residency_boundary(&boundary, &self.route_diag)
     }
 
-    /// Test-only sibling of [`ExecutionProvider::consume_route_residency_at_boundary`]
+    /// Test-only sibling of
+    /// [`ExecutionProvider::consume_route_residency_at_boundary_for_executor`]
     /// that drives the installed boundary through the phase-8 driver-fault
     /// consumer, so a deterministic unmap/map fault proves the *caller-driven*
     /// transition rolls back range-precisely and quarantines like a real driver
@@ -4230,15 +4243,19 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// is a lock + `None` check. Only when a binding is installed (the Slice-7C
     /// tests) does it drive snapshot → consume → reset exactly once, recording
     /// the typed outcome in [`route_residency_diagnostics`](Self::route_residency_diagnostics).
-    fn consume_route_residency_at_boundary(&self) -> Result<()> {
-        self.consume_route_residency_for_executor(ExecutorInstanceId::UNSCOPED)
-    }
-
     fn consume_route_residency_at_boundary_for_executor(
         &self,
         executor: ExecutorInstanceId,
     ) -> Result<()> {
         self.consume_route_residency_for_executor(executor)
+    }
+
+    fn requires_route_residency_request_boundary(&self, executor: ExecutorInstanceId) -> bool {
+        self.route_executors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&executor)
+            .is_some_and(|state| !state.drained && state.boundary.is_some())
     }
 
     fn finalize_executor_artifacts(

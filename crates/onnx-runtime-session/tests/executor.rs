@@ -318,10 +318,6 @@ impl Kernel for FinalizationCheckingKernel {
 }
 
 impl ExecutionProvider for HostDownloadCountingEp {
-    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
-        Ok(())
-    }
-
     fn finalize_executor_artifacts(
         &self,
         executor: ExecutorInstanceId,
