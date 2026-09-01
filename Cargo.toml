@@ -265,6 +265,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
+arc-swap = "1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -286,3 +287,4 @@ image = { version = "0.25", default-features = false }
 libloading = "0.8"
 memmap2 = "0.9"
 prost-reflect = { version = "0.14" }
+smallvec = "1"

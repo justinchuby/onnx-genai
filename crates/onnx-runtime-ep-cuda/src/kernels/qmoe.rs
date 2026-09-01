@@ -1204,6 +1204,7 @@ impl RouteTelemetrySourceRegistry {
         executor: ExecutorInstanceId,
         node_id: NodeId,
         runtime: Arc<CudaRuntime>,
+        routes_per_row: usize,
     ) -> Option<Arc<QMoERouteTelemetry>> {
         if !crate::coarse_residency::coarse_residency_profile_enabled() {
             return None;
@@ -1217,7 +1218,7 @@ impl RouteTelemetrySourceRegistry {
                 .entry(executor)
                 .or_default()
                 .entry(node_id)
-                .or_insert_with(|| Arc::new(QMoERouteTelemetry::new(runtime))),
+                .or_insert_with(|| Arc::new(QMoERouteTelemetry::new(runtime, routes_per_row))),
         ))
     }
 
@@ -1310,9 +1311,13 @@ impl QMoEFactory {
         node: &Node,
         input_shapes: &[Vec<usize>],
     ) -> Result<Box<dyn Kernel>> {
-        let telemetry =
-            self.telemetry_registry
-                .source_for(executor, node.id, Arc::clone(&self.runtime));
+        let routes_per_row = MoeAttributes::from_node(node)?.k;
+        let telemetry = self.telemetry_registry.source_for(
+            executor,
+            node.id,
+            Arc::clone(&self.runtime),
+            routes_per_row,
+        );
         let kernel = Arc::new(self.create_kernel_with_telemetry(node, input_shapes, telemetry)?);
         Ok(Box::new(SharedQMoEKernel(kernel)))
     }
@@ -1324,10 +1329,14 @@ impl QMoEFactory {
     /// test seam only.
     #[doc(hidden)]
     pub fn create_kernel(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<QMoEKernel> {
+        let routes_per_row = MoeAttributes::from_node(node)?.k;
         self.create_kernel_with_telemetry(
             node,
             _input_shapes,
-            Some(Arc::new(QMoERouteTelemetry::new(Arc::clone(&self.runtime)))),
+            Some(Arc::new(QMoERouteTelemetry::new(
+                Arc::clone(&self.runtime),
+                routes_per_row,
+            ))),
         )
     }
 
@@ -1439,13 +1448,15 @@ pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
 /// executor/node QMoE producer.
 pub struct QMoERouteTelemetry {
     runtime: Arc<CudaRuntime>,
+    routes_per_row: usize,
     state: Mutex<Option<ArmedTelemetry>>,
 }
 
 impl QMoERouteTelemetry {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
+    fn new(runtime: Arc<CudaRuntime>, routes_per_row: usize) -> Self {
         Self {
             runtime,
+            routes_per_row,
             state: Mutex::new(None),
         }
     }
@@ -1455,6 +1466,12 @@ impl QMoERouteTelemetry {
         &self,
         config: RouteTelemetryConfig,
     ) -> std::result::Result<(), TelemetryUnsupported> {
+        if config.routes_per_row != self.routes_per_row {
+            return Err(TelemetryUnsupported::RouteWidthMismatch {
+                config: config.routes_per_row,
+                execution: self.routes_per_row,
+            });
+        }
         let armed = ArmedTelemetry::arm(&self.runtime, config)?;
         let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         if let Some(previous) = telemetry.take() {

@@ -377,11 +377,20 @@ fn set_routes(case: &mut LiveCase, banks: usize, selected: [usize; ROWS]) {
     }
 }
 
+fn consume_latest_output(case: &mut LiveCase) {
+    case.bindings
+        .last_mut()
+        .expect("QMoE output binding")
+        .read_bytes()
+        .expect("consume device validation receipt");
+}
+
 fn run_first_prefill(case: &mut LiveCase, banks: usize) -> ExecutorInstanceId {
     set_routes(case, banks, [0, 1, 2, 3]);
     case.session
         .run_with_device_bindings(&[], &mut case.bindings)
         .expect("real QMoE prefill");
+    consume_latest_output(case);
     let new_scopes: Vec<_> = case
         .provider
         .route_residency_scopes()
@@ -482,12 +491,14 @@ fn run_fault_case(fixture: &Fixture, quarantine: bool) {
             .expect("capture fault case"),
         DeviceGraphCaptureResult::Captured(_)
     ));
+    consume_latest_output(&mut case);
     for _ in 0..3 {
         assert!(
             case.session
                 .replay_device_graph(&mut case.bindings)
                 .expect("fault replay")
         );
+        consume_latest_output(&mut case);
     }
     provider.sync().expect("finish fault replay");
     let output_index = case.bindings.len() - 1;
@@ -522,7 +533,7 @@ fn run_fault_case(fixture: &Fixture, quarantine: bool) {
             Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 3)),
         );
     }
-    let diag = Arc::clone(provider.route_residency_diagnostics());
+    let diag = provider.route_residency_diagnostics(scope);
     let fatal_before = diag.fatal_values();
     let quarantine_before = diag.quarantined_blocks();
     provider
@@ -564,15 +575,14 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
         return;
     };
     let baseline = ledger.used(Tier::Device);
-    let diag = Arc::clone(provider.route_residency_diagnostics());
     let mut primary = build_case(&fixture, Arc::clone(&provider), Arc::clone(&ledger), 2);
 
     assert!(
         provider.route_residency_scopes().is_empty(),
         "symbolic build cannot install before resolved kernel compilation"
     );
-    assert_eq!(diag.installs(), 0);
     let scope = run_first_prefill(&mut primary, 2);
+    let diag = provider.route_residency_diagnostics(scope);
     assert_eq!(diag.installs(), 1);
     assert_eq!(diag.declines(), 0);
     assert_eq!(
@@ -609,6 +619,7 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
             .expect("capture symbolic QMoE"),
         DeviceGraphCaptureResult::Captured(_)
     ));
+    consume_latest_output(&mut primary);
     assert!(diag.values_touched() >= 8);
     assert!(diag.device_bytes_released() > 0);
     assert!(diag.host_bytes_committed() > 0);
@@ -620,11 +631,9 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
                 .replay_device_graph(&mut primary.bindings)
                 .expect("capture replay")
         );
+        consume_latest_output(&mut primary);
     }
     provider.sync().expect("complete captured replays");
-    provider
-        .consume_route_residency_at_boundary_for_executor(scope)
-        .expect("consume expert-zero replay window");
 
     let output_index = primary.bindings.len() - 1;
     let expert_zero_output = primary.bindings[output_index]
@@ -638,6 +647,7 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
                 .replay_device_graph(&mut primary.bindings)
                 .expect("decode through remapped stable VA")
         );
+        consume_latest_output(&mut primary);
     }
     provider.sync().expect("complete sixteen decodes");
     assert_eq!(
@@ -656,8 +666,11 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
             .route_telemetry_snapshot()
             .expect("snapshot")
             .expect("producer armed");
-        assert_eq!(snapshot.routed_experts(), vec![1]);
-        assert!(snapshot.count() >= 16 * ROWS as u32);
+        assert!(
+            snapshot.routed_experts().is_empty(),
+            "each exact validation receipt consumes its request telemetry window"
+        );
+        assert_eq!(snapshot.count(), 0);
     }
     let touched_before = diag.values_touched();
     provider
@@ -760,7 +773,10 @@ fn static_qmoe_installs_at_build_and_tears_down_exactly() {
         .filter(|scope| !case.scopes_before_build.contains(scope))
         .collect();
     assert_eq!(scopes.len(), 1, "static compile installs during build");
-    assert_eq!(provider.route_residency_diagnostics().installs(), 1);
+    assert_eq!(
+        provider.route_residency_diagnostics(scopes[0]).installs(),
+        1
+    );
     drop_case_to_provider_baseline(case);
     shutdown_provider(provider, ledger, baseline);
 }

@@ -961,6 +961,7 @@ impl Executor {
 
         let (sequence_values, control_flow_output_values) =
             Self::classify_special_values(&graph, &order);
+        let all_value_ids = value_shapes.keys().copied().collect();
 
         // 3) Build the structural per-node plan.
         let capabilities = ep.capabilities();
@@ -978,13 +979,17 @@ impl Executor {
 
         let plan_len = plan.len();
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
+        let instance_id = ExecutorInstanceId::fresh();
         let mut exec = Self {
-            instance_id: ExecutorInstanceId::fresh(),
+            instance_id,
             graph,
             weights,
             ep,
             heterogeneous: None,
             graph_slot: DeviceGraphSlot::Primary,
+            graph_owner: DeviceGraphOwner::for_executor(instance_id),
+            validation_registration: None,
+            pending_device_validation: None,
             weight_handles,
             expert_region_candidates,
             finalized_expert_banks,
@@ -1021,6 +1026,13 @@ impl Executor {
             execution_provider_fallback_report,
             trace: TraceContext::noop(),
             scratch_input_shapes: Vec::new(),
+            scratch_input_infos: Vec::new(),
+            scratch_output_shapes: Vec::new(),
+            scratch_output_strides: Vec::new(),
+            scratch_materialized_inputs: Vec::new(),
+            scratch_external_bindings: ExternalBindings::default(),
+            scratch_resolved_shapes: HashMap::new(),
+            all_value_ids,
             decode_memo_enabled: decode_memo_env_enabled(),
             decode_memo_verify: cfg!(debug_assertions) || decode_memo_verify_env_enabled(),
             decode_memo: None,
@@ -1183,6 +1195,10 @@ impl Executor {
             }
         }
 
+        exec.validation_registration = Some(
+            exec.ep
+                .register_device_validation_owner_for_executor(exec.instance_id)?,
+        );
         Ok(exec)
     }
 
@@ -1375,11 +1391,11 @@ impl Executor {
     }
 
     /// Record initializer metadata and back resident consumers with a device
-    /// buffer. A non-host nxrt initializer used exclusively at the lazy
-    /// fused-MoE boundary deliberately has no eager buffer; the EP materializes
-    /// it through its WeightHandle on demand. If any resident consumer (or graph
-    /// output) coexists, no handle is built and the one eager buffer is shared by
-    /// every consumer. Host mmap bytes retain the existing zero-copy borrow path.
+    /// buffer. A non-host initializer used exclusively at either a lazy-weight
+    /// boundary or provider-prepared immutable-constant slots deliberately has
+    /// no eager buffer. If any resident consumer (or graph output) coexists, the
+    /// one eager buffer is retained and shared by every consumer. Host mmap bytes
+    /// retain the existing zero-copy borrow path.
     /// Preserves the `session.initializer_buffers` tracing span and its
     /// arguments.
     #[allow(clippy::type_complexity)]
@@ -1406,11 +1422,24 @@ impl Executor {
         let mut borrowed_initializers = 0_u64;
         let mut copied_initializers = 0_u64;
         let mut lazy_initializers = 0_u64;
+        let mut prepared_initializers = 0_u64;
         for (&vid, weight) in &graph.initializers {
             let dtype = weight.dtype();
             let dims = weight.dims().to_vec();
             value_dtypes.insert(vid, dtype);
             value_shapes.insert(vid, dims.iter().map(|&d| Dim::Static(d)).collect());
+            let value = graph.value(vid);
+            let prepared_only = !value.is_graph_output
+                && !value.consumers.is_empty()
+                && value.consumers.uses().into_iter().all(|(node, input_idx)| {
+                    ep.prepares_immutable_constant(graph.node(node), input_idx as usize)
+                });
+            if !ep.device_id().is_host_accessible() && prepared_only {
+                if initializer_span.is_some() {
+                    prepared_initializers += 1;
+                }
+                continue;
+            }
             if !ep.device_id().is_host_accessible() && weight_handles.contains_key(&vid) {
                 if initializer_span.is_some() {
                     lazy_initializers += 1;
@@ -1480,6 +1509,7 @@ impl Executor {
                     .with("borrowed_initializers", borrowed_initializers)
                     .with("copied_initializers", copied_initializers)
                     .with("lazy_initializers", lazy_initializers)
+                    .with("prepared_initializers", prepared_initializers)
                     .with("buffers", buffers.len() as u64),
             );
         }
@@ -1827,6 +1857,34 @@ impl Executor {
         for (&vid, shape) in &self.value_shapes {
             if let Some(dims) = substitute(shape, bindings) {
                 resolved.insert(vid, dims);
+            }
+        }
+        resolved
+    }
+
+    /// Refill a previously resolved shape map without rebuilding its buckets or
+    /// each value's dimension vector.
+    pub(super) fn resolve_soft_reuse(
+        &self,
+        bindings: &HashMap<SymbolId, usize>,
+        mut resolved: HashMap<ValueId, Vec<usize>>,
+    ) -> HashMap<ValueId, Vec<usize>> {
+        resolved.retain(|vid, _| self.value_shapes.contains_key(vid));
+        for (&vid, shape) in &self.value_shapes {
+            let mut remove = false;
+            match resolved.entry(vid) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    remove = !substitute_into(shape, bindings, entry.get_mut());
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let mut dims = Vec::with_capacity(shape.len());
+                    if substitute_into(shape, bindings, &mut dims) {
+                        entry.insert(dims);
+                    }
+                }
+            }
+            if remove {
+                resolved.remove(&vid);
             }
         }
         resolved
@@ -2199,9 +2257,25 @@ impl Executor {
         resolved: &HashMap<ValueId, Vec<usize>>,
         excluded: &HashSet<ValueId>,
     ) -> Result<()> {
-        let vids: Vec<ValueId> = self.value_shapes.keys().copied().collect();
-        for vid in vids {
-            if self.graph.initializers.contains_key(&vid) || excluded.contains(&vid) {
+        self.size_buffers_filtered(resolved, |vid| excluded.contains(&vid))
+    }
+
+    pub(super) fn size_buffers_excluding_slice(
+        &mut self,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+        excluded: &[ValueId],
+    ) -> Result<()> {
+        self.size_buffers_filtered(resolved, |vid| excluded.contains(&vid))
+    }
+
+    fn size_buffers_filtered(
+        &mut self,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+        excluded: impl Fn(ValueId) -> bool,
+    ) -> Result<()> {
+        for index in 0..self.all_value_ids.len() {
+            let vid = self.all_value_ids[index];
+            if self.graph.initializers.contains_key(&vid) || excluded(vid) {
                 continue;
             }
             // Sequence-typed values own no tensor buffer (their list lives in
@@ -2210,10 +2284,10 @@ impl Executor {
                 continue;
             }
             let dtype = self.value_dtypes[&vid];
-            let Some(dims) = resolved.get(&vid).cloned() else {
+            let Some(dims) = resolved.get(&vid) else {
                 continue;
             };
-            self.ensure_buffer(vid, dtype, &dims)?;
+            self.ensure_buffer(vid, dtype, dims)?;
         }
         Ok(())
     }
@@ -2322,21 +2396,31 @@ impl Executor {
                 .iter()
                 .map(|input| input.is_some_and(|vid| self.graph.initializers.contains_key(&vid)))
                 .collect();
+            let constant_values = resolve_kernel_constant_inputs(
+                &self.graph,
+                &self.weights,
+                &self.plan[i].inputs,
+                &input_shapes,
+            )?;
             let node = self.graph.node(node_id);
             let opset = effective_opset(&self.graph, node);
             let seq_independent =
                 node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
+            let graph_tokens =
+                std::array::from_fn(|index| self.slot_capture[index].device_graph_token);
             let (_, key) = self.cache.get_or_create(
                 node_id,
                 node,
                 &input_shapes,
                 &input_dtypes,
                 &constant_inputs,
+                &constant_values,
                 opset,
                 seq_independent,
                 self.instance_id,
                 &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
+                graph_tokens,
             )?;
             self.provider_artifact_readiness
                 .advance_to(ExecutorArtifactReadinessEpoch::new(

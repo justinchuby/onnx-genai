@@ -6,16 +6,22 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr, CUfunction_attribute_enum};
+use arc_swap::{ArcSwap, ArcSwapOption};
+use cudarc::driver::sys::{
+    CUdevice_attribute, CUdeviceptr, CUfunction, CUfunction_attribute_enum, CUmodule,
+};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 
-use onnx_runtime_ep_api::DeviceGraphSlot;
 use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Kernel;
+use onnx_runtime_ep_api::{
+    DeviceGraphOwner, DeviceGraphResource, DeviceGraphSlot, DeviceGraphToken,
+    DeviceValidationOwner, DeviceValidationRegistration, DeviceValidationToken, ExecutorInstanceId,
+};
 use onnx_runtime_ep_api::{RawDeviceAllocationSiteStats, Result};
 
 use crate::blas::CublasLt;
@@ -41,6 +47,124 @@ pub struct CudaTransferCounts {
     /// Stream-ordered asynchronous host→device copies issued on the dedicated
     /// transfer stream by [`CudaRuntime::htod_async`] (Phase-4 weight prefetch).
     pub async_host_to_device: u64,
+}
+
+const VALIDATION_PHASE_BITS: u32 = 3;
+const VALIDATION_PHASE_MASK: u64 = (1 << VALIDATION_PHASE_BITS) - 1;
+const VALIDATION_MAX_GENERATION: u64 = u64::MAX >> VALIDATION_PHASE_BITS;
+
+// Invariant: one coordinator word and each owner's one slot word are the sole
+// authority for generation phase, result visibility, and cleanup ownership.
+fn next_validation_runtime_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .unwrap_or_else(|_| {
+            panic!("CUDA validation runtime identity space exhausted; refusing ABA reuse")
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+enum ValidationPhase {
+    Idle = 0,
+    Resetting = 1,
+    Preparing = 2,
+    Attaching = 3,
+    Active = 4,
+    Consuming = 5,
+}
+
+fn validation_word(phase: ValidationPhase, generation: u64) -> u64 {
+    (generation << VALIDATION_PHASE_BITS) | phase as u64
+}
+
+fn validation_phase(word: u64) -> ValidationPhase {
+    match word & VALIDATION_PHASE_MASK {
+        0 => ValidationPhase::Idle,
+        1 => ValidationPhase::Resetting,
+        2 => ValidationPhase::Preparing,
+        3 => ValidationPhase::Attaching,
+        4 => ValidationPhase::Active,
+        5 => ValidationPhase::Consuming,
+        _ => unreachable!("all validation phase values are encoded by this module"),
+    }
+}
+
+fn validation_generation(word: u64) -> u64 {
+    word >> VALIDATION_PHASE_BITS
+}
+
+fn take_validation_generation(next: &AtomicU64) -> Result<u64> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+        (generation < VALIDATION_MAX_GENERATION).then_some(generation + 1)
+    })
+    .map_err(|_| {
+        EpError::KernelFailed(
+            "cuda_ep: device validation generation space exhausted; rebuild the provider".into(),
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+enum ValidationSlotPhase {
+    Idle = 0,
+    Pending = 1,
+    Complete = 2,
+    Retired = 3,
+}
+
+fn validation_slot_word(phase: ValidationSlotPhase, generation: u64) -> u64 {
+    (generation << VALIDATION_PHASE_BITS) | phase as u64
+}
+
+fn validation_slot_phase(word: u64) -> ValidationSlotPhase {
+    match word & VALIDATION_PHASE_MASK {
+        0 => ValidationSlotPhase::Idle,
+        1 => ValidationSlotPhase::Pending,
+        2 => ValidationSlotPhase::Complete,
+        3 => ValidationSlotPhase::Retired,
+        _ => unreachable!("all validation slot phase values are encoded by this module"),
+    }
+}
+
+#[derive(Debug)]
+struct CudaValidationRegistration {
+    runtime_id: u64,
+    slot: usize,
+    retired: bool,
+}
+
+#[derive(Debug)]
+struct DeviceValidationSlot {
+    owner: DeviceValidationOwner,
+    executor_scope: u64,
+    submission_executor_scope: AtomicU64,
+    state: AtomicU64,
+    flags: AtomicU32,
+    next: AtomicPtr<DeviceValidationSlot>,
+}
+
+impl DeviceValidationSlot {
+    fn new(owner: DeviceValidationOwner, executor_scope: Option<ExecutorInstanceId>) -> Self {
+        Self {
+            owner,
+            executor_scope: executor_scope.map_or(0, ExecutorInstanceId::get),
+            submission_executor_scope: AtomicU64::new(0),
+            state: AtomicU64::new(validation_slot_word(ValidationSlotPhase::Idle, 0)),
+            flags: AtomicU32::new(0),
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+}
+
+pub(crate) struct DeviceValidationConsumption {
+    pub(crate) flags: u32,
+    pub(crate) executor_scope: u64,
+    pub(crate) completed_active_submission: bool,
 }
 
 /// Whether a failed measured H2D operation can still be using its source and
@@ -471,6 +595,93 @@ fn raw_pool_size_class(bytes: usize) -> usize {
 /// is never handed to a second runtime.
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
+struct RawCudaModule {
+    module: CUmodule,
+    context: Arc<CudaContext>,
+}
+
+// Mirrors cudarc's `CudaModule`: the driver module is context-owned and its
+// handle may be used from threads that bind that context.
+unsafe impl Send for RawCudaModule {}
+unsafe impl Sync for RawCudaModule {}
+
+impl Drop for RawCudaModule {
+    fn drop(&mut self) {
+        let _ = self.context.bind_to_thread();
+        // SAFETY: this module was loaded exactly once by `load_raw_module` and
+        // the runtime cache is its sole owner.
+        let _ = unsafe { cudarc::driver::result::module::unload(self.module) };
+    }
+}
+
+/// Allocation-free launch handle for prepared decode kernels.
+///
+/// cudarc's safe launch builder allocates argument/event vectors on every
+/// launch. This handle retains the loaded module but accepts a fixed stack
+/// parameter array, so warmed eager execution and graph recording perform no
+/// host allocation.
+#[derive(Clone)]
+pub(crate) struct RawCudaFunction {
+    function: CUfunction,
+    _module: Arc<RawCudaModule>,
+}
+
+// CUDA function handles are immutable and cudarc gives its equivalent wrapper
+// the same cross-thread guarantees.
+unsafe impl Send for RawCudaFunction {}
+unsafe impl Sync for RawCudaFunction {}
+
+impl RawCudaFunction {
+    /// Launch with caller-owned scalar storage and a stack-backed parameter
+    /// pointer array.
+    ///
+    /// # Safety
+    /// Every entry in `kernel_params` must point to a live value matching the
+    /// loaded kernel ABI, and all referenced device storage must remain live
+    /// until the stream has consumed the launch.
+    pub(crate) unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        kernel_params: &mut [*mut c_void],
+    ) -> std::result::Result<(), cudarc::driver::result::DriverError> {
+        // SAFETY: upheld by this method's caller contract.
+        unsafe {
+            cudarc::driver::result::launch_kernel(
+                self.function,
+                config.grid_dim,
+                config.block_dim,
+                config.shared_mem_bytes,
+                stream.cu_stream(),
+                kernel_params,
+            )
+        }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    doc = r#"
+The isolated capture-error reset is intentionally absent from ordinary builds.
+The runtime type remains publicly usable while the test-only mutation does not:
+
+```
+use onnx_runtime_ep_cuda::CudaRuntime;
+
+fn accepts_runtime(_: &CudaRuntime) {}
+```
+
+```compile_fail,E0599
+use onnx_runtime_ep_cuda::CudaRuntime;
+
+fn production_cannot_reset_capture_error(runtime: &CudaRuntime) {
+    unsafe {
+        runtime.reset_capture_error_for_isolated_test().unwrap();
+    }
+}
+```
+"#
+)]
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -483,6 +694,14 @@ pub struct CudaRuntime {
     copy_stream: Arc<CudaStream>,
     graph: CudaGraphLifecycle,
     verify_graph: CudaGraphLifecycle,
+    /// Executor-owned graph lifecycles. The atomically published map makes the
+    /// warmed replay lookup allocation- and mutex-free; capture/reset clone the
+    /// small map under `owned_graphs_write`.
+    owned_graphs: ArcSwap<HashMap<(DeviceGraphOwner, DeviceGraphSlot), Arc<CudaGraphLifecycle>>>,
+    owned_graphs_write: Mutex<()>,
+    registered_capture_active: AtomicBool,
+    unregistered_capture_active: AtomicBool,
+    active_capture_resource_ids: ArcSwapOption<Vec<usize>>,
     blas: CublasLt,
     cudnn: CudnnBackend,
     ordinal: u32,
@@ -493,6 +712,10 @@ pub struct CudaRuntime {
     /// runtime compiles a given kernel (e.g. the fused attention softmax) at
     /// most once and reuses the loaded module for every kernel invocation.
     modules: Mutex<HashMap<&'static str, Arc<CudaModule>>>,
+    /// Raw launch modules used by kernels whose warmed host path must not
+    /// allocate. Kept separate from cudarc's safe-module cache because cudarc
+    /// does not expose a raw function handle.
+    raw_modules: Mutex<HashMap<&'static str, Arc<RawCudaModule>>>,
     /// Set after a driver rejects the toolkit's PTX ISA. Subsequent modules are
     /// compiled directly to the device's native SM CUBIN instead of repeating
     /// the failed load.
@@ -547,6 +770,7 @@ pub struct CudaRuntime {
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
     async_host_to_device_copies: AtomicU64,
+    forced_synchronizations: AtomicU64,
     /// Completion events recorded on a transfer/compute stream, keyed by an
     /// opaque fence id handed out to the executor inside an
     /// [`onnx_runtime_ep_api::Fence`]. `wait_*_fence` removes and waits on the
@@ -556,12 +780,37 @@ pub struct CudaRuntime {
     next_fence_id: AtomicU64,
     /// Persistent four-byte device word into which kernels latch an out-of-range
     /// bounds violation during deferred eager execution or CUDA-graph replay. It
-    /// is set (via `atomicOr`) and never auto-cleared on the device;
-    /// only an explicit host [`CudaRuntime::reset_capture_error`] returns it to
-    /// zero. Session request boundaries and graph reset/re-capture use that reset.
+    /// is set (via `atomicOr`) and never auto-cleared on the device. Only the
+    /// owner-scoped validation lifecycle clears it while opening a generation or
+    /// after publishing that generation's result. Graph reset never clears it.
     /// The host reads it after a request synchronization so eager or captured
     /// validation failures become hard errors before outputs are consumed.
     capture_error: CUdeviceptr,
+    /// Sole authority for the provider-wide validation phase and cleanup owner.
+    /// Recipient slots are setup-allocated and linked while this word is in
+    /// `Preparing`/`Attaching`; the `Active -> Consuming` CAS is the cleanup
+    /// linearization point.
+    validation_state: AtomicU64,
+    validation_head: AtomicPtr<DeviceValidationSlot>,
+    validation_submitter: AtomicPtr<DeviceValidationSlot>,
+    next_validation_generation: AtomicU64,
+    validation_runtime_id: u64,
+    // Boxes keep intrusive-list addresses stable when setup registration grows.
+    #[allow(clippy::vec_box)]
+    validation_owners: Mutex<Vec<Box<DeviceValidationSlot>>>,
+    registered_validation_owners: AtomicUsize,
+    validation_registry_lock_acquisitions: AtomicU64,
+    validation_submissions: AtomicU64,
+    #[cfg(feature = "gpu-tests")]
+    validation_cleanups: AtomicU64,
+    #[cfg(feature = "gpu-tests")]
+    validation_consumer_pause: AtomicBool,
+    #[cfg(feature = "gpu-tests")]
+    validation_consumer_claimed: AtomicBool,
+    #[cfg(feature = "gpu-tests")]
+    validation_reset_pause: AtomicBool,
+    #[cfg(feature = "gpu-tests")]
+    validation_reset_claimed: AtomicBool,
     /// When set, the public [`CudaRuntime::synchronize`] becomes a no-op so the
     /// redundant trailing per-op eager device syncs (issued by kernels on the
     /// `!capturing` branch) are elided and launches pipeline on the in-order EP
@@ -736,18 +985,31 @@ impl CudaRuntime {
             .map_err(|e| driver_err("create transfer stream", e))?;
         let blas = CublasLt::new()?;
         let cudnn = CudnnBackend::new(stream.clone());
-        let graph = CudaGraphLifecycle::new(stream.clone());
+        let graph = CudaGraphLifecycle::new(
+            stream.clone(),
+            DeviceGraphOwner::new(),
+            DeviceGraphSlot::Primary,
+        );
         // Second captured-graph slot for the MTP fixed-width verify forward,
         // held independently of `graph` (the M=1 decode step) on the same
         // compute stream so both shapes can be replayed by shape key without
         // per-step recapture (see `DeviceGraphSlot`).
-        let verify_graph = CudaGraphLifecycle::new(stream.clone());
+        let verify_graph = CudaGraphLifecycle::new(
+            stream.clone(),
+            DeviceGraphOwner::new(),
+            DeviceGraphSlot::Verify,
+        );
         Self {
             context,
             stream,
             copy_stream,
             graph,
             verify_graph,
+            owned_graphs: ArcSwap::from_pointee(HashMap::new()),
+            owned_graphs_write: Mutex::new(()),
+            registered_capture_active: AtomicBool::new(false),
+            unregistered_capture_active: AtomicBool::new(false),
+            active_capture_resource_ids: ArcSwapOption::empty(),
             blas,
             cudnn,
             ordinal,
@@ -755,6 +1017,7 @@ impl CudaRuntime {
             ptx_arch,
             cubin_arch,
             modules: Mutex::new(HashMap::new()),
+            raw_modules: Mutex::new(HashMap::new()),
             nvrtc_cubin_fallback: AtomicBool::new(false),
             allocations: AtomicU64::new(0),
             frees: AtomicU64::new(0),
@@ -770,9 +1033,29 @@ impl CudaRuntime {
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
             async_host_to_device_copies: AtomicU64::new(0),
+            forced_synchronizations: AtomicU64::new(0),
             fences: Mutex::new(HashMap::new()),
             next_fence_id: AtomicU64::new(1),
             capture_error: 0,
+            validation_state: AtomicU64::new(validation_word(ValidationPhase::Idle, 0)),
+            validation_head: AtomicPtr::new(std::ptr::null_mut()),
+            validation_submitter: AtomicPtr::new(std::ptr::null_mut()),
+            next_validation_generation: AtomicU64::new(1),
+            validation_runtime_id: next_validation_runtime_id(),
+            validation_owners: Mutex::new(Vec::new()),
+            registered_validation_owners: AtomicUsize::new(0),
+            validation_registry_lock_acquisitions: AtomicU64::new(0),
+            validation_submissions: AtomicU64::new(0),
+            #[cfg(feature = "gpu-tests")]
+            validation_cleanups: AtomicU64::new(0),
+            #[cfg(feature = "gpu-tests")]
+            validation_consumer_pause: AtomicBool::new(false),
+            #[cfg(feature = "gpu-tests")]
+            validation_consumer_claimed: AtomicBool::new(false),
+            #[cfg(feature = "gpu-tests")]
+            validation_reset_pause: AtomicBool::new(false),
+            #[cfg(feature = "gpu-tests")]
+            validation_reset_claimed: AtomicBool::new(false),
             defer_eager_sync: AtomicBool::new(
                 // On by default; only an explicit falsey value restores the old
                 // always-sync eager path (escape hatch for debugging).
@@ -849,20 +1132,34 @@ impl CudaRuntime {
 
     /// Begin capture on the EP stream after auditing the complete kernel sequence.
     pub fn begin_graph_capture(&self, kernels: &[&dyn Kernel]) -> Result<()> {
+        self.begin_graph_capture_with_resources(kernels, Vec::new())
+    }
+
+    /// Begin capture with additional immutable address owners.
+    pub fn begin_graph_capture_with_resources(
+        &self,
+        kernels: &[&dyn Kernel],
+        mut resources: Vec<DeviceGraphResource>,
+    ) -> Result<()> {
         crate::capture::require_subgraph_graph_capturable(kernels)?;
-        self.graph.begin()
+        resources.extend(
+            kernels
+                .iter()
+                .flat_map(|kernel| kernel.device_graph_resources()),
+        );
+        self.begin_graph_capture_resources_in(DeviceGraphSlot::Primary, resources)
     }
 
     /// End stream capture and install the instantiated graph executable.
     pub fn end_graph_capture(&self) -> Result<()> {
-        self.graph.end()
+        self.end_graph_capture_in(DeviceGraphSlot::Primary)
     }
 
     /// Abort an in-progress stream capture, discarding any half-recorded graph
     /// and returning the lifecycle to idle so a subsequent [`reset_graph`]
     /// succeeds. Used on the error path of segmented capture.
     pub fn abort_graph_capture(&self) -> Result<()> {
-        self.graph.abort()
+        self.abort_graph_capture_in(DeviceGraphSlot::Primary)
     }
 
     /// Launch the installed graph executable on the same EP stream.
@@ -870,17 +1167,17 @@ impl CudaRuntime {
     /// Replays every installed segment in capture order (one graph for a
     /// whole-subgraph capture).
     pub fn replay_graph(&self) -> Result<()> {
-        self.graph.replay()
+        self.graph.replay_current()
     }
 
     /// Launch one installed segment by its zero-based capture-order index.
     pub fn replay_graph_segment(&self, index: usize) -> Result<()> {
-        self.graph.replay_segment(index)
+        self.graph.replay_current_segment(index)
     }
 
     /// Number of installed captured segments (1 for a whole-subgraph capture).
     pub fn graph_segment_count(&self) -> Result<usize> {
-        self.graph.segment_count()
+        self.graph.current_segment_count()
     }
 
     /// Destroy the installed graph and graph-exec handles.
@@ -888,12 +1185,12 @@ impl CudaRuntime {
     /// Returns whether an executable was invalidated. Reset is rejected while a
     /// capture is active; callers must end the capture first.
     pub fn reset_graph(&self) -> Result<bool> {
-        self.graph.reset()
+        self.graph.reset_current()
     }
 
     /// Whether this runtime currently owns an instantiated graph executable.
     pub fn has_graph_executable(&self) -> Result<bool> {
-        self.graph.has_executable()
+        self.graph.has_current_executable()
     }
 
     /// Raw device pointer to the persistent capture-error latch word, passed to
@@ -917,12 +1214,669 @@ impl CudaRuntime {
         Ok(u32::from_ne_bytes(bytes))
     }
 
+    fn validation_slot<'a>(
+        &self,
+        registration: &'a DeviceValidationRegistration,
+    ) -> Result<&'a DeviceValidationSlot> {
+        let key = registration
+            .state::<CudaValidationRegistration>()
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: validation owner {} was registered by a different provider",
+                    registration.owner().get()
+                ))
+            })?;
+        if key.runtime_id != self.validation_runtime_id {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation owner {} belongs to another CUDA runtime",
+                registration.owner().get()
+            )));
+        }
+        if key.retired {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation owner {} is already retired",
+                registration.owner().get()
+            )));
+        }
+        // SAFETY: the runtime owns every registered slot until consuming
+        // `unregister_device_validation_owner` removes it. A live registration
+        // cannot be used after that consuming call.
+        let slot = unsafe { &*(key.slot as *const DeviceValidationSlot) };
+        if slot.owner != registration.owner() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation registration owner {} does not match slot owner {}",
+                registration.owner().get(),
+                slot.owner.get()
+            )));
+        }
+        Ok(slot)
+    }
+
+    fn take_validation_generation(&self) -> Result<u64> {
+        take_validation_generation(&self.next_validation_generation)
+    }
+
+    /// Allocate one stable owner slot during setup. The registry lock is only a
+    /// storage/lifetime mechanism; warmed validation never touches it.
+    pub(crate) fn register_device_validation_owner(&self) -> Result<DeviceValidationRegistration> {
+        self.register_device_validation_owner_in_scope(None)
+    }
+
+    pub(crate) fn register_device_validation_owner_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Result<DeviceValidationRegistration> {
+        self.register_device_validation_owner_in_scope(Some(executor))
+    }
+
+    fn register_device_validation_owner_in_scope(
+        &self,
+        executor: Option<ExecutorInstanceId>,
+    ) -> Result<DeviceValidationRegistration> {
+        let owner = DeviceValidationOwner::new();
+        let mut slot = Box::new(DeviceValidationSlot::new(owner, executor));
+        let slot_ptr = (&mut *slot) as *mut DeviceValidationSlot;
+        self.validation_registry_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        self.validation_owners
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: device validation setup registry lock is poisoned".into(),
+                )
+            })?
+            .push(slot);
+        self.registered_validation_owners
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(DeviceValidationRegistration::new(
+            owner,
+            CudaValidationRegistration {
+                runtime_id: self.validation_runtime_id,
+                slot: slot_ptr as usize,
+                retired: false,
+            },
+        ))
+    }
+
+    /// Retire one setup slot. A pending generation is first consumed through the
+    /// same state machine, so concurrent legitimate consumption converges on the
+    /// sticky result instead of leaking the slot.
+    pub(crate) fn unregister_device_validation_owner(
+        &self,
+        registration: &mut DeviceValidationRegistration,
+    ) -> Result<()> {
+        let slot = self.validation_slot(registration)?;
+        loop {
+            let current = slot.state.load(Ordering::Acquire);
+            match validation_slot_phase(current) {
+                ValidationSlotPhase::Pending => {
+                    let token = DeviceValidationToken::new(
+                        registration.owner(),
+                        validation_generation(current),
+                    );
+                    self.consume_device_validation(registration, token)?;
+                }
+                ValidationSlotPhase::Idle | ValidationSlotPhase::Complete => {
+                    let retired = validation_slot_word(
+                        ValidationSlotPhase::Retired,
+                        validation_generation(current),
+                    );
+                    if slot
+                        .state
+                        .compare_exchange(current, retired, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                ValidationSlotPhase::Retired => {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep: validation owner {} is already retired",
+                        registration.owner().get()
+                    )));
+                }
+            }
+        }
+
+        let slot_ptr = slot as *const DeviceValidationSlot as usize;
+        self.validation_registry_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        let mut owners = self.validation_owners.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep: device validation setup registry lock is poisoned".into(),
+            )
+        })?;
+        let index = owners
+            .iter()
+            .position(|candidate| {
+                (&**candidate as *const DeviceValidationSlot as usize) == slot_ptr
+            })
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: validation owner {} slot is absent from the setup registry",
+                    registration.owner().get()
+                ))
+            })?;
+        registration
+            .state_mut::<CudaValidationRegistration>()
+            .expect("CUDA registration type was checked before retirement")
+            .retired = true;
+        owners.swap_remove(index);
+        self.registered_validation_owners
+            .fetch_sub(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Reserve a generation and clear its device latch before recipient
+    /// attachment. `Idle -> Resetting` excludes both another begin and the
+    /// isolated-test reset in one CAS protocol.
+    pub(crate) fn begin_device_validation(
+        &self,
+        registration: &DeviceValidationRegistration,
+    ) -> Result<DeviceValidationToken> {
+        let slot = self.validation_slot(registration)?;
+        let generation = self.take_validation_generation()?;
+        let resetting = validation_word(ValidationPhase::Resetting, generation);
+        if let Err(current) = self.validation_state.compare_exchange(
+            validation_word(ValidationPhase::Idle, 0),
+            resetting,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: previous deferred device validation is still {:?} at generation {}; \
+                 consume its bound output or finish its request boundary before submitting \
+                 owner={}",
+                validation_phase(current),
+                validation_generation(current),
+                registration.owner().get()
+            )));
+        }
+        if let Err(error) = self.reset_capture_error() {
+            self.validation_state
+                .store(validation_word(ValidationPhase::Idle, 0), Ordering::Release);
+            return Err(error);
+        }
+
+        let pending = validation_slot_word(ValidationSlotPhase::Pending, generation);
+        loop {
+            let current = slot.state.load(Ordering::Acquire);
+            match validation_slot_phase(current) {
+                ValidationSlotPhase::Idle | ValidationSlotPhase::Complete => {
+                    if slot
+                        .state
+                        .compare_exchange(current, pending, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                ValidationSlotPhase::Pending | ValidationSlotPhase::Retired => {
+                    self.validation_state
+                        .store(validation_word(ValidationPhase::Idle, 0), Ordering::Release);
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep: validation owner {} cannot begin generation {generation} from \
+                         slot state {:?} generation {}",
+                        registration.owner().get(),
+                        validation_slot_phase(current),
+                        validation_generation(current)
+                    )));
+                }
+            }
+        }
+        let slot_ptr = slot as *const DeviceValidationSlot as *mut DeviceValidationSlot;
+        slot.submission_executor_scope
+            .store(slot.executor_scope, Ordering::Relaxed);
+        slot.next.store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.validation_head.store(slot_ptr, Ordering::Relaxed);
+        self.validation_submitter.store(slot_ptr, Ordering::Relaxed);
+        self.validation_state.store(
+            validation_word(ValidationPhase::Preparing, generation),
+            Ordering::Release,
+        );
+        self.validation_submissions.fetch_add(1, Ordering::Relaxed);
+        Ok(DeviceValidationToken::new(registration.owner(), generation))
+    }
+
+    /// Attach one setup-allocated output slot. `Preparing -> Attaching`
+    /// serializes list mutation without a lock; activation succeeds only after
+    /// the attachment publishes `Preparing` again.
+    pub(crate) fn add_device_validation_recipient(
+        &self,
+        submission: DeviceValidationToken,
+        recipient: &DeviceValidationRegistration,
+    ) -> Result<DeviceValidationToken> {
+        let generation = submission.generation();
+        let preparing = validation_word(ValidationPhase::Preparing, generation);
+        let attaching = validation_word(ValidationPhase::Attaching, generation);
+        self.validation_state
+            .compare_exchange(preparing, attaching, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|current| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: validation submission owner={} generation={} cannot attach owner={}; \
+                     coordinator is {:?} at generation {}",
+                    submission.owner().get(),
+                    generation,
+                    recipient.owner().get(),
+                    validation_phase(current),
+                    validation_generation(current)
+                ))
+            })?;
+
+        let result = (|| {
+            let submitter_ptr = self.validation_submitter.load(Ordering::Acquire);
+            if submitter_ptr.is_null() {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep: validation submission has no registered submitter slot".into(),
+                ));
+            }
+            // SAFETY: the submitter slot remains registered while its submission
+            // is preparing or active.
+            let submitter = unsafe { &*submitter_ptr };
+            if submitter.owner != submission.owner() {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: validation submission owner {} is foreign to active submitter {}",
+                    submission.owner().get(),
+                    submitter.owner.get()
+                )));
+            }
+
+            let slot = self.validation_slot(recipient)?;
+            let pending = validation_slot_word(ValidationSlotPhase::Pending, generation);
+            loop {
+                let current = slot.state.load(Ordering::Acquire);
+                match validation_slot_phase(current) {
+                    ValidationSlotPhase::Idle | ValidationSlotPhase::Complete => {
+                        if slot
+                            .state
+                            .compare_exchange(current, pending, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            break;
+                        }
+                    }
+                    ValidationSlotPhase::Pending | ValidationSlotPhase::Retired => {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep: validation recipient owner {} cannot attach to generation \
+                             {generation} from slot state {:?} generation {}",
+                            recipient.owner().get(),
+                            validation_slot_phase(current),
+                            validation_generation(current)
+                        )));
+                    }
+                }
+            }
+            slot.submission_executor_scope.store(
+                submitter.submission_executor_scope.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            let slot_ptr = slot as *const DeviceValidationSlot as *mut DeviceValidationSlot;
+            slot.next.store(
+                self.validation_head.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            self.validation_head.store(slot_ptr, Ordering::Relaxed);
+            Ok(DeviceValidationToken::new(recipient.owner(), generation))
+        })();
+
+        self.validation_state.store(preparing, Ordering::Release);
+        result
+    }
+
+    /// Seal attachment. This release publishes the reset and complete recipient
+    /// list before any thread may acquire cleanup authority.
+    pub(crate) fn activate_device_validation(
+        &self,
+        submission: DeviceValidationToken,
+    ) -> Result<()> {
+        let generation = submission.generation();
+        let submitter_ptr = self.validation_submitter.load(Ordering::Acquire);
+        if submitter_ptr.is_null() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: validation submission has no registered submitter slot".into(),
+            ));
+        }
+        // SAFETY: the submitter cannot unregister while its generation is
+        // preparing.
+        let submitter = unsafe { &*submitter_ptr };
+        if submitter.owner != submission.owner() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation submission owner {} is foreign to active submitter {}",
+                submission.owner().get(),
+                submitter.owner.get()
+            )));
+        }
+        self.validation_state
+            .compare_exchange(
+                validation_word(ValidationPhase::Preparing, generation),
+                validation_word(ValidationPhase::Active, generation),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|current| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: validation submission owner={} generation={} cannot activate; \
+                     coordinator is {:?} at generation {}",
+                    submission.owner().get(),
+                    generation,
+                    validation_phase(current),
+                    validation_generation(current)
+                ))
+            })
+    }
+
+    fn publish_device_validation(&self, generation: u64, flags: u32) {
+        let mut slot_ptr = self.validation_head.load(Ordering::Acquire);
+        while !slot_ptr.is_null() {
+            // SAFETY: pending slots cannot unregister; this traversal owns the
+            // generation's sole `Consuming` authority.
+            let slot = unsafe { &*slot_ptr };
+            let next = slot.next.load(Ordering::Relaxed);
+            slot.flags.store(flags, Ordering::Relaxed);
+            let pending = validation_slot_word(ValidationSlotPhase::Pending, generation);
+            let complete = validation_slot_word(ValidationSlotPhase::Complete, generation);
+            // Release makes the flags payload visible to a sticky reader's
+            // Acquire load of `Complete`.
+            if let Err(current) =
+                slot.state
+                    .compare_exchange(pending, complete, Ordering::Release, Ordering::Acquire)
+            {
+                eprintln!(
+                    "[onnx-runtime-ep-cuda] validation owner {} changed unexpectedly while \
+                     publishing generation {generation}: phase={:?} generation={}",
+                    slot.owner.get(),
+                    validation_slot_phase(current),
+                    validation_generation(current)
+                );
+            }
+            slot_ptr = next;
+        }
+        self.validation_head
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.validation_submitter
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.validation_state
+            .store(validation_word(ValidationPhase::Idle, 0), Ordering::Release);
+        #[cfg(feature = "gpu-tests")]
+        self.validation_cleanups.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Consume exactly `token`. `Active -> Consuming` is the linearization point
+    /// that assigns latch cleanup to one caller; competitors wait for that
+    /// caller's release-published sticky result.
+    pub(crate) fn consume_device_validation(
+        &self,
+        registration: &DeviceValidationRegistration,
+        token: DeviceValidationToken,
+    ) -> Result<DeviceValidationConsumption> {
+        let slot = self.validation_slot(registration)?;
+        if registration.owner() != token.owner() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation token owner={} is foreign to registration owner={}",
+                token.owner().get(),
+                registration.owner().get()
+            )));
+        }
+        self.consume_device_validation_slot(slot, token)
+    }
+
+    pub(crate) fn abort_device_validation_submission(
+        &self,
+        token: DeviceValidationToken,
+    ) -> Result<DeviceValidationConsumption> {
+        let slot_ptr = self.validation_submitter.load(Ordering::Acquire);
+        if slot_ptr.is_null() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation submission owner={} generation={} has no active submitter",
+                token.owner().get(),
+                token.generation()
+            )));
+        }
+        // SAFETY: a pending submitter cannot unregister before this submission
+        // reaches a terminal state.
+        let slot = unsafe { &*slot_ptr };
+        if slot.owner != token.owner() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation submission owner={} is foreign to active submitter={}",
+                token.owner().get(),
+                slot.owner.get()
+            )));
+        }
+        self.consume_device_validation_slot(slot, token)
+    }
+
+    fn consume_device_validation_slot(
+        &self,
+        slot: &DeviceValidationSlot,
+        token: DeviceValidationToken,
+    ) -> Result<DeviceValidationConsumption> {
+        let pending = validation_slot_word(ValidationSlotPhase::Pending, token.generation());
+        let complete = validation_slot_word(ValidationSlotPhase::Complete, token.generation());
+        let mut spins = 0_u32;
+        loop {
+            let owner_state = slot.state.load(Ordering::Acquire);
+            if owner_state == complete {
+                let flags = slot.flags.load(Ordering::Relaxed);
+                // An owner may begin a later generation immediately after the
+                // first Acquire; the second rejects that reuse instead of
+                // returning the later generation's flags for this token.
+                if slot.state.load(Ordering::Acquire) == complete {
+                    return Ok(DeviceValidationConsumption {
+                        flags,
+                        executor_scope: slot.submission_executor_scope.load(Ordering::Relaxed),
+                        completed_active_submission: false,
+                    });
+                }
+                continue;
+            }
+            if owner_state != pending {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: validation token owner={} generation={} is stale for slot phase \
+                     {:?} generation {}",
+                    token.owner().get(),
+                    token.generation(),
+                    validation_slot_phase(owner_state),
+                    validation_generation(owner_state)
+                )));
+            }
+
+            let coordinator = self.validation_state.load(Ordering::Acquire);
+            if validation_generation(coordinator) != token.generation() {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: validation token owner={} generation={} does not belong to \
+                     coordinator phase {:?} generation {}",
+                    token.owner().get(),
+                    token.generation(),
+                    validation_phase(coordinator),
+                    validation_generation(coordinator)
+                )));
+            }
+            let phase = validation_phase(coordinator);
+            match phase {
+                ValidationPhase::Preparing | ValidationPhase::Active => {
+                    let consuming = validation_word(ValidationPhase::Consuming, token.generation());
+                    if self
+                        .validation_state
+                        .compare_exchange(
+                            coordinator,
+                            consuming,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    #[cfg(feature = "gpu-tests")]
+                    if phase == ValidationPhase::Active
+                        && self.validation_consumer_pause.load(Ordering::Acquire)
+                    {
+                        self.validation_consumer_claimed
+                            .store(true, Ordering::Release);
+                        while self.validation_consumer_pause.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                    }
+                    if phase == ValidationPhase::Preparing {
+                        self.publish_device_validation(token.generation(), 0);
+                        return Ok(DeviceValidationConsumption {
+                            flags: 0,
+                            executor_scope: slot.submission_executor_scope.load(Ordering::Relaxed),
+                            completed_active_submission: false,
+                        });
+                    }
+                    let result = self
+                        .check_capture_error()
+                        .and_then(|flags| self.reset_capture_error().map(|()| flags));
+                    match result {
+                        Ok(flags) => {
+                            self.publish_device_validation(token.generation(), flags);
+                            return Ok(DeviceValidationConsumption {
+                                flags,
+                                executor_scope: slot
+                                    .submission_executor_scope
+                                    .load(Ordering::Relaxed),
+                                completed_active_submission: true,
+                            });
+                        }
+                        Err(error) => {
+                            self.validation_state.store(
+                                validation_word(ValidationPhase::Active, token.generation()),
+                                Ordering::Release,
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
+                ValidationPhase::Resetting
+                | ValidationPhase::Attaching
+                | ValidationPhase::Consuming => {
+                    spins = spins.saturating_add(1);
+                    if spins < 64 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                ValidationPhase::Idle => {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep: validation token owner={} generation={} is pending while the \
+                         coordinator is idle",
+                        token.owner().get(),
+                        token.generation()
+                    )));
+                }
+            }
+        }
+    }
+
     /// Clear the latching capture-error word back to the un-poisoned state.
-    /// Invoked at session request boundaries and on graph reset / re-capture.
-    pub fn reset_capture_error(&self) -> Result<()> {
+    /// Invoked only when opening or consuming a validation generation. Graph
+    /// reset must never clear an unconsumed result.
+    fn reset_capture_error(&self) -> Result<()> {
+        self.bind()?;
         // SAFETY: `capture_error` is a live four-byte device allocation owned by
-        // this runtime for its whole lifetime.
-        unsafe { self.htod(&0_u32.to_ne_bytes(), self.capture_error) }
+        // this runtime for its whole lifetime. The stream-ordered clear executes
+        // before subsequently submitted eager or captured kernels.
+        unsafe {
+            cudarc::driver::result::memset_d8_async(
+                self.capture_error,
+                0,
+                std::mem::size_of::<u32>(),
+                self.stream.cu_stream(),
+            )
+        }
+        .map_err(|error| driver_err("clear CUDA validation latch", error))
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn validation_submission_count(&self) -> u64 {
+        self.validation_submissions.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn registered_validation_owner_count(&self) -> usize {
+        self.registered_validation_owners.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn validation_registry_lock_acquisition_count(&self) -> u64 {
+        self.validation_registry_lock_acquisitions
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn validation_cleanup_count(&self) -> u64 {
+        self.validation_cleanups.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn pause_validation_consumer_for_test(&self, pause: bool) {
+        if pause {
+            self.validation_consumer_claimed
+                .store(false, Ordering::Release);
+        }
+        self.validation_consumer_pause
+            .store(pause, Ordering::Release);
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn validation_consumer_claimed_for_test(&self) -> bool {
+        self.validation_consumer_claimed.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn pause_validation_reset_for_test(&self, pause: bool) {
+        if pause {
+            self.validation_reset_claimed
+                .store(false, Ordering::Release);
+        }
+        self.validation_reset_pause.store(pause, Ordering::Release);
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn validation_reset_claimed_for_test(&self) -> bool {
+        self.validation_reset_claimed.load(Ordering::Acquire)
+    }
+
+    /// Test-only raw reset for isolated kernel probes that do not use the
+    /// session validation lifecycle.
+    ///
+    /// # Safety
+    /// The caller must prove no validation generation is active.
+    #[cfg(any(test, feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub unsafe fn reset_capture_error_for_isolated_test(&self) -> Result<()> {
+        let resetting = validation_word(ValidationPhase::Resetting, 0);
+        self.validation_state
+            .compare_exchange(
+                validation_word(ValidationPhase::Idle, 0),
+                resetting,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|current| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: isolated-test reset refused while validation phase {:?} generation \
+                     {} is active",
+                    validation_phase(current),
+                    validation_generation(current)
+                ))
+            })?;
+        #[cfg(feature = "gpu-tests")]
+        {
+            if self.validation_reset_pause.load(Ordering::Acquire) {
+                self.validation_reset_claimed.store(true, Ordering::Release);
+                while self.validation_reset_pause.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        let result = self.reset_capture_error();
+        self.validation_state
+            .store(validation_word(ValidationPhase::Idle, 0), Ordering::Release);
+        result
     }
 
     /// Driver-reported capture status for the EP stream.
@@ -948,72 +1902,271 @@ impl CudaRuntime {
         kernels: &[&dyn Kernel],
     ) -> Result<()> {
         crate::capture::require_subgraph_graph_capturable(kernels)?;
-        self.graph_slot(slot).begin()
+        let resources = kernels
+            .iter()
+            .flat_map(|kernel| kernel.device_graph_resources())
+            .collect();
+        self.begin_graph_capture_resources_in(slot, resources)
+    }
+
+    /// Slot-aware capture with additional immutable address owners.
+    pub fn begin_graph_capture_with_resources_in(
+        &self,
+        slot: DeviceGraphSlot,
+        kernels: &[&dyn Kernel],
+        mut resources: Vec<DeviceGraphResource>,
+    ) -> Result<()> {
+        crate::capture::require_subgraph_graph_capturable(kernels)?;
+        resources.extend(
+            kernels
+                .iter()
+                .flat_map(|kernel| kernel.device_graph_resources()),
+        );
+        self.begin_graph_capture_resources_in(slot, resources)
+    }
+
+    fn begin_graph_capture_resources_in(
+        &self,
+        slot: DeviceGraphSlot,
+        mut resources: Vec<DeviceGraphResource>,
+    ) -> Result<()> {
+        resources.sort_unstable_by_key(DeviceGraphResource::identity);
+        resources.dedup_by_key(|resource| resource.identity());
+        let resource_ids = Arc::new(
+            resources
+                .iter()
+                .map(DeviceGraphResource::identity)
+                .collect(),
+        );
+        self.registered_capture_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: cannot begin CUDA graph capture while another registered capture \
+                     is active on the runtime stream"
+                        .into(),
+                )
+            })?;
+        if let Err(error) = self.graph_slot(slot).begin_current(resources) {
+            self.registered_capture_active
+                .store(false, Ordering::Release);
+            return Err(error);
+        }
+        self.active_capture_resource_ids.store(Some(resource_ids));
+        Ok(())
     }
 
     /// Slot-aware [`end_graph_capture`](Self::end_graph_capture).
     pub fn end_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
-        self.graph_slot(slot).end()
+        let result = self.graph_slot(slot).end_current();
+        self.registered_capture_active
+            .store(false, Ordering::Release);
+        self.active_capture_resource_ids.store(None);
+        result
     }
 
     /// Slot-aware [`abort_graph_capture`](Self::abort_graph_capture).
     pub fn abort_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
-        self.graph_slot(slot).abort()
+        let result = self.graph_slot(slot).abort_current();
+        self.registered_capture_active
+            .store(false, Ordering::Release);
+        self.active_capture_resource_ids.store(None);
+        result
     }
 
     /// Slot-aware [`replay_graph`](Self::replay_graph).
     pub fn replay_graph_in(&self, slot: DeviceGraphSlot) -> Result<()> {
-        self.graph_slot(slot).replay()
+        self.graph_slot(slot).replay_current()
     }
 
     /// Slot-aware [`replay_graph_segment`](Self::replay_graph_segment).
     pub fn replay_graph_segment_in(&self, slot: DeviceGraphSlot, index: usize) -> Result<()> {
-        self.graph_slot(slot).replay_segment(index)
+        self.graph_slot(slot).replay_current_segment(index)
     }
 
     /// Slot-aware [`graph_segment_count`](Self::graph_segment_count).
     pub fn graph_segment_count_in(&self, slot: DeviceGraphSlot) -> Result<usize> {
-        self.graph_slot(slot).segment_count()
+        self.graph_slot(slot).current_segment_count()
     }
 
     /// Slot-aware [`reset_graph`](Self::reset_graph).
     pub fn reset_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
-        self.graph_slot(slot).reset()
+        self.graph_slot(slot).reset_current()
     }
 
     /// Slot-aware [`has_graph_executable`](Self::has_graph_executable).
     pub fn has_graph_executable_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
-        self.graph_slot(slot).has_executable()
+        self.graph_slot(slot).has_current_executable()
     }
 
-    /// Strongly retain a sealed resource in the graph capture currently active
-    /// on this runtime's stream.
-    ///
-    /// Eager launches are unchanged and retain nothing. If the CUDA stream is
-    /// capturing but neither runtime-owned graph slot is the active ownership
-    /// sink, fail before an address-bearing kernel is launched; an externally
-    /// initiated capture must not embed an allocation the runtime cannot pin.
-    pub(crate) fn retain_active_graph_resource<T>(
+    fn owned_graph(
         &self,
-        identity: usize,
-        owner: &Arc<T>,
-        label: &str,
-    ) -> Result<()>
-    where
-        T: Send + Sync + 'static,
-    {
-        if !self.is_capturing()? {
-            return Ok(());
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+    ) -> Option<Arc<CudaGraphLifecycle>> {
+        self.owned_graphs.load().get(&(owner, slot)).cloned()
+    }
+
+    fn owned_graph_for_begin(
+        &self,
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+        continuation: Option<DeviceGraphToken>,
+    ) -> Result<Arc<CudaGraphLifecycle>> {
+        let _writer = self.owned_graphs_write.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep: owned CUDA graph registry was poisoned".into())
+        })?;
+        if let Some(graph) = self.owned_graph(owner, slot) {
+            return Ok(graph);
         }
-        if self.graph.retain_capture_resource(identity, owner)?
-            || self.verify_graph.retain_capture_resource(identity, owner)?
-        {
-            return Ok(());
+        if continuation.is_some() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: CUDA graph continuation token names a retired executor graph".into(),
+            ));
         }
-        Err(EpError::KernelFailed(format!(
-            "cuda_ep: active CUDA graph capture has no registered ownership sink for sealed \
-             {label}; refusing to embed its device addresses"
-        )))
+        let graph = Arc::new(CudaGraphLifecycle::new(self.stream.clone(), owner, slot));
+        let current = self.owned_graphs.load_full();
+        let mut next = (*current).clone();
+        next.insert((owner, slot), Arc::clone(&graph));
+        self.owned_graphs.store(Arc::new(next));
+        Ok(graph)
+    }
+
+    /// Begin capture in one executor-owned graph namespace.
+    pub(crate) fn begin_owned_graph_capture_in(
+        &self,
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+        continuation: Option<DeviceGraphToken>,
+        kernels: &[&dyn Kernel],
+    ) -> Result<DeviceGraphToken> {
+        crate::capture::require_subgraph_graph_capturable(kernels)?;
+        let mut resources: Vec<DeviceGraphResource> = kernels
+            .iter()
+            .flat_map(|kernel| kernel.device_graph_resources())
+            .collect();
+        resources.sort_unstable_by_key(DeviceGraphResource::identity);
+        resources.dedup_by_key(|resource| resource.identity());
+        let resource_ids = Arc::new(
+            resources
+                .iter()
+                .map(DeviceGraphResource::identity)
+                .collect(),
+        );
+        self.registered_capture_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: cannot begin CUDA graph capture while another registered capture \
+                     is active on the runtime stream"
+                        .into(),
+                )
+            })?;
+        let graph = match self.owned_graph_for_begin(owner, slot, continuation) {
+            Ok(graph) => graph,
+            Err(error) => {
+                self.registered_capture_active
+                    .store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        let token = match graph.begin(continuation, resources) {
+            Ok(token) => token,
+            Err(error) => {
+                self.registered_capture_active
+                    .store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        self.active_capture_resource_ids.store(Some(resource_ids));
+        Ok(token)
+    }
+
+    pub(crate) fn end_owned_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        let result = self
+            .owned_graph(token.owner(), token.slot())
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: cannot end a retired executor-owned CUDA graph".into(),
+                )
+            })?
+            .end(token);
+        self.registered_capture_active
+            .store(false, Ordering::Release);
+        self.active_capture_resource_ids.store(None);
+        result
+    }
+
+    pub(crate) fn abort_owned_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        let result = match self.owned_graph(token.owner(), token.slot()) {
+            Some(graph) => graph.abort(token),
+            None => Ok(()),
+        };
+        self.registered_capture_active
+            .store(false, Ordering::Release);
+        self.active_capture_resource_ids.store(None);
+        result
+    }
+
+    pub(crate) fn replay_owned_graph(&self, token: DeviceGraphToken) -> Result<()> {
+        self.owned_graph(token.owner(), token.slot())
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: cannot replay a retired executor-owned CUDA graph".into(),
+                )
+            })?
+            .replay(token)
+    }
+
+    pub(crate) fn replay_owned_graph_segment(
+        &self,
+        token: DeviceGraphToken,
+        index: usize,
+    ) -> Result<()> {
+        self.owned_graph(token.owner(), token.slot())
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: cannot replay a retired executor-owned CUDA graph".into(),
+                )
+            })?
+            .replay_segment(token, index)
+    }
+
+    pub(crate) fn reset_owned_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        let _writer = self.owned_graphs_write.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep: owned CUDA graph registry was poisoned".into())
+        })?;
+        let Some(graph) = self.owned_graph(token.owner(), token.slot()) else {
+            return Ok(false);
+        };
+        let (_, had_graph) = graph.reset(token)?;
+        Ok(had_graph)
+    }
+
+    pub(crate) fn retire_owned_graphs(&self, owner: DeviceGraphOwner) -> Result<()> {
+        let _writer = self.owned_graphs_write.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep: owned CUDA graph registry was poisoned".into())
+        })?;
+        let current = self.owned_graphs.load_full();
+        for ((entry_owner, _), graph) in current.iter() {
+            if *entry_owner == owner && graph.current_token()?.is_some() {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: cannot retire graph owner {} while an installation is live",
+                    owner.get()
+                )));
+            }
+        }
+        let mut next = (*current).clone();
+        next.retain(|(entry_owner, _), _| *entry_owner != owner);
+        self.owned_graphs.store(Arc::new(next));
+        Ok(())
+    }
+
+    pub(crate) fn has_owned_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        match self.owned_graph(token.owner(), token.slot()) {
+            Some(graph) => graph.has_executable(token),
+            None => Ok(false),
+        }
     }
 
     /// Start capture directly on the stream without installing a lifecycle
@@ -1025,7 +2178,10 @@ impl CudaRuntime {
             .begin_capture(
                 cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
             )
-            .map_err(|error| driver_err("begin unregistered CUDA graph capture", error))
+            .map_err(|error| driver_err("begin unregistered CUDA graph capture", error))?;
+        self.unregistered_capture_active
+            .store(true, Ordering::Release);
+        Ok(())
     }
 
     /// End and destroy the raw test capture started above.
@@ -1039,13 +2195,17 @@ impl CudaRuntime {
             cudarc::driver::result::stream::end_capture(self.stream.cu_stream())
                 .map_err(|error| driver_err("end unregistered CUDA graph capture", error))?
         };
-        if !graph.is_null() {
+        let result = if !graph.is_null() {
             // SAFETY: no executable was instantiated; this helper exclusively
             // owns the fresh raw graph handle.
             unsafe { cudarc::driver::result::graph::destroy(graph) }
-                .map_err(|error| driver_err("destroy unregistered CUDA graph", error))?;
-        }
-        Ok(())
+                .map_err(|error| driver_err("destroy unregistered CUDA graph", error))
+        } else {
+            Ok(())
+        };
+        self.unregistered_capture_active
+            .store(false, Ordering::Release);
+        result
     }
 
     /// Snapshot explicit device allocation/free calls made through this runtime.
@@ -1068,6 +2228,11 @@ impl CudaRuntime {
             device_to_host: self.device_to_host_copies.load(Ordering::Relaxed),
             async_host_to_device: self.async_host_to_device_copies.load(Ordering::Relaxed),
         }
+    }
+
+    /// Number of unconditional compute-stream synchronization calls.
+    pub fn forced_synchronization_count(&self) -> u64 {
+        self.forced_synchronizations.load(Ordering::Relaxed)
     }
 
     /// Validate a requested dynamic shared-memory allocation against the device
@@ -1279,6 +2444,82 @@ impl CudaRuntime {
             .map_err(|e| driver_err(&format!("loading NVRTC function '{entry}'"), e))
     }
 
+    /// Resolve a prepared raw function handle for allocation-free launches.
+    pub(crate) fn nvrtc_raw_function(
+        &self,
+        module_key: &'static str,
+        src: &str,
+        entry: &str,
+    ) -> Result<RawCudaFunction> {
+        require(CudaLibrary::Nvrtc).map_err(|message| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: {message}; CPU execution remains available"
+            ))
+        })?;
+        self.bind()?;
+        let module = {
+            let mut cache = self
+                .raw_modules
+                .lock()
+                .expect("cuda_ep raw module cache poisoned");
+            if let Some(module) = cache.get(module_key) {
+                module.clone()
+            } else {
+                let include_paths = nvrtc_include_paths();
+                let _section = capture_gate::synchronizing_section();
+                let module = if self.nvrtc_cubin_fallback.load(Ordering::Relaxed) {
+                    let image = self.nvrtc_cubin_image(module_key, src, &include_paths)?;
+                    self.load_raw_module(module_key, image.as_ptr().cast())?
+                } else {
+                    let ptx = self.nvrtc_ptx(module_key, src, &include_paths)?;
+                    let image = CString::new(ptx.to_src()).map_err(|_| {
+                        EpError::KernelFailed(format!(
+                            "cuda_ep: loading NVRTC module '{module_key}': PTX contains a NUL byte"
+                        ))
+                    })?;
+                    match self.load_raw_module(module_key, image.as_ptr().cast()) {
+                        Ok(module) => module,
+                        Err(EpError::KernelFailed(message))
+                            if message.contains("CUDA_ERROR_UNSUPPORTED_PTX_VERSION") =>
+                        {
+                            self.nvrtc_cubin_fallback.store(true, Ordering::Relaxed);
+                            let image = self.nvrtc_cubin_image(module_key, src, &include_paths)?;
+                            self.load_raw_module(module_key, image.as_ptr().cast())?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                cache.insert(module_key, module.clone());
+                module
+            }
+        };
+        let name = CString::new(entry).expect("static kernel entry cannot contain a NUL byte");
+        // SAFETY: `module` remains retained by the returned function handle.
+        let function = unsafe { cudarc::driver::result::module::get_function(module.module, name) }
+            .map_err(|error| driver_err(&format!("loading raw NVRTC function '{entry}'"), error))?;
+        Ok(RawCudaFunction {
+            function,
+            _module: module,
+        })
+    }
+
+    fn load_raw_module(
+        &self,
+        module_key: &'static str,
+        image: *const c_void,
+    ) -> Result<Arc<RawCudaModule>> {
+        // SAFETY: callers provide either a live NUL-terminated PTX string or a
+        // live CUBIN image for the duration of this synchronous load call.
+        let module =
+            unsafe { cudarc::driver::result::module::load_data(image) }.map_err(|error| {
+                driver_err(&format!("loading raw NVRTC module '{module_key}'"), error)
+            })?;
+        Ok(Arc::new(RawCudaModule {
+            module,
+            context: self.context.clone(),
+        }))
+    }
+
     /// PTX for `module_key`, from the on-disk cache when possible.
     ///
     /// A cached hit is returned as PTX source rather than a compiled image;
@@ -1322,6 +2563,23 @@ impl CudaRuntime {
         src: &str,
         include_paths: &[String],
     ) -> Result<Arc<CudaModule>> {
+        let image = self.nvrtc_cubin_image(module_key, src, include_paths)?;
+        self.context
+            .load_module(cudarc::nvrtc::Ptx::from_binary(image))
+            .map_err(|error| {
+                driver_err(
+                    &format!("loading NVRTC CUBIN fallback module '{module_key}'"),
+                    error,
+                )
+            })
+    }
+
+    fn nvrtc_cubin_image(
+        &self,
+        module_key: &'static str,
+        src: &str,
+        include_paths: &[String],
+    ) -> Result<Vec<u8>> {
         let key = kernel_cache::CacheKey {
             module_key,
             source: src,
@@ -1339,14 +2597,7 @@ impl CudaRuntime {
                 image
             }
         };
-        self.context
-            .load_module(cudarc::nvrtc::Ptx::from_binary(image))
-            .map_err(|error| {
-                driver_err(
-                    &format!("loading NVRTC CUBIN fallback module '{module_key}'"),
-                    error,
-                )
-            })
+        Ok(image)
     }
 
     fn compile_nvrtc_cubin(
@@ -1493,6 +2744,7 @@ impl CudaRuntime {
     /// that must observe fully-produced bytes regardless of the eager-sync
     /// deferral flag.
     fn force_synchronize(&self) -> Result<()> {
+        self.forced_synchronizations.fetch_add(1, Ordering::Relaxed);
         self.stream
             .synchronize()
             .map_err(|e| driver_err("stream synchronize", e))
@@ -1546,6 +2798,45 @@ impl CudaRuntime {
     pub fn is_capturing(&self) -> Result<bool> {
         Ok(self.graph_capture_status()?
             != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
+    }
+
+    pub(crate) fn require_registered_address_capture(
+        &self,
+        identity: usize,
+        label: &str,
+    ) -> Result<()> {
+        if self.unregistered_capture_active.load(Ordering::Acquire)
+            && !self.registered_capture_active.load(Ordering::Acquire)
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: active CUDA graph capture has no registered ownership token for \
+                 sealed {label}; refusing to embed its device addresses"
+            )));
+        }
+        if self.registered_capture_active.load(Ordering::Acquire)
+            && !self
+                .active_capture_resource_ids
+                .load()
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&identity))
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: active CUDA graph capture did not retain the ownership token for \
+                  sealed {label}; refusing to embed its device addresses"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Number of CUDA graph lifecycle mutex acquisitions by this runtime.
+    pub fn graph_lifecycle_lock_acquisition_count(&self) -> u64 {
+        self.graph.lock_acquisition_count() + self.verify_graph.lock_acquisition_count()
+    }
+
+    /// Positive control for graph-lifecycle lock instrumentation.
+    #[doc(hidden)]
+    pub fn test_acquire_graph_lifecycle_lock(&self) -> Result<()> {
+        self.graph.test_acquire_lock()
     }
 
     /// This runtime's process-unique identity. See [`Self::runtime_id`].
@@ -1754,8 +3045,15 @@ impl CudaRuntime {
             // SAFETY: every pooled block came from `malloc_sync` on this
             // runtime's context and is freed exactly once — it was removed from
             // the pool here, so `free_raw` cannot also free it.
-            let _ = unsafe { cudarc::driver::result::free_sync(ptr) };
+            if unsafe { cudarc::driver::result::free_sync(ptr) }.is_ok() {
+                self.frees.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn test_drain_raw_pool(&self) {
+        self.drain_raw_pool();
     }
 
     /// Free a device pointer previously returned by [`CudaRuntime::alloc_raw`].
@@ -1817,12 +3115,17 @@ impl CudaRuntime {
         // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
             .map_err(|e| driver_err("cuMemcpyHtoD", e))?;
-        self.context.default_stream().synchronize().map_err(|e| {
-            driver_err(
-                "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
-                e,
-            )
-        })?;
+        // SAFETY: a null CUstream selects the current context's legacy default
+        // stream. Calling the raw API avoids constructing an allocating Arc
+        // wrapper on every request-boundary validation reset.
+        unsafe { cudarc::driver::result::stream::synchronize(std::ptr::null_mut()) }.map_err(
+            |e| {
+                driver_err(
+                    "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
+                    e,
+                )
+            },
+        )?;
         self.host_to_device_copies.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -2351,6 +3654,23 @@ pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
 mod tests {
     use super::*;
     use cudarc::driver::PushKernelArg;
+
+    #[test]
+    fn validation_generation_exhaustion_fails_without_wrap_or_aba() {
+        let next = AtomicU64::new(VALIDATION_MAX_GENERATION - 1);
+        assert_eq!(
+            take_validation_generation(&next).unwrap(),
+            VALIDATION_MAX_GENERATION - 1
+        );
+        let error = take_validation_generation(&next)
+            .expect_err("generation allocation must fail instead of wrapping");
+        assert!(error.to_string().contains("generation space exhausted"));
+        assert_eq!(
+            next.load(Ordering::Relaxed),
+            VALIDATION_MAX_GENERATION,
+            "failed allocation must not wrap or reuse an earlier generation"
+        );
+    }
 
     #[test]
     fn fence_dispatch_consumes_fresh_event_once_and_propagates_wait_errors() {

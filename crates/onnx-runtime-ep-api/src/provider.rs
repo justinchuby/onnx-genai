@@ -1,14 +1,19 @@
 //! The [`ExecutionProvider`] trait and its supporting types (§4.1).
 
+use std::any::Any;
 use std::ffi::c_void;
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
 };
-use onnx_runtime_memory_governor::{ManagedAllocation, MemoryLease, MemoryRole, OwningAllocation};
+use onnx_runtime_memory_governor::{
+    AllocationIdentity, ManagedAllocation, MemoryLease, MemoryRole, OwningAllocation,
+    ProviderContextIdentity,
+};
 
 use crate::epcontext::EpContext;
 use crate::error::{EpError, Result};
@@ -193,6 +198,207 @@ impl DeviceGraphSlot {
             DeviceGraphSlot::Primary => 0,
             DeviceGraphSlot::Verify => 1,
         }
+    }
+}
+
+/// Immutable identity of one executor's device-graph namespace.
+///
+/// A provider may be shared by several sessions. The owner prevents one
+/// executor's `Primary` or `Verify` graph from naming another executor's slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DeviceGraphOwner {
+    id: u64,
+    executor: Option<ExecutorInstanceId>,
+}
+
+impl DeviceGraphOwner {
+    /// Mint a process-unique owner identity. Identities are never reused.
+    pub fn new() -> Self {
+        static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+        let owner = NEXT_OWNER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .unwrap_or_else(|_| {
+                panic!(
+                    "device validation owner identity space exhausted; refusing to wrap and \
+                     create an ABA collision"
+                )
+            });
+        Self {
+            id: owner,
+            executor: None,
+        }
+    }
+
+    /// Derive the device-graph namespace owned by one executor.
+    ///
+    /// This is a typed projection of the executor identity, not a second
+    /// independently allocated identity. Providers can therefore attribute
+    /// graph lifecycle telemetry without maintaining a fallible side map.
+    pub const fn for_executor(executor: ExecutorInstanceId) -> Self {
+        Self {
+            id: executor.0.get(),
+            executor: Some(executor),
+        }
+    }
+
+    /// Stable process-local numeric identity.
+    pub const fn get(self) -> u64 {
+        self.id
+    }
+
+    /// Executor scope associated with this graph namespace, when one exists.
+    pub const fn executor(self) -> Option<ExecutorInstanceId> {
+        self.executor
+    }
+}
+
+impl Default for DeviceGraphOwner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Immutable identity of one executor's deferred-validation namespace.
+///
+/// A provider may be shared by several sessions. Only the executor that opened
+/// a validation generation, or an output binding carrying its exact token, may
+/// consume that generation's result.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DeviceValidationOwner(u64);
+
+impl DeviceValidationOwner {
+    /// Mint a process-unique owner identity. Identities are never reused.
+    pub fn new() -> Self {
+        static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+        let owner = NEXT_OWNER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .unwrap_or_else(|_| {
+                panic!(
+                    "device validation owner identity space exhausted; refusing to wrap and \
+                     create an ABA collision"
+                )
+            });
+        Self(owner)
+    }
+
+    /// Stable process-local numeric identity.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for DeviceValidationOwner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Setup-time proof that one deferred-validation owner is registered with an EP.
+///
+/// The provider-specific state is allocated only here. Submission paths borrow
+/// this proof, so they neither look up an owner in a map nor clone a reference-
+/// counted handle.
+pub struct DeviceValidationRegistration {
+    owner: DeviceValidationOwner,
+    state: Box<dyn Any + Send + Sync>,
+}
+
+impl DeviceValidationRegistration {
+    /// Construct a registration carrying provider-specific state.
+    pub fn new<T>(owner: DeviceValidationOwner, state: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            owner,
+            state: Box::new(state),
+        }
+    }
+
+    /// Registered owner identity.
+    pub const fn owner(&self) -> DeviceValidationOwner {
+        self.owner
+    }
+
+    /// Borrow provider-specific registration state.
+    #[doc(hidden)]
+    pub fn state<T: Any>(&self) -> Option<&T> {
+        self.state.downcast_ref()
+    }
+
+    /// Mutably borrow provider-specific registration state during teardown.
+    #[doc(hidden)]
+    pub fn state_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.state.downcast_mut()
+    }
+}
+
+impl std::fmt::Debug for DeviceValidationRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceValidationRegistration")
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact identity of one submitted deferred-validation generation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DeviceValidationToken {
+    owner: DeviceValidationOwner,
+    generation: u64,
+}
+
+impl DeviceValidationToken {
+    /// Construct a provider-issued validation token.
+    pub const fn new(owner: DeviceValidationOwner, generation: u64) -> Self {
+        Self { owner, generation }
+    }
+
+    pub const fn owner(self) -> DeviceValidationOwner {
+        self.owner
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+/// Exact identity of one installed device-graph generation.
+///
+/// All replay, liveness, reset, and invalidation operations require this token.
+/// Re-capture mints a new generation even for the same executor and slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DeviceGraphToken {
+    owner: DeviceGraphOwner,
+    slot: DeviceGraphSlot,
+    generation: u64,
+}
+
+impl DeviceGraphToken {
+    /// Construct a provider-issued installation token.
+    pub const fn new(owner: DeviceGraphOwner, slot: DeviceGraphSlot, generation: u64) -> Self {
+        Self {
+            owner,
+            slot,
+            generation,
+        }
+    }
+
+    pub const fn owner(self) -> DeviceGraphOwner {
+        self.owner
+    }
+
+    pub const fn slot(self) -> DeviceGraphSlot {
+        self.slot
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
     }
 }
 
@@ -812,6 +1018,24 @@ pub struct RawDeviceAllocationSiteStats {
     pub pool_hit_bytes: u64,
 }
 
+/// Immutable, provider-owned device allocation prepared from graph-constant
+/// bytes before a kernel's first launch.
+///
+/// The allocation exposes only a read-only pointer plus the identities a
+/// kernel needs to reject cross-provider/runtime substitution. It cannot be
+/// converted back into a mutable [`DeviceBuffer`].
+pub trait SealedDeviceAllocation: Send + Sync {
+    fn ptr(&self) -> crate::DevicePtr;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn device(&self) -> DeviceId;
+    fn provider_context(&self) -> ProviderContextIdentity;
+    fn allocation_identity(&self) -> AllocationIdentity;
+    fn runtime_identity(&self) -> usize;
+}
+
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -844,6 +1068,46 @@ pub trait ExecutionProvider: Send + Sync {
     /// continue receiving resident [`crate::TensorView`] inputs.
     fn capabilities(&self) -> ExecutionProviderCapabilities {
         ExecutionProviderCapabilities::stock()
+    }
+
+    /// Identity of the concrete runtime/context used by kernels from this EP.
+    ///
+    /// Device providers that support sealed constants override this. `None`
+    /// keeps stock providers out of the sealed-admission contract.
+    fn runtime_identity(&self) -> Option<usize> {
+        None
+    }
+
+    /// Identity of the provider memory context that owns sealed constants.
+    fn provider_context_identity(&self) -> Option<ProviderContextIdentity> {
+        None
+    }
+
+    /// Whether this provider replaces one graph-constant input with immutable
+    /// provider-owned storage during kernel preparation.
+    ///
+    /// The session may omit the ordinary resident initializer buffer only when
+    /// every consumer slot returns `true`; dispatch then requires the prepared
+    /// kernel to supply an exact [`Kernel::constant_input_override`] before the
+    /// input can reach execution. Stock providers retain the resident path.
+    fn prepares_immutable_constant(&self, node: &Node, input_idx: usize) -> bool {
+        let _ = (node, input_idx);
+        false
+    }
+
+    /// Validate-before-upload sink used by kernels with immutable graph-weight
+    /// contracts. The default fails closed; a provider must explicitly support
+    /// generation-bound sealed allocations.
+    fn upload_sealed_constant(
+        &self,
+        bytes: &[u8],
+        alignment: usize,
+    ) -> Result<Arc<dyn SealedDeviceAllocation>> {
+        let _ = (bytes, alignment);
+        Err(EpError::KernelFailed(format!(
+            "{} does not support sealed constant admission",
+            self.name()
+        )))
     }
 
     /// Page a lazy weight into device memory for live dispatch (WEIGHT_OFFLOAD
@@ -1498,82 +1762,147 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(true)
     }
 
-    /// Executor-scoped graph capture. Shared providers override this to bind
-    /// mutable graph lifecycle state to exactly one executor.
-    fn begin_device_graph_capture_for_executor(
+    /// Begin capture in an executor-owned namespace and return the exact
+    /// installation token. `continuation` is supplied for later segments of the
+    /// same capture and must identify the already-installed generation.
+    fn begin_owned_device_graph_capture(
         &self,
-        _executor: ExecutorInstanceId,
+        owner: DeviceGraphOwner,
         slot: DeviceGraphSlot,
+        continuation: Option<DeviceGraphToken>,
         kernels: &[&dyn Kernel],
-    ) -> Result<()> {
-        self.begin_device_graph_capture_in(slot, kernels)
+    ) -> Result<DeviceGraphToken> {
+        self.begin_device_graph_capture_in(slot, kernels)?;
+        Ok(continuation.unwrap_or_else(|| DeviceGraphToken::new(owner, slot, 1)))
     }
 
-    fn end_device_graph_capture_for_executor(
-        &self,
-        _executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<()> {
-        self.end_device_graph_capture_in(slot)
+    /// End the active capture identified by `token`.
+    fn end_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        self.end_device_graph_capture_in(token.slot())
     }
 
-    fn abort_device_graph_capture_for_executor(
-        &self,
-        _executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<()> {
-        self.abort_device_graph_capture_in(slot)
+    /// Abort the active capture identified by `token`.
+    fn abort_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        self.abort_device_graph_capture_in(token.slot())
     }
 
-    fn replay_device_graph_for_executor(
-        &self,
-        _executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<()> {
-        self.replay_device_graph_in(slot)
+    /// Replay the exact installed graph generation identified by `token`.
+    fn replay_owned_device_graph(&self, token: DeviceGraphToken) -> Result<()> {
+        self.replay_device_graph_in(token.slot())
     }
 
-    fn replay_device_graph_segment_for_executor(
+    /// Replay one segment of the exact installed generation.
+    fn replay_owned_device_graph_segment(
         &self,
-        _executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
+        token: DeviceGraphToken,
         index: usize,
     ) -> Result<()> {
-        self.replay_device_graph_segment_in(slot, index)
+        self.replay_device_graph_segment_in(token.slot(), index)
     }
 
-    fn reset_device_graph_for_executor(
-        &self,
-        _executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<bool> {
-        self.reset_device_graph_in(slot)
+    /// Reset only the exact installed generation identified by `token`.
+    fn reset_owned_device_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        self.reset_device_graph_in(token.slot())
     }
 
-    fn has_device_graph_for_executor(
-        &self,
-        _executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<bool> {
-        self.has_device_graph_in(slot)
-    }
-
-    /// Clear the provider's latching device-side validation error.
+    /// Retire empty graph-lifecycle slots for an executor owner at final drop.
     ///
-    /// Session executors call this at top-level request boundaries. Implementations
-    /// must make the reset safe for both eager and captured execution; providers
-    /// without a device validation latch keep the no-op default.
-    fn reset_device_validation_error(&self) -> Result<()> {
+    /// Ordinary reset deliberately retains the lifecycle so a repeated capture
+    /// cannot reuse an earlier installation generation.
+    fn retire_owned_device_graphs(&self, _owner: DeviceGraphOwner) -> Result<()> {
         Ok(())
     }
 
-    /// Read (without clearing) any latching device-side validation error as a
-    /// raw violation bitmask (zero when none). The compatibility name predates
-    /// deferred eager validation; EPs without device validation report no error.
+    /// Whether the exact installed generation identified by `token` is live.
+    fn has_owned_device_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        self.has_device_graph_in(token.slot())
+    }
+
+    /// Register one executor or persistent binding during setup.
     ///
-    /// The caller must first establish a host synchronization boundary so all
-    /// kernels from the request have completed before this value is observed.
-    fn check_device_capture_error(&self) -> Result<u32> {
+    /// Owners are registered once at executor/binding setup. Providers with
+    /// deferred validation may reject this call while a previous generation is
+    /// still executing. The returned token is the submitting executor's exact
+    /// authority for this generation.
+    fn register_device_validation_owner(&self) -> Result<DeviceValidationRegistration> {
+        let owner = DeviceValidationOwner::new();
+        Ok(DeviceValidationRegistration::new(owner, ()))
+    }
+
+    /// Register the deferred-validation owner of one executor.
+    ///
+    /// Providers that couple another executor-scoped safe-boundary action to
+    /// validation completion may retain the identity in setup-allocated state.
+    fn register_device_validation_owner_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+    ) -> Result<DeviceValidationRegistration> {
+        self.register_device_validation_owner()
+    }
+
+    /// Retire one executor/binding validation owner at teardown.
+    fn unregister_device_validation_owner(
+        &self,
+        _registration: &mut DeviceValidationRegistration,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Begin one top-level device-validation generation for `registration`.
+    fn begin_device_validation(
+        &self,
+        registration: &DeviceValidationRegistration,
+    ) -> Result<DeviceValidationToken> {
+        Ok(DeviceValidationToken::new(registration.owner(), 0))
+    }
+
+    /// Add one pre-registered output binding as an exact recipient of the
+    /// active submission. The returned token is sticky in that binding's
+    /// owner-scoped slot until the binding participates in a later submission
+    /// or is unregistered.
+    fn add_device_validation_recipient(
+        &self,
+        submission: DeviceValidationToken,
+        recipient: &DeviceValidationRegistration,
+    ) -> Result<DeviceValidationToken> {
+        Ok(DeviceValidationToken::new(
+            recipient.owner(),
+            submission.generation(),
+        ))
+    }
+
+    /// Seal recipient attachment and make the submission consumable.
+    fn activate_device_validation(&self, _submission: DeviceValidationToken) -> Result<()> {
+        Ok(())
+    }
+
+    /// Recover an executor submission while its stack is unwinding.
+    fn abort_device_validation_submission(
+        &self,
+        _submission: DeviceValidationToken,
+    ) -> Result<u32> {
+        Ok(0)
+    }
+
+    /// Whether top-level execution defers validation until a host-visible read.
+    fn defers_device_validation(&self) -> bool {
+        false
+    }
+
+    /// Whether consuming a deferred validation generation also executes this
+    /// provider's executor-scoped route-residency safe boundary.
+    fn validation_consumes_route_residency(&self) -> bool {
+        false
+    }
+
+    /// Consume the exact top-level device-validation generation after a host
+    /// synchronization boundary. Implementations reject foreign and stale
+    /// tokens; concurrent exact consumers converge on the same sticky result.
+    fn consume_device_validation_error(
+        &self,
+        _registration: &DeviceValidationRegistration,
+        _token: DeviceValidationToken,
+    ) -> Result<u32> {
         Ok(0)
     }
 

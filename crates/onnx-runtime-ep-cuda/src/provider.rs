@@ -42,11 +42,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{
-    BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, EpConfig, EpError,
-    ExecutionProvider, ExecutionProviderCapabilities, ExecutorArtifactFinalization,
-    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
-    ExecutorResidencyTelemetry, ExpertWeightGroup, Fence, HostToDeviceCopier, Kernel, KernelMatch,
-    LazyWeight, OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny, structural_input_bytes,
+    BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
+    DevicePtr, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities,
+    ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
+    ExecutorInstanceId, ExecutorResidencyTelemetry, ExpertWeightGroup, Fence, HostToDeviceCopier,
+    Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, SealedDeviceAllocation,
+    WorkspaceAllocation, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
@@ -260,6 +261,9 @@ pub(crate) struct CudaSealedAllocation {
     runtime: Weak<CudaRuntime>,
     release_queue: Weak<CudaDeferredReleaseQueue>,
     identity: AllocationIdentity,
+    device: DeviceId,
+    provider_context: ProviderContextIdentity,
+    runtime_identity: usize,
     observer: Arc<dyn ReleaseObserver>,
 }
 
@@ -361,6 +365,40 @@ impl Drop for CudaSealedAllocation {
         if let Err(error) = self.release() {
             eprintln!("cuda_ep: WARNING: {error}");
         }
+    }
+}
+
+impl SealedDeviceAllocation for CudaSealedAllocation {
+    fn ptr(&self) -> DevicePtr {
+        DevicePtr(
+            self.buffer
+                .as_ref()
+                .expect("sealed CUDA allocation is taken only during drop")
+                .as_ptr(),
+        )
+    }
+
+    fn len(&self) -> usize {
+        self.buffer
+            .as_ref()
+            .expect("sealed CUDA allocation is taken only during drop")
+            .len()
+    }
+
+    fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    fn provider_context(&self) -> ProviderContextIdentity {
+        self.provider_context
+    }
+
+    fn allocation_identity(&self) -> AllocationIdentity {
+        self.identity
+    }
+
+    fn runtime_identity(&self) -> usize {
+        self.runtime_identity
     }
 }
 
@@ -957,7 +995,6 @@ pub struct CudaExecutionProvider {
     /// executors may share this EP, but each owns an independent finalization
     /// outcome, boundary, and retained bank artifacts.
     route_executors: Mutex<HashMap<ExecutorInstanceId, ExecutorRouteResidencyState>>,
-    graph_owners: Mutex<[Option<ExecutorInstanceId>; 2]>,
     paging_gate: Mutex<()>,
     weight_keys: Mutex<HashMap<Vec<onnx_runtime_ep_api::ExternalMmapRegion>, u64>>,
     next_weight_key: AtomicU64,
@@ -981,69 +1018,6 @@ impl std::fmt::Debug for CudaExecutionProvider {
 }
 
 impl CudaExecutionProvider {
-    fn graph_slot_index(slot: DeviceGraphSlot) -> usize {
-        match slot {
-            DeviceGraphSlot::Primary => 0,
-            DeviceGraphSlot::Verify => 1,
-        }
-    }
-
-    fn claim_graph_slot(&self, executor: ExecutorInstanceId, slot: DeviceGraphSlot) -> Result<()> {
-        let conflict = {
-            let mut owners = self
-                .graph_owners
-                .lock()
-                .expect("cuda_ep graph ownership poisoned");
-            let owner = &mut owners[Self::graph_slot_index(slot)];
-            match *owner {
-                Some(current) if current != executor => Some(current),
-                Some(_) => None,
-                None => {
-                    *owner = Some(executor);
-                    None
-                }
-            }
-        };
-        if let Some(current) = conflict {
-            self.route_executors
-                .lock()
-                .expect("cuda_ep executor telemetry poisoned")
-                .entry(executor)
-                .or_default()
-                .graph_fallbacks += 1;
-            Err(EpError::KernelFailed(format!(
-                "cuda_ep: device graph slot {slot:?} is owned by executor {}; executor {} cannot replace it",
-                current.get(),
-                executor.get()
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn require_graph_slot_owner(
-        &self,
-        executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<()> {
-        let owners = self
-            .graph_owners
-            .lock()
-            .expect("cuda_ep graph ownership poisoned");
-        match owners[Self::graph_slot_index(slot)] {
-            Some(current) if current == executor => Ok(()),
-            Some(current) => Err(EpError::KernelFailed(format!(
-                "cuda_ep: executor {} cannot access device graph slot {slot:?} owned by executor {}",
-                executor.get(),
-                current.get()
-            ))),
-            None => Err(EpError::KernelFailed(format!(
-                "cuda_ep: executor {} has no device graph installed in slot {slot:?}",
-                executor.get()
-            ))),
-        }
-    }
-
     fn require_active_executor_scope(&self, executor: ExecutorInstanceId) -> Result<()> {
         let mut states = self
             .route_executors
@@ -1373,7 +1347,6 @@ impl CudaExecutionProvider {
             retired_allocator_teardown: Vec::new(),
             release_queue,
             route_executors: Mutex::new(HashMap::new()),
-            graph_owners: Mutex::new([None, None]),
             paging_gate: Mutex::new(()),
             weight_keys: Mutex::new(HashMap::new()),
             next_weight_key: AtomicU64::new(1),
@@ -2267,10 +2240,16 @@ impl CudaExecutionProvider {
                 .first()
                 .and_then(|value| authorities.catalogs.get(value))
                 .map_or(0, |catalog| catalog.layout().experts);
+            let routes_per_row = graph
+                .node(group.node)
+                .attr("k")
+                .and_then(|value| value.as_int())
+                .unwrap_or(1) as usize;
             let config = crate::kernels::expert_route_telemetry::RouteTelemetryConfig {
                 request_id: expected_request,
                 device_id: self.device.index,
                 num_experts: experts,
+                routes_per_row,
             };
             if let Err(error) = source.arm_route_telemetry(config) {
                 for source in &armed_sources {
@@ -2442,17 +2421,6 @@ impl CudaExecutionProvider {
         };
 
         let drain_result = (|| {
-            for slot in [DeviceGraphSlot::Primary, DeviceGraphSlot::Verify] {
-                let owns_slot = self
-                    .graph_owners
-                    .lock()
-                    .expect("cuda_ep graph ownership poisoned")[Self::graph_slot_index(slot)]
-                    == Some(executor);
-                if owns_slot {
-                    self.runtime.reset_graph_in(slot)?;
-                }
-            }
-
             if !boundaries.is_empty() {
                 self.runtime.drain_for_unmap()?;
                 self.runtime.sync_copy_stream()?;
@@ -2494,17 +2462,6 @@ impl CudaExecutionProvider {
         self.route_telemetry_registry.remove(executor);
         if let Some(residency) = self.residency.as_ref() {
             residency.remove_route_bank_reservations(executor);
-        }
-        {
-            let mut owners = self
-                .graph_owners
-                .lock()
-                .expect("cuda_ep graph ownership poisoned");
-            for owner in owners.iter_mut() {
-                if *owner == Some(executor) {
-                    *owner = None;
-                }
-            }
         }
         let mut states = self
             .route_executors
@@ -2743,6 +2700,9 @@ impl CudaExecutionProvider {
             runtime: Arc::downgrade(&self.runtime),
             release_queue: Arc::downgrade(&self.release_queue),
             identity,
+            device: self.device,
+            provider_context: self.provider_context_identity(),
+            runtime_identity: Arc::as_ptr(&self.runtime) as usize,
             observer: self.release_accounting(),
         })
     }
@@ -3170,6 +3130,34 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn device_id(&self) -> DeviceId {
         self.device
+    }
+
+    fn runtime_identity(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.runtime) as usize)
+    }
+
+    fn provider_context_identity(&self) -> Option<ProviderContextIdentity> {
+        Some(self.provider_context_identity())
+    }
+
+    fn prepares_immutable_constant(&self, node: &Node, input_idx: usize) -> bool {
+        node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+            && node.op_type == "BlockQuantizedMoE"
+            && matches!(input_idx, 2 | 4 | 6)
+            && node.inputs.get(input_idx).is_some_and(Option::is_some)
+    }
+
+    fn upload_sealed_constant(
+        &self,
+        bytes: &[u8],
+        alignment: usize,
+    ) -> Result<Arc<dyn SealedDeviceAllocation>> {
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: cannot admit sealed constants during CUDA graph capture".into(),
+            ));
+        }
+        Ok(Arc::new(self.upload_sealed(bytes, alignment)?))
     }
 
     fn memory_vendor_id(&self) -> u32 {
@@ -4600,8 +4588,201 @@ impl ExecutionProvider for CudaExecutionProvider {
         ))
     }
 
-    fn reset_device_validation_error(&self) -> Result<()> {
-        self.runtime.reset_capture_error()
+    fn begin_owned_device_graph_capture(
+        &self,
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+        continuation: Option<DeviceGraphToken>,
+        kernels: &[&dyn Kernel],
+    ) -> Result<DeviceGraphToken> {
+        if let Some(executor) = owner.executor() {
+            let operation_gate = self.executor_operation_gate(executor);
+            let _operation = operation_gate
+                .lock()
+                .expect("cuda_ep executor operation gate poisoned");
+            self.require_active_executor_scope(executor)?;
+            self.runtime
+                .begin_owned_graph_capture_in(owner, slot, continuation, kernels)
+        } else {
+            self.runtime
+                .begin_owned_graph_capture_in(owner, slot, continuation, kernels)
+        }
+    }
+
+    fn end_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        if let Some(executor) = token.owner().executor() {
+            let operation_gate = self.executor_operation_gate(executor);
+            let _operation = operation_gate
+                .lock()
+                .expect("cuda_ep executor operation gate poisoned");
+            self.require_active_executor_scope(executor)?;
+            self.runtime.end_owned_graph_capture(token)?;
+            self.route_executors
+                .lock()
+                .expect("cuda_ep executor telemetry poisoned")
+                .entry(executor)
+                .or_default()
+                .graph_captures += 1;
+            Ok(())
+        } else {
+            self.runtime.end_owned_graph_capture(token)
+        }
+    }
+
+    fn abort_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        if let Some(executor) = token.owner().executor() {
+            let operation_gate = self.executor_operation_gate(executor);
+            let _operation = operation_gate
+                .lock()
+                .expect("cuda_ep executor operation gate poisoned");
+            self.require_active_executor_scope(executor)?;
+            self.runtime.abort_owned_graph_capture(token)
+        } else {
+            self.runtime.abort_owned_graph_capture(token)
+        }
+    }
+
+    fn replay_owned_device_graph(&self, token: DeviceGraphToken) -> Result<()> {
+        if let Some(executor) = token.owner().executor() {
+            let operation_gate = self.executor_operation_gate(executor);
+            let _operation = operation_gate
+                .lock()
+                .expect("cuda_ep executor operation gate poisoned");
+            self.require_active_executor_scope(executor)?;
+            self.runtime.replay_owned_graph(token)?;
+            self.route_executors
+                .lock()
+                .expect("cuda_ep executor telemetry poisoned")
+                .entry(executor)
+                .or_default()
+                .graph_replays += 1;
+            Ok(())
+        } else {
+            self.runtime.replay_owned_graph(token)
+        }
+    }
+
+    fn replay_owned_device_graph_segment(
+        &self,
+        token: DeviceGraphToken,
+        index: usize,
+    ) -> Result<()> {
+        if let Some(executor) = token.owner().executor() {
+            let operation_gate = self.executor_operation_gate(executor);
+            let _operation = operation_gate
+                .lock()
+                .expect("cuda_ep executor operation gate poisoned");
+            self.require_active_executor_scope(executor)?;
+            self.runtime.replay_owned_graph_segment(token, index)?;
+            self.route_executors
+                .lock()
+                .expect("cuda_ep executor telemetry poisoned")
+                .entry(executor)
+                .or_default()
+                .graph_replays += 1;
+            Ok(())
+        } else {
+            self.runtime.replay_owned_graph_segment(token, index)
+        }
+    }
+
+    fn reset_owned_device_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        if let Some(executor) = token.owner().executor() {
+            let operation_gate = self.executor_operation_gate(executor);
+            let _operation = operation_gate
+                .lock()
+                .expect("cuda_ep executor operation gate poisoned");
+            self.runtime.reset_owned_graph(token)
+        } else {
+            self.runtime.reset_owned_graph(token)
+        }
+    }
+
+    fn retire_owned_device_graphs(&self, owner: DeviceGraphOwner) -> Result<()> {
+        if let Some(executor) = owner.executor() {
+            let operation_gate = self.executor_operation_gate(executor);
+            let _operation = operation_gate
+                .lock()
+                .expect("cuda_ep executor operation gate poisoned");
+            self.require_active_executor_scope(executor)?;
+            self.runtime.retire_owned_graphs(owner)
+        } else {
+            self.runtime.retire_owned_graphs(owner)
+        }
+    }
+
+    fn has_owned_device_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        if let Some(executor) = token.owner().executor() {
+            let operation_gate = self.executor_operation_gate(executor);
+            let _operation = operation_gate
+                .lock()
+                .expect("cuda_ep executor operation gate poisoned");
+            self.runtime.has_owned_graph(token)
+        } else {
+            self.runtime.has_owned_graph(token)
+        }
+    }
+
+    fn register_device_validation_owner(
+        &self,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationRegistration> {
+        self.runtime.register_device_validation_owner()
+    }
+
+    fn register_device_validation_owner_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationRegistration> {
+        self.runtime
+            .register_device_validation_owner_for_executor(executor)
+    }
+
+    fn unregister_device_validation_owner(
+        &self,
+        registration: &mut onnx_runtime_ep_api::DeviceValidationRegistration,
+    ) -> Result<()> {
+        self.runtime
+            .unregister_device_validation_owner(registration)
+    }
+
+    fn begin_device_validation(
+        &self,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        self.runtime.begin_device_validation(registration)
+    }
+
+    fn add_device_validation_recipient(
+        &self,
+        submission: onnx_runtime_ep_api::DeviceValidationToken,
+        recipient: &onnx_runtime_ep_api::DeviceValidationRegistration,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        self.runtime
+            .add_device_validation_recipient(submission, recipient)
+    }
+
+    fn activate_device_validation(
+        &self,
+        submission: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> Result<()> {
+        self.runtime.activate_device_validation(submission)
+    }
+
+    fn abort_device_validation_submission(
+        &self,
+        submission: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> Result<u32> {
+        self.runtime
+            .abort_device_validation_submission(submission)
+            .map(|consumption| consumption.flags)
+    }
+
+    fn defers_device_validation(&self) -> bool {
+        self.runtime.eager_sync_deferred()
+    }
+
+    fn validation_consumes_route_residency(&self) -> bool {
+        self.runtime.eager_sync_deferred()
     }
 
     fn has_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
@@ -4611,180 +4792,34 @@ impl ExecutionProvider for CudaExecutionProvider {
         ))
     }
 
-    fn begin_device_graph_capture_for_executor(
+    fn consume_device_validation_error(
         &self,
-        executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-        kernels: &[&dyn Kernel],
-    ) -> Result<()> {
-        let operation_gate = self.executor_operation_gate(executor);
-        let _operation = operation_gate
-            .lock()
-            .expect("cuda_ep executor operation gate poisoned");
-        self.require_active_executor_scope(executor)?;
-        self.claim_graph_slot(executor, slot)?;
-        if let Err(error) = self.runtime.begin_graph_capture_in(slot, kernels) {
-            let mut owners = self
-                .graph_owners
-                .lock()
-                .expect("cuda_ep graph ownership poisoned");
-            if owners[Self::graph_slot_index(slot)] == Some(executor) {
-                owners[Self::graph_slot_index(slot)] = None;
-            }
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn end_device_graph_capture_for_executor(
-        &self,
-        executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<()> {
-        let operation_gate = self.executor_operation_gate(executor);
-        let _operation = operation_gate
-            .lock()
-            .expect("cuda_ep executor operation gate poisoned");
-        self.require_active_executor_scope(executor)?;
-        self.require_graph_slot_owner(executor, slot)?;
-        self.runtime.end_graph_capture_in(slot)?;
-        self.route_executors
-            .lock()
-            .expect("cuda_ep executor telemetry poisoned")
-            .entry(executor)
-            .or_default()
-            .graph_captures += 1;
-        Ok(())
-    }
-
-    fn abort_device_graph_capture_for_executor(
-        &self,
-        executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<()> {
-        let operation_gate = self.executor_operation_gate(executor);
-        let _operation = operation_gate
-            .lock()
-            .expect("cuda_ep executor operation gate poisoned");
-        self.require_active_executor_scope(executor)?;
-        self.require_graph_slot_owner(executor, slot)?;
-        self.runtime.abort_graph_capture_in(slot)?;
-        self.graph_owners
-            .lock()
-            .expect("cuda_ep graph ownership poisoned")[Self::graph_slot_index(slot)] = None;
-        Ok(())
-    }
-
-    fn replay_device_graph_for_executor(
-        &self,
-        executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<()> {
-        let operation_gate = self.executor_operation_gate(executor);
-        let _operation = operation_gate
-            .lock()
-            .expect("cuda_ep executor operation gate poisoned");
-        self.require_active_executor_scope(executor)?;
-        self.require_graph_slot_owner(executor, slot)?;
-        self.runtime.replay_graph_in(slot)?;
-        self.route_executors
-            .lock()
-            .expect("cuda_ep executor telemetry poisoned")
-            .entry(executor)
-            .or_default()
-            .graph_replays += 1;
-        Ok(())
-    }
-
-    fn replay_device_graph_segment_for_executor(
-        &self,
-        executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-        index: usize,
-    ) -> Result<()> {
-        let operation_gate = self.executor_operation_gate(executor);
-        let _operation = operation_gate
-            .lock()
-            .expect("cuda_ep executor operation gate poisoned");
-        self.require_active_executor_scope(executor)?;
-        self.require_graph_slot_owner(executor, slot)?;
-        self.runtime.replay_graph_segment_in(slot, index)?;
-        self.route_executors
-            .lock()
-            .expect("cuda_ep executor telemetry poisoned")
-            .entry(executor)
-            .or_default()
-            .graph_replays += 1;
-        Ok(())
-    }
-
-    fn reset_device_graph_for_executor(
-        &self,
-        executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<bool> {
-        let operation_gate = self.executor_operation_gate(executor);
-        let _operation = operation_gate
-            .lock()
-            .expect("cuda_ep executor operation gate poisoned");
-        self.require_active_executor_scope(executor)?;
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> Result<u32> {
+        let consumption = self
+            .runtime
+            .consume_device_validation(registration, token)?;
+        if consumption.completed_active_submission
+            && self.runtime.eager_sync_deferred()
+            && consumption.executor_scope != 0
         {
-            let owners = self
-                .graph_owners
+            let executor = self
+                .route_executors
                 .lock()
-                .expect("cuda_ep graph ownership poisoned");
-            match owners[Self::graph_slot_index(slot)] {
-                Some(owner) if owner != executor => {
-                    return Err(EpError::KernelFailed(format!(
-                        "cuda_ep: executor {} cannot reset device graph slot {slot:?} owned by executor {}",
-                        executor.get(),
-                        owner.get()
-                    )));
-                }
-                None => return Ok(false),
-                Some(_) => {}
-            }
+                .expect("cuda_ep route-residency executors poisoned")
+                .keys()
+                .find(|executor| executor.get() == consumption.executor_scope)
+                .copied()
+                .ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep: completed validation references unknown executor scope {}",
+                        consumption.executor_scope
+                    ))
+                })?;
+            self.consume_route_residency_for_executor(executor)?;
         }
-        let invalidated = self.runtime.reset_graph_in(slot)?;
-        self.runtime.reset_capture_error()?;
-        self.graph_owners
-            .lock()
-            .expect("cuda_ep graph ownership poisoned")[Self::graph_slot_index(slot)] = None;
-        Ok(invalidated)
-    }
-
-    fn has_device_graph_for_executor(
-        &self,
-        executor: ExecutorInstanceId,
-        slot: DeviceGraphSlot,
-    ) -> Result<bool> {
-        let operation_gate = self.executor_operation_gate(executor);
-        let _operation = operation_gate
-            .lock()
-            .expect("cuda_ep executor operation gate poisoned");
-        self.require_active_executor_scope(executor)?;
-        {
-            let owners = self
-                .graph_owners
-                .lock()
-                .expect("cuda_ep graph ownership poisoned");
-            match owners[Self::graph_slot_index(slot)] {
-                Some(owner) if owner != executor => {
-                    return Err(EpError::KernelFailed(format!(
-                        "cuda_ep: executor {} cannot inspect device graph slot {slot:?} owned by executor {}",
-                        executor.get(),
-                        owner.get()
-                    )));
-                }
-                None => return Ok(false),
-                Some(_) => {}
-            }
-        }
-        self.runtime.has_graph_executable_in(slot)
-    }
-
-    fn check_device_capture_error(&self) -> Result<u32> {
-        self.runtime.check_capture_error()
+        Ok(consumption.flags)
     }
 
     /// Slice-7C: the coarse safe-boundary route-telemetry consumer, called once
@@ -6976,7 +7011,7 @@ extern "C" __global__ void copy_out(
     /// This locks that contract: after an out-of-band reset of both slots (exactly
     /// what `evict_surplus_variants` does), the trait method reports no executable.
     #[test]
-    fn has_device_graph_in_tracks_out_of_band_slot_eviction() {
+    fn owned_device_graph_tokens_track_executor_scoped_eviction() {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         use onnx_runtime_ep_api::{CaptureSupport, Kernel, TensorMut, TensorView};
 
@@ -7004,6 +7039,8 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
         };
         let owner = ExecutorInstanceId::fresh();
         let contender = ExecutorInstanceId::fresh();
+        let owner_graph = DeviceGraphOwner::for_executor(owner);
+        let contender_graph = DeviceGraphOwner::for_executor(contender);
         let runtime = ep.runtime().clone();
         let add_one = runtime.nvrtc_function(MODULE, SOURCE, "add_one").unwrap();
 
@@ -7034,32 +7071,37 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
             .begin_device_graph_capture_in(DeviceGraphSlot::Primary, &kernels)
             .expect_err("unscoped graph capture must fail closed");
         assert!(unscoped.to_string().contains("explicit executor scope"));
-        ep.begin_device_graph_capture_for_executor(owner, DeviceGraphSlot::Primary, &kernels)
+        let primary = ep
+            .begin_owned_device_graph_capture(owner_graph, DeviceGraphSlot::Primary, None, &kernels)
             .unwrap();
         launch(p_in, p_out);
-        ep.end_device_graph_capture_for_executor(owner, DeviceGraphSlot::Primary)
-            .unwrap();
-        ep.begin_device_graph_capture_for_executor(owner, DeviceGraphSlot::Verify, &kernels)
+        ep.end_owned_device_graph_capture(primary).unwrap();
+        let verify = ep
+            .begin_owned_device_graph_capture(owner_graph, DeviceGraphSlot::Verify, None, &kernels)
             .unwrap();
         launch(v_in, v_out);
-        ep.end_device_graph_capture_for_executor(owner, DeviceGraphSlot::Verify)
-            .unwrap();
+        ep.end_owned_device_graph_capture(verify).unwrap();
 
         // Both slots hold a replayable executable.
         assert!(
-            ep.has_device_graph_for_executor(owner, DeviceGraphSlot::Primary)
-                .unwrap(),
+            ep.has_owned_device_graph(primary).unwrap(),
             "Primary must report an installed graph after capture"
         );
         assert!(
-            ep.has_device_graph_for_executor(owner, DeviceGraphSlot::Verify)
-                .unwrap(),
+            ep.has_owned_device_graph(verify).unwrap(),
             "Verify must report an installed graph after capture"
         );
-        let conflict = ep
-            .begin_device_graph_capture_for_executor(contender, DeviceGraphSlot::Primary, &kernels)
-            .expect_err("a sibling executor must not replace the owner's graph");
-        assert!(conflict.to_string().contains("owned by executor"));
+        let contender_primary = ep
+            .begin_owned_device_graph_capture(
+                contender_graph,
+                DeviceGraphSlot::Primary,
+                None,
+                &kernels,
+            )
+            .expect("a sibling executor owns an independent graph namespace");
+        launch(p_in, p_out);
+        ep.end_owned_device_graph_capture(contender_primary)
+            .unwrap();
         assert_eq!(
             ep.executor_residency_telemetry(owner)
                 .expect("owner telemetry")
@@ -7070,36 +7112,29 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
             ep.executor_residency_telemetry(contender)
                 .expect("contender telemetry")
                 .graph_fallbacks,
-            1
+            0
         );
 
         // Kernel-variant eviction resets BOTH slots out-of-band (mirrors
         // `evict_surplus_variants`), without touching the executor's host state.
-        ep.reset_device_graph_for_executor(owner, DeviceGraphSlot::Primary)
-            .unwrap();
-        ep.reset_device_graph_for_executor(owner, DeviceGraphSlot::Verify)
-            .unwrap();
+        ep.reset_owned_device_graph(primary).unwrap();
+        ep.reset_owned_device_graph(verify).unwrap();
 
         // The liveness signal the executor's pre-replay guard reads must now show
         // both slots emptied, so it re-warms instead of replaying nothing.
         assert!(
-            !ep.has_device_graph_for_executor(owner, DeviceGraphSlot::Primary)
-                .unwrap(),
+            !ep.has_owned_device_graph(primary).unwrap(),
             "Primary must report no executable after out-of-band eviction"
         );
         assert!(
-            !ep.has_device_graph_for_executor(owner, DeviceGraphSlot::Verify)
-                .unwrap(),
+            !ep.has_owned_device_graph(verify).unwrap(),
             "Verify must report no executable after out-of-band eviction"
         );
 
-        // Releasing the slot lets the contender retry deterministically without
-        // inheriting the prior executor's capture counters or executable.
-        ep.begin_device_graph_capture_for_executor(contender, DeviceGraphSlot::Primary, &kernels)
-            .unwrap();
-        launch(p_in, p_out);
-        ep.end_device_graph_capture_for_executor(contender, DeviceGraphSlot::Primary)
-            .unwrap();
+        // The sibling namespace remains live after the owner's exact tokens are
+        // reset and can replay without inheriting the owner's counters.
+        assert!(ep.has_owned_device_graph(contender_primary).unwrap());
+        ep.replay_owned_device_graph(contender_primary).unwrap();
         assert_eq!(
             ep.executor_residency_telemetry(owner)
                 .expect("owner telemetry")
@@ -7112,8 +7147,15 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
                 .graph_captures,
             1
         );
-        ep.reset_device_graph_for_executor(contender, DeviceGraphSlot::Primary)
-            .unwrap();
+        assert_eq!(
+            ep.executor_residency_telemetry(contender)
+                .expect("contender telemetry")
+                .graph_replays,
+            1
+        );
+        ep.reset_owned_device_graph(contender_primary).unwrap();
+        ep.retire_owned_device_graphs(owner_graph).unwrap();
+        ep.retire_owned_device_graphs(contender_graph).unwrap();
 
         // SAFETY: both slots reset, dropping all graph ownership before frees.
         unsafe {
