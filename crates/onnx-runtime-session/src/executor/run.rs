@@ -59,7 +59,7 @@ impl Executor {
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
     ) -> Result<ScopedOutputs> {
-        match self.run_scoped_mode(inputs, outer_scope, external, RunMode::Eager, None)? {
+        match self.run_scoped_mode(inputs, outer_scope, external, RunMode::Eager, None, None)? {
             ScopedRunResult::Executed(outputs) => Ok(outputs),
             ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
         }
@@ -72,6 +72,7 @@ impl Executor {
         external: &ExternalBindings,
         mode: RunMode,
         validation_submission: Option<DeviceValidationSubmission>,
+        artifact_requirement: Option<CapturedProviderArtifactRequirement>,
     ) -> Result<ScopedRunResult> {
         // Distinguish the outermost (top-level graph) run from nested
         // control-flow subgraph runs so the phase profiler can attribute
@@ -125,6 +126,11 @@ impl Executor {
         let route_residency = self
             .provider_artifact_readiness
             .route_residency(self.ep.name(), self.instance_id)?;
+        let artifact_use = self.provider_artifact_readiness.acquire_use(
+            self.ep.as_ref(),
+            self.artifact_config,
+            artifact_requirement.as_ref(),
+        )?;
         let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
         let measure_activation_plan = !nested
             && mode == RunMode::Eager
@@ -147,6 +153,7 @@ impl Executor {
             measure_activation_plan,
         );
         let validation = if nested {
+            drop(artifact_use);
             Ok(())
         } else {
             let defer_until_binding_read = !self.graph.outputs.is_empty()
@@ -158,7 +165,17 @@ impl Executor {
                     .iter()
                     .all(|output| external.outputs.contains_key(output))
                 && !route_residency.is_required();
-            self.finish_device_validation(defer_until_binding_read, route_residency)
+            if artifact_use.is_some() {
+                let sync = self.ep.sync();
+                drop(artifact_use);
+                match sync {
+                    Ok(()) => self.finish_device_validation_boundary_after_sync(route_residency),
+                    Err(error) => Err(error.into()),
+                }
+            } else {
+                drop(artifact_use);
+                self.finish_device_validation(defer_until_binding_read, route_residency)
+            }
         };
         if let Some(submission) = validation_submission.as_mut() {
             submission.disarm();
@@ -201,6 +218,13 @@ impl Executor {
         // and for captured replay. The CUDA EP's explicit sync is unconditional,
         // so the latch read observes every kernel from this request.
         self.ep.sync()?;
+        self.finish_device_validation_boundary_after_sync(route_residency)
+    }
+
+    pub(super) fn finish_device_validation_boundary_after_sync(
+        &mut self,
+        route_residency: ExecutorRouteResidency,
+    ) -> Result<()> {
         let flags = match self.pending_device_validation.take() {
             Some(token) => match self.ep.consume_device_validation_error(
                 self.validation_registration

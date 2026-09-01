@@ -106,6 +106,7 @@ fn finalize_artifacts(
         config.generation,
         readiness,
         graph,
+        &[],
     )?;
     assert_eq!(report.executor(), config.executor);
     assert_eq!(report.provider(), config.provider);
@@ -359,18 +360,16 @@ fn compile_qmoe_through_ep(
 
 #[test]
 #[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
-fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation() {
+fn enabled_report_without_finalized_banks_typed_declines_without_install() {
     let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    println!(
-        "\n=== enabled_build_binds_real_producer_and_declines_without_per_bank_reservation ==="
-    );
+    println!("\n=== enabled_report_without_finalized_banks_typed_declines_without_install ===");
     let _environment = ScopedGate::enabled();
     let provider = match offload_provider_or_skip("enabled") {
         Some(p) => p,
         None => return,
     };
 
-    let (graph, node_id, members) = qmoe_graph();
+    let (graph, node_id, _members) = qmoe_graph();
     let executor = fresh_executor();
     let config = artifact_config(&provider, executor);
 
@@ -452,13 +451,12 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
         "terminal structural outcome must latch exactly once"
     );
     let diag = provider.route_residency_diagnostics();
-    // Honest typed decline: real discovery + retention succeeded, but the shipped
-    // shared-reservation residency has no per-bank VMM reservation for the coarse
-    // plan to address, so the seam fail-closes with the precise reason.
+    // Direct provider inspection without the session's exact finalized-bank
+    // descriptors must fail closed before reservation or publication.
     assert_eq!(
         diag.installs(),
         0,
-        "no boundary is installed on the shipped shared-reservation residency"
+        "no boundary is installed without finalized bank descriptors"
     );
     assert_eq!(
         diag.boundaries(),
@@ -470,19 +468,15 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
         .last_install_reason()
         .expect("a decline reason is surfaced to diagnostics");
     assert!(
-        reason.contains("per-bank") && reason.contains("reservation"),
-        "the decline discloses the per-bank-reservation residual: {reason}"
+        reason.contains("no finalized routed expert banks"),
+        "the decline names the missing session-owned descriptors: {reason}"
     );
 
-    // Goal 1: the EP retained the real property-discovered per-bank artifacts.
-    let retained = provider
-        .retained_route_residency_artifacts(executor)
-        .expect("enabled discovery retained the bank artifacts");
-    assert_eq!(retained.len(), 1, "exactly one discovered expert bank");
-    assert_eq!(retained[0].node, node_id, "retained the real bank node id");
-    assert_eq!(
-        retained[0].members, members,
-        "retained the exact fc1/fc2/fc3 member ranges"
+    assert!(
+        provider
+            .retained_route_residency_artifacts(executor)
+            .is_none(),
+        "a rejected inspection publishes no partial bank state"
     );
 }
 
@@ -595,11 +589,13 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
     );
     assert!(matches!(
         finalized.outcome,
-        Some(onnx_runtime_ep_cuda::route_residency::RouteResidencyInstallOutcome::Rejected(
-            onnx_runtime_ep_cuda::route_residency::RouteResidencyBindingReject::NoPerBankReservation {
-                ..
-            }
-        ))
+        Some(
+            onnx_runtime_ep_cuda::route_residency::RouteResidencyInstallOutcome::Rejected(
+                onnx_runtime_ep_cuda::route_residency::RouteResidencyBindingReject::Reservation(
+                    onnx_runtime_ep_cuda::weight_paging::RouteBankReservationReject::NoBanks
+                )
+            )
+        )
     ));
 
     let foreign_drain = artifact_config(&provider, foreign_executor);
@@ -628,9 +624,17 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
     provider
         .drain_executor_artifacts(config.provider, config.executor, config.generation)
         .expect("repeat exact drain is idempotent");
-    let drained = provider.route_residency_executor_status(executor);
-    assert_eq!(drained.drain_calls, 1);
-    assert!(drained.drained);
+    assert!(
+        provider.route_telemetry_sources(executor).is_empty(),
+        "exact repeated drain removes the owner's producer once"
+    );
+    #[cfg(feature = "gpu-tests")]
+    assert!(
+        provider
+            .retired_executor_artifact_generations()
+            .contains(&(executor, config.generation)),
+        "exact repeated drain preserves the generation tombstone"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -707,7 +711,7 @@ fn block_quantized_moe_without_producer_is_terminal_not_pending() {
     assert!(matches!(
         status.outcome,
         Some(onnx_runtime_ep_cuda::route_residency::RouteResidencyInstallOutcome::Rejected(
-            onnx_runtime_ep_cuda::route_residency::RouteResidencyBindingReject::TelemetryProducerUnsupported {
+            onnx_runtime_ep_cuda::route_residency::RouteResidencyBindingReject::UnsupportedBoundary {
                 node,
                 boundary: onnx_runtime_ep_api::LazyWeightBoundary::BlockQuantizedMoe,
             }
@@ -943,6 +947,7 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
             stale_enabled_config.generation,
             ExecutorArtifactReadinessEpoch::new(1),
             &graph,
+            &[],
         )
         .expect_err("a later capability for the same executor identity must fail closed");
     assert!(
@@ -1005,6 +1010,7 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
                         enabled_config.generation,
                         ExecutorArtifactReadinessEpoch::new(2),
                         &graph,
+                        &[],
                     )
                     .expect_err("concurrent mismatched finalization must fail closed");
                 assert!(

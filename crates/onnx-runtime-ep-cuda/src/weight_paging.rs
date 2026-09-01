@@ -18,6 +18,7 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -26,10 +27,11 @@ use std::time::Duration;
 use cudarc::driver::sys;
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
-    ExternalMmapRegion, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary, MmapRegionSource,
-    PagedWeight, WeightHandleError,
+    ExecutorArtifactGeneration, ExecutorArtifactProviderId, ExecutorInstanceId, ExternalMmapRegion,
+    FinalizedExpertBank, FinalizedExpertWeight, LazyDeviceWeightBinder, LazyWeight,
+    LazyWeightBoundary, MmapRegionSource, PagedWeight, WeightHandleError,
 };
-use onnx_runtime_ir::{DataType, DeviceId};
+use onnx_runtime_ir::{DataType, DeviceId, DeviceType, NodeId, ValueId};
 use onnx_runtime_memory_governor::{AllocationReleaseState, Tier, VirtualBacking};
 
 use crate::deferred_release::{
@@ -2782,6 +2784,10 @@ pub struct CudaWeightResidency {
     /// fresh buffer per miss (issue #837). See [`crate::pinned_pool`] for the
     /// fence-safety argument.
     staging_pool: Arc<PinnedStagingPool>,
+    /// Exact executor-owned routed-bank reservations. Each reservation owns one
+    /// dedicated allocator/VA and is removed only by that executor's teardown.
+    route_reservations: Mutex<HashMap<ExecutorInstanceId, Arc<RouteReservationSet>>>,
+    route_retirement_counters: Arc<RouteReservationRetirementCounters>,
     inner: Mutex<ResidencyInner>,
     /// Count of live [`onnx_runtime_ep_api::RoutedResidencyProof`] guards
     /// acquired via [`CudaWeightResidency::acquire_routed_residency`]. Only
@@ -2821,6 +2827,7 @@ pub struct CudaWeightResidency {
 pub struct RoutedResidencyGuard {
     proof: onnx_runtime_ep_api::RoutedResidencyProof,
     residency: Arc<CudaWeightResidency>,
+    _reservation_use: Option<RouteReservationUseGuard>,
 }
 
 impl RoutedResidencyGuard {
@@ -2847,6 +2854,753 @@ impl Drop for RoutedResidencyGuard {
 struct PhysicalAdmission {
     allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
     governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+}
+
+struct RouteWeightReservation {
+    identity: FinalizedExpertWeight,
+    allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+    health: Arc<RouteReservationHealth>,
+    ptr: CUdeviceptr,
+    len: usize,
+}
+
+struct RouteReservationSet {
+    by_key: HashMap<u64, Arc<RouteWeightReservation>>,
+    catalogs: HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+    allocators: HashMap<ValueId, Arc<crate::vmm_allocator::CudaVmmAllocator>>,
+    device_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+    host_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+    groups: Vec<onnx_runtime_ep_api::ExpertWeightGroup>,
+    health: Arc<RouteReservationHealth>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RouteReservationRetirementResources {
+    _allocators: Vec<Arc<crate::vmm_allocator::CudaVmmAllocator>>,
+    _device_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+    _host_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+}
+
+#[doc(hidden)]
+pub struct RouteReservationHealth {
+    identity: Option<RouteReservationIdentity>,
+    lifecycle: AtomicU64,
+    reason: Mutex<Option<String>>,
+    retirement_cleanup: Mutex<Option<Box<dyn RouteReservationRetirementCleanup>>>,
+    retirement_counters: Arc<RouteReservationRetirementCounters>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RouteReservationIdentity {
+    provider: ExecutorArtifactProviderId,
+    executor: ExecutorInstanceId,
+    artifact_generation: ExecutorArtifactGeneration,
+    device_ordinal: u32,
+    reservation_generation: u64,
+}
+
+const ROUTE_HEALTH_POISONED: u64 = 1;
+const ROUTE_HEALTH_TRANSITIONING: u64 = 1 << 1;
+const ROUTE_HEALTH_RETIRING: u64 = 1 << 2;
+const ROUTE_HEALTH_RETIRED: u64 = 1 << 3;
+const ROUTE_HEALTH_USE: u64 = 1 << 4;
+static NEXT_ROUTE_RESERVATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_route_reservation_generation(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+            next.checked_add(1)
+        })
+        .ok()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteReservationRetirementStats {
+    pub retirements_started: u64,
+    pub deferred_cleanups: u64,
+    pub cleanups_scheduled: u64,
+    pub cleanups_executed: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RouteReservationRetirementCounters {
+    retirements_started: AtomicU64,
+    deferred_cleanups: AtomicU64,
+    cleanups_scheduled: AtomicU64,
+    cleanups_executed: AtomicU64,
+}
+
+impl RouteReservationRetirementCounters {
+    fn snapshot(&self) -> RouteReservationRetirementStats {
+        RouteReservationRetirementStats {
+            retirements_started: self.retirements_started.load(Ordering::Acquire),
+            deferred_cleanups: self.deferred_cleanups.load(Ordering::Acquire),
+            cleanups_scheduled: self.cleanups_scheduled.load(Ordering::Acquire),
+            cleanups_executed: self.cleanups_executed.load(Ordering::Acquire),
+        }
+    }
+
+    pub(crate) fn record_cleanup_executed(&self) {
+        self.cleanups_executed.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) trait RouteReservationRetirementCleanup: Send + std::fmt::Debug {
+    /// Transfer cleanup to a non-blocking reclamation authority.
+    ///
+    /// This runs from the final use/transition guard's `Drop`, so it must not
+    /// wait for a thread, stream, condition variable, or externally held guard.
+    fn schedule(self: Box<Self>);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteReservationRetirementStart {
+    Started,
+    AlreadyRetiring,
+    Retired,
+}
+
+pub(crate) struct RouteReservationUseGuard {
+    health: Arc<RouteReservationHealth>,
+}
+
+impl onnx_runtime_ep_api::ExecutorArtifactUseGuard for RouteReservationUseGuard {}
+
+impl Drop for RouteReservationUseGuard {
+    fn drop(&mut self) {
+        self.health
+            .lifecycle
+            .fetch_sub(ROUTE_HEALTH_USE, Ordering::AcqRel);
+        self.health.try_schedule_retirement_cleanup();
+    }
+}
+
+pub(crate) struct RouteReservationTransitionGuard {
+    health: Arc<RouteReservationHealth>,
+    completed: bool,
+}
+
+impl RouteReservationTransitionGuard {
+    pub(crate) fn complete(mut self) {
+        self.completed = true;
+        self.health
+            .lifecycle
+            .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::AcqRel);
+        self.health.try_schedule_retirement_cleanup();
+    }
+
+    pub(crate) fn poison(mut self, reason: String) {
+        self.health.mark_unusable(reason);
+        self.completed = true;
+        self.health
+            .lifecycle
+            .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::Release);
+        self.health.try_schedule_retirement_cleanup();
+    }
+}
+
+impl Drop for RouteReservationTransitionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.health.mark_unusable(
+                "reservation transition authority exited without publishing a terminal outcome"
+                    .to_string(),
+            );
+            self.health
+                .lifecycle
+                .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::Release);
+            self.health.try_schedule_retirement_cleanup();
+        }
+    }
+}
+
+pub(crate) struct RouteReservationRequirement {
+    health: Arc<RouteReservationHealth>,
+    identity: RouteReservationIdentity,
+}
+
+impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for RouteReservationRequirement {
+    fn acquire_use(
+        &self,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>> {
+        self.health
+            .acquire_use_identity(self.identity)
+            .map(|guard| Box::new(guard) as Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>)
+            .map_err(|reason| {
+                onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} CUDA:{} route-bank reservation is unusable \
+                     (generation {}): {reason}; tear down and rebuild the executor before \
+                     dispatch, capture, or replay",
+                    self.identity.executor.get(),
+                    self.identity.device_ordinal,
+                    self.identity.reservation_generation
+                ))
+            })
+    }
+}
+
+impl RouteReservationHealth {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            identity: None,
+            lifecycle: AtomicU64::new(0),
+            reason: Mutex::new(None),
+            retirement_cleanup: Mutex::new(None),
+            retirement_counters: Arc::new(RouteReservationRetirementCounters::default()),
+        })
+    }
+
+    fn new_scoped(
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        artifact_generation: ExecutorArtifactGeneration,
+        device_ordinal: u32,
+        retirement_counters: Arc<RouteReservationRetirementCounters>,
+    ) -> Option<Arc<Self>> {
+        let reservation_generation =
+            next_route_reservation_generation(&NEXT_ROUTE_RESERVATION_GENERATION)?;
+        Some(Arc::new(Self {
+            identity: Some(RouteReservationIdentity {
+                provider,
+                executor,
+                artifact_generation,
+                device_ordinal,
+                reservation_generation,
+            }),
+            lifecycle: AtomicU64::new(0),
+            reason: Mutex::new(None),
+            retirement_cleanup: Mutex::new(None),
+            retirement_counters,
+        }))
+    }
+
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.identity
+            .map(|identity| identity.reservation_generation)
+    }
+
+    pub(crate) fn requirement_state(
+        self: &Arc<Self>,
+    ) -> Result<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>, String> {
+        let identity = self.identity.ok_or_else(|| {
+            "reservation health has no provider/executor/artifact/device/generation identity; \
+             rebuild the executor"
+                .to_string()
+        })?;
+        Ok(Arc::new(RouteReservationRequirement {
+            health: Arc::clone(self),
+            identity,
+        })
+            as Arc<
+                dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState,
+            >)
+    }
+
+    pub(crate) fn mark_unusable(&self, reason: String) {
+        let mut stored = self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.lifecycle.load(Ordering::Acquire) & ROUTE_HEALTH_POISONED == 0 {
+            *stored = Some(reason);
+            self.lifecycle
+                .fetch_or(ROUTE_HEALTH_POISONED, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn ensure_usable(&self) -> Result<(), String> {
+        let state = self.lifecycle.load(Ordering::Acquire);
+        if state & ROUTE_HEALTH_RETIRED != 0 {
+            return Err("reservation is retired and its mappings are no longer launchable".into());
+        }
+        if state & ROUTE_HEALTH_RETIRING != 0 {
+            return Err("reservation teardown is retiring its mappings".into());
+        }
+        if state & ROUTE_HEALTH_POISONED == 0 {
+            return Ok(());
+        }
+        let reason = self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| "reservation health was invalidated".to_string());
+        Err(reason)
+    }
+
+    fn validate_identity(
+        &self,
+        executor: ExecutorInstanceId,
+        device_ordinal: u32,
+        reservation_generation: u64,
+    ) -> Result<RouteReservationIdentity, String> {
+        let Some(identity) = self.identity else {
+            return Err(
+                "reservation health has no provider/executor/artifact/device/generation identity; \
+                 rebuild the executor"
+                    .to_string(),
+            );
+        };
+        if identity.executor != executor
+            || identity.device_ordinal != device_ordinal
+            || identity.reservation_generation != reservation_generation
+        {
+            return Err(format!(
+                "reservation generation {} belongs to executor {} on CUDA:{}, not executor {} on \
+                 CUDA:{} generation {}",
+                identity.reservation_generation,
+                identity.executor.get(),
+                identity.device_ordinal,
+                executor.get(),
+                device_ordinal,
+                reservation_generation
+            ));
+        }
+        Ok(identity)
+    }
+
+    pub(crate) fn validate_artifact_scope(
+        &self,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        artifact_generation: ExecutorArtifactGeneration,
+        device_ordinal: u32,
+    ) -> Result<(), String> {
+        let identity = self.identity.ok_or_else(|| {
+            "reservation health has no provider/executor/artifact/device/generation identity; \
+             rebuild the executor"
+                .to_string()
+        })?;
+        if identity.provider != provider
+            || identity.executor != executor
+            || identity.artifact_generation != artifact_generation
+            || identity.device_ordinal != device_ordinal
+        {
+            return Err(format!(
+                "reservation belongs to provider {} executor {} artifact generation {} on CUDA:{}, \
+                 not provider {} executor {} artifact generation {} on CUDA:{}",
+                identity.provider.get(),
+                identity.executor.get(),
+                identity.artifact_generation.get(),
+                identity.device_ordinal,
+                provider.get(),
+                executor.get(),
+                artifact_generation.get(),
+                device_ordinal,
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn acquire_use(
+        self: &Arc<Self>,
+        executor: ExecutorInstanceId,
+        device_ordinal: u32,
+        reservation_generation: u64,
+    ) -> Result<RouteReservationUseGuard, String> {
+        let identity = self.validate_identity(executor, device_ordinal, reservation_generation)?;
+        self.acquire_use_identity(identity)
+    }
+
+    fn acquire_use_identity(
+        self: &Arc<Self>,
+        identity: RouteReservationIdentity,
+    ) -> Result<RouteReservationUseGuard, String> {
+        if self.identity != Some(identity) {
+            return Err(
+                "baked route-reservation identity no longer matches its health owner".into(),
+            );
+        }
+        loop {
+            let state = self.lifecycle.load(Ordering::Acquire);
+            if state & ROUTE_HEALTH_RETIRED != 0 {
+                return Err(format!(
+                    "reservation generation {} is retired; its mappings cannot be used",
+                    identity.reservation_generation
+                ));
+            }
+            if state & ROUTE_HEALTH_RETIRING != 0 {
+                return Err(format!(
+                    "reservation generation {} is retiring; no new launch may begin",
+                    identity.reservation_generation
+                ));
+            }
+            if state & ROUTE_HEALTH_POISONED != 0 {
+                return Err(format!(
+                    "reservation generation {} is poisoned: {}",
+                    identity.reservation_generation,
+                    self.ensure_usable().unwrap_err()
+                ));
+            }
+            if state & ROUTE_HEALTH_TRANSITIONING != 0 {
+                return Err(format!(
+                    "reservation generation {} is in an atomic group transition; retry after the \
+                     request boundary completes",
+                    identity.reservation_generation
+                ));
+            }
+            let next = state.checked_add(ROUTE_HEALTH_USE).ok_or_else(|| {
+                format!(
+                    "reservation generation {} use counter overflowed",
+                    identity.reservation_generation
+                )
+            })?;
+            if self
+                .lifecycle
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(RouteReservationUseGuard {
+                    health: Arc::clone(self),
+                });
+            }
+        }
+    }
+
+    pub(crate) fn begin_transition(
+        self: &Arc<Self>,
+    ) -> Result<RouteReservationTransitionGuard, String> {
+        match self.lifecycle.compare_exchange(
+            0,
+            ROUTE_HEALTH_TRANSITIONING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(RouteReservationTransitionGuard {
+                health: Arc::clone(self),
+                completed: false,
+            }),
+            Err(state) if state & ROUTE_HEALTH_POISONED != 0 => self
+                .ensure_usable()
+                .map(|_| unreachable!("poisoned reservation unexpectedly reported usable")),
+            Err(state) if state & ROUTE_HEALTH_TRANSITIONING != 0 => {
+                Err("another route-bank group transition is already active".to_string())
+            }
+            Err(state) if state & ROUTE_HEALTH_RETIRED != 0 => {
+                Err("route-bank reservation is retired".to_string())
+            }
+            Err(state) if state & ROUTE_HEALTH_RETIRING != 0 => {
+                Err("route-bank reservation teardown is in progress".to_string())
+            }
+            Err(state) => Err(format!(
+                "{} reservation-backed dispatch/replay lease(s) are still active",
+                state / ROUTE_HEALTH_USE
+            )),
+        }
+    }
+
+    pub(crate) fn begin_retirement(&self) -> RouteReservationRetirementStart {
+        loop {
+            let state = self.lifecycle.load(Ordering::Acquire);
+            if state & ROUTE_HEALTH_RETIRED != 0 {
+                return RouteReservationRetirementStart::Retired;
+            }
+            if state & ROUTE_HEALTH_RETIRING != 0 {
+                return RouteReservationRetirementStart::AlreadyRetiring;
+            }
+            if self
+                .lifecycle
+                .compare_exchange_weak(
+                    state,
+                    state | ROUTE_HEALTH_RETIRING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            self.retirement_counters
+                .retirements_started
+                .fetch_add(1, Ordering::AcqRel);
+            return RouteReservationRetirementStart::Started;
+        }
+    }
+
+    pub(crate) fn install_retirement_cleanup(
+        &self,
+        cleanup: Box<dyn RouteReservationRetirementCleanup>,
+    ) {
+        let state = self.lifecycle.load(Ordering::Acquire);
+        if state / ROUTE_HEALTH_USE != 0 || state & ROUTE_HEALTH_TRANSITIONING != 0 {
+            self.retirement_counters
+                .deferred_cleanups
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        let mut slot = self
+            .retirement_cleanup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_some() {
+            self.mark_unusable(
+                "reservation retirement attempted to install cleanup ownership twice".to_string(),
+            );
+            return;
+        }
+        *slot = Some(cleanup);
+        drop(slot);
+        self.try_schedule_retirement_cleanup();
+    }
+
+    fn try_schedule_retirement_cleanup(&self) {
+        let state = self.lifecycle.load(Ordering::Acquire);
+        if state & ROUTE_HEALTH_RETIRING == 0
+            || state & ROUTE_HEALTH_RETIRED != 0
+            || state / ROUTE_HEALTH_USE != 0
+            || state & ROUTE_HEALTH_TRANSITIONING != 0
+        {
+            return;
+        }
+        let cleanup = {
+            let mut slot = self
+                .retirement_cleanup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = self.lifecycle.load(Ordering::Acquire);
+            if state & ROUTE_HEALTH_RETIRING == 0
+                || state & ROUTE_HEALTH_RETIRED != 0
+                || state / ROUTE_HEALTH_USE != 0
+                || state & ROUTE_HEALTH_TRANSITIONING != 0
+            {
+                return;
+            }
+            slot.take()
+        };
+        let Some(cleanup) = cleanup else {
+            return;
+        };
+        self.retirement_counters
+            .cleanups_scheduled
+            .fetch_add(1, Ordering::AcqRel);
+        cleanup.schedule();
+    }
+
+    pub(crate) fn complete_retirement(&self) {
+        let poisoned = self.lifecycle.load(Ordering::Acquire) & ROUTE_HEALTH_POISONED;
+        self.lifecycle
+            .store(poisoned | ROUTE_HEALTH_RETIRED, Ordering::Release);
+        self.retirement_counters.record_cleanup_executed();
+    }
+
+    pub(crate) fn retirement_status(&self) -> (bool, bool) {
+        let state = self.lifecycle.load(Ordering::Acquire);
+        (
+            state & ROUTE_HEALTH_RETIRING != 0,
+            state & ROUTE_HEALTH_RETIRED != 0,
+        )
+    }
+}
+
+#[derive(Clone)]
+pub struct RouteReservationAuthorities {
+    pub catalogs: HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+    pub allocators: HashMap<ValueId, Arc<crate::vmm_allocator::CudaVmmAllocator>>,
+    pub device_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+    pub host_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+    pub groups: Vec<onnx_runtime_ep_api::ExpertWeightGroup>,
+    pub(crate) health: Arc<RouteReservationHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteBankReservationReject {
+    NoPhysicalAdmission,
+    NoDeferredReleaseQueue,
+    NoBanks,
+    BlockQuantizedMoeUnavailable {
+        node: NodeId,
+    },
+    MissingFinalizedMember {
+        node: NodeId,
+        value: ValueId,
+    },
+    UnexpectedFinalizedMember {
+        node: NodeId,
+        value: ValueId,
+    },
+    DuplicateValue {
+        value: ValueId,
+    },
+    OverlappingExternalRange {
+        first: ValueId,
+        second: ValueId,
+        start: usize,
+        end: usize,
+    },
+    NonPageable {
+        value: ValueId,
+    },
+    IdentityMismatch {
+        value: ValueId,
+        reason: String,
+    },
+    InconsistentExpertCount {
+        node: NodeId,
+    },
+    InvalidDeviceOrdinal {
+        ordinal: i32,
+    },
+    DeviceMismatch {
+        expected: onnx_runtime_memory_governor::DeviceKey,
+        actual: onnx_runtime_memory_governor::DeviceKey,
+    },
+    GranularityMismatch {
+        device: usize,
+        host: usize,
+    },
+    UnalignedExpertRange {
+        value: ValueId,
+        expert: usize,
+        offset: usize,
+        len: usize,
+        granularity: usize,
+    },
+    ExistingReservationMismatch {
+        reason: String,
+    },
+    Materialization {
+        value: ValueId,
+        reason: String,
+    },
+    Reservation(String),
+}
+
+impl std::fmt::Display for RouteBankReservationReject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPhysicalAdmission => {
+                write!(formatter, "weight residency has no VMM physical admission")
+            }
+            Self::NoDeferredReleaseQueue => {
+                write!(
+                    formatter,
+                    "weight residency has no deferred reservation queue"
+                )
+            }
+            Self::NoBanks => write!(formatter, "no finalized routed expert banks"),
+            Self::BlockQuantizedMoeUnavailable { node } => write!(
+                formatter,
+                "BlockQuantizedMoE bank {node:?} has no finalized production telemetry/catalog contract"
+            ),
+            Self::MissingFinalizedMember { node, value } => {
+                write!(
+                    formatter,
+                    "bank {node:?} is missing finalized member {value:?}"
+                )
+            }
+            Self::UnexpectedFinalizedMember { node, value } => write!(
+                formatter,
+                "bank {node:?} contains unexpected finalized member {value:?}"
+            ),
+            Self::DuplicateValue { value } => {
+                write!(
+                    formatter,
+                    "bank value {value:?} appears in more than one group"
+                )
+            }
+            Self::OverlappingExternalRange {
+                first,
+                second,
+                start,
+                end,
+            } => write!(
+                formatter,
+                "bank values {first:?} and {second:?} overlap external bytes {start}..{end}"
+            ),
+            Self::NonPageable { value } => {
+                write!(formatter, "bank value {value:?} is not expert-pageable")
+            }
+            Self::IdentityMismatch { value, reason } => {
+                write!(
+                    formatter,
+                    "bank value {value:?} identity mismatch: {reason}"
+                )
+            }
+            Self::InconsistentExpertCount { node } => {
+                write!(formatter, "bank {node:?} members disagree on expert count")
+            }
+            Self::InvalidDeviceOrdinal { ordinal } => {
+                write!(formatter, "invalid CUDA device ordinal {ordinal}")
+            }
+            Self::DeviceMismatch { expected, actual } => write!(
+                formatter,
+                "route-bank reservation device mismatch: expected {expected:?}, got {actual:?}"
+            ),
+            Self::GranularityMismatch { device, host } => write!(
+                formatter,
+                "device granularity {device} differs from host-NUMA granularity {host}"
+            ),
+            Self::UnalignedExpertRange {
+                value,
+                expert,
+                offset,
+                len,
+                granularity,
+            } => write!(
+                formatter,
+                "bank value {value:?} expert {expert} range {offset}..{} is not aligned to VMM granularity {granularity}",
+                offset.saturating_add(*len)
+            ),
+            Self::ExistingReservationMismatch { reason } => {
+                write!(formatter, "existing route reservation mismatch: {reason}")
+            }
+            Self::Materialization { value, reason } => {
+                write!(
+                    formatter,
+                    "bank value {value:?} materialization failed: {reason}"
+                )
+            }
+            Self::Reservation(reason) => write!(formatter, "route reservation failed: {reason}"),
+        }
+    }
+}
+
+fn validate_existing_route_reservations(
+    set: &RouteReservationSet,
+    banks: &[FinalizedExpertBank],
+    device_ordinal: i32,
+) -> Result<(), String> {
+    let groups: Vec<_> = banks.iter().map(|bank| bank.group.clone()).collect();
+    if set.groups != groups {
+        return Err("expert-bank topology differs from the installed reservation set".into());
+    }
+    let member_count = banks.iter().map(|bank| bank.members.len()).sum::<usize>();
+    if set.by_key.len() != member_count {
+        return Err(format!(
+            "installed reservation has {} values, finalized banks have {member_count}",
+            set.by_key.len()
+        ));
+    }
+    let expected_device = onnx_runtime_memory_governor::DeviceKey::device(device_ordinal as u32);
+    for member in banks.iter().flat_map(|bank| &bank.members) {
+        let Some(existing) = set.by_key.get(&(member.value.0 as u64)) else {
+            return Err(format!(
+                "finalized value {:?} has no installed reservation",
+                member.value
+            ));
+        };
+        if existing.identity.value != member.value
+            || existing.identity.external_path != member.external_path
+            || existing.identity.weight.boundary != member.weight.boundary
+            || existing.identity.weight.dtype != member.weight.dtype
+            || existing.identity.weight.shape != member.weight.shape
+            || existing.identity.weight.regions != member.weight.regions
+            || existing.identity.catalog != member.catalog
+            || existing.len != member.catalog.tensor_len()
+        {
+            return Err(format!(
+                "finalized value {:?} differs from its installed property identity",
+                member.value
+            ));
+        }
+        if existing.allocator.device_key() != expected_device {
+            return Err(format!(
+                "finalized value {:?} reservation is on {:?}, expected {expected_device:?}",
+                member.value,
+                existing.allocator.device_key()
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct ResidencyInner {
@@ -3307,6 +4061,8 @@ impl CudaWeightResidency {
             context_scope: OnceLock::new(),
             context_terminated: AtomicBool::new(false),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
+            route_reservations: Mutex::new(HashMap::new()),
+            route_retirement_counters: Arc::new(RouteReservationRetirementCounters::default()),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(budget_bytes),
                 lease: None,
@@ -3374,6 +4130,8 @@ impl CudaWeightResidency {
             context_scope: OnceLock::new(),
             context_terminated: AtomicBool::new(false),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
+            route_reservations: Mutex::new(HashMap::new()),
+            route_retirement_counters: Arc::new(RouteReservationRetirementCounters::default()),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(lease.bytes()),
                 lease: Some(lease),
@@ -3538,15 +4296,553 @@ impl CudaWeightResidency {
     /// the disclosed Slice-7E residual; when a later slice admits routed banks
     /// into dedicated reservations this method returns `Some` and the same seam
     /// installs a real binding.
+    pub fn install_route_bank_reservations(
+        &self,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        artifact_generation: ExecutorArtifactGeneration,
+        banks: &[FinalizedExpertBank],
+        device_ordinal: i32,
+    ) -> Result<RouteReservationAuthorities, RouteBankReservationReject> {
+        let physical = self
+            .physical
+            .get()
+            .ok_or(RouteBankReservationReject::NoPhysicalAdmission)?;
+        let queue = self
+            .queue
+            .as_ref()
+            .ok_or(RouteBankReservationReject::NoDeferredReleaseQueue)?;
+        if banks.is_empty() {
+            return Err(RouteBankReservationReject::NoBanks);
+        }
+        if device_ordinal < 0 {
+            return Err(RouteBankReservationReject::InvalidDeviceOrdinal {
+                ordinal: device_ordinal,
+            });
+        }
+        let expected_device =
+            onnx_runtime_memory_governor::DeviceKey::device(device_ordinal as u32);
+        let actual_device = physical.allocator.device_key();
+        if actual_device != expected_device {
+            return Err(RouteBankReservationReject::DeviceMismatch {
+                expected: expected_device,
+                actual: actual_device,
+            });
+        }
+
+        // This mutex is also the install gate. Holding it through validation,
+        // reservation and publication prevents concurrent first resolved
+        // specializations from double-reserving the same executor.
+        let mut installed = self
+            .route_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = installed.get(&executor) {
+            existing
+                .health
+                .validate_artifact_scope(
+                    provider,
+                    executor,
+                    artifact_generation,
+                    device_ordinal as u32,
+                )
+                .map_err(
+                    |reason| RouteBankReservationReject::ExistingReservationMismatch { reason },
+                )?;
+            validate_existing_route_reservations(existing, banks, device_ordinal).map_err(
+                |reason| RouteBankReservationReject::ExistingReservationMismatch { reason },
+            )?;
+            return Ok(Self::authorities_from_set(existing));
+        }
+
+        let host_numa = onnx_runtime_cuda_memory::capability::host_numa_capability(device_ordinal)
+            .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
+        let device_location = onnx_runtime_cuda_memory::virtual_memory::PhysicalLocation::Device {
+            ordinal: device_ordinal,
+        };
+        let host_location = onnx_runtime_cuda_memory::virtual_memory::PhysicalLocation::HostNuma {
+            node: host_numa.host_numa_id,
+        };
+        let device_granularity =
+            onnx_runtime_cuda_memory::virtual_memory::allocation_granularity_for_location(
+                device_location,
+            );
+        let host_granularity =
+            onnx_runtime_cuda_memory::virtual_memory::allocation_granularity_for_location(
+                host_location,
+            );
+        if device_granularity != host_granularity {
+            return Err(RouteBankReservationReject::GranularityMismatch {
+                device: device_granularity,
+                host: host_granularity,
+            });
+        }
+        let granularity = device_granularity;
+
+        let mut seen = HashSet::new();
+        let mut external_ranges = Vec::<(PathBuf, usize, usize, ValueId)>::new();
+        for bank in banks {
+            if bank.group.boundary == LazyWeightBoundary::BlockQuantizedMoe {
+                return Err(RouteBankReservationReject::BlockQuantizedMoeUnavailable {
+                    node: bank.group.node,
+                });
+            }
+            if bank.group.boundary != LazyWeightBoundary::QMoe {
+                return Err(RouteBankReservationReject::IdentityMismatch {
+                    value: bank
+                        .group
+                        .members
+                        .first()
+                        .copied()
+                        .unwrap_or(ValueId(u32::MAX)),
+                    reason: "only the production QMoE boundary has routed-bank telemetry".into(),
+                });
+            }
+            let members: HashMap<_, _> = bank
+                .members
+                .iter()
+                .map(|member| (member.value, member))
+                .collect();
+            if members.len() != bank.members.len() {
+                let value = bank
+                    .members
+                    .iter()
+                    .find(|candidate| {
+                        bank.members
+                            .iter()
+                            .filter(|other| other.value == candidate.value)
+                            .count()
+                            > 1
+                    })
+                    .map(|member| member.value)
+                    .unwrap_or(ValueId(u32::MAX));
+                return Err(RouteBankReservationReject::DuplicateValue { value });
+            }
+            for value in &bank.group.members {
+                if !members.contains_key(value) {
+                    return Err(RouteBankReservationReject::MissingFinalizedMember {
+                        node: bank.group.node,
+                        value: *value,
+                    });
+                }
+            }
+            for member in &bank.members {
+                if !bank.group.contains(member.value) {
+                    return Err(RouteBankReservationReject::UnexpectedFinalizedMember {
+                        node: bank.group.node,
+                        value: member.value,
+                    });
+                }
+                if !seen.insert(member.value) {
+                    return Err(RouteBankReservationReject::DuplicateValue {
+                        value: member.value,
+                    });
+                }
+                if !member.catalog.is_pageable() {
+                    return Err(RouteBankReservationReject::NonPageable {
+                        value: member.value,
+                    });
+                }
+                if member.catalog.path() != Some(member.external_path.as_path()) {
+                    return Err(RouteBankReservationReject::IdentityMismatch {
+                        value: member.value,
+                        reason:
+                            "pageable bank catalog path differs from the finalized external property"
+                                .into(),
+                    });
+                }
+                let region = match member.weight.regions.as_slice() {
+                    [region] => region,
+                    _ => {
+                        return Err(RouteBankReservationReject::IdentityMismatch {
+                            value: member.value,
+                            reason: "coarse bank members require one contiguous mmap identity"
+                                .into(),
+                        });
+                    }
+                };
+                let expected_shape = vec![
+                    member.catalog.layout().experts,
+                    member.catalog.layout().rows_per_expert,
+                    member.catalog.layout().storage_elements_per_row,
+                ];
+                let endpoint = region.offset.checked_add(region.len).ok_or_else(|| {
+                    RouteBankReservationReject::IdentityMismatch {
+                        value: member.value,
+                        reason: "mmap range endpoint overflow".into(),
+                    }
+                })?;
+                for (path, start, end, value) in &external_ranges {
+                    if path == &member.external_path && region.offset < *end && *start < endpoint {
+                        return Err(RouteBankReservationReject::OverlappingExternalRange {
+                            first: *value,
+                            second: member.value,
+                            start: region.offset.max(*start),
+                            end: endpoint.min(*end),
+                        });
+                    }
+                }
+                if endpoint > isize::MAX as usize
+                    || region.mapping_id == 0
+                    || member.weight.boundary != bank.group.boundary
+                    || member.weight.dtype != member.catalog.dtype()
+                    || member.weight.shape != expected_shape
+                    || region.offset != member.catalog.tensor_offset()
+                    || region.len != member.catalog.tensor_len()
+                    || member.weight.region_bytes_len() != member.catalog.tensor_len()
+                    || region.len % granularity != 0
+                {
+                    return Err(RouteBankReservationReject::IdentityMismatch {
+                        value: member.value,
+                        reason:
+                            "boundary/format/shape/mmap mapping and catalog byte properties disagree"
+                                .into(),
+                    });
+                }
+                external_ranges.push((
+                    member.external_path.clone(),
+                    region.offset,
+                    endpoint,
+                    member.value,
+                ));
+                let mut prior_end = 0usize;
+                for expert in 0..member.catalog.layout().experts {
+                    let range = member.catalog.relative_range(expert).ok_or_else(|| {
+                        RouteBankReservationReject::IdentityMismatch {
+                            value: member.value,
+                            reason: format!("expert {expert} has no exact relative byte range"),
+                        }
+                    })?;
+                    let len = range.end.saturating_sub(range.start);
+                    if range.start != prior_end
+                        || range.end > member.catalog.tensor_len()
+                        || range.start % granularity != 0
+                        || len == 0
+                        || len % granularity != 0
+                    {
+                        return Err(RouteBankReservationReject::UnalignedExpertRange {
+                            value: member.value,
+                            expert,
+                            offset: range.start,
+                            len,
+                            granularity,
+                        });
+                    }
+                    prior_end = range.end;
+                }
+                if prior_end != member.catalog.tensor_len() {
+                    return Err(RouteBankReservationReject::IdentityMismatch {
+                        value: member.value,
+                        reason: "expert ranges do not exactly partition the tensor byte range"
+                            .into(),
+                    });
+                }
+            }
+            let mut expert_counts = bank
+                .members
+                .iter()
+                .map(|member| member.catalog.layout().experts);
+            if let Some(first) = expert_counts.next()
+                && expert_counts.any(|experts| experts != first)
+            {
+                return Err(RouteBankReservationReject::InconsistentExpertCount {
+                    node: bank.group.node,
+                });
+            }
+        }
+
+        // Resolve every host artifact before reserving VA or charging either
+        // governor tier. A materializer failure therefore cannot leave a
+        // partially installed bank.
+        let materialized = banks
+            .iter()
+            .flat_map(|bank| &bank.members)
+            .map(|member| {
+                let resident = member.weight.materialize().map_err(|error| {
+                    RouteBankReservationReject::Materialization {
+                        value: member.value,
+                        reason: error.to_string(),
+                    }
+                })?;
+                if resident.dtype != member.weight.dtype
+                    || resident.shape != member.weight.shape
+                    || resident.bytes().len() != member.catalog.tensor_len()
+                {
+                    return Err(RouteBankReservationReject::Materialization {
+                        value: member.value,
+                        reason: "resolved bytes differ from finalized dtype/shape/catalog".into(),
+                    });
+                }
+                Ok((member.clone(), resident))
+            })
+            .collect::<Result<Vec<_>, RouteBankReservationReject>>()?;
+
+        let context = self.runtime.cuda_context();
+        let role = onnx_runtime_memory_governor::MemoryRole::Weights;
+        let holder_seed = executor.get().wrapping_mul(2);
+        let device_pool =
+            onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool::new_isolated_at_location(
+                Arc::clone(&context),
+                device_ordinal,
+                device_location,
+                0,
+                physical.governor.as_ref(),
+                onnx_runtime_memory_governor::HolderId::new(holder_seed.wrapping_add(0x1810)),
+                role,
+            )
+            .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
+        let host_pool =
+            onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool::new_isolated_at_location(
+                Arc::clone(&context),
+                device_ordinal,
+                host_location,
+                0,
+                physical.governor.as_ref(),
+                onnx_runtime_memory_governor::HolderId::new(holder_seed.wrapping_add(0x1811)),
+                role,
+            )
+            .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
+        let reservation_queue: Arc<
+            dyn onnx_runtime_cuda_memory::virtual_memory::DeferredReservationQueue,
+        > = Arc::clone(queue)
+            as Arc<dyn onnx_runtime_cuda_memory::virtual_memory::DeferredReservationQueue>;
+
+        let health = RouteReservationHealth::new_scoped(
+            provider,
+            executor,
+            artifact_generation,
+            device_ordinal as u32,
+            Arc::clone(&self.route_retirement_counters),
+        )
+        .ok_or_else(|| {
+            RouteBankReservationReject::Reservation(
+                "route-reservation generation identity exhausted".to_string(),
+            )
+        })?;
+        let mut by_key = HashMap::new();
+        let mut catalogs = HashMap::new();
+        let mut allocators = HashMap::new();
+        for (member, resident) in materialized {
+            let allocator = Arc::new(
+                onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator::new_with_physical_pool_and_reservation_queue(
+                    Arc::clone(&context),
+                    expected_device,
+                    device_ordinal,
+                    member.catalog.tensor_len(),
+                    physical.governor.as_ref(),
+                    onnx_runtime_memory_governor::HolderId::new(holder_seed.wrapping_add(0x1810)),
+                    role,
+                    Arc::clone(&device_pool),
+                    Arc::clone(&reservation_queue),
+                )
+                .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?,
+            );
+            let full_range = 0..member.catalog.tensor_len();
+            let ptr = allocator
+                .allocate_committed(
+                    member.catalog.tensor_len(),
+                    granularity,
+                    std::slice::from_ref(&full_range),
+                )
+                .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
+            let mut staging = self
+                .runtime
+                .alloc_pinned(member.catalog.tensor_len())
+                .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
+            staging.as_mut_slice().copy_from_slice(resident.bytes());
+            // SAFETY: `ptr` is the exact committed tensor reservation and the
+            // pinned source remains live until the copy stream is synchronized.
+            unsafe {
+                self.runtime
+                    .htod_async(staging.as_slice(), ptr.as_ptr() as CUdeviceptr)
+            }
+            .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
+            self.runtime
+                .sync_copy_stream()
+                .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
+            let reservation = Arc::new(RouteWeightReservation {
+                identity: member.clone(),
+                allocator: Arc::clone(&allocator),
+                health: Arc::clone(&health),
+                ptr: ptr.as_ptr() as CUdeviceptr,
+                len: member.catalog.tensor_len(),
+            });
+            catalogs.insert(member.value, member.catalog.clone());
+            allocators.insert(member.value, allocator);
+            by_key.insert(member.value.0 as u64, reservation);
+        }
+
+        let set = Arc::new(RouteReservationSet {
+            by_key,
+            catalogs,
+            allocators,
+            device_pool,
+            host_pool,
+            groups: banks.iter().map(|bank| bank.group.clone()).collect(),
+            health,
+        });
+        installed.insert(executor, Arc::clone(&set));
+        Ok(Self::authorities_from_set(&set))
+    }
+
+    fn authorities_from_set(set: &RouteReservationSet) -> RouteReservationAuthorities {
+        RouteReservationAuthorities {
+            catalogs: set.catalogs.clone(),
+            allocators: set.allocators.clone(),
+            device_pool: Arc::clone(&set.device_pool),
+            host_pool: Arc::clone(&set.host_pool),
+            groups: set.groups.clone(),
+            health: Arc::clone(&set.health),
+        }
+    }
+
+    pub fn route_reservation_authorities(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Option<RouteReservationAuthorities> {
+        let installed = self
+            .route_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        installed
+            .get(&executor)
+            .map(|set| Self::authorities_from_set(set))
+    }
+
+    pub(crate) fn take_route_bank_reservations(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Option<RouteReservationRetirementResources> {
+        let removed = self
+            .route_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&executor);
+        removed.map(|set| RouteReservationRetirementResources {
+            _allocators: set.allocators.values().cloned().collect(),
+            _device_pool: Arc::clone(&set.device_pool),
+            _host_pool: Arc::clone(&set.host_pool),
+        })
+    }
+
+    pub fn remove_route_bank_reservations(&self, executor: ExecutorInstanceId) -> bool {
+        self.take_route_bank_reservations(executor).is_some()
+    }
+
+    pub fn route_reservation_count(&self) -> usize {
+        self.route_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    pub(crate) fn route_reservation_resource_stats(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Option<(usize, u64)> {
+        self.route_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&executor)
+            .map(|set| {
+                (
+                    set.allocators.len(),
+                    set.by_key
+                        .values()
+                        .map(|reservation| reservation.len as u64)
+                        .sum(),
+                )
+            })
+    }
+
+    pub fn route_reservation_retirement_stats(&self) -> RouteReservationRetirementStats {
+        self.route_retirement_counters.snapshot()
+    }
+
+    pub(crate) fn route_weight_page(
+        &self,
+        executor: ExecutorInstanceId,
+        key: u64,
+        weight: &LazyWeight,
+        device: DeviceId,
+    ) -> Result<Option<PagedWeight>, WeightHandleError> {
+        let reservation = {
+            let installed = self
+                .route_reservations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            installed
+                .get(&executor)
+                .and_then(|set| set.by_key.get(&key))
+                .cloned()
+        };
+        let Some(reservation) = reservation else {
+            return Ok(None);
+        };
+        reservation.health.ensure_usable().map_err(|reason| {
+            WeightHandleError::DeviceBinding(format!(
+                "route-bank value key {key} is unavailable because its executor-scoped \
+                 reservation was invalidated after a failed atomic residency transition: \
+                 {reason}; tear down and rebuild the executor"
+            ))
+        })?;
+        if weight.boundary != reservation.identity.weight.boundary
+            || weight.dtype != reservation.identity.weight.dtype
+            || weight.shape != reservation.identity.weight.shape
+            || weight.regions != reservation.identity.weight.regions
+            || weight.region_bytes_len() != reservation.len
+        {
+            return Err(WeightHandleError::DeviceBinding(format!(
+                "route-bank value key {key} no longer matches its finalized property identity"
+            )));
+        }
+        let reservation_device = reservation.allocator.device_key();
+        let requested_device = onnx_runtime_memory_governor::DeviceKey::device(device.index);
+        if device.device_type != DeviceType::Cuda || requested_device != reservation_device {
+            return Err(WeightHandleError::DeviceBinding(format!(
+                "route-bank value key {key} requested on {requested_device:?}, reservation is on \
+                 {reservation_device:?}"
+            )));
+        }
+        let ptr = reservation.ptr;
+        let keep_alive: Arc<dyn std::any::Any + Send + Sync> = reservation;
+        Ok(Some(PagedWeight::new(
+            ptr as *const std::ffi::c_void,
+            device,
+            weight.region_bytes_len(),
+            keep_alive,
+        )))
+    }
+
+    /// The executor-scoped dedicated VMM reservation for one finalized bank
+    /// member. Graph-local ValueIds cannot collide across sibling executors.
     pub fn coarse_route_bank_reservation(
         &self,
-        _value: onnx_runtime_ir::ValueId,
+        executor: ExecutorInstanceId,
+        value: onnx_runtime_ir::ValueId,
     ) -> Option<Arc<crate::vmm_allocator::CudaVmmAllocator>> {
-        // Inspect the real admission: even once offloading has admitted weights,
-        // the single shared reservation is not a per-bank reservation, so this
-        // is `None` by construction on the shipped layout.
-        let _shared = self.physical.get()?;
-        None
+        self.route_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&executor)?
+            .allocators
+            .get(&value)
+            .cloned()
+    }
+
+    pub(crate) fn route_reservation_health(
+        &self,
+        executor: ExecutorInstanceId,
+        value: ValueId,
+    ) -> Option<Arc<RouteReservationHealth>> {
+        let installed = self
+            .route_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let set = installed.get(&executor)?;
+        set.allocators
+            .contains_key(&value)
+            .then(|| Arc::clone(&set.health))
     }
 
     /// #1810 Slice 5 — Apply a [`ResidencyPlan`] at the model-load coarse
@@ -3656,7 +4952,29 @@ impl CudaWeightResidency {
         RoutedResidencyGuard {
             proof,
             residency: Arc::clone(self),
+            _reservation_use: None,
         }
+    }
+
+    pub(crate) fn acquire_route_reservation_use(
+        self: &Arc<Self>,
+        executor: ExecutorInstanceId,
+        device_ordinal: u32,
+        requirement: onnx_runtime_ep_api::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+        health: Arc<RouteReservationHealth>,
+    ) -> Result<RoutedResidencyGuard, String> {
+        let generation = health.generation().ok_or_else(|| {
+            "route reservation use requires an executor/device/generation identity".to_string()
+        })?;
+        let reservation_use = health.acquire_use(executor, device_ordinal, generation)?;
+        let proof = onnx_runtime_ep_api::prove_routed_residency(requirement, catalog);
+        self.routed_guards_active.fetch_add(1, Ordering::SeqCst);
+        Ok(RoutedResidencyGuard {
+            proof,
+            residency: Arc::clone(self),
+            _reservation_use: Some(reservation_use),
+        })
     }
 
     /// Execute an accepted [`onnx_runtime_ep_api::ResidencyResizePlan`].
@@ -6460,6 +7778,308 @@ impl ResidencyInner {
 mod tests {
     use super::*;
     use crate::test_support::EnvVarGuard;
+
+    #[derive(Debug)]
+    struct CountingRetirementCleanup {
+        runs: Arc<AtomicU64>,
+        health: std::sync::Weak<RouteReservationHealth>,
+    }
+
+    impl RouteReservationRetirementCleanup for CountingRetirementCleanup {
+        fn schedule(self: Box<Self>) {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if let Some(health) = self.health.upgrade() {
+                health.complete_retirement();
+            }
+        }
+    }
+
+    fn scoped_health(
+        executor: ExecutorInstanceId,
+        device: u32,
+    ) -> (
+        Arc<RouteReservationHealth>,
+        Arc<RouteReservationRetirementCounters>,
+    ) {
+        let counters = Arc::new(RouteReservationRetirementCounters::default());
+        (
+            RouteReservationHealth::new_scoped(
+                ExecutorArtifactProviderId::from_raw(1),
+                executor,
+                ExecutorArtifactGeneration::from_raw(1),
+                device,
+                Arc::clone(&counters),
+            )
+            .expect("test route generation"),
+            counters,
+        )
+    }
+
+    fn fresh_executor() -> ExecutorInstanceId {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        ExecutorInstanceId::from_raw(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[test]
+    fn route_reservation_generation_exhaustion_never_wraps_or_reuses_identity() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            next_route_reservation_generation(&counter),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(next_route_reservation_generation(&counter), None);
+        assert_eq!(next_route_reservation_generation(&counter), None);
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn route_reservation_lifecycle_linearizes_use_transition_and_poison() {
+        let executor = fresh_executor();
+        let (health, _) = scoped_health(executor, 3);
+        let generation = health.generation().expect("scoped generation");
+
+        let use_guard = health
+            .acquire_use(executor, 3, generation)
+            .expect("exact owner acquires use");
+        let blocked = health
+            .begin_transition()
+            .err()
+            .expect("active use must block transition");
+        assert!(blocked.contains("dispatch/replay lease"));
+        drop(use_guard);
+
+        let transition = health
+            .begin_transition()
+            .expect("transition starts after use completes");
+        let blocked = health
+            .acquire_use(executor, 3, generation)
+            .err()
+            .expect("transition must block a new use");
+        assert!(blocked.contains("atomic group transition"));
+        transition.poison("incomplete logical expert group".to_string());
+
+        let poisoned = health
+            .acquire_use(executor, 3, generation)
+            .err()
+            .expect("poison is irreversible");
+        assert!(poisoned.contains(&format!("generation {generation}")));
+        assert!(poisoned.contains("incomplete logical expert group"));
+    }
+
+    #[test]
+    fn route_reservation_lifecycle_rejects_sibling_and_device_aliases() {
+        let owner = fresh_executor();
+        let sibling = fresh_executor();
+        let (health, _) = scoped_health(owner, 1);
+        let generation = health.generation().expect("scoped generation");
+
+        let sibling_error = health
+            .acquire_use(sibling, 1, generation)
+            .err()
+            .expect("sibling executor must not borrow owner's generation");
+        assert!(sibling_error.contains(&format!("executor {}", owner.get())));
+        assert!(sibling_error.contains(&format!("not executor {}", sibling.get())));
+
+        let device_error = health
+            .acquire_use(owner, 2, generation)
+            .err()
+            .expect("wrong device must not borrow owner's generation");
+        assert!(device_error.contains("CUDA:1"));
+        assert!(device_error.contains("CUDA:2"));
+
+        let generation_error = health
+            .acquire_use(owner, 1, generation + 1)
+            .err()
+            .expect("stale generation must not borrow a replacement reservation");
+        assert!(generation_error.contains(&format!("generation {generation}")));
+        assert!(generation_error.contains(&format!("generation {}", generation + 1)));
+    }
+
+    #[test]
+    fn route_reservation_requirement_rejects_foreign_provider_and_artifact_generation() {
+        let executor = fresh_executor();
+        let (health, _) = scoped_health(executor, 2);
+        let provider = ExecutorArtifactProviderId::from_raw(1);
+        let generation = ExecutorArtifactGeneration::from_raw(1);
+        health
+            .validate_artifact_scope(provider, executor, generation, 2)
+            .expect("exact private session scope");
+
+        let foreign_provider = health
+            .validate_artifact_scope(
+                ExecutorArtifactProviderId::from_raw(2),
+                executor,
+                generation,
+                2,
+            )
+            .expect_err("foreign provider cannot retain another owner's requirement");
+        assert!(foreign_provider.contains("provider 1"));
+        assert!(foreign_provider.contains("not provider 2"));
+
+        let stale_generation = health
+            .validate_artifact_scope(
+                provider,
+                executor,
+                ExecutorArtifactGeneration::from_raw(2),
+                2,
+            )
+            .expect_err("stale artifact generation cannot retain a replacement reservation");
+        assert!(stale_generation.contains("artifact generation 1"));
+        assert!(stale_generation.contains("artifact generation 2"));
+    }
+
+    #[test]
+    fn route_reservation_retirement_returns_with_public_holder_and_cleans_on_last_release() {
+        let executor = fresh_executor();
+        let (health, counters) = scoped_health(executor, 0);
+        let requirement = health
+            .requirement_state()
+            .expect("retained requirement state");
+        let holder = requirement.acquire_use().expect("pre-retirement holder");
+        let cleanups = Arc::new(AtomicU64::new(0));
+        let teardown_health = Arc::clone(&health);
+        let teardown_cleanups = Arc::clone(&cleanups);
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            assert_eq!(
+                teardown_health.begin_retirement(),
+                RouteReservationRetirementStart::Started
+            );
+            teardown_health.install_retirement_cleanup(Box::new(CountingRetirementCleanup {
+                runs: teardown_cleanups,
+                health: Arc::downgrade(&teardown_health),
+            }));
+            returned_tx.send(()).unwrap();
+        });
+        returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retirement must not wait for a public use guard");
+
+        let rejection = requirement
+            .acquire_use()
+            .err()
+            .expect("retirement rejects later public acquisition");
+        assert!(rejection.to_string().contains("retiring"));
+        assert_eq!(
+            cleanups.load(Ordering::SeqCst),
+            0,
+            "cleanup must remain quarantined while the original lease is active"
+        );
+
+        let replay_launches = AtomicU64::new(0);
+        if requirement.acquire_use().is_ok() {
+            replay_launches.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(
+            replay_launches.load(Ordering::SeqCst),
+            0,
+            "a replay racing retirement must not reach its launch"
+        );
+
+        drop(holder);
+        teardown.join().unwrap();
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+        let retired = requirement
+            .acquire_use()
+            .err()
+            .expect("completed teardown remains a requirement, but is retired");
+        assert!(retired.to_string().contains("retired"));
+        assert_eq!(
+            counters.snapshot(),
+            RouteReservationRetirementStats {
+                retirements_started: 1,
+                deferred_cleanups: 1,
+                cleanups_scheduled: 1,
+                cleanups_executed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn route_reservation_stalled_transition_defers_and_releases_cleanup_once() {
+        let executor = fresh_executor();
+        let (health, counters) = scoped_health(executor, 0);
+        let transition = health.begin_transition().expect("transition authority");
+        let cleanups = Arc::new(AtomicU64::new(0));
+        assert_eq!(
+            health.begin_retirement(),
+            RouteReservationRetirementStart::Started
+        );
+        health.install_retirement_cleanup(Box::new(CountingRetirementCleanup {
+            runs: Arc::clone(&cleanups),
+            health: Arc::downgrade(&health),
+        }));
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+        transition.complete();
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.snapshot().deferred_cleanups, 1);
+        assert_eq!(counters.snapshot().cleanups_scheduled, 1);
+    }
+
+    #[test]
+    fn route_reservation_acquire_racing_retirement_never_launches_after_unmap() {
+        for _ in 0..64 {
+            let executor = fresh_executor();
+            let (health, _) = scoped_health(executor, 0);
+            let generation = health.generation().expect("scoped generation");
+            let gate = Arc::new(std::sync::Barrier::new(3));
+            let launches = Arc::new(AtomicU64::new(0));
+            let unmaps = Arc::new(AtomicU64::new(0));
+
+            let use_health = Arc::clone(&health);
+            let use_gate = Arc::clone(&gate);
+            let use_launches = Arc::clone(&launches);
+            let use_unmaps = Arc::clone(&unmaps);
+            let acquire = std::thread::spawn(move || {
+                use_gate.wait();
+                match use_health.acquire_use(executor, 0, generation) {
+                    Ok(guard) => {
+                        assert_eq!(
+                            use_unmaps.load(Ordering::SeqCst),
+                            0,
+                            "a valid pre-retirement lease must launch before unmap"
+                        );
+                        use_launches.fetch_add(1, Ordering::SeqCst);
+                        drop(guard);
+                        true
+                    }
+                    Err(error) => {
+                        assert!(error.contains("retiring") || error.contains("retired"));
+                        false
+                    }
+                }
+            });
+
+            let retire_health = Arc::clone(&health);
+            let retire_gate = Arc::clone(&gate);
+            let retire_unmaps = Arc::clone(&unmaps);
+            let retire = std::thread::spawn(move || {
+                retire_gate.wait();
+                assert_eq!(
+                    retire_health.begin_retirement(),
+                    RouteReservationRetirementStart::Started
+                );
+                retire_health.install_retirement_cleanup(Box::new(CountingRetirementCleanup {
+                    runs: retire_unmaps,
+                    health: Arc::downgrade(&retire_health),
+                }));
+            });
+
+            gate.wait();
+            let acquired = acquire.join().unwrap();
+            retire.join().unwrap();
+            assert_eq!(unmaps.load(Ordering::SeqCst), 1);
+            assert_eq!(launches.load(Ordering::SeqCst), u64::from(acquired));
+            assert!(
+                health
+                    .acquire_use(executor, 0, generation)
+                    .err()
+                    .expect("completed retirement rejects acquisition")
+                    .contains("retired")
+            );
+        }
+    }
 
     #[test]
     fn slot_operation_state_never_reopens_after_poison() {

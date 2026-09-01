@@ -622,6 +622,40 @@ pub(super) fn plan_default_residency(
     )
 }
 
+fn finalized_expert_banks(
+    graph: &Graph,
+    handles: &HashMap<ValueId, WeightHandle>,
+    catalogs: &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+) -> Vec<FinalizedExpertBank> {
+    expert_weight_groups(graph)
+        .into_iter()
+        .map(|group| {
+            let members = group
+                .members
+                .iter()
+                .filter_map(|value| {
+                    let WeightHandle::Lazy(weight) = handles.get(value)? else {
+                        return None;
+                    };
+                    let catalog = catalogs.get(value)?;
+                    let onnx_runtime_ir::WeightRef::External { path, .. } =
+                        graph.initializers.get(value)?
+                    else {
+                        return None;
+                    };
+                    Some(FinalizedExpertWeight {
+                        value: *value,
+                        external_path: path.clone(),
+                        weight: weight.clone(),
+                        catalog: catalog.clone(),
+                    })
+                })
+                .collect();
+            FinalizedExpertBank { group, members }
+        })
+        .collect()
+}
+
 /// Test/measurement seam: build a plan with an arbitrary
 /// [`onnx_runtime_ep_api::ResidencyPolicy`], to prove the boundary is
 /// substitutable without wiring a second production call site.
@@ -968,6 +1002,13 @@ impl Executor {
             }
             plan
         };
+        let finalized_expert_banks = if artifact_transaction.config().route_residency()
+            == ExecutorRouteResidencyConfig::Enabled
+        {
+            finalized_expert_banks(&graph, &weight_handles, &expert_region_candidates)
+        } else {
+            Vec::new()
+        };
 
         let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
             Self::materialize_initializers(&graph, &weights, ep.as_ref(), &weight_handles)?;
@@ -1012,6 +1053,7 @@ impl Executor {
             pending_device_validation: None,
             weight_handles,
             expert_region_candidates,
+            finalized_expert_banks,
             residency_plan,
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
@@ -2363,6 +2405,7 @@ impl Executor {
             self.ep.as_ref(),
             self.artifact_config,
             &self.graph,
+            &self.finalized_expert_banks,
         )
     }
 

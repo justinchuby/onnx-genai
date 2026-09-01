@@ -53,10 +53,11 @@ use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
     ExecutionProvider, ExecutorArtifactGeneration, ExecutorArtifactPending, ExecutorArtifactPolicy,
     ExecutorArtifactReadinessEpoch, ExecutorArtifactState, ExecutorInstanceId,
-    ExecutorRouteResidencyConfig, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput,
-    KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline,
-    TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation,
-    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
+    ExecutorRouteResidencyConfig, ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight,
+    Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
+    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
+    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    expert_weight_groups, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -970,22 +971,6 @@ impl Drop for Executor {
                  dispatch_elided={dispatch_elided}"
             );
         }
-        // Drain only this executor's provider-owned artifacts before its
-        // buffers/kernels are torn down. Sibling/MTP executors may share the same
-        // EP and must retain their own producers and boundary state.
-        if self.artifact_teardown_armed {
-            self.artifact_teardown_armed = false;
-            if let Err(error) =
-                drain_executor_artifacts_panic_safe(self.ep.as_ref(), self.artifact_config)
-            {
-                eprintln!(
-                    "[onnx-runtime-session] executor {} generation {} provider-artifact teardown \
-                     failed: {error}",
-                    self.artifact_config.executor().get(),
-                    self.artifact_config.generation().get(),
-                );
-            }
-        }
         // Evict the global weight-transpose cache to prevent address-reuse
         // staleness: if a subsequently loaded model's mmap recycles a virtual
         // address, the cache must not serve the old model's transposed weights.
@@ -1048,6 +1033,7 @@ impl Drop for Executor {
                 }
             }
             cap.device_graph_signature = None;
+            cap.provider_artifact_requirement = CapturedProviderArtifactRequirement::Uncaptured;
         }
         if graphs_reset && let Err(error) = self.ep.retire_owned_device_graphs(self.graph_owner) {
             safe_to_release = false;
@@ -1055,6 +1041,24 @@ impl Drop for Executor {
                 "[onnx-runtime-session] executor drop could not retire graph owner {}: {error}",
                 self.graph_owner.get()
             );
+        }
+        // All executor work is synchronized and every baked graph is retired
+        // before reservation teardown begins. The provider's retirement
+        // authority excludes concurrent external drain/use races and transfers
+        // externally held leases to deferred reclamation; Drop never waits for
+        // another owner to release one.
+        if self.artifact_teardown_armed {
+            self.artifact_teardown_armed = false;
+            if let Err(error) =
+                drain_executor_artifacts_panic_safe(self.ep.as_ref(), self.artifact_config)
+            {
+                eprintln!(
+                    "[onnx-runtime-session] executor {} generation {} provider-artifact teardown \
+                     failed: {error}",
+                    self.artifact_config.executor().get(),
+                    self.artifact_config.generation().get(),
+                );
+            }
         }
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {

@@ -123,6 +123,18 @@ enum TestArtifactFinalization {
     ReadyPendingFailedReady,
 }
 
+struct TestArtifactUseGuard;
+
+impl onnx_runtime_ep_api::ExecutorArtifactUseGuard for TestArtifactUseGuard {}
+
+struct TestArtifactRequirement;
+
+impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for TestArtifactRequirement {
+    fn acquire_use(&self) -> EpResult<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>> {
+        Ok(Box::new(TestArtifactUseGuard))
+    }
+}
+
 struct HostDownloadCountingEp {
     cpu: CpuExecutionProvider,
     host_downloads: Arc<AtomicUsize>,
@@ -359,6 +371,7 @@ impl ExecutionProvider for HostDownloadCountingEp {
         generation: ExecutorArtifactGeneration,
         readiness: ExecutorArtifactReadinessEpoch,
         graph: &Graph,
+        _banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
     ) -> EpResult<ExecutorArtifactReport> {
         let report = |state| {
             ExecutorArtifactReport::observed(
@@ -455,6 +468,22 @@ impl ExecutionProvider for HostDownloadCountingEp {
                 }))
             }
         }
+    }
+
+    fn executor_artifact_requirement(
+        &self,
+        _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        _executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+    ) -> EpResult<Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>> {
+        Ok(matches!(
+            self.artifact_finalization,
+            TestArtifactFinalization::Required
+        )
+        .then(|| {
+            Arc::new(TestArtifactRequirement)
+                as Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>
+        }))
     }
 
     fn consume_route_residency_at_boundary_for_executor(

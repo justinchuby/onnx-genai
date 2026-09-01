@@ -84,6 +84,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(any(test, feature = "gpu-tests"))]
+use std::sync::Barrier;
 
 use onnx_runtime_cuda_memory::release::MappedBlock;
 use onnx_runtime_cuda_memory::virtual_memory::{PhysicalHandlePool, PhysicalLocation};
@@ -103,6 +105,39 @@ use crate::runtime::CudaRuntime;
 /// Named `..._ENABLE` (not `..._PROFILE`): this is a hard on/off gate for
 /// whether the plan is *applied at all*, not a diagnostics/profiling toggle.
 pub const COARSE_RESIDENCY_ENABLE_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_COARSE_RESIDENCY_ENABLE";
+
+/// Deterministic test-only rendezvous immediately before the rollback
+/// safe-point recheck. The worker announces that a real forward member
+/// failure occurred, then waits while the test introduces a concurrent
+/// safe-point blocker.
+#[cfg(any(test, feature = "gpu-tests"))]
+pub struct RollbackSafePointInterlock {
+    reached: Barrier,
+    resume: Barrier,
+}
+
+#[cfg(any(test, feature = "gpu-tests"))]
+impl RollbackSafePointInterlock {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            reached: Barrier::new(2),
+            resume: Barrier::new(2),
+        })
+    }
+
+    pub fn wait_until_forward_failure(&self) {
+        self.reached.wait();
+    }
+
+    pub fn resume_rollback(&self) {
+        self.resume.wait();
+    }
+
+    fn block_before_rollback(&self) {
+        self.reached.wait();
+        self.resume.wait();
+    }
+}
 
 /// Deprecated alias for [`COARSE_RESIDENCY_ENABLE_ENV`]. Kept so any external
 /// reference to the old name still resolves; new code should use the
@@ -132,6 +167,16 @@ pub fn coarse_residency_profile_enabled() -> bool {
 struct CommittedRange {
     offset: usize,
     len: usize,
+}
+
+/// Exact byte range that remains on HOST_NUMA when a boundary application
+/// returns. This is the authoritative transition journal consumed by the
+/// route-residency owner for teardown and poison decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostResidentRange {
+    pub value: ValueId,
+    pub offset: usize,
+    pub len: usize,
 }
 
 /// Per-value transition bookkeeping accumulated during the forward pass.
@@ -240,6 +285,53 @@ pub struct BoundaryApplicationOutcome {
     /// list here means real data is in a state this outcome describes
     /// precisely — never just `all_ok = false`.
     pub rollback_failures: Vec<RollbackFailure>,
+    /// Exact ranges still backed by HOST_NUMA at return. Empty after a
+    /// complete rollback; non-empty after an incomplete rollback even when
+    /// `values_touched` would historically have hidden the partial move.
+    pub host_resident_ranges: Vec<HostResidentRange>,
+}
+
+fn append_unpoisoned_suffix(
+    ranges: &mut Vec<HostResidentRange>,
+    value: ValueId,
+    range: &CommittedRange,
+    committed_count: usize,
+    granularity: usize,
+    poisoned_range: Option<(usize, usize)>,
+) {
+    let committed_bytes = committed_count.saturating_mul(granularity).min(range.len);
+    let start = range.offset.saturating_add(committed_bytes);
+    let end = range.offset.saturating_add(range.len);
+    if start >= end {
+        return;
+    }
+    let Some((poison_offset, poison_len)) = poisoned_range else {
+        ranges.push(HostResidentRange {
+            value,
+            offset: start,
+            len: end - start,
+        });
+        return;
+    };
+    let poison_end = poison_offset.saturating_add(poison_len);
+    if poison_offset > start {
+        let prefix_end = poison_offset.min(end);
+        if prefix_end > start {
+            ranges.push(HostResidentRange {
+                value,
+                offset: start,
+                len: prefix_end - start,
+            });
+        }
+    }
+    let suffix_start = poison_end.max(start);
+    if suffix_start < end {
+        ranges.push(HostResidentRange {
+            value,
+            offset: suffix_start,
+            len: end - suffix_start,
+        });
+    }
 }
 
 /// Validate that `allocator` and both pools are bound to `device_ordinal`.
@@ -393,6 +485,8 @@ pub fn apply_residency_plan_at_boundary(
         expert_groups,
         #[cfg(any(test, feature = "gpu-tests"))]
         None,
+        #[cfg(any(test, feature = "gpu-tests"))]
+        None,
     )
 }
 
@@ -424,6 +518,8 @@ pub(crate) fn apply_resolved_residency_plan_at_boundary(
         device_count,
         device_ordinal,
         expert_groups,
+        #[cfg(any(test, feature = "gpu-tests"))]
+        None,
         #[cfg(any(test, feature = "gpu-tests"))]
         None,
     )
@@ -468,12 +564,13 @@ pub fn apply_residency_plan_at_boundary_with_phase8_faults(
         device_ordinal,
         expert_groups,
         Some(phase8_faults),
+        None,
     )
 }
 
 #[cfg(any(test, feature = "gpu-tests"))]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_resolved_residency_plan_at_boundary_with_phase8_faults(
+pub fn apply_residency_plan_at_boundary_with_rollback_interlock(
     runtime: &Arc<CudaRuntime>,
     residency: &crate::weight_paging::CudaWeightResidency,
     plan: &ResidencyPlan,
@@ -485,6 +582,7 @@ pub(crate) fn apply_resolved_residency_plan_at_boundary_with_phase8_faults(
     device_ordinal: i32,
     expert_groups: &[ExpertWeightGroup],
     phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
+    rollback_interlock: Arc<RollbackSafePointInterlock>,
 ) -> BoundaryApplicationOutcome {
     apply_residency_plan_at_boundary_inner(
         true,
@@ -499,6 +597,7 @@ pub(crate) fn apply_resolved_residency_plan_at_boundary_with_phase8_faults(
         device_ordinal,
         expert_groups,
         Some(phase8_faults),
+        Some(rollback_interlock),
     )
 }
 
@@ -517,6 +616,9 @@ fn apply_residency_plan_at_boundary_inner(
     expert_groups: &[ExpertWeightGroup],
     #[cfg(any(test, feature = "gpu-tests"))] phase8_faults: Option<
         HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
+    >,
+    #[cfg(any(test, feature = "gpu-tests"))] rollback_interlock: Option<
+        Arc<RollbackSafePointInterlock>,
     >,
 ) -> BoundaryApplicationOutcome {
     let mut outcome = BoundaryApplicationOutcome {
@@ -772,7 +874,7 @@ fn apply_residency_plan_at_boundary_inner(
     // deterministic order (guaranteed since `eligible` was built by iterating
     // `plan.ordered_values()`).
     let mut progress: HashMap<ValueId, ValueProgress> = HashMap::new();
-    let mut fatal_hit = false;
+    let mut rollback_required = false;
     'outer: for e in &eligible {
         let value = e.value;
         outcome.hot_expert_count += e.hot_count;
@@ -836,12 +938,16 @@ fn apply_residency_plan_at_boundary_inner(
                     outcome
                         .per_value_fallbacks
                         .push((value, format!("transition rejected: {reason}")));
+                    rollback_required = true;
+                    break 'outer;
                 }
                 TransitionOutcome::RolledBack { fault } => {
                     outcome.failure_count += 1;
                     outcome
                         .per_value_fallbacks
                         .push((value, format!("transition rolled back: {fault:?}")));
+                    rollback_required = true;
+                    break 'outer;
                 }
                 TransitionOutcome::Fatal {
                     transition_fault,
@@ -850,6 +956,13 @@ fn apply_residency_plan_at_boundary_inner(
                     poisoned_range,
                     ..
                 } => {
+                    let committed_len = committed_count.saturating_mul(granularity).min(*len);
+                    if committed_len > 0 {
+                        entry.committed.push(CommittedRange {
+                            offset: *offset,
+                            len: committed_len,
+                        });
+                    }
                     outcome.quarantined.push((value, quarantined));
                     outcome
                         .fatal_progress
@@ -857,39 +970,52 @@ fn apply_residency_plan_at_boundary_inner(
                     outcome
                         .per_value_fallbacks
                         .push((value, format!("fatal transition: {transition_fault:?}")));
-                    fatal_hit = true;
+                    rollback_required = true;
                     break 'outer;
                 }
             }
         }
     }
 
-    // Every value that has at least one committed range and did NOT hit a
-    // fatal transition anywhere in the plan is provisionally touched. If a
-    // fatal occurred anywhere, ALL committed ranges (including this value's
-    // own already-committed ranges) go through the rollback loop below, which
-    // updates `committed_values`/`values_touched` precisely.
-    if !fatal_hit {
-        for (value, prog) in &progress {
-            if !prog.committed.is_empty() {
-                outcome.values_touched += 1;
-                outcome.committed_values.push(*value);
-            }
+    // 6. Rollback loop on any member failure: revert every committed RANGE
+    // (not value) recorded in `progress`, across every value that has any.
+    // A logical expert group is therefore never left split merely because the
+    // failing member's own transition had no side effects.
+    if rollback_required {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        if let Some(interlock) = rollback_interlock {
+            interlock.block_before_rollback();
         }
-    }
-
-    // 6. Rollback loop on any Fatal: revert every committed RANGE (not
-    // value) recorded in `progress`, across every value that has any —
-    // including the same value whose later range hit the Fatal, and
-    // including values earlier in plan order that already fully committed.
-    if fatal_hit {
         let recheck_sp = residency.resize_safe_point(device_count);
         let rollback_sp = match verify_safe_point(recheck_sp) {
             Ok(v) => v,
             Err(reason) => {
                 outcome.fallback_reason = Some(format!(
-                    "fatal transition + safe-point lost during rollback: {reason}"
+                    "transition failure + safe-point lost during rollback: {reason}"
                 ));
+                for (&value, prog) in &progress {
+                    outcome
+                        .host_resident_ranges
+                        .extend(prog.committed.iter().map(|range| HostResidentRange {
+                            value,
+                            offset: range.offset,
+                            len: range.len,
+                        }));
+                }
+                outcome
+                    .host_resident_ranges
+                    .sort_by_key(|range| (range.value.0, range.offset, range.len));
+                outcome.committed_values = outcome
+                    .host_resident_ranges
+                    .iter()
+                    .map(|range| range.value)
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                outcome
+                    .committed_values
+                    .sort_unstable_by_key(|value| value.0);
+                outcome.values_touched = outcome.committed_values.len();
                 return outcome;
             }
         };
@@ -943,6 +1069,11 @@ fn apply_residency_plan_at_boundary_inner(
                     TransitionOutcome::Committed { .. } => {}
                     TransitionOutcome::Rejected { reason } => {
                         all_ok = false;
+                        outcome.host_resident_ranges.push(HostResidentRange {
+                            value: *value,
+                            offset: range.offset,
+                            len: range.len,
+                        });
                         outcome.rollback_failures.push(RollbackFailure {
                             value: *value,
                             range: (range.offset, range.len),
@@ -954,6 +1085,11 @@ fn apply_residency_plan_at_boundary_inner(
                     }
                     TransitionOutcome::RolledBack { fault } => {
                         all_ok = false;
+                        outcome.host_resident_ranges.push(HostResidentRange {
+                            value: *value,
+                            offset: range.offset,
+                            len: range.len,
+                        });
                         outcome.rollback_failures.push(RollbackFailure {
                             value: *value,
                             range: (range.offset, range.len),
@@ -971,6 +1107,14 @@ fn apply_residency_plan_at_boundary_inner(
                         ..
                     } => {
                         all_ok = false;
+                        append_unpoisoned_suffix(
+                            &mut outcome.host_resident_ranges,
+                            *value,
+                            range,
+                            committed_count,
+                            granularity,
+                            poisoned_range,
+                        );
                         outcome.quarantined.push((*value, quarantined.clone()));
                         outcome.rollback_failures.push(RollbackFailure {
                             value: *value,
@@ -988,10 +1132,35 @@ fn apply_residency_plan_at_boundary_inner(
             }
         }
         if outcome.fallback_reason.is_none() {
-            outcome.fallback_reason = Some("fatal transition; rollback attempted".to_string());
+            outcome.fallback_reason =
+                Some("transition failure; atomic rollback attempted".to_string());
+        }
+    } else {
+        for (&value, prog) in &progress {
+            outcome
+                .host_resident_ranges
+                .extend(prog.committed.iter().map(|range| HostResidentRange {
+                    value,
+                    offset: range.offset,
+                    len: range.len,
+                }));
         }
     }
 
+    outcome
+        .host_resident_ranges
+        .sort_by_key(|range| (range.value.0, range.offset, range.len));
+    outcome.committed_values = outcome
+        .host_resident_ranges
+        .iter()
+        .map(|range| range.value)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    outcome
+        .committed_values
+        .sort_unstable_by_key(|value| value.0);
+    outcome.values_touched = outcome.committed_values.len();
     outcome
 }
 

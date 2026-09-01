@@ -73,8 +73,8 @@ use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
 use crate::release::{MappedBlock, SpanReleaseReport, block_bytes};
 use crate::virtual_memory::{
-    CudaVirtualBacking, PhysicalHandlePool, PhysicalHandlePoolStats, RangeDecommit,
-    SharedPrefixReservation,
+    CudaVirtualBacking, PhysicalHandlePool, PhysicalHandlePoolStats, PhysicalLocation,
+    RangeDecommit, SharedPrefixReservation,
 };
 use cudarc::driver::CudaContext;
 
@@ -816,6 +816,7 @@ struct VmmConstruction {
     holder: HolderId,
     role: MemoryRole,
     pool_bytes: Option<usize>,
+    physical_pool: Option<Arc<PhysicalHandlePool>>,
     teardown_synchronizer: Option<crate::virtual_memory::TeardownSynchronizer>,
     reservation_queue: Option<Arc<dyn crate::virtual_memory::DeferredReservationQueue>>,
 }
@@ -878,6 +879,7 @@ impl CudaVmmAllocator {
                 holder,
                 role,
                 pool_bytes: None,
+                physical_pool: None,
                 teardown_synchronizer: None,
                 reservation_queue: None,
             },
@@ -910,6 +912,7 @@ impl CudaVmmAllocator {
                 holder,
                 role,
                 pool_bytes: physical_handle_pool_bytes(),
+                physical_pool: None,
                 teardown_synchronizer: None,
                 reservation_queue: None,
             },
@@ -940,6 +943,7 @@ impl CudaVmmAllocator {
                 holder,
                 role,
                 pool_bytes: physical_handle_pool_bytes().or(default_pool_bytes),
+                physical_pool: None,
                 teardown_synchronizer: Some(teardown_synchronizer),
                 reservation_queue: None,
             },
@@ -977,6 +981,7 @@ impl CudaVmmAllocator {
                 holder,
                 role,
                 pool_bytes: physical_handle_pool_bytes().or(default_pool_bytes),
+                physical_pool: None,
                 teardown_synchronizer: None,
                 reservation_queue: Some(reservation_queue),
             },
@@ -1056,6 +1061,7 @@ impl CudaVmmAllocator {
                 holder,
                 role,
                 pool_bytes: physical_handle_pool_bytes(),
+                physical_pool: None,
                 teardown_synchronizer: None,
                 reservation_queue: None,
             },
@@ -1084,6 +1090,7 @@ impl CudaVmmAllocator {
                 holder,
                 role,
                 pool_bytes: physical_handle_pool_bytes().or(default_pool_bytes),
+                physical_pool: None,
                 teardown_synchronizer: Some(teardown_synchronizer),
                 reservation_queue: None,
             },
@@ -1114,6 +1121,38 @@ impl CudaVmmAllocator {
                 holder,
                 role,
                 pool_bytes: physical_handle_pool_bytes().or(default_pool_bytes),
+                physical_pool: None,
+                teardown_synchronizer: None,
+                reservation_queue: Some(reservation_queue),
+            },
+            governor,
+        )
+    }
+
+    /// Construct a governed reservation over an existing authority-owned
+    /// device pool.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_physical_pool_and_reservation_queue(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        governor: &dyn MemoryGovernor,
+        holder: HolderId,
+        role: MemoryRole,
+        physical_pool: Arc<PhysicalHandlePool>,
+        reservation_queue: Arc<dyn crate::virtual_memory::DeferredReservationQueue>,
+    ) -> Result<Self, MemoryError> {
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: None,
+                physical_pool: Some(physical_pool),
                 teardown_synchronizer: None,
                 reservation_queue: Some(reservation_queue),
             },
@@ -1133,10 +1172,33 @@ impl CudaVmmAllocator {
             holder,
             role,
             pool_bytes,
+            physical_pool,
             teardown_synchronizer,
             reservation_queue,
         } = construction;
-        let backing = if let Some(pool_bytes) = pool_bytes {
+        let backing = if let Some(pool) = physical_pool {
+            if pool.authority() != governor.authority_id() {
+                return Err(MemoryError::InvalidRequest {
+                    tier: Tier::Device.name(),
+                    requested: 0,
+                    reason: "the supplied physical pool belongs to a different memory authority",
+                });
+            }
+            if pool.device_ordinal_pub() != device_ordinal
+                || pool.location()
+                    != (PhysicalLocation::Device {
+                        ordinal: device_ordinal,
+                    })
+                || device != DeviceKey::device(device_ordinal as u32)
+            {
+                return Err(MemoryError::InvalidRequest {
+                    tier: Tier::Device.name(),
+                    requested: capacity as u64,
+                    reason: "the supplied physical pool does not match the allocator device",
+                });
+            }
+            CudaVirtualBacking::with_physical_pool(pool)
+        } else if let Some(pool_bytes) = pool_bytes {
             let pool = PhysicalHandlePool::get_or_create(
                 context,
                 device_ordinal,

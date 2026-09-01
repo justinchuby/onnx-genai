@@ -154,6 +154,59 @@ struct DeferredValidationState {
     owners: HashMap<onnx_runtime_ep_api::DeviceValidationOwner, Option<(u64, u32)>>,
 }
 
+struct TestArtifactUseGuard;
+
+impl onnx_runtime_ep_api::ExecutorArtifactUseGuard for TestArtifactUseGuard {}
+
+struct TestArtifactRequirement;
+
+impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for TestArtifactRequirement {
+    fn acquire_use(
+        &self,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>> {
+        Ok(Box::new(TestArtifactUseGuard))
+    }
+}
+
+#[test]
+fn baked_requirement_rejects_another_private_session_generation() {
+    let policy = ExecutorArtifactPolicy::new(
+        onnx_runtime_ep_api::ExecutorArtifactProviderId::from_raw(17),
+        onnx_runtime_ir::DeviceId::cuda(0),
+        ExecutorRouteResidencyConfig::Enabled,
+    );
+    let executor = issue_executor_instance_id().expect("first executor identity");
+    let first = ExecutorArtifactConfig::issue(policy, executor).expect("first artifact generation");
+    let second =
+        ExecutorArtifactConfig::issue(policy, executor).expect("second artifact generation");
+    let requirement = ProviderArtifactRequirement::new(first, Arc::new(TestArtifactRequirement));
+
+    drop(
+        requirement
+            .acquire_use(first)
+            .expect("exact baked generation acquires"),
+    );
+    let error = match requirement.acquire_use(second) {
+        Ok(_) => panic!("another generation cannot reuse the baked requirement"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("baked provider-artifact requirement")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&first.generation().get().to_string())
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&second.generation().get().to_string())
+    );
+}
+
 impl DeferredValidationEp {
     fn new() -> Self {
         let mut cpu = CpuExecutionProvider::new();
@@ -497,6 +550,7 @@ impl ExecutionProvider for DeferredValidationEp {
         generation: ExecutorArtifactGeneration,
         readiness: ExecutorArtifactReadinessEpoch,
         _graph: &Graph,
+        _banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
     ) -> onnx_runtime_ep_api::Result<ExecutorArtifactReport> {
         if self
             .return_foreign_artifact_finalization
@@ -529,6 +583,23 @@ impl ExecutionProvider for DeferredValidationEp {
         *self.artifact_finalization_cache.lock().unwrap() = Some(report.clone());
         Ok(report)
     }
+
+    fn executor_artifact_requirement(
+        &self,
+        _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        _executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+    ) -> onnx_runtime_ep_api::Result<
+        Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>,
+    > {
+        Ok(self
+            .route_boundary_required
+            .load(Ordering::Relaxed)
+            .then(|| {
+                Arc::new(TestArtifactRequirement)
+                    as Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>
+            }))
+    }
 }
 
 #[test]
@@ -547,7 +618,7 @@ fn route_residency_finalization_rejects_foreign_capability() {
     let mut readiness = ProviderArtifactReadiness::default();
 
     let error = readiness
-        .finalize_if_needed(&ep, config, &Graph::new())
+        .finalize_if_needed(&ep, config, &Graph::new(), &[])
         .expect_err("a provider cannot resolve another executor's route boundary");
     assert!(
         error
@@ -614,7 +685,7 @@ fn disabled_artifact_config_rejects_required_finalization_without_publication() 
     let mut readiness = ProviderArtifactReadiness::default();
 
     let error = readiness
-        .finalize_if_needed(&ep, config, &Graph::new())
+        .finalize_if_needed(&ep, config, &Graph::new(), &[])
         .expect_err("Disabled cannot accept a Required finalization");
     assert!(
         error
@@ -639,14 +710,14 @@ fn stale_finalization_epoch_replay_fails_closed() {
     .expect("issue private executor artifact configuration");
     let mut readiness = ProviderArtifactReadiness::default();
     readiness
-        .finalize_if_needed(&ep, config, &Graph::new())
+        .finalize_if_needed(&ep, config, &Graph::new(), &[])
         .expect("initial exact-generation finalization");
 
     readiness.advance_to(ExecutorArtifactReadinessEpoch::new(1));
     ep.replay_artifact_finalization
         .store(true, Ordering::Relaxed);
     let error = readiness
-        .finalize_if_needed(&ep, config, &Graph::new())
+        .finalize_if_needed(&ep, config, &Graph::new(), &[])
         .expect_err("a finalization from the previous epoch cannot be replayed");
     assert!(
         error
@@ -8584,9 +8655,22 @@ impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
         generation: ExecutorArtifactGeneration,
         readiness: onnx_runtime_ep_api::ExecutorArtifactReadinessEpoch,
         graph: &Graph,
+        banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
     ) -> onnx_runtime_ep_api::Result<ExecutorArtifactReport> {
         self.inner
-            .inspect_executor_artifacts(provider, executor, generation, readiness, graph)
+            .inspect_executor_artifacts(provider, executor, generation, readiness, graph, banks)
+    }
+
+    fn executor_artifact_requirement(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+    ) -> onnx_runtime_ep_api::Result<
+        Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>,
+    > {
+        self.inner
+            .executor_artifact_requirement(provider, executor, generation)
     }
 
     fn drain_executor_artifacts(
@@ -9079,6 +9163,7 @@ impl ExecutionProvider for BuildTransactionProbeEp {
         generation: ExecutorArtifactGeneration,
         readiness: onnx_runtime_ep_api::ExecutorArtifactReadinessEpoch,
         _graph: &Graph,
+        _banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
     ) -> onnx_runtime_ep_api::Result<ExecutorArtifactReport> {
         match self.finalization {
             BuildProbeFinalization::Fail => Err(EpError::KernelFailed(

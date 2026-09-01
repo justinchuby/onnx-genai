@@ -58,9 +58,11 @@ use onnx_runtime_ep_cuda::kernels::expert_route_telemetry::{
 };
 use onnx_runtime_ep_cuda::route_residency::{
     RouteResidencyBoundary, RouteResidencyInstallOutcome, RouteTelemetrySource,
-    build_route_residency_boundary,
+    build_route_residency_boundaries,
 };
-use onnx_runtime_ep_cuda::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
+use onnx_runtime_ep_cuda::weight_paging::{
+    CudaWeightResidency, DeviceOffloadPolicy, RouteReservationHealth,
+};
 use onnx_runtime_ir::{DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape};
 use onnx_runtime_loader::{
     ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog,
@@ -150,42 +152,12 @@ static GPU_SERIAL: Mutex<()> = Mutex::new(());
 #[cfg(not(feature = "gpu-tests"))]
 trait RouteResidencyGpuTestSupport {
     fn install_route_residency_boundary(&self, boundary: Arc<RouteResidencyBoundary>);
-    fn try_install_route_residency_binding(
-        &self,
-        graph: &Graph,
-        sources: &HashMap<NodeId, Arc<dyn RouteTelemetrySource>>,
-        catalogs: HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
-        allocators: HashMap<ValueId, Arc<CudaVmmAllocator>>,
-        device_pool: Arc<PhysicalHandlePool>,
-        host_pool: Arc<PhysicalHandlePool>,
-        expected_request: u32,
-        initial_epoch: u32,
-    ) -> RouteResidencyInstallOutcome;
-    fn drain_route_residency_boundary(&self);
     fn consume_route_residency_at_boundary(&self) -> Result<()>;
 }
 
 #[cfg(not(feature = "gpu-tests"))]
 impl RouteResidencyGpuTestSupport for CudaExecutionProvider {
     fn install_route_residency_boundary(&self, _boundary: Arc<RouteResidencyBoundary>) {
-        panic!("route-residency GPU test support requires feature `gpu-tests`")
-    }
-
-    fn try_install_route_residency_binding(
-        &self,
-        _graph: &Graph,
-        _sources: &HashMap<NodeId, Arc<dyn RouteTelemetrySource>>,
-        _catalogs: HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
-        _allocators: HashMap<ValueId, Arc<CudaVmmAllocator>>,
-        _device_pool: Arc<PhysicalHandlePool>,
-        _host_pool: Arc<PhysicalHandlePool>,
-        _expected_request: u32,
-        _initial_epoch: u32,
-    ) -> RouteResidencyInstallOutcome {
-        panic!("route-residency GPU test support requires feature `gpu-tests`")
-    }
-
-    fn drain_route_residency_boundary(&self) {
         panic!("route-residency GPU test support requires feature `gpu-tests`")
     }
 
@@ -472,6 +444,7 @@ fn boundary_disabled_gate_is_structural_no_op() {
         runtime.ordinal(),
         1,
         Vec::new(),
+        RouteReservationHealth::new(),
     );
     provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -603,6 +576,7 @@ fn boundary_applies_group_hot_set_and_advances_window() {
         runtime.ordinal(),
         1,
         groups,
+        RouteReservationHealth::new(),
     );
     provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -732,6 +706,7 @@ fn boundary_unsafe_point_rejects_before_consume_and_reset() {
             runtime.ordinal(),
             1,
             Vec::new(),
+            RouteReservationHealth::new(),
         );
         provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -787,6 +762,7 @@ fn boundary_unsafe_point_rejects_before_consume_and_reset() {
             runtime.ordinal(),
             1,
             Vec::new(),
+            RouteReservationHealth::new(),
         );
         provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -915,6 +891,7 @@ fn boundary_defective_windows_fail_closed() {
             device,
             initial_epoch,
             Vec::new(),
+            RouteReservationHealth::new(),
         );
         provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -1035,6 +1012,7 @@ fn boundary_injected_fault_rolls_back_through_caller() {
         runtime.ordinal(),
         1,
         Vec::new(),
+        RouteReservationHealth::new(),
     );
     provider.install_route_residency_boundary(Arc::new(boundary));
 
@@ -1085,7 +1063,7 @@ fn boundary_injected_fault_rolls_back_through_caller() {
 // (`CudaExecutionProvider::try_install_route_residency_binding`), so the merged
 // live caller has a production binding when the feature is enabled.
 //
-// These tests never call `build_route_residency_boundary`'s inner helper
+// These tests never call `build_route_residency_boundaries`' inner helper
 // directly for the reachability proof: they build a shape-faithful QMoE graph,
 // let discovery find the bank identities, install through the EP, then drive
 // the same trait method the executor calls — asserting the binding is actually
@@ -1213,7 +1191,7 @@ fn wire_two_bank_artifacts(
 // Slice 7D Test 1: the production builder assembles a *firing* binding purely
 // from graph-property discovery. Build a shape-faithful two-bank QMoE graph,
 // let `expert_weight_groups` discover the bank identities, construct the
-// binding with `build_route_residency_boundary`, install it through the EP, and
+// binding with `build_route_residency_boundaries`, install it through the EP, and
 // drive the executor's trait method: the routed union transitions both
 // discovered members atomically, the window advances once, the next boundary is
 // empty, and draining removes the binding so no further boundary work occurs.
@@ -1266,12 +1244,13 @@ fn builder_assembles_firing_binding_from_graph_banks() {
 
     // The production builder: no op/name allowlist — it consumes the discovered
     // group and the EP's existing catalog/allocator/pool authorities.
-    let binding = build_route_residency_boundary(
+    let mut bindings = build_route_residency_boundaries(
         &graph,
         Arc::clone(&residency),
         &sources,
-        catalogs,
-        allocators,
+        &catalogs,
+        &allocators,
+        RouteReservationHealth::new(),
         Arc::clone(&pools.device_pool),
         Arc::clone(&pools.host_pool),
         1,
@@ -1281,6 +1260,8 @@ fn builder_assembles_firing_binding_from_graph_banks() {
         1,
     )
     .expect("builder must assemble a binding from a valid two-bank graph");
+    assert_eq!(bindings.len(), 1);
+    let binding = bindings.remove(0);
     assert_eq!(
         binding.bank_value_count(),
         2,
@@ -1599,12 +1580,13 @@ fn boundary_host_overhead_on_vs_off() {
         Some(p) => p,
         None => return,
     };
-    let binding = build_route_residency_boundary(
+    let mut bindings = build_route_residency_boundaries(
         &graph,
         residency,
         &sources,
-        catalogs,
-        allocators,
+        &catalogs,
+        &allocators,
+        RouteReservationHealth::new(),
         Arc::clone(&pools.device_pool),
         Arc::clone(&pools.host_pool),
         1,
@@ -1614,6 +1596,8 @@ fn boundary_host_overhead_on_vs_off() {
         1,
     )
     .expect("binding");
+    assert_eq!(bindings.len(), 1);
+    let binding = bindings.remove(0);
     provider.install_route_residency_boundary(Arc::new(binding));
 
     let sample = |gate_enabled: bool| -> f64 {

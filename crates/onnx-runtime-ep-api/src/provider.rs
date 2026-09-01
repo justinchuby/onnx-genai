@@ -439,6 +439,22 @@ pub struct DeviceValidationRegistration {
     state: Box<dyn Any + Send + Sync>,
 }
 
+/// Opaque lease proving provider-owned executor artifacts are safe to use.
+///
+/// Providers with mutable reservation-backed artifacts return a lease that
+/// remains live from the final health check through the last kernel or graph
+/// launch. This closes the check-then-launch race with boundary-time artifact
+/// transitions. Providers without mutable artifact state return `None`.
+pub trait ExecutorArtifactUseGuard: Send + Sync {}
+
+/// Provider-owned state retained by the session after it privately validates a
+/// `Required` artifact report. The session stores the returned `Arc` in its
+/// private executor state and in every baked graph requirement; there is no
+/// public constructor, issuer, binder, proof resolver, or finalization path.
+pub trait ExecutorArtifactRequirementState: Send + Sync {
+    fn acquire_use(&self) -> Result<Box<dyn ExecutorArtifactUseGuard>>;
+}
+
 impl DeviceValidationRegistration {
     /// Construct a registration carrying provider-specific state.
     pub fn new<T>(owner: DeviceValidationOwner, state: T) -> Self
@@ -1261,6 +1277,20 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Executor-scoped lazy-weight paging.
+    ///
+    /// Providers with executor-owned stable reservations override this method;
+    /// stock providers preserve the historical unscoped path.
+    fn page_lazy_weight_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        key: u64,
+        weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
+    ) -> Result<Option<crate::PagedWeight>> {
+        self.page_lazy_weight(key, weight, source)
+    }
+
     /// Prove routed-bank residency for a QMoE-family dispatch and mint a
     /// guard the executor keeps alive for the kernel's lifetime, exactly like
     /// [`Self::page_lazy_weight`]'s `PagedWeight`.
@@ -1284,6 +1314,17 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Executor-scoped routed-residency proof acquisition.
+    fn acquire_routed_residency_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        key: u64,
+        requirement: crate::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    ) -> Result<Option<Box<dyn crate::RoutedResidencyGuardHandle>>> {
+        self.acquire_routed_residency(key, requirement, catalog)
+    }
+
     /// Best-effort lookahead page-in for a lazy weight the executor knows will be
     /// needed by a later node. Returns `true` only when a transfer was actually
     /// enqueued, so callers can distinguish a real prefetch from a no-op or
@@ -1297,6 +1338,17 @@ pub trait ExecutionProvider: Send + Sync {
     ) -> Result<bool> {
         let _ = (key, weight, source);
         Ok(false)
+    }
+
+    /// Executor-scoped lazy-weight prefetch.
+    fn prefetch_lazy_weight_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        key: u64,
+        weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
+    ) -> Result<bool> {
+        self.prefetch_lazy_weight(key, weight, source)
     }
 
     /// Initialize device resources / load libraries.
@@ -2049,6 +2101,7 @@ pub trait ExecutionProvider: Send + Sync {
         generation: ExecutorArtifactGeneration,
         readiness: ExecutorArtifactReadinessEpoch,
         _graph: &Graph,
+        _banks: &[crate::FinalizedExpertBank],
     ) -> Result<ExecutorArtifactReport> {
         Ok(ExecutorArtifactReport::observed(
             self.executor_artifact_policy()?.provider(),
@@ -2075,6 +2128,25 @@ pub trait ExecutionProvider: Send + Sync {
         _generation: ExecutorArtifactGeneration,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// Retain the exact requirement installed by a privately validated
+    /// `Required` report.
+    ///
+    /// This is a provider-owned use lease source, not session finalization
+    /// authority. The session calls it only after validating the report's exact
+    /// provider/executor/generation/readiness labels against private immutable
+    /// state. Providers must return the same retained state while the artifact
+    /// is active, retiring, or retired so baked graphs fail closed after
+    /// teardown instead of interpreting missing live registry state as
+    /// "nothing required."
+    fn executor_artifact_requirement(
+        &self,
+        _provider: ExecutorArtifactProviderId,
+        _executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+    ) -> Result<Option<Arc<dyn ExecutorArtifactRequirementState>>> {
+        Ok(None)
     }
 
     /// Explicit device allocation/free counters, when the EP exposes them.
