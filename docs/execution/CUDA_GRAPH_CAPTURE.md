@@ -34,6 +34,18 @@ not the capture/reset lifecycle mutex. Reset, rewind, multi-token/prefill shape
 changes, incompatible bindings, and session drop destroy graphs before their
 referenced buffers; repeated capture mints a fresh generation.
 
+Deferred validation follows the same ownership discipline without sharing the
+graph lifecycle lock. Each executor or persistent binding receives one
+setup-allocated registration slot. A provider-wide atomic coordinator moves
+through `Idle → Resetting → Preparing → Attaching → Active → Consuming → Idle`;
+the successful `Active → Consuming` CAS is the cleanup linearization point.
+Recipient slots form a setup-backed intrusive list, so warmed begin, attachment,
+capture, replay, and consumption allocate nothing and acquire no registry lock.
+The consumer release-publishes the full flags into every exact recipient slot;
+competing consume or Drop paths acquire that sticky result and then retire their
+own slots. The isolated test reset also requires `Idle → Resetting`, so it either
+linearizes before a begin or fails closed without clearing active work.
+
 ## Multi-component / routed decoders (step-inputs capture, default-on)
 
 A multi-component pipeline decoder (e.g. gemma-3n / gemma4-e2b, and the

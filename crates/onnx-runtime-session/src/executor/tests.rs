@@ -168,6 +168,54 @@ impl DeferredValidationEp {
             route_boundary_before_sync: Arc::new(AtomicBool::new(false)),
         }
     }
+
+    fn consume_validation_token(
+        &self,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> onnx_runtime_ep_api::Result<u32> {
+        self.validation_consume_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let mut state = self.validation_state.lock().unwrap();
+        if let Some(Some((generation, flags))) = state.owners.get(&token.owner())
+            && *generation == token.generation()
+        {
+            return Ok(*flags);
+        }
+        match state.active {
+            Some(expected)
+                if expected.generation() == token.generation()
+                    && state.recipients.contains(&token.owner()) => {}
+            Some(expected) => {
+                return Err(EpError::KernelFailed(format!(
+                    "validation token owner={} generation={} cannot consume active owner={} \
+                     generation={}",
+                    token.owner().get(),
+                    token.generation(),
+                    expected.owner().get(),
+                    expected.generation()
+                )));
+            }
+            None => {
+                return Err(EpError::KernelFailed(format!(
+                    "validation token owner={} generation={} is stale",
+                    token.owner().get(),
+                    token.generation()
+                )));
+            }
+        }
+        let result = self
+            .check_validation_latch()
+            .and_then(|flags| self.reset_validation_latch().map(|()| flags));
+        if let Ok(flags) = &result {
+            let generation = token.generation();
+            for owner in state.recipients.clone() {
+                state.owners.insert(owner, Some((generation, *flags)));
+            }
+            state.active = None;
+            state.recipients.clear();
+        }
+        result
+    }
 }
 
 impl ExecutionProvider for DeferredValidationEp {
@@ -264,8 +312,8 @@ impl ExecutionProvider for DeferredValidationEp {
 
     fn register_device_validation_owner(
         &self,
-        owner: onnx_runtime_ep_api::DeviceValidationOwner,
-    ) -> onnx_runtime_ep_api::Result<()> {
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::DeviceValidationRegistration> {
+        let owner = onnx_runtime_ep_api::DeviceValidationOwner::new();
         let mut state = self.validation_state.lock().unwrap();
         if state.owners.insert(owner, None).is_some() {
             return Err(EpError::KernelFailed(format!(
@@ -273,13 +321,17 @@ impl ExecutionProvider for DeferredValidationEp {
                 owner.get()
             )));
         }
-        Ok(())
+        Ok(onnx_runtime_ep_api::DeviceValidationRegistration::new(
+            owner,
+            (),
+        ))
     }
 
     fn unregister_device_validation_owner(
         &self,
-        owner: onnx_runtime_ep_api::DeviceValidationOwner,
+        registration: &mut onnx_runtime_ep_api::DeviceValidationRegistration,
     ) -> onnx_runtime_ep_api::Result<()> {
+        let owner = registration.owner();
         let mut state = self.validation_state.lock().unwrap();
         if state.active.is_some() && state.recipients.contains(&owner) {
             return Err(EpError::KernelFailed(format!(
@@ -293,8 +345,9 @@ impl ExecutionProvider for DeferredValidationEp {
 
     fn begin_device_validation(
         &self,
-        owner: onnx_runtime_ep_api::DeviceValidationOwner,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
     ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        let owner = registration.owner();
         let mut state = self.validation_state.lock().unwrap();
         if let Some(token) = state.active {
             return Err(EpError::KernelFailed(format!(
@@ -324,8 +377,9 @@ impl ExecutionProvider for DeferredValidationEp {
     fn add_device_validation_recipient(
         &self,
         submission: onnx_runtime_ep_api::DeviceValidationToken,
-        recipient: onnx_runtime_ep_api::DeviceValidationOwner,
+        recipient: &onnx_runtime_ep_api::DeviceValidationRegistration,
     ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        let recipient = recipient.owner();
         let mut state = self.validation_state.lock().unwrap();
         if state.active != Some(submission) || !state.owners.contains_key(&recipient) {
             return Err(EpError::KernelFailed(
@@ -344,52 +398,26 @@ impl ExecutionProvider for DeferredValidationEp {
         true
     }
 
-    fn consume_device_validation_error(
+    fn abort_device_validation_submission(
         &self,
         token: onnx_runtime_ep_api::DeviceValidationToken,
     ) -> onnx_runtime_ep_api::Result<u32> {
-        self.validation_consume_attempts
-            .fetch_add(1, Ordering::Relaxed);
-        let mut state = self.validation_state.lock().unwrap();
-        if let Some(Some((generation, flags))) = state.owners.get(&token.owner())
-            && *generation == token.generation()
-        {
-            return Ok(*flags);
+        self.consume_validation_token(token)
+    }
+
+    fn consume_device_validation_error(
+        &self,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> onnx_runtime_ep_api::Result<u32> {
+        if registration.owner() != token.owner() {
+            return Err(EpError::KernelFailed(format!(
+                "validation token owner={} is foreign to registration owner={}",
+                token.owner().get(),
+                registration.owner().get()
+            )));
         }
-        match state.active {
-            Some(expected)
-                if expected.generation() == token.generation()
-                    && state.recipients.contains(&token.owner()) => {}
-            Some(expected) => {
-                return Err(EpError::KernelFailed(format!(
-                    "validation token owner={} generation={} cannot consume active owner={} \
-                     generation={}",
-                    token.owner().get(),
-                    token.generation(),
-                    expected.owner().get(),
-                    expected.generation()
-                )));
-            }
-            None => {
-                return Err(EpError::KernelFailed(format!(
-                    "validation token owner={} generation={} is stale",
-                    token.owner().get(),
-                    token.generation()
-                )));
-            }
-        }
-        let result = self
-            .check_validation_latch()
-            .and_then(|flags| self.reset_validation_latch().map(|()| flags));
-        if let Ok(flags) = &result {
-            let generation = token.generation();
-            for owner in state.recipients.clone() {
-                state.owners.insert(owner, Some((generation, *flags)));
-            }
-            state.active = None;
-            state.recipients.clear();
-        }
-        result
+        self.consume_validation_token(token)
     }
 
     fn reset_owned_device_graph(
@@ -603,7 +631,10 @@ fn foreign_binding_executor_drop_and_reset_cannot_consume_owned_validation() {
             deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
         let (foreign, mut foreign_bindings) =
             deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
-        assert_ne!(owner.validation_owner, foreign.validation_owner);
+        assert_ne!(
+            owner.validation_registration.as_ref().unwrap().owner(),
+            foreign.validation_registration.as_ref().unwrap().owner()
+        );
 
         owner
             .run_with_device_bindings(&[], &mut owner_bindings)
@@ -619,7 +650,10 @@ fn foreign_binding_executor_drop_and_reset_cannot_consume_owned_validation() {
             .unwrap()
             .active
             .expect("the owner's validation token must remain pending");
-        assert_eq!(active.owner(), owner.validation_owner);
+        assert_eq!(
+            active.owner(),
+            owner.validation_registration.as_ref().unwrap().owner()
+        );
 
         let sync_before = ep.sync_calls.load(Ordering::Relaxed);
         let mut foreign = Some(foreign);
@@ -747,7 +781,7 @@ fn stale_generation_cannot_consume_or_clear_current_submission() {
         .expect("second binding token");
     assert_ne!(stale.generation(), current.generation());
     let error = ep
-        .consume_device_validation_error(stale)
+        .consume_device_validation_error(bindings[1].validation_registration(), stale)
         .expect_err("stale generation must fail closed");
     assert!(
         error.to_string().contains("cannot consume active"),
@@ -756,7 +790,7 @@ fn stale_generation_cannot_consume_or_clear_current_submission() {
     assert_eq!(
         ep.validation_state.lock().unwrap().active,
         Some(onnx_runtime_ep_api::DeviceValidationToken::new(
-            executor.validation_owner,
+            executor.validation_registration.as_ref().unwrap().owner(),
             current.generation()
         )),
         "stale consume must not clear or replace the current active submission"
@@ -6293,6 +6327,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     let synchronizations = runtime.forced_synchronization_count();
     let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
     let locks = runtime.graph_lifecycle_lock_acquisition_count();
+    let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
     let submissions = runtime.validation_submission_count();
     let (warmed, host_allocations) =
         count_host_allocations(|| executor.run_with_device_bindings(&[], &mut bindings));
@@ -6316,6 +6351,11 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         "warmed production Executor graph locks"
     );
     assert_eq!(
+        runtime.validation_registry_lock_acquisition_count(),
+        validation_registry_locks,
+        "warmed production Executor validation-registry locks"
+    );
+    assert_eq!(
         runtime.validation_submission_count() - submissions,
         1,
         "warmed production measurement must execute exactly one real validation submission"
@@ -6336,6 +6376,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     let synchronizations = runtime.forced_synchronization_count();
     let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
     let locks = runtime.graph_lifecycle_lock_acquisition_count();
+    let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
     let submissions = runtime.validation_submission_count();
     let (replayed, host_allocations) =
         count_host_allocations(|| executor.replay_device_graph(&mut bindings));
@@ -6359,6 +6400,11 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         "first captured launch lifecycle locks"
     );
     assert_eq!(
+        runtime.validation_registry_lock_acquisition_count(),
+        validation_registry_locks,
+        "first captured launch validation-registry locks"
+    );
+    assert_eq!(
         runtime.validation_submission_count() - submissions,
         1,
         "first captured launch measurement must execute exactly one real submission"
@@ -6373,6 +6419,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     let synchronizations = runtime.forced_synchronization_count();
     let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
     let locks = runtime.graph_lifecycle_lock_acquisition_count();
+    let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
     let submissions = runtime.validation_submission_count();
     let (replayed, host_allocations) =
         count_host_allocations(|| executor.replay_device_graph(&mut bindings));
@@ -6394,6 +6441,11 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         runtime.graph_lifecycle_lock_acquisition_count(),
         locks,
         "production graph replay lifecycle locks"
+    );
+    assert_eq!(
+        runtime.validation_registry_lock_acquisition_count(),
+        validation_registry_locks,
+        "production graph replay validation-registry locks"
     );
     assert_eq!(
         runtime.validation_submission_count() - submissions,
@@ -6721,7 +6773,10 @@ fn isolated_raw_reset_cannot_clear_an_active_owner_generation() {
     }
     let reset_error = unsafe { runtime.reset_capture_error_for_isolated_test() }
         .expect_err("even the test-only raw reset must reject an active generation");
-    assert!(reset_error.to_string().contains("generation is active"));
+    assert!(
+        reset_error.to_string().contains("phase Active"),
+        "reset refusal must identify the active authority: {reset_error}"
+    );
     let error = bindings[2].read_bytes_range(0, 4).unwrap_err();
     assert!(
         error
@@ -6733,20 +6788,170 @@ fn isolated_raw_reset_cannot_clear_an_active_owner_generation() {
 
 #[cfg(feature = "gpu-tests")]
 #[test]
+fn concurrent_consume_and_executor_drop_share_exactly_one_cleanup() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    const ITERATIONS: u64 = 16;
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let runtime = Arc::clone(cuda.runtime());
+    for iteration in 0..ITERATIONS {
+        let (mut owner, mut bindings, _) =
+            sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+        let cleanup_before = runtime.validation_cleanup_count();
+        owner
+            .run_with_device_bindings(&[], &mut bindings)
+            .expect("owner submits one deferred run");
+        unsafe {
+            runtime
+                .htod(&0x40u32.to_ne_bytes(), runtime.capture_error_ptr())
+                .unwrap();
+        }
+
+        runtime.pause_validation_consumer_for_test(true);
+        let mut output = bindings.remove(2);
+        let consumer = std::thread::spawn(move || {
+            let first = output.read_bytes_range(0, 4).unwrap_err().to_string();
+            let second = output.read_bytes_range(0, 4).unwrap_err().to_string();
+            drop(output);
+            (first, second)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !runtime.validation_consumer_claimed_for_test() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "iteration {iteration}: binding consumer did not claim validation cleanup \
+                 authority"
+            );
+            std::thread::yield_now();
+        }
+
+        let dropper = std::thread::spawn(move || drop(owner));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            !dropper.is_finished(),
+            "iteration {iteration}: executor Drop must wait for the legitimate consuming \
+             recipient"
+        );
+        runtime.pause_validation_consumer_for_test(false);
+        dropper.join().expect("executor Drop must not panic");
+        let (first, second) = consumer.join().expect("binding consumer must not panic");
+        for (observation, error) in [(1, first), (2, second)] {
+            assert!(
+                error.contains("device validation failed (flags=0x40)"),
+                "iteration {iteration} sticky observation {observation} lost the exact result: \
+                 {error}"
+            );
+        }
+        drop(bindings);
+        assert_eq!(
+            runtime.validation_cleanup_count() - cleanup_before,
+            1,
+            "iteration {iteration}: the Active -> Consuming CAS must assign exactly one cleanup"
+        );
+        assert_eq!(
+            runtime.registered_validation_owner_count(),
+            0,
+            "iteration {iteration}: concurrent consume-vs-Drop leaked owner slots"
+        );
+    }
+    assert_eq!(
+        runtime.registered_validation_owner_count(),
+        0,
+        "concurrent consume-vs-Drop must retire every owner slot"
+    );
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn isolated_reset_and_begin_linearize_through_one_atomic_authority() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let runtime = Arc::clone(cuda.runtime());
+    let mut registration = cuda.register_device_validation_owner().unwrap();
+    const ITERATIONS: u64 = 16;
+    let cleanup_before = runtime.validation_cleanup_count();
+    for iteration in 0..ITERATIONS {
+        runtime.pause_validation_reset_for_test(true);
+        let reset_runtime = Arc::clone(&runtime);
+        let resetter = std::thread::spawn(move || unsafe {
+            reset_runtime.reset_capture_error_for_isolated_test()
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !runtime.validation_reset_claimed_for_test() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "iteration {iteration}: isolated reset did not claim the coordinator"
+            );
+            std::thread::yield_now();
+        }
+        let begin_error = cuda
+            .begin_device_validation(&registration)
+            .expect_err("begin must fail closed while reset owns the atomic authority");
+        assert!(
+            begin_error.to_string().contains("Resetting"),
+            "iteration {iteration}: begin refusal must identify the conflicting phase: \
+             {begin_error}"
+        );
+        runtime.pause_validation_reset_for_test(false);
+        resetter
+            .join()
+            .expect("isolated reset thread must not panic")
+            .expect("the reset that linearized first must complete");
+
+        let token = cuda.begin_device_validation(&registration).unwrap();
+        cuda.activate_device_validation(token).unwrap();
+        unsafe {
+            runtime
+                .htod(&0x40u32.to_ne_bytes(), runtime.capture_error_ptr())
+                .unwrap();
+        }
+        let reset_error = unsafe { runtime.reset_capture_error_for_isolated_test() }
+            .expect_err("reset must fail closed after begin/activation linearizes");
+        assert!(
+            reset_error.to_string().contains("Active"),
+            "iteration {iteration}: reset refusal must identify the active generation: \
+             {reset_error}"
+        );
+        cuda.sync().unwrap();
+        assert_eq!(
+            cuda.consume_device_validation_error(&registration, token)
+                .unwrap(),
+            0x40,
+            "iteration {iteration}: failed reset must never clear active work"
+        );
+        assert_eq!(
+            runtime.check_capture_error().unwrap(),
+            0,
+            "iteration {iteration}: consuming cleanup must leave the latch clear"
+        );
+    }
+    assert_eq!(
+        runtime.validation_cleanup_count() - cleanup_before,
+        ITERATIONS,
+        "each activated generation must have exactly one cleanup"
+    );
+    cuda.unregister_device_validation_owner(&mut registration)
+        .unwrap();
+    assert_eq!(runtime.registered_validation_owner_count(), 0);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
 fn cuda_owner_slot_preserves_old_receipt_across_96_later_submissions() {
     use onnx_runtime_ep_cuda::CudaExecutionProvider;
 
     const LATER_SUBMISSIONS: u64 = 96;
     let cuda = CudaExecutionProvider::new_default().unwrap();
     let runtime = cuda.runtime();
-    let old_owner = onnx_runtime_ep_api::DeviceValidationOwner::new();
-    let old_sibling = onnx_runtime_ep_api::DeviceValidationOwner::new();
-    cuda.register_device_validation_owner(old_owner).unwrap();
-    cuda.register_device_validation_owner(old_sibling).unwrap();
+    let mut old_owner = cuda.register_device_validation_owner().unwrap();
+    let mut old_sibling = cuda.register_device_validation_owner().unwrap();
 
-    let old_submitter_token = cuda.begin_device_validation(old_owner).unwrap();
+    let old_submitter_token = cuda.begin_device_validation(&old_owner).unwrap();
     let old_sibling_token = cuda
-        .add_device_validation_recipient(old_submitter_token, old_sibling)
+        .add_device_validation_recipient(old_submitter_token, &old_sibling)
+        .unwrap();
+    cuda.activate_device_validation(old_submitter_token)
         .unwrap();
     let flags = 0x40u32.to_ne_bytes();
     unsafe {
@@ -6754,46 +6959,52 @@ fn cuda_owner_slot_preserves_old_receipt_across_96_later_submissions() {
     }
     cuda.sync().unwrap();
     assert_eq!(
-        cuda.consume_device_validation_error(old_sibling_token)
+        cuda.consume_device_validation_error(&old_sibling, old_sibling_token)
             .unwrap(),
         0x40
     );
 
     for _ in 0..LATER_SUBMISSIONS {
-        let owner = onnx_runtime_ep_api::DeviceValidationOwner::new();
-        cuda.register_device_validation_owner(owner).unwrap();
-        let token = cuda.begin_device_validation(owner).unwrap();
+        let mut owner = cuda.register_device_validation_owner().unwrap();
+        let token = cuda.begin_device_validation(&owner).unwrap();
+        cuda.activate_device_validation(token).unwrap();
         cuda.sync().unwrap();
-        assert_eq!(cuda.consume_device_validation_error(token).unwrap(), 0);
-        cuda.unregister_device_validation_owner(owner).unwrap();
+        assert_eq!(
+            cuda.consume_device_validation_error(&owner, token).unwrap(),
+            0
+        );
+        cuda.unregister_device_validation_owner(&mut owner).unwrap();
     }
 
     assert_eq!(
-        cuda.consume_device_validation_error(old_submitter_token)
+        cuda.consume_device_validation_error(&old_owner, old_submitter_token)
             .unwrap(),
         0x40,
         "the old exact receipt must not be overwritten by later owners"
     );
-    let replacement = cuda.begin_device_validation(old_owner).unwrap();
+    let replacement = cuda.begin_device_validation(&old_owner).unwrap();
+    cuda.activate_device_validation(replacement).unwrap();
     let stale = cuda
-        .consume_device_validation_error(old_submitter_token)
+        .consume_device_validation_error(&old_owner, old_submitter_token)
         .expect_err("an overwritten owner generation must fail closed");
     assert!(stale.to_string().contains("stale"));
     cuda.sync().unwrap();
     assert_eq!(
-        cuda.consume_device_validation_error(replacement).unwrap(),
+        cuda.consume_device_validation_error(&old_owner, replacement)
+            .unwrap(),
         0,
         "stale-token rejection must not consume or poison the replacement generation"
     );
     assert_eq!(
-        cuda.consume_device_validation_error(old_sibling_token)
+        cuda.consume_device_validation_error(&old_sibling, old_sibling_token)
             .unwrap(),
         0x40,
         "reusing one owner slot must not overwrite its sibling's independent completed slot"
     );
-    cuda.unregister_device_validation_owner(old_sibling)
+    cuda.unregister_device_validation_owner(&mut old_sibling)
         .unwrap();
-    cuda.unregister_device_validation_owner(old_owner).unwrap();
+    cuda.unregister_device_validation_owner(&mut old_owner)
+        .unwrap();
     assert_eq!(runtime.registered_validation_owner_count(), 0);
     assert_eq!(runtime.validation_submission_count(), LATER_SUBMISSIONS + 2);
     eprintln!(

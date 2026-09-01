@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
-    DevicePtr, DevicePtrMut, DeviceValidationOwner, DeviceValidationToken, EpError,
+    DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
     ExecutionProvider, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput, KernelMatch,
     LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline, TensorBacking,
     TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
@@ -92,9 +92,9 @@ pub(super) struct DeviceValidationSubmission {
 impl DeviceValidationSubmission {
     pub(super) fn begin(
         ep: &Arc<dyn ExecutionProvider>,
-        owner: DeviceValidationOwner,
+        registration: &DeviceValidationRegistration,
     ) -> Result<Self> {
-        let token = ep.begin_device_validation(owner)?;
+        let token = ep.begin_device_validation(registration)?;
         Ok(Self {
             ep: Arc::clone(ep),
             token,
@@ -112,8 +112,13 @@ impl DeviceValidationSubmission {
         }
         let token = self
             .ep
-            .add_device_validation_recipient(self.token, binding.validation_owner())?;
+            .add_device_validation_recipient(self.token, binding.validation_registration())?;
         binding.set_device_validation(token);
+        Ok(())
+    }
+
+    pub(super) fn activate(&self) -> Result<()> {
+        self.ep.activate_device_validation(self.token)?;
         Ok(())
     }
 
@@ -129,7 +134,7 @@ impl Drop for DeviceValidationSubmission {
         }
         let result = self.ep.sync().map_err(SessionError::from).and_then(|()| {
             self.ep
-                .consume_device_validation_error(self.token)
+                .abort_device_validation_submission(self.token)
                 .map_err(SessionError::from)
         });
         match result {
@@ -838,17 +843,28 @@ impl Drop for Executor {
             }
         };
         if safe_to_release && let Some(token) = self.pending_device_validation {
-            match self.ep.consume_device_validation_error(token) {
-                Ok(0) => {}
-                Ok(flags) => eprintln!(
-                    "[onnx-runtime-session] executor drop consumed its deferred validation \
-                     failure (flags=0x{flags:x})"
-                ),
-                Err(error) => {
+            match self.validation_registration.as_ref() {
+                Some(registration) => {
+                    match self.ep.consume_device_validation_error(registration, token) {
+                        Ok(0) => {}
+                        Ok(flags) => eprintln!(
+                            "[onnx-runtime-session] executor drop consumed its deferred validation \
+                             failure (flags=0x{flags:x})"
+                        ),
+                        Err(error) => {
+                            safe_to_release = false;
+                            eprintln!(
+                                "[onnx-runtime-session] executor drop could not consume its \
+                                 deferred validation: {error}"
+                            );
+                        }
+                    }
+                }
+                None => {
                     safe_to_release = false;
                     eprintln!(
-                        "[onnx-runtime-session] executor drop could not consume its deferred \
-                         validation: {error}"
+                        "[onnx-runtime-session] executor drop is missing its validation \
+                         registration"
                     );
                 }
             }
@@ -911,18 +927,16 @@ impl Drop for Executor {
             }
         }
         self.shared_buffers.clear();
-        if self.validation_owner_registered {
-            if let Err(error) = self
-                .ep
-                .unregister_device_validation_owner(self.validation_owner)
-            {
+        if let Some(registration) = self.validation_registration.as_mut() {
+            let owner = registration.owner();
+            if let Err(error) = self.ep.unregister_device_validation_owner(registration) {
                 eprintln!(
                     "[onnx-runtime-session] executor drop could not unregister validation owner \
                      {}: {error}",
-                    self.validation_owner.get()
+                    owner.get()
                 );
             } else {
-                self.validation_owner_registered = false;
+                self.validation_registration = None;
             }
         }
     }

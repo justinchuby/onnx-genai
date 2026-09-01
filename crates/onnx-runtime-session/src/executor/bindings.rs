@@ -1237,7 +1237,12 @@ impl Executor {
         match self.pending_device_validation {
             Some(token) => self
                 .ep
-                .consume_device_validation_error(token)
+                .consume_device_validation_error(
+                    self.validation_registration
+                        .as_ref()
+                        .expect("executor validation registration exists until Drop"),
+                    token,
+                )
                 .map_err(SessionError::from),
             None => Ok(0),
         }

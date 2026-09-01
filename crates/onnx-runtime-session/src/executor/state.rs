@@ -94,10 +94,9 @@ pub(crate) struct Executor {
     /// Immutable namespace identity for every captured graph owned by this
     /// executor. Sibling sessions sharing one provider receive distinct owners.
     pub(super) graph_owner: DeviceGraphOwner,
-    /// Immutable namespace identity for deferred device validation. The
-    /// provider issues exact per-submission tokens under this owner.
-    pub(super) validation_owner: DeviceValidationOwner,
-    pub(super) validation_owner_registered: bool,
+    /// Setup-time owner slot. Warming borrows this proof directly instead of
+    /// looking up an owner or cloning a shared handle.
+    pub(super) validation_registration: Option<DeviceValidationRegistration>,
     /// Most recent submitted generation in this executor's registered
     /// owner-scoped validation slot.
     pub(super) pending_device_validation: Option<DeviceValidationToken>,

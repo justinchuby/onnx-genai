@@ -3868,32 +3868,46 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn register_device_validation_owner(
         &self,
-        owner: onnx_runtime_ep_api::DeviceValidationOwner,
-    ) -> Result<()> {
-        self.runtime.register_device_validation_owner(owner)
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationRegistration> {
+        self.runtime.register_device_validation_owner()
     }
 
     fn unregister_device_validation_owner(
         &self,
-        owner: onnx_runtime_ep_api::DeviceValidationOwner,
+        registration: &mut onnx_runtime_ep_api::DeviceValidationRegistration,
     ) -> Result<()> {
-        self.runtime.unregister_device_validation_owner(owner)
+        self.runtime
+            .unregister_device_validation_owner(registration)
     }
 
     fn begin_device_validation(
         &self,
-        owner: onnx_runtime_ep_api::DeviceValidationOwner,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
     ) -> Result<onnx_runtime_ep_api::DeviceValidationToken> {
-        self.runtime.begin_device_validation(owner)
+        self.runtime.begin_device_validation(registration)
     }
 
     fn add_device_validation_recipient(
         &self,
         submission: onnx_runtime_ep_api::DeviceValidationToken,
-        recipient: onnx_runtime_ep_api::DeviceValidationOwner,
+        recipient: &onnx_runtime_ep_api::DeviceValidationRegistration,
     ) -> Result<onnx_runtime_ep_api::DeviceValidationToken> {
         self.runtime
             .add_device_validation_recipient(submission, recipient)
+    }
+
+    fn activate_device_validation(
+        &self,
+        submission: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> Result<()> {
+        self.runtime.activate_device_validation(submission)
+    }
+
+    fn abort_device_validation_submission(
+        &self,
+        submission: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> Result<u32> {
+        self.runtime.abort_device_validation_submission(submission)
     }
 
     fn defers_device_validation(&self) -> bool {
@@ -3910,9 +3924,10 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn consume_device_validation_error(
         &self,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
         token: onnx_runtime_ep_api::DeviceValidationToken,
     ) -> Result<u32> {
-        self.runtime.consume_device_validation(token)
+        self.runtime.consume_device_validation(registration, token)
     }
 
     /// Slice-7C: the coarse safe-boundary route-telemetry consumer, called once

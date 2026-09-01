@@ -26,7 +26,8 @@
 use std::sync::{Arc, OnceLock};
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DeviceGraphToken, DeviceValidationOwner, DeviceValidationToken, ExecutionProvider,
+    DeviceBuffer, DeviceGraphToken, DeviceValidationRegistration, DeviceValidationToken,
+    ExecutionProvider,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{DataType, DeviceId, TensorLayout, checked_expected_bytes, read_vec_le};
@@ -338,7 +339,7 @@ pub struct DeviceIoBinding {
     /// cannot reset another executor's graph.
     device_graph_token: Option<DeviceGraphToken>,
     /// Setup-time registered owner of this binding's sticky validation slot.
-    validation_owner: DeviceValidationOwner,
+    validation_registration: Option<DeviceValidationRegistration>,
     /// Exact deferred-validation generation whose output was submitted into
     /// this binding. Foreign bindings never receive this token.
     device_validation: Option<DeviceValidationToken>,
@@ -391,11 +392,13 @@ impl DeviceIoBinding {
             TensorLayout::contiguous().alignment,
             ranges,
         )?;
-        let validation_owner = DeviceValidationOwner::new();
-        if let Err(error) = allocator.register_device_validation_owner(validation_owner) {
-            let _ = allocator.deallocate(buffer);
-            return Err(error.into());
-        }
+        let validation_registration = match allocator.register_device_validation_owner() {
+            Ok(registration) => registration,
+            Err(error) => {
+                let _ = allocator.deallocate(buffer);
+                return Err(error.into());
+            }
+        };
         Ok(Self {
             input_name,
             bind_input,
@@ -409,7 +412,7 @@ impl DeviceIoBinding {
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
             device_graph_token: None,
-            validation_owner,
+            validation_registration: Some(validation_registration),
             device_validation: None,
         })
     }
@@ -496,8 +499,7 @@ impl DeviceIoBinding {
             binding: input_name.clone(),
             reason: "it is null; pass the address of a real allocation".to_string(),
         })?;
-        let validation_owner = DeviceValidationOwner::new();
-        allocator.register_device_validation_owner(validation_owner)?;
+        let validation_registration = allocator.register_device_validation_owner()?;
         Ok(Self {
             input_name,
             bind_input,
@@ -511,7 +513,7 @@ impl DeviceIoBinding {
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
             device_graph_token: None,
-            validation_owner,
+            validation_registration: Some(validation_registration),
             device_validation: None,
         })
     }
@@ -581,8 +583,10 @@ impl DeviceIoBinding {
         self.device_graph_token = Some(token);
     }
 
-    pub(crate) fn validation_owner(&self) -> DeviceValidationOwner {
-        self.validation_owner
+    pub(crate) fn validation_registration(&self) -> &DeviceValidationRegistration {
+        self.validation_registration
+            .as_ref()
+            .expect("device binding validation registration exists until Drop")
     }
 
     pub(crate) fn set_device_validation(&mut self, token: DeviceValidationToken) {
@@ -809,7 +813,9 @@ impl DeviceIoBinding {
         let Some(token) = self.device_validation else {
             return Ok(());
         };
-        let flags = self.allocator.consume_device_validation_error(token)?;
+        let flags = self
+            .allocator
+            .consume_device_validation_error(self.validation_registration(), token)?;
         if flags != 0 {
             return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
                 "{}: device validation failed (flags=0x{flags:x})",
@@ -1035,7 +1041,10 @@ impl Drop for DeviceIoBinding {
                 );
             }
             if safe_to_release && let Some(token) = self.device_validation {
-                match self.allocator.consume_device_validation_error(token) {
+                match self
+                    .allocator
+                    .consume_device_validation_error(self.validation_registration(), token)
+                {
                     Ok(0) => {}
                     Ok(flags) => eprintln!(
                         "[onnx-runtime-session] device binding drop consumed its deferred \
@@ -1072,15 +1081,20 @@ impl Drop for DeviceIoBinding {
                 drop(buffer);
             }
         }
-        if let Err(error) = self
-            .allocator
-            .unregister_device_validation_owner(self.validation_owner)
-        {
-            eprintln!(
-                "[onnx-runtime-session] device binding drop could not unregister validation \
-                 owner {}: {error}",
-                self.validation_owner.get()
-            );
+        if let Some(registration) = self.validation_registration.as_mut() {
+            let owner = registration.owner();
+            if let Err(error) = self
+                .allocator
+                .unregister_device_validation_owner(registration)
+            {
+                eprintln!(
+                    "[onnx-runtime-session] device binding drop could not unregister validation \
+                     owner {}: {error}",
+                    owner.get()
+                );
+            } else {
+                self.validation_registration = None;
+            }
         }
     }
 }

@@ -21,7 +21,12 @@ impl Executor {
     pub(super) fn begin_device_validation_submission(
         &mut self,
     ) -> Result<DeviceValidationSubmission> {
-        let submission = DeviceValidationSubmission::begin(&self.ep, self.validation_owner)?;
+        let registration = self
+            .validation_registration
+            .as_ref()
+            .expect("executor validation registration exists until Drop");
+        let submission = DeviceValidationSubmission::begin(&self.ep, registration)?;
+        submission.activate()?;
         self.pending_device_validation = Some(submission.token());
         Ok(submission)
     }
@@ -30,10 +35,16 @@ impl Executor {
         &mut self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceValidationSubmission> {
-        let submission = self.begin_device_validation_submission()?;
+        let registration = self
+            .validation_registration
+            .as_ref()
+            .expect("executor validation registration exists until Drop");
+        let submission = DeviceValidationSubmission::begin(&self.ep, registration)?;
         for binding in bindings {
             submission.add_recipient(binding)?;
         }
+        submission.activate()?;
+        self.pending_device_validation = Some(submission.token());
         Ok(submission)
     }
 
@@ -168,7 +179,12 @@ impl Executor {
         // so the latch read observes every kernel from this request.
         self.ep.sync()?;
         let flags = match self.pending_device_validation.take() {
-            Some(token) => match self.ep.consume_device_validation_error(token) {
+            Some(token) => match self.ep.consume_device_validation_error(
+                self.validation_registration
+                    .as_ref()
+                    .expect("executor validation registration exists until Drop"),
+                token,
+            ) {
                 Ok(flags) => flags,
                 Err(error) => {
                     self.pending_device_validation = Some(token);

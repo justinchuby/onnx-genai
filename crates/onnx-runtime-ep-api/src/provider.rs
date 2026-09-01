@@ -1,5 +1,6 @@
 //! The [`ExecutionProvider`] trait and its supporting types (§4.1).
 
+use std::any::Any;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -141,7 +142,17 @@ impl DeviceValidationOwner {
     /// Mint a process-unique owner identity. Identities are never reused.
     pub fn new() -> Self {
         static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT_OWNER.fetch_add(1, Ordering::Relaxed))
+        let owner = NEXT_OWNER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .unwrap_or_else(|_| {
+                panic!(
+                    "device validation owner identity space exhausted; refusing to wrap and \
+                     create an ABA collision"
+                )
+            });
+        Self(owner)
     }
 
     /// Stable process-local numeric identity.
@@ -153,6 +164,55 @@ impl DeviceValidationOwner {
 impl Default for DeviceValidationOwner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Setup-time proof that one deferred-validation owner is registered with an EP.
+///
+/// The provider-specific state is allocated only here. Submission paths borrow
+/// this proof, so they neither look up an owner in a map nor clone a reference-
+/// counted handle.
+pub struct DeviceValidationRegistration {
+    owner: DeviceValidationOwner,
+    state: Box<dyn Any + Send + Sync>,
+}
+
+impl DeviceValidationRegistration {
+    /// Construct a registration carrying provider-specific state.
+    pub fn new<T>(owner: DeviceValidationOwner, state: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            owner,
+            state: Box::new(state),
+        }
+    }
+
+    /// Registered owner identity.
+    pub const fn owner(&self) -> DeviceValidationOwner {
+        self.owner
+    }
+
+    /// Borrow provider-specific registration state.
+    #[doc(hidden)]
+    pub fn state<T: Any>(&self) -> Option<&T> {
+        self.state.downcast_ref()
+    }
+
+    /// Mutably borrow provider-specific registration state during teardown.
+    #[doc(hidden)]
+    pub fn state_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.state.downcast_mut()
+    }
+}
+
+impl std::fmt::Debug for DeviceValidationRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceValidationRegistration")
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1576,27 +1636,31 @@ pub trait ExecutionProvider: Send + Sync {
         self.has_device_graph_in(token.slot())
     }
 
-    /// Begin one top-level device-validation generation owned by `owner`.
+    /// Register one executor or persistent binding during setup.
     ///
     /// Owners are registered once at executor/binding setup. Providers with
     /// deferred validation may reject this call while a previous generation is
     /// still executing. The returned token is the submitting executor's exact
     /// authority for this generation.
-    fn register_device_validation_owner(&self, _owner: DeviceValidationOwner) -> Result<()> {
-        Ok(())
+    fn register_device_validation_owner(&self) -> Result<DeviceValidationRegistration> {
+        let owner = DeviceValidationOwner::new();
+        Ok(DeviceValidationRegistration::new(owner, ()))
     }
 
     /// Retire one executor/binding validation owner at teardown.
-    fn unregister_device_validation_owner(&self, _owner: DeviceValidationOwner) -> Result<()> {
+    fn unregister_device_validation_owner(
+        &self,
+        _registration: &mut DeviceValidationRegistration,
+    ) -> Result<()> {
         Ok(())
     }
 
-    /// Begin one top-level device-validation generation owned by `owner`.
+    /// Begin one top-level device-validation generation for `registration`.
     fn begin_device_validation(
         &self,
-        owner: DeviceValidationOwner,
+        registration: &DeviceValidationRegistration,
     ) -> Result<DeviceValidationToken> {
-        Ok(DeviceValidationToken::new(owner, 0))
+        Ok(DeviceValidationToken::new(registration.owner(), 0))
     }
 
     /// Add one pre-registered output binding as an exact recipient of the
@@ -1606,12 +1670,25 @@ pub trait ExecutionProvider: Send + Sync {
     fn add_device_validation_recipient(
         &self,
         submission: DeviceValidationToken,
-        recipient: DeviceValidationOwner,
+        recipient: &DeviceValidationRegistration,
     ) -> Result<DeviceValidationToken> {
         Ok(DeviceValidationToken::new(
-            recipient,
+            recipient.owner(),
             submission.generation(),
         ))
+    }
+
+    /// Seal recipient attachment and make the submission consumable.
+    fn activate_device_validation(&self, _submission: DeviceValidationToken) -> Result<()> {
+        Ok(())
+    }
+
+    /// Recover an executor submission while its stack is unwinding.
+    fn abort_device_validation_submission(
+        &self,
+        _submission: DeviceValidationToken,
+    ) -> Result<u32> {
+        Ok(0)
     }
 
     /// Whether top-level execution defers validation until a host-visible read.
@@ -1620,9 +1697,13 @@ pub trait ExecutionProvider: Send + Sync {
     }
 
     /// Consume the exact top-level device-validation generation after a host
-    /// synchronization boundary. Implementations must reject a foreign, stale,
-    /// or concurrently consumed token without clearing the active result.
-    fn consume_device_validation_error(&self, _token: DeviceValidationToken) -> Result<u32> {
+    /// synchronization boundary. Implementations reject foreign and stale
+    /// tokens; concurrent exact consumers converge on the same sticky result.
+    fn consume_device_validation_error(
+        &self,
+        _registration: &DeviceValidationRegistration,
+        _token: DeviceValidationToken,
+    ) -> Result<u32> {
         Ok(0)
     }
 

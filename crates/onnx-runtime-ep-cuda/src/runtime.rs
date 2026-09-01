@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -20,7 +20,7 @@ use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Kernel;
 use onnx_runtime_ep_api::{
     DeviceGraphOwner, DeviceGraphResource, DeviceGraphSlot, DeviceGraphToken,
-    DeviceValidationOwner, DeviceValidationToken,
+    DeviceValidationOwner, DeviceValidationRegistration, DeviceValidationToken,
 };
 use onnx_runtime_ep_api::{RawDeviceAllocationSiteStats, Result};
 
@@ -49,48 +49,111 @@ pub struct CudaTransferCounts {
     pub async_host_to_device: u64,
 }
 
+const VALIDATION_PHASE_BITS: u32 = 3;
+const VALIDATION_PHASE_MASK: u64 = (1 << VALIDATION_PHASE_BITS) - 1;
+const VALIDATION_MAX_GENERATION: u64 = u64::MAX >> VALIDATION_PHASE_BITS;
+
+// Invariant: one coordinator word and each owner's one slot word are the sole
+// authority for generation phase, result visibility, and cleanup ownership.
+fn next_validation_runtime_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .unwrap_or_else(|_| {
+            panic!("CUDA validation runtime identity space exhausted; refusing ABA reuse")
+        })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OwnerDeviceValidation {
-    Idle,
-    Pending(u64),
-    Completed { generation: u64, flags: u32 },
+#[repr(u64)]
+enum ValidationPhase {
+    Idle = 0,
+    Resetting = 1,
+    Preparing = 2,
+    Attaching = 3,
+    Active = 4,
+    Consuming = 5,
 }
 
-#[derive(Debug)]
-struct ActiveDeviceValidation {
-    submitter: DeviceValidationToken,
-    consuming: bool,
+fn validation_word(phase: ValidationPhase, generation: u64) -> u64 {
+    (generation << VALIDATION_PHASE_BITS) | phase as u64
 }
 
-#[derive(Debug)]
-struct DeviceValidationState {
-    next_generation: u64,
-    active: Option<ActiveDeviceValidation>,
-    owners: HashMap<DeviceValidationOwner, OwnerDeviceValidation>,
-    active_owners: Vec<DeviceValidationOwner>,
-}
-
-impl Default for DeviceValidationState {
-    fn default() -> Self {
-        Self {
-            next_generation: 1,
-            active: None,
-            owners: HashMap::new(),
-            active_owners: Vec::new(),
-        }
+fn validation_phase(word: u64) -> ValidationPhase {
+    match word & VALIDATION_PHASE_MASK {
+        0 => ValidationPhase::Idle,
+        1 => ValidationPhase::Resetting,
+        2 => ValidationPhase::Preparing,
+        3 => ValidationPhase::Attaching,
+        4 => ValidationPhase::Active,
+        5 => ValidationPhase::Consuming,
+        _ => unreachable!("all validation phase values are encoded by this module"),
     }
 }
 
-impl DeviceValidationState {
-    fn take_generation(&mut self) -> Result<u64> {
-        let generation = self.next_generation;
-        self.next_generation = generation.checked_add(1).ok_or_else(|| {
-            EpError::KernelFailed(
-                "cuda_ep: device validation generation space exhausted; rebuild the provider"
-                    .into(),
-            )
-        })?;
-        Ok(generation)
+fn validation_generation(word: u64) -> u64 {
+    word >> VALIDATION_PHASE_BITS
+}
+
+fn take_validation_generation(next: &AtomicU64) -> Result<u64> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+        (generation < VALIDATION_MAX_GENERATION).then_some(generation + 1)
+    })
+    .map_err(|_| {
+        EpError::KernelFailed(
+            "cuda_ep: device validation generation space exhausted; rebuild the provider".into(),
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+enum ValidationSlotPhase {
+    Idle = 0,
+    Pending = 1,
+    Complete = 2,
+    Retired = 3,
+}
+
+fn validation_slot_word(phase: ValidationSlotPhase, generation: u64) -> u64 {
+    (generation << VALIDATION_PHASE_BITS) | phase as u64
+}
+
+fn validation_slot_phase(word: u64) -> ValidationSlotPhase {
+    match word & VALIDATION_PHASE_MASK {
+        0 => ValidationSlotPhase::Idle,
+        1 => ValidationSlotPhase::Pending,
+        2 => ValidationSlotPhase::Complete,
+        3 => ValidationSlotPhase::Retired,
+        _ => unreachable!("all validation slot phase values are encoded by this module"),
+    }
+}
+
+#[derive(Debug)]
+struct CudaValidationRegistration {
+    runtime_id: u64,
+    slot: usize,
+    retired: bool,
+}
+
+#[derive(Debug)]
+struct DeviceValidationSlot {
+    owner: DeviceValidationOwner,
+    state: AtomicU64,
+    flags: AtomicU32,
+    next: AtomicPtr<DeviceValidationSlot>,
+}
+
+impl DeviceValidationSlot {
+    fn new(owner: DeviceValidationOwner) -> Self {
+        Self {
+            owner,
+            state: AtomicU64::new(validation_slot_word(ValidationSlotPhase::Idle, 0)),
+            flags: AtomicU32::new(0),
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        }
     }
 }
 
@@ -690,11 +753,31 @@ pub struct CudaRuntime {
     /// The host reads it after a request synchronization so eager or captured
     /// validation failures become hard errors before outputs are consumed.
     capture_error: CUdeviceptr,
-    /// Exactly one provider-wide deferred validation generation may be
-    /// outstanding. Its executor owner and generation are retained here so a
-    /// foreign binding, reset, or executor teardown cannot consume or clear it.
-    validation_state: Mutex<DeviceValidationState>,
+    /// Sole authority for the provider-wide validation phase and cleanup owner.
+    /// Recipient slots are setup-allocated and linked while this word is in
+    /// `Preparing`/`Attaching`; the `Active -> Consuming` CAS is the cleanup
+    /// linearization point.
+    validation_state: AtomicU64,
+    validation_head: AtomicPtr<DeviceValidationSlot>,
+    validation_submitter: AtomicPtr<DeviceValidationSlot>,
+    next_validation_generation: AtomicU64,
+    validation_runtime_id: u64,
+    // Boxes keep intrusive-list addresses stable when setup registration grows.
+    #[allow(clippy::vec_box)]
+    validation_owners: Mutex<Vec<Box<DeviceValidationSlot>>>,
+    registered_validation_owners: AtomicUsize,
+    validation_registry_lock_acquisitions: AtomicU64,
     validation_submissions: AtomicU64,
+    #[cfg(feature = "gpu-tests")]
+    validation_cleanups: AtomicU64,
+    #[cfg(feature = "gpu-tests")]
+    validation_consumer_pause: AtomicBool,
+    #[cfg(feature = "gpu-tests")]
+    validation_consumer_claimed: AtomicBool,
+    #[cfg(feature = "gpu-tests")]
+    validation_reset_pause: AtomicBool,
+    #[cfg(feature = "gpu-tests")]
+    validation_reset_claimed: AtomicBool,
     /// When set, the public [`CudaRuntime::synchronize`] becomes a no-op so the
     /// redundant trailing per-op eager device syncs (issued by kernels on the
     /// `!capturing` branch) are elided and launches pipeline on the in-order EP
@@ -921,8 +1004,25 @@ impl CudaRuntime {
             fences: Mutex::new(HashMap::new()),
             next_fence_id: AtomicU64::new(1),
             capture_error: 0,
-            validation_state: Mutex::new(DeviceValidationState::default()),
+            validation_state: AtomicU64::new(validation_word(ValidationPhase::Idle, 0)),
+            validation_head: AtomicPtr::new(std::ptr::null_mut()),
+            validation_submitter: AtomicPtr::new(std::ptr::null_mut()),
+            next_validation_generation: AtomicU64::new(1),
+            validation_runtime_id: next_validation_runtime_id(),
+            validation_owners: Mutex::new(Vec::new()),
+            registered_validation_owners: AtomicUsize::new(0),
+            validation_registry_lock_acquisitions: AtomicU64::new(0),
             validation_submissions: AtomicU64::new(0),
+            #[cfg(feature = "gpu-tests")]
+            validation_cleanups: AtomicU64::new(0),
+            #[cfg(feature = "gpu-tests")]
+            validation_consumer_pause: AtomicBool::new(false),
+            #[cfg(feature = "gpu-tests")]
+            validation_consumer_claimed: AtomicBool::new(false),
+            #[cfg(feature = "gpu-tests")]
+            validation_reset_pause: AtomicBool::new(false),
+            #[cfg(feature = "gpu-tests")]
+            validation_reset_claimed: AtomicBool::new(false),
             defer_eager_sync: AtomicBool::new(
                 // On by default; only an explicit falsey value restores the old
                 // always-sync eager path (escape hatch for debugging).
@@ -1081,245 +1181,527 @@ impl CudaRuntime {
         Ok(u32::from_ne_bytes(bytes))
     }
 
-    /// Register one executor or persistent output binding as a validation-result
-    /// owner. Registry and active-recipient capacity grow here, outside warmed
-    /// submission/capture/replay.
-    pub(crate) fn register_device_validation_owner(
+    fn validation_slot<'a>(
         &self,
-        owner: DeviceValidationOwner,
-    ) -> Result<()> {
-        let mut state = self.validation_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep: device validation ownership lock is poisoned".into())
-        })?;
-        if state.owners.contains_key(&owner) {
+        registration: &'a DeviceValidationRegistration,
+    ) -> Result<&'a DeviceValidationSlot> {
+        let key = registration
+            .state::<CudaValidationRegistration>()
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: validation owner {} was registered by a different provider",
+                    registration.owner().get()
+                ))
+            })?;
+        if key.runtime_id != self.validation_runtime_id {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep: device validation owner {} is already registered",
-                owner.get()
+                "cuda_ep: validation owner {} belongs to another CUDA runtime",
+                registration.owner().get()
             )));
         }
-        let required = state.owners.len().checked_add(1).ok_or_else(|| {
-            EpError::KernelFailed("cuda_ep: device validation owner registry is full".into())
-        })?;
-        if state.active_owners.capacity() < required {
-            let additional = required.saturating_sub(state.active_owners.len());
-            state.active_owners.reserve_exact(additional);
+        if key.retired {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation owner {} is already retired",
+                registration.owner().get()
+            )));
         }
-        state.owners.insert(owner, OwnerDeviceValidation::Idle);
-        Ok(())
+        // SAFETY: the runtime owns every registered slot until consuming
+        // `unregister_device_validation_owner` removes it. A live registration
+        // cannot be used after that consuming call.
+        let slot = unsafe { &*(key.slot as *const DeviceValidationSlot) };
+        if slot.owner != registration.owner() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation registration owner {} does not match slot owner {}",
+                registration.owner().get(),
+                slot.owner.get()
+            )));
+        }
+        Ok(slot)
     }
 
-    /// Unregister an owner after its exact pending generation has been consumed.
-    pub(crate) fn unregister_device_validation_owner(
-        &self,
-        owner: DeviceValidationOwner,
-    ) -> Result<()> {
-        let mut state = self.validation_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep: device validation ownership lock is poisoned".into())
-        })?;
-        let Some(owner_state) = state.owners.get(&owner).copied() else {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: device validation owner {} is not registered",
-                owner.get()
-            )));
-        };
-        if matches!(owner_state, OwnerDeviceValidation::Pending(_)) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: device validation owner {} still has a pending result; synchronize and \
-                 consume its exact token before unregistering",
-                owner.get()
-            )));
-        }
-        state.owners.remove(&owner);
-        Ok(())
+    fn take_validation_generation(&self) -> Result<u64> {
+        take_validation_generation(&self.next_validation_generation)
     }
 
-    /// Open one provider-wide validation generation for a registered submitter.
-    ///
-    /// A fully device-bound run may return before its device word is readable.
-    /// Once any exact recipient consumes the result, every registered recipient
-    /// gets its own sticky completed slot and later sibling submissions may
-    /// proceed without overwriting it.
-    pub(crate) fn begin_device_validation(
-        &self,
-        owner: DeviceValidationOwner,
-    ) -> Result<DeviceValidationToken> {
-        let mut state = self.validation_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep: device validation ownership lock is poisoned".into())
-        })?;
-        if let Some(active) = &state.active {
-            let token = active.submitter;
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: previous deferred device validation is still pending (owner={} \
-                 generation={}); consume that owner's bound output or finish its request \
-                 boundary before submitting owner={}",
-                token.owner().get(),
-                token.generation(),
-                owner.get()
-            )));
-        }
-        if !state.owners.contains_key(&owner) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: device validation owner {} was not registered during executor/binding \
-                 setup",
-                owner.get()
-            )));
-        }
-        let generation = state.take_generation()?;
-        self.reset_capture_error()?;
-        let token = DeviceValidationToken::new(owner, generation);
-        state.active_owners.clear();
-        state.active_owners.push(owner);
-        state
-            .owners
-            .insert(owner, OwnerDeviceValidation::Pending(generation));
-        state.active = Some(ActiveDeviceValidation {
-            submitter: token,
-            consuming: false,
-        });
-        self.validation_submissions.fetch_add(1, Ordering::Relaxed);
-        Ok(token)
-    }
-
-    /// Attach one registered output owner to an active submission.
-    pub(crate) fn add_device_validation_recipient(
-        &self,
-        submission: DeviceValidationToken,
-        recipient: DeviceValidationOwner,
-    ) -> Result<DeviceValidationToken> {
-        let mut state = self.validation_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep: device validation ownership lock is poisoned".into())
-        })?;
-        let Some(active) = &state.active else {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: validation submission owner={} generation={} is no longer active",
-                submission.owner().get(),
-                submission.generation()
-            )));
-        };
-        if active.submitter != submission || active.consuming {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: validation submission owner={} generation={} cannot add recipient \
-                 owner={}; the active submission differs or is already being consumed",
-                submission.owner().get(),
-                submission.generation(),
-                recipient.get()
-            )));
-        }
-        if !state.owners.contains_key(&recipient) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: validation recipient owner {} was not registered during binding setup",
-                recipient.get()
-            )));
-        }
-        if state.active_owners.contains(&recipient) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: validation recipient owner {} is already attached to generation {}",
-                recipient.get(),
-                submission.generation()
-            )));
-        }
-        state.active_owners.push(recipient);
-        state.owners.insert(
-            recipient,
-            OwnerDeviceValidation::Pending(submission.generation()),
-        );
-        Ok(DeviceValidationToken::new(
-            recipient,
-            submission.generation(),
+    /// Allocate one stable owner slot during setup. The registry lock is only a
+    /// storage/lifetime mechanism; warmed validation never touches it.
+    pub(crate) fn register_device_validation_owner(&self) -> Result<DeviceValidationRegistration> {
+        let owner = DeviceValidationOwner::new();
+        let mut slot = Box::new(DeviceValidationSlot::new(owner));
+        let slot_ptr = (&mut *slot) as *mut DeviceValidationSlot;
+        self.validation_registry_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        self.validation_owners
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: device validation setup registry lock is poisoned".into(),
+                )
+            })?
+            .push(slot);
+        self.registered_validation_owners
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(DeviceValidationRegistration::new(
+            owner,
+            CudaValidationRegistration {
+                runtime_id: self.validation_runtime_id,
+                slot: slot_ptr as usize,
+                retired: false,
+            },
         ))
     }
 
-    /// Consume exactly `token` after the caller established a host boundary.
-    /// Foreign and stale tokens fail without reading or clearing the latch.
-    /// The first exact recipient publishes the result into every recipient's
-    /// registered slot; later reads are allocation-free idempotent lookups.
-    pub(crate) fn consume_device_validation(&self, token: DeviceValidationToken) -> Result<u32> {
-        {
-            let mut state = self.validation_state.lock().map_err(|_| {
-                EpError::KernelFailed(
-                    "cuda_ep: device validation ownership lock is poisoned".into(),
-                )
-            })?;
-            match state.owners.get(&token.owner()).copied() {
-                Some(OwnerDeviceValidation::Completed { generation, flags })
-                    if generation == token.generation() =>
-                {
-                    return Ok(flags);
+    /// Retire one setup slot. A pending generation is first consumed through the
+    /// same state machine, so concurrent legitimate consumption converges on the
+    /// sticky result instead of leaking the slot.
+    pub(crate) fn unregister_device_validation_owner(
+        &self,
+        registration: &mut DeviceValidationRegistration,
+    ) -> Result<()> {
+        let slot = self.validation_slot(registration)?;
+        loop {
+            let current = slot.state.load(Ordering::Acquire);
+            match validation_slot_phase(current) {
+                ValidationSlotPhase::Pending => {
+                    let token = DeviceValidationToken::new(
+                        registration.owner(),
+                        validation_generation(current),
+                    );
+                    self.consume_device_validation(registration, token)?;
                 }
-                Some(OwnerDeviceValidation::Pending(generation))
-                    if generation == token.generation() =>
-                {
-                    let is_recipient = state.active_owners.contains(&token.owner());
-                    let Some(active) = state.active.as_mut() else {
-                        return Err(EpError::KernelFailed(format!(
-                            "cuda_ep: validation token owner={} generation={} is pending without \
-                             an active submission",
-                            token.owner().get(),
-                            token.generation()
-                        )));
-                    };
-                    if active.submitter.generation() != token.generation() || !is_recipient {
-                        return Err(EpError::KernelFailed(format!(
-                            "cuda_ep: validation token owner={} generation={} does not belong to \
-                             the active submission",
-                            token.owner().get(),
-                            token.generation()
-                        )));
+                ValidationSlotPhase::Idle | ValidationSlotPhase::Complete => {
+                    let retired = validation_slot_word(
+                        ValidationSlotPhase::Retired,
+                        validation_generation(current),
+                    );
+                    if slot
+                        .state
+                        .compare_exchange(current, retired, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        break;
                     }
-                    if active.consuming {
-                        return Err(EpError::KernelFailed(format!(
-                            "cuda_ep: validation generation {} is already being consumed",
-                            token.generation()
-                        )));
-                    }
-                    active.consuming = true;
                 }
-                Some(owner_state) => {
+                ValidationSlotPhase::Retired => {
                     return Err(EpError::KernelFailed(format!(
-                        "cuda_ep: validation token owner={} generation={} is stale for registered \
-                         owner state {owner_state:?}",
-                        token.owner().get(),
-                        token.generation(),
+                        "cuda_ep: validation owner {} is already retired",
+                        registration.owner().get()
                     )));
                 }
-                None => {
+            }
+        }
+
+        let slot_ptr = slot as *const DeviceValidationSlot as usize;
+        self.validation_registry_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        let mut owners = self.validation_owners.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep: device validation setup registry lock is poisoned".into(),
+            )
+        })?;
+        let index = owners
+            .iter()
+            .position(|candidate| {
+                (&**candidate as *const DeviceValidationSlot as usize) == slot_ptr
+            })
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: validation owner {} slot is absent from the setup registry",
+                    registration.owner().get()
+                ))
+            })?;
+        registration
+            .state_mut::<CudaValidationRegistration>()
+            .expect("CUDA registration type was checked before retirement")
+            .retired = true;
+        owners.swap_remove(index);
+        self.registered_validation_owners
+            .fetch_sub(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Reserve a generation and clear its device latch before recipient
+    /// attachment. `Idle -> Resetting` excludes both another begin and the
+    /// isolated-test reset in one CAS protocol.
+    pub(crate) fn begin_device_validation(
+        &self,
+        registration: &DeviceValidationRegistration,
+    ) -> Result<DeviceValidationToken> {
+        let slot = self.validation_slot(registration)?;
+        let generation = self.take_validation_generation()?;
+        let resetting = validation_word(ValidationPhase::Resetting, generation);
+        if let Err(current) = self.validation_state.compare_exchange(
+            validation_word(ValidationPhase::Idle, 0),
+            resetting,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: previous deferred device validation is still {:?} at generation {}; \
+                 consume its bound output or finish its request boundary before submitting \
+                 owner={}",
+                validation_phase(current),
+                validation_generation(current),
+                registration.owner().get()
+            )));
+        }
+        if let Err(error) = self.reset_capture_error() {
+            self.validation_state
+                .store(validation_word(ValidationPhase::Idle, 0), Ordering::Release);
+            return Err(error);
+        }
+
+        let pending = validation_slot_word(ValidationSlotPhase::Pending, generation);
+        loop {
+            let current = slot.state.load(Ordering::Acquire);
+            match validation_slot_phase(current) {
+                ValidationSlotPhase::Idle | ValidationSlotPhase::Complete => {
+                    if slot
+                        .state
+                        .compare_exchange(current, pending, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                ValidationSlotPhase::Pending | ValidationSlotPhase::Retired => {
+                    self.validation_state
+                        .store(validation_word(ValidationPhase::Idle, 0), Ordering::Release);
                     return Err(EpError::KernelFailed(format!(
-                        "cuda_ep: validation token owner={} generation={} names an unregistered \
-                         owner",
+                        "cuda_ep: validation owner {} cannot begin generation {generation} from \
+                         slot state {:?} generation {}",
+                        registration.owner().get(),
+                        validation_slot_phase(current),
+                        validation_generation(current)
+                    )));
+                }
+            }
+        }
+        let slot_ptr = slot as *const DeviceValidationSlot as *mut DeviceValidationSlot;
+        slot.next.store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.validation_head.store(slot_ptr, Ordering::Relaxed);
+        self.validation_submitter.store(slot_ptr, Ordering::Relaxed);
+        self.validation_state.store(
+            validation_word(ValidationPhase::Preparing, generation),
+            Ordering::Release,
+        );
+        self.validation_submissions.fetch_add(1, Ordering::Relaxed);
+        Ok(DeviceValidationToken::new(registration.owner(), generation))
+    }
+
+    /// Attach one setup-allocated output slot. `Preparing -> Attaching`
+    /// serializes list mutation without a lock; activation succeeds only after
+    /// the attachment publishes `Preparing` again.
+    pub(crate) fn add_device_validation_recipient(
+        &self,
+        submission: DeviceValidationToken,
+        recipient: &DeviceValidationRegistration,
+    ) -> Result<DeviceValidationToken> {
+        let generation = submission.generation();
+        let preparing = validation_word(ValidationPhase::Preparing, generation);
+        let attaching = validation_word(ValidationPhase::Attaching, generation);
+        self.validation_state
+            .compare_exchange(preparing, attaching, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|current| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: validation submission owner={} generation={} cannot attach owner={}; \
+                     coordinator is {:?} at generation {}",
+                    submission.owner().get(),
+                    generation,
+                    recipient.owner().get(),
+                    validation_phase(current),
+                    validation_generation(current)
+                ))
+            })?;
+
+        let result = (|| {
+            let submitter_ptr = self.validation_submitter.load(Ordering::Acquire);
+            if submitter_ptr.is_null() {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep: validation submission has no registered submitter slot".into(),
+                ));
+            }
+            // SAFETY: the submitter slot remains registered while its submission
+            // is preparing or active.
+            let submitter = unsafe { &*submitter_ptr };
+            if submitter.owner != submission.owner() {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: validation submission owner {} is foreign to active submitter {}",
+                    submission.owner().get(),
+                    submitter.owner.get()
+                )));
+            }
+
+            let slot = self.validation_slot(recipient)?;
+            let pending = validation_slot_word(ValidationSlotPhase::Pending, generation);
+            loop {
+                let current = slot.state.load(Ordering::Acquire);
+                match validation_slot_phase(current) {
+                    ValidationSlotPhase::Idle | ValidationSlotPhase::Complete => {
+                        if slot
+                            .state
+                            .compare_exchange(current, pending, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            break;
+                        }
+                    }
+                    ValidationSlotPhase::Pending | ValidationSlotPhase::Retired => {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep: validation recipient owner {} cannot attach to generation \
+                             {generation} from slot state {:?} generation {}",
+                            recipient.owner().get(),
+                            validation_slot_phase(current),
+                            validation_generation(current)
+                        )));
+                    }
+                }
+            }
+            let slot_ptr = slot as *const DeviceValidationSlot as *mut DeviceValidationSlot;
+            slot.next.store(
+                self.validation_head.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            self.validation_head.store(slot_ptr, Ordering::Relaxed);
+            Ok(DeviceValidationToken::new(recipient.owner(), generation))
+        })();
+
+        self.validation_state.store(preparing, Ordering::Release);
+        result
+    }
+
+    /// Seal attachment. This release publishes the reset and complete recipient
+    /// list before any thread may acquire cleanup authority.
+    pub(crate) fn activate_device_validation(
+        &self,
+        submission: DeviceValidationToken,
+    ) -> Result<()> {
+        let generation = submission.generation();
+        let submitter_ptr = self.validation_submitter.load(Ordering::Acquire);
+        if submitter_ptr.is_null() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: validation submission has no registered submitter slot".into(),
+            ));
+        }
+        // SAFETY: the submitter cannot unregister while its generation is
+        // preparing.
+        let submitter = unsafe { &*submitter_ptr };
+        if submitter.owner != submission.owner() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation submission owner {} is foreign to active submitter {}",
+                submission.owner().get(),
+                submitter.owner.get()
+            )));
+        }
+        self.validation_state
+            .compare_exchange(
+                validation_word(ValidationPhase::Preparing, generation),
+                validation_word(ValidationPhase::Active, generation),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|current| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: validation submission owner={} generation={} cannot activate; \
+                     coordinator is {:?} at generation {}",
+                    submission.owner().get(),
+                    generation,
+                    validation_phase(current),
+                    validation_generation(current)
+                ))
+            })
+    }
+
+    fn publish_device_validation(&self, generation: u64, flags: u32) {
+        let mut slot_ptr = self.validation_head.load(Ordering::Acquire);
+        while !slot_ptr.is_null() {
+            // SAFETY: pending slots cannot unregister; this traversal owns the
+            // generation's sole `Consuming` authority.
+            let slot = unsafe { &*slot_ptr };
+            let next = slot.next.load(Ordering::Relaxed);
+            slot.flags.store(flags, Ordering::Relaxed);
+            let pending = validation_slot_word(ValidationSlotPhase::Pending, generation);
+            let complete = validation_slot_word(ValidationSlotPhase::Complete, generation);
+            // Release makes the flags payload visible to a sticky reader's
+            // Acquire load of `Complete`.
+            if let Err(current) =
+                slot.state
+                    .compare_exchange(pending, complete, Ordering::Release, Ordering::Acquire)
+            {
+                eprintln!(
+                    "[onnx-runtime-ep-cuda] validation owner {} changed unexpectedly while \
+                     publishing generation {generation}: phase={:?} generation={}",
+                    slot.owner.get(),
+                    validation_slot_phase(current),
+                    validation_generation(current)
+                );
+            }
+            slot_ptr = next;
+        }
+        self.validation_head
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.validation_submitter
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.validation_state
+            .store(validation_word(ValidationPhase::Idle, 0), Ordering::Release);
+        #[cfg(feature = "gpu-tests")]
+        self.validation_cleanups.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Consume exactly `token`. `Active -> Consuming` is the linearization point
+    /// that assigns latch cleanup to one caller; competitors wait for that
+    /// caller's release-published sticky result.
+    pub(crate) fn consume_device_validation(
+        &self,
+        registration: &DeviceValidationRegistration,
+        token: DeviceValidationToken,
+    ) -> Result<u32> {
+        let slot = self.validation_slot(registration)?;
+        if registration.owner() != token.owner() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation token owner={} is foreign to registration owner={}",
+                token.owner().get(),
+                registration.owner().get()
+            )));
+        }
+        self.consume_device_validation_slot(slot, token)
+    }
+
+    pub(crate) fn abort_device_validation_submission(
+        &self,
+        token: DeviceValidationToken,
+    ) -> Result<u32> {
+        let slot_ptr = self.validation_submitter.load(Ordering::Acquire);
+        if slot_ptr.is_null() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation submission owner={} generation={} has no active submitter",
+                token.owner().get(),
+                token.generation()
+            )));
+        }
+        // SAFETY: a pending submitter cannot unregister before this submission
+        // reaches a terminal state.
+        let slot = unsafe { &*slot_ptr };
+        if slot.owner != token.owner() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: validation submission owner={} is foreign to active submitter={}",
+                token.owner().get(),
+                slot.owner.get()
+            )));
+        }
+        self.consume_device_validation_slot(slot, token)
+    }
+
+    fn consume_device_validation_slot(
+        &self,
+        slot: &DeviceValidationSlot,
+        token: DeviceValidationToken,
+    ) -> Result<u32> {
+        let pending = validation_slot_word(ValidationSlotPhase::Pending, token.generation());
+        let complete = validation_slot_word(ValidationSlotPhase::Complete, token.generation());
+        let mut spins = 0_u32;
+        loop {
+            let owner_state = slot.state.load(Ordering::Acquire);
+            if owner_state == complete {
+                let flags = slot.flags.load(Ordering::Relaxed);
+                // An owner may begin a later generation immediately after the
+                // first Acquire; the second rejects that reuse instead of
+                // returning the later generation's flags for this token.
+                if slot.state.load(Ordering::Acquire) == complete {
+                    return Ok(flags);
+                }
+                continue;
+            }
+            if owner_state != pending {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: validation token owner={} generation={} is stale for slot phase \
+                     {:?} generation {}",
+                    token.owner().get(),
+                    token.generation(),
+                    validation_slot_phase(owner_state),
+                    validation_generation(owner_state)
+                )));
+            }
+
+            let coordinator = self.validation_state.load(Ordering::Acquire);
+            if validation_generation(coordinator) != token.generation() {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: validation token owner={} generation={} does not belong to \
+                     coordinator phase {:?} generation {}",
+                    token.owner().get(),
+                    token.generation(),
+                    validation_phase(coordinator),
+                    validation_generation(coordinator)
+                )));
+            }
+            let phase = validation_phase(coordinator);
+            match phase {
+                ValidationPhase::Preparing | ValidationPhase::Active => {
+                    let consuming = validation_word(ValidationPhase::Consuming, token.generation());
+                    if self
+                        .validation_state
+                        .compare_exchange(
+                            coordinator,
+                            consuming,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    #[cfg(feature = "gpu-tests")]
+                    if phase == ValidationPhase::Active
+                        && self.validation_consumer_pause.load(Ordering::Acquire)
+                    {
+                        self.validation_consumer_claimed
+                            .store(true, Ordering::Release);
+                        while self.validation_consumer_pause.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                    }
+                    if phase == ValidationPhase::Preparing {
+                        self.publish_device_validation(token.generation(), 0);
+                        return Ok(0);
+                    }
+                    let result = self
+                        .check_capture_error()
+                        .and_then(|flags| self.reset_capture_error().map(|()| flags));
+                    match result {
+                        Ok(flags) => {
+                            self.publish_device_validation(token.generation(), flags);
+                            return Ok(flags);
+                        }
+                        Err(error) => {
+                            self.validation_state.store(
+                                validation_word(ValidationPhase::Active, token.generation()),
+                                Ordering::Release,
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
+                ValidationPhase::Resetting
+                | ValidationPhase::Attaching
+                | ValidationPhase::Consuming => {
+                    spins = spins.saturating_add(1);
+                    if spins < 64 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                ValidationPhase::Idle => {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep: validation token owner={} generation={} is pending while the \
+                         coordinator is idle",
                         token.owner().get(),
                         token.generation()
                     )));
                 }
             }
         }
-        let result = self
-            .check_capture_error()
-            .and_then(|flags| self.reset_capture_error().map(|()| flags));
-        let mut state = self.validation_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep: device validation ownership lock is poisoned".into())
-        })?;
-        match &result {
-            Ok(flags) => {
-                let generation = token.generation();
-                for index in 0..state.active_owners.len() {
-                    let owner = state.active_owners[index];
-                    if let Some(slot) = state.owners.get_mut(&owner) {
-                        *slot = OwnerDeviceValidation::Completed {
-                            generation,
-                            flags: *flags,
-                        };
-                    }
-                }
-                state.active_owners.clear();
-                state.active = None;
-            }
-            Err(_) => {
-                if let Some(active) = state.active.as_mut() {
-                    active.consuming = false;
-                }
-            }
-        }
-        result
     }
 
     /// Clear the latching capture-error word back to the un-poisoned state.
@@ -1348,10 +1730,47 @@ impl CudaRuntime {
 
     #[cfg(feature = "gpu-tests")]
     pub fn registered_validation_owner_count(&self) -> usize {
-        self.validation_state
-            .lock()
-            .map(|state| state.owners.len())
-            .unwrap_or(usize::MAX)
+        self.registered_validation_owners.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn validation_registry_lock_acquisition_count(&self) -> u64 {
+        self.validation_registry_lock_acquisitions
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn validation_cleanup_count(&self) -> u64 {
+        self.validation_cleanups.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn pause_validation_consumer_for_test(&self, pause: bool) {
+        if pause {
+            self.validation_consumer_claimed
+                .store(false, Ordering::Release);
+        }
+        self.validation_consumer_pause
+            .store(pause, Ordering::Release);
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn validation_consumer_claimed_for_test(&self) -> bool {
+        self.validation_consumer_claimed.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn pause_validation_reset_for_test(&self, pause: bool) {
+        if pause {
+            self.validation_reset_claimed
+                .store(false, Ordering::Release);
+        }
+        self.validation_reset_pause.store(pause, Ordering::Release);
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn validation_reset_claimed_for_test(&self) -> bool {
+        self.validation_reset_claimed.load(Ordering::Acquire)
     }
 
     /// Test-only raw reset for isolated kernel probes that do not use the
@@ -1361,17 +1780,35 @@ impl CudaRuntime {
     /// The caller must prove no validation generation is active.
     #[doc(hidden)]
     pub unsafe fn reset_capture_error_for_isolated_test(&self) -> Result<()> {
-        let state = self.validation_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep: device validation ownership lock is poisoned".into())
-        })?;
-        if state.active.is_some() {
-            return Err(EpError::KernelFailed(
-                "cuda_ep: isolated-test reset refused while a validation generation is active"
-                    .into(),
-            ));
+        let resetting = validation_word(ValidationPhase::Resetting, 0);
+        self.validation_state
+            .compare_exchange(
+                validation_word(ValidationPhase::Idle, 0),
+                resetting,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|current| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: isolated-test reset refused while validation phase {:?} generation \
+                     {} is active",
+                    validation_phase(current),
+                    validation_generation(current)
+                ))
+            })?;
+        #[cfg(feature = "gpu-tests")]
+        {
+            if self.validation_reset_pause.load(Ordering::Acquire) {
+                self.validation_reset_claimed.store(true, Ordering::Release);
+                while self.validation_reset_pause.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
         }
-        drop(state);
-        self.reset_capture_error()
+        let result = self.reset_capture_error();
+        self.validation_state
+            .store(validation_word(ValidationPhase::Idle, 0), Ordering::Release);
+        result
     }
 
     /// Driver-reported capture status for the EP stream.
@@ -3152,18 +3589,17 @@ mod tests {
 
     #[test]
     fn validation_generation_exhaustion_fails_without_wrap_or_aba() {
-        let mut state = DeviceValidationState {
-            next_generation: u64::MAX - 1,
-            ..DeviceValidationState::default()
-        };
-        assert_eq!(state.take_generation().unwrap(), u64::MAX - 1);
-        let error = state
-            .take_generation()
+        let next = AtomicU64::new(VALIDATION_MAX_GENERATION - 1);
+        assert_eq!(
+            take_validation_generation(&next).unwrap(),
+            VALIDATION_MAX_GENERATION - 1
+        );
+        let error = take_validation_generation(&next)
             .expect_err("generation allocation must fail instead of wrapping");
         assert!(error.to_string().contains("generation space exhausted"));
         assert_eq!(
-            state.next_generation,
-            u64::MAX,
+            next.load(Ordering::Relaxed),
+            VALIDATION_MAX_GENERATION,
             "failed allocation must not wrap or reuse an earlier generation"
         );
     }
