@@ -93,8 +93,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool;
+use onnx_runtime_cuda_memory::virtual_memory::{PhysicalHandlePool, PhysicalLocation};
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_ep_api::{
     ExpertWeightGroup, LazyWeightBoundary, ResidencyPlan, Result, StaticProfileResidencyPolicy,
@@ -460,6 +461,16 @@ pub struct RouteResidencyBoundary {
     /// that failed to advance (an older epoch) is caught as stale.
     expected_epoch: AtomicU32,
     expert_groups: Vec<ExpertWeightGroup>,
+    /// The first non-vacuous coarse placement is stable for this executor.
+    /// Later route windows remain real telemetry windows but are observation
+    /// only until a future bidirectional promotion policy exists.
+    transition_state: Mutex<StableTransitionState>,
+}
+
+#[derive(Default)]
+struct StableTransitionState {
+    installed: bool,
+    host_ranges: HashMap<ValueId, Vec<(usize, usize)>>,
 }
 
 impl RouteResidencyBoundary {
@@ -498,6 +509,7 @@ impl RouteResidencyBoundary {
             expected_device,
             expected_epoch: AtomicU32::new(initial_epoch),
             expert_groups,
+            transition_state: Mutex::new(StableTransitionState::default()),
         }
     }
 
@@ -513,6 +525,136 @@ impl RouteResidencyBoundary {
     fn advance_epoch(&self) {
         self.expected_epoch.fetch_add(1, Ordering::Relaxed);
     }
+
+    fn record_host_ranges(
+        &self,
+        state: &mut StableTransitionState,
+        outcome: &RouteWindowConsumeOutcome,
+    ) {
+        let RouteWindowConsumeOutcome::Applied {
+            routed_experts,
+            outcome,
+            ..
+        } = outcome
+        else {
+            return;
+        };
+        if outcome.values_touched == 0 {
+            return;
+        }
+        let hot: std::collections::HashSet<_> = routed_experts.iter().copied().collect();
+        for value in &outcome.committed_values {
+            let Some(catalog) = self.catalogs.get(value) else {
+                continue;
+            };
+            let cold = (0..catalog.layout().experts)
+                .filter(|expert| !hot.contains(expert))
+                .filter_map(|expert| catalog.relative_range(expert))
+                .map(|range| (range.start, range.end - range.start))
+                .collect::<Vec<_>>();
+            if !cold.is_empty() {
+                state.host_ranges.insert(*value, cold);
+            }
+        }
+        state.installed = !state.host_ranges.is_empty();
+    }
+
+    pub(crate) fn restore_host_ranges_to_device(
+        &self,
+        runtime: &Arc<crate::runtime::CudaRuntime>,
+    ) -> std::result::Result<(), String> {
+        let mut state = self
+            .transition_state
+            .lock()
+            .expect("route-residency transition state poisoned");
+        if state.host_ranges.is_empty() {
+            return Ok(());
+        }
+        let verified = crate::granule_transition::verify_safe_point(
+            self.residency.resize_safe_point(self.device_count),
+        )
+        .map_err(str::to_string)?;
+        for (&value, ranges) in &state.host_ranges {
+            let allocator = self
+                .allocators
+                .get(&value)
+                .ok_or_else(|| format!("route-bank value {value:?} lost its allocator"))?;
+            for &(offset, len) in ranges {
+                let outcome = allocator.with_reservation_mut(|reservation, backing| {
+                    crate::granule_transition::transition_granule_range(
+                        runtime,
+                        reservation,
+                        backing,
+                        offset,
+                        len,
+                        PhysicalLocation::Device {
+                            ordinal: self.device_ordinal,
+                        },
+                        &self.host_pool,
+                        &self.device_pool,
+                        &verified,
+                        || self.residency.resize_safe_point(self.device_count),
+                    )
+                });
+                if !matches!(
+                    outcome,
+                    crate::granule_transition::TransitionOutcome::Committed { .. }
+                ) {
+                    return Err(format!(
+                        "route-bank value {value:?} range {offset}..{} restore failed: \
+                         {outcome:?}",
+                        offset.saturating_add(len)
+                    ));
+                }
+                if let Some(queue) = self.residency.deferred_release_queue()
+                    && !queue.wait_until_idle(Duration::from_secs(30))
+                {
+                    return Err(format!(
+                        "route-bank value {value:?} range {offset}..{} old backing did not settle",
+                        offset.saturating_add(len)
+                    ));
+                }
+            }
+        }
+        state.host_ranges.clear();
+        state.installed = false;
+        onnx_runtime_cuda_memory::virtual_memory::trim_physical_handle_pools(
+            self.host_pool.authority(),
+            u64::MAX,
+        )
+        .map_err(|error| format!("cannot trim route-residency physical pools: {error}"))?;
+        Ok(())
+    }
+}
+
+fn observe_route_window_without_transition(
+    binding: &RouteResidencyBoundary,
+    snapshot: &TelemetrySnapshot,
+) -> RouteWindowConsumeOutcome {
+    match prepare_route_window(
+        &binding.residency,
+        snapshot,
+        binding.expected_epoch(),
+        binding.expected_request,
+        binding.expected_device,
+        &binding.bank_values,
+        binding.boundary,
+        &binding.catalogs,
+        binding.device_count,
+    ) {
+        Prepared::Early(outcome) => outcome,
+        Prepared::Ready {
+            routed_experts,
+            epoch,
+            count,
+            ..
+        } => RouteWindowConsumeOutcome::Applied {
+            routed_experts,
+            epoch,
+            count,
+            outcome: Box::default(),
+        },
+    }
 }
 
 /// Why a production route-residency binding could not be constructed from a
@@ -525,21 +667,42 @@ pub enum RouteResidencyBindingReject {
     /// BlockQuantizedMoE node with initializer-backed weight inputs). Dense-only
     /// or non-MoE graphs land here; there is nothing to tier.
     NoExpertGroups,
-    /// More than one routed expert group was discovered. The single-binding
-    /// install authority (one producer window source per EP/request/device)
-    /// cannot yet cover multiple banks, so binding is refused rather than
-    /// silently covering only one. Multi-bank binding is a later slice.
-    MultipleBanksUnsupported { groups: usize },
     /// The discovered group's node has no armed route-telemetry producer source
-    /// (its kernel never surfaced a window source to the EP). Without a producer
-    /// there is no window to consume, so no binding is installed.
-    NoTelemetrySource { node: NodeId },
+    /// yet, but its boundary publishes one during resolved kernel compilation.
+    /// Without a producer there is no window to consume, so no binding is
+    /// installed until a later readiness epoch.
+    NoTelemetrySource {
+        node: NodeId,
+    },
+    /// This boundary has no executor-scoped route-telemetry producer
+    /// publication path. Waiting for another readiness epoch cannot change that,
+    /// so the binding is terminally declined rather than left pending forever.
+    TelemetryProducerUnsupported {
+        node: NodeId,
+        boundary: LazyWeightBoundary,
+    },
     /// A group member weight has no region catalog — it was not classified/
     /// loaded, so the boundary consumer could not map its regions.
-    MissingCatalog { value: ValueId },
+    MissingCatalog {
+        value: ValueId,
+    },
     /// A group member weight has no backing VMM allocator — it was not paged/
     /// committed, so the boundary consumer had no allocator to tier against.
-    MissingAllocator { value: ValueId },
+    MissingAllocator {
+        value: ValueId,
+    },
+    UnsupportedBoundary {
+        node: NodeId,
+        boundary: LazyWeightBoundary,
+    },
+    RequestIdentityOutOfRange {
+        executor: u64,
+    },
+    Reservation(crate::weight_paging::RouteBankReservationReject),
+    TelemetryUnsupported {
+        node: NodeId,
+        reason: String,
+    },
 }
 
 impl RouteResidencyBindingReject {
@@ -549,17 +712,32 @@ impl RouteResidencyBindingReject {
             RouteResidencyBindingReject::NoExpertGroups => {
                 "no routed expert group discovered".to_string()
             }
-            RouteResidencyBindingReject::MultipleBanksUnsupported { groups } => {
-                format!("{groups} expert groups; single-binding authority covers one bank")
-            }
             RouteResidencyBindingReject::NoTelemetrySource { node } => {
                 format!("expert group node {node:?} has no armed telemetry source")
+            }
+            RouteResidencyBindingReject::TelemetryProducerUnsupported { node, boundary } => {
+                format!(
+                    "expert group node {node:?} at {boundary:?} has no supported executor-scoped \
+                     route-telemetry producer"
+                )
             }
             RouteResidencyBindingReject::MissingCatalog { value } => {
                 format!("bank value {value:?} has no region catalog")
             }
             RouteResidencyBindingReject::MissingAllocator { value } => {
                 format!("bank value {value:?} has no VMM allocator")
+            }
+            RouteResidencyBindingReject::UnsupportedBoundary { node, boundary } => {
+                format!("expert group node {node:?} uses unsupported boundary {boundary:?}")
+            }
+            RouteResidencyBindingReject::RequestIdentityOutOfRange { executor } => {
+                format!("executor identity {executor} does not fit telemetry request_id")
+            }
+            RouteResidencyBindingReject::Reservation(reject) => {
+                format!("executor-scoped bank reservation unavailable: {reject}")
+            }
+            RouteResidencyBindingReject::TelemetryUnsupported { node, reason } => {
+                format!("expert group node {node:?} telemetry unsupported: {reason}")
             }
         }
     }
@@ -585,62 +763,59 @@ pub enum RouteResidencyInstallOutcome {
     Installed { banks: usize },
 }
 
-/// Property-based validation of a bindable expert bank against the artifacts an
-/// install would supply, with no GPU handles required (so it is unit-testable).
-///
-/// Uses the typed [`expert_weight_groups`] discovery (via
-/// [`LazyWeightBoundary::for_op`], never op/name allowlists) and fail-closes on
-/// the exact reason nothing can be bound. `has_source`/`has_catalog`/
-/// `has_allocator` are membership predicates over the maps the real builder
-/// holds, so the pure classification here matches what
-/// [`build_route_residency_boundary`] would construct.
-pub(crate) fn validate_route_residency_binding(
+/// Validate every property-discovered expert group before publishing any
+/// boundary. The membership predicates mirror the real source, catalog, and
+/// allocator maps while keeping validation CPU-testable.
+pub(crate) fn validate_route_residency_bindings(
     graph: &Graph,
     has_source: impl Fn(NodeId) -> bool,
     has_catalog: impl Fn(ValueId) -> bool,
     has_allocator: impl Fn(ValueId) -> bool,
-) -> std::result::Result<ExpertWeightGroup, RouteResidencyBindingReject> {
-    let mut groups = expert_weight_groups(graph);
+) -> std::result::Result<Vec<ExpertWeightGroup>, RouteResidencyBindingReject> {
+    let groups = expert_weight_groups(graph);
     if groups.is_empty() {
         return Err(RouteResidencyBindingReject::NoExpertGroups);
     }
-    if groups.len() > 1 {
-        return Err(RouteResidencyBindingReject::MultipleBanksUnsupported {
-            groups: groups.len(),
-        });
-    }
-    let group = groups.pop().expect("exactly one group");
-    if !has_source(group.node) {
-        return Err(RouteResidencyBindingReject::NoTelemetrySource { node: group.node });
-    }
-    for member in &group.members {
-        if !has_catalog(*member) {
-            return Err(RouteResidencyBindingReject::MissingCatalog { value: *member });
+    for group in &groups {
+        if !has_source(group.node) {
+            return Err(
+                if group
+                    .boundary
+                    .route_telemetry_producer_may_appear_after_compilation()
+                {
+                    RouteResidencyBindingReject::NoTelemetrySource { node: group.node }
+                } else {
+                    RouteResidencyBindingReject::TelemetryProducerUnsupported {
+                        node: group.node,
+                        boundary: group.boundary,
+                    }
+                },
+            );
         }
-        if !has_allocator(*member) {
-            return Err(RouteResidencyBindingReject::MissingAllocator { value: *member });
+        for member in &group.members {
+            if !has_catalog(*member) {
+                return Err(RouteResidencyBindingReject::MissingCatalog { value: *member });
+            }
+            if !has_allocator(*member) {
+                return Err(RouteResidencyBindingReject::MissingAllocator { value: *member });
+            }
         }
     }
-    Ok(group)
+    Ok(groups)
 }
 
-/// Construct a production [`RouteResidencyBoundary`] from a loaded graph's
-/// expert banks by property-based discovery.
+/// Construct one production boundary per property-discovered expert group.
 ///
-/// The bank identity, membership (fc1/fc2/fc3/scales/bias) and boundary kind
-/// come entirely from [`expert_weight_groups`] — no model/layer/op-name
-/// allowlist. The producer `source`, `catalogs`, `allocators`, and pools are
-/// the EP's existing authorities, keyed by the discovered node/values; the
-/// builder only *binds* them (it maps nothing and owns no new allocator). On
-/// any missing artifact it fail-closes with a typed
-/// [`RouteResidencyBindingReject`] so the caller installs nothing.
+/// Each group binds only its own producer, catalogs, allocators, and exact
+/// stable-VA reservations. Missing artifacts fail closed before any boundary
+/// is published.
 #[allow(clippy::too_many_arguments)]
-pub fn build_route_residency_boundary(
+pub fn build_route_residency_boundaries(
     graph: &Graph,
     residency: Arc<CudaWeightResidency>,
     sources: &HashMap<NodeId, Arc<dyn RouteTelemetrySource>>,
-    catalogs: HashMap<ValueId, WeightRegionCatalog>,
-    allocators: HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+    allocators: &HashMap<ValueId, Arc<CudaVmmAllocator>>,
     device_pool: Arc<PhysicalHandlePool>,
     host_pool: Arc<PhysicalHandlePool>,
     device_count: usize,
@@ -648,32 +823,44 @@ pub fn build_route_residency_boundary(
     expected_request: u32,
     expected_device: u32,
     initial_epoch: u32,
-) -> std::result::Result<RouteResidencyBoundary, RouteResidencyBindingReject> {
-    let group = validate_route_residency_binding(
+) -> std::result::Result<Vec<RouteResidencyBoundary>, RouteResidencyBindingReject> {
+    let groups = validate_route_residency_bindings(
         graph,
         |node| sources.contains_key(&node),
         |value| catalogs.contains_key(&value),
         |value| allocators.contains_key(&value),
     )?;
-    let source = Arc::clone(&sources[&group.node]);
-    let bank_values = group.members.clone();
-    let boundary = group.boundary;
-    Ok(RouteResidencyBoundary::new(
-        source,
-        residency,
-        bank_values,
-        boundary,
-        catalogs,
-        allocators,
-        device_pool,
-        host_pool,
-        device_count,
-        device_ordinal,
-        expected_request,
-        expected_device,
-        initial_epoch,
-        vec![group],
-    ))
+    Ok(groups
+        .into_iter()
+        .map(|group| {
+            let group_catalogs = group
+                .members
+                .iter()
+                .map(|value| (*value, catalogs[value].clone()))
+                .collect();
+            let group_allocators = group
+                .members
+                .iter()
+                .map(|value| (*value, Arc::clone(&allocators[value])))
+                .collect();
+            RouteResidencyBoundary::new(
+                Arc::clone(&sources[&group.node]),
+                Arc::clone(&residency),
+                group.members.clone(),
+                group.boundary,
+                group_catalogs,
+                group_allocators,
+                Arc::clone(&device_pool),
+                Arc::clone(&host_pool),
+                device_count,
+                device_ordinal,
+                expected_request,
+                expected_device,
+                initial_epoch,
+                vec![group],
+            )
+        })
+        .collect())
 }
 
 /// Observability for the boundary consumer. Every boundary records its typed
@@ -685,6 +872,16 @@ pub fn build_route_residency_boundary(
 pub struct RouteResidencyDiagnostics {
     boundaries: AtomicU64,
     applied: AtomicU64,
+    route_count: AtomicU64,
+    values_touched: AtomicU64,
+    device_bytes_released: AtomicU64,
+    host_bytes_committed: AtomicU64,
+    transition_time_ns: AtomicU64,
+    rollback_count: AtomicU64,
+    quarantined_blocks: AtomicU64,
+    fatal_values: AtomicU64,
+    boundary_host_time_ns: AtomicU64,
+    boundary_host_time_max_ns: AtomicU64,
     rejected: AtomicU64,
     whole_bank: AtomicU64,
     empty: AtomicU64,
@@ -704,6 +901,46 @@ impl RouteResidencyDiagnostics {
     /// Boundaries that applied a routed hot-set through the #1854 lifecycle.
     pub fn applied(&self) -> u64 {
         self.applied.load(Ordering::Relaxed)
+    }
+
+    pub fn route_count(&self) -> u64 {
+        self.route_count.load(Ordering::Relaxed)
+    }
+
+    pub fn values_touched(&self) -> u64 {
+        self.values_touched.load(Ordering::Relaxed)
+    }
+
+    pub fn device_bytes_released(&self) -> u64 {
+        self.device_bytes_released.load(Ordering::Relaxed)
+    }
+
+    pub fn host_bytes_committed(&self) -> u64 {
+        self.host_bytes_committed.load(Ordering::Relaxed)
+    }
+
+    pub fn transition_time_ns(&self) -> u64 {
+        self.transition_time_ns.load(Ordering::Relaxed)
+    }
+
+    pub fn rollback_count(&self) -> u64 {
+        self.rollback_count.load(Ordering::Relaxed)
+    }
+
+    pub fn quarantined_blocks(&self) -> u64 {
+        self.quarantined_blocks.load(Ordering::Relaxed)
+    }
+
+    pub fn fatal_values(&self) -> u64 {
+        self.fatal_values.load(Ordering::Relaxed)
+    }
+
+    pub fn boundary_host_time_ns(&self) -> u64 {
+        self.boundary_host_time_ns.load(Ordering::Relaxed)
+    }
+
+    pub fn boundary_host_time_max_ns(&self) -> u64 {
+        self.boundary_host_time_max_ns.load(Ordering::Relaxed)
     }
 
     /// Boundaries rejected before consume/reset because the point was unsafe.
@@ -776,6 +1013,14 @@ impl RouteResidencyDiagnostics {
         self.set_reason(format!("empty: {reason}"));
     }
 
+    fn record_boundary_host_time(&self, elapsed: Duration) {
+        let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.boundary_host_time_ns
+            .fetch_add(nanos, Ordering::Relaxed);
+        self.boundary_host_time_max_ns
+            .fetch_max(nanos, Ordering::Relaxed);
+    }
+
     fn record_outcome(&self, outcome: &RouteWindowConsumeOutcome) {
         match outcome {
             RouteWindowConsumeOutcome::Disabled => {
@@ -793,9 +1038,33 @@ impl RouteResidencyDiagnostics {
                 routed_experts,
                 epoch,
                 count,
-                ..
+                outcome,
             } => {
                 self.applied.fetch_add(1, Ordering::Relaxed);
+                self.route_count
+                    .fetch_add(u64::from(*count), Ordering::Relaxed);
+                self.values_touched
+                    .fetch_add(outcome.values_touched as u64, Ordering::Relaxed);
+                self.device_bytes_released
+                    .fetch_add(outcome.device_bytes_released, Ordering::Relaxed);
+                self.host_bytes_committed
+                    .fetch_add(outcome.host_bytes_committed, Ordering::Relaxed);
+                let transition_ns =
+                    (outcome.transition_time_ms * 1_000_000.0).clamp(0.0, u64::MAX as f64) as u64;
+                self.transition_time_ns
+                    .fetch_add(transition_ns, Ordering::Relaxed);
+                self.rollback_count
+                    .fetch_add(outcome.rollback_count as u64, Ordering::Relaxed);
+                self.quarantined_blocks.fetch_add(
+                    outcome
+                        .quarantined
+                        .iter()
+                        .map(|(_, blocks)| blocks.len() as u64)
+                        .sum::<u64>(),
+                    Ordering::Relaxed,
+                );
+                self.fatal_values
+                    .fetch_add(outcome.fatal_progress.len() as u64, Ordering::Relaxed);
                 self.set_reason(format!(
                     "applied hot-set of {} experts at epoch {epoch} (count {count})",
                     routed_experts.len()
@@ -830,6 +1099,7 @@ pub fn run_route_residency_boundary(
     binding: &RouteResidencyBoundary,
     diag: &RouteResidencyDiagnostics,
 ) -> Result<()> {
+    let started = Instant::now();
     diag.boundaries.fetch_add(1, Ordering::Relaxed);
 
     // Fail closed before the snapshot dtoh so an unsafe boundary (capture/
@@ -841,30 +1111,41 @@ pub fn run_route_residency_boundary(
         .blocking_reason()
     {
         diag.record_rejected(reason);
+        diag.record_boundary_host_time(started.elapsed());
         return Ok(());
     }
 
     let Some(snapshot) = binding.source.route_telemetry_snapshot()? else {
         diag.record_empty("route telemetry disarmed; no window to consume");
+        diag.record_boundary_host_time(started.elapsed());
         return Ok(());
     };
 
-    let outcome = consume_route_window_at_boundary(
-        &binding.residency,
-        &snapshot,
-        binding.expected_epoch(),
-        binding.expected_request,
-        binding.expected_device,
-        &binding.bank_values,
-        binding.boundary,
-        &binding.catalogs,
-        &binding.allocators,
-        &binding.device_pool,
-        &binding.host_pool,
-        binding.device_count,
-        binding.device_ordinal,
-        &binding.expert_groups,
-    );
+    let mut transition_state = binding
+        .transition_state
+        .lock()
+        .expect("route-residency transition state poisoned");
+    let outcome = if transition_state.installed {
+        observe_route_window_without_transition(binding, &snapshot)
+    } else {
+        consume_route_window_at_boundary(
+            &binding.residency,
+            &snapshot,
+            binding.expected_epoch(),
+            binding.expected_request,
+            binding.expected_device,
+            &binding.bank_values,
+            binding.boundary,
+            &binding.catalogs,
+            &binding.allocators,
+            &binding.device_pool,
+            &binding.host_pool,
+            binding.device_count,
+            binding.device_ordinal,
+            &binding.expert_groups,
+        )
+    };
+    binding.record_host_ranges(&mut transition_state, &outcome);
 
     if window_was_consumed(&outcome) {
         binding.source.reset_route_telemetry_boundary()?;
@@ -872,6 +1153,7 @@ pub fn run_route_residency_boundary(
     }
 
     diag.record_outcome(&outcome);
+    diag.record_boundary_host_time(started.elapsed());
     Ok(())
 }
 
@@ -887,6 +1169,7 @@ pub fn run_route_residency_boundary_with_phase8_faults(
     diag: &RouteResidencyDiagnostics,
     phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
 ) -> Result<()> {
+    let started = Instant::now();
     diag.boundaries.fetch_add(1, Ordering::Relaxed);
 
     if let Some(reason) = binding
@@ -895,32 +1178,43 @@ pub fn run_route_residency_boundary_with_phase8_faults(
         .blocking_reason()
     {
         diag.record_rejected(reason);
+        diag.record_boundary_host_time(started.elapsed());
         return Ok(());
     }
 
     let Some(snapshot) = binding.source.route_telemetry_snapshot()? else {
         diag.record_empty("route telemetry disarmed; no window to consume");
+        diag.record_boundary_host_time(started.elapsed());
         return Ok(());
     };
 
-    let outcome = consume_route_window_at_boundary_with_phase8_faults(
-        runtime,
-        &binding.residency,
-        &snapshot,
-        binding.expected_epoch(),
-        binding.expected_request,
-        binding.expected_device,
-        &binding.bank_values,
-        binding.boundary,
-        &binding.catalogs,
-        &binding.allocators,
-        &binding.device_pool,
-        &binding.host_pool,
-        binding.device_count,
-        binding.device_ordinal,
-        &binding.expert_groups,
-        phase8_faults,
-    );
+    let mut transition_state = binding
+        .transition_state
+        .lock()
+        .expect("route-residency transition state poisoned");
+    let outcome = if transition_state.installed {
+        observe_route_window_without_transition(binding, &snapshot)
+    } else {
+        consume_route_window_at_boundary_with_phase8_faults(
+            runtime,
+            &binding.residency,
+            &snapshot,
+            binding.expected_epoch(),
+            binding.expected_request,
+            binding.expected_device,
+            &binding.bank_values,
+            binding.boundary,
+            &binding.catalogs,
+            &binding.allocators,
+            &binding.device_pool,
+            &binding.host_pool,
+            binding.device_count,
+            binding.device_ordinal,
+            &binding.expert_groups,
+            phase8_faults,
+        )
+    };
+    binding.record_host_ranges(&mut transition_state, &outcome);
 
     if window_was_consumed(&outcome) {
         binding.source.reset_route_telemetry_boundary()?;
@@ -928,6 +1222,7 @@ pub fn run_route_residency_boundary_with_phase8_faults(
     }
 
     diag.record_outcome(&outcome);
+    diag.record_boundary_host_time(started.elapsed());
     Ok(())
 }
 
@@ -944,9 +1239,9 @@ fn _assert_qmoe_is_route_telemetry_source() {
 mod binding_tests {
     //! CPU-only tests for the property-based binding *builder*'s discovery and
     //! typed fail-closed rejects. These need no GPU handles because
-    //! [`validate_route_residency_binding`] classifies purely from the graph
+    //! [`validate_route_residency_bindings`] classifies purely from the graph
     //! and membership predicates — the exact predicates
-    //! [`build_route_residency_boundary`] evaluates against its real
+    //! [`build_route_residency_boundaries`] evaluates against its real
     //! source/catalog/allocator maps. The successful *construction* (which does
     //! need a real residency/allocator) is proven by the GPU harness.
     use std::collections::HashSet;
@@ -954,7 +1249,7 @@ mod binding_tests {
     use onnx_runtime_ep_api::LazyWeightBoundary;
     use onnx_runtime_ir::{DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape};
 
-    use super::{RouteResidencyBindingReject, validate_route_residency_binding};
+    use super::{RouteResidencyBindingReject, validate_route_residency_bindings};
 
     fn shape1(n: usize) -> onnx_runtime_ir::Shape {
         static_shape([n])
@@ -1008,6 +1303,20 @@ mod binding_tests {
         )
     }
 
+    fn block_quantized_moe_node(graph: &mut Graph) -> (NodeId, ValueId) {
+        let input = graph.create_named_value("input", DataType::Float32, shape1(4));
+        let weight = inline_initializer(graph, "experts");
+        let output = graph.create_named_value("output", DataType::Float32, shape1(4));
+        let mut node = onnx_runtime_ir::Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            vec![Some(input), Some(weight)],
+            vec![output],
+        );
+        node.domain = "pkg.nxrt".to_string();
+        (graph.insert_node(node), weight)
+    }
+
     fn always(_: NodeId) -> bool {
         true
     }
@@ -1019,8 +1328,10 @@ mod binding_tests {
     fn binds_single_qmoe_bank_with_all_artifacts_present() {
         let mut graph = Graph::new();
         let (node, members) = qmoe_node(&mut graph);
-        let group = validate_route_residency_binding(&graph, always, always_v, always_v)
+        let groups = validate_route_residency_bindings(&graph, always, always_v, always_v)
             .expect("bindable bank");
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
         assert_eq!(group.node, node);
         assert_eq!(group.boundary, LazyWeightBoundary::QMoe);
         assert_eq!(group.members, members, "exact fc1/fc2/fc3 membership bound");
@@ -1040,29 +1351,50 @@ mod binding_tests {
             vec![y],
         ));
         assert_eq!(
-            validate_route_residency_binding(&graph, always, always_v, always_v),
+            validate_route_residency_bindings(&graph, always, always_v, always_v),
             Err(RouteResidencyBindingReject::NoExpertGroups)
         );
     }
 
     #[test]
-    fn rejects_multiple_banks_as_single_binding_unsupported() {
+    fn plural_binding_accepts_multiple_property_discovered_banks() {
         let mut graph = Graph::new();
-        qmoe_node(&mut graph);
-        qmoe_node(&mut graph);
-        assert_eq!(
-            validate_route_residency_binding(&graph, always, always_v, always_v),
-            Err(RouteResidencyBindingReject::MultipleBanksUnsupported { groups: 2 })
-        );
+        let (first, _) = qmoe_node(&mut graph);
+        let (second, _) = qmoe_node(&mut graph);
+        let groups = validate_route_residency_bindings(&graph, always, always_v, always_v)
+            .expect("plural binding");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].node, first);
+        assert_eq!(groups[1].node, second);
     }
 
     #[test]
     fn rejects_when_group_node_has_no_telemetry_source() {
         let mut graph = Graph::new();
         let (node, _) = qmoe_node(&mut graph);
-        let err = validate_route_residency_binding(&graph, |_| false, always_v, always_v)
+        let err = validate_route_residency_bindings(&graph, |_| false, always_v, always_v)
             .expect_err("no source");
         assert_eq!(err, RouteResidencyBindingReject::NoTelemetrySource { node });
+    }
+
+    #[test]
+    fn missing_block_quantized_moe_producer_is_terminally_unsupported() {
+        let mut graph = Graph::new();
+        let (node, _) = block_quantized_moe_node(&mut graph);
+        let err = validate_route_residency_bindings(&graph, |_| false, always_v, always_v)
+            .expect_err("BlockQuantizedMoE has no deferred producer");
+        assert_eq!(
+            err,
+            RouteResidencyBindingReject::TelemetryProducerUnsupported {
+                node,
+                boundary: LazyWeightBoundary::BlockQuantizedMoe,
+            }
+        );
+        let reason = err.reason();
+        assert!(
+            reason.contains("BlockQuantizedMoe") && reason.contains("no supported"),
+            "terminal reason names the unsupported boundary capability: {reason}"
+        );
     }
 
     #[test]
@@ -1071,7 +1403,7 @@ mod binding_tests {
         let (_, members) = qmoe_node(&mut graph);
         // Every member classified except the first, which lacks a catalog.
         let with_catalog: HashSet<ValueId> = members[1..].iter().copied().collect();
-        let err = validate_route_residency_binding(
+        let err = validate_route_residency_bindings(
             &graph,
             always,
             |v| with_catalog.contains(&v),
@@ -1089,9 +1421,10 @@ mod binding_tests {
         let mut graph = Graph::new();
         let (_, members) = qmoe_node(&mut graph);
         let with_alloc: HashSet<ValueId> = members[1..].iter().copied().collect();
-        let err =
-            validate_route_residency_binding(&graph, always, always_v, |v| with_alloc.contains(&v))
-                .expect_err("missing allocator");
+        let err = validate_route_residency_bindings(&graph, always, always_v, |v| {
+            with_alloc.contains(&v)
+        })
+        .expect_err("missing allocator");
         assert_eq!(
             err,
             RouteResidencyBindingReject::MissingAllocator { value: members[0] }
@@ -1105,7 +1438,26 @@ mod binding_tests {
                 .reason()
                 .is_empty()
         );
-        let r = RouteResidencyBindingReject::MultipleBanksUnsupported { groups: 3 }.reason();
-        assert!(r.contains('3'), "reason carries the group count: {r}");
+        let r = RouteResidencyBindingReject::NoTelemetrySource { node: NodeId(3) }.reason();
+        assert!(r.contains('3'), "reason carries the node identity: {r}");
+    }
+
+    #[test]
+    fn reservation_unavailable_reason_carries_typed_detail() {
+        let r = RouteResidencyBindingReject::Reservation(
+            crate::weight_paging::RouteBankReservationReject::UnalignedExpertRange {
+                value: ValueId(7),
+                expert: 0,
+                offset: 1,
+                len: 2,
+                granularity: 4,
+            },
+        )
+        .reason();
+        assert!(r.contains("ValueId(7)"), "reason names the bank value: {r}");
+        assert!(
+            r.contains("not aligned") && r.contains("reservation"),
+            "reason preserves the typed reservation failure: {r}"
+        );
     }
 }

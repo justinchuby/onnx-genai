@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::ffi::c_void;
+use std::num::NonZeroU64;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +23,112 @@ use crate::weight::ExecutionProviderCapabilities;
 /// Index of an EP within an [`crate::registry::EpRegistry`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct EpId(pub u32);
+
+/// Process-unique identity of one executor instance sharing an execution
+/// provider.
+///
+/// A session may own several executors (base decode, decode-inline, MTP verify)
+/// over the same `Arc<dyn ExecutionProvider>`. Provider-owned artifacts whose
+/// lifetime follows an executor use this identity instead of graph-local
+/// [`NodeId`]s, which collide across sibling executors.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ExecutorInstanceId(NonZeroU64);
+
+impl ExecutorInstanceId {
+    /// Allocate a process-unique executor identity.
+    pub fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            id < u64::MAX,
+            "executor instance id space exhausted before identity reuse"
+        );
+        Self(NonZeroU64::new(id).expect("executor identity starts at one"))
+    }
+
+    /// Stable numeric representation for provider-owned maps and diagnostics.
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Executor-scoped residency and device-graph telemetry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecutorResidencyTelemetry {
+    pub route_boundaries: u64,
+    pub route_applied: u64,
+    pub expert_device_bytes_released: u64,
+    pub expert_host_bytes_committed: u64,
+    pub quarantined_blocks: u64,
+    pub graph_captures: u64,
+    pub graph_replays: u64,
+    pub graph_fallbacks: u64,
+    pub weight_page_ins: u64,
+    pub weight_hits: u64,
+    pub weight_evictions: u64,
+    pub weight_committed_bytes: u64,
+    pub weight_prefetch_fallbacks: u64,
+    pub drained: bool,
+    pub quarantined: bool,
+}
+
+/// Monotonic executor-local epoch for concrete kernel/producer readiness.
+///
+/// The session advances this at the kernel-cache publication chokepoint whenever
+/// any build, binding-preparation, or runtime-dispatch path creates a new
+/// specialization. A provider that returns
+/// [`ExecutorArtifactFinalization::Pending`] is not called again for the same
+/// epoch: another attempt requires a concrete compilation transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExecutorArtifactReadinessEpoch(u64);
+
+impl ExecutorArtifactReadinessEpoch {
+    pub const INITIAL: Self = Self(0);
+
+    pub const fn new(epoch: u64) -> Self {
+        Self(epoch)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Typed reason provider-artifact finalization cannot yet reach a terminal
+/// outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorArtifactPending {
+    /// A graph node that requires an execution-time producer has not published
+    /// it for this executor yet.
+    ProducerUnavailable { node: NodeId },
+    /// Provider-specific readiness which is not represented by a graph node.
+    ProviderReadiness { reason: String },
+}
+
+impl ExecutorArtifactPending {
+    pub fn reason(&self) -> String {
+        match self {
+            Self::ProducerUnavailable { node } => {
+                format!("producer for graph node {node:?} is not registered")
+            }
+            Self::ProviderReadiness { reason } => reason.clone(),
+        }
+    }
+}
+
+/// Result of the authoritative executor-artifact finalization transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorArtifactFinalization {
+    /// Every provider artifact required by this executor reached an honest
+    /// terminal outcome: installed, disabled, or structurally declined. Later
+    /// kernel specializations may reuse the executor-owned producer identity
+    /// without reinstalling.
+    Complete,
+    /// A readiness-dependent producer is not available yet. Nothing terminal
+    /// was latched. Execution and capture remain forbidden, and the executor
+    /// may invoke the transition again only after its readiness epoch advances.
+    Pending(ExecutorArtifactPending),
+}
 
 /// Tie-break policy for [`ExecutionProvider::device_argmax`] when two or more
 /// logits share the maximum value.
@@ -99,7 +206,10 @@ impl DeviceGraphSlot {
 /// A provider may be shared by several sessions. The owner prevents one
 /// executor's `Primary` or `Verify` graph from naming another executor's slot.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct DeviceGraphOwner(u64);
+pub struct DeviceGraphOwner {
+    id: u64,
+    executor: Option<ExecutorInstanceId>,
+}
 
 impl DeviceGraphOwner {
     /// Mint a process-unique owner identity. Identities are never reused.
@@ -115,12 +225,32 @@ impl DeviceGraphOwner {
                      create an ABA collision"
                 )
             });
-        Self(owner)
+        Self {
+            id: owner,
+            executor: None,
+        }
+    }
+
+    /// Derive the device-graph namespace owned by one executor.
+    ///
+    /// This is a typed projection of the executor identity, not a second
+    /// independently allocated identity. Providers can therefore attribute
+    /// graph lifecycle telemetry without maintaining a fallible side map.
+    pub const fn for_executor(executor: ExecutorInstanceId) -> Self {
+        Self {
+            id: executor.0.get(),
+            executor: Some(executor),
+        }
     }
 
     /// Stable process-local numeric identity.
     pub const fn get(self) -> u64 {
-        self.0
+        self.id
+    }
+
+    /// Executor scope associated with this graph namespace, when one exists.
+    pub const fn executor(self) -> Option<ExecutorInstanceId> {
+        self.executor
     }
 }
 
@@ -999,6 +1129,20 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Executor-scoped lazy-weight paging.
+    ///
+    /// Providers with executor-owned stable reservations override this method;
+    /// stock providers preserve the historical unscoped path.
+    fn page_lazy_weight_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        key: u64,
+        weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
+    ) -> Result<Option<crate::PagedWeight>> {
+        self.page_lazy_weight(key, weight, source)
+    }
+
     /// Prove routed-bank residency for a QMoE-family dispatch and mint a
     /// guard the executor keeps alive for the kernel's lifetime, exactly like
     /// [`Self::page_lazy_weight`]'s `PagedWeight`.
@@ -1022,6 +1166,17 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Executor-scoped routed-residency proof acquisition.
+    fn acquire_routed_residency_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        key: u64,
+        requirement: crate::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    ) -> Result<Option<Box<dyn crate::RoutedResidencyGuardHandle>>> {
+        self.acquire_routed_residency(key, requirement, catalog)
+    }
+
     /// Best-effort lookahead page-in for a lazy weight the executor knows will be
     /// needed by a later node. Returns `true` only when a transfer was actually
     /// enqueued, so callers can distinguish a real prefetch from a no-op or
@@ -1035,6 +1190,17 @@ pub trait ExecutionProvider: Send + Sync {
     ) -> Result<bool> {
         let _ = (key, weight, source);
         Ok(false)
+    }
+
+    /// Executor-scoped lazy-weight prefetch.
+    fn prefetch_lazy_weight_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        key: u64,
+        weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
+    ) -> Result<bool> {
+        self.prefetch_lazy_weight(key, weight, source)
     }
 
     /// Initialize device resources / load libraries.
@@ -1097,6 +1263,22 @@ pub trait ExecutionProvider: Send + Sync {
     /// owning graph. EPs use it to select opset-specialized kernels (e.g. the
     /// opset-13 per-axis vs. the legacy opset-<13 2D-coercion `Softmax`).
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>>;
+
+    /// Executor-scoped kernel creation.
+    ///
+    /// The default preserves providers that own no executor-scoped artifacts.
+    /// Providers whose factories publish producer handles override this method
+    /// so compilation is attributed to the owning executor rather than to a
+    /// graph-local node id shared by sibling sessions.
+    fn get_kernel_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> Result<Box<dyn Kernel>> {
+        self.get_kernel(op, shapes, opset)
+    }
 
     /// Apply EP-owned structural policy to one prospective capture-region node.
     ///
@@ -1647,6 +1829,17 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(DeviceValidationRegistration::new(owner, ()))
     }
 
+    /// Register the deferred-validation owner of one executor.
+    ///
+    /// Providers that couple another executor-scoped safe-boundary action to
+    /// validation completion may retain the identity in setup-allocated state.
+    fn register_device_validation_owner_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+    ) -> Result<DeviceValidationRegistration> {
+        self.register_device_validation_owner()
+    }
+
     /// Retire one executor/binding validation owner at teardown.
     fn unregister_device_validation_owner(
         &self,
@@ -1696,6 +1889,12 @@ pub trait ExecutionProvider: Send + Sync {
         false
     }
 
+    /// Whether consuming a deferred validation generation also executes this
+    /// provider's executor-scoped route-residency safe boundary.
+    fn validation_consumes_route_residency(&self) -> bool {
+        false
+    }
+
     /// Consume the exact top-level device-validation generation after a host
     /// synchronization boundary. Implementations reject foreign and stale
     /// tokens; concurrent exact consumers converge on the same sticky result.
@@ -1728,6 +1927,69 @@ pub trait ExecutionProvider: Send + Sync {
     /// consumes or resets anything, and surfaces a typed outcome to its own
     /// diagnostics rather than failing silently.
     fn consume_route_residency_at_boundary(&self) -> Result<()>;
+
+    /// Executor-scoped form of
+    /// [`Self::consume_route_residency_at_boundary`].
+    ///
+    /// The default delegates to the historical unscoped hook. A provider that
+    /// can be shared by sibling executors overrides this method so one
+    /// executor's request boundary cannot consume another executor's producer.
+    fn consume_route_residency_at_boundary_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+    ) -> Result<()> {
+        self.consume_route_residency_at_boundary()
+    }
+
+    /// Whether the session should retain finalized expert-bank descriptors for
+    /// this provider's executor-artifact finalization transition.
+    ///
+    /// The default is false, so non-participating providers and the shipped
+    /// default-off CUDA path allocate and retain no route-residency metadata.
+    fn wants_finalized_route_residency_banks(&self) -> bool {
+        false
+    }
+
+    /// Authoritative transition for "all provider artifacts required by this
+    /// executor's resolved compilation are finalized."
+    ///
+    /// Static build and every newly compiled symbolic/dynamic specialization
+    /// invoke this same idempotent path after kernel factories have published
+    /// their producer handles and before any execution, capture, or replay.
+    /// `readiness` advances at every executor kernel-cache miss, including
+    /// binding preparation and runtime dispatch; the executor never calls a
+    /// provider twice for the same pending/failed epoch. Structural declines
+    /// may latch as [`ExecutorArtifactFinalization::Complete`];
+    /// readiness-dependent absence returns
+    /// [`ExecutorArtifactFinalization::Pending`] without poisoning a later
+    /// epoch. An `Err` is also fail-closed and may be retried only after a later
+    /// compilation epoch. The default completes without side effects.
+    fn finalize_executor_artifacts(
+        &self,
+        _executor: ExecutorInstanceId,
+        _graph: &Graph,
+        _banks: &[crate::FinalizedExpertBank],
+        _readiness: ExecutorArtifactReadinessEpoch,
+    ) -> Result<ExecutorArtifactFinalization> {
+        Ok(ExecutorArtifactFinalization::Complete)
+    }
+
+    /// Drain exactly the artifacts owned by `executor`.
+    ///
+    /// The default is a no-op. Participating providers must make this
+    /// idempotent and must not clear producer/boundary state owned by sibling
+    /// executors sharing the same provider.
+    fn drain_executor_artifacts(&self, _executor: ExecutorInstanceId) -> Result<()> {
+        Ok(())
+    }
+
+    /// Snapshot telemetry owned exclusively by `executor`.
+    fn executor_residency_telemetry(
+        &self,
+        _executor: ExecutorInstanceId,
+    ) -> Option<ExecutorResidencyTelemetry> {
+        None
+    }
 
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {

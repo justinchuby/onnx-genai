@@ -1,6 +1,11 @@
 //! Production allocator proof for cross-reservation physical-handle reuse.
 
 use cudarc::driver::CudaContext;
+use onnx_runtime_cuda_memory::capability::host_numa_capability;
+use onnx_runtime_cuda_memory::virtual_memory::{
+    DeferredReservationQueue, PhysicalHandlePool, PhysicalLocation, ReservationEnqueueError,
+    ReservationTeardownTicket,
+};
 use onnx_runtime_cuda_memory::vmm_allocator::{
     CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV, CudaVmmAllocator,
 };
@@ -11,6 +16,135 @@ use onnx_runtime_memory_governor::{
 use std::sync::{Arc, Barrier};
 
 const HOLDER: HolderId = HolderId::new(736);
+
+#[derive(Debug)]
+struct ImmediateReservationQueue;
+
+impl DeferredReservationQueue for ImmediateReservationQueue {
+    fn enqueue_reservation(
+        &self,
+        ticket: ReservationTeardownTicket,
+    ) -> Result<(), ReservationEnqueueError> {
+        let report = ticket.execute_outcome().report;
+        assert!(report.is_complete(), "reservation teardown: {report:?}");
+        Ok(())
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn isolated_pool_constructor_enforces_authority_device_and_location() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 8 << 30, 0));
+    let role = MemoryRole::Weights;
+    let pool = PhysicalHandlePool::new_isolated_at_location(
+        Arc::clone(&context),
+        0,
+        PhysicalLocation::Device { ordinal: 0 },
+        0,
+        &governor,
+        HOLDER,
+        role,
+    )
+    .expect("isolated device pool");
+    let queue: Arc<dyn DeferredReservationQueue> = Arc::new(ImmediateReservationQueue);
+    let allocator = CudaVmmAllocator::new_with_physical_pool_and_reservation_queue(
+        Arc::clone(&context),
+        DeviceKey::device(0),
+        0,
+        pool.granularity(),
+        &governor,
+        HOLDER,
+        role,
+        Arc::clone(&pool),
+        Arc::clone(&queue),
+    )
+    .expect("allocator using the matching authority-owned pool");
+
+    let granularity = pool.granularity();
+    let allocation = allocator
+        .allocate(granularity, granularity)
+        .expect("commit one pool granule");
+    assert_eq!(governor.used(Tier::Device), granularity as u64);
+
+    let other_governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 8 << 30, 0));
+    let authority_error = CudaVmmAllocator::new_with_physical_pool_and_reservation_queue(
+        Arc::clone(&context),
+        DeviceKey::device(0),
+        0,
+        granularity,
+        &other_governor,
+        HOLDER,
+        role,
+        Arc::clone(&pool),
+        Arc::clone(&queue),
+    )
+    .expect_err("a foreign governor cannot mutate this pool");
+    assert!(
+        authority_error
+            .to_string()
+            .contains("different memory authority")
+    );
+
+    let device_error = CudaVmmAllocator::new_with_physical_pool_and_reservation_queue(
+        Arc::clone(&context),
+        DeviceKey::device(1),
+        1,
+        granularity,
+        &governor,
+        HOLDER,
+        role,
+        Arc::clone(&pool),
+        Arc::clone(&queue),
+    )
+    .expect_err("a device-0 pool cannot back a device-1 allocator");
+    assert!(
+        device_error
+            .to_string()
+            .contains("does not match the allocator device")
+    );
+
+    let host_numa = host_numa_capability(0).expect("HOST_NUMA capability");
+    let host_pool = PhysicalHandlePool::new_isolated_at_location(
+        Arc::clone(&context),
+        0,
+        PhysicalLocation::HostNuma {
+            node: host_numa.host_numa_id,
+        },
+        0,
+        &governor,
+        HOLDER,
+        role,
+    )
+    .expect("isolated HOST_NUMA pool");
+    let location_error = CudaVmmAllocator::new_with_physical_pool_and_reservation_queue(
+        Arc::clone(&context),
+        DeviceKey::device(0),
+        0,
+        granularity,
+        &governor,
+        HOLDER,
+        role,
+        host_pool,
+        Arc::clone(&queue),
+    )
+    .expect_err("a HOST_NUMA pool cannot be supplied as the allocator's device pool");
+    assert!(
+        location_error
+            .to_string()
+            .contains("does not match the allocator device")
+    );
+
+    // SAFETY: this exact allocation belongs to `allocator` and has no in-flight users.
+    unsafe { allocator.deallocate(allocation, granularity, granularity) };
+    drop(allocator);
+    assert_eq!(governor.used(Tier::Device), 0);
+    assert_eq!(governor.used(Tier::Host), 0);
+    assert_eq!(pool.stats().snapshot().total_owned_bytes, 0);
+}
 
 #[cfg_attr(
     not(feature = "gpu-tests"),

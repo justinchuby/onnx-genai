@@ -606,6 +606,40 @@ pub(super) fn plan_default_residency(
     )
 }
 
+fn finalized_expert_banks(
+    graph: &Graph,
+    handles: &HashMap<ValueId, WeightHandle>,
+    catalogs: &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+) -> Vec<FinalizedExpertBank> {
+    expert_weight_groups(graph)
+        .into_iter()
+        .map(|group| {
+            let members = group
+                .members
+                .iter()
+                .filter_map(|value| {
+                    let WeightHandle::Lazy(weight) = handles.get(value)? else {
+                        return None;
+                    };
+                    let catalog = catalogs.get(value)?;
+                    let onnx_runtime_ir::WeightRef::External { path, .. } =
+                        graph.initializers.get(value)?
+                    else {
+                        return None;
+                    };
+                    Some(FinalizedExpertWeight {
+                        value: *value,
+                        external_path: path.clone(),
+                        weight: weight.clone(),
+                        catalog: catalog.clone(),
+                    })
+                })
+                .collect();
+            FinalizedExpertBank { group, members }
+        })
+        .collect()
+}
+
 /// Test/measurement seam: build a plan with an arbitrary
 /// [`onnx_runtime_ep_api::ResidencyPolicy`], to prove the boundary is
 /// substitutable without wiring a second production call site.
@@ -910,6 +944,11 @@ impl Executor {
             }
             plan
         };
+        let finalized_expert_banks = if ep.wants_finalized_route_residency_banks() {
+            finalized_expert_banks(&graph, &weight_handles, &expert_region_candidates)
+        } else {
+            Vec::new()
+        };
 
         let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
             Self::materialize_initializers(&graph, &weights, ep.as_ref(), &weight_handles)?;
@@ -940,17 +979,20 @@ impl Executor {
 
         let plan_len = plan.len();
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
+        let instance_id = ExecutorInstanceId::fresh();
         let mut exec = Self {
+            instance_id,
             graph,
             weights,
             ep,
             heterogeneous: None,
             graph_slot: DeviceGraphSlot::Primary,
-            graph_owner: DeviceGraphOwner::new(),
+            graph_owner: DeviceGraphOwner::for_executor(instance_id),
             validation_registration: None,
             pending_device_validation: None,
             weight_handles,
             expert_region_candidates,
+            finalized_expert_banks,
             residency_plan,
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
@@ -1012,6 +1054,7 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
+            provider_artifact_readiness: ProviderArtifactReadiness::default(),
             persistent_workspace: None,
             step_workspace: None,
             pin_step_workspace: false,
@@ -1027,7 +1070,7 @@ impl Executor {
             let mut span = trace_span("session.static_materialize", "session");
             let empty = HashMap::new();
             let resolved = exec.resolve_all(&empty)?;
-            exec.compile_all(&resolved)?;
+            exec.ensure_provider_artifacts_ready(&resolved)?;
             exec.size_buffers(&resolved)?;
             if let Some(span) = span.as_mut() {
                 span.set_args(
@@ -1152,7 +1195,10 @@ impl Executor {
             }
         }
 
-        exec.validation_registration = Some(exec.ep.register_device_validation_owner()?);
+        exec.validation_registration = Some(
+            exec.ep
+                .register_device_validation_owner_for_executor(exec.instance_id)?,
+        );
         Ok(exec)
     }
 
@@ -2259,13 +2305,42 @@ impl Executor {
             .collect()
     }
 
-    /// Populate the kernel cache for the compiled plan against `resolved` shapes.
-    pub(super) fn compile_all(&mut self, resolved: &HashMap<ValueId, Vec<usize>>) -> Result<()> {
+    /// Advance the executor's pre-execution provider-artifact state machine.
+    ///
+    /// Every currently-resolved leaf kernel is compiled first, publishing any
+    /// executor-scoped producer handles. The provider then receives the
+    /// resulting readiness epoch and must report either an honest terminal
+    /// outcome or a typed pending state. Pending and failed epochs are cached:
+    /// another run with no newly compiled specialization returns the same typed
+    /// error without calling the provider again. No caller may execute or enter
+    /// capture until this method succeeds.
+    pub(super) fn ensure_provider_artifacts_ready(
+        &mut self,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) -> Result<()> {
+        self.compile_ready_kernels(resolved)?;
+        self.provider_artifact_readiness.finalize_if_needed(
+            self.ep.as_ref(),
+            self.instance_id,
+            &self.graph,
+            &self.finalized_expert_banks,
+        )
+    }
+
+    /// Compile every leaf kernel whose inputs are currently resolved.
+    ///
+    /// Unresolved leaves are deliberately skipped rather than guessed. A
+    /// provider that needs one of them observes its missing producer and
+    /// returns typed `Pending`, which blocks the plan until a later input
+    /// specialization creates a concrete kernel and advances the readiness
+    /// epoch.
+    fn compile_ready_kernels(&mut self, resolved: &HashMap<ValueId, Vec<usize>>) -> Result<()> {
         let mut span = trace_span("session.kernel_compile_plan", "session");
         let cache_entries_before = self.cache.stats().entries;
         let mut compiled_nodes = 0_u64;
         let mut skipped_control_flow = 0_u64;
         let mut skipped_sequence = 0_u64;
+        let mut skipped_unresolved = 0_u64;
         for i in 0..self.plan.len() {
             let node_id = self.plan[i].node_id;
             let node = self.graph.node(node_id);
@@ -2285,6 +2360,30 @@ impl Executor {
                 if span.is_some() {
                     skipped_sequence += 1;
                 }
+                continue;
+            }
+            if !self.plan[i]
+                .inputs
+                .iter()
+                .all(|input| input.is_none_or(|value| resolved.contains_key(&value)))
+            {
+                if span.is_some() {
+                    skipped_unresolved += 1;
+                }
+                continue;
+            }
+            if self.kernel_bindings[i].as_ref().is_some_and(|binding| {
+                self.cache.contains(binding)
+                    && binding.shapes.len() == self.plan[i].inputs.len()
+                    && binding.shapes.iter().zip(&self.plan[i].inputs).all(
+                        |(bound_shape, input)| match input {
+                            Some(value) => resolved
+                                .get(value)
+                                .is_some_and(|shape| shape == bound_shape),
+                            None => bound_shape.is_empty(),
+                        },
+                    )
+            }) {
                 continue;
             }
             if span.is_some() {
@@ -2318,9 +2417,15 @@ impl Executor {
                 &constant_values,
                 opset,
                 seq_independent,
+                self.instance_id,
+                &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
                 graph_tokens,
             )?;
+            self.provider_artifact_readiness
+                .advance_to(ExecutorArtifactReadinessEpoch::new(
+                    self.cache.stats().misses,
+                ));
             // Pre-populate the kernel binding so the first decode step already
             // hits the zero-alloc fast path for static-shape graphs.
             self.kernel_bindings[i] = Some(key);
@@ -2332,6 +2437,7 @@ impl Executor {
                     .with("compiled_nodes", compiled_nodes)
                     .with("skipped_control_flow", skipped_control_flow)
                     .with("skipped_sequence", skipped_sequence)
+                    .with("skipped_unresolved", skipped_unresolved)
                     .with("cache_entries_before", cache_entries_before as u64)
                     .with("cache_entries_after", self.cache.stats().entries as u64),
             );
@@ -2707,6 +2813,14 @@ impl Executor {
         &self.weights
     }
 
+    pub(crate) fn instance_id(&self) -> ExecutorInstanceId {
+        self.instance_id
+    }
+
+    pub(crate) fn residency_telemetry(&self) -> Option<ExecutorResidencyTelemetry> {
+        self.ep.executor_residency_telemetry(self.instance_id)
+    }
+
     /// Warmup: re-touch the shape-keyed cache for the compiled plan so the first
     /// real `run` sees only cache hits (§11.3). Only meaningful for fully-static
     /// graphs, whose plan shapes are known at build; symbolic graphs cannot be
@@ -2717,6 +2831,6 @@ impl Executor {
         }
         let empty = HashMap::new();
         let resolved = self.resolve_all(&empty)?;
-        self.compile_all(&resolved)
+        self.ensure_provider_artifacts_ready(&resolved)
     }
 }

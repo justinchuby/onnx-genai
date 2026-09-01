@@ -51,10 +51,13 @@ use std::time::{Duration, Instant};
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
-    ExecutionProvider, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput, KernelMatch,
-    LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline, TensorBacking,
-    TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
-    WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
+    ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
+    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExecutorResidencyTelemetry,
+    ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight, Kernel, KernelConstantInput,
+    KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight,
+    StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle,
+    WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    expert_weight_groups, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -891,6 +894,16 @@ impl Drop for Executor {
             eprintln!(
                 "[onnx-runtime-session] executor drop could not retire graph owner {}: {error}",
                 self.graph_owner.get()
+            );
+        }
+        // Drain only this executor's provider-owned artifacts after its work,
+        // validation generation, and exact graph tokens are retired. Sibling
+        // and MTP executors sharing the EP retain their own artifact scopes.
+        if let Err(error) = self.ep.drain_executor_artifacts(self.instance_id) {
+            safe_to_release = false;
+            eprintln!(
+                "session: executor {} provider-artifact teardown was quarantined: {error}",
+                self.instance_id.get()
             );
         }
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).

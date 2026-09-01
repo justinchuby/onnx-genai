@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    ExternalMmapRegion, LazyWeight, LazyWeightBoundary, MmapRegionSource, ResidentWeight,
-    WeightHandleError,
+    ExecutionProvider, ExecutorInstanceId, ExternalMmapRegion, LazyWeight, LazyWeightBoundary,
+    MmapRegionSource, ResidentWeight, WeightHandleError,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::prefill_double_buffer::{
@@ -561,22 +561,17 @@ fn assert_paged_bytes_identical(
     assert_eq!(readback, canonical_layer(host, lazy), "paged bytes");
 }
 
-/// Drive the *production* provider entry points (`prefetch_lazy_weight` one
-/// layer ahead, then `page_lazy_weight`) across four whole layers with the
-/// double buffer enabled: proves N/N+1 overlap ordering, slot wraparound (>2
-/// layers reuse both slots), byte-identity of every paged layer, and that
-/// dropping each `PagedWeight` releases its slot for the next look-ahead. Also
-/// checks the wiring accounting and that nothing is quarantined on the clean
-/// path.
+/// A shared provider cannot expose the prefill pipeline's single pending
+/// completion to executor-scoped callers. The production scoped entry points
+/// therefore decline look-ahead and page synchronously without losing bytes.
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn provider_double_buffers_across_wraparound_byte_identical() {
-    use onnx_runtime_ep_api::ExecutionProvider;
-
+fn scoped_provider_prefetch_falls_back_to_byte_identical_synchronous_paging() {
     let mut ep = require_cuda();
+    let executor = ExecutorInstanceId::fresh();
     let runtime = ep.runtime().clone();
 
     let region_bytes = 2 * 1024 * 1024;
@@ -591,85 +586,129 @@ fn provider_double_buffers_across_wraparound_byte_identical() {
     ep.install_residency_for_test(residency);
     let source: &dyn MmapRegionSource = &*host;
 
-    // Prime one layer ahead (the executor's look-ahead), then for each layer
-    // prefetch N+1 before paging N — the double-buffer overlap ordering.
-    assert!(
-        ep.prefetch_lazy_weight(0, &lazies[0], source).unwrap(),
-        "cold prime prefetch must route through the pipeline"
-    );
-    for layer in 0..layers {
-        if layer + 1 < layers {
-            assert!(
-                ep.prefetch_lazy_weight((layer + 1) as u64, &lazies[layer + 1], source)
-                    .unwrap(),
-                "look-ahead prefetch of layer {} must route through the pipeline",
-                layer + 1
-            );
-        }
+    let unscoped = ep
+        .prefetch_lazy_weight(0, &lazies[0], source)
+        .expect_err("unscoped prefetch must fail closed");
+    assert!(unscoped.to_string().contains("explicit executor scope"));
+    for (layer, lazy) in lazies.iter().enumerate() {
+        assert!(
+            !ep.prefetch_lazy_weight_for_executor(executor, layer as u64, lazy, source,)
+                .unwrap(),
+            "scoped look-ahead must decline the provider-global pending completion"
+        );
         let paged = ep
-            .page_lazy_weight(layer as u64, &lazies[layer], source)
+            .page_lazy_weight_for_executor(executor, layer as u64, lazy, source)
             .unwrap()
-            .expect("an in-pipeline layer must page through the double buffer");
+            .expect("synchronous scoped paging remains available");
         assert_eq!(
             paged.len(),
             layer_bytes as usize,
             "layer {layer} byte count"
         );
-        assert_paged_bytes_identical(&runtime, &paged, &host, &lazies[layer]);
-        // Kernel done: dropping the binding releases the slot for the next
-        // look-ahead to reuse (the executor drops `InInfo.paged` after the node).
+        assert_paged_bytes_identical(&runtime, &paged, &host, lazy);
         drop(paged);
     }
 
     let residency = ep.residency().expect("installed above");
-    let stats = residency
-        .prefill_pipeline_stats()
-        .expect("an eligible layer built the pipeline");
-    assert_eq!(stats.routed, layers as u64, "every layer routed");
-    assert_eq!(stats.consumed, layers as u64, "every layer consumed");
-    assert_eq!(stats.released, layers as u64, "every slot released on drop");
     assert_eq!(
-        residency.prefill_pipeline_quarantined(),
-        Some(0),
-        "clean path quarantines nothing"
+        residency.prefill_pipeline_stats(),
+        None,
+        "scoped callers must not publish into the provider-global pipeline"
     );
+    let telemetry = ep
+        .executor_residency_telemetry(executor)
+        .expect("scoped telemetry");
+    assert_eq!(telemetry.weight_prefetch_fallbacks, layers as u64);
+    assert_eq!(telemetry.weight_page_ins, layers as u64);
+    assert!(telemetry.weight_committed_bytes >= layer_bytes * layers as u64);
+    ep.drain_executor_artifacts(executor).unwrap();
 }
 
-/// A single / final layer pages through the pipeline and releases cleanly with
-/// no slot reuse (mirrors the primitive's single-layer invariant, but via the
-/// production provider path).
+/// Two executors sharing one provider receive independent paging/fallback/
+/// committed-byte counters. Draining one rejects stale work while the sibling
+/// continues paging.
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn provider_single_layer_pages_and_releases() {
-    use onnx_runtime_ep_api::ExecutionProvider;
-
+fn shared_provider_scopes_paging_counters_and_teardown() {
     let mut ep = require_cuda();
     let runtime = ep.runtime().clone();
+    let first = ExecutorInstanceId::fresh();
+    let second = ExecutorInstanceId::fresh();
 
     let layer_bytes = 4 * 1024 * 1024u64;
-    let (host, lazies) = whole_layer_weights(layer_bytes as usize, 1, 1);
+    let (host, lazies) = whole_layer_weights(layer_bytes as usize, 1, 3);
     let residency = ep
-        .weight_residency(layer_bytes)
+        .weight_residency(layer_bytes * lazies.len() as u64)
         .with_prefill_double_buffer_enabled(true);
     ep.install_residency_for_test(residency);
     let source: &dyn MmapRegionSource = &*host;
 
-    assert!(ep.prefetch_lazy_weight(0, &lazies[0], source).unwrap());
-    let paged = ep
-        .page_lazy_weight(0, &lazies[0], source)
+    assert!(
+        !ep.prefetch_lazy_weight_for_executor(first, 0, &lazies[0], source)
+            .unwrap()
+    );
+    assert!(
+        !ep.prefetch_lazy_weight_for_executor(second, 1, &lazies[1], source)
+            .unwrap()
+    );
+    let first_page = ep
+        .page_lazy_weight_for_executor(first, 0, &lazies[0], source)
         .unwrap()
-        .expect("single layer pages");
-    assert_eq!(paged.len(), layer_bytes as usize);
-    assert_paged_bytes_identical(&runtime, &paged, &host, &lazies[0]);
-    drop(paged);
+        .expect("first executor page");
+    let second_page = ep
+        .page_lazy_weight_for_executor(second, 1, &lazies[1], source)
+        .unwrap()
+        .expect("second executor page");
+    assert_paged_bytes_identical(&runtime, &first_page, &host, &lazies[0]);
+    assert_paged_bytes_identical(&runtime, &second_page, &host, &lazies[1]);
 
-    let residency = ep.residency().unwrap();
-    let stats = residency.prefill_pipeline_stats().unwrap();
-    assert_eq!((stats.routed, stats.consumed, stats.released), (1, 1, 1));
-    assert_eq!(residency.prefill_pipeline_quarantined(), Some(0));
+    let first_before_drain = ep.executor_residency_telemetry(first).unwrap();
+    let second_before_continue = ep.executor_residency_telemetry(second).unwrap();
+    assert_eq!(first_before_drain.weight_prefetch_fallbacks, 1);
+    assert_eq!(second_before_continue.weight_prefetch_fallbacks, 1);
+    assert_eq!(first_before_drain.weight_page_ins, 1);
+    assert_eq!(second_before_continue.weight_page_ins, 1);
+    assert!(first_before_drain.weight_committed_bytes >= layer_bytes);
+    assert!(second_before_continue.weight_committed_bytes >= layer_bytes);
+
+    drop(first_page);
+    ep.drain_executor_artifacts(first).unwrap();
+    let stale = ep
+        .page_lazy_weight_for_executor(first, 0, &lazies[0], source)
+        .expect_err("drained executor must not publish late paging work");
+    assert!(stale.to_string().contains("already drained"));
+
+    assert!(
+        !ep.prefetch_lazy_weight_for_executor(second, 2, &lazies[2], source)
+            .unwrap()
+    );
+    let third_page = ep
+        .page_lazy_weight_for_executor(second, 2, &lazies[2], source)
+        .unwrap()
+        .expect("surviving executor page");
+    assert_paged_bytes_identical(&runtime, &third_page, &host, &lazies[2]);
+    let first_after = ep.executor_residency_telemetry(first).unwrap();
+    let second_after = ep.executor_residency_telemetry(second).unwrap();
+    assert_eq!(
+        first_after.weight_page_ins,
+        first_before_drain.weight_page_ins
+    );
+    assert_eq!(
+        first_after.weight_committed_bytes,
+        first_before_drain.weight_committed_bytes
+    );
+    assert!(first_after.drained);
+    assert_eq!(second_after.weight_page_ins, 2);
+    assert_eq!(second_after.weight_prefetch_fallbacks, 2);
+    assert!(second_after.weight_committed_bytes >= layer_bytes * 2);
+    assert!(!second_after.drained);
+
+    drop(second_page);
+    drop(third_page);
+    ep.drain_executor_artifacts(second).unwrap();
 }
 
 /// With the double buffer disabled (the default), the provider path issues no

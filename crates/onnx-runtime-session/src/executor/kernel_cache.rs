@@ -814,6 +814,11 @@ fn variants_per_node() -> usize {
 }
 
 impl KernelCache {
+    #[inline]
+    pub(super) fn contains(&self, key: &KernelKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
     pub(super) fn arm_block_quantized_moe_traffic(&mut self, request_id: u32) -> Result<usize> {
         let mut visited = HashSet::new();
         let mut armed = 0;
@@ -1065,6 +1070,8 @@ impl KernelCache {
         constant_values: &[Option<KernelConstantInput<'_>>],
         opset: u64,
         capture_seq_independent: bool,
+        executor: ExecutorInstanceId,
+        artifact_readiness: &mut ProviderArtifactReadiness,
         ep: &dyn ExecutionProvider,
         graph_tokens: [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT],
     ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
@@ -1098,7 +1105,7 @@ impl KernelCache {
                     reason,
                 ));
             }
-            let mut kernel = match ep.get_kernel(node, input_shapes, opset) {
+            let mut kernel = match ep.get_kernel_for_executor(executor, node, input_shapes, opset) {
                 Ok(kernel) => kernel,
                 Err(EpError::NoEpForOp {
                     domain,
@@ -1136,6 +1143,10 @@ impl KernelCache {
             self.last_used
                 .insert(key.clone(), AtomicU64::new(self.tick()));
             self.misses += 1;
+            // Kernel creation is the publication chokepoint for
+            // executor-scoped provider artifacts. Invalidate readiness here so
+            // build preflight, binding preparation, and dispatch agree.
+            artifact_readiness.advance_to(ExecutorArtifactReadinessEpoch::new(self.misses));
             self.evict_surplus_variants(key.node, ep, graph_tokens)?;
         }
         self.touch(&key);

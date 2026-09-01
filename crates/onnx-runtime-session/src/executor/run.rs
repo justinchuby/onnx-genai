@@ -116,6 +116,12 @@ impl Executor {
         let decode_memo_eligible = self.decode_memo_eligible(mode, nested);
         let mut resolved =
             self.prepare_resolved_shapes(&bindings, external, mode, nested, decode_memo_eligible);
+        // Static build and every symbolic/dynamic readiness epoch converge on
+        // this fail-closed transition: compile every currently-resolved leaf,
+        // publish its executor-scoped producers, then require an honest
+        // provider terminal outcome. Pending or failed finalization returns
+        // before buffers are bound and before eager, capture, or replay work.
+        self.ensure_provider_artifacts_ready(&resolved)?;
         let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
         let measure_activation_plan = !nested
             && mode == RunMode::Eager
@@ -160,14 +166,13 @@ impl Executor {
         match (outcome, validation, unbound) {
             (_, Err(e), _) => Err(e),
             (Err(e), _, _) => Err(e),
-            (Ok(_), _, Err(e)) => Err(e),
+            (Ok(_), Ok(()), Err(e)) => Err(e),
             (Ok(result), Ok(()), Ok(())) => Ok(result),
         }
     }
 
     fn finish_device_validation(&mut self, defer_until_binding_read: bool) -> Result<()> {
         if defer_until_binding_read && self.ep.defers_device_validation() {
-            self.ep.consume_route_residency_at_boundary()?;
             return Ok(());
         }
         self.finish_device_validation_boundary()
@@ -202,7 +207,10 @@ impl Executor {
                 // else (issue #1810 Slice 7C). Every EP declares this explicitly;
                 // non-residency EPs return Ok(()) and the CUDA EP is gated off by
                 // default, so this is byte-identical unless a provider opts in.
-                self.ep.consume_route_residency_at_boundary()?;
+                if !self.ep.validation_consumes_route_residency() {
+                    self.ep
+                        .consume_route_residency_at_boundary_for_executor(self.instance_id)?;
+                }
                 Ok(())
             }
             flags => Err(EpError::KernelFailed(format!(

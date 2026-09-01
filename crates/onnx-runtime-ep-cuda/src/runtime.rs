@@ -20,7 +20,7 @@ use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Kernel;
 use onnx_runtime_ep_api::{
     DeviceGraphOwner, DeviceGraphResource, DeviceGraphSlot, DeviceGraphToken,
-    DeviceValidationOwner, DeviceValidationRegistration, DeviceValidationToken,
+    DeviceValidationOwner, DeviceValidationRegistration, DeviceValidationToken, ExecutorInstanceId,
 };
 use onnx_runtime_ep_api::{RawDeviceAllocationSiteStats, Result};
 
@@ -141,20 +141,30 @@ struct CudaValidationRegistration {
 #[derive(Debug)]
 struct DeviceValidationSlot {
     owner: DeviceValidationOwner,
+    executor_scope: u64,
+    submission_executor_scope: AtomicU64,
     state: AtomicU64,
     flags: AtomicU32,
     next: AtomicPtr<DeviceValidationSlot>,
 }
 
 impl DeviceValidationSlot {
-    fn new(owner: DeviceValidationOwner) -> Self {
+    fn new(owner: DeviceValidationOwner, executor_scope: Option<ExecutorInstanceId>) -> Self {
         Self {
             owner,
+            executor_scope: executor_scope.map_or(0, ExecutorInstanceId::get),
+            submission_executor_scope: AtomicU64::new(0),
             state: AtomicU64::new(validation_slot_word(ValidationSlotPhase::Idle, 0)),
             flags: AtomicU32::new(0),
             next: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
+}
+
+pub(crate) struct DeviceValidationConsumption {
+    pub(crate) flags: u32,
+    pub(crate) executor_scope: u64,
+    pub(crate) completed_active_submission: bool,
 }
 
 /// Whether a failed measured H2D operation can still be using its source and
@@ -1249,8 +1259,22 @@ impl CudaRuntime {
     /// Allocate one stable owner slot during setup. The registry lock is only a
     /// storage/lifetime mechanism; warmed validation never touches it.
     pub(crate) fn register_device_validation_owner(&self) -> Result<DeviceValidationRegistration> {
+        self.register_device_validation_owner_in_scope(None)
+    }
+
+    pub(crate) fn register_device_validation_owner_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Result<DeviceValidationRegistration> {
+        self.register_device_validation_owner_in_scope(Some(executor))
+    }
+
+    fn register_device_validation_owner_in_scope(
+        &self,
+        executor: Option<ExecutorInstanceId>,
+    ) -> Result<DeviceValidationRegistration> {
         let owner = DeviceValidationOwner::new();
-        let mut slot = Box::new(DeviceValidationSlot::new(owner));
+        let mut slot = Box::new(DeviceValidationSlot::new(owner, executor));
         let slot_ptr = (&mut *slot) as *mut DeviceValidationSlot;
         self.validation_registry_lock_acquisitions
             .fetch_add(1, Ordering::Relaxed);
@@ -1401,6 +1425,8 @@ impl CudaRuntime {
             }
         }
         let slot_ptr = slot as *const DeviceValidationSlot as *mut DeviceValidationSlot;
+        slot.submission_executor_scope
+            .store(slot.executor_scope, Ordering::Relaxed);
         slot.next.store(std::ptr::null_mut(), Ordering::Relaxed);
         self.validation_head.store(slot_ptr, Ordering::Relaxed);
         self.validation_submitter.store(slot_ptr, Ordering::Relaxed);
@@ -1480,6 +1506,10 @@ impl CudaRuntime {
                     }
                 }
             }
+            slot.submission_executor_scope.store(
+                submitter.submission_executor_scope.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             let slot_ptr = slot as *const DeviceValidationSlot as *mut DeviceValidationSlot;
             slot.next.store(
                 self.validation_head.load(Ordering::Relaxed),
@@ -1579,7 +1609,7 @@ impl CudaRuntime {
         &self,
         registration: &DeviceValidationRegistration,
         token: DeviceValidationToken,
-    ) -> Result<u32> {
+    ) -> Result<DeviceValidationConsumption> {
         let slot = self.validation_slot(registration)?;
         if registration.owner() != token.owner() {
             return Err(EpError::KernelFailed(format!(
@@ -1594,7 +1624,7 @@ impl CudaRuntime {
     pub(crate) fn abort_device_validation_submission(
         &self,
         token: DeviceValidationToken,
-    ) -> Result<u32> {
+    ) -> Result<DeviceValidationConsumption> {
         let slot_ptr = self.validation_submitter.load(Ordering::Acquire);
         if slot_ptr.is_null() {
             return Err(EpError::KernelFailed(format!(
@@ -1620,7 +1650,7 @@ impl CudaRuntime {
         &self,
         slot: &DeviceValidationSlot,
         token: DeviceValidationToken,
-    ) -> Result<u32> {
+    ) -> Result<DeviceValidationConsumption> {
         let pending = validation_slot_word(ValidationSlotPhase::Pending, token.generation());
         let complete = validation_slot_word(ValidationSlotPhase::Complete, token.generation());
         let mut spins = 0_u32;
@@ -1632,7 +1662,11 @@ impl CudaRuntime {
                 // first Acquire; the second rejects that reuse instead of
                 // returning the later generation's flags for this token.
                 if slot.state.load(Ordering::Acquire) == complete {
-                    return Ok(flags);
+                    return Ok(DeviceValidationConsumption {
+                        flags,
+                        executor_scope: slot.submission_executor_scope.load(Ordering::Relaxed),
+                        completed_active_submission: false,
+                    });
                 }
                 continue;
             }
@@ -1686,7 +1720,11 @@ impl CudaRuntime {
                     }
                     if phase == ValidationPhase::Preparing {
                         self.publish_device_validation(token.generation(), 0);
-                        return Ok(0);
+                        return Ok(DeviceValidationConsumption {
+                            flags: 0,
+                            executor_scope: slot.submission_executor_scope.load(Ordering::Relaxed),
+                            completed_active_submission: false,
+                        });
                     }
                     let result = self
                         .check_capture_error()
@@ -1694,7 +1732,13 @@ impl CudaRuntime {
                     match result {
                         Ok(flags) => {
                             self.publish_device_validation(token.generation(), flags);
-                            return Ok(flags);
+                            return Ok(DeviceValidationConsumption {
+                                flags,
+                                executor_scope: slot
+                                    .submission_executor_scope
+                                    .load(Ordering::Relaxed),
+                                completed_active_submission: true,
+                            });
                         }
                         Err(error) => {
                             self.validation_state.store(

@@ -62,9 +62,110 @@ pub(crate) struct SlotCaptureState {
     pub(super) capture_quarantine_ops: HashSet<(String, String)>,
 }
 
+#[derive(Clone, Debug)]
+enum ProviderArtifactOutcome {
+    Unfinalized,
+    Pending(ExecutorArtifactPending),
+    Failed(Arc<EpError>),
+    Complete,
+}
+
+/// The executor's sole authority for whether provider-owned artifacts may be
+/// used by eager execution, capture, or replay.
+#[derive(Clone, Debug)]
+pub(super) struct ProviderArtifactReadiness {
+    epoch: ExecutorArtifactReadinessEpoch,
+    outcome: ProviderArtifactOutcome,
+}
+
+impl Default for ProviderArtifactReadiness {
+    fn default() -> Self {
+        Self {
+            epoch: ExecutorArtifactReadinessEpoch::INITIAL,
+            outcome: ProviderArtifactOutcome::Unfinalized,
+        }
+    }
+}
+
+impl ProviderArtifactReadiness {
+    pub(super) fn advance_to(&mut self, epoch: ExecutorArtifactReadinessEpoch) {
+        if epoch > self.epoch {
+            self.epoch = epoch;
+            self.outcome = ProviderArtifactOutcome::Unfinalized;
+        }
+    }
+
+    pub(super) fn needs_finalization(&self) -> bool {
+        matches!(self.outcome, ProviderArtifactOutcome::Unfinalized)
+    }
+
+    /// Finalize the current specialization exactly once, then require its
+    /// outcome before any eager execution, capture, or replay.
+    pub(super) fn finalize_if_needed(
+        &mut self,
+        ep: &dyn ExecutionProvider,
+        executor: ExecutorInstanceId,
+        graph: &Graph,
+        finalized_banks: &[FinalizedExpertBank],
+    ) -> Result<()> {
+        if self.needs_finalization() {
+            match ep.finalize_executor_artifacts(executor, graph, finalized_banks, self.epoch) {
+                Ok(ExecutorArtifactFinalization::Complete) => {
+                    self.outcome = ProviderArtifactOutcome::Complete;
+                }
+                Ok(ExecutorArtifactFinalization::Pending(pending)) => {
+                    self.outcome = ProviderArtifactOutcome::Pending(pending);
+                }
+                Err(error) => {
+                    self.outcome = ProviderArtifactOutcome::Failed(Arc::new(error));
+                }
+            }
+        }
+        self.require_complete(ep.name(), executor)
+    }
+
+    pub(super) fn require_complete(
+        &self,
+        provider: &str,
+        executor: ExecutorInstanceId,
+    ) -> Result<()> {
+        match &self.outcome {
+            ProviderArtifactOutcome::Complete => Ok(()),
+            ProviderArtifactOutcome::Unfinalized => {
+                Err(SessionError::ExecutionProviderArtifactsPending {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: "provider artifact finalization has not reached a terminal outcome"
+                        .to_string(),
+                })
+            }
+            ProviderArtifactOutcome::Pending(pending) => {
+                Err(SessionError::ExecutionProviderArtifactsPending {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: pending.reason(),
+                })
+            }
+            ProviderArtifactOutcome::Failed(reason) => {
+                Err(SessionError::ExecutionProviderArtifactFinalizationFailed {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: reason.to_string(),
+                })
+            }
+        }
+    }
+}
+
 /// The compiled, runnable graph: buffers + plan + kernel cache. Owned by the
 /// public [`InferenceSession`](crate::InferenceSession).
 pub(crate) struct Executor {
+    /// Process-unique ownership scope for provider artifacts published while
+    /// this executor compiles kernels.
+    pub(super) instance_id: ExecutorInstanceId,
     pub(super) graph: Graph,
     /// Kept alive so external-weight memory maps outlive buffer population —
     /// **and**, since the weight-streaming change, so borrowed initializer
@@ -120,6 +221,10 @@ pub(crate) struct Executor {
     /// today; production consumers land in a follow-up slice per issue #82.
     #[allow(dead_code)]
     pub(super) expert_region_candidates: HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+    /// Exact loader-finalized routed banks supplied to the provider only by
+    /// the authoritative post-kernel finalization transition. Empty unless the
+    /// provider opted in during build.
+    pub(super) finalized_expert_banks: Vec<FinalizedExpertBank>,
     /// The validated [`onnx_runtime_ep_api::ResidencyPlan`] derived from
     /// `expert_region_candidates` using [`onnx_runtime_ep_api::WholeBankResidentPolicy`]
     /// (the only shipped policy today). Pure bookkeeping: it does not own
@@ -402,6 +507,10 @@ pub(crate) struct Executor {
     /// Control-flow and sequence nodes always have `None` (they don't use the
     /// kernel cache).
     pub(super) kernel_bindings: Vec<Option<KernelKey>>,
+    /// Single readiness authority for this executor's provider-owned artifacts.
+    /// Its epoch advances with concrete kernel specializations; every execute,
+    /// capture, and replay path must observe `Complete` before enqueuing work.
+    pub(super) provider_artifact_readiness: ProviderArtifactReadiness,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
     /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped

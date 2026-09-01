@@ -40,6 +40,7 @@ pub use executor::{
 };
 pub use onnx_runtime_ep_api::DeviceBuffer;
 pub use onnx_runtime_ep_api::DeviceGraphSlot;
+pub use onnx_runtime_ep_api::ExecutorResidencyTelemetry;
 pub use onnx_runtime_ep_api::WorkspaceRequirement;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
@@ -226,6 +227,28 @@ mod error {
 
         #[error("no inferred shape for value {value} produced by op {op}")]
         UnresolvedShape { value: String, op: String },
+
+        #[error(
+            "{provider} executor {executor} provider artifacts are pending at readiness epoch \
+             {readiness_epoch}: {reason}; no kernel execution or capture was started"
+        )]
+        ExecutionProviderArtifactsPending {
+            provider: String,
+            executor: u64,
+            readiness_epoch: u64,
+            reason: String,
+        },
+
+        #[error(
+            "{provider} executor {executor} provider-artifact finalization failed at readiness \
+             epoch {readiness_epoch}: {reason}; no kernel execution or capture was started"
+        )]
+        ExecutionProviderArtifactFinalizationFailed {
+            provider: String,
+            executor: u64,
+            readiness_epoch: u64,
+            reason: String,
+        },
 
         #[error("shape element count overflows usize for value {value} (dims {dims:?})")]
         ShapeOverflow { value: String, dims: Vec<usize> },
@@ -1932,6 +1955,18 @@ impl InferenceSession {
     /// choose the subgraphs it claims.
     pub fn graph(&self) -> &onnx_runtime_ir::Graph {
         self.exec.graph()
+    }
+
+    /// Executor ownership identity used by provider lifecycle diagnostics.
+    #[doc(hidden)]
+    pub fn executor_instance_id(&self) -> onnx_runtime_ep_api::ExecutorInstanceId {
+        self.exec.instance_id()
+    }
+
+    /// Snapshot residency, paging, and graph telemetry owned by this session's
+    /// primary executor.
+    pub fn residency_telemetry(&self) -> Option<ExecutorResidencyTelemetry> {
+        self.exec.residency_telemetry()
     }
 
     /// Export a `com.microsoft::EPContext` context-cache model for this session

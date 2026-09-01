@@ -620,6 +620,8 @@ impl Executor {
                 &constant_values,
                 opset,
                 seq_independent,
+                self.instance_id,
+                &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
                 graph_tokens,
             )?;
@@ -1081,6 +1083,12 @@ impl Executor {
                 "mixed-provider device-graph replay",
             ));
         }
+        self.provider_artifact_readiness.finalize_if_needed(
+            self.ep.as_ref(),
+            self.instance_id,
+            &self.graph,
+            &self.finalized_expert_banks,
+        )?;
         if !self.bindings_match_graph_signature(bindings) {
             self.reset_device_graph()?;
             return Err(SessionError::Internal(
