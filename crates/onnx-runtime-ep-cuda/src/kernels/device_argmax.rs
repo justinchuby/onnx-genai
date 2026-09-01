@@ -734,7 +734,12 @@ mod tests {
         }
         let result = run_case(&ep, &[1.0, 5.0, 3.0], ArgmaxTieBreak::LowestIndex);
         assert_eq!(result, [1, capture_error]);
-        ep.runtime().reset_capture_error().unwrap();
+        // SAFETY: this isolated kernel test has no session validation generation.
+        unsafe {
+            ep.runtime()
+                .reset_capture_error_for_isolated_test()
+                .unwrap();
+        }
     }
 
     #[test]

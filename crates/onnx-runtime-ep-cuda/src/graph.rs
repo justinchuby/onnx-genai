@@ -1,32 +1,28 @@
 //! Serialized ownership for the CUDA graph captured on an EP runtime stream.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::ThreadId;
 
+use arc_swap::ArcSwapOption;
 use cudarc::driver::sys::{
     CUgraph, CUgraphExec, CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus,
 };
 use cudarc::driver::{CudaStream, result};
 use onnx_runtime_cuda_memory::capture_gate::CaptureExclusion;
-use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_api::{
+    DeviceGraphOwner, DeviceGraphResource, DeviceGraphSlot, DeviceGraphToken, EpError, Result,
+};
 
 use crate::error::driver_err;
-
-trait CapturedResource: Send + Sync {}
-
-impl<T> CapturedResource for T where T: Send + Sync {}
-
-/// One strongly owned resource whose address or contents were embedded in a
-/// captured graph segment.
-struct GraphResource {
-    identity: usize,
-    _owner: Arc<dyn CapturedResource>,
-}
 
 /// Whether the lifecycle is currently recording a segment, and on which thread.
 enum CaptureState {
     Idle,
-    Capturing(ThreadId),
+    Capturing {
+        thread: ThreadId,
+        token: DeviceGraphToken,
+    },
 }
 
 /// Owns the graph and graph-exec handles created from one runtime stream.
@@ -38,14 +34,14 @@ struct CapturedGraph {
     graph_exec: CUgraphExec,
     stream: Arc<CudaStream>,
     /// Dropped only after `graph_exec` and `graph` are destroyed by `Drop`.
-    resources: Vec<GraphResource>,
+    resources: Vec<DeviceGraphResource>,
 }
 
 impl CapturedGraph {
     fn end_capture(
         stream: &Arc<CudaStream>,
         flags: CUgraphInstantiate_flags,
-        resources: Vec<GraphResource>,
+        resources: Vec<DeviceGraphResource>,
     ) -> std::result::Result<Option<Self>, cudarc::driver::DriverError> {
         stream.context().bind_to_thread()?;
         // SAFETY: this lifecycle holds the state mutex and `stream` is currently
@@ -81,18 +77,25 @@ impl CapturedGraph {
 
     fn upload(&self) -> std::result::Result<(), cudarc::driver::DriverError> {
         self.stream.context().bind_to_thread()?;
-        // SAFETY: this wrapper owns `graph_exec`, and the lifecycle mutex
-        // serializes access on its owning stream.
+        // SAFETY: this wrapper owns `graph_exec`, which has not been published
+        // for replay yet, and uploads it on its owning stream.
         unsafe { result::graph::upload(self.graph_exec, self.stream.cu_stream()) }
     }
 
     fn launch(&self) -> std::result::Result<(), cudarc::driver::DriverError> {
         self.stream.context().bind_to_thread()?;
-        // SAFETY: this wrapper owns `graph_exec`, and the lifecycle mutex
-        // serializes access on its owning stream.
+        // SAFETY: the executable is immutable after publication and every
+        // launch is submitted to its one owning stream.
         unsafe { result::graph::launch(self.graph_exec, self.stream.cu_stream()) }
     }
 }
+
+// SAFETY: after publication a captured graph is immutable. CUDA graph launches
+// are submitted to the one owned stream, whose ordering serializes execution;
+// ArcSwap keeps the handles alive across concurrent reset/invalidation.
+unsafe impl Send for CapturedGraph {}
+// SAFETY: same immutable-publication and stream-ordering invariant as `Send`.
+unsafe impl Sync for CapturedGraph {}
 
 impl Drop for CapturedGraph {
     fn drop(&mut self) {
@@ -123,10 +126,9 @@ impl Drop for CapturedGraph {
 
 /// Owns the captured graph segments installed on one EP runtime stream.
 ///
-/// `CapturedGraph` is intentionally neither `Send` nor `Sync`. CUDA permits graph
-/// objects to cross threads only when every access is externally serialized.
-/// This wrapper enforces that rule with one mutex and never exposes a graph
-/// handle or performs graph work without holding its guard.
+/// Capture mutation stays behind the lifecycle mutex. Completed executables are
+/// immutable and atomically published for allocation- and mutex-free replay on
+/// their single owning stream.
 ///
 /// A whole-subgraph capture installs exactly one segment. Segmented capture —
 /// used when only parts of a claimed subgraph are device-graph capturable —
@@ -135,7 +137,33 @@ impl Drop for CapturedGraph {
 /// order and each is destroyed exactly once on reset/drop.
 pub(crate) struct CudaGraphLifecycle {
     stream: Arc<CudaStream>,
+    owner: DeviceGraphOwner,
+    slot: DeviceGraphSlot,
     state: Mutex<LifecycleState>,
+    replay: ArcSwapOption<ReplaySet>,
+    /// Published generation and admitted replay count form a lock-free reader
+    /// epoch. Reset first retires the generation, then waits for already
+    /// admitted readers to finish their enqueue. A reader increments before
+    /// rechecking the generation, so it either observes retirement and backs
+    /// out or is covered by reset's wait.
+    installed_generation: AtomicU64,
+    active_replays: AtomicUsize,
+    lock_acquisitions: AtomicU64,
+}
+
+struct ReplaySet {
+    token: DeviceGraphToken,
+    segments: Vec<Arc<CapturedGraph>>,
+}
+
+struct AdmittedReplay<'a> {
+    active_replays: &'a AtomicUsize,
+}
+
+impl Drop for AdmittedReplay<'_> {
+    fn drop(&mut self) {
+        self.active_replays.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// The capture flag and the ordered list of installed segment executables.
@@ -148,54 +176,142 @@ struct LifecycleState {
     /// Resources provisionally retained by the active capture. On successful
     /// instantiation these move into exactly one `CapturedGraph`; abort/failure
     /// drops them after the half-recorded graph is destroyed.
-    capture_resources: Vec<GraphResource>,
-    segments: Vec<CapturedGraph>,
+    capture_resources: Vec<DeviceGraphResource>,
+    installation: Option<DeviceGraphToken>,
+    next_generation: u64,
+    segments: Vec<Arc<CapturedGraph>>,
 }
 
-// SAFETY: all access to the non-Send/non-Sync `CapturedGraph` handles is
-// confined to `state`, every method holds that mutex for the complete CUDA graph
-// API call, and every segment launches on its single owning `stream`.
+// SAFETY: capture mutation is serialized through `state`; published executables
+// are immutable and every segment launches on its single owning `stream`.
 unsafe impl Send for CudaGraphLifecycle {}
-// SAFETY: the same serialized-access invariant covers shared references.
+// SAFETY: the same mutation/publication invariant covers shared references.
 unsafe impl Sync for CudaGraphLifecycle {}
 
 impl CudaGraphLifecycle {
-    pub(crate) fn new(stream: Arc<CudaStream>) -> Self {
+    pub(crate) fn new(
+        stream: Arc<CudaStream>,
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+    ) -> Self {
         Self {
             stream,
+            owner,
+            slot,
             state: Mutex::new(LifecycleState {
                 capture: CaptureState::Idle,
                 exclusion: None,
                 capture_resources: Vec::new(),
+                installation: None,
+                next_generation: 1,
                 segments: Vec::new(),
             }),
+            replay: ArcSwapOption::empty(),
+            installed_generation: AtomicU64::new(0),
+            active_replays: AtomicUsize::new(0),
+            lock_acquisitions: AtomicU64::new(0),
         }
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, LifecycleState>> {
+        self.lock_acquisitions.fetch_add(1, Ordering::Relaxed);
         self.state.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep: CUDA graph lifecycle lock was poisoned".into())
+        })
+    }
+
+    pub(crate) fn lock_acquisition_count(&self) -> u64 {
+        self.lock_acquisitions.load(Ordering::Relaxed)
+    }
+
+    fn admit_replay(&self, token: DeviceGraphToken) -> Result<AdmittedReplay<'_>> {
+        let generation = self.installed_generation.load(Ordering::Acquire);
+        if generation == 0 {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: cannot replay CUDA graph because no executable is installed".into(),
+            ));
+        }
+        if generation != token.generation() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: CUDA graph replay generation mismatch: installed={generation}, \
+                 supplied={}",
+                token.generation()
+            )));
+        }
+        self.active_replays.fetch_add(1, Ordering::AcqRel);
+        if self.installed_generation.load(Ordering::Acquire) != generation {
+            self.active_replays.fetch_sub(1, Ordering::Release);
+            return Err(EpError::KernelFailed(
+                "cuda_ep: CUDA graph generation was retired before replay enqueue".into(),
+            ));
+        }
+        Ok(AdmittedReplay {
+            active_replays: &self.active_replays,
         })
     }
 
     /// Begin recording a new segment. Additional segments may be captured while
     /// earlier ones are already installed (segmented capture); only a second
     /// concurrent capture is rejected.
-    pub(crate) fn begin(&self) -> Result<()> {
+    pub(crate) fn begin(
+        &self,
+        continuation: Option<DeviceGraphToken>,
+        resources: Vec<DeviceGraphResource>,
+    ) -> Result<DeviceGraphToken> {
         let mut state = self.lock()?;
         match state.capture {
             CaptureState::Idle => {}
-            CaptureState::Capturing(_) => {
+            CaptureState::Capturing { .. } => {
                 return Err(EpError::KernelFailed(
                     "cuda_ep: cannot begin CUDA graph capture while capture is already active"
                         .into(),
                 ));
             }
         }
+        let token = match state.installation {
+            Some(installed) => {
+                if continuation != Some(installed) {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep: CUDA graph capture continuation token mismatch: installed \
+                         owner={} slot={:?} generation={}, supplied={continuation:?}",
+                        installed.owner().get(),
+                        installed.slot(),
+                        installed.generation()
+                    )));
+                }
+                installed
+            }
+            None => {
+                if continuation.is_some() {
+                    return Err(EpError::KernelFailed(
+                        "cuda_ep: CUDA graph capture continuation names no installed generation"
+                            .into(),
+                    ));
+                }
+                let generation = state.next_generation;
+                state.next_generation = state.next_generation.checked_add(1).ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep: CUDA graph installation generation overflow".into(),
+                    )
+                })?;
+                let token = DeviceGraphToken::new(self.owner, self.slot, generation);
+                state.installation = Some(token);
+                token
+            }
+        };
         debug_assert!(
             state.capture_resources.is_empty(),
             "idle CUDA graph lifecycle retained provisional resources"
         );
+        for resource in resources {
+            if !state
+                .capture_resources
+                .iter()
+                .any(|existing| existing.identity() == resource.identity())
+            {
+                state.capture_resources.push(resource);
+            }
+        }
 
         // Acquire *before* `cuStreamBeginCapture`: taking it afterwards leaves a
         // window in which the capture is live and unprotected. THREAD_LOCAL mode
@@ -203,26 +319,44 @@ impl CudaGraphLifecycle {
         // device-wide synchronization anywhere in the process invalidates this
         // capture.
         let exclusion = CaptureExclusion::acquire();
-        self.stream
+        if let Err(error) = self
+            .stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-            .map_err(|error| driver_err("begin CUDA graph stream capture", error))?;
-        state.capture = CaptureState::Capturing(std::thread::current().id());
+        {
+            state.capture_resources.clear();
+            if state.segments.is_empty() {
+                state.installation = None;
+            }
+            return Err(driver_err("begin CUDA graph stream capture", error));
+        }
+        state.capture = CaptureState::Capturing {
+            thread: std::thread::current().id(),
+            token,
+        };
         state.exclusion = Some(exclusion);
-        Ok(())
+        Ok(token)
     }
 
     /// End the active segment capture, instantiate it, and append it to the
     /// ordered segment list.
-    pub(crate) fn end(&self) -> Result<()> {
+    pub(crate) fn end(&self, token: DeviceGraphToken) -> Result<()> {
         let mut state = self.lock()?;
         match state.capture {
-            CaptureState::Capturing(owner) if owner == std::thread::current().id() => {}
-            CaptureState::Capturing(_) => {
+            CaptureState::Capturing {
+                thread,
+                token: active,
+            } if thread == std::thread::current().id() && active == token => {}
+            CaptureState::Capturing { thread, .. } if thread != std::thread::current().id() => {
                 return Err(EpError::KernelFailed(
                     "cuda_ep: CUDA graph capture must end on the thread that began the \
                      thread-local capture"
                         .into(),
                 ));
+            }
+            CaptureState::Capturing { token: active, .. } => {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: CUDA graph end token mismatch: active={active:?}, supplied={token:?}"
+                )));
             }
             CaptureState::Idle => {
                 return Err(EpError::KernelFailed(
@@ -239,37 +373,63 @@ impl CudaGraphLifecycle {
         // local, it drops at every exit from this function and never earlier.
         let _exclusion = state.exclusion.take();
         let resources = std::mem::take(&mut state.capture_resources);
-        let graph = CapturedGraph::end_capture(
-            &self.stream,
-            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
-            resources,
-        )
-        .map_err(|error| driver_err("end and instantiate CUDA graph capture", error))?
-        .ok_or_else(|| {
-            EpError::KernelFailed(
-                "cuda_ep: CUDA graph capture ended without producing a graph".into(),
+        let graph = Arc::new(
+            CapturedGraph::end_capture(
+                &self.stream,
+                CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
+                resources,
             )
-        })?;
+            .map_err(|error| driver_err("end and instantiate CUDA graph capture", error))?
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: CUDA graph capture ended without producing a graph".into(),
+                )
+            })?,
+        );
         graph
             .upload()
             .map_err(|error| driver_err("upload CUDA graph executable", error))?;
         state.segments.push(graph);
+        self.replay.store(Some(Arc::new(ReplaySet {
+            token,
+            segments: state.segments.clone(),
+        })));
+        self.installed_generation
+            .store(token.generation(), Ordering::Release);
         Ok(())
     }
 
     /// Replay every installed segment in capture order. For a whole-subgraph
     /// capture this is the single installed graph.
-    pub(crate) fn replay(&self) -> Result<()> {
-        let state = self.lock()?;
-        if state.segments.is_empty() {
+    pub(crate) fn replay(&self, token: DeviceGraphToken) -> Result<()> {
+        self.replay_with_hooks(token, || {}, || {})
+    }
+
+    fn replay_with_hooks(
+        &self,
+        token: DeviceGraphToken,
+        mut before_launch: impl FnMut(),
+        mut after_launch: impl FnMut(),
+    ) -> Result<()> {
+        let _reader = self.admit_replay(token)?;
+        let replay = self.replay.load();
+        let Some(replay) = replay.as_ref() else {
             return Err(EpError::KernelFailed(
                 "cuda_ep: cannot replay CUDA graph because no executable is installed".into(),
             ));
+        };
+        if replay.token != token {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: CUDA graph replay token mismatch: installed={:?}, supplied={token:?}",
+                replay.token
+            )));
         }
-        for graph in &state.segments {
+        for graph in &replay.segments {
+            before_launch();
             graph
                 .launch()
                 .map_err(|error| driver_err("launch CUDA graph executable", error))?;
+            after_launch();
         }
         Ok(())
     }
@@ -277,12 +437,22 @@ impl CudaGraphLifecycle {
     /// Replay one installed segment by its zero-based capture-order index. The
     /// executor drives this per segment, running the non-capturable seam nodes
     /// eagerly between replays.
-    pub(crate) fn replay_segment(&self, index: usize) -> Result<()> {
-        let state = self.lock()?;
-        let graph = state.segments.get(index).ok_or_else(|| {
+    pub(crate) fn replay_segment(&self, token: DeviceGraphToken, index: usize) -> Result<()> {
+        let _reader = self.admit_replay(token)?;
+        let replay = self.replay.load();
+        if let Some(replay) = replay.as_ref()
+            && replay.token != token
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: CUDA graph segment replay token mismatch: installed={:?}, \
+                 supplied={token:?}",
+                replay.token
+            )));
+        }
+        let graph = replay.as_ref().and_then(|set| set.segments.get(index)).ok_or_else(|| {
             EpError::KernelFailed(format!(
                 "cuda_ep: cannot replay CUDA graph segment {index}; only {} segment(s) installed",
-                state.segments.len()
+                replay.as_ref().map_or(0, |set| set.segments.len())
             ))
         })?;
         graph
@@ -303,16 +473,25 @@ impl CudaGraphLifecycle {
     /// eager run.
     ///
     /// Legal only while `Capturing` on the owning thread; a no-op when idle.
-    pub(crate) fn abort(&self) -> Result<()> {
+    pub(crate) fn abort(&self, token: DeviceGraphToken) -> Result<()> {
         let mut state = self.lock()?;
         match state.capture {
-            CaptureState::Capturing(owner) if owner == std::thread::current().id() => {}
-            CaptureState::Capturing(_) => {
+            CaptureState::Capturing {
+                thread,
+                token: active,
+            } if thread == std::thread::current().id() && active == token => {}
+            CaptureState::Capturing { thread, .. } if thread != std::thread::current().id() => {
                 return Err(EpError::KernelFailed(
                     "cuda_ep: CUDA graph capture must abort on the thread that began the \
                      thread-local capture"
                         .into(),
                 ));
+            }
+            CaptureState::Capturing { token: active, .. } => {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: CUDA graph abort token mismatch: active={active:?}, \
+                     supplied={token:?}"
+                )));
             }
             CaptureState::Idle => return Ok(()),
         }
@@ -338,64 +517,66 @@ impl CudaGraphLifecycle {
         Ok(())
     }
 
-    /// Retain `owner` in the active capture on this lifecycle.
-    ///
-    /// Returns `false` when this slot is idle so the runtime can try its other
-    /// graph slot. A capture owned by another thread is a hard error: CUDA's
-    /// thread-local capture cannot safely accept launches or resources there.
-    pub(crate) fn retain_capture_resource<T>(&self, identity: usize, owner: &Arc<T>) -> Result<bool>
-    where
-        T: Send + Sync + 'static,
-    {
+    pub(crate) fn reset(&self, token: DeviceGraphToken) -> Result<(bool, bool)> {
         let mut state = self.lock()?;
-        match state.capture {
-            CaptureState::Idle => return Ok(false),
-            CaptureState::Capturing(capture_owner)
-                if capture_owner == std::thread::current().id() => {}
-            CaptureState::Capturing(_) => {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: CUDA graph capture resource registration must occur on the thread \
-                     that began the thread-local capture"
-                        .into(),
-                ));
-            }
+        if state.installation != Some(token) {
+            return Ok((false, false));
         }
-        if state
-            .capture_resources
-            .iter()
-            .any(|resource| resource.identity == identity)
-        {
-            return Ok(true);
-        }
-        let owner: Arc<dyn CapturedResource> = owner.clone();
-        state.capture_resources.push(GraphResource {
-            identity,
-            _owner: owner,
-        });
-        Ok(true)
-    }
-
-    pub(crate) fn reset(&self) -> Result<bool> {
-        let mut state = self.lock()?;
-        if matches!(state.capture, CaptureState::Capturing(_)) {
+        if matches!(state.capture, CaptureState::Capturing { .. }) {
             return Err(EpError::KernelFailed(
                 "cuda_ep: cannot reset CUDA graph while stream capture is active; end capture \
                  first"
                     .into(),
             ));
         }
+        let installed = self.installed_generation.load(Ordering::Acquire);
+        if installed == token.generation() {
+            self.installed_generation
+                .compare_exchange(token.generation(), 0, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|changed| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep: CUDA graph generation changed during reset: \
+                         installed={changed}, token={}",
+                        token.generation()
+                    ))
+                })?;
+        } else if installed != 0 || !state.segments.is_empty() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: CUDA graph generation publication mismatch during reset: \
+                 installed={installed}, token={}",
+                token.generation()
+            )));
+        }
+        while self.active_replays.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
         let had_graph = !state.segments.is_empty();
         state.segments.clear();
-        Ok(had_graph)
+        state.installation = None;
+        state.capture_resources.clear();
+        self.replay.store(None);
+        Ok((true, had_graph))
     }
 
-    pub(crate) fn has_executable(&self) -> Result<bool> {
-        Ok(!self.lock()?.segments.is_empty())
+    pub(crate) fn has_executable(&self, token: DeviceGraphToken) -> Result<bool> {
+        Ok(
+            self.installed_generation.load(Ordering::Acquire) == token.generation()
+                && self
+                    .replay
+                    .load()
+                    .as_ref()
+                    .is_some_and(|set| set.token == token && !set.segments.is_empty()),
+        )
     }
 
     /// Number of installed segment executables (1 for a whole-subgraph capture).
-    pub(crate) fn segment_count(&self) -> Result<usize> {
-        Ok(self.lock()?.segments.len())
+    pub(crate) fn segment_count(&self, token: DeviceGraphToken) -> Result<usize> {
+        Ok(self
+            .replay
+            .load()
+            .as_ref()
+            .filter(|set| set.token == token)
+            .map_or(0, |set| set.segments.len()))
     }
 
     /// Whether exactly one whole-subgraph segment is installed.
@@ -409,8 +590,79 @@ impl CudaGraphLifecycle {
     /// the capture instead of re-warming.
     // Kept for the planned WP4 retained-graph verification path.
     #[allow(dead_code)]
-    pub(crate) fn holds_single_capture(&self) -> Result<bool> {
-        Ok(self.lock()?.segments.len() == 1)
+    pub(crate) fn holds_single_capture(&self, token: DeviceGraphToken) -> Result<bool> {
+        Ok(self
+            .replay
+            .load()
+            .as_ref()
+            .is_some_and(|set| set.token == token && set.segments.len() == 1))
+    }
+
+    pub(crate) fn current_token(&self) -> Result<Option<DeviceGraphToken>> {
+        Ok(self.lock()?.installation)
+    }
+
+    pub(crate) fn begin_current(
+        &self,
+        resources: Vec<DeviceGraphResource>,
+    ) -> Result<DeviceGraphToken> {
+        let continuation = self.current_token()?;
+        self.begin(continuation, resources)
+    }
+
+    pub(crate) fn end_current(&self) -> Result<()> {
+        let token = self.current_token()?.ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep: cannot end CUDA graph capture without an installation token".into(),
+            )
+        })?;
+        self.end(token)
+    }
+
+    pub(crate) fn abort_current(&self) -> Result<()> {
+        let Some(token) = self.current_token()? else {
+            return Ok(());
+        };
+        self.abort(token)
+    }
+
+    pub(crate) fn replay_current(&self) -> Result<()> {
+        let token = self.current_token()?.ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep: cannot replay CUDA graph because no executable is installed".into(),
+            )
+        })?;
+        self.replay(token)
+    }
+
+    pub(crate) fn replay_current_segment(&self, index: usize) -> Result<()> {
+        let token = self.current_token()?.ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep: cannot replay CUDA graph because no executable is installed".into(),
+            )
+        })?;
+        self.replay_segment(token, index)
+    }
+
+    pub(crate) fn reset_current(&self) -> Result<bool> {
+        let Some(token) = self.current_token()? else {
+            return Ok(false);
+        };
+        self.reset(token).map(|(_, had_graph)| had_graph)
+    }
+
+    pub(crate) fn has_current_executable(&self) -> Result<bool> {
+        let Some(token) = self.current_token()? else {
+            return Ok(false);
+        };
+        self.has_executable(token)
+    }
+
+    pub(crate) fn current_segment_count(&self) -> Result<usize> {
+        let Some(token) = self.current_token()? else {
+            return Ok(0);
+        };
+        self.segment_count(token)
     }
 
     pub(crate) fn capture_status(&self) -> Result<CUstreamCaptureStatus> {
@@ -418,6 +670,11 @@ impl CudaGraphLifecycle {
         self.stream
             .capture_status()
             .map_err(|error| driver_err("query CUDA graph capture status", error))
+    }
+
+    pub(crate) fn test_acquire_lock(&self) -> Result<()> {
+        drop(self.lock()?);
+        Ok(())
     }
 }
 
@@ -1023,28 +1280,141 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
         let input_ptr = runtime.alloc_raw(size).unwrap();
         let output_ptr = runtime.alloc_raw(size).unwrap();
 
-        let lifecycle = CudaGraphLifecycle::new(runtime.stream().clone());
+        let lifecycle = CudaGraphLifecycle::new(
+            runtime.stream().clone(),
+            DeviceGraphOwner::new(),
+            DeviceGraphSlot::Primary,
+        );
         // No capture installed yet.
-        assert!(!lifecycle.holds_single_capture().unwrap());
+        assert!(lifecycle.current_token().unwrap().is_none());
 
         // One whole-subgraph segment satisfies the option (c) retain invariant.
-        lifecycle.begin().unwrap();
+        let token = lifecycle.begin(None, Vec::new()).unwrap();
         launch_add_one(&runtime, &function, input_ptr, output_ptr, n);
-        lifecycle.end().unwrap();
-        assert!(lifecycle.holds_single_capture().unwrap());
-        assert_eq!(lifecycle.segment_count().unwrap(), 1);
+        lifecycle.end(token).unwrap();
+        assert!(lifecycle.holds_single_capture(token).unwrap());
+        assert_eq!(lifecycle.segment_count(token).unwrap(), 1);
 
         // A second appended segment (segmented capture) breaks the invariant.
-        lifecycle.begin().unwrap();
+        assert_eq!(lifecycle.begin(Some(token), Vec::new()).unwrap(), token);
         launch_add_one(&runtime, &function, output_ptr, input_ptr, n);
-        lifecycle.end().unwrap();
-        assert!(!lifecycle.holds_single_capture().unwrap());
-        assert_eq!(lifecycle.segment_count().unwrap(), 2);
+        lifecycle.end(token).unwrap();
+        assert!(!lifecycle.holds_single_capture(token).unwrap());
+        assert_eq!(lifecycle.segment_count(token).unwrap(), 2);
 
-        assert!(lifecycle.reset().unwrap());
-        assert!(!lifecycle.holds_single_capture().unwrap());
+        assert_eq!(lifecycle.reset(token).unwrap(), (true, true));
+        assert!(!lifecycle.holds_single_capture(token).unwrap());
 
         // SAFETY: reset dropped all segment ownership before the buffers are freed.
+        unsafe {
+            runtime.free_raw(output_ptr).unwrap();
+            runtime.free_raw(input_ptr).unwrap();
+        }
+    }
+
+    #[test]
+    fn exact_owner_token_and_reset_gate_linearize_replay_enqueue() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping graph reset race test: CUDA runtime unavailable");
+            return;
+        };
+        let function = runtime.nvrtc_function(MODULE, SOURCE, "add_one").unwrap();
+        let n = 16usize;
+        let size = n * std::mem::size_of::<f32>();
+        let input_ptr = runtime.alloc_raw(size).unwrap();
+        let output_ptr = runtime.alloc_raw(size).unwrap();
+        let input = (0..n).map(|index| index as f32).collect::<Vec<_>>();
+        // SAFETY: `input_ptr` covers the whole source slice.
+        unsafe {
+            runtime.htod(bytes(&input), input_ptr).unwrap();
+        }
+
+        let lifecycle = Arc::new(CudaGraphLifecycle::new(
+            runtime.stream().clone(),
+            DeviceGraphOwner::new(),
+            DeviceGraphSlot::Primary,
+        ));
+        let token = lifecycle.begin(None, Vec::new()).unwrap();
+        launch_add_one(&runtime, &function, input_ptr, output_ptr, n);
+        lifecycle.end(token).unwrap();
+
+        let wrong_owner =
+            DeviceGraphToken::new(DeviceGraphOwner::new(), token.slot(), token.generation());
+        let error = lifecycle.replay(wrong_owner).unwrap_err();
+        assert!(
+            error.to_string().contains("token mismatch"),
+            "a different executor owner must not name this graph: {error}"
+        );
+        assert_eq!(
+            lifecycle.reset(wrong_owner).unwrap(),
+            (false, false),
+            "a different executor owner must not reset this graph"
+        );
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let enqueues = Arc::new(AtomicUsize::new(0));
+        let replay_lifecycle = Arc::clone(&lifecycle);
+        let replay_entered = Arc::clone(&entered);
+        let replay_release = Arc::clone(&release);
+        let replay_enqueues = Arc::clone(&enqueues);
+        let replay = std::thread::spawn(move || {
+            replay_lifecycle.replay_with_hooks(
+                token,
+                || {
+                    replay_entered.wait();
+                    replay_release.wait();
+                },
+                || {
+                    replay_enqueues.fetch_add(1, Ordering::Release);
+                },
+            )
+        });
+        entered.wait();
+
+        let (reset_started_tx, reset_started_rx) = mpsc::channel();
+        let (reset_done_tx, reset_done_rx) = mpsc::channel();
+        let reset_lifecycle = Arc::clone(&lifecycle);
+        let reset = std::thread::spawn(move || {
+            reset_started_tx.send(()).unwrap();
+            let result = reset_lifecycle.reset(token);
+            reset_done_tx.send(result).unwrap();
+        });
+        reset_started_rx.recv().unwrap();
+        assert!(
+            reset_done_rx.try_recv().is_err(),
+            "reset must wait for a replay that already owns the enqueue epoch"
+        );
+
+        release.wait();
+        replay.join().unwrap().unwrap();
+        assert_eq!(enqueues.load(Ordering::Acquire), 1);
+        assert_eq!(reset_done_rx.recv().unwrap().unwrap(), (true, true));
+        reset.join().unwrap();
+
+        let after_reset = lifecycle.replay(token).unwrap_err();
+        assert!(
+            after_reset
+                .to_string()
+                .contains("no executable is installed"),
+            "a retired generation must not enqueue after reset returns: {after_reset}"
+        );
+        assert_eq!(
+            enqueues.load(Ordering::Acquire),
+            1,
+            "no launch may be newly enqueued after reset returns"
+        );
+
+        runtime.synchronize().unwrap();
+        assert_eq!(
+            read_f32(&runtime, output_ptr, n),
+            input.iter().map(|value| value + 1.0).collect::<Vec<_>>()
+        );
+        // SAFETY: reset dropped graph ownership before either buffer is freed.
         unsafe {
             runtime.free_raw(output_ptr).unwrap();
             runtime.free_raw(input_ptr).unwrap();

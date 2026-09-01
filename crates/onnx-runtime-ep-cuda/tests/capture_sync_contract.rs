@@ -373,8 +373,6 @@ fn reviewed_dynamic_output_syncs() -> [ReviewedDynamicOutputSync; 2] {
 fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
     BTreeSet::from([
         "attention.rs::run_attention_phase2a".to_string(),
-        "block_quantized_matmul.rs::execute".to_string(),
-        "block_quantized_moe.rs::execute_with_workspace".to_string(),
         "fused_gemm.rs::run".to_string(),
         "gemm.rs::run".to_string(),
         "matmul_nbits.rs::run".to_string(),

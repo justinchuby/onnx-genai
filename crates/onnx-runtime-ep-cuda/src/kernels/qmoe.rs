@@ -1340,6 +1340,12 @@ impl QMoEKernel {
         &self,
         config: RouteTelemetryConfig,
     ) -> std::result::Result<(), TelemetryUnsupported> {
+        if config.routes_per_row != self.attributes.k {
+            return Err(TelemetryUnsupported::RouteWidthMismatch {
+                config: config.routes_per_row,
+                execution: self.attributes.k,
+            });
+        }
         let armed = ArmedTelemetry::arm(&self.runtime, config)?;
         let mut telemetry = self
             .telemetry
