@@ -8794,6 +8794,33 @@ mod tests {
         );
     }
 
+    /// `Rotate(k)` must send lane `i` to canonical chunk `(i + k) % count` --
+    /// in that direction specifically, not merely to *some* permutation.
+    ///
+    /// `chunk_permutation_is_always_a_permutation` above cannot see this.
+    /// `rotate_right` is also a permutation, is also the identity for
+    /// `count <= 1`, and also round-trips its label, so it satisfies every
+    /// assertion there. Verified by mutation: swapping `rotate_left` for
+    /// `rotate_right` leaves the whole `onnx-runtime-ep-cpu` lib suite green.
+    ///
+    /// The direction is load-bearing outside this crate. The width-16
+    /// straggler study reads its chunk frame as `(lane + k) % width`, so
+    /// reversing the rotation inverts that frame and flips the study's
+    /// published lane-vs-chunk verdict -- with no test failing to say so.
+    #[test]
+    fn rotate_sends_lane_i_to_chunk_i_plus_k() {
+        for count in 1..=33 {
+            for k in 0..=count + 2 {
+                let order = ChunkPermutation::Rotate(k).indices(count);
+                let expected: Vec<usize> = (0..count).map(|i| (i + k) % count).collect();
+                assert_eq!(
+                    order, expected,
+                    "Rotate({k}) at count={count} must map lane i -> chunk (i+{k})%{count}"
+                );
+            }
+        }
+    }
+
     /// Permuting relabels the table without changing the segment *set*, and
     /// never moves a row range across a node boundary.
     #[test]
