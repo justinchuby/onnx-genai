@@ -487,16 +487,106 @@ impl SessionStore for OrtSessions<'_> {
 /// `Engine::native_sessions` and one in-process decoder that is rewound or reset
 /// only while it holds this session's KV (`native_active_session`).
 #[cfg(feature = "native-backend")]
-struct NativeSessions<'a>(&'a mut Engine);
+struct NativeSessions<'a> {
+    engine: &'a mut Engine,
+    #[cfg(test)]
+    rewind_backend: Option<&'a mut dyn NativeRewindBackend>,
+}
 
 /// Read-only view of the native backend for `&self` policy calls.
 #[cfg(feature = "native-backend")]
 struct NativeSessionsRef<'a>(&'a Engine);
 
 #[cfg(feature = "native-backend")]
+trait NativeRewindBackend {
+    fn current_len(&self) -> usize;
+    fn rewind(&mut self, target: usize) -> anyhow::Result<()>;
+}
+
+#[cfg(feature = "native-backend")]
+impl NativeRewindBackend for crate::native_decode::NativeDecodeSession {
+    fn current_len(&self) -> usize {
+        crate::native_decode::NativeDecodeSession::current_len(self)
+    }
+
+    fn rewind(&mut self, target: usize) -> anyhow::Result<()> {
+        crate::native_decode::NativeDecodeSession::rewind(self, target)
+    }
+}
+
+/// Commit a logical rewind only after any required materialized-state rewind.
+///
+/// A target at or beyond the decoder cursor removes only unmaterialized logical
+/// tokens, so capability checks for a physical CSA/HCA rewind do not apply.
+#[cfg(feature = "native-backend")]
+fn apply_native_rewind<T>(
+    logical_tokens: Option<&mut Vec<T>>,
+    logical_target: usize,
+    materialized_len: Option<usize>,
+    rewind_materialized: impl FnOnce(usize) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if let Some(current) = materialized_len {
+        let target = logical_target.min(current);
+        if target < current {
+            rewind_materialized(target)?;
+        }
+    }
+    if let Some(tokens) = logical_tokens {
+        tokens.truncate(logical_target);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-backend")]
+impl<'a> NativeSessions<'a> {
+    fn new(engine: &'a mut Engine) -> Self {
+        Self {
+            engine,
+            #[cfg(test)]
+            rewind_backend: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_rewind_backend(
+        engine: &'a mut Engine,
+        rewind_backend: &'a mut dyn NativeRewindBackend,
+    ) -> Self {
+        Self {
+            engine,
+            rewind_backend: Some(rewind_backend),
+        }
+    }
+
+    fn rewind_backend(
+        backend: &mut dyn NativeRewindBackend,
+        logical_target: usize,
+    ) -> anyhow::Result<()> {
+        let materialized_len = backend.current_len();
+        apply_native_rewind::<()>(None, logical_target, Some(materialized_len), |target| {
+            backend.rewind(target)
+        })
+    }
+
+    fn rewind_active_backend(&mut self, logical_target: usize) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(backend) = self.rewind_backend.as_deref_mut() {
+            return Self::rewind_backend(backend, logical_target);
+        }
+
+        let backend = self
+            .engine
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?;
+        Self::rewind_backend(backend, logical_target)
+    }
+}
+
+#[cfg(feature = "native-backend")]
 impl SessionLen for NativeSessions<'_> {
     fn logical_len(&self, id: SessionId) -> Option<usize> {
-        native_logical_len(self.0, id)
+        native_logical_len(self.engine, id)
     }
 }
 
@@ -510,24 +600,19 @@ impl SessionLen for NativeSessionsRef<'_> {
 #[cfg(feature = "native-backend")]
 impl SessionStore for NativeSessions<'_> {
     fn validate_rewind(&self, _id: SessionId, _target: CheckedPosition) -> anyhow::Result<()> {
-        // The native decoder always admits a rewind and clamps to its own
-        // materialized length in `rewind`; there is no runner/draft state to
-        // reject it the way ORT's does.
+        // The native decoder validates any required physical move before the
+        // logical tail is committed in `rewind`.
         Ok(())
     }
 
     fn rewind(&mut self, id: SessionId, target: CheckedPosition) -> anyhow::Result<()> {
-        let engine = &mut *self.0;
         let position = target.get();
+        if self.engine.native_active_session == Some(id) {
+            self.rewind_active_backend(position)?;
+        }
+        let engine = &mut *self.engine;
         if let Some(state) = engine.native_sessions.get_mut(&id) {
             state.tokens.truncate(position);
-        }
-        if engine.native_active_session == Some(id) {
-            let native = engine
-                .native_session
-                .as_mut()
-                .context("native decoder session is unavailable")?;
-            native.rewind(position.min(native.current_len()))?;
         }
         let last_access = engine.touch_native_session();
         if let Some(state) = engine.native_sessions.get_mut(&id) {
@@ -537,7 +622,7 @@ impl SessionStore for NativeSessions<'_> {
     }
 
     fn reset(&mut self, id: SessionId) -> anyhow::Result<()> {
-        let engine = &mut *self.0;
+        let engine = &mut *self.engine;
         let last_access = engine.touch_native_session();
         if let Some(state) = engine.native_sessions.get_mut(&id) {
             state.tokens.clear();
@@ -555,7 +640,7 @@ impl SessionStore for NativeSessions<'_> {
     }
 
     fn close(&mut self, id: SessionId) -> anyhow::Result<()> {
-        let engine = &mut *self.0;
+        let engine = &mut *self.engine;
         engine.native_sessions.remove(&id);
         if engine.native_active_session == Some(id) {
             let native = engine
@@ -2240,7 +2325,11 @@ impl Engine {
     ) -> anyhow::Result<SessionPosition> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            return session_state::rewind_by(&mut NativeSessions(self), session_id, tokens.get());
+            return session_state::rewind_by(
+                &mut NativeSessions::new(self),
+                session_id,
+                tokens.get(),
+            );
         }
         self.require_ort_backend("session rewind")?;
         session_state::rewind_by(&mut OrtSessions(self), session_id, tokens.get())
@@ -2258,7 +2347,7 @@ impl Engine {
     ) -> anyhow::Result<()> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            return session_state::rewind_to(&mut NativeSessions(self), session_id, position);
+            return session_state::rewind_to(&mut NativeSessions::new(self), session_id, position);
         }
         self.require_ort_backend("session rewind")?;
         session_state::rewind_to(&mut OrtSessions(self), session_id, position)
@@ -2283,7 +2372,7 @@ impl Engine {
         }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            return session_state::reset(&mut NativeSessions(self), session_id);
+            return session_state::reset(&mut NativeSessions::new(self), session_id);
         }
         self.require_ort_backend("persistent sessions")?;
         session_state::reset(&mut OrtSessions(self), session_id)
@@ -2330,7 +2419,7 @@ impl Engine {
         }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            return session_state::close(&mut NativeSessions(self), session_id);
+            return session_state::close(&mut NativeSessions::new(self), session_id);
         }
         self.require_ort_backend("persistent sessions")?;
         session_state::close(&mut OrtSessions(self), session_id)
@@ -3671,6 +3760,35 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "native-backend")]
+    struct RejectingNativeRewind {
+        tokens: Vec<TokenId>,
+        attempts: Vec<usize>,
+    }
+
+    #[cfg(feature = "native-backend")]
+    impl RejectingNativeRewind {
+        fn new(tokens: Vec<TokenId>) -> Self {
+            Self {
+                tokens,
+                attempts: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    impl NativeRewindBackend for RejectingNativeRewind {
+        fn current_len(&self) -> usize {
+            self.tokens.len()
+        }
+
+        fn rewind(&mut self, target: usize) -> anyhow::Result<()> {
+            self.attempts.push(target);
+            anyhow::bail!("test backend does not support physical rewind to {target}")
+        }
+    }
+
     #[cfg(feature = "native-backend")]
     use crate::ProcessorChain;
     use std::path::Path;
@@ -4065,6 +4183,110 @@ mod tests {
             _shared_memory_plan: None,
             _environment: None,
         })
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn native_rewind_transaction_fixture(
+        logical_tokens: Vec<TokenId>,
+    ) -> anyhow::Result<(Engine, SessionId)> {
+        let mut engine = interpreted_engine_with_byte_budget(100)?;
+        let session_id = engine.create_native_session_state()?;
+        engine
+            .native_sessions
+            .get_mut(&session_id)
+            .context("native test session exists")?
+            .tokens = logical_tokens;
+        engine.native_active_session = Some(session_id);
+        Ok((engine, session_id))
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn rewind_native_with_backend(
+        engine: &mut Engine,
+        backend: &mut dyn NativeRewindBackend,
+        session_id: SessionId,
+        target: usize,
+    ) -> anyhow::Result<()> {
+        session_state::rewind_to(
+            &mut NativeSessions::with_rewind_backend(engine, backend),
+            session_id,
+            SessionPosition::new(target),
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_session_noop_rewind_skips_unsupported_physical_backend() -> anyhow::Result<()> {
+        let logical_tokens = vec![10, 11, 12, 13];
+        let physical_tokens = logical_tokens.clone();
+        let (mut engine, session_id) = native_rewind_transaction_fixture(logical_tokens.clone())?;
+        let mut backend = RejectingNativeRewind::new(physical_tokens.clone());
+
+        rewind_native_with_backend(&mut engine, &mut backend, session_id, logical_tokens.len())?;
+
+        assert_eq!(engine.native_sessions[&session_id].tokens, logical_tokens);
+        assert_eq!(backend.tokens, physical_tokens);
+        assert!(backend.attempts.is_empty());
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_session_logical_only_rewind_truncates_only_unmaterialized_tail() -> anyhow::Result<()>
+    {
+        let logical_tokens = vec![10, 11, 12, 13, 14];
+        let physical_tokens = vec![10, 11, 12, 13];
+        let (mut engine, session_id) = native_rewind_transaction_fixture(logical_tokens)?;
+        let mut backend = RejectingNativeRewind::new(physical_tokens.clone());
+
+        rewind_native_with_backend(&mut engine, &mut backend, session_id, physical_tokens.len())?;
+
+        assert_eq!(
+            engine.native_sessions[&session_id].tokens, physical_tokens,
+            "the unmaterialized logical token must be truncated"
+        );
+        assert_eq!(backend.tokens, physical_tokens);
+        assert!(backend.attempts.is_empty());
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_session_physical_rewind_rejection_is_atomic_and_retryable() -> anyhow::Result<()> {
+        let logical_tokens = vec![10, 11, 12, 13, 14];
+        let physical_tokens = vec![10, 11, 12, 13];
+        let (mut engine, session_id) = native_rewind_transaction_fixture(logical_tokens.clone())?;
+        let mut backend = RejectingNativeRewind::new(physical_tokens.clone());
+        let access_counter = engine.native_access_counter;
+        let last_access = engine.native_sessions[&session_id].last_access;
+
+        let first = rewind_native_with_backend(&mut engine, &mut backend, session_id, 3)
+            .expect_err("a genuine physical rewind must reach the rejecting backend")
+            .to_string();
+        assert_eq!(first, "test backend does not support physical rewind to 3");
+        assert_eq!(engine.native_sessions[&session_id].tokens, logical_tokens);
+        assert_eq!(
+            engine.native_sessions[&session_id].last_access, last_access,
+            "a rejected rewind must not publish a new access stamp"
+        );
+        assert_eq!(
+            engine.native_access_counter, access_counter,
+            "a rejected rewind must not advance the access authority"
+        );
+        assert_eq!(engine.native_active_session, Some(session_id));
+        assert_eq!(backend.tokens, physical_tokens);
+
+        let second = rewind_native_with_backend(&mut engine, &mut backend, session_id, 3)
+            .expect_err("retry must deterministically reject the same physical rewind")
+            .to_string();
+        assert_eq!(second, first);
+        assert_eq!(backend.attempts, vec![3, 3]);
+        assert_eq!(engine.native_sessions[&session_id].tokens, logical_tokens);
+        assert_eq!(engine.native_sessions[&session_id].last_access, last_access);
+        assert_eq!(engine.native_access_counter, access_counter);
+        assert_eq!(engine.native_active_session, Some(session_id));
+        assert_eq!(backend.tokens, physical_tokens);
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]
