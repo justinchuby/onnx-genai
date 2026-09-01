@@ -12,6 +12,7 @@ categories = ["science", "hardware-support"]
 default = []
 
 [dependencies]
+onnx-runtime-session-authority = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 # Maps a model's external weight file once and shares it across every tensor a
 # plugin asks about, instead of re-reading the file per lookup.

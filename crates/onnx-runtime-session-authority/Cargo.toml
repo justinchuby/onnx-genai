@@ -1,0 +1,13 @@
+[package]
+name = "onnx-runtime-session-authority"
+description = "Private session-to-EP authority boundary for the nxrt runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

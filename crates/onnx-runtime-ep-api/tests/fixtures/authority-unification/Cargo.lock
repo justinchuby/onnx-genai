@@ -556,6 +556,7 @@ dependencies = [
  "onnx-runtime-loader",
  "onnx-runtime-memory-governor",
  "onnx-runtime-optimizer",
+ "onnx-runtime-session-authority",
  "onnx-runtime-tracer",
  "thiserror 2.0.20",
 ]
@@ -672,12 +673,17 @@ dependencies = [
  "onnx-runtime-memory",
  "onnx-runtime-memory-governor",
  "onnx-runtime-optimizer",
+ "onnx-runtime-session-authority",
  "onnx-runtime-shape-inference",
  "onnx-runtime-tracer",
  "rayon",
  "smallvec",
  "thiserror 2.0.20",
 ]
+
+[[package]]
+name = "onnx-runtime-session-authority"
+version = "0.1.0-dev.5"
 
 [[package]]
 name = "onnx-runtime-shape-inference"

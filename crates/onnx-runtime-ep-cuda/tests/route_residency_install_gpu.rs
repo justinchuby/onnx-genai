@@ -38,12 +38,12 @@
 #![allow(clippy::uninlined_format_args)]
 
 use std::ffi::OsString;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use onnx_runtime_ep_api::{
     ExecutionProvider, ExecutorArtifactConfig, ExecutorArtifactFinalizationOutcome,
-    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorArtifactSessionAuthority,
-    ExecutorInstanceId, ExecutorRouteResidency, ExecutorRouteResidencyConfig,
+    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
+    ExecutorRouteResidency, ExecutorRouteResidencyConfig,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
@@ -52,16 +52,14 @@ use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
+use onnx_runtime_session_authority::ExecutorArtifactSessionAuthority;
 
 // Serialize GPU test bodies in this binary: the coarse gate is a process-global
 // env var, so two tests toggling it concurrently would race.
 static GPU_SERIAL: Mutex<()> = Mutex::new(());
 
-// SAFETY: the opaque authority is a zero-sized token containing only `()`.
-// This raw construction is compiled only into this integration-test binary;
-// `gpu-tests` exposes no production constructor or accessor.
-static GPU_TEST_SESSION_AUTHORITY: ExecutorArtifactSessionAuthority =
-    unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+static GPU_TEST_SESSION_AUTHORITY: LazyLock<ExecutorArtifactSessionAuthority> =
+    LazyLock::new(ExecutorArtifactSessionAuthority::issue_for_runtime_session);
 
 fn fresh_executor() -> ExecutorInstanceId {
     ExecutorInstanceId::fresh(&GPU_TEST_SESSION_AUTHORITY)

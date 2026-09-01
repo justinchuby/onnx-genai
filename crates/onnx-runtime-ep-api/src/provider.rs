@@ -13,6 +13,7 @@ use onnx_runtime_memory_governor::{
     AllocationIdentity, ManagedAllocation, MemoryLease, MemoryRole, OwningAllocation,
     ProviderContextIdentity,
 };
+use onnx_runtime_session_authority::ExecutorArtifactSessionAuthority;
 
 use crate::epcontext::EpContext;
 use crate::error::{EpError, Result};
@@ -49,7 +50,7 @@ impl ExecutorInstanceId {
     /// Allocate a process-unique executor identity under the session's
     /// lifecycle authority.
     pub fn fresh(authority: &ExecutorArtifactSessionAuthority) -> Self {
-        let () = authority.private;
+        authority.witness();
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self(allocate_non_reusable_identity(
             &NEXT,
@@ -123,26 +124,17 @@ pub enum ExecutorKernelScope {
     Required,
 }
 
-/// Opaque capability held only by the crate that owns executor lifecycle
-/// issuance.
-///
-/// Cargo features deliberately do not grant this authority: features are
-/// additive across a dependency graph and therefore cannot identify the
-/// caller that is allowed to issue a session capability.
-///
-/// ```compile_fail
-/// # use onnx_runtime_ep_api::ExecutorArtifactSessionAuthority;
-/// let _forged = ExecutorArtifactSessionAuthority { private: () };
-/// ```
-pub struct ExecutorArtifactSessionAuthority {
-    private: (),
-}
-
 /// Provider-owned half of an executor artifact configuration.
 ///
 /// A provider resolves only its own authority and immutable feature policy.
 /// The session binds this template to the executor identity and a fresh
 /// generation, so a provider cannot choose the owner accepted by the session.
+/// The issuer type lives in an unpublished implementation crate and is not
+/// re-exported by the public EP API:
+///
+/// ```compile_fail
+/// use onnx_runtime_ep_api::ExecutorArtifactSessionAuthority;
+/// ```
 ///
 /// Receiving a template and executor identity is insufficient to bind the
 /// capability without the session's private issuer:
@@ -192,7 +184,7 @@ impl ExecutorArtifactConfigTemplate {
         authority: &ExecutorArtifactSessionAuthority,
         executor: ExecutorInstanceId,
     ) -> ExecutorArtifactConfig {
-        let () = authority.private;
+        authority.witness();
         ExecutorArtifactConfig {
             authority: self.authority,
             executor,
@@ -277,7 +269,7 @@ impl ExecutorArtifactConfig {
         authority: &ExecutorArtifactSessionAuthority,
         readiness: ExecutorArtifactReadinessEpoch,
     ) -> ExecutorArtifactFinalizationProof<'_> {
-        let () = authority.private;
+        authority.witness();
         match self.route_residency {
             ExecutorRouteResidencyConfig::Disabled => {
                 ExecutorArtifactFinalizationProof::Disabled(ExecutorArtifactDisabledFinalization {
@@ -2631,8 +2623,8 @@ fn is_control_flow_or_sequence(node: &Node) -> bool {
 mod tests {
     use super::*;
 
-    static TEST_SESSION_AUTHORITY: ExecutorArtifactSessionAuthority =
-        ExecutorArtifactSessionAuthority { private: () };
+    static TEST_SESSION_AUTHORITY: std::sync::LazyLock<ExecutorArtifactSessionAuthority> =
+        std::sync::LazyLock::new(ExecutorArtifactSessionAuthority::issue_for_runtime_session);
 
     fn _assert_send_sync<T: Send + Sync>() {}
 

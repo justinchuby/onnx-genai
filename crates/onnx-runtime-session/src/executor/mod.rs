@@ -44,21 +44,21 @@
 //! ep-cpu's unchecked pointer derefs sound.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
     ExecutionProvider, ExecutorArtifactConfig, ExecutorArtifactFinalizationOutcome,
-    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorArtifactSessionAuthority,
-    ExecutorInstanceId, ExecutorRouteResidency, ExternalMmapRegion, Kernel, KernelConstantInput,
-    KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight,
-    StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle,
-    WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
-    lazy_weight_candidates,
+    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
+    ExecutorRouteResidency, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput,
+    KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline,
+    TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
 };
+use onnx_runtime_session_authority::ExecutorArtifactSessionAuthority;
 use smallvec::SmallVec;
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
@@ -86,11 +86,8 @@ use crate::sequence::{
 };
 use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor};
 
-// SAFETY: `ExecutorArtifactSessionAuthority` is a zero-sized token whose only
-// field is `()`, so it has no invalid bit pattern. This is the one production
-// construction site, and the private static is never returned by session APIs.
-static SESSION_ARTIFACT_AUTHORITY: ExecutorArtifactSessionAuthority =
-    unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+static SESSION_ARTIFACT_AUTHORITY: LazyLock<ExecutorArtifactSessionAuthority> =
+    LazyLock::new(ExecutorArtifactSessionAuthority::issue_for_runtime_session);
 
 pub(super) struct DeviceValidationSubmission {
     ep: Arc<dyn ExecutionProvider>,
