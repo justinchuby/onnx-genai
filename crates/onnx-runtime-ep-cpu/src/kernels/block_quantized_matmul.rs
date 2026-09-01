@@ -44,6 +44,12 @@ const IQ2_XS_BLOCK_BYTES: usize = 74;
 const IQ2_XXS_BLOCK_BYTES: usize = 66;
 const IQ1_S_BLOCK_BYTES: usize = 50;
 const IQ1_M_BLOCK_BYTES: usize = 56;
+const Q2_K_BLOCK_BYTES: usize = 84;
+const Q3_K_BLOCK_BYTES: usize = 110;
+const Q5_K_BLOCK_BYTES: usize = 176;
+const Q6_K_BLOCK_BYTES: usize = 210;
+const Q8_0_QK: usize = 32;
+const Q8_0_BLOCK_BYTES: usize = 34;
 const IQ1_S_DELTA: f32 = 0.125;
 const IQ1_M_DELTA: f32 = 0.125;
 pub(super) const DEFAULT_DENSE_WEIGHT_CACHE_BYTES: usize = 256 * 1024 * 1024;
@@ -79,6 +85,11 @@ pub(super) enum BlockFormat {
     Iq2Xxs,
     Iq1S,
     Iq1M,
+    Q2K,
+    Q3K,
+    Q5K,
+    Q6K,
+    Q8_0,
 }
 
 impl BlockFormat {
@@ -94,8 +105,13 @@ impl BlockFormat {
             "iq2_xxs" => Ok(Self::Iq2Xxs),
             "iq1_s" => Ok(Self::Iq1S),
             "iq1_m" => Ok(Self::Iq1M),
+            "q2_k" => Ok(Self::Q2K),
+            "q3_k" => Ok(Self::Q3K),
+            "q5_k" => Ok(Self::Q5K),
+            "q6_k" => Ok(Self::Q6K),
+            "q8_0" => Ok(Self::Q8_0),
             _ => Err(error(format!(
-                "unsupported format '{value}'; supported formats are mxfp4, iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_s, iq2_xs, iq2_xxs, iq1_s, and iq1_m"
+                "unsupported format '{value}'; supported formats are mxfp4, iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_s, iq2_xs, iq2_xxs, iq1_s, iq1_m, q2_k, q3_k, q5_k, q6_k, and q8_0"
             ))),
         }
     }
@@ -111,7 +127,12 @@ impl BlockFormat {
             | Self::Iq2Xs
             | Self::Iq2Xxs
             | Self::Iq1S
-            | Self::Iq1M => IQ_SUPER_QK,
+            | Self::Iq1M
+            | Self::Q2K
+            | Self::Q3K
+            | Self::Q5K
+            | Self::Q6K => IQ_SUPER_QK,
+            Self::Q8_0 => Q8_0_QK,
         }
     }
 
@@ -127,6 +148,11 @@ impl BlockFormat {
             Self::Iq2Xxs => IQ2_XXS_BLOCK_BYTES,
             Self::Iq1S => IQ1_S_BLOCK_BYTES,
             Self::Iq1M => IQ1_M_BLOCK_BYTES,
+            Self::Q2K => Q2_K_BLOCK_BYTES,
+            Self::Q3K => Q3_K_BLOCK_BYTES,
+            Self::Q5K => Q5_K_BLOCK_BYTES,
+            Self::Q6K => Q6_K_BLOCK_BYTES,
+            Self::Q8_0 => Q8_0_BLOCK_BYTES,
         }
     }
 
@@ -142,6 +168,11 @@ impl BlockFormat {
             Self::Iq2Xxs => decode_iq2_xxs_block,
             Self::Iq1S => decode_iq1_s_block,
             Self::Iq1M => decode_iq1_m_block,
+            Self::Q2K => decode_q2_k_block,
+            Self::Q3K => decode_q3_k_block,
+            Self::Q5K => decode_q5_k_block,
+            Self::Q6K => decode_q6_k_block,
+            Self::Q8_0 => decode_q8_0_block,
         }
     }
 
@@ -540,6 +571,11 @@ impl DenseWeightSource {
                 byte_offset: view.byte_offset,
                 len: view.byte_size(),
             },
+            TensorBacking::Sealed { .. } => {
+                return Err(error(
+                    "provider-sealed device weights cannot be admitted by the CPU kernel",
+                ));
+            }
         })
     }
 }
@@ -1184,6 +1220,146 @@ fn decode_iq1_m_block(block: &[u8], output: &mut [f32]) {
     }
 }
 
+fn decode_q2_k_block(block: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q2_K_BLOCK_BYTES);
+    debug_assert_eq!(output.len(), IQ_SUPER_QK);
+    let scales = &block[..16];
+    let quants = &block[16..80];
+    let d = half::f16::from_le_bytes([block[80], block[81]]).to_f32();
+    let dmin = half::f16::from_le_bytes([block[82], block[83]]).to_f32();
+
+    for half in 0..2 {
+        for lane in 0..32 {
+            let quant = quants[half * 32 + lane];
+            let scale_base = 8 * half + lane / 16;
+            for quarter in 0..4 {
+                let scale = scales[scale_base + 2 * quarter];
+                output[128 * half + 32 * quarter + lane] =
+                    d * f32::from(scale & 0x0f) * f32::from((quant >> (2 * quarter)) & 3)
+                        - dmin * f32::from(scale >> 4);
+            }
+        }
+    }
+}
+
+fn q3_k_scale(scales: &[u8], index: usize) -> i8 {
+    let unpacked = if index < 4 {
+        (scales[index] & 0x0f) | ((scales[index + 8] & 3) << 4)
+    } else if index < 8 {
+        (scales[index] & 0x0f) | (((scales[index + 4] >> 2) & 3) << 4)
+    } else if index < 12 {
+        (scales[index - 8] >> 4) | (((scales[index] >> 4) & 3) << 4)
+    } else {
+        (scales[index - 8] >> 4) | (((scales[index - 4] >> 6) & 3) << 4)
+    };
+    unpacked as i8 - 32
+}
+
+fn decode_q3_k_block(block: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q3_K_BLOCK_BYTES);
+    debug_assert_eq!(output.len(), IQ_SUPER_QK);
+    let high_mask = &block[..32];
+    let quants = &block[32..96];
+    let scales = &block[96..108];
+    let d = half::f16::from_le_bytes([block[108], block[109]]).to_f32();
+
+    for half in 0..2 {
+        for quarter in 0..4 {
+            for lane in 0..32 {
+                let scale_index = 8 * half + 2 * quarter + lane / 16;
+                let low = ((quants[32 * half + lane] >> (2 * quarter)) & 3) as i8;
+                let high = high_mask[lane] & (1 << (4 * half + quarter)) != 0;
+                let quant = if high { low } else { low - 4 };
+                output[128 * half + 32 * quarter + lane] =
+                    d * f32::from(q3_k_scale(scales, scale_index)) * f32::from(quant);
+            }
+        }
+    }
+}
+
+fn q4_k_scale_min(scales: &[u8], index: usize) -> (u8, u8) {
+    if index < 4 {
+        (scales[index] & 63, scales[index + 4] & 63)
+    } else {
+        (
+            (scales[index + 4] & 0x0f) | ((scales[index - 4] >> 6) << 4),
+            (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4),
+        )
+    }
+}
+
+fn decode_q5_k_block(block: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q5_K_BLOCK_BYTES);
+    debug_assert_eq!(output.len(), IQ_SUPER_QK);
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let dmin = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
+    let scales = &block[4..16];
+    let high_bits = &block[16..48];
+    let quants = &block[48..176];
+
+    for quarter in 0..4 {
+        let (scale0, min0) = q4_k_scale_min(scales, 2 * quarter);
+        let (scale1, min1) = q4_k_scale_min(scales, 2 * quarter + 1);
+        for lane in 0..32 {
+            let packed = quants[32 * quarter + lane];
+            let high = high_bits[lane];
+            let low_quant = (packed & 0x0f)
+                + if high & (1 << (2 * quarter)) != 0 {
+                    16
+                } else {
+                    0
+                };
+            let high_quant = (packed >> 4)
+                + if high & (1 << (2 * quarter + 1)) != 0 {
+                    16
+                } else {
+                    0
+                };
+            output[64 * quarter + lane] =
+                d * f32::from(scale0) * f32::from(low_quant) - dmin * f32::from(min0);
+            output[64 * quarter + 32 + lane] =
+                d * f32::from(scale1) * f32::from(high_quant) - dmin * f32::from(min1);
+        }
+    }
+}
+
+fn decode_q6_k_block(block: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q6_K_BLOCK_BYTES);
+    debug_assert_eq!(output.len(), IQ_SUPER_QK);
+    let low_bits = &block[..128];
+    let high_bits = &block[128..192];
+    let scales = &block[192..208];
+    let d = half::f16::from_le_bytes([block[208], block[209]]).to_f32();
+
+    for half in 0..2 {
+        for lane in 0..32 {
+            let low = &low_bits[64 * half..][..64];
+            let high = high_bits[32 * half + lane];
+            let scale_base = 8 * half + lane / 16;
+            for quarter in 0..4 {
+                let packed = low[32 * (quarter & 1) + lane];
+                let packed_low = if quarter < 2 {
+                    packed & 0x0f
+                } else {
+                    packed >> 4
+                };
+                let quant = (packed_low | (((high >> (2 * quarter)) & 3) << 4)) as i8 - 32;
+                output[128 * half + 32 * quarter + lane] =
+                    d * f32::from(scales[scale_base + 2 * quarter] as i8) * f32::from(quant);
+            }
+        }
+    }
+}
+
+fn decode_q8_0_block(block: &[u8], output: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q8_0_BLOCK_BYTES);
+    debug_assert_eq!(output.len(), Q8_0_QK);
+    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    for (value, &quant) in output.iter_mut().zip(&block[2..]) {
+        *value = scale * f32::from(quant as i8);
+    }
+}
+
 fn required_positive_attr(node: &Node, name: &str) -> Result<usize> {
     let value = optional_int_attr(node, name)?
         .ok_or_else(|| error(format!("missing required integer attribute '{name}'")))?;
@@ -1323,6 +1499,43 @@ mod tests {
         assert_eq!(e8m0_half_scale(128), 1.0);
         assert_eq!((e8m0_half_scale(254) * 2.0).to_bits(), 0x7f00_0000);
         assert!(e8m0_half_scale(255).is_nan());
+    }
+
+    #[test]
+    fn glm52_k_quant_and_q8_known_blocks_match_ggml_layouts() {
+        let mut q2 = vec![0u8; Q2_K_BLOCK_BYTES];
+        q2[0] = 0x32;
+        q2[80..82].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+        q2[82..84].copy_from_slice(&half::f16::from_f32(0.25).to_le_bytes());
+
+        let mut q3 = vec![0u8; Q3_K_BLOCK_BYTES];
+        q3[108..110].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+
+        let mut q5 = vec![0u8; Q5_K_BLOCK_BYTES];
+        q5[..2].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+        q5[2..4].copy_from_slice(&half::f16::from_f32(0.25).to_le_bytes());
+        q5[4] = 2;
+        q5[8] = 3;
+
+        let mut q6 = vec![0u8; Q6_K_BLOCK_BYTES];
+        q6[192] = 2;
+        q6[208..210].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+
+        let mut q8 = vec![0u8; Q8_0_BLOCK_BYTES];
+        q8[..2].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+        q8[2] = (-4i8) as u8;
+
+        for (format, block, expected) in [
+            (BlockFormat::Q2K, q2, -0.75),
+            (BlockFormat::Q3K, q3, 64.0),
+            (BlockFormat::Q5K, q5, -0.75),
+            (BlockFormat::Q6K, q6, -32.0),
+            (BlockFormat::Q8_0, q8, -2.0),
+        ] {
+            let mut output = vec![0.0; format.qk()];
+            format.scalar_decoder()(&block, &mut output);
+            assert_eq!(output[0], expected, "{format:?}");
+        }
     }
 
     #[test]

@@ -359,7 +359,15 @@ fn router_bytes(selected: &[usize; ROWS]) -> Vec<u8> {
     selected
         .iter()
         .flat_map(|&hot| {
-            (0..EXPERTS).map(move |expert| if expert == hot { 20.0_f32 } else { -20.0_f32 })
+            (0..EXPERTS).map(move |expert| {
+                if expert == hot {
+                    20.0_f32
+                } else if expert == (hot + 1) % EXPERTS {
+                    10.0_f32
+                } else {
+                    -20.0_f32
+                }
+            })
         })
         .flat_map(f32::to_le_bytes)
         .collect()
@@ -382,6 +390,10 @@ fn run_first_prefill(case: &mut LiveCase, banks: usize) -> ExecutorInstanceId {
     case.session
         .run_with_device_bindings(&[], &mut case.bindings)
         .expect("real QMoE prefill");
+    let output_index = case.bindings.len() - 1;
+    case.bindings[output_index]
+        .read_bytes()
+        .expect("consume prefill validation receipt");
     let new_scopes: Vec<_> = case
         .provider
         .route_residency_scopes()
@@ -482,18 +494,24 @@ fn run_fault_case(fixture: &Fixture, quarantine: bool) {
             .expect("capture fault case"),
         DeviceGraphCaptureResult::Captured(_)
     ));
+    let output_index = case.bindings.len() - 1;
+    let baseline = case.bindings[output_index]
+        .read_bytes()
+        .expect("consume capture validation receipt");
     for _ in 0..3 {
         assert!(
             case.session
                 .replay_device_graph(&mut case.bindings)
                 .expect("fault replay")
         );
+        assert_eq!(
+            case.bindings[output_index]
+                .read_bytes()
+                .expect("consume fault replay validation receipt"),
+            baseline
+        );
     }
     provider.sync().expect("finish fault replay");
-    let output_index = case.bindings.len() - 1;
-    let baseline = case.bindings[output_index]
-        .read_bytes()
-        .expect("read pre-fault output");
     unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
 
     let groups = provider
@@ -553,12 +571,12 @@ fn run_fault_case(fixture: &Fixture, quarantine: bool) {
                 .replay_device_graph(&mut case.bindings)
                 .expect("replay after range rollback")
         );
+        let post_rollback = case.bindings[output_index]
+            .read_bytes()
+            .expect("consume post-rollback validation receipt");
         provider.sync().expect("complete post-rollback replay");
         assert_eq!(
-            case.bindings[output_index]
-                .read_bytes()
-                .expect("read post-rollback output"),
-            baseline,
+            post_rollback, baseline,
             "mapping failure rollback preserves the real QMoE bank"
         );
     }
@@ -624,7 +642,15 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
             .expect("capture symbolic QMoE"),
         DeviceGraphCaptureResult::Captured(_)
     ));
-    assert!(diag.values_touched() >= 8);
+    let output_index = primary.bindings.len() - 1;
+    let expert_zero_output = primary.bindings[output_index]
+        .read_bytes()
+        .expect("consume capture validation receipt");
+    assert!(
+        diag.values_touched() >= 8,
+        "capture boundary did not apply route residency: {:?}",
+        diag.last_reason()
+    );
     assert!(diag.device_bytes_released() > 0);
     assert!(diag.host_bytes_committed() > 0);
     assert!(ledger.used(Tier::Host) > 0);
@@ -640,6 +666,12 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
                 .replay_device_graph(&mut primary.bindings)
                 .expect("capture replay")
         );
+        assert_eq!(
+            primary.bindings[output_index]
+                .read_bytes()
+                .expect("consume capture replay validation receipt"),
+            expert_zero_output
+        );
     }
     assert_eq!(
         diag.boundaries(),
@@ -647,10 +679,6 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
         "every public fast replay must consume its request-local telemetry window"
     );
 
-    let output_index = primary.bindings.len() - 1;
-    let expert_zero_output = primary.bindings[output_index]
-        .read_bytes()
-        .expect("read expert-zero output");
     set_routes(&mut primary, 2, [1; ROWS]);
     let touched_before = diag.values_touched();
     let boundaries_before_decode = diag.boundaries();
@@ -661,6 +689,12 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
                 .replay_device_graph(&mut primary.bindings)
                 .expect("decode through remapped stable VA")
         );
+        assert_eq!(
+            primary.bindings[output_index]
+                .read_bytes()
+                .expect("consume decode validation receipt"),
+            expert_zero_output
+        );
     }
     assert_eq!(
         diag.boundaries(),
@@ -670,12 +704,6 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
         diag.values_touched(),
         touched_before,
         "the finalized coarse placement installs once"
-    );
-    assert_eq!(
-        primary.bindings[output_index]
-            .read_bytes()
-            .expect("read expert-one output"),
-        expert_zero_output
     );
     let groups = provider
         .retained_route_residency_artifacts(scope)
@@ -717,6 +745,9 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
         .session
         .run_with_device_bindings(&[], &mut primary.bindings)
         .expect("primary survives sibling teardown");
+    primary.bindings[output_index]
+        .read_bytes()
+        .expect("consume post-sibling validation receipt");
 
     let primary_baseline = primary.provider_baseline_device;
     drop(primary);

@@ -84,12 +84,26 @@ pub fn consume_and_validate(
     expected_epoch: u32,
     expected_request: u32,
     expected_device: u32,
+    expected_num_experts: usize,
 ) -> Decision {
+    if header.len() != HEADER_LEN {
+        return Decision::WholeBank(format!(
+            "header length mismatch: record={} expected {HEADER_LEN}",
+            header.len()
+        ));
+    }
+    let expected_words = expected_num_experts.div_ceil(32);
+    if bitmap.len() != expected_words {
+        return Decision::WholeBank(format!(
+            "bitmap length mismatch: record={} expected {expected_words}",
+            bitmap.len()
+        ));
+    }
     if header[H_POISON] != 0 {
         return Decision::WholeBank("poison: out-of-range expert id observed".into());
     }
     if header[H_OVERFLOW] != 0 {
-        return Decision::WholeBank("overflow: distinct routes exceeded queue capacity".into());
+        return Decision::WholeBank("overflow: bounded route counter saturated".into());
     }
     if header[H_DEVICE] != expected_device {
         return Decision::WholeBank(format!(
@@ -103,10 +117,30 @@ pub fn consume_and_validate(
             header[H_REQUEST]
         ));
     }
-    if header[H_EPOCH] < expected_epoch {
+    if header[H_EPOCH] != expected_epoch {
         return Decision::WholeBank(format!(
-            "stale epoch: record epoch={} < boundary epoch {expected_epoch}",
+            "epoch mismatch: record epoch={} expected {expected_epoch}",
             header[H_EPOCH]
+        ));
+    }
+    if let Some(last) = bitmap.last() {
+        let valid_tail_bits = expected_num_experts % 32;
+        if valid_tail_bits != 0 && (*last >> valid_tail_bits) != 0 {
+            return Decision::WholeBank(
+                "bitmap contains experts outside the armed capacity".into(),
+            );
+        }
+    }
+    let Some(unique) = bitmap
+        .iter()
+        .try_fold(0u32, |total, word| total.checked_add(word.count_ones()))
+    else {
+        return Decision::WholeBank("unique expert count overflow".into());
+    };
+    let count = header[H_COUNT];
+    if count < unique || (count == 0 && unique != 0) {
+        return Decision::WholeBank(format!(
+            "route count {count} is inconsistent with {unique} unique selected experts"
         ));
     }
     Decision::HotSet(bitmap.to_vec())

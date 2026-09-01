@@ -282,6 +282,16 @@ fn window_snapshot(
     request: u32,
     device: u32,
 ) -> TelemetrySnapshot {
+    let routes_per_row = route_lists
+        .iter()
+        .find(|routes| !routes.is_empty())
+        .map_or(1, |routes| routes.len());
+    assert!(
+        route_lists
+            .iter()
+            .all(|routes| routes.is_empty() || routes.len() == routes_per_row),
+        "a telemetry window must use one prepared routes-per-row contract"
+    );
     let mut bitmap = vec![0u32; num_experts.div_ceil(32)];
     let mut poison = false;
     let mut count: u32 = 0;
@@ -306,6 +316,7 @@ fn window_snapshot(
         header,
         bitmap,
         num_experts,
+        routes_per_row: u32::try_from(routes_per_row).unwrap(),
     }
 }
 
@@ -964,7 +975,7 @@ fn boundary_injected_fault_rolls_back_through_caller() {
 
     let request = 7_u32;
     let source = WindowSource::with_window(window_snapshot(
-        &[&[0, 2], &[2]],
+        &[&[0, 2], &[0, 2]],
         n_experts,
         1,
         request,

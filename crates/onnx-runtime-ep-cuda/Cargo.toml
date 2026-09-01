@@ -34,10 +34,10 @@ cuda-13000 = [
     "onnx-runtime-cuda-memory/cuda-13000",
 ]
 # Opt-in for real CUDA integration tests. Without this feature they are reported as ignored.
-# Forwarded to onnx-runtime-cuda-memory so its own `gpu-tests`-gated test-only
-# APIs (e.g. `CudaVmmAllocator::install_driver_faults`, used by this crate's
-# `weight_paging.rs` fault-injection tests) are actually compiled in, instead
-# of silently failing to resolve only when this feature is enabled.
+# Enables this crate's test-only CUDA hooks, including the isolated capture-error
+# reset, and forwards to onnx-runtime-cuda-memory so its `gpu-tests`-gated APIs
+# (e.g. `CudaVmmAllocator::install_driver_faults`, used by `weight_paging.rs`
+# fault-injection tests) compile only for the explicit GPU-test contract.
 gpu-tests = ["onnx-runtime-cuda-memory/gpu-tests"]
 
 [dependencies]
@@ -53,6 +53,7 @@ onnx-runtime-quantization = { workspace = true }
 thiserror = { workspace = true }
 half = { workspace = true }
 libloading = { workspace = true }
+arc-swap = { workspace = true }
 # Canonical CUDA runtime (`cudart`) library-name table lives here, shared with
 # `onnx-genai-ort` so the two loaders can never drift (issue #1180). The table
 # is platform data independent of which CUDA API version the bindings target, so
