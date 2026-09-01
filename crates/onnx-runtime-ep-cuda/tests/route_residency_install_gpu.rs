@@ -6,12 +6,12 @@ use onnx_runtime_ep_api::{
     ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExternalMmapRegion, FinalizedExpertBank,
     FinalizedExpertWeight, LazyWeight, LazyWeightBoundary, ResidentWeight, expert_weight_groups,
 };
-use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
 use onnx_runtime_ep_cuda::route_residency::{
     RouteResidencyBindingReject, RouteResidencyInstallOutcome,
 };
 use onnx_runtime_ep_cuda::weight_paging::{DeviceOffloadPolicy, RouteBankReservationReject};
+use onnx_runtime_ep_cuda::{CudaExecutionProvider, RouteFinalizationCommitInterlock};
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, ValueId, WeightRef, static_shape};
 use onnx_runtime_loader::{ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog};
 use onnx_runtime_memory_governor::{DeviceKey, LeaseLedger, LedgerGovernor, MemoryGovernor};
@@ -391,6 +391,153 @@ fn real_producer_installs_executor_scoped_banks_once() {
 
 #[test]
 #[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
+fn repeated_retirement_invalidates_admitted_finalizer_and_rolls_back_once_per_epoch() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let _gate = GateGuard::set(true);
+    let Some(provider) = provider_or_skip("retire before finalization commit") else {
+        return;
+    };
+    let provider = Arc::new(provider);
+    let (graph, node, bank) = qmoe_graph_and_bank(13);
+    let executor = ExecutorInstanceId::fresh();
+    let rollbacks_before = provider
+        .route_residency_retirement_census()
+        .prepared_rollbacks;
+
+    for cycle in 0..4 {
+        let kernel = compile_real_qmoe(&provider, executor, &graph, node);
+        let interlock = Arc::new(RouteFinalizationCommitInterlock::new());
+        std::thread::scope(|scope| {
+            let finalize_provider = Arc::clone(&provider);
+            let finalize_interlock = Arc::clone(&interlock);
+            let finalize_graph = &graph;
+            let finalize_bank = &bank;
+            let finalize = scope.spawn(move || {
+                finalize_provider.finalize_route_residency_for_executor_with_commit_interlock(
+                    executor,
+                    finalize_graph,
+                    ExecutorArtifactReadinessEpoch::new(cycle + 1),
+                    std::slice::from_ref(finalize_bank),
+                    &finalize_interlock,
+                )
+            });
+            interlock.wait_until_admitted();
+            assert_eq!(
+                provider.residency().unwrap().route_reservation_count(),
+                1,
+                "cycle {cycle} must pause after a real reservation was prepared"
+            );
+
+            provider.drain_executor_artifacts(executor);
+            interlock.resume_commit();
+            let error = finalize
+                .join()
+                .expect("finalizer thread")
+                .expect_err("retirement must invalidate the admitted commit");
+            assert!(error.to_string().contains("invalidated before commit"));
+        });
+        drop(kernel);
+
+        assert_eq!(
+            provider.residency().unwrap().route_reservation_count(),
+            0,
+            "cycle {cycle} must remove the rejected preparation exactly once"
+        );
+        let census = provider.route_residency_retirement_census();
+        assert_eq!(census.active_registry_entries, 0, "cycle {cycle}");
+        assert_eq!(census.retirement_registry_entries, 0, "cycle {cycle}");
+        assert_eq!(census.reservation_registry_entries, 0, "cycle {cycle}");
+        assert_eq!(
+            census.prepared_rollbacks,
+            rollbacks_before + cycle + 1,
+            "cycle {cycle} must transfer rollback ownership exactly once"
+        );
+    }
+
+    let replacement_kernel = compile_real_qmoe(&provider, executor, &graph, node);
+    assert_eq!(
+        provider
+            .finalize_executor_artifacts(
+                executor,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(5),
+                std::slice::from_ref(&bank),
+            )
+            .expect("replacement after stale rollback"),
+        ExecutorArtifactFinalization::Complete
+    );
+    assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
+    provider.drain_executor_artifacts(executor);
+    drop(replacement_kernel);
+}
+
+#[test]
+#[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
+fn commit_authority_admits_exactly_one_concurrent_finalizer() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let _gate = GateGuard::set(true);
+    let Some(provider) = provider_or_skip("commit before retirement") else {
+        return;
+    };
+    let provider = Arc::new(provider);
+    let (graph, node, bank) = qmoe_graph_and_bank(15);
+    let executor = ExecutorInstanceId::fresh();
+    let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
+    let interlock = Arc::new(RouteFinalizationCommitInterlock::new());
+
+    std::thread::scope(|scope| {
+        let finalize_provider = Arc::clone(&provider);
+        let finalize_interlock = Arc::clone(&interlock);
+        let finalize_graph = &graph;
+        let finalize_bank = &bank;
+        let finalize = scope.spawn(move || {
+            finalize_provider.finalize_route_residency_for_executor_with_commit_interlock(
+                executor,
+                finalize_graph,
+                ExecutorArtifactReadinessEpoch::new(1),
+                std::slice::from_ref(finalize_bank),
+                &finalize_interlock,
+            )
+        });
+        interlock.wait_until_admitted();
+        let sibling = provider
+            .finalize_executor_artifacts(
+                executor,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(1),
+                std::slice::from_ref(&bank),
+            )
+            .expect("concurrent finalizer observes admission");
+        assert!(matches!(
+            sibling,
+            ExecutorArtifactFinalization::Pending(
+                ExecutorArtifactPending::ProviderReadiness { .. }
+            )
+        ));
+        assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
+
+        interlock.resume_commit();
+        assert_eq!(
+            finalize
+                .join()
+                .expect("finalizer thread")
+                .expect("admitted finalizer commits"),
+            ExecutorArtifactFinalization::Complete
+        );
+    });
+
+    let status = provider.route_residency_executor_status(executor);
+    assert_eq!(status.finalization_attempts, 1);
+    assert!(matches!(
+        status.outcome,
+        Some(RouteResidencyInstallOutcome::Installed { banks: 4 })
+    ));
+    assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
+    provider.drain_executor_artifacts(executor);
+}
+
+#[test]
+#[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
 fn retirement_registry_reclaims_churn_and_blocks_live_generation_aba() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let _gate = GateGuard::set(true);
@@ -531,26 +678,47 @@ fn readiness_absence_is_pending_and_concurrent_finalize_is_idempotent() {
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
     let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
 
-    std::thread::scope(|scope| {
+    let results = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
         for _ in 0..2 {
             let provider = Arc::clone(&provider);
             let graph = Arc::clone(&graph);
             let bank = Arc::clone(&bank);
-            scope.spawn(move || {
-                assert_eq!(
-                    provider
-                        .finalize_executor_artifacts(
-                            executor,
-                            &graph,
-                            ExecutorArtifactReadinessEpoch::new(2),
-                            std::slice::from_ref(bank.as_ref()),
-                        )
-                        .expect("concurrent finalization"),
-                    ExecutorArtifactFinalization::Complete
-                );
-            });
+            handles.push(scope.spawn(move || {
+                provider
+                    .finalize_executor_artifacts(
+                        executor,
+                        &graph,
+                        ExecutorArtifactReadinessEpoch::new(2),
+                        std::slice::from_ref(bank.as_ref()),
+                    )
+                    .expect("concurrent finalization")
+            }));
         }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("finalizer thread"))
+            .collect::<Vec<_>>()
     });
+    assert!(results.contains(&ExecutorArtifactFinalization::Complete));
+    assert!(results.iter().all(|result| matches!(
+        result,
+        ExecutorArtifactFinalization::Complete
+            | ExecutorArtifactFinalization::Pending(
+                ExecutorArtifactPending::ProviderReadiness { .. }
+            )
+    )));
+    assert_eq!(
+        provider
+            .finalize_executor_artifacts(
+                executor,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(2),
+                std::slice::from_ref(bank.as_ref()),
+            )
+            .expect("idempotent retry after concurrent admission"),
+        ExecutorArtifactFinalization::Complete
+    );
     assert_eq!(
         provider
             .route_residency_executor_status(executor)

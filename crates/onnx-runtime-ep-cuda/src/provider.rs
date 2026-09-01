@@ -102,6 +102,41 @@ pub struct RouteResidencyRetirementCensus {
     pub deferred_cleanups: u64,
     pub cleanups_scheduled: u64,
     pub cleanups_executed: u64,
+    pub prepared_rollbacks: u64,
+}
+
+#[doc(hidden)]
+pub struct RouteFinalizationCommitInterlock {
+    admitted: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+impl RouteFinalizationCommitInterlock {
+    pub fn new() -> Self {
+        Self {
+            admitted: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        }
+    }
+
+    pub fn wait_until_admitted(&self) {
+        self.admitted.wait();
+    }
+
+    pub fn resume_commit(&self) {
+        self.resume.wait();
+    }
+
+    fn pause_before_commit(&self) {
+        self.admitted.wait();
+        self.resume.wait();
+    }
+}
+
+impl Default for RouteFinalizationCommitInterlock {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Default)]
@@ -118,6 +153,64 @@ struct ExecutorRouteResidencyState {
     reservation_health: Option<Arc<crate::weight_paging::RouteReservationHealth>>,
     reservation_generation: Option<u64>,
     reservation_removals: u64,
+    finalization_admission: Option<RouteFinalizationAdmission>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RouteFinalizationAdmission {
+    token: u64,
+    readiness: ExecutorArtifactReadinessEpoch,
+}
+
+enum PreparedRouteFinalization {
+    Complete(RouteResidencyInstallOutcome),
+    Pending(ExecutorArtifactPending),
+    Installed(PreparedRouteResidencyInstallation),
+}
+
+struct PreparedRouteResidencyInstallation {
+    executor: ExecutorInstanceId,
+    residency: Arc<CudaWeightResidency>,
+    groups: Vec<ExpertWeightGroup>,
+    boundaries: Vec<RouteResidencyBoundary>,
+    armed_sources: Vec<Arc<crate::kernels::qmoe::QMoERouteTelemetry>>,
+    health: Option<Arc<crate::weight_paging::RouteReservationHealth>>,
+    rollback_counter: Arc<AtomicU64>,
+    banks: usize,
+    committed: bool,
+}
+
+impl PreparedRouteResidencyInstallation {
+    fn commit(mut self, state: &mut ExecutorRouteResidencyState) -> usize {
+        state.retained_artifacts = Some(Arc::new(std::mem::take(&mut self.groups)));
+        state.boundaries = std::mem::take(&mut self.boundaries)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        state.armed_sources = std::mem::take(&mut self.armed_sources);
+        state.reservation_health = self.health.take();
+        state.reservation_generation = state
+            .reservation_health
+            .as_ref()
+            .and_then(|health| health.generation());
+        state.outcome = Some(RouteResidencyInstallOutcome::Installed { banks: self.banks });
+        self.committed = true;
+        self.banks
+    }
+}
+
+impl Drop for PreparedRouteResidencyInstallation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for source in &self.armed_sources {
+            source.disarm_route_telemetry();
+        }
+        if self.residency.remove_route_bank_reservations(self.executor) {
+            self.rollback_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 struct RouteReservationRetirementAction {
@@ -1090,6 +1183,8 @@ pub struct CudaExecutionProvider {
     /// dead weak entries are pruned on every lookup and census.
     route_retirements:
         Mutex<HashMap<ExecutorInstanceId, Weak<crate::weight_paging::RouteReservationHealth>>>,
+    next_route_finalization_admission: AtomicU64,
+    route_finalization_rollbacks: Arc<AtomicU64>,
     route_diag: Arc<RouteResidencyDiagnostics>,
     /// EP-owned registry of live `QMoE` route-telemetry producer sources,
     /// keyed by call-site `NodeId` (issue #1810 Slice 7E). Shared with the
@@ -1098,6 +1193,22 @@ pub struct CudaExecutionProvider {
     /// producer instances instead of a controllable test double. Empty until a
     /// model with `QMoE` nodes is compiled; drained at teardown.
     route_telemetry_registry: Arc<crate::kernels::qmoe::RouteTelemetrySourceRegistry>,
+}
+
+struct RouteFinalizationAdmissionGuard<'a> {
+    provider: &'a CudaExecutionProvider,
+    executor: ExecutorInstanceId,
+    admission: RouteFinalizationAdmission,
+    committed: bool,
+}
+
+impl Drop for RouteFinalizationAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.provider
+                .cancel_route_finalization_admission(self.executor, self.admission);
+        }
+    }
 }
 
 impl std::fmt::Debug for CudaExecutionProvider {
@@ -1354,6 +1465,8 @@ impl CudaExecutionProvider {
             release_queue,
             route_executors: Mutex::new(HashMap::new()),
             route_retirements: Mutex::new(HashMap::new()),
+            next_route_finalization_admission: AtomicU64::new(1),
+            route_finalization_rollbacks: Arc::new(AtomicU64::new(0)),
             route_diag: Arc::new(RouteResidencyDiagnostics::default()),
             route_telemetry_registry,
         };
@@ -2127,6 +2240,7 @@ impl CudaExecutionProvider {
             deferred_cleanups: stats.deferred_cleanups,
             cleanups_scheduled: stats.cleanups_scheduled,
             cleanups_executed: stats.cleanups_executed,
+            prepared_rollbacks: self.route_finalization_rollbacks.load(Ordering::Relaxed),
         }
     }
 
@@ -2149,96 +2263,72 @@ impl CudaExecutionProvider {
         scopes
     }
 
-    /// Finalize one executor's real QMoE route-residency artifacts.
-    ///
-    /// `NoTelemetrySource` is readiness-dependent and returns `Pending` without
-    /// recording or latching a decline only for boundary kinds whose producer
-    /// can be published by a later resolved compilation. Unsupported producer
-    /// kinds are structural, terminal declines. Every structural outcome is
-    /// idempotent. The shipped default-off path returns before touching the
-    /// executor-state map.
-    pub fn finalize_route_residency_for_executor(
+    fn next_route_finalization_admission(&self) -> Result<u64> {
+        self.next_route_finalization_admission
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: route-residency finalization admission identity exhausted"
+                        .to_string(),
+                )
+            })
+    }
+
+    fn cancel_route_finalization_admission(
         &self,
         executor: ExecutorInstanceId,
-        graph: &Graph,
-        readiness: ExecutorArtifactReadinessEpoch,
-        finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
-    ) -> Result<ExecutorArtifactFinalization> {
-        if !crate::coarse_residency::coarse_residency_profile_enabled() {
-            return Ok(ExecutorArtifactFinalization::Complete);
-        }
-
-        if let Some(health) = self.retired_route_reservation(executor) {
-            let generation = health.generation();
-            let (retiring, retired) = health.retirement_status();
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: executor {} route-bank artifact generation {:?} is {}; executor \
-                 identities cannot be reused while a baked requirement or lease still references \
-                 the retired generation",
-                executor.get(),
-                generation,
-                if retired {
-                    "retired"
-                } else if retiring {
-                    "retiring"
-                } else {
-                    "not live"
-                }
-            )));
-        }
-
+        admission: RouteFinalizationAdmission,
+    ) {
+        let _retirements = self
+            .route_retirements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut states = self
             .route_executors
             .lock()
-            .expect("cuda_ep route-residency executors poisoned");
-        let state = states.entry(executor).or_default();
-        if state.drained && state.outcome.is_none() {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: executor {} route-bank artifact authority was retired before \
-                 reservation installation completed; rebuild the executor",
-                executor.get()
-            )));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove = states.get_mut(&executor).is_some_and(|state| {
+            if state.finalization_admission != Some(admission) {
+                return false;
+            }
+            state.finalization_admission = None;
+            state.drained
+        });
+        if remove {
+            states.remove(&executor);
         }
-        if state.outcome.is_some() {
-            state.readiness_epoch = Some(readiness);
-            return Ok(ExecutorArtifactFinalization::Complete);
-        }
-        if state
-            .readiness_epoch
-            .is_some_and(|attempted| attempted >= readiness)
-            && let Some(pending) = &state.pending
-        {
-            return Ok(ExecutorArtifactFinalization::Pending(pending.clone()));
-        }
-        state.readiness_epoch = Some(readiness);
-        state.pending = None;
-        state.finalization_attempts += 1;
+    }
 
+    fn prepare_route_residency_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        graph: &Graph,
+        finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
+    ) -> PreparedRouteFinalization {
         let Some(residency) = self.residency.as_ref() else {
-            self.route_diag
-                .record_decline("weight offload/coarse residency disabled");
-            state.outcome = Some(RouteResidencyInstallOutcome::OffloadDisabled);
-            return Ok(ExecutorArtifactFinalization::Complete);
+            return PreparedRouteFinalization::Complete(
+                RouteResidencyInstallOutcome::OffloadDisabled,
+            );
         };
 
         let discovered = onnx_runtime_ep_api::expert_weight_groups(graph);
         if discovered.is_empty() {
-            let reject = RouteResidencyBindingReject::NoExpertGroups;
-            self.route_diag.record_decline(&reject.reason());
-            state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-            return Ok(ExecutorArtifactFinalization::Complete);
+            return PreparedRouteFinalization::Complete(RouteResidencyInstallOutcome::Rejected(
+                RouteResidencyBindingReject::NoExpertGroups,
+            ));
         }
         if let Some(group) = discovered
             .iter()
             .find(|group| group.boundary != onnx_runtime_ep_api::LazyWeightBoundary::QMoe)
         {
-            let reject = RouteResidencyBindingReject::UnsupportedBoundary {
-                node: group.node,
-                boundary: group.boundary,
-            };
-            self.route_diag.record_decline(&reject.reason());
-            state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-            return Ok(ExecutorArtifactFinalization::Complete);
+            return PreparedRouteFinalization::Complete(RouteResidencyInstallOutcome::Rejected(
+                RouteResidencyBindingReject::UnsupportedBoundary {
+                    node: group.node,
+                    boundary: group.boundary,
+                },
+            ));
         }
 
         let sources = self.route_telemetry_sources(executor);
@@ -2250,28 +2340,30 @@ impl CudaExecutionProvider {
         ) {
             Ok(groups) => groups,
             Err(RouteResidencyBindingReject::NoTelemetrySource { node }) => {
-                let pending = ExecutorArtifactPending::ProducerUnavailable { node };
-                state.pending = Some(pending.clone());
-                return Ok(ExecutorArtifactFinalization::Pending(pending));
+                return PreparedRouteFinalization::Pending(
+                    ExecutorArtifactPending::ProducerUnavailable { node },
+                );
             }
             Err(reject) => {
-                self.route_diag.record_decline(&reject.reason());
-                state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return Ok(ExecutorArtifactFinalization::Complete);
+                return PreparedRouteFinalization::Complete(
+                    RouteResidencyInstallOutcome::Rejected(reject),
+                );
             }
         };
 
         let expected_request = match u32::try_from(executor.get()) {
             Ok(request) => request,
             Err(_) => {
-                let reject = RouteResidencyBindingReject::RequestIdentityOutOfRange {
-                    executor: executor.get(),
-                };
-                self.route_diag.record_decline(&reject.reason());
-                state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return Ok(ExecutorArtifactFinalization::Complete);
+                return PreparedRouteFinalization::Complete(
+                    RouteResidencyInstallOutcome::Rejected(
+                        RouteResidencyBindingReject::RequestIdentityOutOfRange {
+                            executor: executor.get(),
+                        },
+                    ),
+                );
             }
         };
+        let banks = groups.iter().map(|group| group.members.len()).sum();
         let authorities = match residency.install_route_bank_reservations(
             executor,
             finalized_banks,
@@ -2279,24 +2371,30 @@ impl CudaExecutionProvider {
         ) {
             Ok(authorities) => authorities,
             Err(error) => {
-                let reject = RouteResidencyBindingReject::Reservation(error);
-                self.route_diag.record_decline(&reject.reason());
-                state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return Ok(ExecutorArtifactFinalization::Complete);
+                return PreparedRouteFinalization::Complete(
+                    RouteResidencyInstallOutcome::Rejected(
+                        RouteResidencyBindingReject::Reservation(error),
+                    ),
+                );
             }
         };
 
-        let mut armed_sources: Vec<Arc<crate::kernels::qmoe::QMoERouteTelemetry>> =
-            Vec::with_capacity(groups.len());
-        for group in &groups {
+        let mut prepared = PreparedRouteResidencyInstallation {
+            executor,
+            residency: Arc::clone(residency),
+            groups,
+            boundaries: Vec::new(),
+            armed_sources: Vec::new(),
+            health: Some(Arc::clone(&authorities.health)),
+            rollback_counter: Arc::clone(&self.route_finalization_rollbacks),
+            banks,
+            committed: false,
+        };
+        for group in &prepared.groups {
             let Some(source) = self.route_telemetry_registry.source(executor, group.node) else {
-                for source in &armed_sources {
-                    source.disarm_route_telemetry();
-                }
-                residency.remove_route_bank_reservations(executor);
-                let pending = ExecutorArtifactPending::ProducerUnavailable { node: group.node };
-                state.pending = Some(pending.clone());
-                return Ok(ExecutorArtifactFinalization::Pending(pending));
+                return PreparedRouteFinalization::Pending(
+                    ExecutorArtifactPending::ProducerUnavailable { node: group.node },
+                );
             };
             let experts = group
                 .members
@@ -2310,22 +2408,19 @@ impl CudaExecutionProvider {
                 routes_per_row: source.routes_per_row(),
             };
             if let Err(error) = source.arm_route_telemetry(config) {
-                for source in &armed_sources {
-                    source.disarm_route_telemetry();
-                }
-                residency.remove_route_bank_reservations(executor);
-                let reject = RouteResidencyBindingReject::TelemetryUnsupported {
-                    node: group.node,
-                    reason: error.to_string(),
-                };
-                self.route_diag.record_decline(&reject.reason());
-                state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return Ok(ExecutorArtifactFinalization::Complete);
+                return PreparedRouteFinalization::Complete(
+                    RouteResidencyInstallOutcome::Rejected(
+                        RouteResidencyBindingReject::TelemetryUnsupported {
+                            node: group.node,
+                            reason: error.to_string(),
+                        },
+                    ),
+                );
             }
-            armed_sources.push(source);
+            prepared.armed_sources.push(source);
         }
 
-        let boundaries = match build_route_residency_boundaries(
+        prepared.boundaries = match build_route_residency_boundaries(
             graph,
             Arc::clone(residency),
             &sources,
@@ -2342,27 +2437,203 @@ impl CudaExecutionProvider {
         ) {
             Ok(boundaries) => boundaries,
             Err(reject) => {
-                for source in &armed_sources {
-                    source.disarm_route_telemetry();
-                }
-                residency.remove_route_bank_reservations(executor);
-                self.route_diag.record_decline(&reject.reason());
-                state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return Ok(ExecutorArtifactFinalization::Complete);
+                return PreparedRouteFinalization::Complete(
+                    RouteResidencyInstallOutcome::Rejected(reject),
+                );
             }
         };
-        let banks = groups.iter().map(|group| group.members.len()).sum();
-        state.retained_artifacts = Some(Arc::new(groups));
-        state.boundaries = boundaries.into_iter().map(Arc::new).collect();
-        state.armed_sources = armed_sources;
-        state.reservation_health = Some(authorities.health);
-        state.reservation_generation = state
-            .reservation_health
-            .as_ref()
-            .and_then(|health| health.generation());
-        state.outcome = Some(RouteResidencyInstallOutcome::Installed { banks });
-        self.route_diag.record_install(banks);
-        Ok(ExecutorArtifactFinalization::Complete)
+        PreparedRouteFinalization::Installed(prepared)
+    }
+
+    /// Finalize one executor's real QMoE route-residency artifacts.
+    ///
+    /// `NoTelemetrySource` is readiness-dependent and returns `Pending` without
+    /// recording or latching a decline only for boundary kinds whose producer
+    /// can be published by a later resolved compilation. Unsupported producer
+    /// kinds are structural, terminal declines. Every structural outcome is
+    /// idempotent. The shipped default-off path returns before touching the
+    /// executor-state map.
+    pub fn finalize_route_residency_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        graph: &Graph,
+        readiness: ExecutorArtifactReadinessEpoch,
+        finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
+    ) -> Result<ExecutorArtifactFinalization> {
+        self.finalize_route_residency_for_executor_impl(
+            executor,
+            graph,
+            readiness,
+            finalized_banks,
+            || {},
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn finalize_route_residency_for_executor_with_commit_interlock(
+        &self,
+        executor: ExecutorInstanceId,
+        graph: &Graph,
+        readiness: ExecutorArtifactReadinessEpoch,
+        finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
+        interlock: &RouteFinalizationCommitInterlock,
+    ) -> Result<ExecutorArtifactFinalization> {
+        self.finalize_route_residency_for_executor_impl(
+            executor,
+            graph,
+            readiness,
+            finalized_banks,
+            || interlock.pause_before_commit(),
+        )
+    }
+
+    fn finalize_route_residency_for_executor_impl(
+        &self,
+        executor: ExecutorInstanceId,
+        graph: &Graph,
+        readiness: ExecutorArtifactReadinessEpoch,
+        finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
+        after_admission: impl FnOnce(),
+    ) -> Result<ExecutorArtifactFinalization> {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            return Ok(ExecutorArtifactFinalization::Complete);
+        }
+
+        let admission = {
+            let mut retirements = self
+                .route_retirements
+                .lock()
+                .expect("cuda_ep route-residency retirements poisoned");
+            retirements.retain(|_, health| health.strong_count() != 0);
+            if let Some(health) = retirements.get(&executor).and_then(Weak::upgrade) {
+                let generation = health.generation();
+                let (retiring, retired) = health.retirement_status();
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} route-bank artifact generation {:?} is {}; executor \
+                     identities cannot be reused while a baked requirement or lease still references \
+                     the retired generation",
+                    executor.get(),
+                    generation,
+                    if retired {
+                        "retired"
+                    } else if retiring {
+                        "retiring"
+                    } else {
+                        "not live"
+                    }
+                )));
+            }
+
+            let mut states = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            let state = states.entry(executor).or_default();
+            if state.drained {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} route-bank artifact authority was retired before \
+                     reservation installation completed; rebuild the executor",
+                    executor.get()
+                )));
+            }
+            if state.outcome.is_some() {
+                state.readiness_epoch = Some(readiness);
+                return Ok(ExecutorArtifactFinalization::Complete);
+            }
+            if state
+                .readiness_epoch
+                .is_some_and(|attempted| attempted >= readiness)
+                && let Some(pending) = &state.pending
+            {
+                return Ok(ExecutorArtifactFinalization::Pending(pending.clone()));
+            }
+            if let Some(active) = state.finalization_admission {
+                return Ok(ExecutorArtifactFinalization::Pending(
+                    ExecutorArtifactPending::ProviderReadiness {
+                        reason: format!(
+                            "route-residency finalization admission {} is still preparing",
+                            active.token
+                        ),
+                    },
+                ));
+            }
+            let admission = RouteFinalizationAdmission {
+                token: self.next_route_finalization_admission()?,
+                readiness,
+            };
+            state.readiness_epoch = Some(readiness);
+            state.pending = None;
+            state.finalization_attempts += 1;
+            state.finalization_admission = Some(admission);
+            admission
+        };
+
+        let mut admission_guard = RouteFinalizationAdmissionGuard {
+            provider: self,
+            executor,
+            admission,
+            committed: false,
+        };
+        let prepared = self.prepare_route_residency_for_executor(executor, graph, finalized_banks);
+        after_admission();
+
+        let commit_result = {
+            let mut retirements = self
+                .route_retirements
+                .lock()
+                .expect("cuda_ep route-residency retirements poisoned");
+            retirements.retain(|_, health| health.strong_count() != 0);
+            let retired_health = retirements.get(&executor).and_then(Weak::upgrade);
+            let mut states = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            match states.get_mut(&executor) {
+                Some(state)
+                    if !state.drained
+                        && state.finalization_admission == Some(admission)
+                        && retired_health.is_none() =>
+                {
+                    let result = match prepared {
+                        PreparedRouteFinalization::Complete(outcome) => {
+                            if let RouteResidencyInstallOutcome::Rejected(reject) = &outcome {
+                                self.route_diag.record_decline(&reject.reason());
+                            } else if matches!(
+                                outcome,
+                                RouteResidencyInstallOutcome::OffloadDisabled
+                            ) {
+                                self.route_diag
+                                    .record_decline("weight offload/coarse residency disabled");
+                            }
+                            state.outcome = Some(outcome);
+                            ExecutorArtifactFinalization::Complete
+                        }
+                        PreparedRouteFinalization::Pending(pending) => {
+                            state.pending = Some(pending.clone());
+                            ExecutorArtifactFinalization::Pending(pending)
+                        }
+                        PreparedRouteFinalization::Installed(installation) => {
+                            let banks = installation.commit(state);
+                            self.route_diag.record_install(banks);
+                            ExecutorArtifactFinalization::Complete
+                        }
+                    };
+                    state.finalization_admission = None;
+                    Ok(result)
+                }
+                _ => Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} route-residency finalization admission {} for readiness \
+                     epoch {} was invalidated before commit; prepared resources were rolled back",
+                    executor.get(),
+                    admission.token,
+                    admission.readiness.get()
+                ))),
+            }
+        };
+        if commit_result.is_ok() {
+            admission_guard.committed = true;
+        }
+        commit_result
     }
 
     /// Construct and install a production [`RouteResidencyBoundary`] from a
@@ -2463,52 +2734,58 @@ impl CudaExecutionProvider {
     }
 
     pub fn drain_route_residency_for_executor(&self, executor: ExecutorInstanceId) {
-        let health = {
-            let states = self
-                .route_executors
+        enum Drain {
+            Nothing,
+            Preparing,
+            Installed {
+                health: Arc<crate::weight_paging::RouteReservationHealth>,
+                state: Box<ExecutorRouteResidencyState>,
+            },
+        }
+
+        let drain = {
+            // This mutex is the lifecycle linearization authority. Admission,
+            // commit, and retirement all take it before the live-state mutex;
+            // expensive CUDA/resource work happens only after both are released.
+            let mut retirements = self
+                .route_retirements
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            states
-                .get(&executor)
-                .and_then(|state| state.reservation_health.clone())
-        };
-        let Some(health) = health else {
+            retirements.retain(|_, health| health.strong_count() != 0);
             let mut states = self
                 .route_executors
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(mut state) = states.remove(&executor) {
-                state.pending = None;
+            let Some(state) = states.get_mut(&executor) else {
+                return;
+            };
+            state.pending = None;
+            state.drained = true;
+            if let Some(health) = state.reservation_health.clone() {
+                if health.begin_retirement() != RouteReservationRetirementStart::Started {
+                    return;
+                }
+                retirements.insert(executor, Arc::downgrade(&health));
+                let state = states
+                    .remove(&executor)
+                    .expect("live route-residency state disappeared under lifecycle authority");
+                Drain::Installed {
+                    health,
+                    state: Box::new(state),
+                }
+            } else {
+                if state.finalization_admission.is_some() {
+                    Drain::Preparing
+                } else {
+                    states.remove(&executor);
+                    Drain::Nothing
+                }
             }
-            drop(states);
-            self.route_telemetry_registry.remove(executor);
-            return;
         };
-        if health.begin_retirement() != RouteReservationRetirementStart::Started {
-            return;
-        }
-        // Publish the retiring generation before removing the live entry. This
-        // closes the only ABA window: a concurrent finalization either still
-        // observes the installed live state or observes this retirement record,
-        // but can never create a replacement between the two registry updates.
-        self.route_retirements
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(executor, Arc::downgrade(&health));
-
-        let Some(mut state) = self
-            .route_executors
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&executor)
-        else {
-            health.mark_unusable(
-                "reservation retirement lost its live executor registry entry".to_string(),
-            );
-            return;
-        };
-        state.pending = None;
         self.route_telemetry_registry.remove(executor);
+        let Drain::Installed { health, mut state } = drain else {
+            return;
+        };
 
         let Some(residency) = self.residency.as_ref().map(Arc::clone) else {
             health.mark_unusable(

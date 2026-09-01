@@ -2904,6 +2904,14 @@ const ROUTE_HEALTH_RETIRED: u64 = 1 << 3;
 const ROUTE_HEALTH_USE: u64 = 1 << 4;
 static NEXT_ROUTE_RESERVATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+fn next_route_reservation_generation(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+            next.checked_add(1)
+        })
+        .ok()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RouteReservationRetirementStats {
     pub retirements_started: u64,
@@ -3048,9 +3056,9 @@ impl RouteReservationHealth {
         executor: ExecutorInstanceId,
         device_ordinal: u32,
         retirement_counters: Arc<RouteReservationRetirementCounters>,
-    ) -> Arc<Self> {
-        let generation = NEXT_ROUTE_RESERVATION_GENERATION.fetch_add(1, Ordering::Relaxed);
-        Arc::new(Self {
+    ) -> Option<Arc<Self>> {
+        let generation = next_route_reservation_generation(&NEXT_ROUTE_RESERVATION_GENERATION)?;
+        Some(Arc::new(Self {
             identity: Some(RouteReservationIdentity {
                 executor,
                 device_ordinal,
@@ -3060,7 +3068,7 @@ impl RouteReservationHealth {
             reason: Mutex::new(None),
             retirement_cleanup: Mutex::new(None),
             retirement_counters,
-        })
+        }))
     }
 
     pub(crate) fn generation(&self) -> Option<u64> {
@@ -4522,7 +4530,12 @@ impl CudaWeightResidency {
             executor,
             device_ordinal as u32,
             Arc::clone(&self.route_retirement_counters),
-        );
+        )
+        .ok_or_else(|| {
+            RouteBankReservationReject::Reservation(
+                "route-reservation generation identity exhausted".to_string(),
+            )
+        })?;
         let mut by_key = HashMap::new();
         let mut catalogs = HashMap::new();
         let mut allocators = HashMap::new();
@@ -7673,9 +7686,23 @@ mod tests {
     ) {
         let counters = Arc::new(RouteReservationRetirementCounters::default());
         (
-            RouteReservationHealth::new_scoped(executor, device, Arc::clone(&counters)),
+            RouteReservationHealth::new_scoped(executor, device, Arc::clone(&counters))
+                .expect("test route generation"),
             counters,
         )
+    }
+
+    #[test]
+    fn route_reservation_generation_exhaustion_never_wraps_or_reuses_identity() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            next_route_reservation_generation(&counter),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(next_route_reservation_generation(&counter), None);
+        assert_eq!(next_route_reservation_generation(&counter), None);
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
     }
 
     #[test]
