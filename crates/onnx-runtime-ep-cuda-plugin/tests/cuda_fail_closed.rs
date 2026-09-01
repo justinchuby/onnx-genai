@@ -173,10 +173,6 @@ fn shared_ep_allocator_outlives_original_arc() {
     // Minimal mock EP for allocation testing.
     struct AllocEp;
     impl onnx_runtime_ep_api::provider::ExecutionProvider for AllocEp {
-        fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
-            Ok(())
-        }
-
         fn name(&self) -> &str {
             "alloc_test_ep"
         }

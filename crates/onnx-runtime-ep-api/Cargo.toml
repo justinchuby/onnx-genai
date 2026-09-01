@@ -8,6 +8,9 @@ repository.workspace = true
 keywords = ["onnx", "execution-provider", "kernel", "inference", "runtime"]
 categories = ["science", "hardware-support"]
 
+[features]
+default = []
+
 [dependencies]
 onnx-runtime-memory-governor = { workspace = true }
 # Maps a model's external weight file once and shares it across every tensor a

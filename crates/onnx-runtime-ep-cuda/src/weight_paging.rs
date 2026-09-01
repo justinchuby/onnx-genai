@@ -3521,6 +3521,34 @@ impl CudaWeightResidency {
         }
     }
 
+    /// The per-bank *dedicated* VMM reservation the coarse route-residency plan
+    /// would remap for `value`, or `None` when this residency cannot provide one
+    /// (issue #1810 Slice 7E).
+    ///
+    /// The shipped residency admits every paged weight into **one shared** VMM
+    /// reservation ([`PhysicalAdmission::allocator`]) with per-key stable-VA
+    /// slots (issue #716), keyed by page-key rather than by expert-bank
+    /// [`ValueId`]. The coarse plan ([`Self::apply_coarse_residency_plan`])
+    /// addresses each bank at *catalog-relative* offsets, which only a dedicated
+    /// per-bank reservation (base at the bank's first byte) satisfies — so there
+    /// is no per-bank reservation in this layout to hand back, and the install
+    /// seam fail-closes with
+    /// [`RouteResidencyBindingReject::NoPerBankReservation`](crate::route_residency::RouteResidencyBindingReject::NoPerBankReservation)
+    /// rather than remapping the wrong bytes. The per-bank-reservation bridge is
+    /// the disclosed Slice-7E residual; when a later slice admits routed banks
+    /// into dedicated reservations this method returns `Some` and the same seam
+    /// installs a real binding.
+    pub fn coarse_route_bank_reservation(
+        &self,
+        _value: onnx_runtime_ir::ValueId,
+    ) -> Option<Arc<crate::vmm_allocator::CudaVmmAllocator>> {
+        // Inspect the real admission: even once offloading has admitted weights,
+        // the single shared reservation is not a per-bank reservation, so this
+        // is `None` by construction on the shipped layout.
+        let _shared = self.physical.get()?;
+        None
+    }
+
     /// #1810 Slice 5 — Apply a [`ResidencyPlan`] at the model-load coarse
     /// boundary, delegating to
     /// [`crate::coarse_residency::apply_residency_plan_at_boundary`].
@@ -3557,6 +3585,40 @@ impl CudaWeightResidency {
         expert_groups: &[onnx_runtime_ep_api::ExpertWeightGroup],
     ) -> crate::coarse_residency::BoundaryApplicationOutcome {
         crate::coarse_residency::apply_residency_plan_at_boundary(
+            &self.runtime,
+            self,
+            plan,
+            catalogs,
+            allocators,
+            device_pool,
+            host_pool,
+            device_count,
+            device_ordinal,
+            expert_groups,
+        )
+    }
+
+    /// Apply a coarse plan for an executor generation whose immutable artifact
+    /// configuration already resolved route residency as enabled.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_resolved_coarse_residency_plan(
+        &self,
+        plan: &onnx_runtime_ep_api::ResidencyPlan,
+        catalogs: &std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            onnx_runtime_loader::WeightRegionCatalog,
+        >,
+        allocators: &std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            Arc<onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator>,
+        >,
+        device_pool: &Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+        host_pool: &Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+        device_count: usize,
+        device_ordinal: i32,
+        expert_groups: &[onnx_runtime_ep_api::ExpertWeightGroup],
+    ) -> crate::coarse_residency::BoundaryApplicationOutcome {
+        crate::coarse_residency::apply_resolved_residency_plan_at_boundary(
             &self.runtime,
             self,
             plan,

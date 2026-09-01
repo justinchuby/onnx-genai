@@ -5,7 +5,8 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
-    CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel,
+    CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, ExecutorArtifactPolicy,
+    ExecutorArtifactReport, ExecutorArtifactState, ExecutorRouteResidencyConfig, Fence, Kernel,
     NegotiatedWeight,
 };
 use onnx_runtime_memory_governor::MemoryRole;
@@ -136,6 +137,14 @@ struct DeferredValidationEp {
     graph_reset_calls: Arc<AtomicUsize>,
     route_boundary_calls: Arc<AtomicUsize>,
     route_boundary_before_sync: Arc<AtomicBool>,
+    route_boundary_before_validation: Arc<AtomicBool>,
+    route_boundary_required: Arc<AtomicBool>,
+    return_foreign_config_device: Arc<AtomicBool>,
+    return_foreign_artifact_finalization: Arc<AtomicBool>,
+    replay_artifact_finalization: Arc<AtomicBool>,
+    artifact_finalization_cache: Arc<std::sync::Mutex<Option<ExecutorArtifactReport>>>,
+    route_boundary_executors: Arc<std::sync::Mutex<Vec<ExecutorInstanceId>>>,
+    route_lifecycle_events: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
 #[derive(Default)]
@@ -166,6 +175,14 @@ impl DeferredValidationEp {
             graph_reset_calls: Arc::new(AtomicUsize::new(0)),
             route_boundary_calls: Arc::new(AtomicUsize::new(0)),
             route_boundary_before_sync: Arc::new(AtomicBool::new(false)),
+            route_boundary_before_validation: Arc::new(AtomicBool::new(false)),
+            route_boundary_required: Arc::new(AtomicBool::new(false)),
+            return_foreign_config_device: Arc::new(AtomicBool::new(false)),
+            return_foreign_artifact_finalization: Arc::new(AtomicBool::new(false)),
+            replay_artifact_finalization: Arc::new(AtomicBool::new(false)),
+            artifact_finalization_cache: Arc::new(std::sync::Mutex::new(None)),
+            route_boundary_executors: Arc::new(std::sync::Mutex::new(Vec::new())),
+            route_lifecycle_events: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -175,6 +192,7 @@ impl DeferredValidationEp {
     ) -> onnx_runtime_ep_api::Result<u32> {
         self.validation_consume_attempts
             .fetch_add(1, Ordering::Relaxed);
+        self.route_lifecycle_events.lock().unwrap().push("receipt");
         let mut state = self.validation_state.lock().unwrap();
         if let Some(Some((generation, flags))) = state.owners.get(&token.owner())
             && *generation == token.generation()
@@ -307,6 +325,7 @@ impl ExecutionProvider for DeferredValidationEp {
         self.sync_calls.fetch_add(1, Ordering::Relaxed);
         self.synchronized_executions
             .store(self.executions.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.route_lifecycle_events.lock().unwrap().push("sync");
         Ok(())
     }
 
@@ -433,20 +452,276 @@ impl ExecutionProvider for DeferredValidationEp {
         Ok(true)
     }
 
-    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
-        // The production Slice-7C boundary caller lands here once per top-level
-        // request, after `sync()`. Record the call and prove the request-level
-        // synchronization boundary was crossed first (mirrors the latch check
-        // above): if the sync counter has not caught up to executions, the
-        // boundary fired too early.
+    fn consume_route_residency_at_boundary_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> onnx_runtime_ep_api::Result<()> {
         if self.synchronized_executions.load(Ordering::Relaxed)
             != self.executions.load(Ordering::Relaxed)
         {
             self.route_boundary_before_sync
                 .store(true, Ordering::Relaxed);
         }
+        let mut events = self.route_lifecycle_events.lock().unwrap();
+        if !events.ends_with(&["sync", "receipt"]) {
+            self.route_boundary_before_validation
+                .store(true, Ordering::Relaxed);
+        }
+        events.push("boundary");
+        drop(events);
+        self.route_boundary_executors.lock().unwrap().push(executor);
         self.route_boundary_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn executor_artifact_policy(&self) -> onnx_runtime_ep_api::Result<ExecutorArtifactPolicy> {
+        Ok(ExecutorArtifactPolicy::new(
+            onnx_runtime_ep_api::ExecutorArtifactProviderId::UNSCOPED,
+            if self.return_foreign_config_device.load(Ordering::Relaxed) {
+                onnx_runtime_ir::DeviceId::cuda(0)
+            } else {
+                self.device_id()
+            },
+            if self.route_boundary_required.load(Ordering::Relaxed) {
+                ExecutorRouteResidencyConfig::Enabled
+            } else {
+                ExecutorRouteResidencyConfig::Disabled
+            },
+        ))
+    }
+
+    fn inspect_executor_artifacts(
+        &self,
+        _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        readiness: ExecutorArtifactReadinessEpoch,
+        _graph: &Graph,
+    ) -> onnx_runtime_ep_api::Result<ExecutorArtifactReport> {
+        if self
+            .return_foreign_artifact_finalization
+            .load(Ordering::Relaxed)
+        {
+            return Ok(ExecutorArtifactReport::observed(
+                onnx_runtime_ep_api::ExecutorArtifactProviderId::from_raw(1),
+                ExecutorInstanceId::from_raw(executor.get().saturating_add(1)),
+                generation,
+                readiness,
+                ExecutorArtifactState::Required,
+            ));
+        }
+        if self.replay_artifact_finalization.load(Ordering::Relaxed)
+            && let Some(cached) = self.artifact_finalization_cache.lock().unwrap().clone()
+        {
+            return Ok(cached);
+        }
+        let report = ExecutorArtifactReport::observed(
+            onnx_runtime_ep_api::ExecutorArtifactProviderId::UNSCOPED,
+            executor,
+            generation,
+            readiness,
+            if self.route_boundary_required.load(Ordering::Relaxed) {
+                ExecutorArtifactState::Required
+            } else {
+                ExecutorArtifactState::Disabled
+            },
+        );
+        *self.artifact_finalization_cache.lock().unwrap() = Some(report.clone());
+        Ok(report)
+    }
+}
+
+#[test]
+fn route_residency_finalization_rejects_foreign_capability() {
+    let ep = DeferredValidationEp::new();
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
+    ep.return_foreign_artifact_finalization
+        .store(true, Ordering::Relaxed);
+    let executor = issue_executor_instance_id().expect("issue executor identity");
+    let config = ExecutorArtifactConfig::issue(
+        ep.executor_artifact_policy()
+            .expect("resolve executor artifact policy"),
+        executor,
+    )
+    .expect("issue private executor artifact configuration");
+    let mut readiness = ProviderArtifactReadiness::default();
+
+    let error = readiness
+        .finalize_if_needed(&ep, config, &Graph::new())
+        .expect_err("a provider cannot resolve another executor's route boundary");
+    assert!(
+        error
+            .to_string()
+            .contains("provider artifact report mismatch")
+            && error
+                .to_string()
+                .contains(&format!("executor {}", executor.get())),
+        "unexpected foreign-owner diagnostic: {error}"
+    );
+}
+
+#[test]
+fn executor_build_rejects_foreign_provider_device_before_compilation() {
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.return_foreign_config_device
+        .store(true, Ordering::Relaxed);
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let error = match Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+    ) {
+        Ok(_) => panic!("a foreign-device artifact template must fail before compilation"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("configuration for device")
+            && error.to_string().contains("authoritative device"),
+        "unexpected foreign-device diagnostic: {error}"
+    );
+    assert_eq!(ep.executions.load(Ordering::Relaxed), 0);
+    assert!(ep.artifact_finalization_cache.lock().unwrap().is_none());
+}
+
+#[test]
+fn disabled_artifact_config_rejects_required_finalization_without_publication() {
+    let ep = DeferredValidationEp::new();
+    ep.return_foreign_artifact_finalization
+        .store(true, Ordering::Relaxed);
+    let executor = issue_executor_instance_id().expect("issue executor identity");
+    let config = ExecutorArtifactConfig::issue(
+        ep.executor_artifact_policy()
+            .expect("resolve disabled executor artifact policy"),
+        executor,
+    )
+    .expect("issue private executor artifact configuration");
+    assert_eq!(
+        config.route_residency(),
+        ExecutorRouteResidencyConfig::Disabled
+    );
+    let mut readiness = ProviderArtifactReadiness::default();
+
+    let error = readiness
+        .finalize_if_needed(&ep, config, &Graph::new())
+        .expect_err("Disabled cannot accept a Required finalization");
+    assert!(
+        error
+            .to_string()
+            .contains("provider artifact report mismatch"),
+        "unexpected Disabled/Required diagnostic: {error}"
+    );
+    assert_eq!(ep.route_boundary_calls.load(Ordering::Relaxed), 0);
+    assert!(ep.route_lifecycle_events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn stale_finalization_epoch_replay_fails_closed() {
+    let ep = DeferredValidationEp::new();
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
+    let executor = issue_executor_instance_id().expect("issue executor identity");
+    let config = ExecutorArtifactConfig::issue(
+        ep.executor_artifact_policy()
+            .expect("resolve enabled executor artifact policy"),
+        executor,
+    )
+    .expect("issue private executor artifact configuration");
+    let mut readiness = ProviderArtifactReadiness::default();
+    readiness
+        .finalize_if_needed(&ep, config, &Graph::new())
+        .expect("initial exact-generation finalization");
+
+    readiness.advance_to(ExecutorArtifactReadinessEpoch::new(1));
+    ep.replay_artifact_finalization
+        .store(true, Ordering::Relaxed);
+    let error = readiness
+        .finalize_if_needed(&ep, config, &Graph::new())
+        .expect_err("a finalization from the previous epoch cannot be replayed");
+    assert!(
+        error
+            .to_string()
+            .contains("provider artifact report mismatch")
+            && error.to_string().contains("epoch 0")
+            && error.to_string().contains("epoch 1"),
+        "unexpected stale-epoch diagnostic: {error}"
+    );
+    assert_eq!(ep.route_boundary_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn private_identity_exhaustion_is_checked_sticky_and_non_reusing() {
+    let counter = AtomicU64::new(u64::MAX - 1);
+    assert_eq!(
+        allocate_non_reusable_identity(&counter, "identity exhausted").unwrap(),
+        u64::MAX - 1
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+
+    for _ in 0..2 {
+        let error = allocate_non_reusable_identity(&counter, "identity exhausted")
+            .expect_err("exhausted identity allocation must fail closed");
+        assert!(error.to_string().contains("identity exhausted"));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            u64::MAX,
+            "exhaustion must stay sticky and never wrap"
+        );
+    }
+}
+
+#[test]
+fn readiness_exhaustion_rejects_before_kernel_publication_and_stays_exhausted() {
+    let ep = CpuExecutionProvider::new();
+    let config = ExecutorArtifactConfig::issue(
+        ep.executor_artifact_policy()
+            .expect("resolve artifact policy"),
+        issue_executor_instance_id().expect("issue executor identity"),
+    )
+    .expect("issue private executor artifact configuration");
+    let mut cache = KernelCache::default();
+    let mut readiness = ProviderArtifactReadiness::at_epoch_for_test(u64::MAX);
+    let node = Node::new(NodeId(0), "Relu", vec![Some(ValueId(0))], vec![ValueId(1)]);
+
+    for _ in 0..2 {
+        let error = match cache.get_or_create(
+            NodeId(0),
+            &node,
+            &[vec![1]],
+            &[DataType::Float32],
+            &[false],
+            &[None],
+            17,
+            false,
+            config,
+            &mut readiness,
+            &ep,
+            [None; DeviceGraphSlot::COUNT],
+        ) {
+            Ok(_) => panic!("readiness exhaustion must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("readiness epoch space exhausted"),
+            "unexpected exhaustion diagnostic: {error}"
+        );
+        assert_eq!(
+            cache.stats().entries,
+            0,
+            "an exhausted epoch must not publish a kernel"
+        );
     }
 }
 
@@ -919,6 +1194,71 @@ fn device_bound_validation_is_deferred_until_a_partial_host_read() {
 }
 
 #[test]
+fn route_residency_owner_boundary_forces_device_bound_receipt_synchronization() {
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.fail_next.store(false, Ordering::Relaxed);
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
+    let (mut executor, mut bindings) =
+        deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+    let owner = executor.instance_id;
+
+    let outputs = executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("healthy owner-scoped request");
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].is_none());
+    assert_eq!(ep.sync_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.validation_consume_attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.route_boundary_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        ep.route_lifecycle_events.lock().unwrap().as_slice(),
+        &["sync", "receipt", "boundary"]
+    );
+    assert_eq!(
+        ep.route_boundary_executors.lock().unwrap().as_slice(),
+        &[owner]
+    );
+    assert!(!ep.route_boundary_before_sync.load(Ordering::Relaxed));
+    assert!(!ep.route_boundary_before_validation.load(Ordering::Relaxed));
+
+    ep.fail_next.store(true, Ordering::Relaxed);
+    let error = executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect_err("failed exact-owner receipt must fail the request");
+    assert!(
+        error.to_string().contains("device validation failed"),
+        "unexpected typed validation failure: {error}"
+    );
+    assert_eq!(
+        ep.route_boundary_calls.load(Ordering::Relaxed),
+        1,
+        "a failed owner receipt must prevent route-boundary consumption"
+    );
+}
+
+#[test]
+fn route_residency_boundary_rejects_missing_owner_receipt() {
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
+    let (mut executor, _bindings) = deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+
+    let error = executor
+        .finish_device_validation_boundary()
+        .expect_err("a route boundary without an owner receipt must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("missing its owner-scoped device-validation receipt"),
+        "unexpected missing-receipt error: {error}"
+    );
+    assert_eq!(
+        ep.route_boundary_calls.load(Ordering::Relaxed),
+        0,
+        "an unscoped/manual boundary cannot run without an owner receipt"
+    );
+}
+
+#[test]
 fn route_residency_boundary_fires_once_per_top_level_run_after_sync() {
     // Slice-7C reachability: the boundary consumer must be driven from the real
     // request lifecycle exactly once per top-level `run`, and only after the
@@ -940,8 +1280,10 @@ fn route_residency_boundary_fires_once_per_top_level_run_after_sync() {
     // The boundary only fires on a clean validation latch, so keep every request
     // healthy (the failing-latch path is covered by the request-local test).
     ep.fail_next.store(false, Ordering::Relaxed);
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
     let boundary_calls = Arc::clone(&ep.route_boundary_calls);
     let before_sync = Arc::clone(&ep.route_boundary_before_sync);
+    let before_validation = Arc::clone(&ep.route_boundary_before_validation);
     let mut executor = Executor::build(
         graph,
         Arc::new(WeightStore::new()),
@@ -962,6 +1304,18 @@ fn route_residency_boundary_fires_once_per_top_level_run_after_sync() {
     assert!(
         !before_sync.load(Ordering::Relaxed),
         "the boundary consumer must run only after the request synchronization boundary"
+    );
+    assert!(
+        !before_validation.load(Ordering::Relaxed),
+        "the boundary consumer must run only after exact receipt consumption"
+    );
+    assert!(
+        ep.route_boundary_executors
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|owner| *owner == executor.instance_id),
+        "every boundary must carry the exact executor owner"
     );
 }
 
@@ -1013,6 +1367,7 @@ fn route_residency_boundary_skips_nested_control_flow_runs() {
 
     let ep = Arc::new(DeferredValidationEp::new());
     ep.fail_next.store(false, Ordering::Relaxed);
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
     let boundary_calls = Arc::clone(&ep.route_boundary_calls);
     let executions = Arc::clone(&ep.executions);
     let before_sync = Arc::clone(&ep.route_boundary_before_sync);
@@ -4049,10 +4404,6 @@ impl KvCapacityAppendTestEp {
 }
 
 impl ExecutionProvider for KvCapacityAppendTestEp {
-    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
-        Ok(())
-    }
-
     fn name(&self) -> &str {
         "kv_capacity_append_test_ep"
     }
@@ -4956,10 +5307,6 @@ impl WeightDeliveryEp {
 }
 
 impl ExecutionProvider for WeightDeliveryEp {
-    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
-        Ok(())
-    }
-
     fn name(&self) -> &str {
         if self.lazy {
             "nxrt_test_ep"
@@ -6163,7 +6510,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     let mut executor = Executor::build(
         sealed_bqmoe_session_graph(),
         Arc::new(WeightStore::new()),
-        cuda,
+        Arc::clone(&cuda) as Arc<dyn ExecutionProvider>,
     )
     .unwrap();
     let first = executor.run(&[("x", &input), ("router", &router)]).unwrap()[0].to_vec_f32();
@@ -6243,6 +6590,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         unsafe {
             let ptr = std::alloc::alloc(layout);
             assert!(!ptr.is_null(), "positive-control allocation");
+            std::hint::black_box(ptr);
             std::alloc::dealloc(ptr, layout);
         }
     });
@@ -6264,6 +6612,13 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     assert!(
         runtime.graph_lifecycle_lock_acquisition_count() > lock_before,
         "graph-lock falsifier"
+    );
+    let route_lock_before = cuda.route_state_lock_acquisition_count();
+    cuda.test_acquire_route_state_lock();
+    assert_eq!(
+        cuda.route_state_lock_acquisition_count(),
+        route_lock_before + 1,
+        "route-state lock falsifier must observe the intentional acquisition"
     );
     let alloc_before = runtime.allocation_counts();
     let transfer_before = runtime.transfer_counts();
@@ -6322,48 +6677,76 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     );
     drop(preparation_control);
 
-    let allocations = runtime.allocation_counts();
-    let transfers = runtime.transfer_counts();
-    let synchronizations = runtime.forced_synchronization_count();
-    let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
-    let locks = runtime.graph_lifecycle_lock_acquisition_count();
-    let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
-    let submissions = runtime.validation_submission_count();
-    let (warmed, host_allocations) =
-        count_host_allocations(|| executor.run_with_device_bindings(&[], &mut bindings));
-    warmed.unwrap();
+    let route_locks = cuda.route_state_lock_acquisition_count();
+    let route_boundary_calls = cuda.route_request_boundary_call_count();
+    let route_diag = (
+        cuda.route_residency_diagnostics().boundaries(),
+        cuda.route_residency_diagnostics().applied(),
+        cuda.route_residency_diagnostics().rejected(),
+        cuda.route_residency_diagnostics().empty(),
+    );
+    const MEASURED_REQUESTS: u64 = 8;
+    let mut host_allocations = 0;
+    let mut output_prefix = [0u8; 4];
+    for _ in 0..MEASURED_REQUESTS {
+        let allocations = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        let synchronizations = runtime.forced_synchronization_count();
+        let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+        let locks = runtime.graph_lifecycle_lock_acquisition_count();
+        let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
+        let submissions = runtime.validation_submission_count();
+        let (_, request_allocations) = count_host_allocations(|| {
+            executor
+                .run_with_device_bindings(&[], &mut bindings)
+                .unwrap();
+        });
+        host_allocations += request_allocations;
+        assert_eq!(runtime.allocation_counts(), allocations);
+        assert_eq!(runtime.transfer_counts(), transfers);
+        assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+        assert_eq!(
+            onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
+            preparation
+        );
+        assert_eq!(runtime.graph_lifecycle_lock_acquisition_count(), locks);
+        assert_eq!(
+            runtime.validation_registry_lock_acquisition_count(),
+            validation_registry_locks
+        );
+        assert_eq!(runtime.validation_submission_count() - submissions, 1);
+        bindings[2].read_bytes_into(&mut output_prefix).unwrap();
+    }
     assert_eq!(
         host_allocations,
         0,
         "warmed production Executor allocations: {:?}",
         HOST_ALLOCATION_SIZES.with(Cell::get)
     );
-    assert_eq!(runtime.allocation_counts(), allocations);
-    assert_eq!(runtime.transfer_counts(), transfers);
-    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
     assert_eq!(
-        onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
-        preparation
+        cuda.route_state_lock_acquisition_count(),
+        route_locks,
+        "default-off warmed requests must acquire zero route-state locks"
     );
     assert_eq!(
-        runtime.graph_lifecycle_lock_acquisition_count(),
-        locks,
-        "warmed production Executor graph locks"
+        cuda.route_request_boundary_call_count(),
+        route_boundary_calls,
+        "default-off warmed requests must not enter the route boundary"
     );
     assert_eq!(
-        runtime.validation_registry_lock_acquisition_count(),
-        validation_registry_locks,
-        "warmed production Executor validation-registry locks"
-    );
-    assert_eq!(
-        runtime.validation_submission_count() - submissions,
-        1,
-        "warmed production measurement must execute exactly one real validation submission"
+        (
+            cuda.route_residency_diagnostics().boundaries(),
+            cuda.route_residency_diagnostics().applied(),
+            cuda.route_residency_diagnostics().rejected(),
+            cuda.route_residency_diagnostics().empty(),
+        ),
+        route_diag,
+        "default-off warmed requests must perform no producer or telemetry work"
     );
     eprintln!(
-        "validation-allocation warmed-production allocations={host_allocations} submissions=1"
+        "route-default-off warmed-production requests={MEASURED_REQUESTS} \
+         allocations={host_allocations} route_locks=0 boundary_calls=0"
     );
-    bindings[2].read_bytes_range(0, 4).unwrap();
 
     assert!(matches!(
         executor
@@ -6378,6 +6761,8 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     let locks = runtime.graph_lifecycle_lock_acquisition_count();
     let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
     let submissions = runtime.validation_submission_count();
+    let route_locks = cuda.route_state_lock_acquisition_count();
+    let route_boundary_calls = cuda.route_request_boundary_call_count();
     let (replayed, host_allocations) =
         count_host_allocations(|| executor.replay_device_graph(&mut bindings));
     assert!(replayed.unwrap());
@@ -6409,50 +6794,66 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         1,
         "first captured launch measurement must execute exactly one real submission"
     );
+    assert_eq!(cuda.route_state_lock_acquisition_count(), route_locks);
+    assert_eq!(
+        cuda.route_request_boundary_call_count(),
+        route_boundary_calls
+    );
     eprintln!(
         "validation-allocation first-captured-launch allocations={host_allocations} submissions=1"
     );
     bindings[2].read_bytes_range(0, 4).unwrap();
 
-    let allocations = runtime.allocation_counts();
-    let transfers = runtime.transfer_counts();
-    let synchronizations = runtime.forced_synchronization_count();
-    let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
-    let locks = runtime.graph_lifecycle_lock_acquisition_count();
-    let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
-    let submissions = runtime.validation_submission_count();
-    let (replayed, host_allocations) =
-        count_host_allocations(|| executor.replay_device_graph(&mut bindings));
-    assert!(replayed.unwrap());
+    let route_locks = cuda.route_state_lock_acquisition_count();
+    let route_boundary_calls = cuda.route_request_boundary_call_count();
+    let mut host_allocations = 0;
+    for _ in 0..MEASURED_REQUESTS {
+        let allocations = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        let synchronizations = runtime.forced_synchronization_count();
+        let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+        let locks = runtime.graph_lifecycle_lock_acquisition_count();
+        let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
+        let submissions = runtime.validation_submission_count();
+        let (_, replay_allocations) = count_host_allocations(|| {
+            assert!(executor.replay_device_graph(&mut bindings).unwrap());
+        });
+        host_allocations += replay_allocations;
+        assert_eq!(runtime.allocation_counts(), allocations);
+        assert_eq!(runtime.transfer_counts(), transfers);
+        assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+        assert_eq!(
+            onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
+            preparation
+        );
+        assert_eq!(runtime.graph_lifecycle_lock_acquisition_count(), locks);
+        assert_eq!(
+            runtime.validation_registry_lock_acquisition_count(),
+            validation_registry_locks
+        );
+        assert_eq!(runtime.validation_submission_count() - submissions, 1);
+        bindings[2].read_bytes_into(&mut output_prefix).unwrap();
+    }
     assert_eq!(
         host_allocations,
         0,
         "production graph replay allocations: {:?}",
         HOST_ALLOCATION_SIZES.with(Cell::get)
     );
-    assert_eq!(runtime.allocation_counts(), allocations);
-    assert_eq!(runtime.transfer_counts(), transfers);
-    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
     assert_eq!(
-        onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
-        preparation
+        cuda.route_state_lock_acquisition_count(),
+        route_locks,
+        "default-off graph replay must acquire zero route-state locks"
     );
     assert_eq!(
-        runtime.graph_lifecycle_lock_acquisition_count(),
-        locks,
-        "production graph replay lifecycle locks"
+        cuda.route_request_boundary_call_count(),
+        route_boundary_calls,
+        "default-off graph replay must not enter the route boundary"
     );
-    assert_eq!(
-        runtime.validation_registry_lock_acquisition_count(),
-        validation_registry_locks,
-        "production graph replay validation-registry locks"
+    eprintln!(
+        "route-default-off replay requests={MEASURED_REQUESTS} allocations={host_allocations} \
+         route_locks=0 boundary_calls=0"
     );
-    assert_eq!(
-        runtime.validation_submission_count() - submissions,
-        1,
-        "graph replay measurement must execute exactly one real submission"
-    );
-    eprintln!("validation-allocation replay allocations={host_allocations} submissions=1");
 }
 
 #[cfg(feature = "gpu-tests")]
@@ -7917,8 +8318,13 @@ fn coverage_collector_surfaces_ep_decline_reason() {
     ));
 
     let ep = CpuExecutionProvider::new();
+    let artifact_config = ExecutorArtifactConfig::issue(
+        ep.executor_artifact_policy().unwrap(),
+        issue_executor_instance_id().unwrap(),
+    )
+    .unwrap();
     let mut issues = Vec::new();
-    collect_cuda_coverage_issues(&graph, &graph, &ep, "graph", &mut issues);
+    collect_cuda_coverage_issues(&graph, &graph, &ep, artifact_config, "graph", &mut issues);
 
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].op_type, "NotRegistered");
@@ -7979,8 +8385,13 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     );
+    let artifact_config = ExecutorArtifactConfig::issue(
+        ep.executor_artifact_policy().unwrap(),
+        issue_executor_instance_id().unwrap(),
+    )
+    .unwrap();
     let report = || {
-        cuda_fallback_report(&graph, &ep)
+        cuda_fallback_report(&graph, &ep, artifact_config)
             .expect("CUDA declines must produce a fallback report")
             .to_string()
     };

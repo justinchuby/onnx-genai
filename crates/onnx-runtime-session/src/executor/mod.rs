@@ -51,10 +51,12 @@ use std::time::{Duration, Instant};
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
-    ExecutionProvider, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput, KernelMatch,
-    LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline, TensorBacking,
-    TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
-    WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
+    ExecutionProvider, ExecutorArtifactGeneration, ExecutorArtifactPending, ExecutorArtifactPolicy,
+    ExecutorArtifactReadinessEpoch, ExecutorArtifactState, ExecutorInstanceId,
+    ExecutorRouteResidencyConfig, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput,
+    KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline,
+    TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -82,6 +84,69 @@ use crate::sequence::{
     ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
 use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor};
+
+static NEXT_EXECUTOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
+static NEXT_ARTIFACT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_non_reusable_identity(counter: &AtomicU64, exhausted: &'static str) -> Result<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| EpError::KernelFailed(exhausted.to_string()).into())
+}
+
+fn issue_executor_instance_id() -> Result<ExecutorInstanceId> {
+    allocate_non_reusable_identity(
+        &NEXT_EXECUTOR_INSTANCE,
+        "executor instance id space exhausted; refusing to wrap and create an ABA collision",
+    )
+    .map(ExecutorInstanceId::from_raw)
+}
+
+fn issue_artifact_generation() -> Result<ExecutorArtifactGeneration> {
+    allocate_non_reusable_identity(
+        &NEXT_ARTIFACT_GENERATION,
+        "executor artifact generation space exhausted; refusing to wrap and create an ABA collision",
+    )
+    .map(ExecutorArtifactGeneration::from_raw)
+}
+
+/// The session-private lifecycle value. Public EP crates see only its routing
+/// labels and can return reports; they cannot construct, clone, or finalize
+/// this authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExecutorArtifactConfig {
+    policy: ExecutorArtifactPolicy,
+    executor: ExecutorInstanceId,
+    generation: ExecutorArtifactGeneration,
+}
+
+impl ExecutorArtifactConfig {
+    fn issue(policy: ExecutorArtifactPolicy, executor: ExecutorInstanceId) -> Result<Self> {
+        Ok(Self {
+            policy,
+            executor,
+            generation: issue_artifact_generation()?,
+        })
+    }
+
+    fn executor(self) -> ExecutorInstanceId {
+        self.executor
+    }
+
+    fn provider(self) -> onnx_runtime_ep_api::ExecutorArtifactProviderId {
+        self.policy.provider()
+    }
+
+    fn generation(self) -> ExecutorArtifactGeneration {
+        self.generation
+    }
+
+    fn route_residency(self) -> ExecutorRouteResidencyConfig {
+        self.policy.route_residency()
+    }
+}
 
 pub(super) struct DeviceValidationSubmission {
     ep: Arc<dyn ExecutionProvider>,
@@ -823,6 +888,14 @@ impl Drop for Executor {
                  dispatch_elided={dispatch_elided}"
             );
         }
+        // Drain only this executor's provider-owned artifacts before its
+        // buffers/kernels are torn down. Sibling/MTP executors may share the same
+        // EP and must retain their own producers and boundary state.
+        self.ep.drain_executor_artifacts(
+            self.artifact_config.provider(),
+            self.artifact_config.executor(),
+            self.artifact_config.generation(),
+        );
         // Evict the global weight-transpose cache to prevent address-reuse
         // staleness: if a subsequently loaded model's mmap recycles a virtual
         // address, the cache must not serve the old model's transposed weights.

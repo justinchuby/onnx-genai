@@ -563,6 +563,7 @@ impl Executor {
         let has_lazy_inputs = in_infos.iter().any(|info| info.lazy_unresolved);
 
         let ep = self.ep.clone();
+        let artifact_config = self.artifact_config;
         let graph_tokens = std::array::from_fn(|index| self.slot_capture[index].device_graph_token);
 
         // Bind the mutated fields as disjoint borrows so `self` is never borrowed
@@ -571,6 +572,7 @@ impl Executor {
         // resolved kernel reference borrows `cache` for the rest of the dispatch.
         let cache = &mut self.cache;
         let kernel_bindings = &mut self.kernel_bindings;
+        let provider_artifact_readiness = &mut self.provider_artifact_readiness;
         let capture_growing = &self.capture_growing_symbols;
         let weights = &self.weights;
         let mut ctx = KernelDispatchContext {
@@ -651,6 +653,8 @@ impl Executor {
                     &constant_values,
                     opset,
                     node_capture_seq_independent(ctx.graph, node, capture_growing),
+                    artifact_config,
+                    provider_artifact_readiness,
                     ep.as_ref(),
                     graph_tokens,
                 )?;
@@ -665,6 +669,11 @@ impl Executor {
                 )
                 .expect("kernel binding resolved immediately before lookup")
         };
+        // Preflight cannot compile a node whose inputs become concrete only
+        // during runtime shape resolution. If lookup above created that
+        // specialization, the cache publication chokepoint invalidated the
+        // authority. Finalize it now, while no kernel work has been enqueued.
+        provider_artifact_readiness.finalize_if_needed(ep.as_ref(), artifact_config, ctx.graph)?;
         for (index, (view, info)) in views.iter_mut().zip(&in_infos).enumerate() {
             if let Some(sealed) = kernel.constant_input_override(index) {
                 *view = sealed;
