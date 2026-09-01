@@ -99,6 +99,76 @@ pub enum ExecutorRouteResidencyConfig {
     Enabled,
 }
 
+/// Provider-owned half of an executor artifact configuration.
+///
+/// A provider resolves only its own authority and immutable feature policy.
+/// The session binds this template to the executor identity and a fresh
+/// generation, so a provider cannot choose the owner accepted by the session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExecutorArtifactConfigTemplate {
+    authority: ExecutorArtifactConfigAuthority,
+    device: DeviceId,
+    route_residency: ExecutorRouteResidencyConfig,
+}
+
+impl ExecutorArtifactConfigTemplate {
+    /// Construct a provider-resolved artifact configuration template.
+    #[doc(hidden)]
+    pub const fn resolved(
+        authority: ExecutorArtifactConfigAuthority,
+        device: DeviceId,
+        route_residency: ExecutorRouteResidencyConfig,
+    ) -> Self {
+        Self {
+            authority,
+            device,
+            route_residency,
+        }
+    }
+
+    pub const fn device(self) -> DeviceId {
+        self.device
+    }
+
+    pub const fn route_residency(self) -> ExecutorRouteResidencyConfig {
+        self.route_residency
+    }
+
+    /// Bind this provider policy to one session-issued executor generation.
+    #[must_use]
+    pub fn bind(self, executor: ExecutorInstanceId) -> ExecutorArtifactConfig {
+        ExecutorArtifactConfig {
+            authority: self.authority,
+            executor,
+            generation: ExecutorArtifactGeneration::fresh(),
+            device: self.device,
+            route_residency: self.route_residency,
+        }
+    }
+}
+
+/// Process-unique generation of one executor artifact configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExecutorArtifactGeneration(u64);
+
+impl ExecutorArtifactGeneration {
+    fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let generation = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(
+            generation,
+            u64::MAX,
+            "executor artifact generation space exhausted"
+        );
+        Self(generation)
+    }
+
+    /// Stable numeric representation for diagnostics.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Typed immutable configuration for one executor/provider generation.
 ///
 /// The same token is required at kernel-producer publication, artifact
@@ -108,24 +178,12 @@ pub enum ExecutorRouteResidencyConfig {
 pub struct ExecutorArtifactConfig {
     authority: ExecutorArtifactConfigAuthority,
     executor: ExecutorInstanceId,
+    generation: ExecutorArtifactGeneration,
+    device: DeviceId,
     route_residency: ExecutorRouteResidencyConfig,
 }
 
 impl ExecutorArtifactConfig {
-    /// Construct a provider-resolved executor artifact configuration.
-    #[doc(hidden)]
-    pub const fn resolved(
-        authority: ExecutorArtifactConfigAuthority,
-        executor: ExecutorInstanceId,
-        route_residency: ExecutorRouteResidencyConfig,
-    ) -> Self {
-        Self {
-            authority,
-            executor,
-            route_residency,
-        }
-    }
-
     pub const fn authority(self) -> ExecutorArtifactConfigAuthority {
         self.authority
     }
@@ -134,8 +192,38 @@ impl ExecutorArtifactConfig {
         self.executor
     }
 
+    pub const fn generation(self) -> ExecutorArtifactGeneration {
+        self.generation
+    }
+
+    pub const fn device(self) -> DeviceId {
+        self.device
+    }
+
     pub const fn route_residency(self) -> ExecutorRouteResidencyConfig {
         self.route_residency
+    }
+
+    /// Issue a scoped finalization proof for exactly this readiness epoch.
+    #[must_use]
+    pub fn finalization_proof(
+        &self,
+        readiness: ExecutorArtifactReadinessEpoch,
+    ) -> ExecutorArtifactFinalizationProof<'_> {
+        match self.route_residency {
+            ExecutorRouteResidencyConfig::Disabled => {
+                ExecutorArtifactFinalizationProof::Disabled(ExecutorArtifactDisabledFinalization {
+                    config: self,
+                    readiness,
+                })
+            }
+            ExecutorRouteResidencyConfig::Enabled => {
+                ExecutorArtifactFinalizationProof::Enabled(ExecutorArtifactEnabledFinalization {
+                    config: self,
+                    readiness,
+                })
+            }
+        }
     }
 }
 
@@ -143,9 +231,9 @@ impl ExecutorArtifactConfig {
 ///
 /// The session advances this at the kernel-cache publication chokepoint whenever
 /// any build, binding-preparation, or runtime-dispatch path creates a new
-/// specialization. A provider that returns
-/// [`ExecutorArtifactFinalization::Pending`] is not called again for the same
-/// epoch: another attempt requires a concrete compilation transition.
+/// specialization. A provider that returns a pending proof is not called again
+/// for the same epoch: another attempt requires a concrete compilation
+/// transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExecutorArtifactReadinessEpoch(u64);
 
@@ -183,21 +271,189 @@ impl ExecutorArtifactPending {
     }
 }
 
-/// Result of the authoritative executor-artifact finalization transition.
+/// Scoped proof offered to a provider for one exact executor generation and
+/// readiness epoch.
+///
+/// The variants expose only legal constructors: a disabled generation can
+/// complete only as disabled, while an enabled generation can require a
+/// boundary, explicitly decline, or remain pending.
+pub enum ExecutorArtifactFinalizationProof<'a> {
+    Disabled(ExecutorArtifactDisabledFinalization<'a>),
+    Enabled(ExecutorArtifactEnabledFinalization<'a>),
+}
+
+impl ExecutorArtifactFinalizationProof<'_> {
+    pub fn config(&self) -> ExecutorArtifactConfig {
+        match self {
+            Self::Disabled(proof) => proof.config(),
+            Self::Enabled(proof) => proof.config(),
+        }
+    }
+
+    pub fn readiness(&self) -> ExecutorArtifactReadinessEpoch {
+        match self {
+            Self::Disabled(proof) => proof.readiness(),
+            Self::Enabled(proof) => proof.readiness(),
+        }
+    }
+}
+
+/// Finalization authority for an immutable disabled generation.
+///
+/// A disabled proof deliberately has no `required`, `declined`, or `pending`
+/// constructor:
+///
+/// ```compile_fail
+/// # use onnx_runtime_ep_api::{
+/// #     ExecutorArtifactConfigAuthority, ExecutorArtifactConfigTemplate,
+/// #     ExecutorArtifactFinalizationProof, ExecutorArtifactReadinessEpoch,
+/// #     ExecutorInstanceId, ExecutorRouteResidencyConfig,
+/// # };
+/// # use onnx_runtime_ir::DeviceId;
+/// let config = ExecutorArtifactConfigTemplate::resolved(
+///     ExecutorArtifactConfigAuthority::UNSCOPED,
+///     DeviceId::cpu(),
+///     ExecutorRouteResidencyConfig::Disabled,
+/// )
+/// .bind(ExecutorInstanceId::fresh());
+/// if let ExecutorArtifactFinalizationProof::Disabled(disabled) =
+///     config.finalization_proof(ExecutorArtifactReadinessEpoch::INITIAL)
+/// {
+///     disabled.required();
+/// }
+/// ```
+pub struct ExecutorArtifactDisabledFinalization<'a> {
+    config: &'a ExecutorArtifactConfig,
+    readiness: ExecutorArtifactReadinessEpoch,
+}
+
+impl ExecutorArtifactDisabledFinalization<'_> {
+    pub fn config(&self) -> ExecutorArtifactConfig {
+        *self.config
+    }
+
+    pub fn readiness(&self) -> ExecutorArtifactReadinessEpoch {
+        self.readiness
+    }
+
+    #[must_use]
+    pub fn complete(self) -> ExecutorArtifactFinalization {
+        ExecutorArtifactFinalization::new(
+            *self.config,
+            self.readiness,
+            ExecutorArtifactFinalizationOutcome::Complete {
+                route_residency: ExecutorRouteResidency::Disabled,
+            },
+        )
+    }
+}
+
+/// Finalization authority for an immutable enabled generation.
+pub struct ExecutorArtifactEnabledFinalization<'a> {
+    config: &'a ExecutorArtifactConfig,
+    readiness: ExecutorArtifactReadinessEpoch,
+}
+
+impl ExecutorArtifactEnabledFinalization<'_> {
+    pub fn config(&self) -> ExecutorArtifactConfig {
+        *self.config
+    }
+
+    pub fn readiness(&self) -> ExecutorArtifactReadinessEpoch {
+        self.readiness
+    }
+
+    #[must_use]
+    pub fn required(self) -> ExecutorArtifactFinalization {
+        ExecutorArtifactFinalization::new(
+            *self.config,
+            self.readiness,
+            ExecutorArtifactFinalizationOutcome::Complete {
+                route_residency: ExecutorRouteResidency::required_for(self.config.executor),
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn declined(self) -> ExecutorArtifactFinalization {
+        ExecutorArtifactFinalization::new(
+            *self.config,
+            self.readiness,
+            ExecutorArtifactFinalizationOutcome::Complete {
+                route_residency: ExecutorRouteResidency::Declined,
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn pending(self, pending: ExecutorArtifactPending) -> ExecutorArtifactFinalization {
+        ExecutorArtifactFinalization::new(
+            *self.config,
+            self.readiness,
+            ExecutorArtifactFinalizationOutcome::Pending(pending),
+        )
+    }
+}
+
+/// Opaque provider response minted from a scoped finalization proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ExecutorArtifactFinalization {
+pub struct ExecutorArtifactFinalization {
+    config: ExecutorArtifactConfig,
+    readiness: ExecutorArtifactReadinessEpoch,
+    outcome: ExecutorArtifactFinalizationOutcome,
+}
+
+impl ExecutorArtifactFinalization {
+    fn new(
+        config: ExecutorArtifactConfig,
+        readiness: ExecutorArtifactReadinessEpoch,
+        outcome: ExecutorArtifactFinalizationOutcome,
+    ) -> Self {
+        Self {
+            config,
+            readiness,
+            outcome,
+        }
+    }
+
+    /// Verify that this response was minted for the exact capability and epoch
+    /// currently held by the session.
+    pub fn resolve(
+        self,
+        expected: ExecutorArtifactConfig,
+        readiness: ExecutorArtifactReadinessEpoch,
+    ) -> Result<ExecutorArtifactFinalizationOutcome> {
+        if self.config != expected || self.readiness != readiness {
+            return Err(EpError::KernelFailed(format!(
+                "executor artifact finalization proof mismatch: returned authority {} device {:?} \
+                 executor {} generation {} epoch {}, expected authority {} device {:?} executor {} \
+                 generation {} epoch {}",
+                self.config.authority().get(),
+                self.config.device(),
+                self.config.executor().get(),
+                self.config.generation().get(),
+                self.readiness.get(),
+                expected.authority().get(),
+                expected.device(),
+                expected.executor().get(),
+                expected.generation().get(),
+                readiness.get(),
+            )));
+        }
+        Ok(self.outcome)
+    }
+}
+
+/// Session-validated result of executor artifact finalization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorArtifactFinalizationOutcome {
     /// Every provider artifact required by this executor reached an honest
-    /// terminal outcome: installed, disabled, or structurally declined. Later
-    /// kernel specializations may reuse the executor-owned producer identity
-    /// without reinstalling.
+    /// terminal outcome.
     Complete {
-        /// Resolved request-boundary behavior for this executor. The executor
-        /// retains this proof and never re-queries provider state on a request.
         route_residency: ExecutorRouteResidency,
     },
     /// A readiness-dependent producer is not available yet. Nothing terminal
-    /// was latched. Execution and capture remain forbidden, and the executor
-    /// may invoke the transition again only after its readiness epoch advances.
+    /// was latched.
     Pending(ExecutorArtifactPending),
 }
 
@@ -1957,19 +2213,18 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
-    /// Resolve the immutable configuration for one executor generation.
+    /// Resolve the provider-owned half of an immutable executor configuration.
     ///
     /// The session calls this exactly once before compiling any kernel for the
-    /// executor, then carries the returned token through publication,
-    /// finalization, and teardown. Providers that own no executor-scoped
-    /// artifacts keep the disabled default.
-    fn resolve_executor_artifact_config(
-        &self,
-        executor: ExecutorInstanceId,
-    ) -> Result<ExecutorArtifactConfig> {
-        Ok(ExecutorArtifactConfig::resolved(
+    /// executor, binds the returned template to its own executor identity and
+    /// fresh generation, then carries that capability through publication,
+    /// finalization, and teardown. Providers cannot choose the executor owner.
+    /// Providers that own no executor-scoped artifacts keep the disabled
+    /// default.
+    fn resolve_executor_artifact_config(&self) -> Result<ExecutorArtifactConfigTemplate> {
+        Ok(ExecutorArtifactConfigTemplate::resolved(
             ExecutorArtifactConfigAuthority::UNSCOPED,
-            executor,
+            self.device_id(),
             ExecutorRouteResidencyConfig::Disabled,
         ))
     }
@@ -1983,19 +2238,18 @@ pub trait ExecutionProvider: Send + Sync {
     /// `readiness` advances at every executor kernel-cache miss, including
     /// binding preparation and runtime dispatch; the executor never calls a
     /// provider twice for the same pending/failed epoch. Structural declines
-    /// may latch as [`ExecutorArtifactFinalization::Complete`];
-    /// readiness-dependent absence returns
-    /// [`ExecutorArtifactFinalization::Pending`] without poisoning a later
-    /// epoch. An `Err` is also fail-closed and may be retried only after a later
-    /// compilation epoch. The default completes without side effects.
+    /// may latch as complete; readiness-dependent absence returns a pending
+    /// proof without poisoning a later epoch. An `Err` is also fail-closed and
+    /// may be retried only after a later compilation epoch. The default
+    /// completes without side effects.
     fn finalize_executor_artifacts(
         &self,
-        _config: ExecutorArtifactConfig,
+        proof: ExecutorArtifactFinalizationProof<'_>,
         _graph: &Graph,
-        _readiness: ExecutorArtifactReadinessEpoch,
     ) -> Result<ExecutorArtifactFinalization> {
-        Ok(ExecutorArtifactFinalization::Complete {
-            route_residency: ExecutorRouteResidency::Disabled,
+        Ok(match proof {
+            ExecutorArtifactFinalizationProof::Disabled(disabled) => disabled.complete(),
+            ExecutorArtifactFinalizationProof::Enabled(enabled) => enabled.declined(),
         })
     }
 
@@ -2332,6 +2586,75 @@ mod tests {
     #[test]
     fn device_buffer_is_send_sync() {
         _assert_send_sync::<DeviceBuffer>();
+    }
+
+    #[test]
+    fn artifact_template_binding_issues_unique_session_generations() {
+        let template = ExecutorArtifactConfigTemplate::resolved(
+            ExecutorArtifactConfigAuthority::fresh(),
+            DeviceId::cpu(),
+            ExecutorRouteResidencyConfig::Enabled,
+        );
+        let executor = ExecutorInstanceId::fresh();
+        let first = template.bind(executor);
+        let second = template.bind(executor);
+        assert_eq!(first.executor(), executor);
+        assert_eq!(first.device(), DeviceId::cpu());
+        assert_ne!(first.generation(), second.generation());
+    }
+
+    #[test]
+    fn artifact_finalization_is_scoped_to_exact_capability_and_epoch() {
+        let expected = ExecutorArtifactConfigTemplate::resolved(
+            ExecutorArtifactConfigAuthority::fresh(),
+            DeviceId::cpu(),
+            ExecutorRouteResidencyConfig::Enabled,
+        )
+        .bind(ExecutorInstanceId::fresh());
+        let epoch = ExecutorArtifactReadinessEpoch::new(7);
+        let ExecutorArtifactFinalizationProof::Enabled(enabled) =
+            expected.finalization_proof(epoch)
+        else {
+            unreachable!("test configuration is enabled")
+        };
+        assert_eq!(
+            enabled
+                .required()
+                .resolve(expected, epoch)
+                .expect("exact proof resolves"),
+            ExecutorArtifactFinalizationOutcome::Complete {
+                route_residency: ExecutorRouteResidency::required_for(expected.executor()),
+            }
+        );
+
+        let foreign = ExecutorArtifactConfigTemplate::resolved(
+            ExecutorArtifactConfigAuthority::fresh(),
+            DeviceId::cuda(1),
+            ExecutorRouteResidencyConfig::Enabled,
+        )
+        .bind(ExecutorInstanceId::fresh());
+        let ExecutorArtifactFinalizationProof::Enabled(foreign_proof) =
+            foreign.finalization_proof(epoch)
+        else {
+            unreachable!("foreign test configuration is enabled")
+        };
+        let error = foreign_proof
+            .required()
+            .resolve(expected, epoch)
+            .expect_err("foreign provider/device/executor/generation must fail closed");
+        assert!(error.to_string().contains("finalization proof mismatch"));
+
+        let ExecutorArtifactFinalizationProof::Enabled(stale_epoch) =
+            expected.finalization_proof(ExecutorArtifactReadinessEpoch::new(6))
+        else {
+            unreachable!("test configuration is enabled")
+        };
+        let error = stale_epoch
+            .required()
+            .resolve(expected, epoch)
+            .expect_err("stale readiness epoch must fail closed");
+        assert!(error.to_string().contains("epoch 6"));
+        assert!(error.to_string().contains("epoch 7"));
     }
 
     #[test]

@@ -941,7 +941,18 @@ impl Executor {
         let plan_len = plan.len();
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
         let instance_id = ExecutorInstanceId::fresh();
-        let artifact_config = ep.resolve_executor_artifact_config(instance_id)?;
+        let artifact_template = ep.resolve_executor_artifact_config()?;
+        if artifact_template.device() != ep.device_id() {
+            return Err(EpError::KernelFailed(format!(
+                "{} returned executor artifact configuration for device {:?}, but the provider \
+                 is bound to device {:?}; rebuild the provider with one authoritative device",
+                ep.name(),
+                artifact_template.device(),
+                ep.device_id(),
+            ))
+            .into());
+        }
+        let artifact_config = artifact_template.bind(instance_id);
         let mut exec = Self {
             instance_id,
             artifact_config,

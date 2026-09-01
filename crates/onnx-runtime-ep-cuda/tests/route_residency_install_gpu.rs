@@ -41,7 +41,7 @@ use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
-    ExecutionProvider, ExecutorArtifactConfig, ExecutorArtifactFinalization,
+    ExecutionProvider, ExecutorArtifactConfig, ExecutorArtifactFinalizationOutcome,
     ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
     ExecutorRouteResidency, ExecutorRouteResidencyConfig,
 };
@@ -62,8 +62,20 @@ fn artifact_config(
     executor: ExecutorInstanceId,
 ) -> ExecutorArtifactConfig {
     provider
-        .resolve_executor_artifact_config(executor)
+        .resolve_executor_artifact_config()
         .expect("resolve executor artifact config")
+        .bind(executor)
+}
+
+fn finalize_artifacts(
+    provider: &CudaExecutionProvider,
+    config: ExecutorArtifactConfig,
+    graph: &Graph,
+    readiness: ExecutorArtifactReadinessEpoch,
+) -> onnx_runtime_ep_api::Result<ExecutorArtifactFinalizationOutcome> {
+    provider
+        .finalize_executor_artifacts(config.finalization_proof(readiness), graph)?
+        .resolve(config, readiness)
 }
 
 struct ScopedGate {
@@ -287,17 +299,12 @@ fn block_quantized_moe_graph() -> (Graph, NodeId) {
 /// boxed kernel so it (and thus the shared `Arc`) stays alive for the assertion.
 fn compile_qmoe_through_ep(
     provider: &CudaExecutionProvider,
-    executor: ExecutorInstanceId,
+    config: ExecutorArtifactConfig,
     graph: &Graph,
     node_id: NodeId,
 ) -> Box<dyn onnx_runtime_ep_api::Kernel> {
     provider
-        .get_kernel_for_executor(
-            artifact_config(provider, executor),
-            graph.node(node_id),
-            &[],
-            1,
-        )
+        .get_kernel_for_executor(config, graph.node(node_id), &[], 1)
         .expect("EP constructs the real QMoE kernel from its attributes")
 }
 
@@ -322,6 +329,7 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
 
     let (graph, node_id, members) = qmoe_graph();
     let executor = ExecutorInstanceId::fresh();
+    let config = artifact_config(&provider, executor);
 
     // Before compile the EP owns no producer source and has retained nothing.
     assert!(
@@ -337,7 +345,7 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
 
     // Compile the QMoE node through the EP's factory: the executing kernel
     // registers itself as the EP-owned producer (goal 2, no test double).
-    let _kernel = compile_qmoe_through_ep(&provider, executor, &graph, node_id);
+    let _kernel = compile_qmoe_through_ep(&provider, config, &graph, node_id);
     let sources = provider.route_telemetry_sources(executor);
     assert!(
         sources.contains_key(&node_id),
@@ -353,14 +361,14 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
     // Invoke the exact transition the session executor calls after resolved
     // compilation.
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                artifact_config(&provider, executor),
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-            )
-            .expect("finalize compiled executor"),
-        ExecutorArtifactFinalization::Complete {
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("finalize compiled executor"),
+        ExecutorArtifactFinalizationOutcome::Complete {
             route_residency: ExecutorRouteResidency::Declined,
         }
     );
@@ -370,12 +378,7 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
         .route_telemetry_producer(executor, node_id)
         .expect("compiled QMoE has a stable producer");
     let _specialization = provider
-        .get_kernel_for_executor(
-            artifact_config(&provider, executor),
-            graph.node(node_id),
-            &[vec![2]],
-            1,
-        )
+        .get_kernel_for_executor(config, graph.node(node_id), &[vec![2]], 1)
         .expect("dynamic QMoE specialization compiles");
     assert!(Arc::ptr_eq(
         &stable_source,
@@ -384,14 +387,14 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
             .expect("specialization retains the source")
     ));
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                artifact_config(&provider, executor),
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(2),
-            )
-            .expect("finalize specialized executor"),
-        ExecutorArtifactFinalization::Complete {
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(2),
+        )
+        .expect("finalize specialized executor"),
+        ExecutorArtifactFinalizationOutcome::Complete {
             route_residency: ExecutorRouteResidency::Declined,
         }
     );
@@ -450,18 +453,20 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
     let graph = Arc::new(graph);
     let executor = ExecutorInstanceId::fresh();
     let foreign_executor = ExecutorInstanceId::fresh();
+    let config = artifact_config(&provider, executor);
+    let foreign_config = artifact_config(&provider, foreign_executor);
     let declines_before = provider.route_residency_diagnostics().declines();
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                artifact_config(&provider, executor),
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-            )
-            .expect("pending finalization is not an EP error"),
-        ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProducerUnavailable {
-            node: node_id
-        })
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("pending finalization is not an EP error"),
+        ExecutorArtifactFinalizationOutcome::Pending(
+            ExecutorArtifactPending::ProducerUnavailable { node: node_id }
+        )
     );
     let pending = provider.route_residency_executor_status(executor);
     assert_eq!(pending.finalization_attempts, 1);
@@ -474,16 +479,16 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
         Some(ExecutorArtifactPending::ProducerUnavailable { node: node_id })
     );
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                artifact_config(&provider, executor),
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-            )
-            .expect("same pending epoch is cached"),
-        ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProducerUnavailable {
-            node: node_id
-        })
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("same pending epoch is cached"),
+        ExecutorArtifactFinalizationOutcome::Pending(
+            ExecutorArtifactPending::ProducerUnavailable { node: node_id }
+        )
     );
     assert_eq!(
         provider
@@ -499,7 +504,7 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
         "readiness absence is not a structural decline"
     );
 
-    let _kernel = compile_qmoe_through_ep(&provider, executor, &graph, node_id);
+    let _kernel = compile_qmoe_through_ep(&provider, config, &graph, node_id);
     assert!(
         provider
             .route_telemetry_sources(foreign_executor)
@@ -507,16 +512,16 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
         "a sibling executor cannot observe the owner's registered producer"
     );
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                artifact_config(&provider, foreign_executor),
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(2),
-            )
-            .expect("foreign owner remains a readiness miss"),
-        ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProducerUnavailable {
-            node: node_id
-        }),
+        finalize_artifacts(
+            &provider,
+            foreign_config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(2),
+        )
+        .expect("foreign owner remains a readiness miss"),
+        ExecutorArtifactFinalizationOutcome::Pending(
+            ExecutorArtifactPending::ProducerUnavailable { node: node_id }
+        ),
         "another executor's real producer cannot satisfy this owner"
     );
     std::thread::scope(|scope| {
@@ -525,14 +530,14 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
             let graph = Arc::clone(&graph);
             scope.spawn(move || {
                 assert_eq!(
-                    provider
-                        .finalize_executor_artifacts(
-                            artifact_config(&provider, executor),
-                            &graph,
-                            ExecutorArtifactReadinessEpoch::new(2),
-                        )
-                        .expect("concurrent finalization"),
-                    ExecutorArtifactFinalization::Complete {
+                    finalize_artifacts(
+                        &provider,
+                        config,
+                        &graph,
+                        ExecutorArtifactReadinessEpoch::new(2),
+                    )
+                    .expect("concurrent finalization"),
+                    ExecutorArtifactFinalizationOutcome::Complete {
                         route_residency: ExecutorRouteResidency::Declined,
                     }
                 );
@@ -560,8 +565,8 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
             .is_some(),
         "draining a sibling executor cannot tear down the owner's producer"
     );
-    provider.drain_executor_artifacts(artifact_config(&provider, executor));
-    provider.drain_executor_artifacts(artifact_config(&provider, executor));
+    provider.drain_executor_artifacts(config);
+    provider.drain_executor_artifacts(config);
     let drained = provider.route_residency_executor_status(executor);
     assert_eq!(drained.drain_calls, 1);
     assert!(drained.drained);
@@ -583,6 +588,7 @@ fn block_quantized_moe_without_producer_is_terminal_not_pending() {
     };
     let (graph, node_id) = block_quantized_moe_graph();
     let executor = ExecutorInstanceId::fresh();
+    let config = artifact_config(&provider, executor);
     let valid_shapes = vec![
         vec![1, 32],
         vec![1, 2],
@@ -592,12 +598,7 @@ fn block_quantized_moe_without_producer_is_terminal_not_pending() {
         vec![],
     ];
     let _kernel = provider
-        .get_kernel_for_executor(
-            artifact_config(&provider, executor),
-            graph.node(node_id),
-            &valid_shapes,
-            1,
-        )
+        .get_kernel_for_executor(config, graph.node(node_id), &valid_shapes, 1)
         .expect("production-shape BlockQuantizedMoE passes parser and kernel admission");
     let mut malformed_shapes = valid_shapes.clone();
     malformed_shapes[4][3] = 16;
@@ -620,14 +621,14 @@ fn block_quantized_moe_without_producer_is_terminal_not_pending() {
     );
 
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                artifact_config(&provider, executor),
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-            )
-            .expect("unsupported producer capability is a typed decline"),
-        ExecutorArtifactFinalization::Complete {
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("unsupported producer capability is a typed decline"),
+        ExecutorArtifactFinalizationOutcome::Complete {
             route_residency: ExecutorRouteResidency::Declined,
         }
     );
@@ -645,14 +646,14 @@ fn block_quantized_moe_without_producer_is_terminal_not_pending() {
     ));
 
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                artifact_config(&provider, executor),
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(2),
-            )
-            .expect("terminal decline remains idempotent"),
-        ExecutorArtifactFinalization::Complete {
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(2),
+        )
+        .expect("terminal decline remains idempotent"),
+        ExecutorArtifactFinalizationOutcome::Complete {
             route_residency: ExecutorRouteResidency::Declined,
         }
     );
@@ -688,7 +689,7 @@ fn disabled_build_installs_and_retains_nothing() {
         config.route_residency(),
         ExecutorRouteResidencyConfig::Disabled
     );
-    let _kernel = compile_qmoe_through_ep(&provider, executor, &graph, node_id);
+    let _kernel = compile_qmoe_through_ep(&provider, config, &graph, node_id);
     assert!(
         provider.route_telemetry_sources(executor).is_empty(),
         "default-off compilation must not register a producer"
@@ -703,10 +704,14 @@ fn disabled_build_installs_and_retains_nothing() {
     #[cfg(feature = "gpu-tests")]
     let locks_before_finalization = provider.route_state_lock_acquisition_count();
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(config, &graph, ExecutorArtifactReadinessEpoch::new(1),)
-            .expect("default-off finalization"),
-        ExecutorArtifactFinalization::Complete {
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("default-off finalization"),
+        ExecutorArtifactFinalizationOutcome::Complete {
             route_residency: ExecutorRouteResidency::Disabled,
         }
     );
@@ -728,10 +733,14 @@ fn disabled_build_installs_and_retains_nothing() {
         "a finalized Disabled executor cannot publish a producer after a late env enable"
     );
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(config, &graph, ExecutorArtifactReadinessEpoch::new(2),)
-            .expect("late process-env changes do not mutate resolved provider configuration"),
-        ExecutorArtifactFinalization::Complete {
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(2),
+        )
+        .expect("late process-env changes do not mutate resolved provider configuration"),
+        ExecutorArtifactFinalizationOutcome::Complete {
             route_residency: ExecutorRouteResidency::Disabled,
         }
     );
@@ -777,7 +786,7 @@ fn disabled_build_installs_and_retains_nothing() {
         "a newly constructed provider resolves the updated environment"
     );
     let _enabled_kernel =
-        compile_qmoe_through_ep(&enabled_provider, enabled_executor, &graph, node_id);
+        compile_qmoe_through_ep(&enabled_provider, enabled_config, &graph, node_id);
     assert!(
         enabled_provider
             .route_telemetry_producer(enabled_executor, node_id)
@@ -785,14 +794,14 @@ fn disabled_build_installs_and_retains_nothing() {
         "the rebuilt enabled executor publishes its QMoE producer normally"
     );
     assert_eq!(
-        enabled_provider
-            .finalize_executor_artifacts(
-                enabled_config,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-            )
-            .expect("rebuilt enabled executor finalizes normally"),
-        ExecutorArtifactFinalization::Complete {
+        finalize_artifacts(
+            &enabled_provider,
+            enabled_config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("rebuilt enabled executor finalizes normally"),
+        ExecutorArtifactFinalizationOutcome::Complete {
             route_residency: ExecutorRouteResidency::Declined,
         },
         "the current shared-reservation artifact retains its typed per-bank decline"
@@ -838,8 +847,8 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
     let disabled_config = artifact_config(&disabled, disabled_executor);
     let enabled_config = artifact_config(&enabled, enabled_executor);
 
-    let _disabled_kernel = compile_qmoe_through_ep(&disabled, disabled_executor, &graph, node_id);
-    let _enabled_kernel = compile_qmoe_through_ep(&enabled, enabled_executor, &graph, node_id);
+    let _disabled_kernel = compile_qmoe_through_ep(&disabled, disabled_config, &graph, node_id);
+    let _enabled_kernel = compile_qmoe_through_ep(&enabled, enabled_config, &graph, node_id);
     assert!(
         disabled
             .route_telemetry_producer(disabled_executor, node_id)
@@ -852,15 +861,39 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
             .is_some(),
         "the explicit Enabled sibling publishes independently"
     );
+    let stale_enabled_config = artifact_config(&enabled, enabled_executor);
+    assert_ne!(
+        stale_enabled_config.generation(),
+        enabled_config.generation(),
+        "the stale-generation control must construct a distinct capability"
+    );
+    let stale_error = enabled
+        .finalize_executor_artifacts(
+            stale_enabled_config.finalization_proof(ExecutorArtifactReadinessEpoch::new(1)),
+            &graph,
+        )
+        .expect_err("a later capability for the same executor identity must fail closed");
+    assert!(
+        stale_error.to_string().contains("artifact generation")
+            && stale_error.to_string().contains("is stale"),
+        "unexpected stale-generation diagnostic: {stale_error}"
+    );
     assert_eq!(
-        disabled
-            .finalize_executor_artifacts(
-                disabled_config,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-            )
-            .expect("explicit Disabled sibling finalizes"),
-        ExecutorArtifactFinalization::Complete {
+        enabled
+            .route_residency_executor_status(enabled_executor)
+            .finalization_attempts,
+        0,
+        "stale generation rejection must precede route-state publication"
+    );
+    assert_eq!(
+        finalize_artifacts(
+            &disabled,
+            disabled_config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("explicit Disabled sibling finalizes"),
+        ExecutorArtifactFinalizationOutcome::Complete {
             route_residency: ExecutorRouteResidency::Disabled,
         }
     );
@@ -897,9 +930,8 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
             scope.spawn(move || {
                 let error = disabled
                     .finalize_executor_artifacts(
-                        enabled_config,
+                        enabled_config.finalization_proof(ExecutorArtifactReadinessEpoch::new(2)),
                         &graph,
-                        ExecutorArtifactReadinessEpoch::new(2),
                     )
                     .expect_err("concurrent mismatched finalization must fail closed");
                 assert!(
@@ -913,26 +945,26 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
         }
     });
     assert_eq!(
-        disabled
-            .finalize_executor_artifacts(
-                disabled_config,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(2),
-            )
-            .expect("matching Disabled token remains valid"),
-        ExecutorArtifactFinalization::Complete {
+        finalize_artifacts(
+            &disabled,
+            disabled_config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(2),
+        )
+        .expect("matching Disabled token remains valid"),
+        ExecutorArtifactFinalizationOutcome::Complete {
             route_residency: ExecutorRouteResidency::Disabled,
         }
     );
     assert_eq!(
-        enabled
-            .finalize_executor_artifacts(
-                enabled_config,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-            )
-            .expect("matching Enabled token remains isolated"),
-        ExecutorArtifactFinalization::Complete {
+        finalize_artifacts(
+            &enabled,
+            enabled_config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("matching Enabled token remains isolated"),
+        ExecutorArtifactFinalizationOutcome::Complete {
             route_residency: ExecutorRouteResidency::Declined,
         }
     );

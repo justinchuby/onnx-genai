@@ -15,13 +15,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    EpError, ExecutorArtifactConfig, ExecutorArtifactConfigAuthority, ExecutorInstanceId,
-    ExecutorRouteResidencyConfig, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    EpError, ExecutorArtifactConfig, ExecutorArtifactConfigAuthority, ExecutorArtifactGeneration,
+    ExecutorInstanceId, ExecutorRouteResidencyConfig, Kernel, KernelFactory, Result, TensorMut,
+    TensorView,
 };
 use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
 };
-use onnx_runtime_ir::{DataType, Node, NodeId};
+use onnx_runtime_ir::{DataType, DeviceId, Node, NodeId};
 
 use crate::error::driver_err;
 use crate::kernels::expert_route_telemetry::{
@@ -1196,9 +1197,11 @@ impl FloatDtype {
 /// identity.
 pub struct RouteTelemetrySourceRegistry {
     authority: ExecutorArtifactConfigAuthority,
+    device: DeviceId,
     route_residency: ExecutorRouteResidencyConfig,
     compile_scope: Mutex<()>,
     active_executor: AtomicU64,
+    generations: Mutex<HashMap<ExecutorInstanceId, ExecutorArtifactGeneration>>,
     sources: Mutex<HashMap<ExecutorInstanceId, HashMap<NodeId, Arc<QMoERouteTelemetry>>>>,
 }
 
@@ -1206,6 +1209,7 @@ impl Default for RouteTelemetrySourceRegistry {
     fn default() -> Self {
         Self::new(
             ExecutorArtifactConfigAuthority::UNSCOPED,
+            DeviceId::cuda(0),
             ExecutorRouteResidencyConfig::Disabled,
         )
     }
@@ -1214,30 +1218,65 @@ impl Default for RouteTelemetrySourceRegistry {
 impl RouteTelemetrySourceRegistry {
     pub(crate) fn new(
         authority: ExecutorArtifactConfigAuthority,
+        device: DeviceId,
         route_residency: ExecutorRouteResidencyConfig,
     ) -> Self {
         Self {
             authority,
+            device,
             route_residency,
             compile_scope: Mutex::new(()),
             active_executor: AtomicU64::new(0),
+            generations: Mutex::new(HashMap::new()),
             sources: Mutex::new(HashMap::new()),
         }
     }
 
     fn validate_config(&self, config: ExecutorArtifactConfig) -> Result<()> {
-        if config.authority() != self.authority || config.route_residency() != self.route_residency
+        if config.authority() != self.authority
+            || config.device() != self.device
+            || config.route_residency() != self.route_residency
         {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep: executor {} artifact configuration mismatch: token authority {} with \
-                 route residency {:?}, provider authority {} with route residency {:?}; rebuild \
-                 the executor from the provider's resolved configuration",
+                "cuda_ep: executor {} artifact configuration mismatch: token authority {} device \
+                 {:?} with route residency {:?}, provider authority {} device {:?} with route \
+                 residency {:?}; rebuild the executor from the provider's resolved configuration",
                 config.executor().get(),
                 config.authority().get(),
+                config.device(),
                 config.route_residency(),
                 self.authority.get(),
+                self.device,
                 self.route_residency,
             )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn claim_config(&self, config: ExecutorArtifactConfig) -> Result<()> {
+        self.validate_config(config)?;
+        if config.route_residency() == ExecutorRouteResidencyConfig::Disabled {
+            return Ok(());
+        }
+        let mut generations = self
+            .generations
+            .lock()
+            .expect("cuda_ep route-telemetry generation registry poisoned");
+        match generations.entry(config.executor()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(config.generation());
+            }
+            std::collections::hash_map::Entry::Occupied(entry)
+                if *entry.get() == config.generation() => {}
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} artifact generation {} is stale; active generation is \
+                     {}; rebuild the executor and use its exact capability",
+                    config.executor().get(),
+                    config.generation().get(),
+                    entry.get().get(),
+                )));
+            }
         }
         Ok(())
     }
@@ -1248,7 +1287,7 @@ impl RouteTelemetrySourceRegistry {
         config: ExecutorArtifactConfig,
         f: impl FnOnce() -> T,
     ) -> Result<T> {
-        self.validate_config(config)?;
+        self.claim_config(config)?;
         if config.route_residency() == ExecutorRouteResidencyConfig::Disabled {
             return Ok(f());
         }
@@ -1336,8 +1375,9 @@ impl RouteTelemetrySourceRegistry {
         self.len(executor) == 0
     }
 
-    /// Drop only one executor's registry ownership. Live cached kernels keep
-    /// the stable source alive until that executor's cache is dropped.
+    /// Drop only one executor's source ownership. The generation tombstone
+    /// remains until provider shutdown so stale capabilities cannot reclaim the
+    /// executor key after drain.
     pub(crate) fn remove(&self, executor: ExecutorInstanceId) {
         self.sources
             .lock()
@@ -1346,6 +1386,10 @@ impl RouteTelemetrySourceRegistry {
     }
 
     pub(crate) fn clear(&self) {
+        self.generations
+            .lock()
+            .expect("cuda_ep route-telemetry generation registry poisoned")
+            .clear();
         self.sources
             .lock()
             .expect("cuda_ep route-telemetry registry poisoned")

@@ -13,9 +13,10 @@ use std::sync::{
 
 use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider, ExecutorArtifactConfig,
-    ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
-    ExecutorInstanceId, ExecutorRouteResidency, Fence, Kernel, KernelMatch, Result as EpResult,
-    TensorMetadata, TensorMut, TensorView, ViewOutput, WorkspaceRequirement,
+    ExecutorArtifactConfigAuthority, ExecutorArtifactConfigTemplate, ExecutorArtifactFinalization,
+    ExecutorArtifactFinalizationProof, ExecutorArtifactPending, ExecutorInstanceId,
+    ExecutorRouteResidencyConfig, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata,
+    TensorMut, TensorView, ViewOutput, WorkspaceRequirement,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{
@@ -131,6 +132,7 @@ struct HostDownloadCountingEp {
     route_terminal_outcomes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_drains: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_install_graph_nodes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    artifact_config_authority: ExecutorArtifactConfigAuthority,
     assert_finalized_before_execute: bool,
     capture_checks: Arc<AtomicUsize>,
     artifact_finalization: TestArtifactFinalization,
@@ -155,6 +157,7 @@ impl HostDownloadCountingEp {
             route_terminal_outcomes: Arc::new(Mutex::new(HashMap::new())),
             route_drains: Arc::new(Mutex::new(HashMap::new())),
             route_install_graph_nodes: Arc::new(Mutex::new(HashMap::new())),
+            artifact_config_authority: ExecutorArtifactConfigAuthority::fresh(),
             assert_finalized_before_execute: false,
             capture_checks: Arc::new(AtomicUsize::new(0)),
             artifact_finalization: TestArtifactFinalization::Complete,
@@ -318,12 +321,30 @@ impl Kernel for FinalizationCheckingKernel {
 }
 
 impl ExecutionProvider for HostDownloadCountingEp {
+    fn resolve_executor_artifact_config(&self) -> EpResult<ExecutorArtifactConfigTemplate> {
+        let route_residency = match self.artifact_finalization {
+            TestArtifactFinalization::Complete => ExecutorRouteResidencyConfig::Disabled,
+            TestArtifactFinalization::PendingOnce
+            | TestArtifactFinalization::StructuralDecline
+            | TestArtifactFinalization::FailOnce
+            | TestArtifactFinalization::ReadyPendingFailedReady => {
+                ExecutorRouteResidencyConfig::Enabled
+            }
+        };
+        Ok(ExecutorArtifactConfigTemplate::resolved(
+            self.artifact_config_authority,
+            self.device_id(),
+            route_residency,
+        ))
+    }
+
     fn finalize_executor_artifacts(
         &self,
-        config: ExecutorArtifactConfig,
+        proof: ExecutorArtifactFinalizationProof<'_>,
         graph: &Graph,
-        readiness: ExecutorArtifactReadinessEpoch,
     ) -> EpResult<ExecutorArtifactFinalization> {
+        let config = proof.config();
+        let readiness = proof.readiness();
         let executor = config.executor();
         *self
             .route_readiness_checks
@@ -337,8 +358,9 @@ impl ExecutionProvider for HostDownloadCountingEp {
                 TestArtifactFinalization::ReadyPendingFailedReady
             )
         {
-            return Ok(ExecutorArtifactFinalization::Complete {
-                route_residency: ExecutorRouteResidency::Disabled,
+            return Ok(match proof {
+                ExecutorArtifactFinalizationProof::Disabled(disabled) => disabled.complete(),
+                ExecutorArtifactFinalizationProof::Enabled(enabled) => enabled.declined(),
             });
         }
         assert!(
@@ -358,28 +380,38 @@ impl ExecutionProvider for HostDownloadCountingEp {
             *attempt
         };
         match self.artifact_finalization {
-            TestArtifactFinalization::PendingOnce if attempt == 1 => Ok(
-                ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProviderReadiness {
-                    reason: format!(
-                        "test provider awaits a later compiled specialization after epoch {}",
-                        readiness.get()
-                    ),
-                }),
-            ),
+            TestArtifactFinalization::PendingOnce if attempt == 1 => match proof {
+                ExecutorArtifactFinalizationProof::Enabled(enabled) => {
+                    Ok(enabled.pending(ExecutorArtifactPending::ProviderReadiness {
+                        reason: format!(
+                            "test provider awaits a later compiled specialization after epoch {}",
+                            readiness.get()
+                        ),
+                    }))
+                }
+                ExecutorArtifactFinalizationProof::Disabled(_) => {
+                    unreachable!("pending lifecycle resolves an enabled configuration")
+                }
+            },
             TestArtifactFinalization::FailOnce if attempt == 1 => {
                 Err(EpError::KernelFailed(format!(
                     "injected artifact finalization failure at epoch {}",
                     readiness.get()
                 )))
             }
-            TestArtifactFinalization::ReadyPendingFailedReady if attempt == 2 => Ok(
-                ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProviderReadiness {
-                    reason: format!(
-                        "test provider awaits a later compiled specialization after epoch {}",
-                        readiness.get()
-                    ),
-                }),
-            ),
+            TestArtifactFinalization::ReadyPendingFailedReady if attempt == 2 => match proof {
+                ExecutorArtifactFinalizationProof::Enabled(enabled) => {
+                    Ok(enabled.pending(ExecutorArtifactPending::ProviderReadiness {
+                        reason: format!(
+                            "test provider awaits a later compiled specialization after epoch {}",
+                            readiness.get()
+                        ),
+                    }))
+                }
+                ExecutorArtifactFinalizationProof::Disabled(_) => {
+                    unreachable!("replay lifecycle resolves an enabled configuration")
+                }
+            },
             TestArtifactFinalization::ReadyPendingFailedReady if attempt == 3 => {
                 Err(EpError::KernelFailed(format!(
                     "injected artifact finalization failure at epoch {}",
@@ -401,8 +433,9 @@ impl ExecutionProvider for HostDownloadCountingEp {
                     .lock()
                     .unwrap()
                     .insert(executor, graph.num_nodes());
-                Ok(ExecutorArtifactFinalization::Complete {
-                    route_residency: ExecutorRouteResidency::Disabled,
+                Ok(match proof {
+                    ExecutorArtifactFinalizationProof::Disabled(disabled) => disabled.complete(),
+                    ExecutorArtifactFinalizationProof::Enabled(enabled) => enabled.declined(),
                 })
             }
         }

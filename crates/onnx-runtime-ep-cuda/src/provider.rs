@@ -44,11 +44,11 @@ use std::sync::{Arc, Mutex, Weak};
 use onnx_runtime_ep_api::{
     BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities,
-    ExecutorArtifactConfig, ExecutorArtifactConfigAuthority, ExecutorArtifactFinalization,
-    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
-    ExecutorRouteResidency, ExecutorRouteResidencyConfig, ExpertWeightGroup, Fence,
-    HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result,
-    SealedDeviceAllocation, WorkspaceAllocation, deny, structural_input_bytes,
+    ExecutorArtifactConfig, ExecutorArtifactConfigAuthority, ExecutorArtifactConfigTemplate,
+    ExecutorArtifactFinalization, ExecutorArtifactFinalizationProof, ExecutorArtifactPending,
+    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExecutorRouteResidencyConfig,
+    ExpertWeightGroup, Fence, HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry,
+    PagedWeight, Result, SealedDeviceAllocation, WorkspaceAllocation, deny, structural_input_bytes,
 };
 #[cfg(any(test, feature = "gpu-tests"))]
 use onnx_runtime_ir::ValueId;
@@ -99,6 +99,13 @@ struct ExecutorRouteResidencyState {
     outcome: Option<RouteResidencyInstallOutcome>,
     boundary: Option<Arc<RouteResidencyBoundary>>,
     retained_artifacts: Option<Arc<Vec<ExpertWeightGroup>>>,
+}
+
+enum RouteArtifactFinalization {
+    Disabled,
+    Declined,
+    Required,
+    Pending(ExecutorArtifactPending),
 }
 
 /// The provider-owned mapped-attribution zone.
@@ -1013,10 +1020,10 @@ impl std::fmt::Debug for CudaExecutionProvider {
 }
 
 impl CudaExecutionProvider {
-    fn executor_artifact_config(&self, executor: ExecutorInstanceId) -> ExecutorArtifactConfig {
-        ExecutorArtifactConfig::resolved(
+    fn executor_artifact_config(&self) -> ExecutorArtifactConfigTemplate {
+        ExecutorArtifactConfigTemplate::resolved(
             self.artifact_config_authority,
-            executor,
+            self.device,
             self.route_residency_config,
         )
     }
@@ -1026,37 +1033,41 @@ impl CudaExecutionProvider {
         config: ExecutorArtifactConfig,
     ) -> Result<ExecutorInstanceId> {
         if config.authority() != self.artifact_config_authority
+            || config.device() != self.device
             || config.route_residency() != self.route_residency_config
         {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep: executor {} artifact configuration mismatch: token authority {} with \
-                 route residency {:?}, provider authority {} with route residency {:?}; rebuild \
-                 the executor from the provider's resolved configuration",
+                "cuda_ep: executor {} artifact configuration mismatch: token authority {} device \
+                 {:?} with route residency {:?}, provider authority {} device {:?} with route \
+                 residency {:?}; rebuild the executor from the provider's resolved configuration",
                 config.executor().get(),
                 config.authority().get(),
+                config.device(),
                 config.route_residency(),
                 self.artifact_config_authority.get(),
+                self.device,
                 self.route_residency_config,
             )));
         }
+        self.route_telemetry_registry.claim_config(config)?;
         Ok(config.executor())
     }
 
     fn resolved_route_residency(
         executor: ExecutorInstanceId,
         state: &ExecutorRouteResidencyState,
-    ) -> Result<ExecutorRouteResidency> {
+    ) -> Result<RouteArtifactFinalization> {
         if !state.drained && state.boundary.is_some() {
-            return Ok(ExecutorRouteResidency::required_for(executor));
+            return Ok(RouteArtifactFinalization::Required);
         }
         match state.outcome.as_ref() {
             Some(RouteResidencyInstallOutcome::GateDisabled) => {
-                Ok(ExecutorRouteResidency::Disabled)
+                Ok(RouteArtifactFinalization::Disabled)
             }
             Some(
                 RouteResidencyInstallOutcome::OffloadDisabled
                 | RouteResidencyInstallOutcome::Rejected(_),
-            ) => Ok(ExecutorRouteResidency::Declined),
+            ) => Ok(RouteArtifactFinalization::Declined),
             Some(RouteResidencyInstallOutcome::Installed { .. }) => {
                 Err(EpError::KernelFailed(format!(
                     "cuda_ep: executor {} reports installed route residency without a live \
@@ -1208,6 +1219,7 @@ impl CudaExecutionProvider {
         let route_telemetry_registry =
             Arc::new(crate::kernels::qmoe::RouteTelemetrySourceRegistry::new(
                 artifact_config_authority,
+                DeviceId::cuda(ordinal),
                 route_residency_config,
             ));
         let registry = build_cuda_registry_with_metrics(
@@ -2120,27 +2132,23 @@ impl CudaExecutionProvider {
         executor: ExecutorInstanceId,
         graph: &Graph,
         readiness: ExecutorArtifactReadinessEpoch,
-    ) -> Result<ExecutorArtifactFinalization> {
+    ) -> Result<RouteArtifactFinalization> {
         if self.route_residency_config == ExecutorRouteResidencyConfig::Disabled {
-            return Ok(ExecutorArtifactFinalization::Complete {
-                route_residency: ExecutorRouteResidency::Disabled,
-            });
+            return Ok(RouteArtifactFinalization::Disabled);
         }
 
         let mut states = self.lock_route_executors();
         let state = states.entry(executor).or_default();
         if state.outcome.is_some() {
             state.readiness_epoch = Some(readiness);
-            return Ok(ExecutorArtifactFinalization::Complete {
-                route_residency: Self::resolved_route_residency(executor, state)?,
-            });
+            return Self::resolved_route_residency(executor, state);
         }
         if state
             .readiness_epoch
             .is_some_and(|attempted| attempted >= readiness)
             && let Some(pending) = &state.pending
         {
-            return Ok(ExecutorArtifactFinalization::Pending(pending.clone()));
+            return Ok(RouteArtifactFinalization::Pending(pending.clone()));
         }
         state.readiness_epoch = Some(readiness);
         state.pending = None;
@@ -2150,9 +2158,7 @@ impl CudaExecutionProvider {
             self.route_diag
                 .record_decline("weight offload/coarse residency disabled");
             state.outcome = Some(RouteResidencyInstallOutcome::OffloadDisabled);
-            return Ok(ExecutorArtifactFinalization::Complete {
-                route_residency: ExecutorRouteResidency::Declined,
-            });
+            return Ok(RouteArtifactFinalization::Declined);
         };
 
         let sources = self.route_telemetry_sources(executor);
@@ -2167,14 +2173,12 @@ impl CudaExecutionProvider {
             Err(RouteResidencyBindingReject::NoTelemetrySource { node }) => {
                 let pending = ExecutorArtifactPending::ProducerUnavailable { node };
                 state.pending = Some(pending.clone());
-                return Ok(ExecutorArtifactFinalization::Pending(pending));
+                return Ok(RouteArtifactFinalization::Pending(pending));
             }
             Err(reject) => {
                 self.route_diag.record_decline(&reject.reason());
                 state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return Ok(ExecutorArtifactFinalization::Complete {
-                    route_residency: ExecutorRouteResidency::Declined,
-                });
+                return Ok(RouteArtifactFinalization::Declined);
             }
         };
 
@@ -2185,9 +2189,7 @@ impl CudaExecutionProvider {
                 let reject = RouteResidencyBindingReject::NoPerBankReservation { value: *member };
                 self.route_diag.record_decline(&reject.reason());
                 state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return Ok(ExecutorArtifactFinalization::Complete {
-                    route_residency: ExecutorRouteResidency::Declined,
-                });
+                return Ok(RouteArtifactFinalization::Declined);
             }
         }
 
@@ -2196,9 +2198,7 @@ impl CudaExecutionProvider {
         };
         self.route_diag.record_decline(&reject.reason());
         state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-        Ok(ExecutorArtifactFinalization::Complete {
-            route_residency: ExecutorRouteResidency::Declined,
-        })
+        Ok(RouteArtifactFinalization::Declined)
     }
 
     /// Construct and install a production [`RouteResidencyBoundary`] from a
@@ -3405,10 +3405,11 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>> {
-        self.route_telemetry_registry.with_executor_scope(
-            self.executor_artifact_config(ExecutorInstanceId::UNSCOPED),
-            || self.create_registered_kernel(op, shapes, opset),
-        )?
+        let config = self
+            .executor_artifact_config()
+            .bind(ExecutorInstanceId::UNSCOPED);
+        self.route_telemetry_registry
+            .with_executor_scope(config, || self.create_registered_kernel(op, shapes, opset))?
     }
 
     fn get_kernel_for_executor(
@@ -4409,21 +4410,49 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.consume_route_residency_for_executor(executor)
     }
 
-    fn resolve_executor_artifact_config(
-        &self,
-        executor: ExecutorInstanceId,
-    ) -> Result<ExecutorArtifactConfig> {
-        Ok(self.executor_artifact_config(executor))
+    fn resolve_executor_artifact_config(&self) -> Result<ExecutorArtifactConfigTemplate> {
+        Ok(self.executor_artifact_config())
     }
 
     fn finalize_executor_artifacts(
         &self,
-        config: ExecutorArtifactConfig,
+        proof: ExecutorArtifactFinalizationProof<'_>,
         graph: &Graph,
-        readiness: ExecutorArtifactReadinessEpoch,
     ) -> Result<ExecutorArtifactFinalization> {
+        let config = proof.config();
+        let readiness = proof.readiness();
         let executor = self.validate_executor_artifact_config(config)?;
-        self.finalize_route_residency_for_executor(executor, graph, readiness)
+        let outcome = self.finalize_route_residency_for_executor(executor, graph, readiness)?;
+        match (proof, outcome) {
+            (
+                ExecutorArtifactFinalizationProof::Disabled(disabled),
+                RouteArtifactFinalization::Disabled,
+            ) => Ok(disabled.complete()),
+            (
+                ExecutorArtifactFinalizationProof::Enabled(enabled),
+                RouteArtifactFinalization::Declined,
+            ) => Ok(enabled.declined()),
+            (
+                ExecutorArtifactFinalizationProof::Enabled(enabled),
+                RouteArtifactFinalization::Required,
+            ) => Ok(enabled.required()),
+            (
+                ExecutorArtifactFinalizationProof::Enabled(enabled),
+                RouteArtifactFinalization::Pending(pending),
+            ) => Ok(enabled.pending(pending)),
+            (proof, outcome) => Err(EpError::KernelFailed(format!(
+                "cuda_ep: executor {} artifact finalization {:?} is incompatible with immutable \
+                 route-residency configuration {:?}",
+                executor.get(),
+                match outcome {
+                    RouteArtifactFinalization::Disabled => "disabled",
+                    RouteArtifactFinalization::Declined => "declined",
+                    RouteArtifactFinalization::Required => "required",
+                    RouteArtifactFinalization::Pending(_) => "pending",
+                },
+                proof.config().route_residency(),
+            ))),
+        }
     }
 
     fn drain_executor_artifacts(&self, config: ExecutorArtifactConfig) {

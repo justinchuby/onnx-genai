@@ -5,7 +5,9 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
-    CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel,
+    CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities,
+    ExecutorArtifactConfigAuthority, ExecutorArtifactConfigTemplate, ExecutorArtifactFinalization,
+    ExecutorArtifactFinalizationProof, ExecutorRouteResidencyConfig, Fence, Kernel,
     NegotiatedWeight,
 };
 use onnx_runtime_memory_governor::MemoryRole;
@@ -138,7 +140,11 @@ struct DeferredValidationEp {
     route_boundary_before_sync: Arc<AtomicBool>,
     route_boundary_before_validation: Arc<AtomicBool>,
     route_boundary_required: Arc<AtomicBool>,
-    return_foreign_route_owner: Arc<AtomicBool>,
+    artifact_config_authority: ExecutorArtifactConfigAuthority,
+    return_foreign_config_device: Arc<AtomicBool>,
+    return_foreign_artifact_finalization: Arc<AtomicBool>,
+    replay_artifact_finalization: Arc<AtomicBool>,
+    artifact_finalization_cache: Arc<std::sync::Mutex<Option<ExecutorArtifactFinalization>>>,
     route_boundary_executors: Arc<std::sync::Mutex<Vec<ExecutorInstanceId>>>,
     route_lifecycle_events: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
@@ -173,7 +179,11 @@ impl DeferredValidationEp {
             route_boundary_before_sync: Arc::new(AtomicBool::new(false)),
             route_boundary_before_validation: Arc::new(AtomicBool::new(false)),
             route_boundary_required: Arc::new(AtomicBool::new(false)),
-            return_foreign_route_owner: Arc::new(AtomicBool::new(false)),
+            artifact_config_authority: ExecutorArtifactConfigAuthority::fresh(),
+            return_foreign_config_device: Arc::new(AtomicBool::new(false)),
+            return_foreign_artifact_finalization: Arc::new(AtomicBool::new(false)),
+            replay_artifact_finalization: Arc::new(AtomicBool::new(false)),
+            artifact_finalization_cache: Arc::new(std::sync::Mutex::new(None)),
             route_boundary_executors: Arc::new(std::sync::Mutex::new(Vec::new())),
             route_lifecycle_events: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
@@ -467,49 +477,174 @@ impl ExecutionProvider for DeferredValidationEp {
         Ok(())
     }
 
+    fn resolve_executor_artifact_config(
+        &self,
+    ) -> onnx_runtime_ep_api::Result<ExecutorArtifactConfigTemplate> {
+        Ok(ExecutorArtifactConfigTemplate::resolved(
+            self.artifact_config_authority,
+            if self.return_foreign_config_device.load(Ordering::Relaxed) {
+                onnx_runtime_ir::DeviceId::cuda(0)
+            } else {
+                self.device_id()
+            },
+            if self.route_boundary_required.load(Ordering::Relaxed) {
+                ExecutorRouteResidencyConfig::Enabled
+            } else {
+                ExecutorRouteResidencyConfig::Disabled
+            },
+        ))
+    }
+
     fn finalize_executor_artifacts(
         &self,
-        config: ExecutorArtifactConfig,
+        proof: ExecutorArtifactFinalizationProof<'_>,
         _graph: &Graph,
-        _readiness: ExecutorArtifactReadinessEpoch,
     ) -> onnx_runtime_ep_api::Result<ExecutorArtifactFinalization> {
-        let executor = config.executor();
-        Ok(ExecutorArtifactFinalization::Complete {
-            route_residency: if self.route_boundary_required.load(Ordering::Relaxed) {
-                let owner = if self.return_foreign_route_owner.load(Ordering::Relaxed) {
-                    ExecutorInstanceId::fresh()
-                } else {
-                    executor
-                };
-                ExecutorRouteResidency::required_for(owner)
-            } else {
-                ExecutorRouteResidency::Disabled
-            },
-        })
+        if self
+            .return_foreign_artifact_finalization
+            .load(Ordering::Relaxed)
+        {
+            let foreign = ExecutorArtifactConfigTemplate::resolved(
+                ExecutorArtifactConfigAuthority::fresh(),
+                onnx_runtime_ir::DeviceId::cuda(0),
+                ExecutorRouteResidencyConfig::Enabled,
+            )
+            .bind(ExecutorInstanceId::fresh());
+            let ExecutorArtifactFinalizationProof::Enabled(foreign) =
+                foreign.finalization_proof(proof.readiness())
+            else {
+                unreachable!("foreign test configuration is enabled")
+            };
+            return Ok(foreign.required());
+        }
+        if self.replay_artifact_finalization.load(Ordering::Relaxed)
+            && let Some(cached) = self.artifact_finalization_cache.lock().unwrap().clone()
+        {
+            return Ok(cached);
+        }
+        let finalization = match proof {
+            ExecutorArtifactFinalizationProof::Disabled(disabled) => disabled.complete(),
+            ExecutorArtifactFinalizationProof::Enabled(enabled) => enabled.required(),
+        };
+        *self.artifact_finalization_cache.lock().unwrap() = Some(finalization.clone());
+        Ok(finalization)
     }
 }
 
 #[test]
-fn route_residency_finalization_rejects_foreign_resolved_owner() {
+fn route_residency_finalization_rejects_foreign_capability() {
     let ep = DeferredValidationEp::new();
     ep.route_boundary_required.store(true, Ordering::Relaxed);
-    ep.return_foreign_route_owner.store(true, Ordering::Relaxed);
+    ep.return_foreign_artifact_finalization
+        .store(true, Ordering::Relaxed);
     let executor = ExecutorInstanceId::fresh();
     let config = ep
-        .resolve_executor_artifact_config(executor)
-        .expect("resolve executor artifact config");
+        .resolve_executor_artifact_config()
+        .expect("resolve executor artifact config")
+        .bind(executor);
     let mut readiness = ProviderArtifactReadiness::default();
 
     let error = readiness
         .finalize_if_needed(&ep, config, &Graph::new())
         .expect_err("a provider cannot resolve another executor's route boundary");
     assert!(
-        error.to_string().contains("returned route-residency owner")
+        error.to_string().contains("finalization proof mismatch")
             && error
                 .to_string()
                 .contains(&format!("executor {}", executor.get())),
         "unexpected foreign-owner diagnostic: {error}"
     );
+}
+
+#[test]
+fn executor_build_rejects_foreign_provider_device_before_compilation() {
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.return_foreign_config_device
+        .store(true, Ordering::Relaxed);
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let error = match Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+    ) {
+        Ok(_) => panic!("a foreign-device artifact template must fail before compilation"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("configuration for device")
+            && error.to_string().contains("authoritative device"),
+        "unexpected foreign-device diagnostic: {error}"
+    );
+    assert_eq!(ep.executions.load(Ordering::Relaxed), 0);
+    assert!(ep.artifact_finalization_cache.lock().unwrap().is_none());
+}
+
+#[test]
+fn disabled_artifact_config_rejects_required_finalization_without_publication() {
+    let ep = DeferredValidationEp::new();
+    ep.return_foreign_artifact_finalization
+        .store(true, Ordering::Relaxed);
+    let executor = ExecutorInstanceId::fresh();
+    let config = ep
+        .resolve_executor_artifact_config()
+        .expect("resolve disabled executor artifact config")
+        .bind(executor);
+    assert_eq!(
+        config.route_residency(),
+        ExecutorRouteResidencyConfig::Disabled
+    );
+    let mut readiness = ProviderArtifactReadiness::default();
+
+    let error = readiness
+        .finalize_if_needed(&ep, config, &Graph::new())
+        .expect_err("Disabled cannot accept a Required finalization");
+    assert!(
+        error.to_string().contains("finalization proof mismatch"),
+        "unexpected Disabled/Required diagnostic: {error}"
+    );
+    assert_eq!(ep.route_boundary_calls.load(Ordering::Relaxed), 0);
+    assert!(ep.route_lifecycle_events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn stale_finalization_epoch_replay_fails_closed() {
+    let ep = DeferredValidationEp::new();
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
+    let executor = ExecutorInstanceId::fresh();
+    let config = ep
+        .resolve_executor_artifact_config()
+        .expect("resolve enabled executor artifact config")
+        .bind(executor);
+    let mut readiness = ProviderArtifactReadiness::default();
+    readiness
+        .finalize_if_needed(&ep, config, &Graph::new())
+        .expect("initial exact-generation finalization");
+
+    readiness.advance_to(ExecutorArtifactReadinessEpoch::new(1));
+    ep.replay_artifact_finalization
+        .store(true, Ordering::Relaxed);
+    let error = readiness
+        .finalize_if_needed(&ep, config, &Graph::new())
+        .expect_err("a finalization from the previous epoch cannot be replayed");
+    assert!(
+        error.to_string().contains("finalization proof mismatch")
+            && error.to_string().contains("epoch 0")
+            && error.to_string().contains("epoch 1"),
+        "unexpected stale-epoch diagnostic: {error}"
+    );
+    assert_eq!(ep.route_boundary_calls.load(Ordering::Relaxed), 0);
 }
 
 impl DeferredValidationEp {

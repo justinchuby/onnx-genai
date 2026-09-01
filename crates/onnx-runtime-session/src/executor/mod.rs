@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
-    ExecutionProvider, ExecutorArtifactConfig, ExecutorArtifactFinalization,
+    ExecutionProvider, ExecutorArtifactConfig, ExecutorArtifactFinalizationOutcome,
     ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
     ExecutorRouteResidency, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput,
     KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline,
