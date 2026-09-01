@@ -19,6 +19,14 @@ use crate::error::{EpError, Result};
 use crate::kernel::{Kernel, KernelMatch};
 use crate::weight::ExecutionProviderCapabilities;
 
+fn allocate_non_reusable_identity(counter: &AtomicU64, exhausted: &'static str) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("{exhausted}"))
+}
+
 /// Index of an EP within an [`crate::registry::EpRegistry`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct EpId(pub u32);
@@ -41,9 +49,10 @@ impl ExecutorInstanceId {
     /// Allocate a process-unique executor identity.
     pub fn fresh() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(id, u64::MAX, "executor instance id space exhausted");
-        Self(id)
+        Self(allocate_non_reusable_identity(
+            &NEXT,
+            "executor instance id space exhausted; refusing to wrap and create an ABA collision",
+        ))
     }
 
     /// Stable numeric representation for provider-owned maps and diagnostics.
@@ -73,13 +82,11 @@ impl ExecutorArtifactConfigAuthority {
     /// Allocate a process-unique provider-configuration authority.
     pub fn fresh() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(
-            id,
-            u64::MAX,
-            "executor artifact configuration authority space exhausted"
-        );
-        Self(id)
+        Self(allocate_non_reusable_identity(
+            &NEXT,
+            "executor artifact configuration authority space exhausted; refusing to wrap and \
+             create an ABA collision",
+        ))
     }
 
     /// Stable numeric representation for diagnostics and provider validation.
@@ -99,11 +106,42 @@ pub enum ExecutorRouteResidencyConfig {
     Enabled,
 }
 
+/// Whether a kernel factory requires a session-issued executor scope.
+///
+/// Ordinary providers and kernels remain [`Unscoped`](Self::Unscoped). A
+/// provider returns [`Required`](Self::Required) only for a factory that
+/// publishes executor-generation-owned artifacts while compiling. Calling
+/// [`ExecutionProvider::get_kernel`] for such a factory must fail clearly;
+/// session compilation uses [`ExecutionProvider::get_kernel_for_executor`]
+/// with the one capability issued for the executor generation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutorKernelScope {
+    #[default]
+    Unscoped,
+    Required,
+}
+
 /// Provider-owned half of an executor artifact configuration.
 ///
 /// A provider resolves only its own authority and immutable feature policy.
 /// The session binds this template to the executor identity and a fresh
 /// generation, so a provider cannot choose the owner accepted by the session.
+///
+/// External crates cannot mint the bound capability:
+///
+/// ```compile_fail
+/// # use onnx_runtime_ep_api::{
+/// #     ExecutorArtifactConfigAuthority, ExecutorArtifactConfigTemplate, ExecutorInstanceId,
+/// #     ExecutorRouteResidencyConfig,
+/// # };
+/// # use onnx_runtime_ir::DeviceId;
+/// let template = ExecutorArtifactConfigTemplate::resolved(
+///     ExecutorArtifactConfigAuthority::fresh(),
+///     DeviceId::cpu(),
+///     ExecutorRouteResidencyConfig::Enabled,
+/// );
+/// let _forged = template.bind(ExecutorInstanceId::fresh());
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ExecutorArtifactConfigTemplate {
     authority: ExecutorArtifactConfigAuthority,
@@ -136,6 +174,8 @@ impl ExecutorArtifactConfigTemplate {
 
     /// Bind this provider policy to one session-issued executor generation.
     #[must_use]
+    #[cfg(any(test, feature = "runtime-session-authority"))]
+    #[doc(hidden)]
     pub fn bind(self, executor: ExecutorInstanceId) -> ExecutorArtifactConfig {
         ExecutorArtifactConfig {
             authority: self.authority,
@@ -152,15 +192,14 @@ impl ExecutorArtifactConfigTemplate {
 pub struct ExecutorArtifactGeneration(u64);
 
 impl ExecutorArtifactGeneration {
+    #[cfg(any(test, feature = "runtime-session-authority"))]
     fn fresh() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let generation = NEXT.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(
-            generation,
-            u64::MAX,
-            "executor artifact generation space exhausted"
-        );
-        Self(generation)
+        Self(allocate_non_reusable_identity(
+            &NEXT,
+            "executor artifact generation space exhausted; refusing to wrap and create an ABA \
+             collision",
+        ))
     }
 
     /// Stable numeric representation for diagnostics.
@@ -174,6 +213,16 @@ impl ExecutorArtifactGeneration {
 /// The same token is required at kernel-producer publication, artifact
 /// finalization, and teardown. Environment variables may be inputs when the EP
 /// is constructed, but are never consulted to mutate this token afterwards.
+///
+/// External crates cannot issue a finalization request even if they receive a
+/// capability for diagnostics:
+///
+/// ```compile_fail
+/// # use onnx_runtime_ep_api::{ExecutorArtifactConfig, ExecutorArtifactReadinessEpoch};
+/// fn forge(config: ExecutorArtifactConfig) {
+///     let _proof = config.finalization_proof(ExecutorArtifactReadinessEpoch::INITIAL);
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ExecutorArtifactConfig {
     authority: ExecutorArtifactConfigAuthority,
@@ -206,6 +255,8 @@ impl ExecutorArtifactConfig {
 
     /// Issue a scoped finalization proof for exactly this readiness epoch.
     #[must_use]
+    #[cfg(any(test, feature = "runtime-session-authority"))]
+    #[doc(hidden)]
     pub fn finalization_proof(
         &self,
         readiness: ExecutorArtifactReadinessEpoch,
@@ -1590,6 +1641,16 @@ pub trait ExecutionProvider: Send + Sync {
         self.get_kernel(op, shapes, opset)
     }
 
+    /// Classify whether `op` may be compiled without a session-issued executor
+    /// generation.
+    ///
+    /// The default keeps generic providers and kernels unchanged. Providers
+    /// that publish executor-owned artifacts must return
+    /// [`ExecutorKernelScope::Required`] for exactly those factories.
+    fn executor_kernel_scope(&self, _op: &Node) -> ExecutorKernelScope {
+        ExecutorKernelScope::Unscoped
+    }
+
     /// Apply EP-owned structural policy to one prospective capture-region node.
     ///
     /// The executor supplies only graph structure and resolved-shape presence.
@@ -2221,6 +2282,11 @@ pub trait ExecutionProvider: Send + Sync {
     /// finalization, and teardown. Providers cannot choose the executor owner.
     /// Providers that own no executor-scoped artifacts keep the disabled
     /// default.
+    ///
+    /// Child integrations based on the pre-scoped API (including #2163) must
+    /// refresh by removing direct template binding/finalization and letting the
+    /// session build own issuance. Provider code should only consume the
+    /// borrowed proof delivered to [`Self::finalize_executor_artifacts`].
     fn resolve_executor_artifact_config(&self) -> Result<ExecutorArtifactConfigTemplate> {
         Ok(ExecutorArtifactConfigTemplate::resolved(
             ExecutorArtifactConfigAuthority::UNSCOPED,
@@ -2601,6 +2667,27 @@ mod tests {
         assert_eq!(first.executor(), executor);
         assert_eq!(first.device(), DeviceId::cpu());
         assert_ne!(first.generation(), second.generation());
+    }
+
+    #[test]
+    fn identity_exhaustion_is_sticky_and_never_reuses_a_value() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            allocate_non_reusable_identity(&counter, "exhausted"),
+            u64::MAX - 1
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+
+        for _ in 0..2 {
+            let exhausted =
+                std::panic::catch_unwind(|| allocate_non_reusable_identity(&counter, "exhausted"));
+            assert!(exhausted.is_err());
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                u64::MAX,
+                "exhaustion must not wrap or publish a reusable identity"
+            );
+        }
     }
 
     #[test]

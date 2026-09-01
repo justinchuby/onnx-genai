@@ -647,6 +647,49 @@ fn stale_finalization_epoch_replay_fails_closed() {
     assert_eq!(ep.route_boundary_calls.load(Ordering::Relaxed), 0);
 }
 
+#[test]
+fn readiness_exhaustion_rejects_before_kernel_publication_and_stays_exhausted() {
+    let ep = CpuExecutionProvider::new();
+    let config = ep
+        .resolve_executor_artifact_config()
+        .expect("resolve artifact config")
+        .bind(ExecutorInstanceId::fresh());
+    let mut cache = KernelCache::default();
+    let mut readiness = ProviderArtifactReadiness::at_epoch_for_test(u64::MAX);
+    let node = Node::new(NodeId(0), "Relu", vec![Some(ValueId(0))], vec![ValueId(1)]);
+
+    for _ in 0..2 {
+        let error = match cache.get_or_create(
+            NodeId(0),
+            &node,
+            &[vec![1]],
+            &[DataType::Float32],
+            &[false],
+            &[None],
+            17,
+            false,
+            config,
+            &mut readiness,
+            &ep,
+            [None; DeviceGraphSlot::COUNT],
+        ) {
+            Ok(_) => panic!("readiness exhaustion must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("readiness epoch space exhausted"),
+            "unexpected exhaustion diagnostic: {error}"
+        );
+        assert_eq!(
+            cache.stats().entries,
+            0,
+            "an exhausted epoch must not publish a kernel"
+        );
+    }
+}
+
 impl DeferredValidationEp {
     fn reset_validation_latch(&self) -> onnx_runtime_ep_api::Result<()> {
         let call = self.resets.fetch_add(1, Ordering::Relaxed) + 1;
@@ -8240,8 +8283,12 @@ fn coverage_collector_surfaces_ep_decline_reason() {
     ));
 
     let ep = CpuExecutionProvider::new();
+    let artifact_config = ep
+        .resolve_executor_artifact_config()
+        .unwrap()
+        .bind(ExecutorInstanceId::fresh());
     let mut issues = Vec::new();
-    collect_cuda_coverage_issues(&graph, &graph, &ep, "graph", &mut issues);
+    collect_cuda_coverage_issues(&graph, &graph, &ep, artifact_config, "graph", &mut issues);
 
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].op_type, "NotRegistered");
@@ -8302,8 +8349,12 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     );
+    let artifact_config = ep
+        .resolve_executor_artifact_config()
+        .unwrap()
+        .bind(ExecutorInstanceId::fresh());
     let report = || {
-        cuda_fallback_report(&graph, &ep)
+        cuda_fallback_report(&graph, &ep, artifact_config)
             .expect("CUDA declines must produce a fallback report")
             .to_string()
     };

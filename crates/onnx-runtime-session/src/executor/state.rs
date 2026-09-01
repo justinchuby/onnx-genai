@@ -90,10 +90,33 @@ impl Default for ProviderArtifactReadiness {
 }
 
 impl ProviderArtifactReadiness {
+    pub(super) fn checked_next_epoch(&self) -> Result<ExecutorArtifactReadinessEpoch> {
+        self.epoch
+            .get()
+            .checked_add(1)
+            .map(ExecutorArtifactReadinessEpoch::new)
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "executor artifact readiness epoch space exhausted; refusing to wrap and \
+                     authorize an ABA-stale provider artifact"
+                        .to_string(),
+                )
+                .into()
+            })
+    }
+
     pub(super) fn advance_to(&mut self, epoch: ExecutorArtifactReadinessEpoch) {
         if epoch > self.epoch {
             self.epoch = epoch;
             self.outcome = ProviderArtifactOutcome::Unfinalized;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn at_epoch_for_test(epoch: u64) -> Self {
+        Self {
+            epoch: ExecutorArtifactReadinessEpoch::new(epoch),
+            outcome: ProviderArtifactOutcome::Unfinalized,
         }
     }
 

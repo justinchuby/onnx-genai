@@ -1375,6 +1375,21 @@ impl RouteTelemetrySourceRegistry {
         self.len(executor) == 0
     }
 
+    #[cfg(any(test, feature = "gpu-tests"))]
+    pub(crate) fn claimed_generations(
+        &self,
+    ) -> Vec<(ExecutorInstanceId, ExecutorArtifactGeneration)> {
+        let mut generations = self
+            .generations
+            .lock()
+            .expect("cuda_ep route-telemetry generation registry poisoned")
+            .iter()
+            .map(|(executor, generation)| (*executor, *generation))
+            .collect::<Vec<_>>();
+        generations.sort_by_key(|(executor, _)| executor.get());
+        generations
+    }
+
     /// Drop only one executor's source ownership. The generation tombstone
     /// remains until provider shutdown so stale capabilities cannot reclaim the
     /// executor key after drain.

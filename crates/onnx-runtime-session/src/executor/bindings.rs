@@ -748,9 +748,12 @@ impl Executor {
                 }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let mut kernel =
-                self.ep
-                    .get_kernel(node, &input_shapes, effective_opset(&self.graph, node))?;
+            let mut kernel = self.ep.get_kernel_for_executor(
+                self.artifact_config,
+                node,
+                &input_shapes,
+                effective_opset(&self.graph, node),
+            )?;
             let constant_inputs = node
                 .inputs
                 .iter()

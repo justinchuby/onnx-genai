@@ -356,13 +356,14 @@ pub(super) fn reject_unsupported_operators(
 pub(super) fn cuda_fallback_report(
     graph: &Graph,
     ep: &dyn ExecutionProvider,
+    artifact_config: ExecutorArtifactConfig,
 ) -> Option<ExecutionProviderFallbackReport> {
     if ep.device_type() != DeviceType::Cuda {
         return None;
     }
 
     let mut issues = Vec::new();
-    collect_cuda_coverage_issues(graph, graph, ep, "graph", &mut issues);
+    collect_cuda_coverage_issues(graph, graph, ep, artifact_config, "graph", &mut issues);
     if issues.is_empty() {
         return None;
     }
@@ -426,6 +427,7 @@ pub(super) fn collect_cuda_coverage_issues(
     graph: &Graph,
     opset_graph: &Graph,
     ep: &dyn ExecutionProvider,
+    artifact_config: ExecutorArtifactConfig,
     scope: &str,
     issues: &mut Vec<ExecutionProviderDecline>,
 ) {
@@ -485,7 +487,9 @@ pub(super) fn collect_cuda_coverage_issues(
         else {
             continue;
         };
-        if let Err(error) = ep.get_kernel(node, &concrete_shapes, opset) {
+        if let Err(error) =
+            ep.get_kernel_for_executor(artifact_config, node, &concrete_shapes, opset)
+        {
             issues.push(ExecutionProviderDecline {
                 node: format_node_identity(scope, node_id, node),
                 domain: canonical_domain(node),
@@ -497,7 +501,14 @@ pub(super) fn collect_cuda_coverage_issues(
 
     for ((node_id, attribute), subgraph) in &graph.subgraphs {
         let sub_scope = format!("{scope}/node#{}/{}", node_id.0, attribute);
-        collect_cuda_coverage_issues(subgraph, opset_graph, ep, &sub_scope, issues);
+        collect_cuda_coverage_issues(
+            subgraph,
+            opset_graph,
+            ep,
+            artifact_config,
+            &sub_scope,
+            issues,
+        );
     }
 }
 
@@ -877,8 +888,16 @@ impl Executor {
             }
         }
 
-        let execution_provider_fallback_report =
-            Self::place_graph(&mut graph, &weights, &mut ep, require_cuda)?;
+        let instance_id = ExecutorInstanceId::fresh();
+        let mut artifact_config = Self::resolve_artifact_config(ep.as_ref(), instance_id)?;
+        let execution_provider_fallback_report = Self::place_graph(
+            &mut graph,
+            &weights,
+            &mut ep,
+            instance_id,
+            &mut artifact_config,
+            require_cuda,
+        )?;
         // Topological order up front: also validates the selected graph is a DAG.
         let order = graph.topological_order()?;
         let (weight_handles, expert_region_candidates) = {
@@ -940,19 +959,6 @@ impl Executor {
 
         let plan_len = plan.len();
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
-        let instance_id = ExecutorInstanceId::fresh();
-        let artifact_template = ep.resolve_executor_artifact_config()?;
-        if artifact_template.device() != ep.device_id() {
-            return Err(EpError::KernelFailed(format!(
-                "{} returned executor artifact configuration for device {:?}, but the provider \
-                 is bound to device {:?}; rebuild the provider with one authoritative device",
-                ep.name(),
-                artifact_template.device(),
-                ep.device_id(),
-            ))
-            .into());
-        }
-        let artifact_config = artifact_template.bind(instance_id);
         let mut exec = Self {
             instance_id,
             artifact_config,
@@ -1265,10 +1271,30 @@ impl Executor {
     /// CUDA-only fusion that could otherwise touch a KV-growth `Concat` has
     /// already run), and its own output must be accounted for by the coverage
     /// check that follows.
+    fn resolve_artifact_config(
+        ep: &dyn ExecutionProvider,
+        instance_id: ExecutorInstanceId,
+    ) -> Result<ExecutorArtifactConfig> {
+        let artifact_template = ep.resolve_executor_artifact_config()?;
+        if artifact_template.device() != ep.device_id() {
+            return Err(EpError::KernelFailed(format!(
+                "{} returned executor artifact configuration for device {:?}, but the provider \
+                 is bound to device {:?}; rebuild the provider with one authoritative device",
+                ep.name(),
+                artifact_template.device(),
+                ep.device_id(),
+            ))
+            .into());
+        }
+        Ok(artifact_template.bind(instance_id))
+    }
+
     fn place_graph(
         graph: &mut Graph,
         weights: &Arc<WeightStore>,
         ep: &mut Arc<dyn ExecutionProvider>,
+        instance_id: ExecutorInstanceId,
+        artifact_config: &mut ExecutorArtifactConfig,
         require_cuda: bool,
     ) -> Result<Option<ExecutionProviderFallbackReport>> {
         let mut placement_span = trace_span("session.node_placement", "session");
@@ -1295,7 +1321,8 @@ impl Executor {
         run_ep_scoped_passes(graph, weights, ep.as_ref())?;
         let ep_pass_nodes_after = graph.num_nodes();
         rewrite_kv_capacity_appends(graph, ep.as_ref());
-        let mut execution_provider_fallback_report = cuda_fallback_report(graph, ep.as_ref());
+        let mut execution_provider_fallback_report =
+            cuda_fallback_report(graph, ep.as_ref(), *artifact_config);
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
             .map_or(0, |report| report.declines.len());
@@ -1325,8 +1352,10 @@ impl Executor {
                 &hetero_providers,
                 hetero_placement_env_enabled(),
             )?;
+            ep.drain_executor_artifacts(*artifact_config);
             *graph = graph_before_ep_passes;
             *ep = auto_detect_cpu_ep()?;
+            *artifact_config = Self::resolve_artifact_config(ep.as_ref(), instance_id)?;
             run_ep_scoped_passes(graph, weights, ep.as_ref())?;
             let mut assigned_ops = BTreeSet::new();
             report.assigned_node_count = collect_executable_ops(graph, &mut assigned_ops);

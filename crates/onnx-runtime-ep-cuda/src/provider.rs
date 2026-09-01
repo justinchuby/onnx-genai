@@ -46,9 +46,10 @@ use onnx_runtime_ep_api::{
     DevicePtr, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities,
     ExecutorArtifactConfig, ExecutorArtifactConfigAuthority, ExecutorArtifactConfigTemplate,
     ExecutorArtifactFinalization, ExecutorArtifactFinalizationProof, ExecutorArtifactPending,
-    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExecutorRouteResidencyConfig,
-    ExpertWeightGroup, Fence, HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry,
-    PagedWeight, Result, SealedDeviceAllocation, WorkspaceAllocation, deny, structural_input_bytes,
+    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExecutorKernelScope,
+    ExecutorRouteResidencyConfig, ExpertWeightGroup, Fence, HostToDeviceCopier, Kernel,
+    KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, SealedDeviceAllocation,
+    WorkspaceAllocation, deny, structural_input_bytes,
 };
 #[cfg(any(test, feature = "gpu-tests"))]
 use onnx_runtime_ir::ValueId;
@@ -2119,6 +2120,16 @@ impl CudaExecutionProvider {
         }
     }
 
+    #[cfg(any(test, feature = "gpu-tests"))]
+    pub fn executor_artifact_generation_claims(
+        &self,
+    ) -> Vec<(
+        ExecutorInstanceId,
+        onnx_runtime_ep_api::ExecutorArtifactGeneration,
+    )> {
+        self.route_telemetry_registry.claimed_generations()
+    }
+
     /// Finalize one executor's real QMoE route-residency artifacts.
     ///
     /// `NoTelemetrySource` is readiness-dependent and returns `Pending` without
@@ -3405,11 +3416,20 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>> {
-        let config = self
-            .executor_artifact_config()
-            .bind(ExecutorInstanceId::UNSCOPED);
-        self.route_telemetry_registry
-            .with_executor_scope(config, || self.create_registered_kernel(op, shapes, opset))?
+        if self.executor_kernel_scope(op) == ExecutorKernelScope::Required {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: {}::{} requires a session-issued executor artifact scope because route \
+                 residency is enabled; compile it through an onnx-runtime-session executor so all \
+                 kernels borrow the same provider generation",
+                if op.domain.is_empty() {
+                    "ai.onnx"
+                } else {
+                    &op.domain
+                },
+                op.op_type,
+            )));
+        }
+        self.create_registered_kernel(op, shapes, opset)
     }
 
     fn get_kernel_for_executor(
@@ -3421,6 +3441,18 @@ impl ExecutionProvider for CudaExecutionProvider {
     ) -> Result<Box<dyn Kernel>> {
         self.route_telemetry_registry
             .with_executor_scope(config, || self.create_registered_kernel(op, shapes, opset))?
+    }
+
+    fn executor_kernel_scope(&self, op: &Node) -> ExecutorKernelScope {
+        if self.route_residency_config == ExecutorRouteResidencyConfig::Enabled
+            && onnx_runtime_ep_api::LazyWeightBoundary::for_op(&op.domain, &op.op_type).is_some_and(
+                |boundary| boundary.route_telemetry_producer_may_appear_after_compilation(),
+            )
+        {
+            ExecutorKernelScope::Required
+        } else {
+            ExecutorKernelScope::Unscoped
+        }
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {

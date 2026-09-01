@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use onnx_runtime_ep_api::ExecutionProvider;
+use onnx_runtime_ep_api::{ExecutionProvider, ExecutorKernelScope, ExecutorRouteResidencyConfig};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
 use onnx_runtime_ep_cuda::route_residency::{
@@ -54,6 +54,43 @@ fn provider_or_skip() -> Option<Arc<CudaExecutionProvider>> {
             None
         }
     }
+}
+
+fn provider_with_route_config_or_skip(
+    route_config: ExecutorRouteResidencyConfig,
+) -> Option<Arc<CudaExecutionProvider>> {
+    let governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+        Arc::new(LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0)));
+    let policy = DeviceOffloadPolicy {
+        enabled: true,
+        device_budget_bytes: Some(8 << 30),
+        ..DeviceOffloadPolicy::default()
+    };
+    match CudaExecutionProvider::initialized_with_offload_policy_governor_and_route_config(
+        0,
+        policy,
+        governor,
+        route_config,
+    ) {
+        Ok(provider) => Some(Arc::new(provider)),
+        Err(error) => {
+            println!("SKIP: CUDA offload provider unavailable: {error}");
+            None
+        }
+    }
+}
+
+fn unary_chain_model() -> Vec<u8> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([4]));
+    graph.add_input(input);
+    let relu = graph.create_named_value("relu", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(input)], vec![relu]));
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(1), "Abs", vec![Some(relu)], vec![output]));
+    graph.add_output(output);
+    encode_model(&Model::new(&graph)).expect("encode unary CUDA chain")
 }
 
 fn fixture_model() -> PathBuf {
@@ -214,6 +251,99 @@ fn run_symbolic_qmoe(
     session
         .run(&[("hidden", &hidden), ("router_probs", &router)])
         .expect("run real symbolic QMoE producer");
+}
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn enabled_multinode_sessions_share_one_generation_each_without_cpu_fallback() {
+    let _serial = GPU_SERIAL.lock().unwrap();
+    let Some(ep) = provider_with_route_config_or_skip(ExecutorRouteResidencyConfig::Enabled) else {
+        return;
+    };
+    let model = unary_chain_model();
+    let input = Tensor::from_f32(&[4], &[-1.0, 2.0, -3.0, 4.0]).unwrap();
+
+    let mut first = InferenceSession::builder()
+        .model_bytes(&model)
+        .execution_provider(ep.clone())
+        .build()
+        .expect("build first enabled multi-node CUDA session");
+    assert!(
+        first.execution_provider_fallback_report().is_none(),
+        "two scoped lookups in one executor generation must remain CUDA-claimed"
+    );
+    first
+        .run(&[("input", &input)])
+        .expect("execute first CUDA session");
+
+    let mut foreign = InferenceSession::builder()
+        .model_bytes(&model)
+        .execution_provider(ep.clone())
+        .build()
+        .expect("build foreign executor on the shared CUDA provider");
+    assert!(
+        foreign.execution_provider_fallback_report().is_none(),
+        "a foreign executor must receive its own generation without invalidating the first"
+    );
+    foreign
+        .run(&[("input", &input)])
+        .expect("execute foreign CUDA session");
+
+    let claims = ep.executor_artifact_generation_claims();
+    assert_eq!(
+        claims.len(),
+        2,
+        "each executor must claim exactly one generation despite two preflight and compile lookups"
+    );
+    assert_ne!(claims[0].0, claims[1].0, "foreign executors must differ");
+    assert_ne!(
+        claims[0].1, claims[1].1,
+        "foreign executors must not share a generation"
+    );
+}
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn enabled_required_kernel_rejects_missing_scope_while_disabled_is_inert() {
+    let _serial = GPU_SERIAL.lock().unwrap();
+    let Some(enabled) = provider_with_route_config_or_skip(ExecutorRouteResidencyConfig::Enabled)
+    else {
+        return;
+    };
+    let mut qmoe = Node::new(NodeId(0), "QMoE", Vec::new(), Vec::new());
+    qmoe.domain = "com.microsoft".into();
+    assert_eq!(
+        enabled.executor_kernel_scope(&qmoe),
+        ExecutorKernelScope::Required
+    );
+    let error = match enabled.get_kernel(&qmoe, &[], 1) {
+        Ok(_) => panic!("enabled QMoE must reject an unscoped kernel lookup"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("requires a session-issued executor artifact scope")
+            && error.to_string().contains("onnx-runtime-session"),
+        "unexpected missing-scope diagnostic: {error}"
+    );
+    assert!(
+        enabled.executor_artifact_generation_claims().is_empty(),
+        "a rejected unscoped lookup must not claim or publish a generation"
+    );
+
+    let Some(disabled) = provider_with_route_config_or_skip(ExecutorRouteResidencyConfig::Disabled)
+    else {
+        return;
+    };
+    assert_eq!(
+        disabled.executor_kernel_scope(&qmoe),
+        ExecutorKernelScope::Unscoped
+    );
+    assert!(
+        disabled.executor_artifact_generation_claims().is_empty(),
+        "disabled construction must remain zero-work"
+    );
 }
 
 #[test]

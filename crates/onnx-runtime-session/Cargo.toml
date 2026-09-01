@@ -26,7 +26,7 @@ onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-shape-inference = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
-onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ep-api = { workspace = true, features = ["runtime-session-authority"] }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
 onnx-runtime-tracer = { workspace = true }
