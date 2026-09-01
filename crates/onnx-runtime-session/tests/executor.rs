@@ -14,6 +14,7 @@ use std::sync::{
 use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider,
     ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
+    ExecutorArtifactRequirement, ExecutorArtifactRequirementState, ExecutorArtifactUseGuard,
     ExecutorInstanceId, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata, TensorMut,
     TensorView, ViewOutput, WorkspaceRequirement,
 };
@@ -140,6 +141,51 @@ struct HostDownloadCountingEp {
     graph_installed: Arc<AtomicBool>,
     graph_segment_replays: Arc<AtomicUsize>,
     graph_fast_replays: Arc<AtomicUsize>,
+    artifact_requirement: Option<Arc<TestArtifactRequirementState>>,
+}
+
+#[derive(Default)]
+struct TestArtifactRequirementCounters {
+    retired: AtomicBool,
+    active: AtomicUsize,
+    acquisitions: AtomicUsize,
+}
+
+struct TestArtifactRequirementState {
+    counters: Arc<TestArtifactRequirementCounters>,
+}
+
+struct TestArtifactUseGuard {
+    counters: Arc<TestArtifactRequirementCounters>,
+}
+
+impl ExecutorArtifactUseGuard for TestArtifactUseGuard {}
+
+impl Drop for TestArtifactUseGuard {
+    fn drop(&mut self) {
+        self.counters.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl ExecutorArtifactRequirementState for TestArtifactRequirementState {
+    fn acquire_use(&self) -> EpResult<Box<dyn ExecutorArtifactUseGuard>> {
+        if self.counters.retired.load(Ordering::SeqCst) {
+            return Err(EpError::KernelFailed(
+                "test executor artifact requirement is retired".into(),
+            ));
+        }
+        self.counters.active.fetch_add(1, Ordering::SeqCst);
+        if self.counters.retired.load(Ordering::SeqCst) {
+            self.counters.active.fetch_sub(1, Ordering::SeqCst);
+            return Err(EpError::KernelFailed(
+                "test executor artifact requirement retired during acquisition".into(),
+            ));
+        }
+        self.counters.acquisitions.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(TestArtifactUseGuard {
+            counters: Arc::clone(&self.counters),
+        }))
+    }
 }
 
 impl HostDownloadCountingEp {
@@ -165,6 +211,7 @@ impl HostDownloadCountingEp {
             graph_installed: Arc::new(AtomicBool::new(false)),
             graph_segment_replays: Arc::new(AtomicUsize::new(0)),
             graph_fast_replays: Arc::new(AtomicUsize::new(0)),
+            artifact_requirement: None,
         }
     }
 
@@ -206,6 +253,23 @@ impl HostDownloadCountingEp {
             fake_device_graph: true,
             ..Self::new(host_downloads)
         }
+    }
+
+    fn new_retirable_fast_replay(
+        host_downloads: Arc<AtomicUsize>,
+    ) -> (Self, Arc<TestArtifactRequirementCounters>) {
+        let counters = Arc::new(TestArtifactRequirementCounters::default());
+        (
+            Self {
+                assert_finalized_before_execute: true,
+                fake_device_graph: true,
+                artifact_requirement: Some(Arc::new(TestArtifactRequirementState {
+                    counters: Arc::clone(&counters),
+                })),
+                ..Self::new(host_downloads)
+            },
+            counters,
+        )
     }
 
     fn kernel_compiles(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
@@ -416,12 +480,25 @@ impl ExecutionProvider for HostDownloadCountingEp {
     }
 
     fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {
+        if let Some(requirement) = &self.artifact_requirement {
+            requirement.counters.retired.store(true, Ordering::SeqCst);
+        }
         *self
             .route_drains
             .lock()
             .unwrap()
             .entry(executor)
             .or_default() += 1;
+    }
+
+    fn executor_artifact_requirement(
+        &self,
+        _executor: ExecutorInstanceId,
+    ) -> EpResult<Option<ExecutorArtifactRequirement>> {
+        Ok(self
+            .artifact_requirement
+            .as_ref()
+            .map(|state| ExecutorArtifactRequirement::new(Arc::clone(state))))
     }
 
     fn name(&self) -> &str {
@@ -2595,6 +2672,58 @@ fn single_graph_fast_replay_obeys_pending_failed_and_ready_specializations() {
 
     drop(session);
     assert_eq!(scoped_count(&drains, executor), 1);
+}
+
+#[test]
+fn baked_graph_retains_retired_artifact_requirement_after_provider_drain() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let (ep, requirement) = HostDownloadCountingEp::new_retirable_fast_replay(downloads);
+    let fast_replays = ep.graph_fast_replays();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(Arc::clone(&ep) as Arc<dyn ExecutionProvider>)
+        .build()
+        .expect("build retirable fast-replay session");
+    let executor = session.executor_instance_id();
+    let input = session
+        .allocate_device_binding("x", None::<String>, DataType::Float32, vec![2], vec![2])
+        .expect("allocate persistent capture input");
+    let output = session
+        .allocate_device_output_binding("y", DataType::Float32, vec![2], vec![2])
+        .expect("allocate persistent capture output");
+    let mut bindings = vec![input, output];
+    bindings[0]
+        .write_bytes(0, &f32_bytes(&[-1.0, 1.0]))
+        .expect("seed persistent capture input");
+    assert!(matches!(
+        session
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .expect("capture with exact artifact requirement"),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    assert_eq!(requirement.acquisitions.load(Ordering::SeqCst), 1);
+    assert_eq!(requirement.active.load(Ordering::SeqCst), 0);
+
+    ep.drain_executor_artifacts(executor);
+    assert!(requirement.retired.load(Ordering::SeqCst));
+    let error = session
+        .replay_device_graph(&mut bindings)
+        .expect_err("retired captured requirement must reject before graph launch");
+    assert!(
+        error.to_string().contains("requirement is retired"),
+        "unexpected retirement error: {error}"
+    );
+    assert_eq!(
+        fast_replays.load(Ordering::SeqCst),
+        0,
+        "retired requirement must reject before the provider graph launch"
+    );
+    assert_eq!(
+        requirement.acquisitions.load(Ordering::SeqCst),
+        1,
+        "post-drain replay must not acquire a new use lease"
+    );
 }
 
 #[test]

@@ -85,6 +85,7 @@ pub struct RouteResidencyExecutorStatus {
     pub producer_nodes: usize,
     pub retained_banks: usize,
     pub reservation_generation: Option<u64>,
+    pub reservation_removals: u64,
 }
 
 #[derive(Default)]
@@ -100,6 +101,7 @@ struct ExecutorRouteResidencyState {
     retained_artifacts: Option<Arc<Vec<ExpertWeightGroup>>>,
     reservation_health: Option<Arc<crate::weight_paging::RouteReservationHealth>>,
     reservation_generation: Option<u64>,
+    reservation_removals: u64,
 }
 
 /// The provider-owned mapped-attribution zone.
@@ -987,7 +989,6 @@ pub struct CudaExecutionProvider {
     /// executors may share this EP, but each owns an independent finalization
     /// outcome, boundary, and retained bank artifacts.
     route_executors: Mutex<HashMap<ExecutorInstanceId, ExecutorRouteResidencyState>>,
-    route_reservations_active: AtomicU64,
     route_diag: Arc<RouteResidencyDiagnostics>,
     /// EP-owned registry of live `QMoE` route-telemetry producer sources,
     /// keyed by call-site `NodeId` (issue #1810 Slice 7E). Shared with the
@@ -1251,7 +1252,6 @@ impl CudaExecutionProvider {
             retired_allocator_teardown: Vec::new(),
             release_queue,
             route_executors: Mutex::new(HashMap::new()),
-            route_reservations_active: AtomicU64::new(0),
             route_diag: Arc::new(RouteResidencyDiagnostics::default()),
             route_telemetry_registry,
         };
@@ -1954,6 +1954,7 @@ impl CudaExecutionProvider {
                 .and_then(|state| state.retained_artifacts.as_ref())
                 .map_or(0, |artifacts| artifacts.len()),
             reservation_generation: state.and_then(|state| state.reservation_generation),
+            reservation_removals: state.map_or(0, |state| state.reservation_removals),
         }
     }
 
@@ -2000,6 +2001,13 @@ impl CudaExecutionProvider {
             .lock()
             .expect("cuda_ep route-residency executors poisoned");
         let state = states.entry(executor).or_default();
+        if state.drained && state.outcome.is_none() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: executor {} route-bank artifact authority was retired before \
+                 reservation installation completed; rebuild the executor",
+                executor.get()
+            )));
+        }
         if state.outcome.is_some() {
             state.readiness_epoch = Some(readiness);
             return Ok(ExecutorArtifactFinalization::Complete);
@@ -2161,8 +2169,6 @@ impl CudaExecutionProvider {
             .reservation_health
             .as_ref()
             .and_then(|health| health.generation());
-        self.route_reservations_active
-            .fetch_add(1, Ordering::Release);
         state.outcome = Some(RouteResidencyInstallOutcome::Installed { banks });
         self.route_diag.record_install(banks);
         Ok(ExecutorArtifactFinalization::Complete)
@@ -2266,136 +2272,133 @@ impl CudaExecutionProvider {
     }
 
     pub fn drain_route_residency_for_executor(&self, executor: ExecutorInstanceId) {
-        let (boundaries, armed_sources, had_reservation) = {
+        let health = {
+            let states = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            states
+                .get(&executor)
+                .and_then(|state| state.reservation_health.clone())
+        };
+        let Some(health) = health else {
             let mut states = self
                 .route_executors
                 .lock()
                 .expect("cuda_ep route-residency executors poisoned");
-            let state = states.entry(executor).or_default();
-            if state.drained {
-                return;
+            if let Some(state) = states.get_mut(&executor)
+                && !state.drained
+            {
+                state.drain_calls += 1;
+                state.drained = true;
+                state.pending = None;
             }
+            return;
+        };
+        let Some(retirement) = health.begin_retirement() else {
+            return;
+        };
+
+        let (boundaries, armed_sources) = {
+            let mut states = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            let state = states
+                .get_mut(&executor)
+                .expect("installed reservation keeps its executor state");
             state.drain_calls += 1;
             state.drained = true;
             state.pending = None;
-            let boundaries = std::mem::take(&mut state.boundaries);
-            state.retained_artifacts = None;
-            let had_reservation = state.reservation_health.take().is_some();
-            state.reservation_generation = None;
-            (
-                boundaries,
-                std::mem::take(&mut state.armed_sources),
-                had_reservation,
-            )
+            (state.boundaries.clone(), state.armed_sources.clone())
         };
-        if had_reservation {
-            self.route_reservations_active
-                .fetch_sub(1, Ordering::Release);
+
+        let mut safe_to_unmap = true;
+        if let Err(error) = self.runtime.drain_for_unmap() {
+            safe_to_unmap = false;
+            eprintln!(
+                "cuda_ep: WARNING: executor {} route teardown could not drain CUDA work; \
+                 reservation mappings remain retained and retired: {error}",
+                executor.get()
+            );
         }
-        if !boundaries.is_empty() {
-            if let Err(error) = self.runtime.drain_for_unmap() {
-                eprintln!(
-                    "cuda_ep: WARNING: executor {} route teardown could not drain CUDA work: \
-                     {error}",
-                    executor.get()
-                );
-            }
-            if let Err(error) = self.runtime.sync_copy_stream() {
-                eprintln!(
-                    "cuda_ep: WARNING: executor {} route teardown could not drain copies: {error}",
-                    executor.get()
-                );
-            }
-            if !self
-                .release_queue
-                .wait_until_idle(std::time::Duration::from_secs(30))
-            {
-                eprintln!(
-                    "cuda_ep: WARNING: executor {} route teardown release queue did not drain",
-                    executor.get()
-                );
+        if let Err(error) = self.runtime.sync_copy_stream() {
+            safe_to_unmap = false;
+            eprintln!(
+                "cuda_ep: WARNING: executor {} route teardown could not drain copies; \
+                 reservation mappings remain retained and retired: {error}",
+                executor.get()
+            );
+        }
+        if !self
+            .release_queue
+            .wait_until_idle(std::time::Duration::from_secs(30))
+        {
+            safe_to_unmap = false;
+            eprintln!(
+                "cuda_ep: WARNING: executor {} route teardown release queue did not drain; \
+                 reservation mappings remain retained and retired",
+                executor.get()
+            );
+        }
+        if safe_to_unmap {
+            for boundary in &boundaries {
+                if let Err(error) = boundary.restore_host_ranges_to_device(&self.runtime) {
+                    safe_to_unmap = false;
+                    health.mark_unusable(format!(
+                        "route-bank restore during executor teardown failed: {error}"
+                    ));
+                    break;
+                }
             }
         }
-        for boundary in boundaries {
-            if let Err(error) = boundary.restore_host_ranges_to_device(&self.runtime) {
-                eprintln!(
-                    "cuda_ep: WARNING: executor {} route-bank restore during teardown failed: \
-                     {error}",
-                    executor.get()
-                );
-            }
+        if !safe_to_unmap {
+            eprintln!(
+                "cuda_ep: WARNING: executor {} route-bank teardown failed closed; no later \
+                 dispatch or replay can acquire generation {:?}",
+                executor.get(),
+                health.generation()
+            );
         }
         for source in armed_sources {
             source.disarm_route_telemetry();
         }
         self.route_telemetry_registry.remove(executor);
-        if let Some(residency) = self.residency.as_ref() {
-            residency.remove_route_bank_reservations(executor);
+        if safe_to_unmap {
+            if let Some(residency) = self.residency.as_ref() {
+                residency.remove_route_bank_reservations(executor);
+            }
+            let mut states = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            let state = states
+                .get_mut(&executor)
+                .expect("retired reservation keeps its executor tombstone");
+            state.boundaries.clear();
+            state.armed_sources.clear();
+            state.retained_artifacts = None;
+            state.reservation_removals += 1;
+        } else {
+            health.mark_unusable(
+                "reservation teardown could not prove all mappings safe to release".to_string(),
+            );
         }
+        retirement.complete();
     }
 
     fn drain_all_route_residency(&self) {
-        let mut states = self
+        let executors: Vec<_> = self
             .route_executors
             .lock()
-            .expect("cuda_ep route-residency executors poisoned");
-        let mut boundaries = Vec::new();
-        let mut armed_sources = Vec::new();
-        let mut reservations_removed = 0_u64;
-        for state in states.values_mut() {
-            if !state.drained {
-                state.drain_calls += 1;
-                state.drained = true;
-            }
-            state.pending = None;
-            boundaries.append(&mut state.boundaries);
-            armed_sources.append(&mut state.armed_sources);
-            state.retained_artifacts = None;
-            reservations_removed += u64::from(state.reservation_health.take().is_some());
-            state.reservation_generation = None;
-        }
-        drop(states);
-        if reservations_removed > 0 {
-            self.route_reservations_active
-                .fetch_sub(reservations_removed, Ordering::Release);
-        }
-        if !boundaries.is_empty() {
-            if let Err(error) = self.runtime.drain_for_unmap() {
-                eprintln!("cuda_ep: WARNING: route teardown could not drain CUDA work: {error}");
-            }
-            if let Err(error) = self.runtime.sync_copy_stream() {
-                eprintln!("cuda_ep: WARNING: route teardown could not drain copies: {error}");
-            }
-            if !self
-                .release_queue
-                .wait_until_idle(std::time::Duration::from_secs(30))
-            {
-                eprintln!("cuda_ep: WARNING: route teardown release queue did not drain");
-            }
-        }
-        for boundary in boundaries {
-            if let Err(error) = boundary.restore_host_ranges_to_device(&self.runtime) {
-                eprintln!(
-                    "cuda_ep: WARNING: route-bank restore during provider teardown failed: {error}"
-                );
-            }
-        }
-        for source in armed_sources {
-            source.disarm_route_telemetry();
+            .expect("cuda_ep route-residency executors poisoned")
+            .keys()
+            .copied()
+            .collect();
+        for executor in executors {
+            self.drain_route_residency_for_executor(executor);
         }
         self.route_telemetry_registry.clear();
-        if let Some(residency) = self.residency.as_ref() {
-            let executors: Vec<_> = self
-                .route_executors
-                .lock()
-                .expect("cuda_ep route-residency executors poisoned")
-                .keys()
-                .copied()
-                .collect();
-            for executor in executors {
-                residency.remove_route_bank_reservations(executor);
-            }
-        }
     }
 
     fn consume_route_residency_for_executor(&self, executor: ExecutorInstanceId) -> Result<()> {
@@ -4633,13 +4636,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         crate::coarse_residency::coarse_residency_profile_enabled() && self.residency.is_some()
     }
 
-    fn acquire_executor_artifact_use(
+    fn executor_artifact_requirement(
         &self,
         executor: ExecutorInstanceId,
-    ) -> Result<Option<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>>> {
-        if self.route_reservations_active.load(Ordering::Acquire) == 0 {
-            return Ok(None);
-        }
+    ) -> Result<Option<onnx_runtime_ep_api::ExecutorArtifactRequirement>> {
         let (health, expected_generation) = {
             let states = self
                 .route_executors
@@ -4648,8 +4648,18 @@ impl ExecutionProvider for CudaExecutionProvider {
             let Some(state) = states.get(&executor) else {
                 return Ok(None);
             };
-            let Some(health) = state.reservation_health.clone() else {
+            if !matches!(
+                state.outcome,
+                Some(RouteResidencyInstallOutcome::Installed { .. })
+            ) {
                 return Ok(None);
+            }
+            let Some(health) = state.reservation_health.clone() else {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} recorded installed route-bank reservations without \
+                     retaining their lifecycle requirement; tear down and rebuild the executor",
+                    executor.get()
+                )));
             };
             (health, state.reservation_generation)
         };
@@ -4663,17 +4673,14 @@ impl ExecutionProvider for CudaExecutionProvider {
                 health.generation()
             )));
         }
-        let guard = health
-            .acquire_use(executor, self.device.index)
-            .map_err(|reason| {
-                EpError::KernelFailed(format!(
-                    "cuda_ep: executor {} CUDA:{} route-bank reservation is unusable: {reason}; \
-                     tear down and rebuild the executor before dispatch, capture, or replay",
-                    executor.get(),
-                    self.device.index
-                ))
-            })?;
-        Ok(Some(Box::new(guard)))
+        health.requirement().map(Some).map_err(|reason| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: executor {} CUDA:{} route-bank reservation requirement is invalid: \
+                 {reason}",
+                executor.get(),
+                self.device.index
+            ))
+        })
     }
 
     fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {

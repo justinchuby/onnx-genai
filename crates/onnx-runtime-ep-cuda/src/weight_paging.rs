@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use cudarc::driver::sys;
@@ -2878,9 +2878,11 @@ pub struct RouteReservationHealth {
     identity: Option<RouteReservationIdentity>,
     lifecycle: AtomicU64,
     reason: Mutex<Option<String>>,
+    lifecycle_wait: Mutex<()>,
+    lifecycle_changed: Condvar,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RouteReservationIdentity {
     executor: ExecutorInstanceId,
     device_ordinal: u32,
@@ -2889,7 +2891,9 @@ struct RouteReservationIdentity {
 
 const ROUTE_HEALTH_POISONED: u64 = 1;
 const ROUTE_HEALTH_TRANSITIONING: u64 = 1 << 1;
-const ROUTE_HEALTH_USE: u64 = 1 << 2;
+const ROUTE_HEALTH_RETIRING: u64 = 1 << 2;
+const ROUTE_HEALTH_RETIRED: u64 = 1 << 3;
+const ROUTE_HEALTH_USE: u64 = 1 << 4;
 static NEXT_ROUTE_RESERVATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct RouteReservationUseGuard {
@@ -2900,9 +2904,18 @@ impl onnx_runtime_ep_api::ExecutorArtifactUseGuard for RouteReservationUseGuard 
 
 impl Drop for RouteReservationUseGuard {
     fn drop(&mut self) {
-        self.health
+        let _wait = self
+            .health
+            .lifecycle_wait
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior = self
+            .health
             .lifecycle
             .fetch_sub(ROUTE_HEALTH_USE, Ordering::AcqRel);
+        if prior & ROUTE_HEALTH_RETIRING != 0 {
+            self.health.lifecycle_changed.notify_all();
+        }
     }
 }
 
@@ -2914,20 +2927,32 @@ pub(crate) struct RouteReservationTransitionGuard {
 impl RouteReservationTransitionGuard {
     pub(crate) fn complete(mut self) {
         self.completed = true;
-        let _ = self.health.lifecycle.compare_exchange(
-            ROUTE_HEALTH_TRANSITIONING,
-            0,
-            Ordering::Release,
-            Ordering::Acquire,
-        );
+        let _wait = self
+            .health
+            .lifecycle_wait
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior = self
+            .health
+            .lifecycle
+            .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::AcqRel);
+        if prior & ROUTE_HEALTH_RETIRING != 0 {
+            self.health.lifecycle_changed.notify_all();
+        }
     }
 
     pub(crate) fn poison(mut self, reason: String) {
         self.health.mark_unusable(reason);
         self.completed = true;
+        let _wait = self
+            .health
+            .lifecycle_wait
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.health
             .lifecycle
             .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::Release);
+        self.health.lifecycle_changed.notify_all();
     }
 }
 
@@ -2938,10 +2963,87 @@ impl Drop for RouteReservationTransitionGuard {
                 "reservation transition authority exited without publishing a terminal outcome"
                     .to_string(),
             );
+            let _wait = self
+                .health
+                .lifecycle_wait
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.health
                 .lifecycle
                 .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::Release);
+            self.health.lifecycle_changed.notify_all();
         }
+    }
+}
+
+pub(crate) struct RouteReservationRetirementGuard {
+    health: Arc<RouteReservationHealth>,
+    completed: bool,
+}
+
+impl RouteReservationRetirementGuard {
+    pub(crate) fn complete(mut self) {
+        self.completed = true;
+        let _wait = self
+            .health
+            .lifecycle_wait
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let poisoned = self.health.lifecycle.load(Ordering::Acquire) & ROUTE_HEALTH_POISONED;
+        self.health
+            .lifecycle
+            .store(poisoned | ROUTE_HEALTH_RETIRED, Ordering::Release);
+        self.health.lifecycle_changed.notify_all();
+    }
+}
+
+impl Drop for RouteReservationRetirementGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.health.mark_unusable(
+                "reservation teardown exited without publishing a terminal retirement outcome"
+                    .to_string(),
+            );
+            let _wait = self
+                .health
+                .lifecycle_wait
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.health.lifecycle.store(
+                ROUTE_HEALTH_POISONED | ROUTE_HEALTH_RETIRED,
+                Ordering::Release,
+            );
+            self.health.lifecycle_changed.notify_all();
+        }
+    }
+}
+
+pub(crate) struct RouteReservationRequirement {
+    health: Arc<RouteReservationHealth>,
+    identity: RouteReservationIdentity,
+}
+
+impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for RouteReservationRequirement {
+    fn acquire_use(
+        &self,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>> {
+        self.health
+            .acquire_use(
+                self.identity.executor,
+                self.identity.device_ordinal,
+                self.identity.generation,
+            )
+            .map(|guard| Box::new(guard) as Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>)
+            .map_err(|reason| {
+                onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} CUDA:{} route-bank reservation is unusable \
+                     (generation {}): {reason}; tear down and rebuild the executor before \
+                     dispatch, capture, or replay",
+                    self.identity.executor.get(),
+                    self.identity.device_ordinal,
+                    self.identity.generation
+                ))
+            })
     }
 }
 
@@ -2951,6 +3053,8 @@ impl RouteReservationHealth {
             identity: None,
             lifecycle: AtomicU64::new(0),
             reason: Mutex::new(None),
+            lifecycle_wait: Mutex::new(()),
+            lifecycle_changed: Condvar::new(),
         })
     }
 
@@ -2964,11 +3068,28 @@ impl RouteReservationHealth {
             }),
             lifecycle: AtomicU64::new(0),
             reason: Mutex::new(None),
+            lifecycle_wait: Mutex::new(()),
+            lifecycle_changed: Condvar::new(),
         })
     }
 
     pub(crate) fn generation(&self) -> Option<u64> {
         self.identity.map(|identity| identity.generation)
+    }
+
+    pub(crate) fn requirement(
+        self: &Arc<Self>,
+    ) -> Result<onnx_runtime_ep_api::ExecutorArtifactRequirement, String> {
+        let identity = self.identity.ok_or_else(|| {
+            "reservation health has no executor/device/generation identity; rebuild the executor"
+                .to_string()
+        })?;
+        Ok(onnx_runtime_ep_api::ExecutorArtifactRequirement::new(
+            Arc::new(RouteReservationRequirement {
+                health: Arc::clone(self),
+                identity,
+            }),
+        ))
     }
 
     pub(crate) fn mark_unusable(&self, reason: String) {
@@ -2984,7 +3105,14 @@ impl RouteReservationHealth {
     }
 
     pub(crate) fn ensure_usable(&self) -> Result<(), String> {
-        if self.lifecycle.load(Ordering::Acquire) & ROUTE_HEALTH_POISONED == 0 {
+        let state = self.lifecycle.load(Ordering::Acquire);
+        if state & ROUTE_HEALTH_RETIRED != 0 {
+            return Err("reservation is retired and its mappings are no longer launchable".into());
+        }
+        if state & ROUTE_HEALTH_RETIRING != 0 {
+            return Err("reservation teardown is retiring its mappings".into());
+        }
+        if state & ROUTE_HEALTH_POISONED == 0 {
             return Ok(());
         }
         let reason = self
@@ -3000,6 +3128,7 @@ impl RouteReservationHealth {
         &self,
         executor: ExecutorInstanceId,
         device_ordinal: u32,
+        generation: u64,
     ) -> Result<RouteReservationIdentity, String> {
         let Some(identity) = self.identity else {
             return Err(
@@ -3008,15 +3137,19 @@ impl RouteReservationHealth {
                     .to_string(),
             );
         };
-        if identity.executor != executor || identity.device_ordinal != device_ordinal {
+        if identity.executor != executor
+            || identity.device_ordinal != device_ordinal
+            || identity.generation != generation
+        {
             return Err(format!(
                 "reservation generation {} belongs to executor {} on CUDA:{}, not executor {} on \
-                 CUDA:{}",
+                 CUDA:{} generation {}",
                 identity.generation,
                 identity.executor.get(),
                 identity.device_ordinal,
                 executor.get(),
-                device_ordinal
+                device_ordinal,
+                generation
             ));
         }
         Ok(identity)
@@ -3026,10 +3159,23 @@ impl RouteReservationHealth {
         self: &Arc<Self>,
         executor: ExecutorInstanceId,
         device_ordinal: u32,
+        generation: u64,
     ) -> Result<RouteReservationUseGuard, String> {
-        let identity = self.validate_identity(executor, device_ordinal)?;
+        let identity = self.validate_identity(executor, device_ordinal, generation)?;
         loop {
             let state = self.lifecycle.load(Ordering::Acquire);
+            if state & ROUTE_HEALTH_RETIRED != 0 {
+                return Err(format!(
+                    "reservation generation {} is retired; its mappings cannot be used",
+                    identity.generation
+                ));
+            }
+            if state & ROUTE_HEALTH_RETIRING != 0 {
+                return Err(format!(
+                    "reservation generation {} is retiring; no new launch may begin",
+                    identity.generation
+                ));
+            }
             if state & ROUTE_HEALTH_POISONED != 0 {
                 return Err(format!(
                     "reservation generation {} is poisoned: {}",
@@ -3081,11 +3227,72 @@ impl RouteReservationHealth {
             Err(state) if state & ROUTE_HEALTH_TRANSITIONING != 0 => {
                 Err("another route-bank group transition is already active".to_string())
             }
+            Err(state) if state & ROUTE_HEALTH_RETIRED != 0 => {
+                Err("route-bank reservation is retired".to_string())
+            }
+            Err(state) if state & ROUTE_HEALTH_RETIRING != 0 => {
+                Err("route-bank reservation teardown is in progress".to_string())
+            }
             Err(state) => Err(format!(
                 "{} reservation-backed dispatch/replay lease(s) are still active",
                 state / ROUTE_HEALTH_USE
             )),
         }
+    }
+
+    pub(crate) fn begin_retirement(self: &Arc<Self>) -> Option<RouteReservationRetirementGuard> {
+        loop {
+            let state = self.lifecycle.load(Ordering::Acquire);
+            if state & ROUTE_HEALTH_RETIRED != 0 {
+                return None;
+            }
+            if state & ROUTE_HEALTH_RETIRING != 0 {
+                let mut wait = self
+                    .lifecycle_wait
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                while self.lifecycle.load(Ordering::Acquire) & ROUTE_HEALTH_RETIRED == 0 {
+                    wait = self
+                        .lifecycle_changed
+                        .wait(wait)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                return None;
+            }
+            if self
+                .lifecycle
+                .compare_exchange_weak(
+                    state,
+                    state | ROUTE_HEALTH_RETIRING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            break;
+        }
+
+        let mut wait = self
+            .lifecycle_wait
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            let state = self.lifecycle.load(Ordering::Acquire);
+            if state / ROUTE_HEALTH_USE == 0 && state & ROUTE_HEALTH_TRANSITIONING == 0 {
+                break;
+            }
+            wait = self
+                .lifecycle_changed
+                .wait(wait)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        drop(wait);
+        Some(RouteReservationRetirementGuard {
+            health: Arc::clone(self),
+            completed: false,
+        })
     }
 }
 
@@ -4551,7 +4758,10 @@ impl CudaWeightResidency {
         catalog: &onnx_runtime_loader::WeightRegionCatalog,
         health: Arc<RouteReservationHealth>,
     ) -> Result<RoutedResidencyGuard, String> {
-        let reservation_use = health.acquire_use(executor, device_ordinal)?;
+        let generation = health.generation().ok_or_else(|| {
+            "route reservation use requires an executor/device/generation identity".to_string()
+        })?;
+        let reservation_use = health.acquire_use(executor, device_ordinal, generation)?;
         let proof = onnx_runtime_ep_api::prove_routed_residency(requirement, catalog);
         self.routed_guards_active.fetch_add(1, Ordering::SeqCst);
         Ok(RoutedResidencyGuard {
@@ -7370,7 +7580,7 @@ mod tests {
         let generation = health.generation().expect("scoped generation");
 
         let use_guard = health
-            .acquire_use(executor, 3)
+            .acquire_use(executor, 3, generation)
             .expect("exact owner acquires use");
         let blocked = health
             .begin_transition()
@@ -7383,14 +7593,14 @@ mod tests {
             .begin_transition()
             .expect("transition starts after use completes");
         let blocked = health
-            .acquire_use(executor, 3)
+            .acquire_use(executor, 3, generation)
             .err()
             .expect("transition must block a new use");
         assert!(blocked.contains("atomic group transition"));
         transition.poison("incomplete logical expert group".to_string());
 
         let poisoned = health
-            .acquire_use(executor, 3)
+            .acquire_use(executor, 3, generation)
             .err()
             .expect("poison is irreversible");
         assert!(poisoned.contains(&format!("generation {generation}")));
@@ -7402,20 +7612,151 @@ mod tests {
         let owner = ExecutorInstanceId::fresh();
         let sibling = ExecutorInstanceId::fresh();
         let health = RouteReservationHealth::new_scoped(owner, 1);
+        let generation = health.generation().expect("scoped generation");
 
         let sibling_error = health
-            .acquire_use(sibling, 1)
+            .acquire_use(sibling, 1, generation)
             .err()
             .expect("sibling executor must not borrow owner's generation");
         assert!(sibling_error.contains(&format!("executor {}", owner.get())));
         assert!(sibling_error.contains(&format!("not executor {}", sibling.get())));
 
         let device_error = health
-            .acquire_use(owner, 2)
+            .acquire_use(owner, 2, generation)
             .err()
             .expect("wrong device must not borrow owner's generation");
         assert!(device_error.contains("CUDA:1"));
         assert!(device_error.contains("CUDA:2"));
+
+        let generation_error = health
+            .acquire_use(owner, 1, generation + 1)
+            .err()
+            .expect("stale generation must not borrow a replacement reservation");
+        assert!(generation_error.contains(&format!("generation {generation}")));
+        assert!(generation_error.contains(&format!("generation {}", generation + 1)));
+    }
+
+    #[test]
+    fn route_reservation_retirement_waits_for_holder_and_rejects_later_replay() {
+        let executor = ExecutorInstanceId::fresh();
+        let health = RouteReservationHealth::new_scoped(executor, 0);
+        let generation = health.generation().expect("scoped generation");
+        let holder = health
+            .acquire_use(executor, 0, generation)
+            .expect("pre-retirement holder");
+        let unmaps = Arc::new(AtomicU64::new(0));
+        let teardown_health = Arc::clone(&health);
+        let teardown_unmaps = Arc::clone(&unmaps);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let retirement = teardown_health
+                .begin_retirement()
+                .expect("one caller owns retirement");
+            assert_eq!(
+                teardown_unmaps.fetch_add(1, Ordering::SeqCst),
+                0,
+                "unmap executes exactly once after all holders release"
+            );
+            retirement.complete();
+        });
+        started_rx.recv().unwrap();
+
+        let rejection = loop {
+            match health.acquire_use(executor, 0, generation) {
+                Ok(probe) => {
+                    drop(probe);
+                    std::thread::yield_now();
+                }
+                Err(error) => break error,
+            }
+        };
+        assert!(rejection.contains("retiring"));
+        assert_eq!(
+            unmaps.load(Ordering::SeqCst),
+            0,
+            "teardown must not unmap while the original use lease is active"
+        );
+
+        let replay_launches = AtomicU64::new(0);
+        if health.acquire_use(executor, 0, generation).is_ok() {
+            replay_launches.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(
+            replay_launches.load(Ordering::SeqCst),
+            0,
+            "a replay racing retirement must not reach its launch"
+        );
+
+        drop(holder);
+        teardown.join().unwrap();
+        assert_eq!(unmaps.load(Ordering::SeqCst), 1);
+        let retired = health
+            .acquire_use(executor, 0, generation)
+            .err()
+            .expect("completed teardown remains a requirement, but is retired");
+        assert!(retired.contains("retired"));
+    }
+
+    #[test]
+    fn route_reservation_acquire_racing_retirement_never_launches_after_unmap() {
+        for _ in 0..64 {
+            let executor = ExecutorInstanceId::fresh();
+            let health = RouteReservationHealth::new_scoped(executor, 0);
+            let generation = health.generation().expect("scoped generation");
+            let gate = Arc::new(std::sync::Barrier::new(3));
+            let launches = Arc::new(AtomicU64::new(0));
+            let unmaps = Arc::new(AtomicU64::new(0));
+
+            let use_health = Arc::clone(&health);
+            let use_gate = Arc::clone(&gate);
+            let use_launches = Arc::clone(&launches);
+            let use_unmaps = Arc::clone(&unmaps);
+            let acquire = std::thread::spawn(move || {
+                use_gate.wait();
+                match use_health.acquire_use(executor, 0, generation) {
+                    Ok(guard) => {
+                        assert_eq!(
+                            use_unmaps.load(Ordering::SeqCst),
+                            0,
+                            "a valid pre-retirement lease must launch before unmap"
+                        );
+                        use_launches.fetch_add(1, Ordering::SeqCst);
+                        drop(guard);
+                        true
+                    }
+                    Err(error) => {
+                        assert!(error.contains("retiring") || error.contains("retired"));
+                        false
+                    }
+                }
+            });
+
+            let retire_health = Arc::clone(&health);
+            let retire_gate = Arc::clone(&gate);
+            let retire_unmaps = Arc::clone(&unmaps);
+            let retire = std::thread::spawn(move || {
+                retire_gate.wait();
+                let retirement = retire_health
+                    .begin_retirement()
+                    .expect("one caller owns retirement");
+                assert_eq!(retire_unmaps.fetch_add(1, Ordering::SeqCst), 0);
+                retirement.complete();
+            });
+
+            gate.wait();
+            let acquired = acquire.join().unwrap();
+            retire.join().unwrap();
+            assert_eq!(unmaps.load(Ordering::SeqCst), 1);
+            assert_eq!(launches.load(Ordering::SeqCst), u64::from(acquired));
+            assert!(
+                health
+                    .acquire_use(executor, 0, generation)
+                    .err()
+                    .expect("completed retirement rejects acquisition")
+                    .contains("retired")
+            );
+        }
     }
 
     #[test]

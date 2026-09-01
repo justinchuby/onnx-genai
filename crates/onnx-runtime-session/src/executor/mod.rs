@@ -52,11 +52,12 @@ use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
     ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
-    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExternalMmapRegion, FinalizedExpertBank,
-    FinalizedExpertWeight, Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight,
-    LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata,
-    TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
-    WorkspaceRequirement, WorkspaceView, expert_weight_groups, lazy_weight_candidates,
+    ExecutorArtifactReadinessEpoch, ExecutorArtifactRequirement, ExecutorInstanceId,
+    ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight, Kernel, KernelConstantInput,
+    KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight,
+    StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle,
+    WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    expert_weight_groups, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -825,10 +826,6 @@ impl Drop for Executor {
                  dispatch_elided={dispatch_elided}"
             );
         }
-        // Drain only this executor's provider-owned artifacts before its
-        // buffers/kernels are torn down. Sibling/MTP executors may share the same
-        // EP and must retain their own producers and boundary state.
-        self.ep.drain_executor_artifacts(self.instance_id);
         // Evict the global weight-transpose cache to prevent address-reuse
         // staleness: if a subsequently loaded model's mmap recycles a virtual
         // address, the cache must not serve the old model's transposed weights.
@@ -891,6 +888,7 @@ impl Drop for Executor {
                 }
             }
             cap.device_graph_signature = None;
+            cap.provider_artifact_requirement = CapturedProviderArtifactRequirement::Uncaptured;
         }
         if graphs_reset && let Err(error) = self.ep.retire_owned_device_graphs(self.graph_owner) {
             safe_to_release = false;
@@ -899,6 +897,11 @@ impl Drop for Executor {
                 self.graph_owner.get()
             );
         }
+        // All executor work is synchronized and every baked graph is retired
+        // before reservation teardown begins. The provider's retirement
+        // authority still excludes concurrent external drain/use races, but
+        // ordinary Drop never waits on a lease owned by this executor itself.
+        self.ep.drain_executor_artifacts(self.instance_id);
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
             if safe_to_release {

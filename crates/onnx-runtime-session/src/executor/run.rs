@@ -59,7 +59,7 @@ impl Executor {
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
     ) -> Result<ScopedOutputs> {
-        match self.run_scoped_mode(inputs, outer_scope, external, RunMode::Eager, None)? {
+        match self.run_scoped_mode(inputs, outer_scope, external, RunMode::Eager, None, None)? {
             ScopedRunResult::Executed(outputs) => Ok(outputs),
             ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
         }
@@ -72,6 +72,7 @@ impl Executor {
         external: &ExternalBindings,
         mode: RunMode,
         validation_submission: Option<DeviceValidationSubmission>,
+        artifact_requirement: Option<CapturedProviderArtifactRequirement>,
     ) -> Result<ScopedRunResult> {
         // Distinguish the outermost (top-level graph) run from nested
         // control-flow subgraph runs so the phase profiler can attribute
@@ -122,9 +123,11 @@ impl Executor {
         // provider terminal outcome. Pending or failed finalization returns
         // before buffers are bound and before eager, capture, or replay work.
         self.ensure_provider_artifacts_ready(&resolved)?;
-        let artifact_use = self
-            .provider_artifact_readiness
-            .acquire_use(self.ep.as_ref(), self.instance_id)?;
+        let artifact_use = self.provider_artifact_readiness.acquire_use(
+            self.ep.as_ref(),
+            self.instance_id,
+            artifact_requirement.as_ref(),
+        )?;
         let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
         let measure_activation_plan = !nested
             && mode == RunMode::Eager

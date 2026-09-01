@@ -1,5 +1,13 @@
 use super::*;
 
+#[derive(Clone, Debug, Default)]
+pub(super) enum CapturedProviderArtifactRequirement {
+    #[default]
+    Uncaptured,
+    NeverInstalled,
+    Required(ExecutorArtifactRequirement),
+}
+
 /// Host-side captured-graph bookkeeping for ONE [`DeviceGraphSlot`]. The
 /// executor holds one of these per slot (see [`Executor::slot_capture`]) so the
 /// M=1 `Primary` decode graph and the M=k+1 `Verify` speculative-verify graph
@@ -14,6 +22,8 @@ use super::*;
 pub(crate) struct SlotCaptureState {
     /// Exact provider installation token for this executor/slot.
     pub(super) device_graph_token: Option<DeviceGraphToken>,
+    /// Exact provider-artifact requirement captured with this graph.
+    pub(super) provider_artifact_requirement: CapturedProviderArtifactRequirement,
     /// Binding signature (I/O name + dtype + physical shape + device ptr) the
     /// installed graph for this slot was captured under; a replay whose bindings
     /// differ retires the graph. `None` when no device graph is installed.
@@ -67,7 +77,9 @@ enum ProviderArtifactOutcome {
     Unfinalized,
     Pending(ExecutorArtifactPending),
     Failed(String),
-    Complete,
+    Complete {
+        requirement: Option<ExecutorArtifactRequirement>,
+    },
 }
 
 /// The executor's sole authority for whether provider-owned artifacts may be
@@ -111,7 +123,14 @@ impl ProviderArtifactReadiness {
         if self.needs_finalization() {
             match ep.finalize_executor_artifacts(executor, graph, self.epoch, finalized_banks) {
                 Ok(ExecutorArtifactFinalization::Complete) => {
-                    self.outcome = ProviderArtifactOutcome::Complete;
+                    match ep.executor_artifact_requirement(executor) {
+                        Ok(requirement) => {
+                            self.outcome = ProviderArtifactOutcome::Complete { requirement };
+                        }
+                        Err(error) => {
+                            self.outcome = ProviderArtifactOutcome::Failed(error.to_string());
+                        }
+                    }
                 }
                 Ok(ExecutorArtifactFinalization::Pending(pending)) => {
                     self.outcome = ProviderArtifactOutcome::Pending(pending);
@@ -133,10 +152,41 @@ impl ProviderArtifactReadiness {
         &self,
         ep: &dyn ExecutionProvider,
         executor: ExecutorInstanceId,
+        exact_requirement: Option<&CapturedProviderArtifactRequirement>,
     ) -> Result<Option<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>>> {
         self.require_complete(ep.name(), executor)?;
-        ep.acquire_executor_artifact_use(executor)
+        let current = match &self.outcome {
+            ProviderArtifactOutcome::Complete { requirement } => requirement.as_ref(),
+            _ => None,
+        };
+        let requirement = match exact_requirement {
+            None => current,
+            Some(CapturedProviderArtifactRequirement::NeverInstalled) => None,
+            Some(CapturedProviderArtifactRequirement::Required(requirement)) => Some(requirement),
+            Some(CapturedProviderArtifactRequirement::Uncaptured) => {
+                return Err(SessionError::Internal(
+                    "device graph has no captured provider-artifact requirement".into(),
+                ));
+            }
+        };
+        requirement
+            .map(ExecutorArtifactRequirement::acquire_use)
+            .transpose()
             .map_err(Into::into)
+    }
+
+    pub(super) fn requirement(&self) -> Option<&ExecutorArtifactRequirement> {
+        match &self.outcome {
+            ProviderArtifactOutcome::Complete { requirement } => requirement.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(super) fn captured_requirement(&self) -> CapturedProviderArtifactRequirement {
+        match self.requirement() {
+            Some(requirement) => CapturedProviderArtifactRequirement::Required(requirement.clone()),
+            None => CapturedProviderArtifactRequirement::NeverInstalled,
+        }
     }
 
     pub(super) fn require_complete(
@@ -145,7 +195,7 @@ impl ProviderArtifactReadiness {
         executor: ExecutorInstanceId,
     ) -> Result<()> {
         match &self.outcome {
-            ProviderArtifactOutcome::Complete => Ok(()),
+            ProviderArtifactOutcome::Complete { .. } => Ok(()),
             ProviderArtifactOutcome::Unfinalized => {
                 Err(SessionError::ExecutionProviderArtifactsPending {
                     provider: provider.to_string(),

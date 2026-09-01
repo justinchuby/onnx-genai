@@ -197,6 +197,7 @@ fn real_producer_installs_executor_scoped_banks_once() {
     let Some(provider) = provider_or_skip("install") else {
         return;
     };
+    let provider = Arc::new(provider);
     let (graph, node, bank) = qmoe_graph_and_bank(11);
     let first = ExecutorInstanceId::fresh();
     let second = ExecutorInstanceId::fresh();
@@ -272,6 +273,10 @@ fn real_producer_installs_executor_scoped_banks_once() {
             .all(|first| !second_ranges.contains(first)),
         "sibling executors own distinct stable addresses"
     );
+    let first_requirement = provider
+        .executor_artifact_requirement(first)
+        .expect("query first executor requirement")
+        .expect("installed reservations publish an exact requirement");
 
     let _specialization = provider
         .get_kernel_for_executor(first, graph.node(node), &[vec![2, 4]], 1)
@@ -294,7 +299,39 @@ fn real_producer_installs_executor_scoped_banks_once() {
         1
     );
 
-    provider.drain_executor_artifacts(first);
+    let holder = first_requirement
+        .acquire_use()
+        .expect("acquire pre-retirement use lease");
+    let drain_provider = Arc::clone(&provider);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let drain = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        drain_provider.drain_executor_artifacts(first);
+    });
+    started_rx.recv().unwrap();
+    let replay_rejection = loop {
+        match first_requirement.acquire_use() {
+            Ok(probe) => {
+                drop(probe);
+                std::thread::yield_now();
+            }
+            Err(error) => break error,
+        }
+    };
+    assert!(replay_rejection.to_string().contains("retiring"));
+    assert_eq!(
+        provider.residency().unwrap().route_reservation_count(),
+        2,
+        "teardown must not remove the first executor's reservation while its holder is active"
+    );
+    assert_eq!(
+        provider
+            .route_residency_executor_status(first)
+            .reservation_removals,
+        0
+    );
+    drop(holder);
+    drain.join().unwrap();
     provider.drain_executor_artifacts(first);
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
     assert!(provider.route_residency_scopes().contains(&second));
@@ -302,6 +339,17 @@ fn real_producer_installs_executor_scoped_banks_once() {
         provider.route_residency_executor_status(first).drain_calls,
         1
     );
+    assert_eq!(
+        provider
+            .route_residency_executor_status(first)
+            .reservation_removals,
+        1
+    );
+    let retired = first_requirement
+        .acquire_use()
+        .err()
+        .expect("requirement survives registry removal as retired");
+    assert!(retired.to_string().contains("retired"));
     provider.drain_executor_artifacts(second);
 }
 
@@ -394,6 +442,13 @@ fn default_off_retains_allocates_and_registers_nothing() {
     assert_eq!(provider.route_residency_diagnostics().declines(), 0);
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
     assert!(provider.route_residency_scopes().is_empty());
+    assert!(
+        provider
+            .executor_artifact_requirement(executor)
+            .expect("query default-off requirement")
+            .is_none(),
+        "NeverInstalled is the only state represented by no requirement"
+    );
     provider.drain_executor_artifacts(executor);
 }
 

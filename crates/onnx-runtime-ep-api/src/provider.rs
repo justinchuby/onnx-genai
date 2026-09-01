@@ -278,6 +278,44 @@ pub struct DeviceValidationRegistration {
 /// transitions. Providers without mutable artifact state return `None`.
 pub trait ExecutorArtifactUseGuard: Send + Sync {}
 
+/// Stable proof that an executor requires one exact provider-owned artifact.
+///
+/// The requirement is captured when provider finalization completes and remains
+/// valid even after the provider's live registry entry begins retirement. A
+/// launch acquires through this value rather than rediscovering requirements
+/// from mutable registry presence, so "missing after teardown" cannot become
+/// "no artifact required."
+#[derive(Clone)]
+pub struct ExecutorArtifactRequirement {
+    state: Arc<dyn ExecutorArtifactRequirementState>,
+}
+
+impl ExecutorArtifactRequirement {
+    pub fn new<T>(state: Arc<T>) -> Self
+    where
+        T: ExecutorArtifactRequirementState + 'static,
+    {
+        Self { state }
+    }
+
+    pub fn acquire_use(&self) -> Result<Box<dyn ExecutorArtifactUseGuard>> {
+        self.state.acquire_use()
+    }
+}
+
+impl std::fmt::Debug for ExecutorArtifactRequirement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutorArtifactRequirement")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Provider-specific state behind an [`ExecutorArtifactRequirement`].
+pub trait ExecutorArtifactRequirementState: Send + Sync {
+    fn acquire_use(&self) -> Result<Box<dyn ExecutorArtifactUseGuard>>;
+}
+
 impl DeviceValidationRegistration {
     /// Construct a registration carrying provider-specific state.
     pub fn new<T>(owner: DeviceValidationOwner, state: T) -> Self
@@ -1940,17 +1978,16 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(ExecutorArtifactFinalization::Complete)
     }
 
-    /// Acquire permission to use already-finalized artifacts.
+    /// Capture the exact requirement installed by artifact finalization.
     ///
-    /// The executor holds the returned lease across eager execution, capture,
-    /// or replay and drops it only after the launched work reaches its
-    /// completion boundary. Providers with mutable reservation-backed state
-    /// must linearize this acquisition against every transition of that state
-    /// and fail closed when the exact executor-owned artifact is poisoned.
-    fn acquire_executor_artifact_use(
+    /// The executor retains this value for ordinary execution and also copies it
+    /// into every baked graph slot. Providers must return the same terminal
+    /// requirement while an installed artifact is active, retiring, or retired;
+    /// returning `None` is reserved for executors that never installed one.
+    fn executor_artifact_requirement(
         &self,
         _executor: ExecutorInstanceId,
-    ) -> Result<Option<Box<dyn ExecutorArtifactUseGuard>>> {
+    ) -> Result<Option<ExecutorArtifactRequirement>> {
         Ok(None)
     }
 
