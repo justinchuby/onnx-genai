@@ -2588,7 +2588,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         let Some(residency) = self.residency.as_ref() else {
             return Ok(None);
         };
-        let guard = residency.acquire_routed_residency(requirement, catalog);
+        let guard = residency.acquire_routed_residency(requirement, catalog)?;
         Ok(Some(Box::new(guard)
             as Box<
                 dyn onnx_runtime_ep_api::RoutedResidencyGuardHandle,

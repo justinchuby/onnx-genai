@@ -49,6 +49,64 @@ pub struct CudaTransferCounts {
     pub async_host_to_device: u64,
 }
 
+/// Counts calls to CUDA's indexed batch-copy entry point.
+///
+/// `submissions` advances immediately after `cuMemcpyBatchAsync[_v2]` accepts
+/// the descriptor array, while `entries` is the number of individual copies
+/// carried by those accepted submissions. These counters bracket driver
+/// submissions, not DMA completion or payload bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaBatchCopyCounts {
+    pub submissions: u64,
+    pub entries: u64,
+}
+
+/// One source/destination range in an indexed CUDA batch copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaBatchCopy {
+    pub src: CUdeviceptr,
+    pub dst: CUdeviceptr,
+    pub bytes: usize,
+}
+
+/// Host-side proof that every CUDA graph replay submitted before `generation`
+/// has completed on this runtime's compute stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplayCompletionWitness {
+    runtime_id: u64,
+    generation: u64,
+    completed_replay_epoch: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReplayBoundaryState {
+    generation: u64,
+    submitted_replay_epoch: u64,
+    completed_replay_epoch: u64,
+    coarse_mutation_active: bool,
+}
+
+/// Exclusive runtime-side half of a PMM/VMM coarse mutation.
+///
+/// While this guard is alive no capture or graph replay can begin. The
+/// residency authority owns the other half: admissions, deferred releases,
+/// and routed-residency guards.
+pub(crate) struct CudaCoarseMutationGuard<'a> {
+    runtime: &'a CudaRuntime,
+}
+
+impl Drop for CudaCoarseMutationGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .runtime
+            .replay_boundary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.coarse_mutation_active = false;
+        state.generation = state.generation.wrapping_add(1);
+    }
+}
+
 const VALIDATION_PHASE_BITS: u32 = 3;
 const VALIDATION_PHASE_MASK: u64 = (1 << VALIDATION_PHASE_BITS) - 1;
 const VALIDATION_MAX_GENERATION: u64 = u64::MAX >> VALIDATION_PHASE_BITS;
@@ -760,6 +818,15 @@ pub struct CudaRuntime {
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
     async_host_to_device_copies: AtomicU64,
+    batch_copy_submissions: AtomicU64,
+    batch_copy_entries: AtomicU64,
+    /// Single authority for capture/replay versus PMM/VMM coarse mutations.
+    ///
+    /// `submitted_replay_epoch != completed_replay_epoch` is not a guessed
+    /// boolean: it means a graph launch occurred after the last host-proven
+    /// compute-stream completion. Only `complete_replay_boundary` advances the
+    /// completed epoch, and only after synchronizing that stream.
+    replay_boundary: Mutex<ReplayBoundaryState>,
     forced_synchronizations: AtomicU64,
     /// Completion events recorded on a transfer/compute stream, keyed by an
     /// opaque fence id handed out to the executor inside an
@@ -1023,6 +1090,9 @@ impl CudaRuntime {
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
             async_host_to_device_copies: AtomicU64::new(0),
+            batch_copy_submissions: AtomicU64::new(0),
+            batch_copy_entries: AtomicU64::new(0),
+            replay_boundary: Mutex::new(ReplayBoundaryState::default()),
             forced_synchronizations: AtomicU64::new(0),
             fences: Mutex::new(HashMap::new()),
             next_fence_id: AtomicU64::new(1),
@@ -1120,6 +1190,137 @@ impl CudaRuntime {
         &self.copy_stream
     }
 
+    fn begin_graph_capture_with<T>(&self, begin: impl FnOnce() -> Result<T>) -> Result<T> {
+        let mut boundary = self
+            .replay_boundary
+            .lock()
+            .map_err(|_| EpError::KernelFailed("cuda replay-boundary lock poisoned".into()))?;
+        if boundary.coarse_mutation_active {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: cannot begin CUDA graph capture while a PMM/VMM coarse mutation is active"
+                    .into(),
+            ));
+        }
+        boundary.generation = boundary.generation.wrapping_add(1);
+        begin()
+    }
+
+    fn replay_with_boundary<T>(&self, replay: impl FnOnce() -> Result<T>) -> Result<T> {
+        let mut boundary = self
+            .replay_boundary
+            .lock()
+            .map_err(|_| EpError::KernelFailed("cuda replay-boundary lock poisoned".into()))?;
+        if boundary.coarse_mutation_active {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: cannot replay a CUDA graph while a PMM/VMM coarse mutation is active"
+                    .into(),
+            ));
+        }
+        boundary.generation = boundary.generation.wrapping_add(1);
+        boundary.submitted_replay_epoch = boundary.submitted_replay_epoch.wrapping_add(1);
+        // Keep the submitted epoch advanced even on error. A multi-segment
+        // replay may have launched a prefix before a later launch failed, so
+        // only a compute-stream completion can safely clear this state.
+        replay()
+    }
+
+    /// Return a completion witness only when no graph replay has been launched
+    /// since the last host-established compute-stream completion.
+    pub(crate) fn try_replay_completion_witness(&self) -> Result<ReplayCompletionWitness> {
+        let boundary = self
+            .replay_boundary
+            .lock()
+            .map_err(|_| EpError::KernelFailed("cuda replay-boundary lock poisoned".into()))?;
+        if self.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: CUDA graph capture is active; no coarse-boundary witness can be issued"
+                    .into(),
+            ));
+        }
+        if boundary.submitted_replay_epoch != boundary.completed_replay_epoch {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: CUDA graph replay completion is not established; complete the replay \
+                 boundary before a PMM/VMM page-in"
+                    .into(),
+            ));
+        }
+        Ok(ReplayCompletionWitness {
+            runtime_id: self.runtime_id,
+            generation: boundary.generation,
+            completed_replay_epoch: boundary.completed_replay_epoch,
+        })
+    }
+
+    /// Host-establish completion of every graph replay submitted so far and
+    /// mint the witness required by a subsequent PMM/VMM coarse mutation.
+    pub(crate) fn complete_replay_boundary(&self) -> Result<ReplayCompletionWitness> {
+        let mut boundary = self
+            .replay_boundary
+            .lock()
+            .map_err(|_| EpError::KernelFailed("cuda replay-boundary lock poisoned".into()))?;
+        if boundary.coarse_mutation_active {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: cannot complete a replay boundary while a PMM/VMM coarse mutation is active"
+                    .into(),
+            ));
+        }
+        if self.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: CUDA graph capture is active; replay completion cannot be established"
+                    .into(),
+            ));
+        }
+        if boundary.submitted_replay_epoch != boundary.completed_replay_epoch {
+            self.force_synchronize()?;
+            boundary.completed_replay_epoch = boundary.submitted_replay_epoch;
+            boundary.generation = boundary.generation.wrapping_add(1);
+        }
+        Ok(ReplayCompletionWitness {
+            runtime_id: self.runtime_id,
+            generation: boundary.generation,
+            completed_replay_epoch: boundary.completed_replay_epoch,
+        })
+    }
+
+    pub(crate) fn begin_coarse_mutation(
+        &self,
+        witness: &ReplayCompletionWitness,
+    ) -> Result<CudaCoarseMutationGuard<'_>> {
+        let mut boundary = self
+            .replay_boundary
+            .lock()
+            .map_err(|_| EpError::KernelFailed("cuda replay-boundary lock poisoned".into()))?;
+        if witness.runtime_id != self.runtime_id
+            || witness.generation != boundary.generation
+            || witness.completed_replay_epoch != boundary.completed_replay_epoch
+            || boundary.submitted_replay_epoch != boundary.completed_replay_epoch
+        {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: stale replay-completion witness; graph activity changed before page-in \
+                 submission"
+                    .into(),
+            ));
+        }
+        if boundary.coarse_mutation_active || self.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: replay/capture boundary is not available for a PMM/VMM coarse mutation"
+                    .into(),
+            ));
+        }
+        boundary.coarse_mutation_active = true;
+        boundary.generation = boundary.generation.wrapping_add(1);
+        Ok(CudaCoarseMutationGuard { runtime: self })
+    }
+
+    pub(crate) fn graph_work_in_flight(&self) -> bool {
+        let boundary = self
+            .replay_boundary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        boundary.submitted_replay_epoch != boundary.completed_replay_epoch
+            || self.is_capturing().unwrap_or(true)
+    }
+
     /// Begin capture on the EP stream after auditing the complete kernel sequence.
     pub fn begin_graph_capture(&self, kernels: &[&dyn Kernel]) -> Result<()> {
         self.begin_graph_capture_with_resources(kernels, Vec::new())
@@ -1137,7 +1338,9 @@ impl CudaRuntime {
                 .iter()
                 .flat_map(|kernel| kernel.device_graph_resources()),
         );
-        self.begin_graph_capture_resources_in(DeviceGraphSlot::Primary, resources)
+        self.begin_graph_capture_with(|| {
+            self.begin_graph_capture_resources_in(DeviceGraphSlot::Primary, resources)
+        })
     }
 
     /// End stream capture and install the instantiated graph executable.
@@ -1157,12 +1360,12 @@ impl CudaRuntime {
     /// Replays every installed segment in capture order (one graph for a
     /// whole-subgraph capture).
     pub fn replay_graph(&self) -> Result<()> {
-        self.graph.replay_current()
+        self.replay_with_boundary(|| self.graph.replay_current())
     }
 
     /// Launch one installed segment by its zero-based capture-order index.
     pub fn replay_graph_segment(&self, index: usize) -> Result<()> {
-        self.graph.replay_current_segment(index)
+        self.replay_with_boundary(|| self.graph.replay_current_segment(index))
     }
 
     /// Number of installed captured segments (1 for a whole-subgraph capture).
@@ -1862,7 +2065,7 @@ impl CudaRuntime {
             .iter()
             .flat_map(|kernel| kernel.device_graph_resources())
             .collect();
-        self.begin_graph_capture_resources_in(slot, resources)
+        self.begin_graph_capture_with(|| self.begin_graph_capture_resources_in(slot, resources))
     }
 
     /// Slot-aware capture with additional immutable address owners.
@@ -1878,7 +2081,7 @@ impl CudaRuntime {
                 .iter()
                 .flat_map(|kernel| kernel.device_graph_resources()),
         );
-        self.begin_graph_capture_resources_in(slot, resources)
+        self.begin_graph_capture_with(|| self.begin_graph_capture_resources_in(slot, resources))
     }
 
     fn begin_graph_capture_resources_in(
@@ -1932,12 +2135,12 @@ impl CudaRuntime {
 
     /// Slot-aware [`replay_graph`](Self::replay_graph).
     pub fn replay_graph_in(&self, slot: DeviceGraphSlot) -> Result<()> {
-        self.graph_slot(slot).replay_current()
+        self.replay_with_boundary(|| self.graph_slot(slot).replay_current())
     }
 
     /// Slot-aware [`replay_graph_segment`](Self::replay_graph_segment).
     pub fn replay_graph_segment_in(&self, slot: DeviceGraphSlot, index: usize) -> Result<()> {
-        self.graph_slot(slot).replay_current_segment(index)
+        self.replay_with_boundary(|| self.graph_slot(slot).replay_current_segment(index))
     }
 
     /// Slot-aware [`graph_segment_count`](Self::graph_segment_count).
@@ -1997,45 +2200,47 @@ impl CudaRuntime {
         kernels: &[&dyn Kernel],
     ) -> Result<DeviceGraphToken> {
         crate::capture::require_subgraph_graph_capturable(kernels)?;
-        let mut resources: Vec<DeviceGraphResource> = kernels
-            .iter()
-            .flat_map(|kernel| kernel.device_graph_resources())
-            .collect();
-        resources.sort_unstable_by_key(DeviceGraphResource::identity);
-        resources.dedup_by_key(|resource| resource.identity());
-        let resource_ids = Arc::new(
-            resources
+        self.begin_graph_capture_with(|| {
+            let mut resources: Vec<DeviceGraphResource> = kernels
                 .iter()
-                .map(DeviceGraphResource::identity)
-                .collect(),
-        );
-        self.registered_capture_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                EpError::KernelFailed(
-                    "cuda_ep: cannot begin CUDA graph capture while another registered capture \
-                     is active on the runtime stream"
-                        .into(),
-                )
-            })?;
-        let graph = match self.owned_graph_for_begin(owner, slot, continuation) {
-            Ok(graph) => graph,
-            Err(error) => {
-                self.registered_capture_active
-                    .store(false, Ordering::Release);
-                return Err(error);
-            }
-        };
-        let token = match graph.begin(continuation, resources) {
-            Ok(token) => token,
-            Err(error) => {
-                self.registered_capture_active
-                    .store(false, Ordering::Release);
-                return Err(error);
-            }
-        };
-        self.active_capture_resource_ids.store(Some(resource_ids));
-        Ok(token)
+                .flat_map(|kernel| kernel.device_graph_resources())
+                .collect();
+            resources.sort_unstable_by_key(DeviceGraphResource::identity);
+            resources.dedup_by_key(|resource| resource.identity());
+            let resource_ids = Arc::new(
+                resources
+                    .iter()
+                    .map(DeviceGraphResource::identity)
+                    .collect(),
+            );
+            self.registered_capture_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep: cannot begin CUDA graph capture while another registered capture \
+                         is active on the runtime stream"
+                            .into(),
+                    )
+                })?;
+            let graph = match self.owned_graph_for_begin(owner, slot, continuation) {
+                Ok(graph) => graph,
+                Err(error) => {
+                    self.registered_capture_active
+                        .store(false, Ordering::Release);
+                    return Err(error);
+                }
+            };
+            let token = match graph.begin(continuation, resources) {
+                Ok(token) => token,
+                Err(error) => {
+                    self.registered_capture_active
+                        .store(false, Ordering::Release);
+                    return Err(error);
+                }
+            };
+            self.active_capture_resource_ids.store(Some(resource_ids));
+            Ok(token)
+        })
     }
 
     pub(crate) fn end_owned_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
@@ -2065,13 +2270,15 @@ impl CudaRuntime {
     }
 
     pub(crate) fn replay_owned_graph(&self, token: DeviceGraphToken) -> Result<()> {
-        self.owned_graph(token.owner(), token.slot())
-            .ok_or_else(|| {
-                EpError::KernelFailed(
-                    "cuda_ep: cannot replay a retired executor-owned CUDA graph".into(),
-                )
-            })?
-            .replay(token)
+        self.replay_with_boundary(|| {
+            self.owned_graph(token.owner(), token.slot())
+                .ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep: cannot replay a retired executor-owned CUDA graph".into(),
+                    )
+                })?
+                .replay(token)
+        })
     }
 
     pub(crate) fn replay_owned_graph_segment(
@@ -2079,13 +2286,15 @@ impl CudaRuntime {
         token: DeviceGraphToken,
         index: usize,
     ) -> Result<()> {
-        self.owned_graph(token.owner(), token.slot())
-            .ok_or_else(|| {
-                EpError::KernelFailed(
-                    "cuda_ep: cannot replay a retired executor-owned CUDA graph".into(),
-                )
-            })?
-            .replay_segment(token, index)
+        self.replay_with_boundary(|| {
+            self.owned_graph(token.owner(), token.slot())
+                .ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep: cannot replay a retired executor-owned CUDA graph".into(),
+                    )
+                })?
+                .replay_segment(token, index)
+        })
     }
 
     pub(crate) fn reset_owned_graph(&self, token: DeviceGraphToken) -> Result<bool> {
@@ -2183,6 +2392,14 @@ impl CudaRuntime {
             host_to_device: self.host_to_device_copies.load(Ordering::Relaxed),
             device_to_host: self.device_to_host_copies.load(Ordering::Relaxed),
             async_host_to_device: self.async_host_to_device_copies.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Snapshot accepted CUDA indexed batch-copy submissions.
+    pub fn batch_copy_counts(&self) -> CudaBatchCopyCounts {
+        CudaBatchCopyCounts {
+            submissions: self.batch_copy_submissions.load(Ordering::Relaxed),
+            entries: self.batch_copy_entries.load(Ordering::Relaxed),
         }
     }
 
@@ -3255,6 +3472,169 @@ impl CudaRuntime {
         self.async_host_to_device_copies
             .fetch_add(1, Ordering::Relaxed);
         Ok((elapsed_ms, CopyCompleted::new()))
+    }
+
+    /// Submit an indexed multi-range copy as one CUDA batch and wait for its
+    /// completion with transfer-stream events.
+    ///
+    /// The span is: record start, call `cuMemcpyBatchAsync[_v2]` once, record
+    /// end, host-synchronize end, and read elapsed time. The submission counter
+    /// advances immediately after the driver accepts the descriptor array;
+    /// callers must account payload bytes only after this method returns
+    /// `Ok`, when [`CopyCompleted`] proves every source read has retired.
+    ///
+    /// Source pointers may name registered host memory in CUDA's unified
+    /// address space; that remains a physical page-in copy, not zero-copy
+    /// execution. Destination ranges must be disjoint because CUDA does not
+    /// promise an execution order among batch entries.
+    ///
+    /// # Safety
+    /// Every source and destination must cover `bytes`, remain live until this
+    /// method returns, and belong to the bound CUDA context's unified address
+    /// space. Destination ranges must not overlap.
+    pub(crate) unsafe fn indexed_batch_copy_elapsed_ms(
+        &self,
+        copies: &[CudaBatchCopy],
+    ) -> std::result::Result<(f32, CopyCompleted), HtodAsyncElapsedError> {
+        self.bind().map_err(|error| HtodAsyncElapsedError {
+            detail: error.to_string(),
+            completion: FailedHtodCompletion::NotSubmitted,
+        })?;
+        if self.graph_work_in_flight() {
+            return Err(HtodAsyncElapsedError {
+                detail: "cuda_ep: indexed expert page-in is a coarse-boundary operation and is \
+                         illegal without established CUDA graph capture/replay completion"
+                    .into(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            });
+        }
+        if copies.is_empty() {
+            return Ok((0.0, CopyCompleted::new()));
+        }
+        if copies.iter().any(|copy| copy.bytes == 0) {
+            return Err(HtodAsyncElapsedError {
+                detail: "cuda_ep: indexed batch copy contains an empty entry".into(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            });
+        }
+
+        #[cfg(feature = "cuda-12060")]
+        {
+            let _ = copies;
+            return Err(HtodAsyncElapsedError {
+                detail: "cuda_ep: indexed batch copy requires CUDA API 12.8 or newer".into(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            });
+        }
+
+        #[cfg(any(feature = "cuda-12080", feature = "cuda-12090", feature = "cuda-13000"))]
+        {
+            let start = self
+                .context
+                .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|error| HtodAsyncElapsedError {
+                    detail: driver_err("cuEventCreate(batch start)", error).to_string(),
+                    completion: FailedHtodCompletion::NotSubmitted,
+                })?;
+            let end = self
+                .context
+                .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|error| HtodAsyncElapsedError {
+                    detail: driver_err("cuEventCreate(batch end)", error).to_string(),
+                    completion: FailedHtodCompletion::NotSubmitted,
+                })?;
+            start
+                .record(&self.copy_stream)
+                .map_err(|error| HtodAsyncElapsedError {
+                    detail: driver_err("cuEventRecord(batch start)", error).to_string(),
+                    completion: FailedHtodCompletion::NotSubmitted,
+                })?;
+
+            let mut srcs: Vec<CUdeviceptr> = copies.iter().map(|copy| copy.src).collect();
+            let mut dsts: Vec<CUdeviceptr> = copies.iter().map(|copy| copy.dst).collect();
+            let mut sizes: Vec<usize> = copies.iter().map(|copy| copy.bytes).collect();
+            let invalid_location = cudarc::driver::sys::CUmemLocation {
+                type_: cudarc::driver::sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_INVALID,
+                id: 0,
+            };
+            let mut attributes = [cudarc::driver::sys::CUmemcpyAttributes {
+                srcAccessOrder: cudarc::driver::sys::CUmemcpySrcAccessOrder_enum::
+                    CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+                srcLocHint: invalid_location,
+                dstLocHint: invalid_location,
+                flags: cudarc::driver::sys::CUmemcpyFlags_enum::CU_MEMCPY_FLAG_DEFAULT as u32,
+            }];
+            let mut attribute_indices = [0usize];
+            #[cfg(any(feature = "cuda-12080", feature = "cuda-12090"))]
+            let result = {
+                let mut fail_index = usize::MAX;
+                // SAFETY: arrays have `copies.len()` entries and remain live
+                // through the driver call; no optional attributes are supplied.
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyBatchAsync(
+                        dsts.as_mut_ptr(),
+                        srcs.as_mut_ptr(),
+                        sizes.as_mut_ptr(),
+                        copies.len(),
+                        attributes.as_mut_ptr(),
+                        attribute_indices.as_mut_ptr(),
+                        attributes.len(),
+                        &mut fail_index,
+                        self.copy_stream.cu_stream(),
+                    )
+                }
+                .result()
+                .map_err(|error| {
+                    driver_err(
+                        &format!("cuMemcpyBatchAsync (failed descriptor index {fail_index})"),
+                        error,
+                    )
+                })
+            };
+            #[cfg(feature = "cuda-13000")]
+            let result = {
+                // SAFETY: arrays have `copies.len()` entries and remain live
+                // through the driver call; no optional attributes are supplied.
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyBatchAsync_v2(
+                        dsts.as_mut_ptr(),
+                        srcs.as_mut_ptr(),
+                        sizes.as_mut_ptr(),
+                        copies.len(),
+                        attributes.as_mut_ptr(),
+                        attribute_indices.as_mut_ptr(),
+                        attributes.len(),
+                        self.copy_stream.cu_stream(),
+                    )
+                }
+                .result()
+                .map_err(|error| driver_err("cuMemcpyBatchAsync_v2", error))
+            };
+            if let Err(error) = result {
+                // CUDA's batch API may execute a prefix before reporting the
+                // failing descriptor. Once the driver call has happened,
+                // NotSubmitted is no longer a sound classification.
+                return Err(self.settle_submitted_htod_failure(error));
+            }
+            self.batch_copy_submissions.fetch_add(1, Ordering::Relaxed);
+            self.batch_copy_entries
+                .fetch_add(copies.len() as u64, Ordering::Relaxed);
+
+            if let Err(error) = end.record(&self.copy_stream) {
+                return Err(self
+                    .settle_submitted_htod_failure(driver_err("cuEventRecord(batch end)", error)));
+            }
+            let elapsed_ms = match start.elapsed_ms(&end) {
+                Ok(elapsed_ms) => elapsed_ms,
+                Err(error) => {
+                    return Err(self.settle_submitted_htod_failure(driver_err(
+                        "cuEventElapsedTime(batch copy)",
+                        error,
+                    )));
+                }
+            };
+            Ok((elapsed_ms, CopyCompleted::new()))
+        }
     }
 
     fn settle_submitted_htod_failure(&self, error: EpError) -> HtodAsyncElapsedError {

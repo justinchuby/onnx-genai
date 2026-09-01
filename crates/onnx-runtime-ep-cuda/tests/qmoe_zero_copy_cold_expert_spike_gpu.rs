@@ -1316,10 +1316,12 @@ fn resize_starvation_stress(iterations: usize) {
         // QMoE launch, hold it for the (simulated) duration of the launch,
         // then release -- back to back, no gaps, the worst case for
         // starving a concurrent resize attempt.
-        let guard = residency.acquire_routed_residency(
-            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
-            &catalog,
-        );
+        let guard = residency
+            .acquire_routed_residency(
+                onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+                &catalog,
+            )
+            .unwrap();
 
         let point = residency.resize_safe_point(1);
         max_concurrent_guards_observed =

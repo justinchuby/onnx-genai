@@ -362,6 +362,10 @@ struct Counters {
 /// the worker, every enqueued action's pins, and the provider all keep it — and
 /// therefore the context and streams — alive until the last request reaches a
 /// terminal state.
+pub(crate) struct DeferredReleaseBoundaryGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
 pub struct CudaDeferredReleaseQueue {
     me: Weak<Self>,
     fences: Box<dyn ReleaseFenceSource>,
@@ -374,6 +378,11 @@ pub struct CudaDeferredReleaseQueue {
     /// release/query. Device-loss marking takes this gate before publishing the
     /// lost state, so no new driver call can begin after loss is observed.
     execution_gate: ExecutionGate,
+    /// Serializes enqueue against an authority-issued coarse mutation. A
+    /// boundary guard is granted only while `outstanding == 0`; holding it
+    /// prevents a new release from appearing between safe-point revalidation
+    /// and the mutation's terminal completion.
+    boundary_gate: Mutex<()>,
     state: Mutex<QueueState>,
     /// Signalled on enqueue, close, and device loss so the worker wakes without
     /// busy-waiting. The worker always waits with a timeout, so a missed
@@ -442,6 +451,7 @@ impl CudaDeferredReleaseQueue {
             poll_interval,
             autonomous,
             execution_gate: ExecutionGate::default(),
+            boundary_gate: Mutex::new(()),
             state: Mutex::new(QueueState::default()),
             wake: Condvar::new(),
             outstanding: AtomicUsize::new(0),
@@ -467,6 +477,19 @@ impl CudaDeferredReleaseQueue {
     /// Accepted requests that have not reached a terminal state.
     pub fn pending(&self) -> usize {
         self.outstanding.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn acquire_idle_boundary(
+        &self,
+    ) -> Result<DeferredReleaseBoundaryGuard<'_>, &'static str> {
+        let guard = self
+            .boundary_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.pending() != 0 {
+            return Err("deferred weight-page releases have not settled");
+        }
+        Ok(DeferredReleaseBoundaryGuard { _guard: guard })
     }
 
     pub fn is_closed(&self) -> bool {
@@ -785,6 +808,10 @@ impl CudaDeferredReleaseQueue {
         &self,
         action: A,
     ) -> Result<(), RefusedRelease<A>> {
+        let _boundary = self
+            .boundary_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(rejection) = self.refusal_reason() {
             self.counters
                 .enqueue_failures
@@ -1428,6 +1455,38 @@ mod tests {
         assert_eq!(queue.poll(), 1);
         assert_eq!(executed.load(Ordering::Acquire), 1);
         assert_eq!(queue.pending(), 0);
+    }
+
+    #[test]
+    fn idle_boundary_atomically_excludes_new_release_enqueues() {
+        let (queue, compute, copy) = manual_queue(8);
+        let boundary = queue.acquire_idle_boundary().expect("idle boundary");
+        assert!(
+            queue.boundary_gate.try_lock().is_err(),
+            "the issued boundary must own the exact gate enqueue uses"
+        );
+        drop(boundary);
+        drop(
+            queue
+                .boundary_gate
+                .try_lock()
+                .expect("released boundary gate"),
+        );
+
+        let executed = Arc::new(AtomicUsize::new(0));
+        queue
+            .enqueue(CountingAction {
+                executed: Arc::clone(&executed),
+            })
+            .expect("enqueue after boundary");
+        assert!(
+            queue.acquire_idle_boundary().is_err(),
+            "accepted release keeps the boundary closed"
+        );
+        compute.store(true, Ordering::Release);
+        copy.store(true, Ordering::Release);
+        assert_eq!(queue.poll(), 1);
+        assert_eq!(executed.load(Ordering::Acquire), 1);
     }
 
     #[test]
