@@ -136,6 +136,14 @@ fn cpu_prefill_and_16_decode_steps_advance_real_record_state() {
             && entry.dtype == DataType::Float32
             && entry.records == 0
     }));
+    let stats = session.compressed_state_path_stats();
+    assert_eq!(stats.transitions_validated, 17 * 6);
+    assert_eq!(stats.host_output_allocations, 17 * 6);
+    assert_eq!(
+        stats.host_output_bytes, 10_345_898,
+        "the root CPU path must report its exact host materialization cost rather than claiming \
+         device residency"
+    );
 }
 
 #[test]
@@ -313,6 +321,65 @@ fn unsupported_state_operations_are_typed_transactional_refusals() {
         .reset()
         .expect("reset to empty state remains supported");
     assert_eq!(session.current_len(), 0);
+}
+
+#[test]
+fn failed_step_retry_and_reset_do_not_reuse_stale_state() {
+    let dir = fixture_dir();
+    let prompt = [2, 7, 1, 8, 2, 8];
+    let mut session = build_cpu_session(&dir);
+    let mut fresh = build_cpu_session(&dir);
+    let before_logits = session.decode(&prompt, 0).unwrap();
+    assert_eq!(before_logits, fresh.decode(&prompt, 0).unwrap());
+    let before_len = session.current_len();
+    let before_state = session.compressed_record_state().unwrap();
+
+    let error = session
+        .decode(&[11], before_len - 1)
+        .expect_err("a stale caller cursor must fail before state mutation");
+    assert!(error.to_string().contains("past length mismatch"));
+    assert_eq!(session.current_len(), before_len);
+    assert_eq!(session.compressed_record_state().unwrap(), before_state);
+    assert_eq!(
+        session.decode(&[11], before_len).unwrap(),
+        fresh.decode(&[11], before_len).unwrap(),
+        "retry after a rejected step must match a clean session"
+    );
+
+    session.reset().unwrap();
+    let mut reset_oracle = build_cpu_session(&dir);
+    assert_eq!(
+        session.decode(&prompt, 0).unwrap(),
+        reset_oracle.decode(&prompt, 0).unwrap(),
+        "a new request after reset must not see the previous generation's records or carries"
+    );
+}
+
+#[cfg(feature = "native-cuda")]
+#[test]
+fn native_cuda_declines_compressed_state_before_provider_allocation() {
+    let dir = fixture_dir();
+    onnx_runtime_ep_cuda::vmm_allocator::reset_global_vmm_stats();
+    let error = match NativeDecodeSession::load_with_resolved_io(
+        dir.join("model.onnx.textproto"),
+        NativeDecodeDevice::Cuda { index: Some(0) },
+    ) {
+        Ok(_) => {
+            panic!("the root PR must leave CUDA record ownership to the stacked device loader")
+        }
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("native decode will not fall back the whole session to CPU"),
+        "typed CUDA decline must explain the no-fallback policy: {error:#}"
+    );
+    let stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
+    assert_eq!(stats.reserved_bytes, 0);
+    assert_eq!(stats.committed_bytes, 0);
+    assert_eq!(stats.allocations, 0);
+    assert_eq!(stats.commits, 0);
 }
 
 #[test]

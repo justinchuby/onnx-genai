@@ -223,7 +223,8 @@ impl NativeDecodeSession {
         // speculative-rollback commit path; a bare non-zero rewind of them is
         // refused earlier in the public `rewind`.
         skip_names.extend(self.csa_record_past_names());
-        for (name, tensor) in &mut self.past {
+        let mut rewound = Vec::new();
+        for (name, tensor) in &self.past {
             // Recurrent states are destructive rolling caches with no per-step
             // history to slice; leave them intact here. Greedy decode never
             // rewinds, and a speculative rewind commits them out-of-band via
@@ -238,8 +239,18 @@ impl NativeDecodeSession {
                 .len()
                 .checked_sub(2)
                 .with_context(|| format!("native KV tensor '{name}' rank is below 2"))?;
-            *tensor = prefix_slice(tensor, axis, target_len)
-                .with_context(|| format!("rewind native KV tensor '{name}'"))?;
+            rewound.push((
+                name.clone(),
+                prefix_slice(tensor, axis, target_len)
+                    .with_context(|| format!("rewind native KV tensor '{name}'"))?,
+            ));
+        }
+        for (name, tensor) in rewound {
+            let slot = self
+                .past
+                .get_mut(&name)
+                .with_context(|| format!("native KV tensor '{name}' disappeared during rewind"))?;
+            *slot = tensor;
         }
         self.current_len = target_len;
         Ok(())

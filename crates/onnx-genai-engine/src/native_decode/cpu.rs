@@ -508,6 +508,43 @@ impl NativeDecodeSession {
                         total_len,
                         1,
                     )?;
+                    self.compressed_state_stats.transitions_validated = self
+                        .compressed_state_stats
+                        .transitions_validated
+                        .saturating_add(1);
+                    self.compressed_state_stats.host_output_allocations = self
+                        .compressed_state_stats
+                        .host_output_allocations
+                        .saturating_add(1);
+                    self.compressed_state_stats.host_output_bytes = self
+                        .compressed_state_stats
+                        .host_output_bytes
+                        .saturating_add(u64::try_from(tensor.as_bytes().len()).unwrap_or(u64::MAX));
+                } else if let Some(spec) = self.compressed_state.carry_for_present(&metadata.name) {
+                    let prior = bindings
+                        .iter()
+                        .find(|(name, _)| *name == spec.input)
+                        .map(|(_, tensor)| *tensor)
+                        .with_context(|| {
+                            format!(
+                                "compressed-attention transition '{}' => '{}' has no bound past \
+                                 tensor",
+                                spec.input, spec.output
+                            )
+                        })?;
+                    csa::validate_carry_transition(spec, prior.into(), (&tensor).into(), 1)?;
+                    self.compressed_state_stats.transitions_validated = self
+                        .compressed_state_stats
+                        .transitions_validated
+                        .saturating_add(1);
+                    self.compressed_state_stats.host_output_allocations = self
+                        .compressed_state_stats
+                        .host_output_allocations
+                        .saturating_add(1);
+                    self.compressed_state_stats.host_output_bytes = self
+                        .compressed_state_stats
+                        .host_output_bytes
+                        .saturating_add(u64::try_from(tensor.as_bytes().len()).unwrap_or(u64::MAX));
                 } else if !recurrent {
                     let seq_axis = tensor.shape.len().checked_sub(2).with_context(|| {
                         format!("native present tensor '{}' rank is below 2", metadata.name)

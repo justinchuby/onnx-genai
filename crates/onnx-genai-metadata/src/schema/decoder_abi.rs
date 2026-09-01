@@ -207,6 +207,7 @@ pub struct DecoderStateGroup {
     pub properties: Option<StateGroupProperties>,
     pub sequence_axis: Option<usize>,
     pub layout: String,
+    pub aliasing: StateAliasing,
     pub update: Option<StateUpdate>,
     pub reuse: StateReuse,
     pub capabilities: StateGroupCapabilities,

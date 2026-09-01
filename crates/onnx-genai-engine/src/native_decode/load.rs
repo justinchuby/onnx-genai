@@ -655,6 +655,16 @@ impl NativeDecodeSession {
             session.outputs(),
             io.map(|io| io.state_groups.as_slice()).unwrap_or_default(),
         )?;
+        if session.device_id().is_host_accessible()
+            && !compressed_state.required_aliasing_groups().is_empty()
+        {
+            bail!(
+                "native host decode cannot honor required present/past aliasing for \
+                 compressed-attention state groups {:?}; use a device state loader that \
+                 explicitly binds those groups in place",
+                compressed_state.required_aliasing_groups()
+            );
+        }
         csa::refuse_compressed_records_on_cuda(
             io.map(|io| io.state_groups.as_slice()).unwrap_or_default(),
             session.device_id().device_type == DeviceType::Cuda,
@@ -940,6 +950,7 @@ impl NativeDecodeSession {
             kv_inputs,
             present_to_past,
             compressed_state,
+            compressed_state_stats: CompressedStatePathStats::default(),
             past: HashMap::new(),
             cuda,
             cpu_kv,

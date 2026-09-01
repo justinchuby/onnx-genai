@@ -17,8 +17,8 @@ use std::{
 };
 
 use onnx_genai_metadata::schema::{
-    CompressedRecordFormat, CompressionRatio, StateGroupContract, StateGroupProperties, StateKind,
-    WorkflowComponent, WorkflowSpec,
+    CompressedRecordFormat, CompressionRatio, StateAliasing, StateGroupContract,
+    StateGroupProperties, StateKind, WorkflowComponent, WorkflowSpec,
 };
 use onnx_genai_metadata::{DecoderAbi, load_metadata, sole_decoder_component};
 
@@ -338,6 +338,57 @@ fn rebuilding_each_package_reproduces_its_abi() {
             package.display()
         );
     }
+}
+
+#[test]
+fn rebuilding_preserves_each_state_groups_alias_contract() {
+    use onnx_genai_metadata::decoder_workflow::{DecoderFacts, decoder_workflow};
+
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../onnx-genai-engine/tests/fixtures/tiny-deepseek-v4-csa");
+    let path = package.join("inference_metadata.yaml");
+    let metadata = load_metadata(&path).expect("compressed fixture loads");
+    let workflow = &metadata.pipeline.as_ref().expect("workflow").workflow;
+    let component = sole_decoder_component(workflow).expect("decoder");
+    let declaration = &workflow.components[component];
+    let mut abi = abi_of(&package);
+    let group = abi
+        .state_groups
+        .iter_mut()
+        .find(|group| group.name == "compressed_records.0")
+        .expect("compressed record group");
+    group.aliasing = StateAliasing::Permitted;
+    let port_contracts = declaration
+        .ports
+        .inputs
+        .iter()
+        .chain(declaration.ports.outputs.iter())
+        .map(|(port, contract)| (port.clone(), contract.clone()))
+        .collect();
+
+    let rebuilt = decoder_workflow(
+        &abi,
+        "model.onnx",
+        &DecoderFacts {
+            max_sequence_length: None,
+            port_contracts,
+        },
+    )
+    .expect("state-group ABI rebuilds");
+    let read_back = onnx_genai_metadata::decoder_abi(
+        &rebuilt,
+        sole_decoder_component(&rebuilt).expect("rebuilt decoder"),
+    )
+    .expect("rebuilt ABI");
+    assert_eq!(
+        read_back
+            .state_groups
+            .iter()
+            .find(|group| group.name == "compressed_records.0")
+            .expect("rebuilt compressed record group")
+            .aliasing,
+        StateAliasing::Permitted
+    );
 }
 
 /// A package with more than one graph is never "a single decoder", however

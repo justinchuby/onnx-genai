@@ -3,10 +3,11 @@
 use super::*;
 use onnx_genai_metadata::{
     CompressedRecordFormat, CompressionRatio, CompressionRecurrence, DecoderStateGroup,
-    StateGroupProperties, StateKind, StatePortRole, StateUpdate,
+    StateAliasing, StateGroupProperties, StateKind, StatePortRole, StateUpdate,
 };
 use onnx_runtime_ir::Dim;
 use onnx_runtime_session::{IoMeta, Tensor};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RecordStateSpec {
@@ -23,11 +24,27 @@ pub(super) struct RecordStateSpec {
     pub record_width_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CarryStateSpec {
+    pub group: String,
+    pub layer: usize,
+    pub role: StatePortRole,
+    pub input: String,
+    pub output: String,
+    pub dtype: DataType,
+    rank: usize,
+    non_batch_extents: Vec<usize>,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct CompressedStatePlan {
     records: Vec<RecordStateSpec>,
+    carries: Vec<CarryStateSpec>,
     present_index: HashMap<String, usize>,
+    carry_present_index: HashMap<String, usize>,
     past_index: HashMap<String, usize>,
+    state_past_names: HashSet<String>,
+    required_aliasing_groups: Vec<String>,
 }
 
 impl CompressedStatePlan {
@@ -53,12 +70,26 @@ impl CompressedStatePlan {
         self.past_index.get(past).map(|&index| &self.records[index])
     }
 
+    pub fn carry_for_present(&self, present: &str) -> Option<&CarryStateSpec> {
+        self.carry_present_index
+            .get(present)
+            .map(|&index| &self.carries[index])
+    }
+
     pub fn contains_past(&self, past: &str) -> bool {
         self.past_index.contains_key(past)
     }
 
     pub fn past_names(&self) -> impl Iterator<Item = &String> {
         self.past_index.keys()
+    }
+
+    pub fn state_past_names(&self) -> impl Iterator<Item = &String> {
+        self.state_past_names.iter()
+    }
+
+    pub fn required_aliasing_groups(&self) -> &[String] {
+        &self.required_aliasing_groups
     }
 
     pub fn verify_pairing(&self, present_to_past: &HashMap<String, String>) -> anyhow::Result<()> {
@@ -159,10 +190,11 @@ impl std::fmt::Display for CompressedStateLoadRefusal {
                 role_name(*role)
             ),
             Self::UnsupportedDevice => formatter.write_str(
-                "compressed-attention record state is unsupported by native CUDA: the current \
-                 persistent-state path cannot represent per-layer rank-3 record axes, packed \
-                 uint8 records, or compression-cadence cursor advancement; use native CPU or \
-                 the CUDA state implementation owned by stacked PR #2194",
+                "compressed-attention record state is unavailable in this native CUDA decoder: \
+                 graph-visible records require typed fixed-capacity device bindings with a \
+                 compression-cadence cursor, snapshot/restore ownership, and capture-stable \
+                 addresses. Use native CPU or a CUDA implementation that advertises this \
+                 state-group capability; native decode will not fall back the whole session to CPU",
             ),
         }
     }
@@ -224,6 +256,15 @@ pub enum CompressedStateTransitionRefusal {
         actual_extents: Vec<(usize, usize)>,
         expected_bytes: usize,
         actual_bytes: usize,
+    },
+    CarryLayoutMismatch {
+        group: String,
+        layer: usize,
+        role: StatePortRole,
+        phase: CompressedStateTensorPhase,
+        port: String,
+        expected: Vec<usize>,
+        actual: Vec<usize>,
     },
     CursorMismatch {
         group: String,
@@ -307,6 +348,20 @@ impl std::fmt::Display for CompressedStateTransitionRefusal {
                 "compressed-attention group '{group}' layer {layer} role '{}' {phase} port \
                  '{port}' has record extents {actual_extents:?} ({actual_bytes} bytes), expected \
                  {expected_extents:?} ({expected_bytes} bytes)",
+                role_name(*role)
+            ),
+            Self::CarryLayoutMismatch {
+                group,
+                layer,
+                role,
+                phase,
+                port,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "compressed-attention group '{group}' layer {layer} role '{}' {phase} port \
+                 '{port}' has shape {actual:?}, expected {expected:?}",
                 role_name(*role)
             ),
             Self::CursorMismatch {
@@ -440,13 +495,59 @@ fn record_layout(
     Ok((record_extents, record_width_bytes))
 }
 
+fn carry_layout(group: &str, input: &IoMeta, output: &IoMeta) -> anyhow::Result<Vec<usize>> {
+    if input.shape.len() != output.shape.len() || input.shape.is_empty() {
+        return Err(anyhow::Error::new(
+            CompressedStateLoadRefusal::InvalidRecordLayout(format!(
+                "compressed-attention carry group '{group}' requires matching nonzero \
+                 input/output rank, got {:?} and {:?}",
+                input.shape, output.shape
+            )),
+        ));
+    }
+    let mut non_batch_extents = Vec::with_capacity(input.shape.len().saturating_sub(1));
+    for (axis, (past, present)) in input
+        .shape
+        .iter()
+        .copied()
+        .zip(output.shape.iter().copied())
+        .enumerate()
+    {
+        match (axis, past, present) {
+            (0, Dim::Symbolic(_), Dim::Symbolic(_)) => {}
+            (0, Dim::Static(past), Dim::Static(present)) if past == present => {}
+            (_, Dim::Static(past), Dim::Static(present)) if past == present => {
+                non_batch_extents.push(past);
+            }
+            _ => {
+                return Err(anyhow::Error::new(
+                    CompressedStateLoadRefusal::InvalidRecordLayout(format!(
+                        "compressed-attention carry group '{group}' axis {axis} must preserve one \
+                         fixed extent across '{}' and '{}', got {past:?} and {present:?}",
+                        input.name, output.name
+                    )),
+                ));
+            }
+        }
+    }
+    Ok(non_batch_extents)
+}
+
 pub(super) fn resolve_compressed_state(
     inputs: &[IoMeta],
     outputs: &[IoMeta],
     groups: &[DecoderStateGroup],
 ) -> anyhow::Result<CompressedStatePlan> {
+    type LayerProperties = (
+        CompressionRatio,
+        CompressedRecordFormat,
+        CompressionRecurrence,
+    );
+    type LayerEntry = (LayerProperties, BTreeMap<StatePortRole, (String, String)>);
+
     let mut plan = CompressedStatePlan::default();
     let mut occupied = HashSet::new();
+    let mut layers: BTreeMap<usize, LayerEntry> = BTreeMap::new();
 
     for group in groups
         .iter()
@@ -478,6 +579,17 @@ pub(super) fn resolve_compressed_state(
                 CompressedStateLoadRefusal::InvalidUpdate(group.name.clone()),
             ));
         }
+        if group.ports.is_empty() {
+            return Err(anyhow::Error::new(CompressedStateLoadRefusal::InvalidRole(
+                format!(
+                    "compressed-attention state group '{}' has no read-write state ports",
+                    group.name
+                ),
+            )));
+        }
+        if group.aliasing == StateAliasing::Required {
+            plan.required_aliasing_groups.push(group.name.clone());
+        }
 
         for port in &group.ports {
             let Some(role) = port.role else {
@@ -496,6 +608,7 @@ pub(super) fn resolve_compressed_state(
             if (!is_record && !is_carry)
                 || (is_record && !matches!(update, StateUpdate::Append))
                 || (is_carry && !matches!(update, StateUpdate::Replace))
+                || (is_carry && group.sequence_axis.is_some())
                 || (!ratio.has_index_state()
                     && matches!(role, StatePortRole::IndexKey | StatePortRole::IndexCarry))
             {
@@ -505,6 +618,43 @@ pub(super) fn resolve_compressed_state(
                          ratio {ratio:?} and update {update:?}",
                         group.name,
                         role_name(role)
+                    ),
+                )));
+            }
+            let Some(layer) = port.layer else {
+                return Err(anyhow::Error::new(CompressedStateLoadRefusal::InvalidRole(
+                    format!(
+                        "compressed-attention state group '{}' role '{}' must declare its layer \
+                         index",
+                        group.name,
+                        role_name(role)
+                    ),
+                )));
+            };
+            let properties = (ratio, record_format, recurrence);
+            let layer_entry = layers
+                .entry(layer)
+                .or_insert_with(|| (properties, BTreeMap::new()));
+            if layer_entry.0 != properties {
+                return Err(anyhow::Error::new(CompressedStateLoadRefusal::InvalidRole(
+                    format!(
+                        "compressed-attention layer {layer} has contradictory properties across \
+                         state groups, including '{}'",
+                        group.name
+                    ),
+                )));
+            }
+            if let Some((previous_group, previous_port)) = layer_entry
+                .1
+                .insert(role, (group.name.clone(), port.input.clone()))
+            {
+                return Err(anyhow::Error::new(CompressedStateLoadRefusal::InvalidRole(
+                    format!(
+                        "compressed-attention layer {layer} role '{}' is declared more than once: \
+                         group '{previous_group}' port '{previous_port}' and group '{}' port '{}'",
+                        role_name(role),
+                        group.name,
+                        port.input
                     ),
                 )));
             }
@@ -542,6 +692,7 @@ pub(super) fn resolve_compressed_state(
                     ));
                 }
             }
+            plan.state_past_names.insert(port.input.clone());
 
             if is_record {
                 let Some(axis) = group.sequence_axis.filter(|axis| {
@@ -550,16 +701,6 @@ pub(super) fn resolve_compressed_state(
                     return Err(anyhow::Error::new(
                         CompressedStateLoadRefusal::InvalidSequenceAxis(group.name.clone()),
                     ));
-                };
-                let Some(layer) = port.layer else {
-                    return Err(anyhow::Error::new(CompressedStateLoadRefusal::InvalidRole(
-                        format!(
-                            "compressed-attention state group '{}' role '{}' must declare its \
-                             layer index",
-                            group.name,
-                            role_name(role)
-                        ),
-                    )));
                 };
                 let (record_extents, record_width_bytes) =
                     record_layout(&group.name, input, output, axis)?;
@@ -579,7 +720,53 @@ pub(super) fn resolve_compressed_state(
                     record_extents,
                     record_width_bytes,
                 });
+            } else {
+                let non_batch_extents = carry_layout(&group.name, input, output)?;
+                let index = plan.carries.len();
+                plan.carry_present_index.insert(port.output.clone(), index);
+                plan.carries.push(CarryStateSpec {
+                    group: group.name.clone(),
+                    layer,
+                    role,
+                    input: port.input.clone(),
+                    output: port.output.clone(),
+                    dtype: expected,
+                    rank: input.shape.len(),
+                    non_batch_extents,
+                });
             }
+        }
+    }
+    for (layer, ((ratio, _, _), roles)) in layers {
+        let expected: &[StatePortRole] = if ratio == CompressionRatio::Ratio4 {
+            &[
+                StatePortRole::CompressedKv,
+                StatePortRole::CompressionCarry,
+                StatePortRole::IndexKey,
+                StatePortRole::IndexCarry,
+            ]
+        } else {
+            &[StatePortRole::CompressedKv, StatePortRole::CompressionCarry]
+        };
+        let missing = expected
+            .iter()
+            .copied()
+            .filter(|role| !roles.contains_key(role))
+            .map(role_name)
+            .collect::<Vec<_>>();
+        let unexpected = roles
+            .keys()
+            .copied()
+            .filter(|role| !expected.contains(role))
+            .map(role_name)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() || !unexpected.is_empty() {
+            return Err(anyhow::Error::new(CompressedStateLoadRefusal::InvalidRole(
+                format!(
+                    "compressed-attention layer {layer} with ratio {ratio:?} has incomplete typed \
+                     state roles; missing {missing:?}, unexpected {unexpected:?}"
+                ),
+            )));
         }
     }
     Ok(plan)
@@ -641,24 +828,35 @@ fn validate_tensor_contract(
             actual: tensor.shape[0],
         });
     }
-    let actual_extents = tensor
+    let mut actual = tensor
         .shape
         .iter()
         .copied()
         .enumerate()
-        .filter(|(axis, _)| *axis != 0 && *axis != spec.sequence_axis)
-        .collect::<Vec<_>>();
-    let record_elements = actual_extents
-        .iter()
-        .try_fold(1_usize, |elements, (_, extent)| {
-            elements.checked_mul(*extent)
-        })
-        .unwrap_or(usize::MAX);
+        .filter(|(axis, _)| *axis != 0 && *axis != spec.sequence_axis);
+    let mut record_elements = 1_usize;
+    let mut layout_matches = true;
+    for expected in &spec.record_extents {
+        let Some(found) = actual.next() else {
+            layout_matches = false;
+            break;
+        };
+        layout_matches &= found == *expected;
+        record_elements = record_elements.saturating_mul(found.1);
+    }
+    layout_matches &= actual.next().is_none();
     let actual_bytes = tensor
         .dtype
         .checked_storage_bytes(record_elements)
         .unwrap_or(usize::MAX);
-    if actual_extents != spec.record_extents || actual_bytes != spec.record_width_bytes {
+    if !layout_matches || actual_bytes != spec.record_width_bytes {
+        let actual_extents = tensor
+            .shape
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(axis, _)| *axis != 0 && *axis != spec.sequence_axis)
+            .collect();
         return refusal(CompressedStateTransitionRefusal::RecordLayoutMismatch {
             group: spec.group.clone(),
             layer: spec.layer,
@@ -744,6 +942,93 @@ pub(super) fn validate_record_transition(
     Ok(())
 }
 
+fn validate_carry_tensor_contract(
+    spec: &CarryStateSpec,
+    tensor: RecordTensorFacts<'_>,
+    phase: CompressedStateTensorPhase,
+    port: &str,
+    batch: usize,
+) -> anyhow::Result<()> {
+    if tensor.dtype != spec.dtype {
+        return Err(anyhow::Error::new(
+            CompressedStateTransitionRefusal::DtypeMismatch {
+                group: spec.group.clone(),
+                layer: spec.layer,
+                role: spec.role,
+                phase,
+                port: port.to_string(),
+                expected: spec.dtype,
+                actual: tensor.dtype,
+            },
+        ));
+    }
+    if tensor.shape.len() != spec.rank {
+        return Err(anyhow::Error::new(
+            CompressedStateTransitionRefusal::RankMismatch {
+                group: spec.group.clone(),
+                layer: spec.layer,
+                role: spec.role,
+                phase,
+                port: port.to_string(),
+                expected: spec.rank,
+                actual: tensor.shape.len(),
+            },
+        ));
+    }
+    if tensor.shape[0] != batch {
+        return Err(anyhow::Error::new(
+            CompressedStateTransitionRefusal::BatchMismatch {
+                group: spec.group.clone(),
+                layer: spec.layer,
+                role: spec.role,
+                phase,
+                port: port.to_string(),
+                expected: batch,
+                actual: tensor.shape[0],
+            },
+        ));
+    }
+    if tensor.shape[1..] != spec.non_batch_extents {
+        let mut expected = Vec::with_capacity(spec.rank);
+        expected.push(batch);
+        expected.extend_from_slice(&spec.non_batch_extents);
+        return Err(anyhow::Error::new(
+            CompressedStateTransitionRefusal::CarryLayoutMismatch {
+                group: spec.group.clone(),
+                layer: spec.layer,
+                role: spec.role,
+                phase,
+                port: port.to_string(),
+                expected,
+                actual: tensor.shape.to_vec(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_carry_transition(
+    spec: &CarryStateSpec,
+    past: RecordTensorFacts<'_>,
+    present: RecordTensorFacts<'_>,
+    batch: usize,
+) -> anyhow::Result<()> {
+    validate_carry_tensor_contract(
+        spec,
+        past,
+        CompressedStateTensorPhase::Past,
+        &spec.input,
+        batch,
+    )?;
+    validate_carry_tensor_contract(
+        spec,
+        present,
+        CompressedStateTensorPhase::Present,
+        &spec.output,
+        batch,
+    )
+}
+
 pub(super) fn refuse_compressed_records_on_cuda(
     groups: &[DecoderStateGroup],
     device_is_cuda: bool,
@@ -797,6 +1082,7 @@ mod tests {
                 StateUpdate::IndexedScatter { .. } => "batch_record_feature",
             }
             .to_string(),
+            aliasing: StateAliasing::Forbidden,
             update: Some(update),
             reuse: Default::default(),
             capabilities: StateGroupCapabilities::default(),
@@ -866,16 +1152,35 @@ mod tests {
 
     #[test]
     fn ratio128_f32_records_resolve() {
-        let groups = vec![group(
-            "records",
-            CompressionRatio::Ratio128,
-            CompressedRecordFormat::F32,
-            StateUpdate::Append,
-            vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
-        )];
+        let groups = vec![
+            group(
+                "records",
+                CompressionRatio::Ratio128,
+                CompressedRecordFormat::F32,
+                StateUpdate::Append,
+                vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
+            ),
+            group(
+                "carries",
+                CompressionRatio::Ratio128,
+                CompressedRecordFormat::F32,
+                StateUpdate::Replace,
+                vec![(
+                    StatePortRole::CompressionCarry,
+                    "past_carry",
+                    "present_carry",
+                )],
+            ),
+        ];
         let plan = resolve_compressed_state(
-            &[meta("past_kv", DataType::Float32, &[1, 0, 512])],
-            &[meta("present_kv", DataType::Float32, &[1, 1, 512])],
+            &[
+                meta("past_kv", DataType::Float32, &[1, 0, 512]),
+                meta("past_carry", DataType::Float32, &[1, 128, 2, 512]),
+            ],
+            &[
+                meta("present_kv", DataType::Float32, &[1, 1, 512]),
+                meta("present_carry", DataType::Float32, &[1, 128, 2, 512]),
+            ],
             &groups,
         )
         .unwrap();
@@ -891,15 +1196,34 @@ mod tests {
 
     fn ratio128_spec() -> RecordStateSpec {
         let plan = resolve_compressed_state(
-            &[meta("past_kv", DataType::Float32, &[1, 0, 512])],
-            &[meta("present_kv", DataType::Float32, &[1, 1, 512])],
-            &[group(
-                "records",
-                CompressionRatio::Ratio128,
-                CompressedRecordFormat::F32,
-                StateUpdate::Append,
-                vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
-            )],
+            &[
+                meta("past_kv", DataType::Float32, &[1, 0, 512]),
+                meta("past_carry", DataType::Float32, &[1, 128, 2, 512]),
+            ],
+            &[
+                meta("present_kv", DataType::Float32, &[1, 1, 512]),
+                meta("present_carry", DataType::Float32, &[1, 128, 2, 512]),
+            ],
+            &[
+                group(
+                    "records",
+                    CompressionRatio::Ratio128,
+                    CompressedRecordFormat::F32,
+                    StateUpdate::Append,
+                    vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
+                ),
+                group(
+                    "carries",
+                    CompressionRatio::Ratio128,
+                    CompressedRecordFormat::F32,
+                    StateUpdate::Replace,
+                    vec![(
+                        StatePortRole::CompressionCarry,
+                        "past_carry",
+                        "present_carry",
+                    )],
+                ),
+            ],
         )
         .unwrap();
         plan.records().next().unwrap().clone()
@@ -932,15 +1256,34 @@ mod tests {
     fn lowered_pairing_must_match_the_property_typed_transition() {
         let spec = ratio128_spec();
         let plan = resolve_compressed_state(
-            &[meta("past_kv", DataType::Float32, &[1, 0, 512])],
-            &[meta("present_kv", DataType::Float32, &[1, 1, 512])],
-            &[group(
-                "records",
-                CompressionRatio::Ratio128,
-                CompressedRecordFormat::F32,
-                StateUpdate::Append,
-                vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
-            )],
+            &[
+                meta("past_kv", DataType::Float32, &[1, 0, 512]),
+                meta("past_carry", DataType::Float32, &[1, 128, 2, 512]),
+            ],
+            &[
+                meta("present_kv", DataType::Float32, &[1, 1, 512]),
+                meta("present_carry", DataType::Float32, &[1, 128, 2, 512]),
+            ],
+            &[
+                group(
+                    "records",
+                    CompressionRatio::Ratio128,
+                    CompressedRecordFormat::F32,
+                    StateUpdate::Append,
+                    vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
+                ),
+                group(
+                    "carries",
+                    CompressionRatio::Ratio128,
+                    CompressedRecordFormat::F32,
+                    StateUpdate::Replace,
+                    vec![(
+                        StatePortRole::CompressionCarry,
+                        "past_carry",
+                        "present_carry",
+                    )],
+                ),
+            ],
         )
         .unwrap();
         let error = plan
@@ -1074,6 +1417,127 @@ mod tests {
                     ))
             );
         }
+    }
+
+    #[test]
+    fn carry_shape_and_dtype_are_checked_before_commit() {
+        let plan = resolve_compressed_state(
+            &[
+                meta("past_kv", DataType::Float32, &[1, 0, 512]),
+                meta("past_carry", DataType::Float32, &[1, 128, 2, 512]),
+            ],
+            &[
+                meta("present_kv", DataType::Float32, &[1, 1, 512]),
+                meta("present_carry", DataType::Float32, &[1, 128, 2, 512]),
+            ],
+            &[
+                group(
+                    "records",
+                    CompressionRatio::Ratio128,
+                    CompressedRecordFormat::F32,
+                    StateUpdate::Append,
+                    vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
+                ),
+                group(
+                    "carries",
+                    CompressionRatio::Ratio128,
+                    CompressedRecordFormat::F32,
+                    StateUpdate::Replace,
+                    vec![(
+                        StatePortRole::CompressionCarry,
+                        "past_carry",
+                        "present_carry",
+                    )],
+                ),
+            ],
+        )
+        .unwrap();
+        let spec = plan.carry_for_present("present_carry").unwrap();
+        for present in [
+            facts(DataType::Float32, &[1, 127, 2, 512]),
+            facts(DataType::Uint8, &[1, 128, 2, 512]),
+        ] {
+            let error = validate_carry_transition(
+                spec,
+                facts(DataType::Float32, &[1, 128, 2, 512]),
+                present,
+                1,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<CompressedStateTransitionRefusal>()
+                    .is_some_and(|reason| matches!(
+                        reason,
+                        CompressedStateTransitionRefusal::CarryLayoutMismatch { .. }
+                            | CompressedStateTransitionRefusal::DtypeMismatch { .. }
+                    ))
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_layer_roles_are_refused_before_state_is_lowered() {
+        let error = resolve_compressed_state(
+            &[meta("past_kv", DataType::Float32, &[1, 0, 512])],
+            &[meta("present_kv", DataType::Float32, &[1, 1, 512])],
+            &[group(
+                "records",
+                CompressionRatio::Ratio128,
+                CompressedRecordFormat::F32,
+                StateUpdate::Append,
+                vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
+            )],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<CompressedStateLoadRefusal>()
+                .is_some_and(|reason| matches!(
+                    reason,
+                    CompressedStateLoadRefusal::InvalidRole(message)
+                        if message.contains("missing [\"compression_carry\"]")
+                ))
+        );
+    }
+
+    #[test]
+    fn internal_snapshot_restores_compressed_state_transactionally() -> anyhow::Result<()> {
+        let model = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny-deepseek-v4-csa/model.onnx.textproto");
+        let mut session =
+            NativeDecodeSession::load_with_resolved_io(&model, NativeDecodeDevice::Cpu)?;
+        let mut oracle =
+            NativeDecodeSession::load_with_resolved_io(&model, NativeDecodeDevice::Cpu)?;
+        let prompt = [1, 2, 3, 4, 5, 6, 7, 8];
+        session.decode(&prompt, 0)?;
+        oracle.decode(&prompt, 0)?;
+
+        let snapshot = session.snapshot_recurrent_state()?;
+        let snapshot_bytes = snapshot
+            .host
+            .as_ref()
+            .expect("CPU snapshot stores host state")
+            .iter()
+            .map(|(name, tensor)| (name.clone(), tensor.as_bytes().to_vec()))
+            .collect::<BTreeMap<_, _>>();
+        session.decode(&[9, 10, 11, 12], prompt.len())?;
+        session.restore_state_snapshot_at(&snapshot, prompt.len())?;
+        assert_eq!(session.current_len(), prompt.len());
+        for (name, expected) in snapshot_bytes {
+            assert_eq!(
+                session.past.get(&name).expect("restored state").as_bytes(),
+                expected,
+                "state '{name}' changed across restore"
+            );
+        }
+
+        assert_eq!(
+            session.decode(&[13], prompt.len())?,
+            oracle.decode(&[13], prompt.len())?,
+            "restored continuation must match a session that never ran the rejected draft"
+        );
+        Ok(())
     }
 
     #[test]

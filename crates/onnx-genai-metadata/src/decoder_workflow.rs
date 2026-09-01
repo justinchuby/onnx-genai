@@ -1120,11 +1120,13 @@ impl Builder {
                     .map(|group| group.layout.clone())
                     .unwrap_or_else(|| layout_name(abi)),
                 logical_lengths,
-                aliasing: if kind == StateKind::FullAttention {
-                    abi.aliasing.unwrap_or(StateAliasing::Forbidden)
-                } else {
-                    StateAliasing::Forbidden
-                },
+                aliasing: declared.map(|group| group.aliasing).unwrap_or_else(|| {
+                    if kind == StateKind::FullAttention {
+                        abi.aliasing.unwrap_or(StateAliasing::Forbidden)
+                    } else {
+                        StateAliasing::Forbidden
+                    }
+                }),
                 update,
                 ports: BTreeMap::from([(DECODER_COMPONENT.to_string(), aliases)]),
                 total_length: None,

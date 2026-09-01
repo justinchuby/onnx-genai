@@ -291,8 +291,8 @@ impl NativeDecoderTurnParticipant {
             .filter(|length| *length > 0 && native.has_recurrent_state())
             .map(|_| {
                 native.snapshot_recurrent_state().with_context(|| {
-                    "cannot admit atomic native decoder turn: recurrent state has no \
-                     snapshot/restore support; implement that participant before mutation"
+                    "cannot admit atomic native decoder turn: non-prefix-sliceable state could \
+                     not be snapshotted before mutation"
                 })
             })
             .transpose()?;
@@ -330,9 +330,10 @@ impl NativeDecoderTurnParticipant {
         )?;
         match self.materialized_len {
             Some(length) => {
-                native.rewind(length)?;
                 if let Some(snapshot) = &self.recurrent {
-                    native.restore_recurrent_state(snapshot)?;
+                    native.restore_state_snapshot_at(snapshot, length)?;
+                } else {
+                    native.rewind(length)?;
                 }
                 engine.native_active_session = Some(self.session_id);
             }

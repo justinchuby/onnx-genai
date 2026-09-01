@@ -3900,6 +3900,19 @@ fn a_decoder_without_recurrent_layers_needs_no_recurrent_state() {
     assert_eq!(bytes, 0);
 }
 
+#[test]
+fn a_decoder_without_compressed_state_records_zero_state_path_work() -> anyhow::Result<()> {
+    let mut session =
+        NativeDecodeSession::from_session_with_io(tiny_decoder(false), &tiny_decoder_io())?;
+    session.decode(&[1], 0)?;
+    assert_eq!(
+        session.compressed_state_path_stats(),
+        CompressedStatePathStats::default(),
+        "default-off decode must perform no compressed-state validation or host materialization"
+    );
+    Ok(())
+}
+
 /// KV is sized at full context, per sequence, from the declared pairs.
 ///
 /// The native path's page table carries no storage, so nothing else leases
