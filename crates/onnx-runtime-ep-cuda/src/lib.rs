@@ -116,6 +116,11 @@ pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
 pub use cufft::{CufftPlanCacheStats, cufft_plan_cache_stats};
 pub use dynamic_library::set_wheel_search_paths;
 pub use kernels::attention::AttentionKernel;
+pub use kernels::block_quantized_moe::{
+    AdmittedBlockQuantizedMoeBanks, BlockQuantizedMoeBank, BlockQuantizedMoeBankIdentity,
+    BlockQuantizedMoePreparationCounts, BlockQuantizedMoeResidency, BlockQuantizedMoeTraffic,
+    admit_block_quantized_moe_banks, block_quantized_moe_preparation_counts,
+};
 pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
 };

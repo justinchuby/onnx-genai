@@ -61,7 +61,7 @@ use std::sync::Arc;
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{DeviceBuffer, EpError, ExecutionProvider, Result};
+use onnx_runtime_ep_api::{DeviceBuffer, DeviceGraphResource, EpError, ExecutionProvider, Result};
 use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     FP4_MICROSCALE_BLOCK as CPU_FP4_MICROSCALE_BLOCK, PlanarBankIdentity, PlanarBlockFormat,
     PlanarLayout, validate_planar_values,
@@ -525,6 +525,11 @@ impl AdmittedPlanarLinear {
     pub fn diagnostic_bank_identity(&self) -> PlanarBankIdentity {
         self.validation.bank_identity
     }
+
+    /// Immutable ownership token that must be supplied before graph capture.
+    pub fn device_graph_resource(&self) -> DeviceGraphResource {
+        DeviceGraphResource::new(Arc::as_ptr(&self.banks) as usize, Arc::clone(&self.banks))
+    }
 }
 
 /// Validate exact host bytes, then atomically upload them into sealed,
@@ -640,9 +645,8 @@ pub fn launch_planar_linear(
         }
     }
     let runtime = admission.provider.runtime();
-    runtime.retain_active_graph_resource(
+    runtime.require_registered_address_capture(
         Arc::as_ptr(&admission.banks) as usize,
-        &admission.banks,
         "planar linear bank",
     )?;
     let access = super::SealedLaunchAccess::new();

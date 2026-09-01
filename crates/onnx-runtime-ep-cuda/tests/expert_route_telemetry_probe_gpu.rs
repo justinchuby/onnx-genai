@@ -341,7 +341,14 @@ fn cuda_route_bitmap_matches_cpu_oracle() {
             "device bitmap must equal oracle (E={num_experts}, rows={rows})"
         );
         assert_eq!(header[H_POISON], 0);
-        let decision = consume_and_validate(&header, &bitmap, header[H_EPOCH], 1, 0);
+        let decision = consume_and_validate(
+            &header,
+            &bitmap,
+            header[H_EPOCH],
+            1,
+            0,
+            num_experts as usize,
+        );
         assert!(matches!(decision, Decision::HotSet(_)));
         println!(
             "bitmap E={num_experts} rows={rows}: {} routed experts, epoch={}",
@@ -402,7 +409,14 @@ fn cuda_dedup_overflow_fails_closed() {
         landed.is_subset(&truth),
         "queued ids must be real routed experts"
     );
-    let decision = consume_and_validate(&header, &bitmap, header[H_EPOCH], 9, 0);
+    let decision = consume_and_validate(
+        &header,
+        &bitmap,
+        header[H_EPOCH],
+        9,
+        0,
+        num_experts as usize,
+    );
     assert!(
         matches!(decision, Decision::WholeBank(_)),
         "overflow must fail closed: {decision:?}"
@@ -429,7 +443,14 @@ fn cuda_poison_out_of_range_fails_closed() {
         header[H_POISON], 1,
         "poison bit must be set for out-of-range ids"
     );
-    let decision = consume_and_validate(&header, &bitmap, header[H_EPOCH], 2, 0);
+    let decision = consume_and_validate(
+        &header,
+        &bitmap,
+        header[H_EPOCH],
+        2,
+        0,
+        num_experts as usize,
+    );
     assert!(
         matches!(decision, Decision::WholeBank(_)),
         "poison must fail closed"
@@ -449,19 +470,40 @@ fn cuda_identity_isolation_fails_closed() {
     let (bitmap, header, _q) =
         produce_record(&ep, runtime, &routes, num_experts, num_experts, 100, 0);
     // A different request consuming the same record must fail closed.
-    let d_req = consume_and_validate(&header, &bitmap, header[H_EPOCH], 101, 0);
+    let d_req = consume_and_validate(
+        &header,
+        &bitmap,
+        header[H_EPOCH],
+        101,
+        0,
+        num_experts as usize,
+    );
     assert!(
         matches!(d_req, Decision::WholeBank(_)),
         "foreign request must fail closed"
     );
     // A consumer on a different device must fail closed.
-    let d_dev = consume_and_validate(&header, &bitmap, header[H_EPOCH], 100, 7);
+    let d_dev = consume_and_validate(
+        &header,
+        &bitmap,
+        header[H_EPOCH],
+        100,
+        7,
+        num_experts as usize,
+    );
     assert!(
         matches!(d_dev, Decision::WholeBank(_)),
         "foreign device must fail closed"
     );
     // The owning request/device on the same epoch accepts.
-    let d_ok = consume_and_validate(&header, &bitmap, header[H_EPOCH], 100, 0);
+    let d_ok = consume_and_validate(
+        &header,
+        &bitmap,
+        header[H_EPOCH],
+        100,
+        0,
+        num_experts as usize,
+    );
     assert!(matches!(d_ok, Decision::HotSet(_)));
     println!("identity isolation: req-mismatch and dev-mismatch both fail closed; owner accepts");
 }
@@ -614,13 +656,27 @@ fn cuda_capture_replay_reaccumulates_real_routes() {
 
     // Stale detection: the last record has epoch=3; a boundary that has since
     // advanced to epoch 4 must treat it as stale and fail closed.
-    let stale = consume_and_validate(&last_header, &vec![0u32; words], 4, request_id, device_id);
+    let stale = consume_and_validate(
+        &last_header,
+        &vec![0u32; words],
+        4,
+        request_id,
+        device_id,
+        num_experts as usize,
+    );
     assert!(
         matches!(stale, Decision::WholeBank(_)),
         "stale epoch must fail closed: {stale:?}"
     );
     // At its own epoch it is fresh.
-    let fresh = consume_and_validate(&last_header, &vec![0u32; words], 3, request_id, device_id);
+    let fresh = consume_and_validate(
+        &last_header,
+        &vec![0u32; words],
+        3,
+        request_id,
+        device_id,
+        num_experts as usize,
+    );
     assert!(matches!(fresh, Decision::HotSet(_)));
 
     unsafe {

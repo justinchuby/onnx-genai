@@ -202,6 +202,9 @@ fn prepare_route_window(
         expected_epoch,
         expected_request,
         expected_device,
+        snapshot.num_experts,
+        usize::try_from(snapshot.routes_per_row)
+            .expect("u32 routes-per-row telemetry contract fits usize"),
     ) {
         RouteDecision::WholeBank(reason) => {
             return Prepared::Early(RouteWindowConsumeOutcome::WholeBank { reason });

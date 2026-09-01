@@ -819,7 +819,9 @@ fn capture_replay_parity() {
     // Capture the warmed launch, then replay ≥3× and compare byte-for-byte.
     let capture_allocations = runtime.allocation_counts();
     let capture_transfers = runtime.transfer_counts();
-    runtime.begin_graph_capture(&[]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[], vec![admission.device_graph_resource()])
+        .unwrap();
     assert!(
         admit_planar_linear(&ep, &dims, m * in_features, &packed, &scale, m * out).is_err(),
         "admission must reject before allocating or uploading during capture"
@@ -917,11 +919,19 @@ fn graph_bank_pins_are_per_graph_and_abort_safe() {
     let admission = admit_planar_linear(&ep, &dims, 32, &packed, &scale, 32).unwrap();
     warm_planar_linear(runtime).unwrap();
 
-    runtime.begin_graph_capture(&[]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[], vec![admission.device_graph_resource()])
+        .unwrap();
     launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf).unwrap();
     runtime.abort_graph_capture().unwrap();
     for slot in [DeviceGraphSlot::Primary, DeviceGraphSlot::Verify] {
-        runtime.begin_graph_capture_in(slot, &[]).unwrap();
+        runtime
+            .begin_graph_capture_with_resources_in(
+                slot,
+                &[],
+                vec![admission.device_graph_resource()],
+            )
+            .unwrap();
         launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf).unwrap();
         runtime.end_graph_capture_in(slot).unwrap();
     }
@@ -979,7 +989,7 @@ fn unregistered_capture_and_foreign_context_are_rejected_before_launch() {
     runtime.test_begin_unregistered_graph_capture().unwrap();
     let error = launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf)
         .expect_err("capture without a lifecycle ownership sink must reject");
-    assert!(error.to_string().contains("no registered ownership sink"));
+    assert!(error.to_string().contains("no registered ownership token"));
     runtime.test_end_unregistered_graph_capture().unwrap();
 
     let foreign = require_cuda();

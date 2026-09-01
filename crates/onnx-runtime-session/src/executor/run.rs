@@ -1,4 +1,5 @@
 use super::*;
+use smallvec::SmallVec;
 
 struct Stage2RunState {
     plan: Option<DecodeViewPlan>,
@@ -17,6 +18,36 @@ fn activation_memory_planning_enabled() -> bool {
 }
 
 impl Executor {
+    pub(super) fn begin_device_validation_submission(
+        &mut self,
+    ) -> Result<DeviceValidationSubmission> {
+        let registration = self
+            .validation_registration
+            .as_ref()
+            .expect("executor validation registration exists until Drop");
+        let submission = DeviceValidationSubmission::begin(&self.ep, registration)?;
+        submission.activate()?;
+        self.pending_device_validation = Some(submission.token());
+        Ok(submission)
+    }
+
+    pub(super) fn begin_device_validation_submission_for_bindings(
+        &mut self,
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceValidationSubmission> {
+        let registration = self
+            .validation_registration
+            .as_ref()
+            .expect("executor validation registration exists until Drop");
+        let submission = DeviceValidationSubmission::begin(&self.ep, registration)?;
+        for binding in bindings {
+            submission.add_recipient(binding)?;
+        }
+        submission.activate()?;
+        self.pending_device_validation = Some(submission.token());
+        Ok(submission)
+    }
+
     /// Execute the graph with `inputs` bound by name, plus an `outer_scope` of
     /// enclosing named values a nested control-flow subgraph body may capture.
     /// The top-level session `run` passes an empty scope; a control-flow body's
@@ -27,8 +58,8 @@ impl Executor {
         inputs: &[(&str, &Tensor)],
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
-    ) -> Result<Vec<Option<SessionOutput>>> {
-        match self.run_scoped_mode(inputs, outer_scope, external, RunMode::Eager)? {
+    ) -> Result<ScopedOutputs> {
+        match self.run_scoped_mode(inputs, outer_scope, external, RunMode::Eager, None)? {
             ScopedRunResult::Executed(outputs) => Ok(outputs),
             ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
         }
@@ -40,6 +71,7 @@ impl Executor {
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
         mode: RunMode,
+        validation_submission: Option<DeviceValidationSubmission>,
     ) -> Result<ScopedRunResult> {
         // Distinguish the outermost (top-level graph) run from nested
         // control-flow subgraph runs so the phase profiler can attribute
@@ -60,13 +92,14 @@ impl Executor {
         }
         let _depth_guard = DepthGuard;
         let nested = depth > 0;
-        if !nested {
-            // The validation word is shared by eager and captured CUDA kernels,
-            // but its meaning is request-local. Clear any prior request before
-            // this one can enqueue work; failures are correctness failures and
-            // must propagate through the EP seam.
-            self.ep.reset_device_validation_error()?;
-        }
+        let mut validation_submission = if nested {
+            None
+        } else {
+            match validation_submission {
+                Some(submission) => Some(submission),
+                None => Some(self.begin_device_validation_submission()?),
+            }
+        };
         self.reset_run_state()?;
 
         // Keep the setup span around shape resolution, Stage-2 restoration,
@@ -113,9 +146,23 @@ impl Executor {
         let validation = if nested {
             Ok(())
         } else {
-            self.finish_device_validation()
+            let defer_until_binding_read = !self.graph.outputs.is_empty()
+                && mode != RunMode::Capture
+                && outcome.is_ok()
+                && self
+                    .graph
+                    .outputs
+                    .iter()
+                    .all(|output| external.outputs.contains_key(output));
+            self.finish_device_validation(defer_until_binding_read)
         };
+        if let Some(submission) = validation_submission.as_mut() {
+            submission.disarm();
+        }
         let unbound = self.unbind_borrowed_inputs();
+        if !decode_memo_eligible {
+            self.scratch_resolved_shapes = resolved;
+        }
         match (outcome, validation, unbound) {
             (_, Err(e), _) => Err(e),
             (Err(e), _, _) => Err(e),
@@ -124,18 +171,36 @@ impl Executor {
         }
     }
 
-    fn finish_device_validation(&self) -> Result<()> {
+    fn finish_device_validation(&mut self, defer_until_binding_read: bool) -> Result<()> {
+        if defer_until_binding_read && self.ep.defers_device_validation() {
+            self.ep.consume_route_residency_at_boundary()?;
+            return Ok(());
+        }
+        self.finish_device_validation_boundary()
+    }
+
+    pub(crate) fn finish_device_validation_boundary(&mut self) -> Result<()> {
         // This is the one request-level host boundary for deferred eager work
         // and for captured replay. The CUDA EP's explicit sync is unconditional,
         // so the latch read observes every kernel from this request.
         self.ep.sync()?;
-        let checked = self.ep.check_device_capture_error();
-        // Clear after the synchronized read as well as before the next request:
-        // callers inspecting a failed run cannot leave poison behind, and a
-        // reset failure is never silently discarded.
-        let reset = self.ep.reset_device_validation_error();
-        match (checked, reset) {
-            (Ok(0), Ok(())) => {
+        let flags = match self.pending_device_validation.take() {
+            Some(token) => match self.ep.consume_device_validation_error(
+                self.validation_registration
+                    .as_ref()
+                    .expect("executor validation registration exists until Drop"),
+                token,
+            ) {
+                Ok(flags) => flags,
+                Err(error) => {
+                    self.pending_device_validation = Some(token);
+                    return Err(error.into());
+                }
+            },
+            None => 0,
+        };
+        match flags {
+            0 => {
                 // The single coarse safe boundary: the request's kernels and any
                 // captured replay have completed (the sync above), the stream is
                 // no longer capturing, and the device validation latch is clean.
@@ -147,22 +212,11 @@ impl Executor {
                     .consume_route_residency_at_boundary_for_executor(self.instance_id)?;
                 Ok(())
             }
-            (Ok(flags), Ok(())) => Err(EpError::KernelFailed(format!(
+            flags => Err(EpError::KernelFailed(format!(
                 "{}: device validation failed (flags=0x{flags:x})",
                 self.ep.name()
             ))
             .into()),
-            (Err(error), Ok(())) | (Ok(0), Err(error)) => Err(error.into()),
-            (Ok(flags), Err(reset_error)) => Err(SessionError::Internal(format!(
-                "{}: device validation failed (flags=0x{flags:x}); additionally failed to reset \
-                 the device validation latch: {reset_error}",
-                self.ep.name()
-            ))),
-            (Err(check_error), Err(reset_error)) => Err(SessionError::Internal(format!(
-                "{}: failed to check the device validation latch: {check_error}; additionally \
-                 failed to reset it: {reset_error}",
-                self.ep.name()
-            ))),
         }
     }
 
@@ -305,13 +359,12 @@ impl Executor {
         }
 
         // Every required input must be supplied.
-        let mut provided: HashSet<ValueId> = inputs
-            .iter()
-            .filter_map(|(name, _)| self.input_index.get(*name).copied())
-            .collect();
-        provided.extend(external.inputs.keys().copied());
         for &vid in &self.required_inputs {
-            if !provided.contains(&vid) {
+            let provided = external.inputs.contains_key(&vid)
+                || inputs
+                    .iter()
+                    .any(|(name, _)| self.input_index.get(*name) == Some(&vid));
+            if !provided {
                 let name = self
                     .graph
                     .value(vid)
@@ -352,7 +405,8 @@ impl Executor {
             if self.decode_memo_enabled && !nested {
                 self.decode_memo_ineligible_count += 1;
             }
-            let mut resolved = self.resolve_soft(bindings);
+            let scratch = std::mem::take(&mut self.scratch_resolved_shapes);
+            let mut resolved = self.resolve_soft_reuse(bindings, scratch);
             if mode != RunMode::Eager {
                 // Persistent bindings seed the kernel-visible geometry selected by
                 // their input/output contracts. Seed only unresolved values:
@@ -454,12 +508,12 @@ impl Executor {
         resolved: &HashMap<ValueId, Vec<usize>>,
         stage2_excluded: Option<&HashSet<ValueId>>,
     ) -> Result<()> {
-        let external_values = external
-            .inputs
-            .keys()
-            .chain(external.outputs.keys())
-            .copied()
-            .collect::<HashSet<_>>();
+        let mut external_values: SmallVec<[ValueId; 16]> = SmallVec::new();
+        for &vid in external.inputs.keys().chain(external.outputs.keys()) {
+            if !external_values.contains(&vid) {
+                external_values.push(vid);
+            }
+        }
         for &vid in &external_values {
             // A producer-less value bound only as an external *output* (a bare
             // initializer, or a value `ConstantFolding` collapsed to one
@@ -501,12 +555,12 @@ impl Executor {
                 // invariant partition (variant/JIT/external) — the invariant
                 // buffers are reused untouched from the rebuild step.
                 Some(invariant) => {
-                    let mut excluded = external_values.clone();
+                    let mut excluded = external_values.iter().copied().collect::<HashSet<_>>();
                     excluded.extend(invariant.iter().copied());
                     self.size_buffers_excluding(resolved, &excluded)?;
                 }
                 None => {
-                    self.size_buffers_excluding(resolved, &external_values)?;
+                    self.size_buffers_excluding_slice(resolved, &external_values)?;
                 }
             }
         }
@@ -707,8 +761,16 @@ impl Executor {
                 // ~600-entry resolved map every token would be pure waste and
                 // would defeat the memo's allocation amortization.
                 if !decode_memo_eligible {
-                    self.cap_mut().capture_warm_shapes = resolved.clone();
-                    self.cap_mut().capture_warm_signature = Some(external.capture_signature());
+                    let cap = self.cap_mut();
+                    cap.capture_warm_shapes
+                        .retain(|vid, _| resolved.contains_key(vid));
+                    for (&vid, shape) in resolved.iter() {
+                        let stored = cap.capture_warm_shapes.entry(vid).or_default();
+                        stored.clear();
+                        stored.extend_from_slice(shape);
+                    }
+                    let signature = cap.capture_warm_signature.get_or_insert_with(Vec::new);
+                    external.refill_capture_signature(signature);
                 }
             }
             RunMode::Capture => {
@@ -749,7 +811,7 @@ impl Executor {
                     ) {
                         Ok(_) => break 'capture schedule,
                         Err(error) => {
-                            let _ = self.ep.reset_device_graph_in(self.graph_slot);
+                            let _ = self.reset_device_graph();
                             // Quarantine the op-type that aborted recording and
                             // retry, unless we already quarantined it (no
                             // progress), hit the attempt bound, or cannot
@@ -798,7 +860,7 @@ impl Executor {
                     .map(|(vid, seeded)| (*vid, seeded.clone()))
                 {
                     let current = resolved.get(&vid).cloned();
-                    let _ = self.ep.reset_device_graph_in(self.graph_slot);
+                    let _ = self.reset_device_graph();
                     let cap = self.cap_mut();
                     cap.capture_schedule = None;
                     cap.capture_segmentation.clear();
@@ -855,11 +917,7 @@ impl Executor {
                     // token), but the installed segments are stale. Retire the
                     // device graph so the caller re-warms and re-captures for the
                     // new branch. `capture_schedule` stays `None`.
-                    let cap = self.cap_mut();
-                    cap.capture_segmentation.clear();
-                    cap.capture_cf_shapes.clear();
-                    cap.device_graph_signature = None;
-                    self.ep.reset_device_graph_in(self.graph_slot)?;
+                    self.reset_device_graph()?;
                 }
             }
         }
@@ -882,10 +940,10 @@ impl Executor {
         } else {
             "run_scoped.collect_outputs.top"
         });
-        let mut results = Vec::with_capacity(self.graph.outputs.len());
+        let mut results = ScopedOutputs::new();
         let mut host_output_bytes = 0usize;
-        let output_vids: Vec<ValueId> = self.graph.outputs.clone();
-        for vid in output_vids {
+        for output_index in 0..self.graph.outputs.len() {
+            let vid = self.graph.outputs[output_index];
             if let Some(ext) = external.outputs.get(&vid) {
                 // A graph output with no producing node (e.g. a bare
                 // initializer, or a value `ConstantFolding` collapsed to one

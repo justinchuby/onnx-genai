@@ -36,6 +36,7 @@ onnx-runtime-tracer = { workspace = true }
 rayon = "1"
 thiserror = { workspace = true }
 half = { workspace = true }
+smallvec = { workspace = true }
 
 [dev-dependencies]
 prost = { workspace = true }

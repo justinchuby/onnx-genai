@@ -42,11 +42,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{
-    BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, EpConfig, EpError,
-    ExecutionProvider, ExecutionProviderCapabilities, ExecutorArtifactFinalization,
-    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExpertWeightGroup,
-    Fence, HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result,
-    WorkspaceAllocation, deny, structural_input_bytes,
+    BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
+    DevicePtr, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities,
+    ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
+    ExecutorInstanceId, ExpertWeightGroup, Fence, HostToDeviceCopier, Kernel, KernelMatch,
+    LazyWeight, OpRegistry, PagedWeight, Result, SealedDeviceAllocation, WorkspaceAllocation, deny,
+    structural_input_bytes,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
@@ -248,6 +249,9 @@ pub(crate) struct CudaSealedAllocation {
     runtime: Weak<CudaRuntime>,
     release_queue: Weak<CudaDeferredReleaseQueue>,
     identity: AllocationIdentity,
+    device: DeviceId,
+    provider_context: ProviderContextIdentity,
+    runtime_identity: usize,
     observer: Arc<dyn ReleaseObserver>,
 }
 
@@ -349,6 +353,40 @@ impl Drop for CudaSealedAllocation {
         if let Err(error) = self.release() {
             eprintln!("cuda_ep: WARNING: {error}");
         }
+    }
+}
+
+impl SealedDeviceAllocation for CudaSealedAllocation {
+    fn ptr(&self) -> DevicePtr {
+        DevicePtr(
+            self.buffer
+                .as_ref()
+                .expect("sealed CUDA allocation is taken only during drop")
+                .as_ptr(),
+        )
+    }
+
+    fn len(&self) -> usize {
+        self.buffer
+            .as_ref()
+            .expect("sealed CUDA allocation is taken only during drop")
+            .len()
+    }
+
+    fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    fn provider_context(&self) -> ProviderContextIdentity {
+        self.provider_context
+    }
+
+    fn allocation_identity(&self) -> AllocationIdentity {
+        self.identity
+    }
+
+    fn runtime_identity(&self) -> usize {
+        self.runtime_identity
     }
 }
 
@@ -2300,6 +2338,9 @@ impl CudaExecutionProvider {
             runtime: Arc::downgrade(&self.runtime),
             release_queue: Arc::downgrade(&self.release_queue),
             identity,
+            device: self.device,
+            provider_context: self.provider_context_identity(),
+            runtime_identity: Arc::as_ptr(&self.runtime) as usize,
             observer: self.release_accounting(),
         })
     }
@@ -2727,6 +2768,34 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn device_id(&self) -> DeviceId {
         self.device
+    }
+
+    fn runtime_identity(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.runtime) as usize)
+    }
+
+    fn provider_context_identity(&self) -> Option<ProviderContextIdentity> {
+        Some(self.provider_context_identity())
+    }
+
+    fn prepares_immutable_constant(&self, node: &Node, input_idx: usize) -> bool {
+        node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+            && node.op_type == "BlockQuantizedMoE"
+            && matches!(input_idx, 2 | 4 | 6)
+            && node.inputs.get(input_idx).is_some_and(Option::is_some)
+    }
+
+    fn upload_sealed_constant(
+        &self,
+        bytes: &[u8],
+        alignment: usize,
+    ) -> Result<Arc<dyn SealedDeviceAllocation>> {
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: cannot admit sealed constants during CUDA graph capture".into(),
+            ));
+        }
+        Ok(Arc::new(self.upload_sealed(bytes, alignment)?))
     }
 
     fn memory_vendor_id(&self) -> u32 {
@@ -4014,12 +4083,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn reset_device_graph(&self) -> Result<bool> {
-        // Graph invalidation (reset / rewind / KV-capacity or shape change /
-        // re-capture) is the explicit host reset point for the capture-error
-        // latch, so a fresh generation always starts un-poisoned.
-        let invalidated = self.runtime.reset_graph()?;
-        self.runtime.reset_capture_error()?;
-        Ok(invalidated)
+        self.runtime.reset_graph()
     }
 
     fn begin_device_graph_capture_in(
@@ -4047,15 +4111,98 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn reset_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
-        // Mirror `reset_device_graph`'s capture-error latch reset for whichever
-        // slot is torn down, so re-capture into that slot starts un-poisoned.
-        let invalidated = self.runtime.reset_graph_in(slot)?;
-        self.runtime.reset_capture_error()?;
-        Ok(invalidated)
+        self.runtime.reset_graph_in(slot)
     }
 
-    fn reset_device_validation_error(&self) -> Result<()> {
-        self.runtime.reset_capture_error()
+    fn begin_owned_device_graph_capture(
+        &self,
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+        continuation: Option<DeviceGraphToken>,
+        kernels: &[&dyn Kernel],
+    ) -> Result<DeviceGraphToken> {
+        self.runtime
+            .begin_owned_graph_capture_in(owner, slot, continuation, kernels)
+    }
+
+    fn end_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        self.runtime.end_owned_graph_capture(token)
+    }
+
+    fn abort_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        self.runtime.abort_owned_graph_capture(token)
+    }
+
+    fn replay_owned_device_graph(&self, token: DeviceGraphToken) -> Result<()> {
+        self.runtime.replay_owned_graph(token)
+    }
+
+    fn replay_owned_device_graph_segment(
+        &self,
+        token: DeviceGraphToken,
+        index: usize,
+    ) -> Result<()> {
+        self.runtime.replay_owned_graph_segment(token, index)
+    }
+
+    fn reset_owned_device_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        self.runtime.reset_owned_graph(token)
+    }
+
+    fn retire_owned_device_graphs(&self, owner: DeviceGraphOwner) -> Result<()> {
+        self.runtime.retire_owned_graphs(owner)
+    }
+
+    fn has_owned_device_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        self.runtime.has_owned_graph(token)
+    }
+
+    fn register_device_validation_owner(
+        &self,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationRegistration> {
+        self.runtime.register_device_validation_owner()
+    }
+
+    fn unregister_device_validation_owner(
+        &self,
+        registration: &mut onnx_runtime_ep_api::DeviceValidationRegistration,
+    ) -> Result<()> {
+        self.runtime
+            .unregister_device_validation_owner(registration)
+    }
+
+    fn begin_device_validation(
+        &self,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        self.runtime.begin_device_validation(registration)
+    }
+
+    fn add_device_validation_recipient(
+        &self,
+        submission: onnx_runtime_ep_api::DeviceValidationToken,
+        recipient: &onnx_runtime_ep_api::DeviceValidationRegistration,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        self.runtime
+            .add_device_validation_recipient(submission, recipient)
+    }
+
+    fn activate_device_validation(
+        &self,
+        submission: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> Result<()> {
+        self.runtime.activate_device_validation(submission)
+    }
+
+    fn abort_device_validation_submission(
+        &self,
+        submission: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> Result<u32> {
+        self.runtime.abort_device_validation_submission(submission)
+    }
+
+    fn defers_device_validation(&self) -> bool {
+        self.runtime.eager_sync_deferred()
     }
 
     fn has_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
@@ -4066,8 +4213,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.runtime.has_graph_executable_in(slot)
     }
 
-    fn check_device_capture_error(&self) -> Result<u32> {
-        self.runtime.check_capture_error()
+    fn consume_device_validation_error(
+        &self,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> Result<u32> {
+        self.runtime.consume_device_validation(registration, token)
     }
 
     /// Slice-7C: the coarse safe-boundary route-telemetry consumer, called once
