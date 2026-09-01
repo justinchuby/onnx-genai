@@ -126,6 +126,11 @@ pub use indexed_page_in::{
     execute_indexed_multi_bank_page_in, indexed_page_in_attribution_stats,
 };
 pub use kernels::attention::AttentionKernel;
+pub use kernels::block_quantized_moe::{
+    AdmittedBlockQuantizedMoeBanks, BlockQuantizedMoeBank, BlockQuantizedMoeBankIdentity,
+    BlockQuantizedMoePreparationCounts, BlockQuantizedMoeResidency, BlockQuantizedMoeTraffic,
+    admit_block_quantized_moe_banks, block_quantized_moe_preparation_counts,
+};
 pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
 };

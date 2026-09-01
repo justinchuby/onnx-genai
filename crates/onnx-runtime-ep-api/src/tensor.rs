@@ -27,6 +27,7 @@
 
 use onnx_runtime_ir::DataType;
 use onnx_runtime_ir::DeviceId;
+use onnx_runtime_memory_governor::{AllocationIdentity, ProviderContextIdentity};
 use std::marker::PhantomData;
 
 use crate::error::{EpError, Result};
@@ -57,6 +58,12 @@ pub enum TensorBacking {
     Opaque,
     /// Read-only bytes directly alias an ONNX external-data mmap.
     ExternalMmap(ExternalMmapRegion),
+    /// Exact provider-owned immutable allocation selected by a kernel's
+    /// constant-binding override.
+    Sealed {
+        provider_context: ProviderContextIdentity,
+        allocation: AllocationIdentity,
+    },
 }
 
 impl DevicePtr {

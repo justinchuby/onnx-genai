@@ -11,6 +11,42 @@ pub(crate) static PREBIND_FAST_PATH_TEST_HITS: std::sync::atomic::AtomicUsize =
 pub(crate) static PREBIND_FALLBACK_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+pub(super) fn resolve_kernel_constant_inputs<'a>(
+    graph: &'a Graph,
+    weights: &'a onnx_runtime_loader::WeightStore,
+    inputs: &[Option<ValueId>],
+    input_shapes: &'a [Vec<usize>],
+) -> Result<Vec<Option<KernelConstantInput<'a>>>> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            let Some(value) = input else {
+                return Ok(None);
+            };
+            let Some(weight) = graph.initializers.get(value) else {
+                return Ok(None);
+            };
+            let bytes = weights.bytes(weight).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "initializer value {} could not be resolved for kernel preparation",
+                    value.0
+                ))
+            })?;
+            let shape = input_shapes.get(index).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "kernel preparation has no shape for initializer input {index}"
+                ))
+            })?;
+            Ok(Some(KernelConstantInput {
+                dtype: graph.value(*value).dtype,
+                shape,
+                bytes,
+            }))
+        })
+        .collect()
+}
+
 /// Cache key for a compiled kernel (§11.1). Keyed by the concrete node and its
 /// **resolved** (concrete) input shapes: attributes are fixed per node, so this
 /// is correct, and the shape component makes it *shape-keyed* — a re-run with
@@ -736,6 +772,7 @@ pub(crate) struct KernelCache {
     /// Entries dropped by the per-node bound.
     pub(super) evictions: u64,
     pub(super) prebind_hits: AtomicU64,
+    block_quantized_moe_traffic_request: Option<u32>,
 }
 
 /// How many shape variants of one node the cache keeps (issue #1362).
@@ -777,6 +814,138 @@ fn variants_per_node() -> usize {
 }
 
 impl KernelCache {
+    pub(super) fn arm_block_quantized_moe_traffic(&mut self, request_id: u32) -> Result<usize> {
+        let mut visited = HashSet::new();
+        let mut armed = 0;
+        let mut failure = None;
+        for (key, kernel) in &mut self.entries {
+            if visited.insert(key.node) {
+                match kernel.arm_block_quantized_moe_traffic(request_id) {
+                    Ok(true) => armed += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(error) = failure {
+            let mut rollback = HashSet::new();
+            for (key, kernel) in &mut self.entries {
+                if rollback.insert(key.node) {
+                    let _ = kernel.disarm_block_quantized_moe_traffic();
+                }
+            }
+            return Err(error.into());
+        }
+        self.block_quantized_moe_traffic_request = (armed != 0).then_some(request_id);
+        Ok(armed)
+    }
+
+    pub(super) fn reset_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        let mut visited = HashSet::new();
+        for (key, kernel) in &mut self.entries {
+            if visited.insert(key.node) {
+                kernel.reset_block_quantized_moe_traffic()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn snapshot_block_quantized_moe_traffic(
+        &self,
+    ) -> Result<onnx_runtime_ep_api::BlockQuantizedMoeTraffic> {
+        let mut visited = HashSet::new();
+        let mut total = onnx_runtime_ep_api::BlockQuantizedMoeTraffic::default();
+        let mut physical_dram_bytes = 0_u64;
+        let mut physical_complete = true;
+        let mut observed = false;
+        for (key, kernel) in &self.entries {
+            if !visited.insert(key.node) {
+                continue;
+            }
+            let Some(snapshot) = kernel.snapshot_block_quantized_moe_traffic()? else {
+                continue;
+            };
+            observed = true;
+            total.uploaded_whole_bank_bytes = total
+                .uploaded_whole_bank_bytes
+                .checked_add(snapshot.uploaded_whole_bank_bytes)
+                .ok_or_else(|| SessionError::Internal("uploaded BQMoE bytes overflow".into()))?;
+            total.committed_whole_bank_bytes = total
+                .committed_whole_bank_bytes
+                .checked_add(snapshot.committed_whole_bank_bytes)
+                .ok_or_else(|| SessionError::Internal("committed BQMoE bytes overflow".into()))?;
+            total.logical_route_demand_bytes = total
+                .logical_route_demand_bytes
+                .checked_add(snapshot.logical_route_demand_bytes)
+                .ok_or_else(|| SessionError::Internal("logical BQMoE bytes overflow".into()))?;
+            total.unique_selected_expert_bytes = total
+                .unique_selected_expert_bytes
+                .checked_add(snapshot.unique_selected_expert_bytes)
+                .ok_or_else(|| SessionError::Internal("unique BQMoE bytes overflow".into()))?;
+            total.page_ins = total
+                .page_ins
+                .checked_add(snapshot.page_ins)
+                .ok_or_else(|| SessionError::Internal("BQMoE page-ins overflow".into()))?;
+            match snapshot.physical_dram_bytes {
+                Some(bytes) => {
+                    physical_dram_bytes =
+                        physical_dram_bytes.checked_add(bytes).ok_or_else(|| {
+                            SessionError::Internal("physical BQMoE bytes overflow".into())
+                        })?;
+                }
+                None => physical_complete = false,
+            }
+        }
+        total.physical_dram_bytes = (observed && physical_complete).then_some(physical_dram_bytes);
+        total.byte_hit_rate = total.physical_dram_bytes.and_then(|physical| {
+            (total.logical_route_demand_bytes != 0)
+                .then(|| 1.0 - (physical as f64 / total.logical_route_demand_bytes as f64).min(1.0))
+        });
+        Ok(total)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub(super) fn inject_block_quantized_moe_traffic_fault_for_test(
+        &self,
+        fault: onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoeTrafficFaultForTest,
+    ) -> Result<()> {
+        let mut visited = HashSet::new();
+        let mut injected = 0usize;
+        for (key, kernel) in &self.entries {
+            if !visited.insert(key.node) {
+                continue;
+            }
+            let Some(kernel) = kernel
+                .as_any()
+                .downcast_ref::<onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoEKernel>()
+            else {
+                continue;
+            };
+            kernel.inject_route_telemetry_fault_for_test(fault)?;
+            injected += 1;
+        }
+        if injected == 0 {
+            return Err(SessionError::Internal(
+                "no CUDA BlockQuantizedMoE kernel was available for traffic fault injection".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn disarm_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        let mut visited = HashSet::new();
+        for (key, kernel) in &mut self.entries {
+            if visited.insert(key.node) {
+                kernel.disarm_block_quantized_moe_traffic()?;
+            }
+        }
+        self.block_quantized_moe_traffic_request = None;
+        Ok(())
+    }
+
     /// Next logical tick.
     fn tick(&self) -> u64 {
         self.clock.fetch_add(1, Ordering::Relaxed)
@@ -797,7 +966,12 @@ impl KernelCache {
     /// workspace this eviction is about to free, and replaying it afterwards
     /// would read freed device memory. Resetting is what the device-binding drop
     /// path already does for the same reason.
-    fn evict_surplus_variants(&mut self, node: u32, ep: &dyn ExecutionProvider) {
+    fn evict_surplus_variants(
+        &mut self,
+        node: u32,
+        ep: &dyn ExecutionProvider,
+        graph_tokens: [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT],
+    ) -> Result<()> {
         let bound = variants_per_node();
         let mut variants = self
             .entries
@@ -813,7 +987,7 @@ impl KernelCache {
             })
             .collect::<Vec<_>>();
         if variants.len() <= bound {
-            return;
+            return Ok(());
         }
         variants.sort_by_key(|(used, _)| *used);
         let surplus = variants.len() - bound;
@@ -822,13 +996,15 @@ impl KernelCache {
         // (M=1 decode) and Verify (M=K speculative) slots here — resetting an
         // empty slot is a cheap no-op. This keeps the eviction path slot-correct
         // without threading the caller's active slot through the whole cache API.
-        let _ = ep.reset_device_graph_in(DeviceGraphSlot::Primary);
-        let _ = ep.reset_device_graph_in(DeviceGraphSlot::Verify);
+        for token in graph_tokens.into_iter().flatten() {
+            ep.reset_owned_device_graph(token)?;
+        }
         for (_, key) in variants.into_iter().take(surplus) {
             self.entries.remove(&key);
             self.last_used.remove(&key);
             self.evictions += 1;
         }
+        Ok(())
     }
 
     pub(super) fn stats(&self) -> CacheStats {
@@ -866,6 +1042,11 @@ impl KernelCache {
         Some(kernel)
     }
 
+    #[inline]
+    pub(super) fn has_prebound(&self, binding: &KernelKey, input_shapes: &[Vec<usize>]) -> bool {
+        binding.matches_shapes(input_shapes) && self.entries.contains_key(binding)
+    }
+
     /// Return the cached kernel for `(node, resolved_input_shapes)`, verifying
     /// EP support and compiling+inserting it on a miss. Also returns the
     /// [`KernelKey`] so the caller can store it as a pre-binding for future
@@ -881,9 +1062,11 @@ impl KernelCache {
         input_shapes: &[Vec<usize>],
         input_dtypes: &[DataType],
         constant_inputs: &[bool],
+        constant_values: &[Option<KernelConstantInput<'_>>],
         opset: u64,
         capture_seq_independent: bool,
         ep: &dyn ExecutionProvider,
+        graph_tokens: [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT],
     ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
         let key = KernelKey {
             node: node_id.0,
@@ -892,6 +1075,11 @@ impl KernelCache {
         if self.entries.contains_key(&key) {
             self.hits += 1;
         } else {
+            let shared_constant_state = self
+                .entries
+                .iter()
+                .find(|(existing, _)| existing.node == key.node)
+                .and_then(|(_, kernel)| kernel.shareable_constant_state());
             // Verify the EP claims this op at these concrete shapes/layouts
             // before compiling — same gate the static path used at build.
             let shape_dims: Vec<Shape> = input_shapes
@@ -932,12 +1120,23 @@ impl KernelCache {
                 Err(error) => return Err(error.into()),
             };
             kernel.set_constant_inputs(constant_inputs);
+            let adopted = if let Some(state) = shared_constant_state {
+                kernel.adopt_shareable_constant_state(state)?
+            } else {
+                false
+            };
+            if !adopted {
+                kernel.prepare_constant_inputs(constant_values, ep)?;
+            }
+            if !adopted && let Some(request_id) = self.block_quantized_moe_traffic_request {
+                kernel.arm_block_quantized_moe_traffic(request_id)?;
+            }
             kernel.set_capture_seq_independent(capture_seq_independent);
             self.entries.insert(key.clone(), kernel);
             self.last_used
                 .insert(key.clone(), AtomicU64::new(self.tick()));
             self.misses += 1;
-            self.evict_surplus_variants(key.node, ep);
+            self.evict_surplus_variants(key.node, ep, graph_tokens)?;
         }
         self.touch(&key);
         #[cfg(test)]

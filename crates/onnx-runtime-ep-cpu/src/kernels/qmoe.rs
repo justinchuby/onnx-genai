@@ -1426,7 +1426,7 @@ impl<'a> QuantizedExperts<'a> {
             .map(|points| catalog_for(points, out_features, zero_point_bytes, zero_point_elements));
         let mapped_region = |view: &TensorView| match view.backing {
             TensorBacking::ExternalMmap(region) => Some(region),
-            TensorBacking::Opaque => None,
+            TensorBacking::Opaque | TensorBacking::Sealed { .. } => None,
         };
         let pageable = prefer_mmap
             && packed_catalog.is_pageable()
