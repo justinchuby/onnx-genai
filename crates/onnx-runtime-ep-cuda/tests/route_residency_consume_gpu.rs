@@ -69,7 +69,7 @@ use onnx_runtime_ep_cuda::kernels::expert_route_telemetry::{
     TelemetrySnapshot, consume_and_validate, cpu_bitmap,
 };
 use onnx_runtime_ep_cuda::route_residency::{
-    RouteWindowConsumeOutcome, consume_route_window_at_boundary,
+    RouteTelemetryGeometry, RouteWindowConsumeOutcome, consume_route_window_at_boundary,
 };
 use onnx_runtime_ep_cuda::weight_paging::CudaWeightResidency;
 use onnx_runtime_ir::{DataType, NodeId, ValueId, WeightRef};
@@ -114,6 +114,11 @@ fn consume_route_window_with_faults(
         expected_epoch,
         expected_request,
         expected_device,
+        RouteTelemetryGeometry {
+            num_experts: snapshot.num_experts,
+            routes_per_row: usize::try_from(snapshot.routes_per_row)
+                .expect("test route width fits usize"),
+        },
         bank_values,
         boundary,
         catalogs,
@@ -290,6 +295,16 @@ fn window_snapshot(
     request: u32,
     device: u32,
 ) -> TelemetrySnapshot {
+    let routes_per_row = route_lists
+        .iter()
+        .find(|routes| !routes.is_empty())
+        .map_or(1, |routes| routes.len());
+    assert!(
+        route_lists
+            .iter()
+            .all(|routes| routes.is_empty() || routes.len() == routes_per_row),
+        "a telemetry window must use one prepared routes-per-row contract"
+    );
     let mut bitmap = vec![0u32; num_experts.div_ceil(32)];
     let mut poison = false;
     let mut count: u32 = 0;
@@ -314,6 +329,7 @@ fn window_snapshot(
         header,
         bitmap,
         num_experts,
+        routes_per_row: u32::try_from(routes_per_row).unwrap(),
     }
 }
 
@@ -401,6 +417,10 @@ fn disabled_gate_is_structural_no_op() {
         1,
         7,
         runtime.ordinal(),
+        RouteTelemetryGeometry {
+            num_experts: n_experts,
+            routes_per_row: 2,
+        },
         &[value],
         LazyWeightBoundary::QMoe,
         &catalogs,
@@ -495,7 +515,9 @@ fn route_window_hot_set_transitions_cold_experts() {
             &snapshot.bitmap,
             1,
             request,
-            runtime.ordinal()
+            runtime.ordinal(),
+            n_experts,
+            usize::try_from(snapshot.routes_per_row).unwrap(),
         ),
         RouteDecision::HotSet(_)
     ));
@@ -520,6 +542,10 @@ fn route_window_hot_set_transitions_cold_experts() {
         1,
         request,
         runtime.ordinal(),
+        RouteTelemetryGeometry {
+            num_experts: n_experts,
+            routes_per_row: 2,
+        },
         &[value],
         LazyWeightBoundary::QMoe,
         &catalogs,
@@ -654,6 +680,10 @@ fn expert_group_transitions_atomically_from_window() {
         1,
         request,
         runtime.ordinal(),
+        RouteTelemetryGeometry {
+            num_experts: n_experts,
+            routes_per_row: 2,
+        },
         &[value_fc1, value_fc2],
         LazyWeightBoundary::QMoe,
         &catalogs,
@@ -769,6 +799,10 @@ fn active_capture_and_multi_device_reject_consume() {
         1,
         request,
         runtime.ordinal(),
+        RouteTelemetryGeometry {
+            num_experts: n_experts,
+            routes_per_row: 2,
+        },
         &[value],
         LazyWeightBoundary::QMoe,
         &catalogs,
@@ -795,6 +829,10 @@ fn active_capture_and_multi_device_reject_consume() {
         1,
         request,
         runtime.ordinal(),
+        RouteTelemetryGeometry {
+            num_experts: n_experts,
+            routes_per_row: 2,
+        },
         &[value],
         LazyWeightBoundary::QMoe,
         &catalogs,
@@ -924,6 +962,10 @@ fn foreign_identity_and_defective_windows_fail_closed() {
             *exp_epoch,
             *exp_req,
             *exp_dev,
+            RouteTelemetryGeometry {
+                num_experts: n_experts,
+                routes_per_row: 2,
+            },
             &[value],
             LazyWeightBoundary::QMoe,
             &catalogs,
@@ -1022,7 +1064,13 @@ fn injected_fault_rolls_back_consumer_transition() {
     };
 
     let request = 7_u32;
-    let snapshot = window_snapshot(&[&[0, 2], &[2]], n_experts, 1, request, runtime.ordinal());
+    let snapshot = window_snapshot(
+        &[&[0, 2], &[0, 2]],
+        n_experts,
+        1,
+        request,
+        runtime.ordinal(),
+    );
     assert_eq!(snapshot.routed_experts(), vec![0, 2]);
     let faults = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 3));
     let mut phase8_faults: HashMap<ValueId, Arc<DriverFaultPlan>> = HashMap::new();

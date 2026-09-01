@@ -100,7 +100,7 @@ use onnx_runtime_ep_api::{
     LazyWeightBoundary, ResidencyPlan, Result, RouteResidencyInstallState,
     StaticProfileResidencyPolicy, expert_weight_groups, plan_residency,
 };
-use onnx_runtime_ir::{Graph, NodeId, ValueId};
+use onnx_runtime_ir::{Attribute, Graph, NodeId, ValueId};
 use onnx_runtime_loader::WeightRegionCatalog;
 
 use crate::coarse_residency::{BoundaryApplicationOutcome, coarse_residency_profile_enabled};
@@ -189,6 +189,7 @@ fn prepare_route_window(
     expected_epoch: u32,
     expected_request: u32,
     expected_device: u32,
+    geometry: RouteTelemetryGeometry,
     bank_values: &[ValueId],
     boundary: LazyWeightBoundary,
     catalogs: &HashMap<ValueId, WeightRegionCatalog>,
@@ -217,6 +218,8 @@ fn prepare_route_window(
         expected_epoch,
         expected_request,
         expected_device,
+        geometry.num_experts,
+        geometry.routes_per_row,
     ) {
         RouteDecision::WholeBank(reason) => {
             return Prepared::Early(RouteWindowConsumeOutcome::WholeBank { reason });
@@ -286,6 +289,7 @@ pub fn consume_route_window_at_boundary(
     expected_epoch: u32,
     expected_request: u32,
     expected_device: u32,
+    geometry: RouteTelemetryGeometry,
     bank_values: &[ValueId],
     boundary: LazyWeightBoundary,
     catalogs: &HashMap<ValueId, WeightRegionCatalog>,
@@ -302,6 +306,7 @@ pub fn consume_route_window_at_boundary(
         expected_epoch,
         expected_request,
         expected_device,
+        geometry,
         bank_values,
         boundary,
         catalogs,
@@ -350,6 +355,7 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
     expected_epoch: u32,
     expected_request: u32,
     expected_device: u32,
+    geometry: RouteTelemetryGeometry,
     bank_values: &[ValueId],
     boundary: LazyWeightBoundary,
     catalogs: &HashMap<ValueId, WeightRegionCatalog>,
@@ -367,6 +373,7 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
         expected_epoch,
         expected_request,
         expected_device,
+        geometry,
         bank_values,
         boundary,
         catalogs,
@@ -440,6 +447,16 @@ pub trait RouteTelemetrySource: Send + Sync {
     fn reset_route_telemetry_boundary(&self) -> Result<()>;
 }
 
+/// Immutable execution geometry registered with a route-telemetry producer.
+///
+/// This authority is derived from the prepared kernel attributes, not from the
+/// mutable telemetry snapshot it validates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteTelemetryGeometry {
+    pub num_experts: usize,
+    pub routes_per_row: usize,
+}
+
 /// One expert-bank value's live allocation inside the production shared VMM
 /// arena. Catalog ranges are value-relative; `base_offset` translates them to
 /// the allocator reservation without creating a second allocator authority.
@@ -454,6 +471,7 @@ pub struct RouteAllocationBinding {
 #[derive(Clone)]
 pub struct RegisteredRouteTelemetrySource {
     pub source: Arc<dyn RouteTelemetrySource>,
+    pub geometry: RouteTelemetryGeometry,
     pub phase: ExpertExecutionPhase,
     pub node_name: String,
     pub expected_epoch: Arc<AtomicU32>,
@@ -473,6 +491,7 @@ impl RouteTelemetryRegistry {
         &self,
         node: NodeId,
         source: Arc<dyn RouteTelemetrySource>,
+        geometry: RouteTelemetryGeometry,
         phase: ExpertExecutionPhase,
         node_name: String,
         expected_epoch: Arc<AtomicU32>,
@@ -480,6 +499,7 @@ impl RouteTelemetryRegistry {
         let mut sources = self.sources.lock().unwrap();
         let unchanged = sources.get(&node).is_some_and(|current| {
             Arc::ptr_eq(&current.source, &source)
+                && current.geometry == geometry
                 && current.phase == phase
                 && current.node_name == node_name
         });
@@ -490,6 +510,7 @@ impl RouteTelemetryRegistry {
             node,
             RegisteredRouteTelemetrySource {
                 source,
+                geometry,
                 phase,
                 node_name,
                 expected_epoch,
@@ -527,6 +548,7 @@ impl RouteTelemetryRegistry {
 /// are loaded and before decode capture.
 pub struct RouteResidencyBoundary {
     source: Arc<dyn RouteTelemetrySource>,
+    geometry: RouteTelemetryGeometry,
     residency: Arc<CudaWeightResidency>,
     bank_values: Vec<ValueId>,
     boundary: LazyWeightBoundary,
@@ -560,6 +582,7 @@ impl RouteResidencyBoundary {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: Arc<dyn RouteTelemetrySource>,
+        geometry: RouteTelemetryGeometry,
         residency: Arc<CudaWeightResidency>,
         bank_values: Vec<ValueId>,
         boundary: LazyWeightBoundary,
@@ -593,6 +616,7 @@ impl RouteResidencyBoundary {
             .collect();
         Self {
             source,
+            geometry,
             residency,
             bank_values,
             boundary,
@@ -619,6 +643,7 @@ impl RouteResidencyBoundary {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_bindings(
         source: Arc<dyn RouteTelemetrySource>,
+        geometry: RouteTelemetryGeometry,
         residency: Arc<CudaWeightResidency>,
         bank_values: Vec<ValueId>,
         boundary: LazyWeightBoundary,
@@ -664,6 +689,7 @@ impl RouteResidencyBoundary {
             .collect();
         Self {
             source,
+            geometry,
             residency,
             bank_values,
             boundary,
@@ -775,8 +801,17 @@ pub fn build_route_residency_boundaries_with_bindings(
             group_catalogs.insert(value, catalog);
             group_bindings.insert(value, binding);
         }
+        let expected_geometry = route_telemetry_geometry(graph, &group, &group_catalogs)?;
+        if registered.geometry != expected_geometry {
+            return Err(RouteResidencyBindingReject::TelemetryGeometryMismatch {
+                node: group.node,
+                expected: expected_geometry,
+                registered: registered.geometry,
+            });
+        }
         let mut boundary = RouteResidencyBoundary::new_with_bindings(
             Arc::clone(&registered.source),
+            registered.geometry,
             Arc::clone(&residency),
             group.members.clone(),
             group.boundary,
@@ -1228,6 +1263,19 @@ pub enum RouteResidencyBindingReject {
     /// A group member weight has no backing VMM allocator — it was not paged/
     /// committed, so the boundary consumer had no allocator to tier against.
     MissingAllocator { value: ValueId },
+    /// Kernel-registered telemetry geometry disagrees with the graph and
+    /// finalized expert-bank catalog that the boundary will consume.
+    TelemetryGeometryMismatch {
+        node: NodeId,
+        expected: RouteTelemetryGeometry,
+        registered: RouteTelemetryGeometry,
+    },
+    /// The graph/catalog pair does not describe a valid top-k route geometry.
+    InvalidTelemetryGeometry {
+        node: NodeId,
+        num_experts: usize,
+        routes_per_row: i64,
+    },
 }
 
 impl RouteResidencyBindingReject {
@@ -1249,8 +1297,59 @@ impl RouteResidencyBindingReject {
             RouteResidencyBindingReject::MissingAllocator { value } => {
                 format!("bank value {value:?} has no VMM allocator")
             }
+            RouteResidencyBindingReject::TelemetryGeometryMismatch {
+                node,
+                expected,
+                registered,
+            } => format!(
+                "expert group node {node:?} registered telemetry geometry {registered:?}, expected \
+                 {expected:?} from graph/catalog"
+            ),
+            RouteResidencyBindingReject::InvalidTelemetryGeometry {
+                node,
+                num_experts,
+                routes_per_row,
+            } => format!(
+                "expert group node {node:?} has invalid telemetry geometry: \
+                 num_experts={num_experts}, routes_per_row={routes_per_row}"
+            ),
         }
     }
+}
+
+fn route_telemetry_geometry(
+    graph: &Graph,
+    group: &ExpertWeightGroup,
+    catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+) -> std::result::Result<RouteTelemetryGeometry, RouteResidencyBindingReject> {
+    let num_experts = group
+        .members
+        .first()
+        .and_then(|value| catalogs.get(value))
+        .map_or(0, |catalog| catalog.layout().experts);
+    let routes_per_row = graph
+        .node(group.node)
+        .attr("k")
+        .and_then(Attribute::as_int)
+        .unwrap_or(1);
+    let Ok(routes_per_row_usize) = usize::try_from(routes_per_row) else {
+        return Err(RouteResidencyBindingReject::InvalidTelemetryGeometry {
+            node: group.node,
+            num_experts,
+            routes_per_row,
+        });
+    };
+    if num_experts == 0 || routes_per_row_usize == 0 || routes_per_row_usize > num_experts {
+        return Err(RouteResidencyBindingReject::InvalidTelemetryGeometry {
+            node: group.node,
+            num_experts,
+            routes_per_row,
+        });
+    }
+    Ok(RouteTelemetryGeometry {
+        num_experts,
+        routes_per_row: routes_per_row_usize,
+    })
 }
 
 /// The outcome of a CUDA-EP attempt to install a production route-residency
@@ -1344,10 +1443,12 @@ pub fn build_route_residency_boundary(
         |value| allocators.contains_key(&value),
     )?;
     let source = Arc::clone(&sources[&group.node]);
+    let geometry = route_telemetry_geometry(graph, &group, &catalogs)?;
     let bank_values = group.members.clone();
     let boundary = group.boundary;
     Ok(RouteResidencyBoundary::new(
         source,
+        geometry,
         residency,
         bank_values,
         boundary,
@@ -1386,10 +1487,12 @@ pub fn build_route_residency_boundary_with_bindings(
         |value| bindings.contains_key(&value),
     )?;
     let source = Arc::clone(&sources[&group.node]);
+    let geometry = route_telemetry_geometry(graph, &group, &catalogs)?;
     let bank_values = group.members.clone();
     let boundary = group.boundary;
     Ok(RouteResidencyBoundary::new_with_bindings(
         source,
+        geometry,
         residency,
         bank_values,
         boundary,
@@ -1750,6 +1853,7 @@ pub fn run_route_residency_boundary(
         binding.expected_epoch(),
         binding.expected_request,
         binding.expected_device,
+        binding.geometry,
         &binding.bank_values,
         binding.boundary,
         &binding.catalogs,
@@ -1899,6 +2003,7 @@ pub fn run_route_residency_boundary_with_phase8_faults(
         binding.expected_epoch(),
         binding.expected_request,
         binding.expected_device,
+        binding.geometry,
         &binding.bank_values,
         binding.boundary,
         &binding.catalogs,
@@ -1946,8 +2051,8 @@ mod binding_tests {
     use onnx_runtime_ir::{DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape};
 
     use super::{
-        RouteResidencyBindingReject, RouteTelemetryRegistry, RouteTelemetrySource,
-        validate_route_residency_binding,
+        RouteResidencyBindingReject, RouteTelemetryGeometry, RouteTelemetryRegistry,
+        RouteTelemetrySource, validate_route_residency_binding,
     };
 
     struct EmptySource;
@@ -2127,6 +2232,10 @@ mod binding_tests {
         registry.activate(
             NodeId(4),
             Arc::clone(&first) as Arc<dyn RouteTelemetrySource>,
+            RouteTelemetryGeometry {
+                num_experts: 4,
+                routes_per_row: 1,
+            },
             ExpertExecutionPhase::Prefill,
             "moe".to_string(),
             Arc::clone(&first_epoch),
@@ -2141,23 +2250,47 @@ mod binding_tests {
         registry.activate(
             NodeId(4),
             Arc::clone(&first) as Arc<dyn RouteTelemetrySource>,
+            RouteTelemetryGeometry {
+                num_experts: 4,
+                routes_per_row: 1,
+            },
             ExpertExecutionPhase::Prefill,
             "moe".to_string(),
             Arc::clone(&first_epoch),
         );
         assert_eq!(registry.snapshot().0, generation);
 
+        let changed_geometry = RouteTelemetryGeometry {
+            num_experts: 4,
+            routes_per_row: 2,
+        };
+        registry.activate(
+            NodeId(4),
+            Arc::clone(&first) as Arc<dyn RouteTelemetrySource>,
+            changed_geometry,
+            ExpertExecutionPhase::Prefill,
+            "moe".to_string(),
+            Arc::clone(&first_epoch),
+        );
+        let (geometry_generation, sources) = registry.snapshot();
+        assert_eq!(geometry_generation, generation + 1);
+        assert_eq!(sources[&NodeId(4)].geometry, changed_geometry);
+
         let decode = Arc::new(EmptySource);
         let decode_epoch = Arc::new(AtomicU32::new(7));
         registry.activate(
             NodeId(4),
             decode as Arc<dyn RouteTelemetrySource>,
+            RouteTelemetryGeometry {
+                num_experts: 4,
+                routes_per_row: 1,
+            },
             ExpertExecutionPhase::Decode,
             "moe".to_string(),
             Arc::clone(&decode_epoch),
         );
         let (next_generation, sources) = registry.snapshot();
-        assert_eq!(next_generation, generation + 1);
+        assert_eq!(next_generation, geometry_generation + 1);
         assert_eq!(sources[&NodeId(4)].phase, ExpertExecutionPhase::Decode);
         assert_eq!(
             sources[&NodeId(4)].expected_epoch.load(Ordering::Acquire),

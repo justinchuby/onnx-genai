@@ -30,15 +30,20 @@ const IQ2_S_BLOCK_BYTES: usize = 82;
 const IQ3_S_BLOCK_BYTES: usize = 110;
 const IQ1_S_BLOCK_BYTES: usize = 50;
 const IQ1_M_BLOCK_BYTES: usize = 56;
+const Q2_K_BLOCK_BYTES: usize = 84;
+const Q3_K_BLOCK_BYTES: usize = 110;
+const Q5_K_BLOCK_BYTES: usize = 176;
+const Q6_K_BLOCK_BYTES: usize = 210;
+const Q8_0_BLOCK_BYTES: usize = 34;
 const BLOCK_THREADS: u32 = 256;
 const GEMM_TILE_M: u32 = 8;
 const CUDA_MAX_GRID_DIM_Y: u32 = 65_535;
 // 4K row tiles saturate the device while keeping the grid-stride path testable.
 const GEMM_GRID_DIM_Y_CAP: u32 = 4_096;
 const _: () = assert!(GEMM_GRID_DIM_Y_CAP <= CUDA_MAX_GRID_DIM_Y);
-const GEMV_MODULE: &str = "block_quantized_matmul_gemv";
+const GEMV_MODULE: &str = "block_quantized_matmul_gemv_v2";
 const GEMV_ENTRY: &str = "block_quantized_matmul_gemv_f32";
-const GEMM_MODULE: &str = "block_quantized_matmul_gemm";
+const GEMM_MODULE: &str = "block_quantized_matmul_gemm_v2";
 const GEMM_ENTRY: &str = "block_quantized_matmul_gemm_f32";
 
 const PREFIX: &str = r#"
@@ -133,16 +138,45 @@ __device__ __forceinline__ float iq1_grid_value(unsigned long long grid, int ele
     return (float)(byte < 128 ? byte : byte - 256);
 }
 
+__device__ __forceinline__ int q3_k_scale(const unsigned char* scales, int index)
+{
+    unsigned char unpacked;
+    if (index < 4) {
+        unpacked = (scales[index] & 15u) | (((scales[index + 8] >> 0) & 3u) << 4);
+    } else if (index < 8) {
+        unpacked = (scales[index] & 15u) | (((scales[index + 4] >> 2) & 3u) << 4);
+    } else if (index < 12) {
+        unpacked = (scales[index - 8] >> 4) | (((scales[index] >> 4) & 3u) << 4);
+    } else {
+        unpacked = (scales[index - 8] >> 4) | (((scales[index - 4] >> 6) & 3u) << 4);
+    }
+    return (int)unpacked - 32;
+}
+
+__device__ __forceinline__ void q4_k_scale_min(
+    const unsigned char* scales,
+    int index,
+    int* scale,
+    int* minimum)
+{
+    if (index < 4) {
+        *scale = scales[index] & 63u;
+        *minimum = scales[index + 4] & 63u;
+    } else {
+        *scale = (scales[index + 4] & 15u) | ((scales[index - 4] >> 6) << 4);
+        *minimum = (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4);
+    }
+}
+
 __device__ __forceinline__ float decode_weight(
     const unsigned char* packed,
     int format,
+    int qk,
     int blocks,
     int block_bytes,
     int column,
     int depth)
 {
-    const int superblock = format >= 2;
-    const int qk = superblock ? 256 : 32;
     const int block = depth / qk;
     const int within = depth - block * qk;
     const unsigned char* data =
@@ -251,6 +285,64 @@ __device__ __forceinline__ float decode_weight(
         return subscale * (iq1_grid_value(iq1s_grid[index], element) + delta);
     }
 
+    if (format == 10) {
+        const int half = within >> 7;
+        const int quarter = (within >> 5) & 3;
+        const int lane = within & 31;
+        const unsigned char packed_scale = data[8 * half + lane / 16 + 2 * quarter];
+        const unsigned char quant = data[16 + 32 * half + lane];
+        const float d = fp16_to_fp32(load_u16_le(data + 80));
+        const float dmin = fp16_to_fp32(load_u16_le(data + 82));
+        return d * (float)(packed_scale & 15u)
+                * (float)((quant >> (2 * quarter)) & 3u)
+            - dmin * (float)(packed_scale >> 4);
+    }
+    if (format == 11) {
+        const int half = within >> 7;
+        const int quarter = (within >> 5) & 3;
+        const int lane = within & 31;
+        const unsigned char low =
+            (data[32 + 32 * half + lane] >> (2 * quarter)) & 3u;
+        const int high = data[lane] & (1u << (4 * half + quarter));
+        const int quant = high ? (int)low : (int)low - 4;
+        const int scale_index = 8 * half + 2 * quarter + lane / 16;
+        const float d = fp16_to_fp32(load_u16_le(data + 108));
+        return d * (float)q3_k_scale(data + 96, scale_index) * (float)quant;
+    }
+    if (format == 12) {
+        const int quarter = within >> 6;
+        const int lane = within & 31;
+        const int upper = (within >> 5) & 1;
+        const unsigned char packed_quant = data[48 + 32 * quarter + lane];
+        const unsigned char high = data[16 + lane];
+        const int quant = (upper ? packed_quant >> 4 : packed_quant & 15u)
+            + ((high & (1u << (2 * quarter + upper))) ? 16 : 0);
+        int scale_factor;
+        int minimum;
+        q4_k_scale_min(data + 4, 2 * quarter + upper, &scale_factor, &minimum);
+        const float d = fp16_to_fp32(load_u16_le(data));
+        const float dmin = fp16_to_fp32(load_u16_le(data + 2));
+        return d * (float)scale_factor * (float)quant - dmin * (float)minimum;
+    }
+    if (format == 13) {
+        const int half = within >> 7;
+        const int quarter = (within >> 5) & 3;
+        const int lane = within & 31;
+        const unsigned char packed_quant =
+            data[64 * half + 32 * (quarter & 1) + lane];
+        const unsigned char low =
+            quarter < 2 ? packed_quant & 15u : packed_quant >> 4;
+        const unsigned char high = data[128 + 32 * half + lane];
+        const int quant = (int)(low | (((high >> (2 * quarter)) & 3u) << 4)) - 32;
+        const int scale_factor =
+            (int)((signed char)data[192 + 8 * half + lane / 16 + 2 * quarter]);
+        const float d = fp16_to_fp32(load_u16_le(data + 208));
+        return d * (float)scale_factor * (float)quant;
+    }
+    if (format == 14) {
+        return fp16_to_fp32(load_u16_le(data)) * (float)((signed char)data[2 + within]);
+    }
+
     const unsigned short packed_scale0 = load_u16_le(data + 48);
     const unsigned short packed_scale1 = load_u16_le(data + 50);
     const unsigned short packed_scale2 = load_u16_le(data + 52);
@@ -308,6 +400,7 @@ extern "C" __global__ void block_quantized_matmul_gemv_f32(
     const int n,
     const int blocks,
     const int block_bytes,
+    const int qk,
     const int format)
 {
     const int column = (int)blockIdx.x;
@@ -318,7 +411,7 @@ extern "C" __global__ void block_quantized_matmul_gemv_f32(
     float value = 0.0f;
     for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
         value += activation[depth]
-            * decode_weight(packed, format, blocks, block_bytes, column, depth);
+            * decode_weight(packed, format, qk, blocks, block_bytes, column, depth);
     }
     value = block_sum(value);
     if (threadIdx.x == 0) {
@@ -338,6 +431,7 @@ extern "C" __global__ void block_quantized_matmul_gemm_f32(
     const int n,
     const int blocks,
     const int block_bytes,
+    const int qk,
     const int format)
 {
     const int column = (int)blockIdx.x;
@@ -354,7 +448,7 @@ extern "C" __global__ void block_quantized_matmul_gemm_f32(
         float values[GEMM_TILE_M] = {0.0f};
         for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
             const float weight =
-                decode_weight(packed, format, blocks, block_bytes, column, depth);
+                decode_weight(packed, format, qk, blocks, block_bytes, column, depth);
 #pragma unroll
             for (int row = 0; row < GEMM_TILE_M; ++row) {
                 const unsigned long long row_index = row_base + (unsigned long long)row;
@@ -479,6 +573,11 @@ pub(crate) enum BlockFormat {
     Iq3S,
     Iq1S,
     Iq1M,
+    Q2K,
+    Q3K,
+    Q5K,
+    Q6K,
+    Q8_0,
 }
 
 impl BlockFormat {
@@ -494,8 +593,13 @@ impl BlockFormat {
             "iq3_s" => Ok(Self::Iq3S),
             "iq1_s" => Ok(Self::Iq1S),
             "iq1_m" => Ok(Self::Iq1M),
+            "q2_k" => Ok(Self::Q2K),
+            "q3_k" => Ok(Self::Q3K),
+            "q5_k" => Ok(Self::Q5K),
+            "q6_k" => Ok(Self::Q6K),
+            "q8_0" => Ok(Self::Q8_0),
             other => Err(error(format!(
-                "format '{other}' is unsupported by CUDA; supported formats are mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, and iq1_m"
+                "format '{other}' is unsupported by CUDA; supported formats are mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, iq1_m, q2_k, q3_k, q5_k, q6_k, and q8_0"
             ))),
         }
     }
@@ -510,7 +614,12 @@ impl BlockFormat {
             | Self::Iq2S
             | Self::Iq3S
             | Self::Iq1S
-            | Self::Iq1M => IQ_SUPER_QK,
+            | Self::Iq1M
+            | Self::Q2K
+            | Self::Q3K
+            | Self::Q5K
+            | Self::Q6K => IQ_SUPER_QK,
+            Self::Q8_0 => SMALL_QK,
         }
     }
 
@@ -526,6 +635,11 @@ impl BlockFormat {
             Self::Iq3S => IQ3_S_BLOCK_BYTES,
             Self::Iq1S => IQ1_S_BLOCK_BYTES,
             Self::Iq1M => IQ1_M_BLOCK_BYTES,
+            Self::Q2K => Q2_K_BLOCK_BYTES,
+            Self::Q3K => Q3_K_BLOCK_BYTES,
+            Self::Q5K => Q5_K_BLOCK_BYTES,
+            Self::Q6K => Q6_K_BLOCK_BYTES,
+            Self::Q8_0 => Q8_0_BLOCK_BYTES,
         }
     }
 
@@ -541,6 +655,11 @@ impl BlockFormat {
             Self::Iq3S => 7,
             Self::Iq1S => 8,
             Self::Iq1M => 9,
+            Self::Q2K => 10,
+            Self::Q3K => 11,
+            Self::Q5K => 12,
+            Self::Q6K => 13,
+            Self::Q8_0 => 14,
         }
     }
 }
@@ -628,6 +747,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
         let grid_x = as_grid_x("N", n)?;
         let blocks = as_i32("block count", blocks)?;
         let block_bytes = as_i32("block byte count", self.format.block_bytes())?;
+        let qk = as_i32("block element count", self.format.qk())?;
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let mut flops = (m as u64)
                 .saturating_mul(self.n as u64)
@@ -664,6 +784,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
                 .arg(&n)
                 .arg(&blocks)
                 .arg(&block_bytes)
+                .arg(&qk)
                 .arg(&format);
             // SAFETY: all tensors are dense and shape-checked, and the scalar ABI
             // matches `block_quantized_matmul_gemv_f32`.
@@ -692,13 +813,14 @@ impl Kernel for BlockQuantizedMatMulKernel {
                 .arg(&n)
                 .arg(&blocks)
                 .arg(&block_bytes)
+                .arg(&qk)
                 .arg(&format);
             // SAFETY: all tensors are dense and shape-checked, and the scalar ABI
             // matches `block_quantized_matmul_gemm_f32`.
             unsafe { builder.launch(launch_config) }
                 .map_err(|err| driver_err("launch BlockQuantizedMatMul GEMM", err))?;
         }
-        self.runtime.synchronize()
+        Ok(())
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -706,9 +828,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "block-quantized MatMul performs a trailing host stream synchronization",
-        )
+        onnx_runtime_ep_api::CaptureSupport::Supported
     }
 }
 
@@ -724,7 +844,7 @@ pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
         },
         None => {
             return Some(Cow::Borrowed(
-                "BlockQuantizedMatMul: missing required string attribute 'format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m",
+                "BlockQuantizedMatMul: missing required string attribute 'format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, iq1_m, q2_k, q3_k, q5_k, q6_k, or q8_0",
             ));
         }
     };
@@ -740,9 +860,14 @@ pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
             | "iq3_s"
             | "iq1_s"
             | "iq1_m"
+            | "q2_k"
+            | "q3_k"
+            | "q5_k"
+            | "q6_k"
+            | "q8_0"
     ) {
         return Some(Cow::Owned(format!(
-            "BlockQuantizedMatMul: CUDA does not support format '{format}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m"
+            "BlockQuantizedMatMul: CUDA does not support format '{format}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, iq1_m, q2_k, q3_k, q5_k, q6_k, or q8_0"
         )));
     }
     if let Some(attribute) = node.attr("block_layout_version") {

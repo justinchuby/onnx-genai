@@ -14,6 +14,9 @@
 )]
 //! GPU conformance checks for CUDA data-movement and metadata kernels.
 
+mod common;
+
+use common::reset_capture_error_for_isolated_test;
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
 };
@@ -295,7 +298,7 @@ fn captured_gather_and_reduce_axes_latch_dynamic_bounds_changes() {
         0
     );
     assert!(runtime.reset_graph().unwrap());
-    runtime.reset_capture_error().unwrap();
+    reset_capture_error_for_isolated_test(runtime).unwrap();
 
     let mut reduce_graph = Graph::new();
     reduce_graph.opset_imports.insert(String::new(), 13);
@@ -368,7 +371,7 @@ fn captured_gather_and_reduce_axes_latch_dynamic_bounds_changes() {
         0
     );
     assert!(runtime.reset_graph().unwrap());
-    runtime.reset_capture_error().unwrap();
+    reset_capture_error_for_isolated_test(runtime).unwrap();
 
     for buffer in [
         data_buffer,

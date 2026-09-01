@@ -55,8 +55,9 @@ fn cpu_oracle_and_validator_self_consistent() {
     header[H_EPOCH] = 5;
     header[H_REQUEST] = 7;
     header[H_DEVICE] = 3;
+    header[5] = routes.len() as u32;
     assert!(matches!(
-        consume_and_validate(&header, &bits, 5, 7, 3),
+        consume_and_validate(&header, &bits, 5, 7, 3, num_experts as usize),
         Decision::HotSet(_)
     ));
     for (idx, val, label) in [(H_POISON, 1, "poison"), (H_OVERFLOW, 1, "overflow")] {
@@ -64,7 +65,7 @@ fn cpu_oracle_and_validator_self_consistent() {
         bad[idx] = val;
         assert!(
             matches!(
-                consume_and_validate(&bad, &bits, 5, 7, 3),
+                consume_and_validate(&bad, &bits, 5, 7, 3, num_experts as usize),
                 Decision::WholeBank(_)
             ),
             "{label} must fail closed"
@@ -72,21 +73,21 @@ fn cpu_oracle_and_validator_self_consistent() {
     }
     assert!(
         matches!(
-            consume_and_validate(&header, &bits, 5, 999, 3),
+            consume_and_validate(&header, &bits, 5, 999, 3, num_experts as usize),
             Decision::WholeBank(_)
         ),
         "request mismatch"
     );
     assert!(
         matches!(
-            consume_and_validate(&header, &bits, 5, 7, 999),
+            consume_and_validate(&header, &bits, 5, 7, 999, num_experts as usize),
             Decision::WholeBank(_)
         ),
         "device mismatch"
     );
     assert!(
         matches!(
-            consume_and_validate(&header, &bits, 6, 7, 3),
+            consume_and_validate(&header, &bits, 6, 7, 3, num_experts as usize),
             Decision::WholeBank(_)
         ),
         "stale epoch"

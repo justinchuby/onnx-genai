@@ -61,6 +61,7 @@
 
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{EpError, Result};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::runtime::CudaRuntime;
 
@@ -154,9 +155,23 @@ __device__ __forceinline__ void route_telemetry_mark_row(
             route_telemetry_bitmap, route_telemetry_header, indices[slot], experts);
     }
     if (valid != 0u) {
-        unsigned int prev = atomicAdd(&route_telemetry_header[5], valid);
-        if (prev + valid < prev) {
-            atomicOr(&route_telemetry_header[3], 1u); // count saturated (overflow)
+        unsigned int* count = &route_telemetry_header[5];
+        unsigned int observed = atomicAdd(count, 0u);
+        for (;;) {
+            if (observed == 0xffffffffu) {
+                atomicOr(&route_telemetry_header[3], 1u);
+                break;
+            }
+            bool overflow = valid > 0xffffffffu - observed;
+            unsigned int desired = overflow ? 0xffffffffu : observed + valid;
+            unsigned int prior = atomicCAS(count, observed, desired);
+            if (prior == observed) {
+                if (overflow) {
+                    atomicOr(&route_telemetry_header[3], 1u);
+                }
+                break;
+            }
+            observed = prior;
         }
     }
 }
@@ -180,6 +195,8 @@ pub struct RouteTelemetryConfig {
     pub device_id: u32,
     /// Number of experts; fixes the bitmap capacity (bits) for this arming.
     pub num_experts: usize,
+    /// Number of selected experts contributed by every clean routed row.
+    pub routes_per_row: usize,
 }
 
 /// Typed reason telemetry could not be armed. Arming returns this instead of
@@ -190,8 +207,18 @@ pub enum TelemetryUnsupported {
     DeviceMismatch { config: u32, runtime: u32 },
     /// `num_experts` was zero — no bitmap capacity is representable.
     ZeroExperts,
+    /// The execution contract cannot select zero experts or more experts than
+    /// the admitted expert domain for one row.
+    InvalidRoutesPerRow {
+        routes_per_row: usize,
+        num_experts: usize,
+    },
+    /// The arming request disagrees with the kernel's prepared top-k contract.
+    RouteWidthMismatch { config: usize, execution: usize },
     /// The device buffer could not be allocated (message carried for the log).
     Alloc(String),
+    /// Reconfiguration would invalidate pointers embedded in an installed graph.
+    GraphInstalled,
 }
 
 impl std::fmt::Display for TelemetryUnsupported {
@@ -202,7 +229,24 @@ impl std::fmt::Display for TelemetryUnsupported {
                 "route telemetry device mismatch: config device {config} != runtime device {runtime} (multi-device fails closed)"
             ),
             Self::ZeroExperts => write!(f, "route telemetry requires num_experts > 0"),
+            Self::InvalidRoutesPerRow {
+                routes_per_row,
+                num_experts,
+            } => write!(
+                f,
+                "route telemetry requires 0 < routes_per_row <= num_experts, got \
+                 routes_per_row={routes_per_row} and num_experts={num_experts}"
+            ),
+            Self::RouteWidthMismatch { config, execution } => write!(
+                f,
+                "route telemetry routes_per_row={config} does not match the prepared execution \
+                 contract {execution}; re-arm with the kernel's actual selected-expert width"
+            ),
             Self::Alloc(message) => write!(f, "route telemetry buffer alloc failed: {message}"),
+            Self::GraphInstalled => write!(
+                f,
+                "route telemetry must be configured before device-graph capture"
+            ),
         }
     }
 }
@@ -223,13 +267,14 @@ pub(crate) struct ArmedTelemetry {
     request_id: u32,
     device_id: u32,
     num_experts: usize,
+    routes_per_row: u32,
     words: usize,
     bitmap: CUdeviceptr,
     header: CUdeviceptr,
     /// Host-side window/epoch counter. Stamped into `header[H_EPOCH]` at arm
     /// (window 1) and at every `reset_boundary`; held fixed for the whole
     /// window. There is no device epoch counter and no reset kernel.
-    epoch: u32,
+    epoch: AtomicU32,
     bitmap_bytes: usize,
 }
 
@@ -255,6 +300,18 @@ impl ArmedTelemetry {
         if config.num_experts == 0 {
             return Err(TelemetryUnsupported::ZeroExperts);
         }
+        if config.routes_per_row == 0 || config.routes_per_row > config.num_experts {
+            return Err(TelemetryUnsupported::InvalidRoutesPerRow {
+                routes_per_row: config.routes_per_row,
+                num_experts: config.num_experts,
+            });
+        }
+        let routes_per_row = u32::try_from(config.routes_per_row).map_err(|_| {
+            TelemetryUnsupported::InvalidRoutesPerRow {
+                routes_per_row: config.routes_per_row,
+                num_experts: config.num_experts,
+            }
+        })?;
 
         let words = words_for(config.num_experts);
         let bitmap_bytes = words * 4;
@@ -276,11 +333,12 @@ impl ArmedTelemetry {
             request_id: config.request_id,
             device_id: config.device_id,
             num_experts: config.num_experts,
+            routes_per_row,
             words,
             bitmap,
             header,
             // Arm opens window 1. `reset_boundary` bumps this to 2, 3, ...
-            epoch: 1,
+            epoch: AtomicU32::new(1),
             bitmap_bytes,
         };
         // Open the first window: stamp identity + epoch 1 and zero the record.
@@ -296,8 +354,14 @@ impl ArmedTelemetry {
     /// `htod`; only ever called at arm or at an explicit boundary, never on the
     /// execute/replay path and never during capture.
     fn open_window(&self, runtime: &CudaRuntime) -> Result<()> {
-        let header_words: [u32; HEADER_LEN] =
-            [self.epoch, self.request_id, self.device_id, 0, 0, 0];
+        let header_words: [u32; HEADER_LEN] = [
+            self.epoch.load(Ordering::Relaxed),
+            self.request_id,
+            self.device_id,
+            0,
+            0,
+            0,
+        ];
         let mut header_bytes = [0u8; HEADER_BYTES];
         for (word, chunk) in header_words.iter().zip(header_bytes.chunks_exact_mut(4)) {
             chunk.copy_from_slice(&word.to_ne_bytes());
@@ -329,8 +393,8 @@ impl ArmedTelemetry {
     ///   `drain_for_unmap` drain authority, so the host zeroing can never race a
     ///   route kernel still accumulating into the record.
     ///
-    /// It allocates nothing, moves no pointer, and touches no PMM/VMM/cache.
-    pub(crate) fn reset_boundary(&mut self, runtime: &CudaRuntime) -> Result<()> {
+    /// It moves no pointer and touches no PMM/VMM/cache.
+    pub(crate) fn reset_boundary(&self, runtime: &CudaRuntime) -> Result<()> {
         if runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
                 "cuda_ep: route telemetry boundary reset is illegal during graph capture/replay \
@@ -341,7 +405,15 @@ impl ArmedTelemetry {
         // Order the reset after all prior EP-stream work (the fused marks of the
         // window being closed) using the existing drain authority.
         runtime.drain_for_unmap()?;
-        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: route telemetry epoch overflow; re-arm the observer".into(),
+                )
+            })?;
         self.open_window(runtime)
     }
 
@@ -398,7 +470,67 @@ impl ArmedTelemetry {
             header,
             bitmap,
             num_experts: self.num_experts,
+            routes_per_row: self.routes_per_row,
         })
+    }
+
+    /// Read and validate the complete record against this immutable arming.
+    pub(crate) fn validated_snapshot(
+        &self,
+        runtime: &CudaRuntime,
+    ) -> Result<ValidatedTelemetrySnapshot> {
+        let snapshot = self.snapshot(runtime)?;
+        match consume_and_validate(
+            &snapshot.header,
+            &snapshot.bitmap,
+            self.epoch.load(Ordering::Acquire),
+            self.request_id,
+            self.device_id,
+            self.num_experts,
+            usize::try_from(self.routes_per_row).expect("u32 routes-per-row fits usize"),
+        ) {
+            RouteDecision::HotSet(_) => {
+                let unique_expert_count = snapshot
+                    .bitmap
+                    .iter()
+                    .try_fold(0_u32, |total, word| total.checked_add(word.count_ones()))
+                    .ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "cuda_ep: validated route telemetry unique-expert count overflow"
+                                .into(),
+                        )
+                    })?;
+                Ok(ValidatedTelemetrySnapshot {
+                    selected_route_count: snapshot.count(),
+                    unique_expert_count,
+                })
+            }
+            RouteDecision::WholeBank(reason) => Err(EpError::KernelFailed(format!(
+                "cuda_ep: invalid BlockQuantizedMoE traffic record: {reason}"
+            ))),
+        }
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub(crate) fn inject_header_word(
+        &self,
+        runtime: &CudaRuntime,
+        index: usize,
+        value: u32,
+    ) -> Result<()> {
+        if index >= HEADER_LEN {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: telemetry test header index {index} is out of range"
+            )));
+        }
+        let byte_offset = index.checked_mul(4).ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep: telemetry test header offset overflow".into())
+        })?;
+        let destination = self.header.checked_add(byte_offset as u64).ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep: telemetry test header address overflow".into())
+        })?;
+        // SAFETY: `destination` names one u32 word within the live header.
+        unsafe { runtime.htod(&value.to_ne_bytes(), destination) }
     }
 
     /// Best-effort free. Drains in-flight launches first (a captured/eager route
@@ -430,6 +562,8 @@ pub struct TelemetrySnapshot {
     pub bitmap: Vec<u32>,
     /// Expert count the bitmap was sized for.
     pub num_experts: usize,
+    /// Number of selected experts every clean routed row contributes.
+    pub routes_per_row: u32,
 }
 
 impl TelemetrySnapshot {
@@ -458,6 +592,21 @@ impl TelemetrySnapshot {
     /// True iff the sticky overflow (counter-saturation) bit is set.
     pub fn overflow(&self) -> bool {
         self.header[H_OVERFLOW] != 0
+    }
+}
+
+pub(crate) struct ValidatedTelemetrySnapshot {
+    selected_route_count: u32,
+    unique_expert_count: u32,
+}
+
+impl ValidatedTelemetrySnapshot {
+    pub(crate) fn selected_route_count(&self) -> u32 {
+        self.selected_route_count
+    }
+
+    pub(crate) fn unique_expert_count(&self) -> u32 {
+        self.unique_expert_count
     }
 }
 
@@ -498,7 +647,28 @@ pub fn consume_and_validate(
     expected_epoch: u32,
     expected_request: u32,
     expected_device: u32,
+    expected_num_experts: usize,
+    expected_routes_per_row: usize,
 ) -> RouteDecision {
+    if header.len() != HEADER_LEN {
+        return RouteDecision::WholeBank(format!(
+            "header length mismatch: record={} expected {HEADER_LEN}",
+            header.len()
+        ));
+    }
+    let expected_words = words_for(expected_num_experts);
+    if bitmap.len() != expected_words {
+        return RouteDecision::WholeBank(format!(
+            "bitmap length mismatch: record={} expected {expected_words}",
+            bitmap.len()
+        ));
+    }
+    if expected_routes_per_row == 0 || expected_routes_per_row > expected_num_experts {
+        return RouteDecision::WholeBank(format!(
+            "invalid route-width contract: routes_per_row={expected_routes_per_row}, \
+             num_experts={expected_num_experts}"
+        ));
+    }
     if header[H_POISON] != 0 {
         return RouteDecision::WholeBank("poison: out-of-range expert id observed".into());
     }
@@ -517,10 +687,41 @@ pub fn consume_and_validate(
             header[H_REQUEST]
         ));
     }
-    if header[H_EPOCH] < expected_epoch {
+    if header[H_EPOCH] != expected_epoch {
         return RouteDecision::WholeBank(format!(
-            "stale epoch: record epoch={} < boundary epoch {expected_epoch}",
+            "epoch mismatch: record epoch={} expected {expected_epoch}",
             header[H_EPOCH]
+        ));
+    }
+    if let Some(last) = bitmap.last() {
+        let valid_tail_bits = expected_num_experts % 32;
+        if valid_tail_bits != 0 && (*last >> valid_tail_bits) != 0 {
+            return RouteDecision::WholeBank(
+                "bitmap contains experts outside the armed capacity".into(),
+            );
+        }
+    }
+    let Some(unique) = bitmap
+        .iter()
+        .try_fold(0u32, |total, word| total.checked_add(word.count_ones()))
+    else {
+        return RouteDecision::WholeBank("unique expert count overflow".into());
+    };
+    let count = header[H_COUNT];
+    let Ok(routes_per_row) = u32::try_from(expected_routes_per_row) else {
+        return RouteDecision::WholeBank(format!(
+            "route-width contract {expected_routes_per_row} exceeds the telemetry counter domain"
+        ));
+    };
+    if !count.is_multiple_of(routes_per_row) {
+        return RouteDecision::WholeBank(format!(
+            "route count {count} is impossible for routes_per_row={routes_per_row}; every clean \
+             routed row contributes exactly {routes_per_row} selections"
+        ));
+    }
+    if count < unique || (count == 0) != (unique == 0) {
+        return RouteDecision::WholeBank(format!(
+            "route count {count} is inconsistent with {unique} unique selected experts"
         ));
     }
     RouteDecision::HotSet(bitmap.to_vec())
@@ -577,16 +778,16 @@ mod tests {
         header[H_EPOCH] = 4;
         header[H_REQUEST] = 9;
         header[H_DEVICE] = 1;
+        header[H_COUNT] = 2;
         let bitmap = vec![0b1010u32];
         assert_eq!(
-            consume_and_validate(&header, &bitmap, 4, 9, 1),
+            consume_and_validate(&header, &bitmap, 4, 9, 1, 32, 2),
             RouteDecision::HotSet(vec![0b1010u32])
         );
-        // A newer epoch than the boundary expected is still fresh (>=).
-        assert_eq!(
-            consume_and_validate(&header, &bitmap, 3, 9, 1),
-            RouteDecision::HotSet(vec![0b1010u32])
-        );
+        assert!(matches!(
+            consume_and_validate(&header, &bitmap, 3, 9, 1, 32, 2),
+            RouteDecision::WholeBank(_)
+        ));
     }
 
     #[test]
@@ -596,6 +797,7 @@ mod tests {
             header[H_EPOCH] = epoch;
             header[H_REQUEST] = request;
             header[H_DEVICE] = device;
+            header[H_COUNT] = 1;
             header
         };
         let bitmap = vec![1u32];
@@ -603,32 +805,64 @@ mod tests {
         let mut poisoned = clean(4, 9, 1);
         poisoned[H_POISON] = 1;
         assert!(matches!(
-            consume_and_validate(&poisoned, &bitmap, 4, 9, 1),
+            consume_and_validate(&poisoned, &bitmap, 4, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
 
         let mut overflowed = clean(4, 9, 1);
         overflowed[H_OVERFLOW] = 1;
         assert!(matches!(
-            consume_and_validate(&overflowed, &bitmap, 4, 9, 1),
+            consume_and_validate(&overflowed, &bitmap, 4, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
 
         // Foreign device / request identity fails closed (isolation).
         assert!(matches!(
-            consume_and_validate(&clean(4, 9, 2), &bitmap, 4, 9, 1),
+            consume_and_validate(&clean(4, 9, 2), &bitmap, 4, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
         assert!(matches!(
-            consume_and_validate(&clean(4, 8, 1), &bitmap, 4, 9, 1),
+            consume_and_validate(&clean(4, 8, 1), &bitmap, 4, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
 
         // A stale epoch (record older than the boundary) fails closed.
         assert!(matches!(
-            consume_and_validate(&clean(2, 9, 1), &bitmap, 3, 9, 1),
+            consume_and_validate(&clean(2, 9, 1), &bitmap, 3, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
+
+        let mut inconsistent_count = clean(4, 9, 1);
+        inconsistent_count[H_COUNT] = 0;
+        assert!(matches!(
+            consume_and_validate(&inconsistent_count, &bitmap, 4, 9, 1, 32, 1),
+            RouteDecision::WholeBank(_)
+        ));
+        assert!(matches!(
+            consume_and_validate(&clean(4, 9, 1), &[1, 0], 4, 9, 1, 32, 1),
+            RouteDecision::WholeBank(_)
+        ));
+        assert!(matches!(
+            consume_and_validate(&clean(4, 9, 1), &[1 << 31], 4, 9, 1, 17, 1),
+            RouteDecision::WholeBank(_)
+        ));
+
+        let mut non_multiple = clean(4, 9, 1);
+        non_multiple[H_COUNT] = 3;
+        assert!(matches!(
+            consume_and_validate(&non_multiple, &bitmap, 4, 9, 1, 32, 2),
+            RouteDecision::WholeBank(reason) if reason.contains("impossible")
+        ));
+    }
+
+    #[test]
+    fn device_counter_uses_saturating_cas_not_wrapping_add() {
+        assert!(MARK_DEVICE_SRC.contains("atomicCAS(count, observed, desired)"));
+        assert!(MARK_DEVICE_SRC.contains("desired = overflow ? 0xffffffffu"));
+        assert!(
+            !MARK_DEVICE_SRC.contains("atomicAdd(&route_telemetry_header[5], valid)"),
+            "the production counter must never use a wrapping increment"
+        );
     }
 
     #[test]
@@ -642,6 +876,7 @@ mod tests {
             header,
             bitmap: vec![(1 << 1) | (1 << 4)],
             num_experts: 8,
+            routes_per_row: 1,
         };
         assert_eq!(snapshot.epoch(), 7);
         assert_eq!(snapshot.count(), 3);

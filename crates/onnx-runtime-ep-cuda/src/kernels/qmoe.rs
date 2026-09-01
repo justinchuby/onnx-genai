@@ -28,7 +28,9 @@ use crate::kernels::expert_route_telemetry::{
     ArmedTelemetry, MARK_DEVICE_SRC, RouteTelemetryConfig, TelemetrySnapshot, TelemetryUnsupported,
 };
 use crate::kernels::{qmoe_gemm, qmoe_grouping};
-use crate::route_residency::{RouteTelemetryRegistry, RouteTelemetrySource};
+use crate::route_residency::{
+    RouteTelemetryGeometry, RouteTelemetryRegistry, RouteTelemetrySource,
+};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const MODULE: &str = "qmoe_affine_v1";
@@ -1202,6 +1204,7 @@ impl KernelFactory for QMoEFactory {
                 request_id: 1,
                 device_id: self.runtime.ordinal(),
                 num_experts,
+                routes_per_row: kernel.attributes.k,
             };
             if kernel.arm_route_telemetry(config).is_ok() {
                 Some(RouteSourceActivation {
@@ -1209,6 +1212,10 @@ impl KernelFactory for QMoEFactory {
                     node_id: node.id,
                     node_name: node.name.clone(),
                     phase: expert_phase(input_shapes.first()),
+                    geometry: RouteTelemetryGeometry {
+                        num_experts,
+                        routes_per_row: kernel.attributes.k,
+                    },
                     expected_epoch: Arc::new(AtomicU32::new(1)),
                 })
             } else {
@@ -1241,6 +1248,7 @@ struct RouteSourceActivation {
     node_id: onnx_runtime_ir::NodeId,
     node_name: String,
     phase: ExpertExecutionPhase,
+    geometry: RouteTelemetryGeometry,
     expected_epoch: Arc<AtomicU32>,
 }
 
@@ -1255,6 +1263,7 @@ impl Kernel for SharedQMoEKernel {
             activation.registry.activate(
                 activation.node_id,
                 Arc::clone(&self.kernel) as Arc<dyn RouteTelemetrySource>,
+                activation.geometry,
                 activation.phase,
                 activation.node_name.clone(),
                 Arc::clone(&activation.expected_epoch),
@@ -1418,6 +1427,12 @@ impl QMoEKernel {
         &self,
         config: RouteTelemetryConfig,
     ) -> std::result::Result<(), TelemetryUnsupported> {
+        if config.routes_per_row != self.attributes.k {
+            return Err(TelemetryUnsupported::RouteWidthMismatch {
+                config: config.routes_per_row,
+                execution: self.attributes.k,
+            });
+        }
         let armed = ArmedTelemetry::arm(&self.runtime, config)?;
         let mut telemetry = self
             .telemetry

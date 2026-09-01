@@ -58,8 +58,8 @@ use onnx_runtime_ep_cuda::kernels::expert_route_telemetry::{
     cpu_bitmap,
 };
 use onnx_runtime_ep_cuda::route_residency::{
-    RouteResidencyBoundary, RouteResidencyInstallOutcome, RouteTelemetrySource,
-    build_route_residency_boundary,
+    RouteResidencyBoundary, RouteResidencyInstallOutcome, RouteTelemetryGeometry,
+    RouteTelemetrySource, build_route_residency_boundary,
 };
 use onnx_runtime_ep_cuda::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
 use onnx_runtime_ir::{DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape};
@@ -280,6 +280,16 @@ fn window_snapshot(
     request: u32,
     device: u32,
 ) -> TelemetrySnapshot {
+    let routes_per_row = route_lists
+        .iter()
+        .find(|routes| !routes.is_empty())
+        .map_or(1, |routes| routes.len());
+    assert!(
+        route_lists
+            .iter()
+            .all(|routes| routes.is_empty() || routes.len() == routes_per_row),
+        "a telemetry window must use one prepared routes-per-row contract"
+    );
     let mut bitmap = vec![0u32; num_experts.div_ceil(32)];
     let mut poison = false;
     let mut count: u32 = 0;
@@ -304,6 +314,7 @@ fn window_snapshot(
         header,
         bitmap,
         num_experts,
+        routes_per_row: u32::try_from(routes_per_row).unwrap(),
     }
 }
 
@@ -402,6 +413,10 @@ fn boundary_disabled_gate_is_structural_no_op() {
     ));
     let boundary = RouteResidencyBoundary::new(
         Arc::clone(&source) as Arc<dyn RouteTelemetrySource>,
+        RouteTelemetryGeometry {
+            num_experts: n_experts,
+            routes_per_row: 2,
+        },
         Arc::clone(&residency),
         vec![value],
         LazyWeightBoundary::QMoe,
@@ -533,6 +548,10 @@ fn boundary_applies_group_hot_set_and_advances_window() {
     ));
     let boundary = RouteResidencyBoundary::new(
         Arc::clone(&source) as Arc<dyn RouteTelemetrySource>,
+        RouteTelemetryGeometry {
+            num_experts: n_experts,
+            routes_per_row: 2,
+        },
         Arc::clone(&residency),
         vec![value_fc1, value_fc2],
         LazyWeightBoundary::QMoe,
@@ -662,6 +681,10 @@ fn boundary_unsafe_point_rejects_before_consume_and_reset() {
         let source = WindowSource::with_window(good_window.clone());
         let boundary = RouteResidencyBoundary::new(
             Arc::clone(&source) as Arc<dyn RouteTelemetrySource>,
+            RouteTelemetryGeometry {
+                num_experts: n_experts,
+                routes_per_row: 2,
+            },
             residency,
             vec![value],
             LazyWeightBoundary::QMoe,
@@ -717,6 +740,10 @@ fn boundary_unsafe_point_rejects_before_consume_and_reset() {
         let source = WindowSource::with_window(good_window.clone());
         let boundary = RouteResidencyBoundary::new(
             Arc::clone(&source) as Arc<dyn RouteTelemetrySource>,
+            RouteTelemetryGeometry {
+                num_experts: n_experts,
+                routes_per_row: 2,
+            },
             residency,
             vec![value],
             LazyWeightBoundary::QMoe,
@@ -845,6 +872,10 @@ fn boundary_defective_windows_fail_closed() {
         let source = WindowSource::with_window(window);
         let boundary = RouteResidencyBoundary::new(
             Arc::clone(&source) as Arc<dyn RouteTelemetrySource>,
+            RouteTelemetryGeometry {
+                num_experts: n_experts,
+                routes_per_row: 2,
+            },
             residency,
             vec![value],
             LazyWeightBoundary::QMoe,
@@ -957,7 +988,7 @@ fn boundary_injected_fault_rolls_back_through_caller() {
 
     let request = 7_u32;
     let source = WindowSource::with_window(window_snapshot(
-        &[&[0, 2], &[2]],
+        &[&[0, 2], &[0, 2]],
         n_experts,
         1,
         request,
@@ -965,6 +996,10 @@ fn boundary_injected_fault_rolls_back_through_caller() {
     ));
     let boundary = RouteResidencyBoundary::new(
         Arc::clone(&source) as Arc<dyn RouteTelemetrySource>,
+        RouteTelemetryGeometry {
+            num_experts: n_experts,
+            routes_per_row: 2,
+        },
         Arc::clone(&residency),
         vec![value],
         LazyWeightBoundary::QMoe,
