@@ -862,6 +862,34 @@ impl CudaDeferredReleaseQueue {
         Ok(())
     }
 
+    /// Retain ownership from a refused enqueue as an explicit quarantine.
+    ///
+    /// Retirement callers use this only after a non-blocking enqueue refusal.
+    /// The action is never executed early: its ownership remains visible in
+    /// [`Self::retained`] and [`Self::stats`] instead of becoming an
+    /// unaccounted leak or an unsafe synchronous fallback.
+    pub(crate) fn retain_refused<A: DeferredReleaseAction + 'static>(
+        &self,
+        refused: RefusedRelease<A>,
+        detail: String,
+    ) {
+        let label = refused.action.label();
+        let bytes = refused.action.bytes();
+        let ownership = RetainedOwnership {
+            bytes,
+            detail: detail.clone(),
+            keep_alive: Box::new(refused.action),
+        };
+        self.lock().retained.push(RetainedRelease {
+            label,
+            state: AllocationReleaseState::Quarantined,
+            bytes,
+            detail,
+            ownership: Some(ownership),
+        });
+        self.counters.quarantined.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Take final ownership of a prepared release, refunding through `observer`
     /// when the release actually completes.
     pub fn enqueue_prepared(
@@ -1299,10 +1327,12 @@ impl crate::virtual_memory::DeferredReservationQueue for CudaDeferredReleaseQueu
                 };
                 Err(crate::virtual_memory::ReservationEnqueueError {
                     rejection,
-                    ticket: refused
-                        .action
-                        .ticket
-                        .expect("a refused reservation teardown still holds its ticket"),
+                    ticket: Box::new(
+                        refused
+                            .action
+                            .ticket
+                            .expect("a refused reservation teardown still holds its ticket"),
+                    ),
                 })
             }
         }
@@ -1449,5 +1479,30 @@ mod tests {
         // The refused action is handed back intact and never executed.
         assert_eq!(executed.load(Ordering::Acquire), 0);
         drop(refused);
+    }
+
+    #[test]
+    fn refused_retirement_ownership_is_quarantined_and_accounted() {
+        let (queue, _compute, _copy) = manual_queue(1);
+        let executed = Arc::new(AtomicUsize::new(0));
+        queue
+            .enqueue(CountingAction {
+                executed: Arc::clone(&executed),
+            })
+            .expect("first accepted");
+        let refused = queue
+            .enqueue(CountingAction {
+                executed: Arc::clone(&executed),
+            })
+            .expect_err("the bound is enforced");
+        queue.retain_refused(refused, "retirement ownership retained".to_string());
+
+        assert_eq!(executed.load(Ordering::Acquire), 0);
+        assert_eq!(queue.stats().quarantined, 1);
+        let retained = queue.retained();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].label, "test");
+        assert_eq!(retained[0].state, AllocationReleaseState::Quarantined);
+        assert!(retained[0].detail.contains("retirement ownership"));
     }
 }

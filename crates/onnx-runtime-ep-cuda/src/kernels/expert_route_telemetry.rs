@@ -537,8 +537,14 @@ impl ArmedTelemetry {
     /// kernel may still reference these pointers), then releases the record.
     pub(crate) fn free(&self, runtime: &CudaRuntime) {
         let _ = runtime.drain_for_unmap();
+        self.free_after_stream_fences(runtime);
+    }
+
+    /// Free after the provider's deferred-release queue has observed both
+    /// stream-tail fences for this telemetry generation.
+    pub(crate) fn free_after_stream_fences(&self, runtime: &CudaRuntime) {
         // SAFETY: every pointer came from this runtime, prior launches have been
-        // drained, and each is freed exactly once.
+        // fenced or drained, and each is freed exactly once.
         unsafe {
             let _ = runtime.free_raw(self.header);
             let _ = runtime.free_raw(self.bitmap);

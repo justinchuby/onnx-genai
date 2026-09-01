@@ -227,6 +227,38 @@ mod error {
         #[error("no inferred shape for value {value} produced by op {op}")]
         UnresolvedShape { value: String, op: String },
 
+        #[error(
+            "{provider} executor {executor} provider artifacts are pending at readiness epoch \
+             {readiness_epoch}: {reason}; no kernel execution or capture was started"
+        )]
+        ExecutionProviderArtifactsPending {
+            provider: String,
+            executor: u64,
+            readiness_epoch: u64,
+            reason: String,
+        },
+
+        #[error(
+            "{provider} executor {executor} provider-artifact finalization failed at readiness \
+             epoch {readiness_epoch}: {reason}; no kernel execution or capture was started"
+        )]
+        ExecutionProviderArtifactFinalizationFailed {
+            provider: String,
+            executor: u64,
+            readiness_epoch: u64,
+            reason: String,
+        },
+
+        #[error(
+            "session build failed: {build}; exact provider-artifact rollback also failed: \
+             {rollback}"
+        )]
+        ExecutionProviderArtifactRollbackFailed {
+            #[source]
+            build: Box<SessionError>,
+            rollback: onnx_runtime_ep_api::EpError,
+        },
+
         #[error("shape element count overflows usize for value {value} (dims {dims:?})")]
         ShapeOverflow { value: String, dims: Vec<usize> },
 
@@ -1074,6 +1106,14 @@ impl Drop for BlockQuantizedMoeTrafficObserver<'_> {
 }
 
 /// A loaded model ready to run inference (§20.2).
+/// Loaded, executable inference session.
+///
+/// Executor artifact authority is deliberately owned by a private session
+/// module and cannot be named by path/git consumers:
+///
+/// ```compile_fail
+/// use onnx_runtime_session::executor::ExecutorArtifactConfig;
+/// ```
 pub struct InferenceSession {
     inputs: Vec<IoMeta>,
     outputs: Vec<IoMeta>,
@@ -1932,6 +1972,12 @@ impl InferenceSession {
     /// choose the subgraphs it claims.
     pub fn graph(&self) -> &onnx_runtime_ir::Graph {
         self.exec.graph()
+    }
+
+    /// Executor ownership identity used by provider lifecycle diagnostics.
+    #[doc(hidden)]
+    pub fn executor_instance_id(&self) -> onnx_runtime_ep_api::ExecutorInstanceId {
+        self.exec.instance_id()
     }
 
     /// Export a `com.microsoft::EPContext` context-cache model for this session

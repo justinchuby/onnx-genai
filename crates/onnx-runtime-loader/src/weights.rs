@@ -467,6 +467,22 @@ impl WeightRegionCatalog {
         self.dtype
     }
 
+    /// External-data path that supplied this catalog, when it is externally
+    /// backed.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Absolute byte offset of the tensor in its external-data mapping.
+    pub fn tensor_offset(&self) -> usize {
+        self.tensor_offset
+    }
+
+    /// Canonical tensor byte length validated by this catalog.
+    pub fn tensor_len(&self) -> usize {
+        self.tensor_len
+    }
+
     pub fn mapped_bytes(&self) -> usize {
         if self.is_pageable() {
             self.tensor_len
@@ -491,10 +507,6 @@ impl WeightRegionCatalog {
         let path = self.path.as_ref()?;
         let region = self.region(expert)?;
         store.external_bytes(path, region.offset, region.len)
-    }
-
-    pub fn tensor_offset(&self) -> usize {
-        self.tensor_offset
     }
 }
 

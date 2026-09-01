@@ -203,10 +203,6 @@ mod tests {
     }
 
     impl ExecutionProvider for MockCompiledEp {
-        fn consume_route_residency_at_boundary(&self) -> Result<()> {
-            Ok(())
-        }
-
         fn name(&self) -> &str {
             "mock_compiled_ep"
         }
@@ -307,10 +303,6 @@ mod tests {
     struct PlainEp;
 
     impl ExecutionProvider for PlainEp {
-        fn consume_route_residency_at_boundary(&self) -> Result<()> {
-            Ok(())
-        }
-
         fn name(&self) -> &str {
             "plain_ep"
         }

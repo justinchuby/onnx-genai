@@ -2193,23 +2193,18 @@ fn expert_group_unsupported_member_metadata_rejects_whole_group_before_mutation(
 
 // ---------------------------------------------------------------------------
 // Test 13: the group agrees and fc1 (earlier ValueId) fully commits; fc2
-// (later ValueId, its group-mate) then hits a genuine `Fatal` — a partial
-// commit *within its own single merged range* (granule 0 of a 2-granule
-// range switches, granule 1's Unmap is then forced to fail) — which is the
-// only way `transition_granule_range` reports `Fatal` rather than a clean
-// `RolledBack` (see its module doc: a partial commit is always `Fatal`,
-// never `RolledBack`). This proves the EARLIER member's already-committed
-// range is still fully and cleanly rolled back once the Fatal propagates
-// (existing item-1 machinery, now proven for a group-tagged pair rather than
-// ungrouped values).
+// (later ValueId, its group-mate) then has its own transition roll back
+// cleanly before committing. This is the nonfatal member-failure case that
+// must still revert fc1: logical expert-group atomicity is a property of the
+// whole plan, not only of failures classified `Fatal`.
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
-fn expert_group_successful_transition_then_later_member_fault_causes_full_group_rollback() {
+fn expert_group_successful_transition_then_later_member_rollback_reverts_whole_group() {
     let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     println!(
-        "\n=== test13: expert_group_successful_transition_then_later_member_fault_causes_full_group_rollback ==="
+        "\n=== test13: expert_group_successful_transition_then_later_member_rollback_reverts_whole_group ==="
     );
 
     let provider = match provider_or_skip("test13") {
@@ -2248,13 +2243,10 @@ fn expert_group_successful_transition_then_later_member_fault_causes_full_group_
         runtime.htod(&pattern_fc1, base_fc1).expect("htod fc1");
     }
 
-    // fc2 (higher ValueId, processed LATER): same 2-granule merged cold
-    // range as fc1. Fail the 2nd Unmap call within fc2's own transition:
-    // granule 0 (expert 1) already switches to the new backing before
-    // granule 1 (expert 2)'s Unmap is forced to fail, so this is a genuine
-    // partial commit -> Fatal with committed_count == 1 (never a clean
-    // RolledBack, per `transition_granule_range`'s own contract).
-    let faults_fc2 = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 2));
+    // fc2 (higher ValueId, processed LATER): fail its first Remap after the
+    // old mapping is removed. The transition restores its own old mapping and
+    // reports `RolledBack`; the outer plan must then restore fc1 as well.
+    let faults_fc2 = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Remap, 1));
     let (allocator_fc2, base_fc2) = build_precommitted_allocator(
         &provider,
         n_experts,
@@ -2330,22 +2322,23 @@ fn expert_group_successful_transition_then_later_member_fault_causes_full_group_
     println!("outcome: {outcome:#?}");
 
     assert!(
-        !outcome.fatal_progress.is_empty(),
-        "expected fc2 to hit a Fatal, got: {:?}",
+        outcome.fatal_progress.is_empty(),
+        "the injected remap failure must roll back locally, not become fatal: {:?}",
         outcome.fatal_progress
     );
+    assert_eq!(outcome.failure_count, 1);
     assert!(
         outcome
-            .fatal_progress
+            .per_value_fallbacks
             .iter()
-            .any(|(v, _, _)| *v == value_fc2),
-        "the Fatal must be attributed to fc2, got: {:?}",
-        outcome.fatal_progress
+            .any(|(value, reason)| *value == value_fc2 && reason.contains("rolled back")),
+        "fc2's nonfatal rollback must be explicit: {:?}",
+        outcome.per_value_fallbacks
     );
     assert_eq!(
         outcome.values_touched, 0,
         "no member may end up touched: fc1's already-committed ranges must be \
-         reverted once fc2 (its group-mate) hits Fatal, got values_touched={}",
+         reverted once fc2 rolls back, got values_touched={}",
         outcome.values_touched
     );
     assert!(
@@ -2385,15 +2378,10 @@ fn expert_group_successful_transition_then_later_member_fault_causes_full_group_
     }
     assert_eq!(
         pattern_fc2, readback_fc2,
-        "fc2 content must remain bit-identical: the content-preserving \
-         transition copies bytes before switching, so a mid-flight Fatal \
-         cannot corrupt them"
+        "fc2 content must remain bit-identical after its local rollback"
     );
 
-    println!(
-        "test13 PASSED: successful group transition, then a later member's fault, causes a \
-         full and clean group rollback ✓"
-    );
+    println!("test13 PASSED: a later member's nonfatal rollback reverts the whole group ✓");
 }
 
 // ---------------------------------------------------------------------------
