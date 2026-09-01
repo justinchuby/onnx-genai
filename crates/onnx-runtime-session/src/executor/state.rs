@@ -284,6 +284,9 @@ pub(crate) struct Executor {
     /// device, executor, and generation and required by every artifact
     /// publication/finalization call.
     pub(super) artifact_config: ExecutorArtifactConfig,
+    /// False while `ExecutorArtifactBuildTransaction` still owns rollback.
+    /// Armed only after the complete executor has been constructed.
+    pub(super) artifact_teardown_armed: bool,
     pub(super) graph: Graph,
     /// Kept alive so external-weight memory maps outlive buffer population —
     /// **and**, since the weight-streaming change, so borrowed initializer

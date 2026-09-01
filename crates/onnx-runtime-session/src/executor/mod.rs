@@ -148,6 +148,88 @@ impl ExecutorArtifactConfig {
     }
 }
 
+fn drain_executor_artifacts_panic_safe(
+    ep: &dyn ExecutionProvider,
+    config: ExecutorArtifactConfig,
+) -> onnx_runtime_ep_api::Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ep.drain_executor_artifacts(config.provider(), config.executor(), config.generation())
+    }))
+    .unwrap_or_else(|_| {
+        Err(EpError::KernelFailed(format!(
+            "{} executor {} generation {} provider-artifact rollback panicked; provider cleanup \
+             must be panic-free",
+            ep.name(),
+            config.executor().get(),
+            config.generation().get(),
+        )))
+    })
+}
+
+/// Owns provider artifacts published before a runnable [`Executor`] exists.
+///
+/// Build/finalization is a transaction: every error explicitly aborts this
+/// exact provider/executor/generation, while unwinding through a panic uses the
+/// same one-shot cleanup from `Drop`. Ownership transfers to `Executor` only
+/// after construction has completed successfully.
+struct ExecutorArtifactBuildTransaction {
+    ep: Arc<dyn ExecutionProvider>,
+    config: ExecutorArtifactConfig,
+    active: bool,
+}
+
+impl ExecutorArtifactBuildTransaction {
+    fn new(ep: Arc<dyn ExecutionProvider>, config: ExecutorArtifactConfig) -> Self {
+        Self {
+            ep,
+            config,
+            active: true,
+        }
+    }
+
+    fn config(&self) -> ExecutorArtifactConfig {
+        self.config
+    }
+
+    fn rebind(
+        &mut self,
+        ep: Arc<dyn ExecutionProvider>,
+        config: ExecutorArtifactConfig,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.abort()?;
+        self.ep = ep;
+        self.config = config;
+        self.active = true;
+        Ok(())
+    }
+
+    fn abort(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        if !std::mem::replace(&mut self.active, false) {
+            return Ok(());
+        }
+        drain_executor_artifacts_panic_safe(self.ep.as_ref(), self.config)
+    }
+
+    fn commit(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ExecutorArtifactBuildTransaction {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = self.abort()
+        {
+            eprintln!(
+                "[onnx-runtime-session] panic-time provider-artifact rollback failed for executor \
+                 {} generation {}: {error}",
+                self.config.executor().get(),
+                self.config.generation().get(),
+            );
+        }
+    }
+}
+
 pub(super) struct DeviceValidationSubmission {
     ep: Arc<dyn ExecutionProvider>,
     token: DeviceValidationToken,
@@ -891,11 +973,19 @@ impl Drop for Executor {
         // Drain only this executor's provider-owned artifacts before its
         // buffers/kernels are torn down. Sibling/MTP executors may share the same
         // EP and must retain their own producers and boundary state.
-        self.ep.drain_executor_artifacts(
-            self.artifact_config.provider(),
-            self.artifact_config.executor(),
-            self.artifact_config.generation(),
-        );
+        if self.artifact_teardown_armed {
+            self.artifact_teardown_armed = false;
+            if let Err(error) =
+                drain_executor_artifacts_panic_safe(self.ep.as_ref(), self.artifact_config)
+            {
+                eprintln!(
+                    "[onnx-runtime-session] executor {} generation {} provider-artifact teardown \
+                     failed: {error}",
+                    self.artifact_config.executor().get(),
+                    self.artifact_config.generation().get(),
+                );
+            }
+        }
         // Evict the global weight-transpose cache to prevent address-reuse
         // staleness: if a subsequently loaded model's mmap recycles a virtual
         // address, the cache must not serve the old model's transposed weights.

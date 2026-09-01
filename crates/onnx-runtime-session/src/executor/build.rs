@@ -849,9 +849,9 @@ impl Executor {
     }
 
     fn build_with_mode(
-        mut graph: Graph,
+        graph: Graph,
         weights: Arc<WeightStore>,
-        mut ep: Arc<dyn ExecutionProvider>,
+        ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
         hetero_enabled: bool,
     ) -> Result<Self> {
@@ -894,13 +894,47 @@ impl Executor {
         }
 
         let instance_id = issue_executor_instance_id()?;
-        let mut artifact_config = Self::resolve_artifact_config(ep.as_ref(), instance_id)?;
+        let artifact_config = Self::resolve_artifact_config(ep.as_ref(), instance_id)?;
+        let mut artifact_transaction =
+            ExecutorArtifactBuildTransaction::new(Arc::clone(&ep), artifact_config);
+        let build = Self::build_with_artifact_transaction(
+            graph,
+            weights,
+            ep,
+            instance_id,
+            &mut artifact_transaction,
+            require_cuda,
+        );
+        match build {
+            Ok(mut exec) => {
+                artifact_transaction.commit();
+                exec.artifact_teardown_armed = true;
+                Ok(exec)
+            }
+            Err(build) => match artifact_transaction.abort() {
+                Ok(()) => Err(build),
+                Err(rollback) => Err(SessionError::ExecutionProviderArtifactRollbackFailed {
+                    build: Box::new(build),
+                    rollback,
+                }),
+            },
+        }
+    }
+
+    fn build_with_artifact_transaction(
+        mut graph: Graph,
+        weights: Arc<WeightStore>,
+        mut ep: Arc<dyn ExecutionProvider>,
+        instance_id: ExecutorInstanceId,
+        artifact_transaction: &mut ExecutorArtifactBuildTransaction,
+        require_cuda: bool,
+    ) -> Result<Self> {
         let execution_provider_fallback_report = Self::place_graph(
             &mut graph,
             &weights,
             &mut ep,
             instance_id,
-            &mut artifact_config,
+            artifact_transaction,
             require_cuda,
         )?;
         // Topological order up front: also validates the selected graph is a DAG.
@@ -966,7 +1000,8 @@ impl Executor {
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
         let mut exec = Self {
             instance_id,
-            artifact_config,
+            artifact_config: artifact_transaction.config(),
+            artifact_teardown_armed: false,
             graph,
             weights,
             ep,
@@ -1299,7 +1334,7 @@ impl Executor {
         weights: &Arc<WeightStore>,
         ep: &mut Arc<dyn ExecutionProvider>,
         instance_id: ExecutorInstanceId,
-        artifact_config: &mut ExecutorArtifactConfig,
+        artifact_transaction: &mut ExecutorArtifactBuildTransaction,
         require_cuda: bool,
     ) -> Result<Option<ExecutionProviderFallbackReport>> {
         let mut placement_span = trace_span("session.node_placement", "session");
@@ -1327,7 +1362,7 @@ impl Executor {
         let ep_pass_nodes_after = graph.num_nodes();
         rewrite_kv_capacity_appends(graph, ep.as_ref());
         let mut execution_provider_fallback_report =
-            cuda_fallback_report(graph, ep.as_ref(), *artifact_config);
+            cuda_fallback_report(graph, ep.as_ref(), artifact_transaction.config());
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
             .map_or(0, |report| report.declines.len());
@@ -1357,14 +1392,11 @@ impl Executor {
                 &hetero_providers,
                 hetero_placement_env_enabled(),
             )?;
-            ep.drain_executor_artifacts(
-                artifact_config.provider(),
-                artifact_config.executor(),
-                artifact_config.generation(),
-            );
+            let cpu = auto_detect_cpu_ep()?;
+            let cpu_artifact_config = Self::resolve_artifact_config(cpu.as_ref(), instance_id)?;
+            artifact_transaction.rebind(Arc::clone(&cpu), cpu_artifact_config)?;
             *graph = graph_before_ep_passes;
-            *ep = auto_detect_cpu_ep()?;
-            *artifact_config = Self::resolve_artifact_config(ep.as_ref(), instance_id)?;
+            *ep = cpu;
             run_ep_scoped_passes(graph, weights, ep.as_ref())?;
             let mut assigned_ops = BTreeSet::new();
             report.assigned_node_count = collect_executable_ops(graph, &mut assigned_ops);

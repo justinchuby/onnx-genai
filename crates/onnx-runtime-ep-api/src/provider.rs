@@ -2066,13 +2066,15 @@ pub trait ExecutionProvider: Send + Sync {
     ///
     /// The default is a no-op. Participating providers must make this
     /// idempotent and must not clear producer/boundary state owned by sibling
-    /// executors sharing the same provider.
+    /// executors sharing the same provider. A foreign or stale scope must fail
+    /// without consuming another executor's artifacts.
     fn drain_executor_artifacts(
         &self,
         _provider: ExecutorArtifactProviderId,
         _executor: ExecutorInstanceId,
         _generation: ExecutorArtifactGeneration,
-    ) {
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Explicit device allocation/free counters, when the EP exposes them.

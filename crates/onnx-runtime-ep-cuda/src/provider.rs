@@ -1045,12 +1045,11 @@ impl CudaExecutionProvider {
         )
     }
 
-    fn validate_executor_scope(
+    fn validate_artifact_provider(
         &self,
         provider: ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
-        generation: ExecutorArtifactGeneration,
-    ) -> Result<ExecutorInstanceId> {
+    ) -> Result<()> {
         if provider != self.artifact_provider_id {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep: executor {} artifact provider {} is foreign; expected provider {} for \
@@ -1061,9 +1060,7 @@ impl CudaExecutionProvider {
                 self.device,
             )));
         }
-        self.route_telemetry_registry
-            .claim_scope(executor, generation)?;
-        Ok(executor)
+        Ok(())
     }
 
     fn resolved_route_residency(
@@ -1105,6 +1102,17 @@ impl CudaExecutionProvider {
         self.route_executors
             .lock()
             .expect("cuda_ep route-residency executors poisoned")
+    }
+
+    fn lock_route_executors_for_cleanup(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<ExecutorInstanceId, ExecutorRouteResidencyState>> {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        self.route_state_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        self.route_executors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(any(test, feature = "gpu-tests"))]
@@ -2139,6 +2147,16 @@ impl CudaExecutionProvider {
         self.route_telemetry_registry.claimed_generations()
     }
 
+    #[cfg(any(test, feature = "gpu-tests"))]
+    pub fn retired_executor_artifact_generations(
+        &self,
+    ) -> Vec<(
+        ExecutorInstanceId,
+        onnx_runtime_ep_api::ExecutorArtifactGeneration,
+    )> {
+        self.route_telemetry_registry.retired_generations()
+    }
+
     /// Finalize one executor's real QMoE route-residency artifacts.
     ///
     /// `NoTelemetrySource` is readiness-dependent and returns `Pending` without
@@ -2311,7 +2329,9 @@ impl CudaExecutionProvider {
     /// Drain the legacy unscoped test binding.
     #[cfg(any(test, feature = "gpu-tests"))]
     pub fn drain_route_residency_boundary(&self) {
-        self.drain_route_residency_for_executor(ExecutorInstanceId::UNSCOPED);
+        let executor = ExecutorInstanceId::UNSCOPED;
+        let has_sources = self.route_telemetry_registry.remove(executor) != 0;
+        self.drain_route_residency_state_for_executor(executor, has_sources);
     }
 
     #[cfg(any(test, feature = "gpu-tests"))]
@@ -2323,10 +2343,13 @@ impl CudaExecutionProvider {
         self.consume_route_residency_for_executor(ExecutorInstanceId::UNSCOPED)
     }
 
-    fn drain_route_residency_for_executor(&self, executor: ExecutorInstanceId) {
-        let should_remove_sources = {
-            let mut states = self.lock_route_executors();
-            let has_sources = !self.route_telemetry_registry.is_empty(executor);
+    fn drain_route_residency_state_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        has_sources: bool,
+    ) {
+        {
+            let mut states = self.lock_route_executors_for_cleanup();
             let Some(state) = states.get_mut(&executor) else {
                 if has_sources {
                     let state = ExecutorRouteResidencyState {
@@ -2336,26 +2359,20 @@ impl CudaExecutionProvider {
                     };
                     states.insert(executor, state);
                 }
-                return self.route_telemetry_registry.remove(executor);
+                return;
             };
-            if state.drained {
-                false
-            } else {
+            if !state.drained {
                 state.drain_calls += 1;
                 state.drained = true;
                 state.pending = None;
                 state.boundary = None;
                 state.retained_artifacts = None;
-                true
             }
-        };
-        if should_remove_sources {
-            self.route_telemetry_registry.remove(executor);
         }
     }
 
     fn drain_all_route_residency(&self) {
-        let mut states = self.lock_route_executors();
+        let mut states = self.lock_route_executors_for_cleanup();
         for state in states.values_mut() {
             if !state.drained {
                 state.drain_calls += 1;
@@ -3450,7 +3467,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         shapes: &[Vec<usize>],
         opset: u64,
     ) -> Result<Box<dyn Kernel>> {
-        self.validate_executor_scope(provider, executor, generation)?;
+        self.validate_artifact_provider(provider, executor)?;
         self.route_telemetry_registry
             .with_executor_scope(executor, generation, || {
                 self.create_registered_kernel(op, shapes, opset)
@@ -4468,8 +4485,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         readiness: ExecutorArtifactReadinessEpoch,
         graph: &Graph,
     ) -> Result<ExecutorArtifactReport> {
-        let executor = self.validate_executor_scope(provider, executor, generation)?;
-        let outcome = self.finalize_route_residency_for_executor(executor, graph, readiness)?;
+        self.validate_artifact_provider(provider, executor)?;
+        let outcome =
+            self.route_telemetry_registry
+                .with_executor_scope(executor, generation, || {
+                    self.finalize_route_residency_for_executor(executor, graph, readiness)
+                })??;
         Ok(ExecutorArtifactReport::observed(
             provider,
             executor,
@@ -4491,10 +4512,16 @@ impl ExecutionProvider for CudaExecutionProvider {
         provider: ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
-    ) {
-        if let Ok(executor) = self.validate_executor_scope(provider, executor, generation) {
-            self.drain_route_residency_for_executor(executor);
-        }
+    ) -> Result<()> {
+        self.validate_artifact_provider(provider, executor)?;
+        self.route_telemetry_registry
+            .retire_scope(executor, generation, |newly_retired| {
+                if newly_retired {
+                    let has_sources = self.route_telemetry_registry.remove(executor) != 0;
+                    self.drain_route_residency_state_for_executor(executor, has_sources);
+                }
+            })?;
+        Ok(())
     }
 
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {

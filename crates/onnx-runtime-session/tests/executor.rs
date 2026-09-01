@@ -470,13 +470,14 @@ impl ExecutionProvider for HostDownloadCountingEp {
         _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         _generation: ExecutorArtifactGeneration,
-    ) {
+    ) -> EpResult<()> {
         *self
             .route_drains
             .lock()
             .unwrap()
             .entry(executor)
             .or_default() += 1;
+        Ok(())
     }
 
     fn name(&self) -> &str {

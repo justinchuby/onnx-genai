@@ -603,10 +603,18 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
     ));
 
     let foreign_drain = artifact_config(&provider, foreign_executor);
-    provider.drain_executor_artifacts(
-        foreign_drain.provider,
-        foreign_drain.executor,
-        foreign_drain.generation,
+    let stale_drain = provider
+        .drain_executor_artifacts(
+            foreign_drain.provider,
+            foreign_drain.executor,
+            foreign_drain.generation,
+        )
+        .expect_err("a stale sibling generation must fail closed");
+    assert!(
+        stale_drain
+            .to_string()
+            .contains("refusing to consume another owner's artifacts"),
+        "unexpected stale teardown diagnostic: {stale_drain}"
     );
     assert!(
         provider
@@ -614,8 +622,12 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
             .is_some(),
         "draining a sibling executor cannot tear down the owner's producer"
     );
-    provider.drain_executor_artifacts(config.provider, config.executor, config.generation);
-    provider.drain_executor_artifacts(config.provider, config.executor, config.generation);
+    provider
+        .drain_executor_artifacts(config.provider, config.executor, config.generation)
+        .expect("drain exact owner");
+    provider
+        .drain_executor_artifacts(config.provider, config.executor, config.generation)
+        .expect("repeat exact drain is idempotent");
     let drained = provider.route_residency_executor_status(executor);
     assert_eq!(drained.drain_calls, 1);
     assert!(drained.drained);
@@ -864,7 +876,9 @@ fn disabled_build_installs_and_retains_nothing() {
     );
 
     // Draining the never-installed boundary is a safe no-op.
-    provider.drain_executor_artifacts(config.provider, config.executor, config.generation);
+    provider
+        .drain_executor_artifacts(config.provider, config.executor, config.generation)
+        .expect("drain disabled exact scope");
     assert!(
         provider.route_telemetry_sources(executor).is_empty(),
         "teardown drains the EP-owned producer registry"

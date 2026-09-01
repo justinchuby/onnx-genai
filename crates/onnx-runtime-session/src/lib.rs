@@ -249,6 +249,16 @@ mod error {
             reason: String,
         },
 
+        #[error(
+            "session build failed: {build}; exact provider-artifact rollback also failed: \
+             {rollback}"
+        )]
+        ExecutionProviderArtifactRollbackFailed {
+            #[source]
+            build: Box<SessionError>,
+            rollback: onnx_runtime_ep_api::EpError,
+        },
+
         #[error("shape element count overflows usize for value {value} (dims {dims:?})")]
         ShapeOverflow { value: String, dims: Vec<usize> },
 

@@ -8486,6 +8486,932 @@ fn cuda_decline_warns_and_falls_back_to_cpu_unless_strict() {
     assert!(strict.to_string().contains("ONNX_GENAI_REQUIRE_CUDA=1"));
 }
 
+#[cfg(feature = "gpu-tests")]
+struct StrictCudaBuildRollbackProbeEp {
+    inner: Arc<onnx_runtime_ep_cuda::CudaExecutionProvider>,
+    fail_once: AtomicBool,
+    drains: std::sync::Mutex<Vec<(ExecutorInstanceId, ExecutorArtifactGeneration, usize)>>,
+}
+
+#[cfg(feature = "gpu-tests")]
+impl StrictCudaBuildRollbackProbeEp {
+    fn new(inner: Arc<onnx_runtime_ep_cuda::CudaExecutionProvider>) -> Self {
+        Self {
+            inner,
+            fail_once: AtomicBool::new(true),
+            drains: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(feature = "gpu-tests")]
+impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
+    fn name(&self) -> &str {
+        "strict_cuda_build_rollback_probe"
+    }
+
+    fn device_type(&self) -> DeviceType {
+        self.inner.device_type()
+    }
+
+    fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        self.inner.device_id()
+    }
+
+    fn capabilities(&self) -> ExecutionProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn initialize(&mut self, _config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        input_dtypes: &[DataType],
+        layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        self.inner
+            .supports_op(op, opset, shapes, input_dtypes, layouts)
+    }
+
+    fn get_kernel(
+        &self,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        self.inner.get_kernel(op, shapes, opset)
+    }
+
+    fn get_kernel_for_executor(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        if op.name == "strict_decline_after_qmoe" && self.fail_once.swap(false, Ordering::SeqCst) {
+            return Err(EpError::KernelFailed(
+                "injected strict-CUDA typed decline after QMoE producer publication".into(),
+            ));
+        }
+        self.inner
+            .get_kernel_for_executor(provider, executor, generation, op, shapes, opset)
+    }
+
+    fn executor_kernel_scope(&self, op: &Node) -> onnx_runtime_ep_api::ExecutorKernelScope {
+        self.inner.executor_kernel_scope(op)
+    }
+
+    fn executor_artifact_policy(&self) -> onnx_runtime_ep_api::Result<ExecutorArtifactPolicy> {
+        self.inner.executor_artifact_policy()
+    }
+
+    fn inspect_executor_artifacts(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        readiness: onnx_runtime_ep_api::ExecutorArtifactReadinessEpoch,
+        graph: &Graph,
+    ) -> onnx_runtime_ep_api::Result<ExecutorArtifactReport> {
+        self.inner
+            .inspect_executor_artifacts(provider, executor, generation, readiness, graph)
+    }
+
+    fn drain_executor_artifacts(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let producer_nodes = self
+            .inner
+            .route_residency_executor_status(executor)
+            .producer_nodes;
+        self.drains
+            .lock()
+            .unwrap()
+            .push((executor, generation, producer_nodes));
+        self.inner
+            .drain_executor_artifacts(provider, executor, generation)
+    }
+
+    fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        self.inner.allocate(size, alignment)
+    }
+
+    fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.deallocate(buffer)
+    }
+
+    fn copy(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.copy(src, dst, size)
+    }
+
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<Fence> {
+        self.inner.copy_async(src, dst, size)
+    }
+
+    fn copy_from_host(
+        &self,
+        src: &[u8],
+        dst: &mut DeviceBuffer,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.copy_from_host(src, dst)
+    }
+
+    fn copy_from_host_at(
+        &self,
+        src: &[u8],
+        dst: &mut DeviceBuffer,
+        byte_offset: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.copy_from_host_at(src, dst, byte_offset)
+    }
+
+    fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.copy_to_host(src, dst)
+    }
+
+    fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.sync()
+    }
+}
+
+#[cfg(feature = "gpu-tests")]
+fn static_qmoe_with_optional_decline_tail(include_decline_tail: bool) -> Graph {
+    use onnx_runtime_ir::{Attribute, TensorData, WeightRef, static_shape};
+
+    fn initializer(graph: &mut Graph, name: &str) -> ValueId {
+        let value = graph.create_named_value(name, DataType::Uint8, static_shape([4]));
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(TensorData::from_raw(DataType::Uint8, vec![4], vec![0; 4])),
+        );
+        value
+    }
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let hidden = graph.create_named_value("hidden", DataType::Float32, static_shape([4]));
+    let router = graph.create_named_value("router", DataType::Float32, static_shape([4]));
+    graph.add_input(hidden);
+    graph.add_input(router);
+    let fc1_w = initializer(&mut graph, "fc1_experts_weights");
+    let fc1_s = initializer(&mut graph, "fc1_scales");
+    let fc1_b = initializer(&mut graph, "fc1_experts_bias");
+    let fc2_w = initializer(&mut graph, "fc2_experts_weights");
+    let fc2_s = initializer(&mut graph, "fc2_scales");
+    let fc3_w = initializer(&mut graph, "fc3_experts_weights");
+    let fc3_s = initializer(&mut graph, "fc3_scales");
+    let qmoe_output = graph.create_named_value("qmoe_output", DataType::Float32, static_shape([4]));
+    let mut qmoe = Node::new(
+        NodeId(0),
+        "QMoE",
+        vec![
+            Some(hidden),
+            Some(router),
+            Some(fc1_w),
+            Some(fc1_s),
+            Some(fc1_b),
+            Some(fc2_w),
+            Some(fc2_s),
+            None,
+            Some(fc3_w),
+            Some(fc3_s),
+        ],
+        vec![qmoe_output],
+    );
+    qmoe.domain = "com.microsoft".into();
+    for (name, value) in [
+        ("expert_weight_bits", Attribute::Int(4)),
+        ("block_size", Attribute::Int(16)),
+        ("k", Attribute::Int(2)),
+        ("activation_type", Attribute::String(b"silu".to_vec())),
+        ("normalize_routing_weights", Attribute::Int(0)),
+        ("swiglu_fusion", Attribute::Int(0)),
+    ] {
+        qmoe.attributes.insert(name.into(), value);
+    }
+    graph.insert_node(qmoe);
+    if include_decline_tail {
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+        let mut tail = Node::new(NodeId(1), "Relu", vec![Some(qmoe_output)], vec![output]);
+        tail.name = "strict_decline_after_qmoe".into();
+        graph.insert_node(tail);
+        graph.add_output(output);
+    } else {
+        graph.add_output(qmoe_output);
+    }
+    graph
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn strict_cuda_failed_build_rolls_back_real_qmoe_producer_and_preserves_sibling() {
+    use onnx_runtime_ep_api::ExecutorRouteResidencyConfig;
+    use onnx_runtime_ep_cuda::weight_paging::DeviceOffloadPolicy;
+    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
+
+    let governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+        Arc::new(LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0)));
+    let policy = DeviceOffloadPolicy {
+        enabled: true,
+        device_budget_bytes: Some(8 << 30),
+        ..DeviceOffloadPolicy::default()
+    };
+    let provider = match onnx_runtime_ep_cuda::CudaExecutionProvider::
+        initialized_with_offload_policy_governor_and_route_config(
+            0,
+            policy,
+            governor,
+            ExecutorRouteResidencyConfig::Enabled,
+        ) {
+        Ok(provider) => Arc::new(provider),
+        Err(error) => {
+            eprintln!("SKIP: CUDA provider unavailable: {error}");
+            return;
+        }
+    };
+
+    let sibling = Executor::build_with_cuda_requirement(
+        static_qmoe_with_optional_decline_tail(false),
+        Arc::new(WeightStore::new()),
+        provider.clone(),
+        true,
+    )
+    .expect("build sibling QMoE executor");
+    let sibling_id = sibling.instance_id;
+    let sibling_before = provider.route_residency_executor_status(sibling_id);
+    assert_eq!(sibling_before.producer_nodes, 1);
+
+    let probe = Arc::new(StrictCudaBuildRollbackProbeEp::new(provider.clone()));
+    let ep: Arc<dyn ExecutionProvider> = probe.clone();
+    let before_claims = provider.executor_artifact_generation_claims();
+    let error = match Executor::build_with_cuda_requirement(
+        static_qmoe_with_optional_decline_tail(true),
+        Arc::new(WeightStore::new()),
+        ep.clone(),
+        true,
+    ) {
+        Ok(_) => panic!("strict CUDA must reject the injected post-producer decline"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("injected strict-CUDA typed decline after QMoE producer publication"),
+        "the initiating build error must remain actionable: {error}"
+    );
+
+    let after_claims = provider.executor_artifact_generation_claims();
+    let failed_claims = after_claims
+        .iter()
+        .filter(|claim| !before_claims.contains(claim))
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failed_claims.len(),
+        1,
+        "the failed preflight must have non-vacuously claimed one exact generation"
+    );
+    let (failed_executor, failed_generation) = failed_claims[0];
+    let failed = provider.route_residency_executor_status(failed_executor);
+    let drains = probe.drains.lock().unwrap();
+    assert_eq!(
+        drains.as_slice(),
+        &[(failed_executor, failed_generation, 1)],
+        "rollback must observe one real QMoE producer and drain the exact failed generation once; \
+         post-error status: {failed:?}"
+    );
+    assert!(failed.drained);
+    assert_eq!(failed.drain_calls, 1);
+    assert_eq!(failed.producer_nodes, 0);
+    assert_eq!(failed.retained_banks, 0);
+    assert!(
+        provider
+            .retired_executor_artifact_generations()
+            .contains(&(failed_executor, failed_generation)),
+        "the failed generation must remain tombstoned against ABA revival"
+    );
+    let failed_graph = static_qmoe_with_optional_decline_tail(false);
+    let failed_node = failed_graph.node(NodeId(0));
+    let revival = match provider.get_kernel_for_executor(
+        provider.executor_artifact_policy().unwrap().provider(),
+        failed_executor,
+        failed_generation,
+        failed_node,
+        &[],
+        1,
+    ) {
+        Ok(_) => panic!("a retired failed generation cannot publish another producer"),
+        Err(error) => error,
+    };
+    assert!(
+        revival.to_string().contains("retired")
+            && revival.to_string().contains("cannot be revived"),
+        "unexpected retired-generation diagnostic: {revival}"
+    );
+    drop(drains);
+
+    let sibling_after = provider.route_residency_executor_status(sibling_id);
+    assert_eq!(sibling_after.drain_calls, sibling_before.drain_calls);
+    assert_eq!(sibling_after.producer_nodes, sibling_before.producer_nodes);
+    assert_eq!(sibling_after.retained_banks, sibling_before.retained_banks);
+    let sibling_generation = before_claims
+        .iter()
+        .find_map(|(executor, generation)| (*executor == sibling_id).then_some(*generation))
+        .expect("sibling generation was claimed");
+    let stale_teardown = provider
+        .drain_executor_artifacts(
+            provider.executor_artifact_policy().unwrap().provider(),
+            sibling_id,
+            failed_generation,
+        )
+        .expect_err("a stale generation cannot drain the live sibling");
+    assert!(
+        stale_teardown
+            .to_string()
+            .contains("refusing to consume another owner's artifacts")
+    );
+    let policy = provider.executor_artifact_policy().unwrap();
+    let foreign_provider =
+        onnx_runtime_ep_api::ExecutorArtifactProviderId::from_raw(policy.provider().get() + 1);
+    let foreign_teardown = provider
+        .drain_executor_artifacts(foreign_provider, sibling_id, sibling_generation)
+        .expect_err("a foreign provider label cannot drain the live sibling");
+    assert!(foreign_teardown.to_string().contains("is foreign"));
+    let sibling_after_hostile_teardown = provider.route_residency_executor_status(sibling_id);
+    assert_eq!(
+        sibling_after_hostile_teardown.drain_calls,
+        sibling_before.drain_calls
+    );
+    assert_eq!(
+        sibling_after_hostile_teardown.producer_nodes,
+        sibling_before.producer_nodes
+    );
+
+    let retry = Executor::build_with_cuda_requirement(
+        static_qmoe_with_optional_decline_tail(true),
+        Arc::new(WeightStore::new()),
+        ep,
+        true,
+    )
+    .expect("a fresh executor generation must build after rollback");
+    let retry_status = provider.route_residency_executor_status(retry.instance_id);
+    assert_eq!(retry_status.producer_nodes, 1);
+    assert_eq!(retry_status.finalization_attempts, 1);
+}
+
+#[derive(Clone, Copy, Default)]
+enum BuildProbeFinalization {
+    #[default]
+    Declined,
+    Fail,
+    ForeignGeneration,
+}
+
+#[derive(Default)]
+struct BuildProbeScope {
+    generation: Option<ExecutorArtifactGeneration>,
+    producers: std::collections::HashSet<NodeId>,
+    retired: bool,
+}
+
+#[derive(Default)]
+struct BuildProbeState {
+    scopes: std::collections::HashMap<ExecutorInstanceId, BuildProbeScope>,
+    producer_setups: u64,
+    drain_attempts: u64,
+    drain_completions: u64,
+    producers_seen_by_drain: Vec<usize>,
+}
+
+struct BuildTransactionProbeEp {
+    inner: WeightDeliveryEp,
+    provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+    state: std::sync::Mutex<BuildProbeState>,
+    fail_node: Option<&'static str>,
+    panic_node: Option<&'static str>,
+    finalization: BuildProbeFinalization,
+    fail_allocation: AtomicBool,
+    fail_cleanup: AtomicBool,
+    panic_cleanup: AtomicBool,
+}
+
+impl BuildTransactionProbeEp {
+    fn new() -> Self {
+        static NEXT_PROVIDER: AtomicU64 = AtomicU64::new(10_000);
+        Self {
+            inner: WeightDeliveryEp::with_device(
+                false,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+                onnx_runtime_ir::DeviceId::cuda(0),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            provider: onnx_runtime_ep_api::ExecutorArtifactProviderId::from_raw(
+                NEXT_PROVIDER.fetch_add(1, Ordering::Relaxed),
+            ),
+            state: std::sync::Mutex::new(BuildProbeState::default()),
+            fail_node: None,
+            panic_node: None,
+            finalization: BuildProbeFinalization::Declined,
+            fail_allocation: AtomicBool::new(false),
+            fail_cleanup: AtomicBool::new(false),
+            panic_cleanup: AtomicBool::new(false),
+        }
+    }
+
+    fn with_fail_node(mut self, node: &'static str) -> Self {
+        self.fail_node = Some(node);
+        self
+    }
+
+    fn with_panic_node(mut self, node: &'static str) -> Self {
+        self.panic_node = Some(node);
+        self
+    }
+
+    fn with_finalization(mut self, finalization: BuildProbeFinalization) -> Self {
+        self.finalization = finalization;
+        self
+    }
+
+    fn fail_next_allocation(&self) {
+        self.fail_allocation.store(true, Ordering::Relaxed);
+    }
+
+    fn fail_cleanup(&self) {
+        self.fail_cleanup.store(true, Ordering::Relaxed);
+    }
+
+    fn panic_cleanup(&self) {
+        self.panic_cleanup.store(true, Ordering::Relaxed);
+    }
+}
+
+impl ExecutionProvider for BuildTransactionProbeEp {
+    fn name(&self) -> &str {
+        "build_transaction_probe"
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Cuda
+    }
+
+    fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        onnx_runtime_ir::DeviceId::cuda(0)
+    }
+
+    fn initialize(&mut self, _config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        input_dtypes: &[DataType],
+        layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        self.inner
+            .supports_op(op, opset, shapes, input_dtypes, layouts)
+    }
+
+    fn get_kernel(
+        &self,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        self.inner.get_kernel(op, shapes, opset)
+    }
+
+    fn get_kernel_for_executor(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        if provider != self.provider {
+            return Err(EpError::KernelFailed(format!(
+                "probe executor {} received foreign provider {}",
+                executor.get(),
+                provider.get(),
+            )));
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            let scope = state.scopes.entry(executor).or_default();
+            match scope.generation {
+                None => scope.generation = Some(generation),
+                Some(active) if active == generation && !scope.retired => {}
+                Some(active) => {
+                    return Err(EpError::KernelFailed(format!(
+                        "probe executor {} generation {} is stale or retired; active generation \
+                         is {}",
+                        executor.get(),
+                        generation.get(),
+                        active.get(),
+                    )));
+                }
+            }
+            if scope.producers.insert(op.id) {
+                state.producer_setups += 1;
+            }
+        }
+        if self.panic_node == Some(op.name.as_str()) {
+            panic!("injected panic after partial artifact publication");
+        }
+        if self.fail_node == Some(op.name.as_str()) {
+            return Err(EpError::KernelFailed(format!(
+                "injected kernel admission failure at {}",
+                op.name
+            )));
+        }
+        self.inner.get_kernel(op, shapes, opset)
+    }
+
+    fn executor_artifact_policy(&self) -> onnx_runtime_ep_api::Result<ExecutorArtifactPolicy> {
+        Ok(ExecutorArtifactPolicy::new(
+            self.provider,
+            self.device_id(),
+            ExecutorRouteResidencyConfig::Enabled,
+        ))
+    }
+
+    fn inspect_executor_artifacts(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        readiness: onnx_runtime_ep_api::ExecutorArtifactReadinessEpoch,
+        _graph: &Graph,
+    ) -> onnx_runtime_ep_api::Result<ExecutorArtifactReport> {
+        match self.finalization {
+            BuildProbeFinalization::Fail => Err(EpError::KernelFailed(
+                "injected provider-artifact finalization failure".into(),
+            )),
+            BuildProbeFinalization::ForeignGeneration => Ok(ExecutorArtifactReport::observed(
+                provider,
+                executor,
+                ExecutorArtifactGeneration::from_raw(generation.get() + 1),
+                readiness,
+                ExecutorArtifactState::Declined,
+            )),
+            BuildProbeFinalization::Declined => Ok(ExecutorArtifactReport::observed(
+                provider,
+                executor,
+                generation,
+                readiness,
+                ExecutorArtifactState::Declined,
+            )),
+        }
+    }
+
+    fn drain_executor_artifacts(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        if self.panic_cleanup.swap(false, Ordering::Relaxed) {
+            panic!("injected provider rollback panic");
+        }
+        let mut state = self.state.lock().unwrap();
+        state.drain_attempts += 1;
+        if self.fail_cleanup.load(Ordering::Relaxed) {
+            return Err(EpError::KernelFailed(
+                "injected exact-generation rollback failure".into(),
+            ));
+        }
+        if provider != self.provider {
+            return Err(EpError::KernelFailed("foreign probe provider".into()));
+        }
+        let Some(scope) = state.scopes.get_mut(&executor) else {
+            return Ok(());
+        };
+        if scope.generation != Some(generation) {
+            return Err(EpError::KernelFailed(
+                "stale probe generation cannot drain the active scope".into(),
+            ));
+        }
+        if scope.retired {
+            return Ok(());
+        }
+        let producers = scope.producers.len();
+        scope.producers.clear();
+        scope.retired = true;
+        state.producers_seen_by_drain.push(producers);
+        state.drain_completions += 1;
+        Ok(())
+    }
+
+    fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        if self.fail_allocation.swap(false, Ordering::Relaxed) {
+            return Err(EpError::OutOfMemory {
+                requested: size,
+                available: 0,
+            });
+        }
+        self.inner.allocate(size, alignment)
+    }
+
+    fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.deallocate(buffer)
+    }
+
+    fn copy(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.copy(src, dst, size)
+    }
+
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<Fence> {
+        self.inner.copy_async(src, dst, size)
+    }
+
+    fn copy_from_host(
+        &self,
+        src: &[u8],
+        dst: &mut DeviceBuffer,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.copy_from_host(src, dst)
+    }
+
+    fn copy_from_host_at(
+        &self,
+        src: &[u8],
+        dst: &mut DeviceBuffer,
+        byte_offset: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.copy_from_host_at(src, dst, byte_offset)
+    }
+
+    fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.copy_to_host(src, dst)
+    }
+
+    fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.sync()
+    }
+}
+
+fn build_transaction_probe_graph(names: &[&str]) -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let mut value = graph.create_named_value("input", DataType::Float32, vec![Dim::Static(1)]);
+    graph.add_input(value);
+    for (index, name) in names.iter().enumerate() {
+        let output = graph.create_named_value(
+            format!("value_{index}"),
+            DataType::Float32,
+            vec![Dim::Static(1)],
+        );
+        let mut node = Node::new(
+            NodeId(index as u32),
+            "Identity",
+            vec![Some(value)],
+            vec![output],
+        );
+        node.name = (*name).to_string();
+        graph.insert_node(node);
+        value = output;
+    }
+    graph.add_output(value);
+    graph
+}
+
+fn assert_probe_rolled_back_once(ep: &BuildTransactionProbeEp, producers: usize) {
+    let state = ep.state.lock().unwrap();
+    assert_eq!(state.producer_setups, producers as u64);
+    assert_eq!(state.drain_attempts, 1);
+    assert_eq!(state.drain_completions, 1);
+    assert_eq!(state.producers_seen_by_drain, [producers]);
+    assert!(
+        state
+            .scopes
+            .values()
+            .all(|scope| scope.retired && scope.producers.is_empty())
+    );
+}
+
+#[test]
+fn strict_cuda_partial_multinode_admission_rolls_back_once() {
+    let ep =
+        Arc::new(BuildTransactionProbeEp::new().with_fail_node("decline_after_two_publications"));
+    let error = match Executor::build_with_cuda_requirement(
+        build_transaction_probe_graph(&[
+            "first_publication",
+            "second_publication",
+            "decline_after_two_publications",
+        ]),
+        Arc::new(WeightStore::new()),
+        ep.clone(),
+        true,
+    ) {
+        Ok(_) => panic!("strict CUDA must reject partial multi-node admission"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("injected kernel admission failure at decline_after_two_publications")
+    );
+    assert_probe_rolled_back_once(&ep, 3);
+}
+
+#[test]
+fn non_strict_cpu_fallback_rebinds_after_rolling_back_cuda_scope_once() {
+    let ep = Arc::new(BuildTransactionProbeEp::new().with_fail_node("decline"));
+    let executor = Executor::build_with_cuda_requirement(
+        build_transaction_probe_graph(&["producer", "decline"]),
+        Arc::new(WeightStore::new()),
+        ep.clone(),
+        false,
+    )
+    .expect("non-strict placement may fall back only after rollback");
+    assert_eq!(executor.device_id().device_type, DeviceType::Cpu);
+    assert_probe_rolled_back_once(&ep, 2);
+    drop(executor);
+    assert_probe_rolled_back_once(&ep, 2);
+}
+
+#[test]
+fn build_finalization_failure_rolls_back_before_executor_owns_teardown() {
+    let ep =
+        Arc::new(BuildTransactionProbeEp::new().with_finalization(BuildProbeFinalization::Fail));
+    let error = match Executor::build_with_cuda_requirement(
+        build_transaction_probe_graph(&["producer"]),
+        Arc::new(WeightStore::new()),
+        ep.clone(),
+        true,
+    ) {
+        Ok(_) => panic!("provider finalization failure must reject the build"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("injected provider-artifact finalization failure")
+    );
+    assert_probe_rolled_back_once(&ep, 1);
+}
+
+#[test]
+fn foreign_generation_finalization_report_rolls_back_exact_build_scope() {
+    let ep = Arc::new(
+        BuildTransactionProbeEp::new().with_finalization(BuildProbeFinalization::ForeignGeneration),
+    );
+    let error = match Executor::build_with_cuda_requirement(
+        build_transaction_probe_graph(&["producer"]),
+        Arc::new(WeightStore::new()),
+        ep.clone(),
+        true,
+    ) {
+        Ok(_) => panic!("foreign generation report must reject the build"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("provider artifact report mismatch")
+    );
+    assert_probe_rolled_back_once(&ep, 1);
+}
+
+#[test]
+fn post_preflight_executor_allocation_failure_rolls_back_exact_scope() {
+    let ep = Arc::new(BuildTransactionProbeEp::new());
+    ep.fail_next_allocation();
+    let error = match Executor::build_with_cuda_requirement(
+        build_transaction_probe_graph(&["producer"]),
+        Arc::new(WeightStore::new()),
+        ep.clone(),
+        true,
+    ) {
+        Ok(_) => panic!("injected executor allocation failure must reject the build"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("device OOM"),
+        "unexpected allocation failure: {error}"
+    );
+    assert_probe_rolled_back_once(&ep, 1);
+}
+
+#[test]
+fn rollback_failure_preserves_initiating_build_error_and_is_not_retried() {
+    let ep = Arc::new(BuildTransactionProbeEp::new().with_fail_node("decline"));
+    ep.fail_cleanup();
+    let error = match Executor::build_with_cuda_requirement(
+        build_transaction_probe_graph(&["producer", "decline"]),
+        Arc::new(WeightStore::new()),
+        ep.clone(),
+        true,
+    ) {
+        Ok(_) => panic!("strict CUDA must reject the injected decline"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            SessionError::ExecutionProviderArtifactRollbackFailed { .. }
+        ),
+        "cleanup failure must retain a typed aggregate: {error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("injected kernel admission failure at decline"));
+    assert!(message.contains("injected exact-generation rollback failure"));
+    let state = ep.state.lock().unwrap();
+    assert_eq!(state.producer_setups, 2);
+    assert_eq!(state.drain_attempts, 1);
+    assert_eq!(state.drain_completions, 0);
+}
+
+#[test]
+fn rollback_panic_is_converted_without_masking_the_build_error() {
+    let ep = Arc::new(BuildTransactionProbeEp::new().with_fail_node("decline"));
+    ep.panic_cleanup();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+        let ep = ep.clone();
+        move || {
+            Executor::build_with_cuda_requirement(
+                build_transaction_probe_graph(&["producer", "decline"]),
+                Arc::new(WeightStore::new()),
+                ep,
+                true,
+            )
+        }
+    }));
+    let error = match result {
+        Ok(Err(error)) => error,
+        Ok(Ok(_)) => panic!("strict CUDA must reject the injected decline"),
+        Err(_) => panic!("rollback panic must be converted into an actionable build error"),
+    };
+    let message = error.to_string();
+    assert!(message.contains("injected kernel admission failure at decline"));
+    assert!(message.contains("provider-artifact rollback panicked"));
+}
+
+#[test]
+fn panic_after_partial_publication_runs_transaction_drop_once() {
+    let ep = Arc::new(BuildTransactionProbeEp::new().with_panic_node("panic_after_publish"));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+        let ep = ep.clone();
+        move || {
+            let _ = Executor::build_with_cuda_requirement(
+                build_transaction_probe_graph(&["producer", "panic_after_publish"]),
+                Arc::new(WeightStore::new()),
+                ep,
+                true,
+            );
+        }
+    }));
+    assert!(result.is_err());
+    assert_probe_rolled_back_once(&ep, 2);
+}
+
 #[test]
 fn sequence_executor_preserves_element_arc_identity() {
     use onnx_runtime_ir::{TensorData, WeightRef, static_shape};

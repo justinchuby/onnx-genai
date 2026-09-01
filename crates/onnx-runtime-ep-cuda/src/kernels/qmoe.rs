@@ -1198,8 +1198,14 @@ pub struct RouteTelemetrySourceRegistry {
     route_residency: ExecutorRouteResidencyConfig,
     compile_scope: Mutex<()>,
     active_executor: AtomicU64,
-    generations: Mutex<HashMap<ExecutorInstanceId, ExecutorArtifactGeneration>>,
+    generations: Mutex<HashMap<ExecutorInstanceId, ArtifactGenerationClaim>>,
     sources: Mutex<HashMap<ExecutorInstanceId, HashMap<NodeId, Arc<QMoERouteTelemetry>>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArtifactGenerationClaim {
+    generation: ExecutorArtifactGeneration,
+    retired: bool,
 }
 
 impl Default for RouteTelemetrySourceRegistry {
@@ -1219,30 +1225,41 @@ impl RouteTelemetrySourceRegistry {
         }
     }
 
-    pub(crate) fn claim_scope(
+    fn claim_scope(
         &self,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
     ) -> Result<()> {
-        if self.route_residency == ExecutorRouteResidencyConfig::Disabled {
-            return Ok(());
-        }
         let mut generations = self
             .generations
             .lock()
             .expect("cuda_ep route-telemetry generation registry poisoned");
         match generations.entry(executor) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(generation);
+                entry.insert(ArtifactGenerationClaim {
+                    generation,
+                    retired: false,
+                });
             }
-            std::collections::hash_map::Entry::Occupied(entry) if *entry.get() == generation => {}
+            std::collections::hash_map::Entry::Occupied(entry)
+                if entry.get().generation == generation && !entry.get().retired => {}
+            std::collections::hash_map::Entry::Occupied(entry)
+                if entry.get().generation == generation =>
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} artifact generation {} is retired and cannot be \
+                     revived; build a fresh session generation",
+                    executor.get(),
+                    generation.get(),
+                )));
+            }
             std::collections::hash_map::Entry::Occupied(entry) => {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep: executor {} artifact generation {} is stale; active generation is \
                      {}; rebuild the executor and use its exact session generation",
                     executor.get(),
                     generation.get(),
-                    entry.get().get(),
+                    entry.get().generation.get(),
                 )));
             }
         }
@@ -1256,7 +1273,6 @@ impl RouteTelemetrySourceRegistry {
         generation: ExecutorArtifactGeneration,
         f: impl FnOnce() -> T,
     ) -> Result<T> {
-        self.claim_scope(executor, generation)?;
         if self.route_residency == ExecutorRouteResidencyConfig::Disabled {
             return Ok(f());
         }
@@ -1264,6 +1280,7 @@ impl RouteTelemetrySourceRegistry {
             .compile_scope
             .lock()
             .expect("cuda_ep route-telemetry compile scope poisoned");
+        self.claim_scope(executor, generation)?;
         self.active_executor
             .store(executor.get(), Ordering::Release);
         struct Reset<'a>(&'a AtomicU64);
@@ -1274,6 +1291,48 @@ impl RouteTelemetrySourceRegistry {
         }
         let _reset = Reset(&self.active_executor);
         Ok(f())
+    }
+
+    /// Retire one exact scope while excluding concurrent publication and
+    /// finalization. The closure runs under the same lifecycle gate so a
+    /// producer cannot appear after cleanup has observed the scope.
+    pub(crate) fn retire_scope<T>(
+        &self,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        f: impl FnOnce(bool) -> T,
+    ) -> Result<T> {
+        if self.route_residency == ExecutorRouteResidencyConfig::Disabled {
+            return Ok(f(false));
+        }
+        let _gate = self
+            .compile_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let newly_retired = {
+            let mut generations = self
+                .generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match generations.get_mut(&executor) {
+                None => false,
+                Some(claim) if claim.generation != generation => {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep: executor {} teardown generation {} is stale; active generation \
+                         is {}; refusing to consume another owner's artifacts",
+                        executor.get(),
+                        generation.get(),
+                        claim.generation.get(),
+                    )));
+                }
+                Some(claim) if claim.retired => false,
+                Some(claim) => {
+                    claim.retired = true;
+                    true
+                }
+            }
+        };
+        Ok(f(newly_retired))
     }
 
     fn source_for_current(
@@ -1352,7 +1411,23 @@ impl RouteTelemetrySourceRegistry {
             .lock()
             .expect("cuda_ep route-telemetry generation registry poisoned")
             .iter()
-            .map(|(executor, generation)| (*executor, *generation))
+            .map(|(executor, claim)| (*executor, claim.generation))
+            .collect::<Vec<_>>();
+        generations.sort_by_key(|(executor, _)| executor.get());
+        generations
+    }
+
+    #[cfg(any(test, feature = "gpu-tests"))]
+    pub(crate) fn retired_generations(
+        &self,
+    ) -> Vec<(ExecutorInstanceId, ExecutorArtifactGeneration)> {
+        let mut generations = self
+            .generations
+            .lock()
+            .expect("cuda_ep route-telemetry generation registry poisoned")
+            .iter()
+            .filter(|(_, claim)| claim.retired)
+            .map(|(executor, claim)| (*executor, claim.generation))
             .collect::<Vec<_>>();
         generations.sort_by_key(|(executor, _)| executor.get());
         generations
@@ -1361,21 +1436,22 @@ impl RouteTelemetrySourceRegistry {
     /// Drop only one executor's source ownership. The generation tombstone
     /// remains until provider shutdown so stale capabilities cannot reclaim the
     /// executor key after drain.
-    pub(crate) fn remove(&self, executor: ExecutorInstanceId) {
+    pub(crate) fn remove(&self, executor: ExecutorInstanceId) -> usize {
         self.sources
             .lock()
-            .expect("cuda_ep route-telemetry registry poisoned")
-            .remove(&executor);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&executor)
+            .map_or(0, |sources| sources.len())
     }
 
     pub(crate) fn clear(&self) {
         self.generations
             .lock()
-            .expect("cuda_ep route-telemetry generation registry poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.sources
             .lock()
-            .expect("cuda_ep route-telemetry registry poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
     }
 }
@@ -3455,6 +3531,111 @@ mod tests {
             node.attributes.insert((*name).into(), value.clone());
         }
         node
+    }
+
+    #[test]
+    fn scope_retirement_serializes_with_publication_and_is_sticky() {
+        let registry = Arc::new(RouteTelemetrySourceRegistry::new(
+            ExecutorRouteResidencyConfig::Enabled,
+        ));
+        let executor = ExecutorInstanceId::from_raw(41);
+        let generation = ExecutorArtifactGeneration::from_raw(73);
+        let published = Arc::new(AtomicBool::new(false));
+        let cleanup_calls = Arc::new(AtomicU64::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let publisher = {
+            let registry = Arc::clone(&registry);
+            let published = Arc::clone(&published);
+            std::thread::spawn(move || {
+                registry
+                    .with_executor_scope(executor, generation, || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        published.store(true, Ordering::Release);
+                    })
+                    .unwrap();
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let (retired_tx, retired_rx) = std::sync::mpsc::channel();
+        let retire = {
+            let registry = Arc::clone(&registry);
+            let published = Arc::clone(&published);
+            let cleanup_calls = Arc::clone(&cleanup_calls);
+            std::thread::spawn(move || {
+                registry
+                    .retire_scope(executor, generation, |newly_retired| {
+                        assert!(newly_retired);
+                        assert!(
+                            published.load(Ordering::Acquire),
+                            "retirement cleanup must run after the in-flight publisher exits"
+                        );
+                        cleanup_calls.fetch_add(1, Ordering::Relaxed);
+                    })
+                    .unwrap();
+                retired_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            retired_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "retirement must wait for an in-flight publication scope"
+        );
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap();
+        retire.join().unwrap();
+        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 1);
+
+        let revival = registry
+            .with_executor_scope(executor, generation, || ())
+            .expect_err("retired generation must not be revived");
+        assert!(revival.to_string().contains("retired"));
+
+        registry
+            .retire_scope(executor, generation, |newly_retired| {
+                assert!(!newly_retired, "repeat exact retirement is idempotent");
+            })
+            .unwrap();
+        let stale = registry
+            .retire_scope(
+                executor,
+                ExecutorArtifactGeneration::from_raw(generation.get() + 1),
+                |_| panic!("stale teardown must not enter cleanup"),
+            )
+            .expect_err("stale teardown must fail closed");
+        assert!(
+            stale
+                .to_string()
+                .contains("refusing to consume another owner's artifacts")
+        );
+        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn retirement_recovers_lifecycle_gate_poisoned_by_publication_panic() {
+        let registry = RouteTelemetrySourceRegistry::new(ExecutorRouteResidencyConfig::Enabled);
+        let executor = ExecutorInstanceId::from_raw(51);
+        let generation = ExecutorArtifactGeneration::from_raw(91);
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = registry.with_executor_scope(executor, generation, || {
+                panic!("injected publication panic");
+            });
+        }));
+        assert!(publication.is_err());
+        registry
+            .retire_scope(executor, generation, |newly_retired| {
+                assert!(newly_retired);
+            })
+            .expect("cleanup must recover the poisoned lifecycle gate");
+        assert!(
+            registry
+                .retired_generations()
+                .contains(&(executor, generation))
+        );
     }
 
     #[test]
