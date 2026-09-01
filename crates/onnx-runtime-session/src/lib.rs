@@ -48,6 +48,8 @@ pub use plugin_provider::{PluginExecutionProvider, is_plugin_fused_node};
 pub use tensor::{
     DeviceBindingTransferStats, DeviceIoBinding, ExternalMemorySpec, Tensor, cpu_allocator,
 };
+/// Device-bound graph outputs, stored inline for the common fixed-output case.
+pub type DeviceBindingOutputs = smallvec::SmallVec<[Option<Tensor>; 16]>;
 
 mod epcontext;
 mod executor;
@@ -922,6 +924,155 @@ fn optimize_graph(graph: &mut onnx_runtime_ir::Graph, level: OptimizationLevel) 
     Ok(())
 }
 
+/// Coarse traffic phase selected by a BlockQuantizedMoE observer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockQuantizedMoeTrafficPhase {
+    Load,
+    Warmup,
+    Prefill,
+    Decode,
+}
+
+/// Request identity used to arm session-owned BlockQuantizedMoE traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockQuantizedMoeTrafficConfig {
+    pub request_id: u32,
+}
+
+/// One explicit phase snapshot from the production device record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockQuantizedMoeTrafficSnapshot {
+    pub phase: BlockQuantizedMoeTrafficPhase,
+    pub request_id: u32,
+    pub traffic: onnx_runtime_ep_api::BlockQuantizedMoeTraffic,
+}
+
+/// Exclusive session/request owner for FreeToken-style BlockQuantizedMoE
+/// observability. The borrow prevents arm/disarm from racing execution, while
+/// captured graphs retain the exact immutable device record they reference.
+///
+/// ```compile_fail
+/// # use onnx_runtime_session::{
+/// #     BlockQuantizedMoeTrafficConfig, InferenceSession,
+/// # };
+/// # fn concurrent_reconfiguration(session: &mut InferenceSession) {
+/// let observer = session
+///     .observe_block_quantized_moe_traffic(BlockQuantizedMoeTrafficConfig {
+///         request_id: 1,
+///     })
+///     .unwrap();
+/// let _ = session.run_with_device_bindings(&[], &mut []);
+/// drop(observer);
+/// # }
+/// ```
+pub struct BlockQuantizedMoeTrafficObserver<'a> {
+    session: &'a mut InferenceSession,
+    phase: BlockQuantizedMoeTrafficPhase,
+    request_id: u32,
+    active: bool,
+}
+
+impl BlockQuantizedMoeTrafficObserver<'_> {
+    pub fn reset_phase(&mut self, phase: BlockQuantizedMoeTrafficPhase) -> Result<()> {
+        self.session.exec.finish_device_validation_boundary()?;
+        self.session.exec.reset_block_quantized_moe_traffic()?;
+        self.phase = phase;
+        Ok(())
+    }
+
+    pub fn snapshot(&mut self) -> Result<BlockQuantizedMoeTrafficSnapshot> {
+        self.session.exec.finish_device_validation_boundary()?;
+        Ok(BlockQuantizedMoeTrafficSnapshot {
+            phase: self.phase,
+            request_id: self.request_id,
+            traffic: self.session.exec.snapshot_block_quantized_moe_traffic()?,
+        })
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn inject_fault_for_test(
+        &self,
+        fault: onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoeTrafficFaultForTest,
+    ) -> Result<()> {
+        self.session
+            .exec
+            .inject_block_quantized_moe_traffic_fault_for_test(fault)
+    }
+
+    pub fn prepare_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        self.session
+            .exec
+            .prepare_with_device_bindings(inputs, bindings)
+    }
+
+    pub fn warmup(&mut self, shapes: &[WarmupShape]) -> Result<()> {
+        self.session.warmup(shapes)
+    }
+
+    pub fn run_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceBindingOutputs> {
+        self.session.exec.run_with_device_bindings(inputs, bindings)
+    }
+
+    pub fn try_capture_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceGraphCaptureResult> {
+        self.session
+            .exec
+            .try_capture_with_device_bindings(inputs, bindings)
+    }
+
+    pub fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<bool> {
+        self.session.exec.replay_device_graph(bindings)
+    }
+
+    pub fn reset_device_graph(&mut self) -> Result<bool> {
+        self.session.exec.reset_device_graph()
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        self.cleanup()
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        let validation = self.session.exec.finish_device_validation_boundary();
+        let disarm = self.session.exec.disarm_block_quantized_moe_traffic();
+        if disarm.is_ok() {
+            self.active = false;
+        }
+        match (validation, disarm) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(validation), Err(disarm)) => Err(SessionError::Internal(format!(
+                "BlockQuantizedMoE observer validation failed: {validation}; cleanup also failed: \
+                 {disarm}"
+            ))),
+        }
+    }
+}
+
+impl Drop for BlockQuantizedMoeTrafficObserver<'_> {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = self.cleanup()
+        {
+            eprintln!(
+                "[onnx-runtime-session] BlockQuantizedMoE observer drop observed a cleanup \
+                 failure after attempting validation and graph-safe disarm: {error}"
+            );
+        }
+    }
+}
+
 /// A loaded model ready to run inference (§20.2).
 pub struct InferenceSession {
     inputs: Vec<IoMeta>,
@@ -1173,8 +1324,30 @@ impl InferenceSession {
         &mut self,
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
-    ) -> Result<Vec<Option<Tensor>>> {
+    ) -> Result<DeviceBindingOutputs> {
         self.exec.run_with_device_bindings(inputs, bindings)
+    }
+
+    /// Arm production BlockQuantizedMoE traffic before capture and hold
+    /// exclusive session ownership through all observed phases.
+    pub fn observe_block_quantized_moe_traffic(
+        &mut self,
+        config: BlockQuantizedMoeTrafficConfig,
+    ) -> Result<BlockQuantizedMoeTrafficObserver<'_>> {
+        let armed = self
+            .exec
+            .arm_block_quantized_moe_traffic(config.request_id)?;
+        if armed == 0 {
+            return Err(SessionError::Internal(
+                "session has no prepared BlockQuantizedMoE kernel to observe".into(),
+            ));
+        }
+        Ok(BlockQuantizedMoeTrafficObserver {
+            session: self,
+            phase: BlockQuantizedMoeTrafficPhase::Load,
+            request_id: config.request_id,
+            active: true,
+        })
     }
 
     /// Prepare exact kernel workspace for a bound run without launching kernels.
@@ -1244,7 +1417,7 @@ impl InferenceSession {
         &mut self,
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
-    ) -> Result<Vec<Option<Tensor>>> {
+    ) -> Result<DeviceBindingOutputs> {
         let exec = self.decode_inline_exec.as_mut().ok_or_else(|| {
             SessionError::Internal(
                 "decode-inline executor requested but not built; call enable_decode_inline first"
@@ -1367,7 +1540,7 @@ impl InferenceSession {
         &mut self,
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
-    ) -> Result<Vec<Option<Tensor>>> {
+    ) -> Result<DeviceBindingOutputs> {
         let exec = self.verify_exec.as_mut().ok_or_else(|| {
             SessionError::Internal(
                 "verify sibling requested but not built; call enable_verify_sibling first".into(),
@@ -1939,6 +2112,7 @@ mod device_binding_tests {
         session
             .run_with_device_bindings(&[], &mut bindings)
             .unwrap();
+        assert_eq!(read_bound_f32(&mut bindings[1]), 7.0);
 
         input_write(&mut bindings[0], 11);
         assert!(matches!(
@@ -2025,6 +2199,7 @@ mod device_binding_tests {
         session
             .run_with_device_bindings(&[], &mut bindings)
             .unwrap();
+        assert_eq!(read_bound_f32(&mut bindings[1]), 7.0);
 
         // Capture into the Verify slot and replay with persistent I/O (no new
         // device allocations across the replay) — the same guarantees Primary has.
