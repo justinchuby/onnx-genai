@@ -12,6 +12,8 @@ use super::*;
 /// single-field layout.
 #[derive(Default)]
 pub(crate) struct SlotCaptureState {
+    /// Exact provider installation token for this executor/slot.
+    pub(super) device_graph_token: Option<DeviceGraphToken>,
     /// Binding signature (I/O name + dtype + physical shape + device ptr) the
     /// installed graph for this slot was captured under; a replay whose bindings
     /// differ retires the graph. `None` when no device graph is installed.
@@ -89,6 +91,15 @@ pub(crate) struct Executor {
     /// calls this executor makes route through this slot; defaulting to Primary
     /// keeps the field inert unless a caller explicitly retargets it.
     pub(super) graph_slot: DeviceGraphSlot,
+    /// Immutable namespace identity for every captured graph owned by this
+    /// executor. Sibling sessions sharing one provider receive distinct owners.
+    pub(super) graph_owner: DeviceGraphOwner,
+    /// Setup-time owner slot. Warming borrows this proof directly instead of
+    /// looking up an owner or cloning a shared handle.
+    pub(super) validation_registration: Option<DeviceValidationRegistration>,
+    /// Most recent submitted generation in this executor's registered
+    /// owner-scoped validation slot.
+    pub(super) pending_device_validation: Option<DeviceValidationToken>,
     /// Lazy external initializers available only at the nxrt fused-MoE boundary.
     /// Stock EPs ignore this map and keep receiving the resident buffers below.
     pub(super) weight_handles: HashMap<ValueId, WeightHandle>,
@@ -279,6 +290,16 @@ pub(crate) struct Executor {
     /// it is fully rewritten at the top of each `exec_kernel_node` call and only
     /// read within that same call — never aliased or carried across nodes.
     pub(super) scratch_input_shapes: Vec<Vec<usize>>,
+    /// Bounded per-executor dispatch metadata reused by fixed-shape runs.
+    pub(super) scratch_input_infos: Vec<InInfo>,
+    pub(super) scratch_output_shapes: Vec<Vec<usize>>,
+    pub(super) scratch_output_strides: Vec<Vec<i64>>,
+    pub(super) scratch_materialized_inputs: Vec<Option<(Vec<u8>, Vec<i64>)>>,
+    /// Persistent run metadata reused by device-bound eager execution.
+    pub(super) scratch_external_bindings: ExternalBindings,
+    pub(super) scratch_resolved_shapes: HashMap<ValueId, Vec<usize>>,
+    /// Stable value traversal order prepared once with the executor.
+    pub(super) all_value_ids: Vec<ValueId>,
     /// F5 Stage 1 — master switch for the steady-state decode-plan memo. Default
     /// ON; disabled by `ONNX_GENAI_DECODE_MEMO=0`. Consulted on the top-level CPU
     /// eager decode path — including the normal persistent-KV-binding case.
@@ -715,7 +736,7 @@ pub(super) struct InInfo {
     pub(super) shape: Vec<usize>,
     pub(super) strides: Vec<i64>,
     pub(super) byte_offset: usize,
-    pub(super) base_ptr: *const std::ffi::c_void,
+    pub(super) base_ptr: usize,
     pub(super) device: onnx_runtime_ir::DeviceId,
     pub(super) backing: TensorBacking,
     /// Length in bytes of the backing (root) allocation, for the bounds gate.
@@ -724,12 +745,9 @@ pub(super) struct InInfo {
     /// disabled or no residency); such inputs stay absent and are routed to the
     /// kernel as a lazy `KernelInput::Weight` instead of a bound view.
     pub(super) lazy_unresolved: bool,
-    /// Keep-alive for a lazy weight the EP paged into device memory: pins the VRAM
-    /// page for the kernel's lifetime, then makes it evictable when the `InInfo`
-    /// is dropped after dispatch. When `Some`, `base_ptr`/`device` point at the
-    /// paged bytes and `present` is true. Held for its `Drop` side effect only.
-    #[allow(dead_code)]
-    pub(super) paged: Option<onnx_runtime_ep_api::PagedWeight>,
+    /// True when the ordinary initializer buffer was deliberately omitted
+    /// because the provider promised an immutable prepared override.
+    pub(super) prepared_unresolved: bool,
 }
 
 #[derive(Clone)]
@@ -738,7 +756,10 @@ pub(super) struct ExternalValue {
     pub(super) shape: Vec<usize>,
     pub(super) accepts_subshape: bool,
     pub(super) strides: Option<Vec<i64>>,
-    pub(super) ptr: *mut std::ffi::c_void,
+    /// Physical shape that remains capture-stable while `shape` exposes a
+    /// shorter logical prefix through fixed row strides.
+    pub(super) fixed_stride_shape: Option<Vec<usize>>,
+    pub(super) ptr: usize,
     pub(super) len: usize,
     pub(super) alignment: usize,
     pub(super) device: onnx_runtime_ir::DeviceId,
@@ -765,13 +786,18 @@ impl ExternalValue {
         // the allocation, outlives this alias, and is not otherwise accessed
         // until execution returns.
         unsafe {
-            DeviceBuffer::from_borrowed_mut_parts(self.ptr, self.device, self.len, self.alignment)
+            DeviceBuffer::from_borrowed_mut_parts(
+                self.ptr as *mut std::ffi::c_void,
+                self.device,
+                self.len,
+                self.alignment,
+            )
         }
         .ok_or_else(|| SessionError::Internal("external output binding has a null pointer".into()))
     }
 
     pub(super) fn readable_buffer(&self) -> Result<DeviceBuffer> {
-        if self.ptr.is_null() {
+        if self.ptr == 0 {
             return Err(SessionError::Internal(
                 "external input binding has a null pointer".into(),
             ));
@@ -780,7 +806,12 @@ impl ExternalValue {
         // `DeviceIoBinding` borrowed for the complete run. This read-only alias
         // neither owns nor mutates the binding's allocation.
         Ok(unsafe {
-            DeviceBuffer::from_borrowed_parts(self.ptr, self.device, self.len, self.alignment)
+            DeviceBuffer::from_borrowed_parts(
+                self.ptr as *mut std::ffi::c_void,
+                self.device,
+                self.len,
+                self.alignment,
+            )
         })
     }
 }
@@ -808,6 +839,10 @@ pub(super) struct ExternalCaptureSig {
 }
 
 impl ExternalBindings {
+    fn capture_shape(value: &ExternalValue) -> &[usize] {
+        value.fixed_stride_shape.as_deref().unwrap_or(&value.shape)
+    }
+
     pub(super) fn seed_capture_shapes(&self, resolved: &mut HashMap<ValueId, Vec<usize>>) {
         for (&vid, value) in &self.inputs {
             resolved.entry(vid).or_insert_with(|| value.shape.clone());
@@ -833,13 +868,50 @@ impl ExternalBindings {
                 vid,
                 is_input,
                 dtype: v.dtype,
-                shape: v.shape.clone(),
-                ptr: v.ptr as usize,
+                shape: Self::capture_shape(v).to_vec(),
+                ptr: v.ptr,
                 len: v.len,
             })
             .collect();
         sig.sort_by_key(|a| (a.vid.0, a.is_input));
         sig
+    }
+
+    pub(super) fn refill_capture_signature(&self, sig: &mut Vec<ExternalCaptureSig>) {
+        sig.retain(|entry| {
+            if entry.is_input {
+                self.inputs.contains_key(&entry.vid)
+            } else {
+                self.outputs.contains_key(&entry.vid)
+            }
+        });
+        for (vid, is_input, value) in self
+            .inputs
+            .iter()
+            .map(|(&vid, value)| (vid, true, value))
+            .chain(self.outputs.iter().map(|(&vid, value)| (vid, false, value)))
+        {
+            if let Some(entry) = sig
+                .iter_mut()
+                .find(|entry| entry.vid == vid && entry.is_input == is_input)
+            {
+                entry.dtype = value.dtype;
+                entry.shape.clear();
+                entry.shape.extend_from_slice(Self::capture_shape(value));
+                entry.ptr = value.ptr;
+                entry.len = value.len;
+            } else {
+                sig.push(ExternalCaptureSig {
+                    vid,
+                    is_input,
+                    dtype: value.dtype,
+                    shape: Self::capture_shape(value).to_vec(),
+                    ptr: value.ptr,
+                    len: value.len,
+                });
+            }
+        }
+        sig.sort_by_key(|entry| (entry.vid.0, entry.is_input));
     }
 }
 

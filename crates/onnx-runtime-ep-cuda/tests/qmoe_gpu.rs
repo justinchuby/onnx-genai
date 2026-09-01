@@ -3903,6 +3903,7 @@ mod route_telemetry {
                     request_id: 42,
                     device_id: ep.runtime().ordinal(),
                     num_experts: case.experts,
+                    routes_per_row: case.top_k,
                 })
                 .expect("arm telemetry");
             let on = exec_eager(&ep, &kernel, &inputs, case).unwrap();
@@ -3933,6 +3934,7 @@ mod route_telemetry {
                     request_id: 7,
                     device_id: ep.runtime().ordinal(),
                     num_experts: case.experts,
+                    routes_per_row: case.top_k,
                 })
                 .expect("arm telemetry");
             exec_eager(&ep, &kernel, &inputs, case).unwrap();
@@ -3967,6 +3969,7 @@ mod route_telemetry {
                 request_id: 3,
                 device_id: ep.runtime().ordinal(),
                 num_experts: case.experts,
+                routes_per_row: case.top_k,
             })
             .expect("arm telemetry");
 
@@ -4054,6 +4057,7 @@ mod route_telemetry {
                 request_id: 11,
                 device_id: ep.runtime().ordinal(),
                 num_experts: case.experts,
+                routes_per_row: case.top_k,
             })
             .expect("arm telemetry");
 
@@ -4196,6 +4200,7 @@ mod route_telemetry {
                 request_id: 77,
                 device_id: ep.runtime().ordinal(),
                 num_experts: case.experts,
+                routes_per_row: case.top_k,
             })
             .expect("arm telemetry");
 
@@ -4282,6 +4287,7 @@ mod route_telemetry {
                 request_id: 1,
                 device_id: wrong_device,
                 num_experts: case.experts,
+                routes_per_row: case.top_k,
             })
             .expect_err("device mismatch must be rejected");
         assert!(matches!(error, TelemetryUnsupported::DeviceMismatch { .. }));
@@ -4311,6 +4317,7 @@ mod route_telemetry {
                 request_id: 5,
                 device_id: ep.runtime().ordinal(),
                 num_experts: case.experts + 4,
+                routes_per_row: case.top_k,
             })
             .expect("arming with any positive capacity succeeds");
 
@@ -4343,6 +4350,7 @@ mod route_telemetry {
                 request_id: 100,
                 device_id: ep.runtime().ordinal(),
                 num_experts: case.experts,
+                routes_per_row: case.top_k,
             })
             .unwrap();
         kernel_b
@@ -4350,6 +4358,7 @@ mod route_telemetry {
                 request_id: 200,
                 device_id: ep.runtime().ordinal(),
                 num_experts: case.experts,
+                routes_per_row: case.top_k,
             })
             .unwrap();
 
@@ -4396,6 +4405,7 @@ mod route_telemetry {
                 request_id: 9,
                 device_id: ep.runtime().ordinal(),
                 num_experts: case.experts,
+                routes_per_row: case.top_k,
             })
             .expect("arm telemetry");
 
@@ -4459,6 +4469,7 @@ mod route_telemetry {
                     request_id: 300 + rows as u32,
                     device_id: ep.runtime().ordinal(),
                     num_experts: case.experts,
+                    routes_per_row: case.top_k,
                 })
                 .expect("arm telemetry");
             exec_eager(&ep, &kernel, &inputs, case).unwrap();
@@ -4630,6 +4641,7 @@ mod route_telemetry {
                     request_id,
                     device_id: runtime.ordinal(),
                     num_experts: case.experts,
+                    routes_per_row: case.top_k,
                 })
                 .expect("arm telemetry");
             run_once(&mut output_buffer);

@@ -1,13 +1,27 @@
 //! The [`Kernel`] trait and kernel-match / cost types (§4.2).
 
+use std::any::Any;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use onnx_runtime_ir::{DataType, TensorLayout};
 use onnx_runtime_memory_governor::MemoryRole;
 
+use crate::ExecutionProvider;
 use crate::error::Result;
 use crate::tensor::{DevicePtrMut, TensorMut, TensorView};
 use crate::weight::WeightHandle;
+
+/// One immutable graph initializer supplied during kernel preparation.
+///
+/// `bytes` borrows the session's inline storage or read-only external mmap; no
+/// copy is made to construct this descriptor.
+#[derive(Clone, Copy, Debug)]
+pub struct KernelConstantInput<'a> {
+    pub dtype: DataType,
+    pub shape: &'a [usize],
+    pub bytes: &'a [u8],
+}
 
 /// A cost estimate for running a kernel, consumed by the placement cost model
 /// (`docs/architecture/ORT2.md` §6). All time fields are in **microseconds**; a fuller model
@@ -574,8 +588,65 @@ impl WorkspaceView {
     }
 }
 
+/// Object-safe concrete-type access for provider-specific diagnostics.
+pub trait KernelType {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any> KernelType for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Immutable owner retained by an installed device graph.
+///
+/// Kernels return these owners before capture begins so address-bearing
+/// resources are pinned before any CUDA node can embed their pointers.
+#[derive(Clone)]
+pub struct DeviceGraphResource {
+    identity: usize,
+    owner: Arc<dyn Any + Send + Sync>,
+}
+
+impl DeviceGraphResource {
+    pub fn new<T>(identity: usize, owner: Arc<T>) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self { identity, owner }
+    }
+
+    pub fn identity(&self) -> usize {
+        self.identity
+    }
+
+    pub fn owner(&self) -> &Arc<dyn Any + Send + Sync> {
+        &self.owner
+    }
+}
+
+/// One coarse phase's production BlockQuantizedMoE traffic projection.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BlockQuantizedMoeTraffic {
+    /// Bytes uploaded once while admitting immutable whole projection banks.
+    pub uploaded_whole_bank_bytes: u64,
+    /// Device bytes committed for those whole projection banks.
+    pub committed_whole_bank_bytes: u64,
+    /// Logical route demand, including repeated expert selections.
+    pub logical_route_demand_bytes: u64,
+    /// Extent of distinct experts selected in the phase.
+    pub unique_selected_expert_bytes: u64,
+    /// Measured physical DRAM bytes, when a hardware counter supplies them.
+    pub physical_dram_bytes: Option<u64>,
+    /// Expert page-ins performed by a residency implementation.
+    pub page_ins: u64,
+    /// Byte-weighted hit rate, when expert-indexed residency is active.
+    pub byte_hit_rate: Option<f64>,
+}
+
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
-pub trait Kernel: Send {
+pub trait Kernel: Send + KernelType {
     /// Tell the kernel which positional inputs are immutable graph constants.
     ///
     /// The session calls this exactly once, immediately after construction.
@@ -583,6 +654,78 @@ pub trait Kernel: Send {
     /// never be marked constant: caching them would return stale results.
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         let _ = constant_inputs;
+    }
+
+    /// Validate and bind immutable graph constants before the first launch.
+    ///
+    /// The session calls this exactly once for a newly constructed kernel,
+    /// after [`Kernel::set_constant_inputs`]. Stock kernels need no preparation.
+    fn prepare_constant_inputs(
+        &mut self,
+        constants: &[Option<KernelConstantInput<'_>>],
+        provider: &dyn ExecutionProvider,
+    ) -> Result<()> {
+        let _ = (constants, provider);
+        Ok(())
+    }
+
+    /// Share immutable preparation across shape-specialized variants of the
+    /// same session node. The executor's kernel cache is node-scoped, so this
+    /// state never crosses sessions or graph nodes.
+    fn shareable_constant_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+
+    /// Adopt state returned by [`Kernel::shareable_constant_state`].
+    ///
+    /// Returns `true` when the state was recognized and installed.
+    fn adopt_shareable_constant_state(
+        &mut self,
+        state: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<bool> {
+        let _ = state;
+        Ok(false)
+    }
+
+    /// Replace a positional constant input with a kernel-owned immutable view.
+    ///
+    /// The session applies overrides after kernel lookup and before execution;
+    /// direct callers that bypass this binding seam are rejected by kernels
+    /// whose launch contract requires a sealed view.
+    fn constant_input_override(&self, input_idx: usize) -> Option<TensorView<'_>> {
+        let _ = input_idx;
+        None
+    }
+
+    /// Immutable owners whose addresses the next device-graph capture may
+    /// embed. Called before capture starts; warmed execution never registers
+    /// resources with the graph lifecycle.
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        Vec::new()
+    }
+
+    /// Arm production BlockQuantizedMoE route traffic for this kernel.
+    ///
+    /// Returns `true` when the kernel participates. Session APIs call this only
+    /// under exclusive request ownership and before capture.
+    fn arm_block_quantized_moe_traffic(&mut self, request_id: u32) -> Result<bool> {
+        let _ = request_id;
+        Ok(false)
+    }
+
+    /// Reset the current BlockQuantizedMoE accumulation phase in place.
+    fn reset_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Snapshot the current BlockQuantizedMoE phase.
+    fn snapshot_block_quantized_moe_traffic(&self) -> Result<Option<BlockQuantizedMoeTraffic>> {
+        Ok(None)
+    }
+
+    /// Disarm BlockQuantizedMoE traffic after dependent graphs are retired.
+    fn disarm_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        Ok(())
     }
 
     /// Tell the kernel whether all of this node's outputs have fully-static
