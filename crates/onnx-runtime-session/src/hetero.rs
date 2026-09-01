@@ -44,8 +44,8 @@ use std::sync::Arc;
 
 use onnx_runtime_ep_api::abi::OrtGraphView;
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DeviceId, DeviceType, EpConfig, EpId, ExecutionProvider, Fence, Kernel,
-    KernelMatch, Result as EpResult, SubgraphClaim,
+    DeviceBuffer, DeviceId, DeviceType, EpConfig, EpId, ExecutionProvider, ExecutorKernelScope,
+    Fence, Kernel, KernelMatch, Result as EpResult, SubgraphClaim,
 };
 use onnx_runtime_ir::{
     DataType, Graph, GraphViewCache, ModelFunction, ModelFunctionKey, Node, NodeId, Shape,
@@ -147,10 +147,6 @@ struct AssignedOracle<'a> {
 }
 
 impl ExecutionProvider for AssignedOracle<'_> {
-    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
-        unreachable!("AssignedOracle is a planning-only capability gate")
-    }
-
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -1281,6 +1277,23 @@ impl HeterogeneousExecutor {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let opset = graph.effective_opset(node).unwrap_or(u64::MAX);
+            if provider.executor_kernel_scope(node) == ExecutorKernelScope::Required {
+                return Err(SessionError::HeterogeneousExecutionUnsupported {
+                    placement_summary: format!(
+                        "node {} ({}::{}@{opset}) requires one session-issued provider generation; \
+                         the current heterogeneous preflight cannot borrow the partition executor's \
+                         lifecycle before it is built. Keep this route-residency-required graph on \
+                         one provider until heterogeneous lifecycle binding is implemented",
+                        node_id.0,
+                        if node.domain.is_empty() {
+                            "ai.onnx"
+                        } else {
+                            &node.domain
+                        },
+                        node.op_type,
+                    ),
+                });
+            }
             let kernel = provider.get_kernel(node, &shapes, opset).map_err(|error| {
                 SessionError::unsupported_op(
                     node,

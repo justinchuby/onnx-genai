@@ -620,6 +620,8 @@ impl Executor {
                 &constant_values,
                 opset,
                 seq_independent,
+                self.artifact_config,
+                &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
                 graph_tokens,
             )?;
@@ -746,9 +748,14 @@ impl Executor {
                 }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let mut kernel =
-                self.ep
-                    .get_kernel(node, &input_shapes, effective_opset(&self.graph, node))?;
+            let mut kernel = self.ep.get_kernel_for_executor(
+                self.artifact_config.provider(),
+                self.artifact_config.executor(),
+                self.artifact_config.generation(),
+                node,
+                &input_shapes,
+                effective_opset(&self.graph, node),
+            )?;
             let constant_inputs = node
                 .inputs
                 .iter()
@@ -1081,6 +1088,16 @@ impl Executor {
                 "mixed-provider device-graph replay",
             ));
         }
+        // Fast replay bypasses the scoped runner, so it must drive the same
+        // executor-local authority that gates eager execution and capture.
+        // Complete any transition published by binding preparation before
+        // relaunching the installed graph. Pending or failed outcomes remain
+        // latched until a later cache miss advances the epoch.
+        self.provider_artifact_readiness.finalize_if_needed(
+            self.ep.as_ref(),
+            self.artifact_config,
+            &self.graph,
+        )?;
         if !self.bindings_match_graph_signature(bindings) {
             self.reset_device_graph()?;
             return Err(SessionError::Internal(

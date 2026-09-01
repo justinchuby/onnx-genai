@@ -54,11 +54,16 @@
 //! # Default off / byte-identical
 //!
 //! Gated by the existing [`COARSE_RESIDENCY_ENABLE_ENV`]
-//! (`coarse_residency_profile_enabled()`). When off — the shipped default —
-//! this returns [`RouteWindowConsumeOutcome::Disabled`] before reading the
-//! snapshot or touching any allocator, so ordinary inference (telemetry
-//! disarmed *and* this gate off: two independent default-off switches) is
-//! byte-identical.
+//! (`coarse_residency_profile_enabled()`). The CUDA provider resolves that
+//! configuration once at construction and executor artifact finalization
+//! records `Disabled`, `Declined`, or `Required { owner }`; a disabled or
+//! declined request never enters the route boundary. Changing the process
+//! environment requires rebuilding the provider/executor rather than silently
+//! changing an already-warmed request path. When off — the shipped default —
+//! producer publication, telemetry, finalization, and request routing all
+//! consume the same immutable executor artifact configuration. The standalone
+//! low-level test consumer also returns [`RouteWindowConsumeOutcome::Disabled`]
+//! before reading the snapshot or touching any allocator.
 //!
 //! # Window ordering the caller owns
 //!
@@ -72,13 +77,13 @@
 //!
 //! # Production status (honest)
 //!
-//! Like `coarse_residency::apply_residency_plan_at_boundary` when it shipped
-//! (Slice 5), this consumer has **no live decode-loop call site yet**: wiring
-//! it into a running session's request boundary is the next slice. It ships
-//! here as the production seam — reachable, default-off, and proven by the
-//! GPU tests in `tests/route_residency_consume_gpu.rs` — so the telemetry the
-//! producer already accumulates has a real, tested consumer to drive the
-//! #1854 transition.
+//! The session executor calls the provider boundary once per top-level
+//! required request, after synchronizing and consuming that exact owner's
+//! validation receipt. Provider artifact finalization resolves the capability
+//! before the request path: `Disabled` and `Declined` perform no route-state
+//! lock, producer read, telemetry work, allocation, or synchronization;
+//! `Required { owner }` preserves the ordered snapshot → consume → reset
+//! transition and fails closed if its owner-scoped boundary is absent.
 //!
 //! [`TelemetrySnapshot`]: crate::kernels::expert_route_telemetry::TelemetrySnapshot
 //! [`consume_and_validate`]: crate::kernels::expert_route_telemetry::consume_and_validate
@@ -179,13 +184,7 @@ fn prepare_route_window(
     catalogs: &HashMap<ValueId, WeightRegionCatalog>,
     device_count: usize,
 ) -> Prepared {
-    // 1. Default-off gate. Read before the snapshot so a disarmed/disabled
-    //    build never inspects telemetry or touches an allocator.
-    if !coarse_residency_profile_enabled() {
-        return Prepared::Early(RouteWindowConsumeOutcome::Disabled);
-    }
-
-    // 2. Proven safe boundary. Reuse the existing residency authority rather
+    // 1. Proven safe boundary. Reuse the existing residency authority rather
     //    than duplicating capture/admission/guard tracking. This is the "no
     //    remap during capture/replay" and "boundary-only, never per-token"
     //    gate; `apply_coarse_residency_plan` re-verifies it immediately before
@@ -194,7 +193,7 @@ fn prepare_route_window(
         return Prepared::Early(RouteWindowConsumeOutcome::RejectedNotSafeBoundary { reason });
     }
 
-    // 3. Validate the completed window with the producer's own consumer
+    // 2. Validate the completed window with the producer's own consumer
     //    reference (fail-closed identity/epoch/poison/overflow contract).
     match consume_and_validate(
         &snapshot.header,
@@ -284,6 +283,44 @@ pub fn consume_route_window_at_boundary(
     device_ordinal: i32,
     expert_groups: &[ExpertWeightGroup],
 ) -> RouteWindowConsumeOutcome {
+    if !coarse_residency_profile_enabled() {
+        return RouteWindowConsumeOutcome::Disabled;
+    }
+    consume_resolved_route_window_at_boundary(
+        residency,
+        snapshot,
+        expected_epoch,
+        expected_request,
+        expected_device,
+        bank_values,
+        boundary,
+        catalogs,
+        allocators,
+        device_pool,
+        host_pool,
+        device_count,
+        device_ordinal,
+        expert_groups,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_resolved_route_window_at_boundary(
+    residency: &CudaWeightResidency,
+    snapshot: &TelemetrySnapshot,
+    expected_epoch: u32,
+    expected_request: u32,
+    expected_device: u32,
+    bank_values: &[ValueId],
+    boundary: LazyWeightBoundary,
+    catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+    allocators: &HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    device_pool: &Arc<PhysicalHandlePool>,
+    host_pool: &Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expert_groups: &[ExpertWeightGroup],
+) -> RouteWindowConsumeOutcome {
     match prepare_route_window(
         residency,
         snapshot,
@@ -302,7 +339,7 @@ pub fn consume_route_window_at_boundary(
             epoch,
             count,
         } => {
-            let outcome = residency.apply_coarse_residency_plan(
+            let outcome = residency.apply_resolved_coarse_residency_plan(
                 &plan,
                 catalogs,
                 allocators,
@@ -349,6 +386,49 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
     expert_groups: &[ExpertWeightGroup],
     phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
 ) -> RouteWindowConsumeOutcome {
+    if !coarse_residency_profile_enabled() {
+        return RouteWindowConsumeOutcome::Disabled;
+    }
+    consume_resolved_route_window_at_boundary_with_phase8_faults(
+        runtime,
+        residency,
+        snapshot,
+        expected_epoch,
+        expected_request,
+        expected_device,
+        bank_values,
+        boundary,
+        catalogs,
+        allocators,
+        device_pool,
+        host_pool,
+        device_count,
+        device_ordinal,
+        expert_groups,
+        phase8_faults,
+    )
+}
+
+#[cfg(any(test, feature = "gpu-tests"))]
+#[allow(clippy::too_many_arguments)]
+fn consume_resolved_route_window_at_boundary_with_phase8_faults(
+    runtime: &Arc<crate::runtime::CudaRuntime>,
+    residency: &CudaWeightResidency,
+    snapshot: &TelemetrySnapshot,
+    expected_epoch: u32,
+    expected_request: u32,
+    expected_device: u32,
+    bank_values: &[ValueId],
+    boundary: LazyWeightBoundary,
+    catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+    allocators: &HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    device_pool: &Arc<PhysicalHandlePool>,
+    host_pool: &Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expert_groups: &[ExpertWeightGroup],
+    phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
+) -> RouteWindowConsumeOutcome {
     match prepare_route_window(
         residency,
         snapshot,
@@ -368,7 +448,7 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
             count,
         } => {
             let outcome =
-                crate::coarse_residency::apply_residency_plan_at_boundary_with_phase8_faults(
+                crate::coarse_residency::apply_resolved_residency_plan_at_boundary_with_phase8_faults(
                     runtime,
                     residency,
                     &plan,
@@ -397,15 +477,17 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
 // The consumer above is pure host glue but takes ~14 arguments and names CUDA
 // types the EP-agnostic executor cannot. So the single production call site
 // (`Executor::finish_device_validation` → `ExecutionProvider::
-// consume_route_residency_at_boundary`) reaches it through the CUDA EP, which
-// owns one optional `RouteResidencyBoundary` binding. The binding carries the
-// producer window source plus every already-existing authority handle the
-// consumer needs; the EP override drives snapshot → consume → reset exactly
-// once per boundary and records the typed outcome here. Production installs no
-// binding yet (honest "reachable seam" — matching how 7A/7B shipped), so the
-// override is a lock + `None` check when the gate is on and a bare env read
-// when it is off. The Slice-7C GPU tests install a binding and exercise the
-// whole matrix through this same override.
+// consume_route_residency_at_boundary_for_executor`) reaches it through the
+// CUDA EP, which owns one optional executor-scoped `RouteResidencyBoundary`
+// binding. The binding carries the producer window source plus every
+// already-existing authority handle the consumer needs; the EP override drives
+// snapshot → consume → reset exactly once per boundary and records the typed
+// outcome here. Artifact finalization resolves a typed disabled/declined/required
+// capability before request execution. Production installs no binding yet
+// (honest "reachable seam" — matching how 7A/7B shipped), so disabled and
+// declined requests never enter the override or touch route state. The Slice-7C
+// GPU tests install a binding and exercise the whole matrix through this same
+// override.
 // ---------------------------------------------------------------------------
 
 /// The producer half of one route-telemetry window, abstracted so the boundary
@@ -531,15 +613,35 @@ pub enum RouteResidencyBindingReject {
     /// silently covering only one. Multi-bank binding is a later slice.
     MultipleBanksUnsupported { groups: usize },
     /// The discovered group's node has no armed route-telemetry producer source
-    /// (its kernel never surfaced a window source to the EP). Without a producer
-    /// there is no window to consume, so no binding is installed.
+    /// yet, but its boundary publishes one during resolved kernel compilation.
+    /// Without a producer there is no window to consume, so no binding is
+    /// installed until a later readiness epoch.
     NoTelemetrySource { node: NodeId },
+    /// This boundary has no executor-scoped route-telemetry producer
+    /// publication path. Waiting for another readiness epoch cannot change that,
+    /// so the binding is terminally declined rather than left pending forever.
+    TelemetryProducerUnsupported {
+        node: NodeId,
+        boundary: LazyWeightBoundary,
+    },
     /// A group member weight has no region catalog — it was not classified/
     /// loaded, so the boundary consumer could not map its regions.
     MissingCatalog { value: ValueId },
     /// A group member weight has no backing VMM allocator — it was not paged/
     /// committed, so the boundary consumer had no allocator to tier against.
     MissingAllocator { value: ValueId },
+    /// The discovered bank's members have no *per-bank dedicated* VMM
+    /// reservation for the coarse route-residency plan to remap (issue #1810
+    /// Slice 7E). The shipped [`CudaWeightResidency`](crate::weight_paging::CudaWeightResidency)
+    /// packs every paged weight into one *shared* VMM reservation with per-key
+    /// stable-VA slots (issue #716); the coarse plan addresses each bank at
+    /// catalog-relative offsets, which only a per-bank reservation satisfies, so
+    /// installing here would let the boundary consumer remap the wrong bytes.
+    /// The seam fail-closes instead. Route producer sources (Slice-7E goal 2)
+    /// and the real build-time install call (goal 3) are wired and fire; the
+    /// per-bank-reservation bridge in the residency is the disclosed residual a
+    /// later slice supplies, after which this same seam installs for real.
+    NoPerBankReservation { value: ValueId },
 }
 
 impl RouteResidencyBindingReject {
@@ -555,11 +657,24 @@ impl RouteResidencyBindingReject {
             RouteResidencyBindingReject::NoTelemetrySource { node } => {
                 format!("expert group node {node:?} has no armed telemetry source")
             }
+            RouteResidencyBindingReject::TelemetryProducerUnsupported { node, boundary } => {
+                format!(
+                    "expert group node {node:?} at {boundary:?} has no supported executor-scoped \
+                     route-telemetry producer"
+                )
+            }
             RouteResidencyBindingReject::MissingCatalog { value } => {
                 format!("bank value {value:?} has no region catalog")
             }
             RouteResidencyBindingReject::MissingAllocator { value } => {
                 format!("bank value {value:?} has no VMM allocator")
+            }
+            RouteResidencyBindingReject::NoPerBankReservation { value } => {
+                format!(
+                    "bank value {value:?} has no per-bank VMM reservation; shipped residency \
+                     packs banks into one shared reservation (per-bank-reservation bridge is the \
+                     Slice-7E residual)"
+                )
             }
         }
     }
@@ -611,7 +726,19 @@ pub(crate) fn validate_route_residency_binding(
     }
     let group = groups.pop().expect("exactly one group");
     if !has_source(group.node) {
-        return Err(RouteResidencyBindingReject::NoTelemetrySource { node: group.node });
+        return Err(
+            if group
+                .boundary
+                .route_telemetry_producer_may_appear_after_compilation()
+            {
+                RouteResidencyBindingReject::NoTelemetrySource { node: group.node }
+            } else {
+                RouteResidencyBindingReject::TelemetryProducerUnsupported {
+                    node: group.node,
+                    boundary: group.boundary,
+                }
+            },
+        );
     }
     for member in &group.members {
         if !has_catalog(*member) {
@@ -751,6 +878,7 @@ impl RouteResidencyDiagnostics {
     }
 
     /// Record that a real binding was installed for `banks` bank values.
+    #[cfg(any(test, feature = "gpu-tests"))]
     pub(crate) fn record_install(&self, banks: usize) {
         self.installs.fetch_add(1, Ordering::Relaxed);
         self.set_install_reason(format!("installed binding over {banks} bank value(s)"));
@@ -824,9 +952,10 @@ fn window_was_consumed(outcome: &RouteWindowConsumeOutcome) -> bool {
 /// boundary neither snapshots nor resets. Reuses only the merged #1971 consumer
 /// and #1854 lifecycle; adds no mapping, allocation, or host sync of its own.
 ///
-/// The caller (the CUDA EP override) has already checked the default-off gate
-/// and that a binding is installed, so reaching here means the consumer runs.
-pub fn run_route_residency_boundary(
+/// The caller (the CUDA EP override) reaches this only from a pre-resolved
+/// `Required { owner }` capability and after finding that owner's installed
+/// binding, so no process configuration is re-read on the request path.
+pub(crate) fn run_route_residency_boundary(
     binding: &RouteResidencyBoundary,
     diag: &RouteResidencyDiagnostics,
 ) -> Result<()> {
@@ -849,7 +978,7 @@ pub fn run_route_residency_boundary(
         return Ok(());
     };
 
-    let outcome = consume_route_window_at_boundary(
+    let outcome = consume_resolved_route_window_at_boundary(
         &binding.residency,
         &snapshot,
         binding.expected_epoch(),
@@ -881,7 +1010,7 @@ pub fn run_route_residency_boundary(
 /// range-precisely and quarantines exactly like a real driver failure. Same
 /// ordering and reset discipline as production; only the apply path differs.
 #[cfg(any(test, feature = "gpu-tests"))]
-pub fn run_route_residency_boundary_with_phase8_faults(
+pub(crate) fn run_route_residency_boundary_with_phase8_faults(
     runtime: &Arc<crate::runtime::CudaRuntime>,
     binding: &RouteResidencyBoundary,
     diag: &RouteResidencyDiagnostics,
@@ -903,7 +1032,7 @@ pub fn run_route_residency_boundary_with_phase8_faults(
         return Ok(());
     };
 
-    let outcome = consume_route_window_at_boundary_with_phase8_faults(
+    let outcome = consume_resolved_route_window_at_boundary_with_phase8_faults(
         runtime,
         &binding.residency,
         &snapshot,
@@ -1008,6 +1137,20 @@ mod binding_tests {
         )
     }
 
+    fn block_quantized_moe_node(graph: &mut Graph) -> (NodeId, ValueId) {
+        let input = graph.create_named_value("input", DataType::Float32, shape1(4));
+        let weight = inline_initializer(graph, "experts");
+        let output = graph.create_named_value("output", DataType::Float32, shape1(4));
+        let mut node = onnx_runtime_ir::Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            vec![Some(input), Some(weight)],
+            vec![output],
+        );
+        node.domain = "pkg.nxrt".to_string();
+        (graph.insert_node(node), weight)
+    }
+
     fn always(_: NodeId) -> bool {
         true
     }
@@ -1066,6 +1209,26 @@ mod binding_tests {
     }
 
     #[test]
+    fn missing_block_quantized_moe_producer_is_terminally_unsupported() {
+        let mut graph = Graph::new();
+        let (node, _) = block_quantized_moe_node(&mut graph);
+        let err = validate_route_residency_binding(&graph, |_| false, always_v, always_v)
+            .expect_err("BlockQuantizedMoE has no deferred producer");
+        assert_eq!(
+            err,
+            RouteResidencyBindingReject::TelemetryProducerUnsupported {
+                node,
+                boundary: LazyWeightBoundary::BlockQuantizedMoe,
+            }
+        );
+        let reason = err.reason();
+        assert!(
+            reason.contains("BlockQuantizedMoe") && reason.contains("no supported"),
+            "terminal reason names the unsupported boundary capability: {reason}"
+        );
+    }
+
+    #[test]
     fn rejects_when_a_bank_member_has_no_catalog() {
         let mut graph = Graph::new();
         let (_, members) = qmoe_node(&mut graph);
@@ -1107,5 +1270,21 @@ mod binding_tests {
         );
         let r = RouteResidencyBindingReject::MultipleBanksUnsupported { groups: 3 }.reason();
         assert!(r.contains('3'), "reason carries the group count: {r}");
+    }
+
+    #[test]
+    fn no_per_bank_reservation_reason_names_the_value_and_residual() {
+        // The shipped enabled-path terminal decline: real discovery + retention
+        // succeed, but the shared-reservation residency has no per-bank VMM
+        // reservation for the coarse plan to address. The reason must name the
+        // offending bank value and disclose the per-bank-reservation residual so
+        // the honest typed outcome is self-describing in diagnostics.
+        let value = ValueId(7);
+        let r = RouteResidencyBindingReject::NoPerBankReservation { value }.reason();
+        assert!(r.contains("7"), "reason names the bank value: {r}");
+        assert!(
+            r.contains("per-bank") && r.contains("reservation"),
+            "reason discloses the per-bank-reservation residual: {r}"
+        );
     }
 }
