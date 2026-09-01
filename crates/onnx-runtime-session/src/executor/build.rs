@@ -940,8 +940,11 @@ impl Executor {
 
         let plan_len = plan.len();
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
+        let instance_id = ExecutorInstanceId::fresh();
+        let artifact_config = ep.resolve_executor_artifact_config(instance_id)?;
         let mut exec = Self {
-            instance_id: ExecutorInstanceId::fresh(),
+            instance_id,
+            artifact_config,
             graph,
             weights,
             ep,
@@ -2277,7 +2280,7 @@ impl Executor {
         self.compile_ready_kernels(resolved)?;
         self.provider_artifact_readiness.finalize_if_needed(
             self.ep.as_ref(),
-            self.instance_id,
+            self.artifact_config,
             &self.graph,
         )
     }
@@ -2372,7 +2375,7 @@ impl Executor {
                 &constant_values,
                 opset,
                 seq_independent,
-                self.instance_id,
+                self.artifact_config,
                 &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
                 graph_tokens,

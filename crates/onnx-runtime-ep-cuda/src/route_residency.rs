@@ -60,10 +60,10 @@
 //! declined request never enters the route boundary. Changing the process
 //! environment requires rebuilding the provider/executor rather than silently
 //! changing an already-warmed request path. When off — the shipped default —
-//! this low-level consumer also returns
-//! [`RouteWindowConsumeOutcome::Disabled`] before reading the snapshot or
-//! touching any allocator, so ordinary inference (telemetry disarmed *and*
-//! this gate off: two independent default-off switches) is byte-identical.
+//! producer publication, telemetry, finalization, and request routing all
+//! consume the same immutable executor artifact configuration. The standalone
+//! low-level test consumer also returns [`RouteWindowConsumeOutcome::Disabled`]
+//! before reading the snapshot or touching any allocator.
 //!
 //! # Window ordering the caller owns
 //!
@@ -339,7 +339,7 @@ fn consume_resolved_route_window_at_boundary(
             epoch,
             count,
         } => {
-            let outcome = residency.apply_coarse_residency_plan(
+            let outcome = residency.apply_resolved_coarse_residency_plan(
                 &plan,
                 catalogs,
                 allocators,
@@ -448,7 +448,7 @@ fn consume_resolved_route_window_at_boundary_with_phase8_faults(
             count,
         } => {
             let outcome =
-                crate::coarse_residency::apply_residency_plan_at_boundary_with_phase8_faults(
+                crate::coarse_residency::apply_resolved_residency_plan_at_boundary_with_phase8_faults(
                     runtime,
                     residency,
                     &plan,

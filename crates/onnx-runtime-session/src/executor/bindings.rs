@@ -620,7 +620,7 @@ impl Executor {
                 &constant_values,
                 opset,
                 seq_independent,
-                self.instance_id,
+                self.artifact_config,
                 &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
                 graph_tokens,
@@ -1090,7 +1090,7 @@ impl Executor {
         // latched until a later cache miss advances the epoch.
         self.provider_artifact_readiness.finalize_if_needed(
             self.ep.as_ref(),
-            self.instance_id,
+            self.artifact_config,
             &self.graph,
         )?;
         if !self.bindings_match_graph_signature(bindings) {

@@ -58,6 +58,87 @@ impl ExecutorInstanceId {
     }
 }
 
+/// Process-unique authority for one immutable execution-provider configuration.
+///
+/// Reconstructing an EP after changing configuration creates a new authority.
+/// Executor artifact tokens from the previous provider generation therefore
+/// cannot publish or finalize artifacts in the replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExecutorArtifactConfigAuthority(u64);
+
+impl ExecutorArtifactConfigAuthority {
+    /// Reserved authority for providers that own no executor-scoped artifacts.
+    pub const UNSCOPED: Self = Self(0);
+
+    /// Allocate a process-unique provider-configuration authority.
+    pub fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(
+            id,
+            u64::MAX,
+            "executor artifact configuration authority space exhausted"
+        );
+        Self(id)
+    }
+
+    /// Stable numeric representation for diagnostics and provider validation.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Immutable route-residency input resolved before an executor compiles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ExecutorRouteResidencyConfig {
+    /// Producer publication, telemetry, and request boundaries are forbidden.
+    #[default]
+    Disabled,
+    /// Producer publication is permitted; finalization may still decline when
+    /// the graph or provider artifacts cannot support route residency.
+    Enabled,
+}
+
+/// Typed immutable configuration for one executor/provider generation.
+///
+/// The same token is required at kernel-producer publication, artifact
+/// finalization, and teardown. Environment variables may be inputs when the EP
+/// is constructed, but are never consulted to mutate this token afterwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExecutorArtifactConfig {
+    authority: ExecutorArtifactConfigAuthority,
+    executor: ExecutorInstanceId,
+    route_residency: ExecutorRouteResidencyConfig,
+}
+
+impl ExecutorArtifactConfig {
+    /// Construct a provider-resolved executor artifact configuration.
+    #[doc(hidden)]
+    pub const fn resolved(
+        authority: ExecutorArtifactConfigAuthority,
+        executor: ExecutorInstanceId,
+        route_residency: ExecutorRouteResidencyConfig,
+    ) -> Self {
+        Self {
+            authority,
+            executor,
+            route_residency,
+        }
+    }
+
+    pub const fn authority(self) -> ExecutorArtifactConfigAuthority {
+        self.authority
+    }
+
+    pub const fn executor(self) -> ExecutorInstanceId {
+        self.executor
+    }
+
+    pub const fn route_residency(self) -> ExecutorRouteResidencyConfig {
+        self.route_residency
+    }
+}
+
 /// Monotonic executor-local epoch for concrete kernel/producer readiness.
 ///
 /// The session advances this at the kernel-cache publication chokepoint whenever
@@ -1234,19 +1315,22 @@ pub trait ExecutionProvider: Send + Sync {
     /// opset-13 per-axis vs. the legacy opset-<13 2D-coercion `Softmax`).
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>>;
 
-    /// Executor-scoped kernel creation.
+    /// Executor-scoped kernel creation under a resolved artifact configuration.
     ///
     /// The default preserves providers that own no executor-scoped artifacts.
     /// Providers whose factories publish producer handles override this method
-    /// so compilation is attributed to the owning executor rather than to a
-    /// graph-local node id shared by sibling sessions.
+    /// so compilation is attributed to the owning executor/provider generation
+    /// rather than to a graph-local node id shared by sibling sessions. Such
+    /// providers must reject foreign or mismatched configuration tokens before
+    /// publishing producer state.
     fn get_kernel_for_executor(
         &self,
-        _executor: ExecutorInstanceId,
+        config: ExecutorArtifactConfig,
         op: &Node,
         shapes: &[Vec<usize>],
         opset: u64,
     ) -> Result<Box<dyn Kernel>> {
+        let _ = config;
         self.get_kernel(op, shapes, opset)
     }
 
@@ -1873,6 +1957,23 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
+    /// Resolve the immutable configuration for one executor generation.
+    ///
+    /// The session calls this exactly once before compiling any kernel for the
+    /// executor, then carries the returned token through publication,
+    /// finalization, and teardown. Providers that own no executor-scoped
+    /// artifacts keep the disabled default.
+    fn resolve_executor_artifact_config(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Result<ExecutorArtifactConfig> {
+        Ok(ExecutorArtifactConfig::resolved(
+            ExecutorArtifactConfigAuthority::UNSCOPED,
+            executor,
+            ExecutorRouteResidencyConfig::Disabled,
+        ))
+    }
+
     /// Authoritative transition for "all provider artifacts required by this
     /// executor's resolved compilation are finalized."
     ///
@@ -1889,7 +1990,7 @@ pub trait ExecutionProvider: Send + Sync {
     /// compilation epoch. The default completes without side effects.
     fn finalize_executor_artifacts(
         &self,
-        _executor: ExecutorInstanceId,
+        _config: ExecutorArtifactConfig,
         _graph: &Graph,
         _readiness: ExecutorArtifactReadinessEpoch,
     ) -> Result<ExecutorArtifactFinalization> {
@@ -1903,7 +2004,7 @@ pub trait ExecutionProvider: Send + Sync {
     /// The default is a no-op. Participating providers must make this
     /// idempotent and must not clear producer/boundary state owned by sibling
     /// executors sharing the same provider.
-    fn drain_executor_artifacts(&self, _executor: ExecutorInstanceId) {}
+    fn drain_executor_artifacts(&self, _config: ExecutorArtifactConfig) {}
 
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {

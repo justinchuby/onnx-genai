@@ -59,9 +59,10 @@ pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{
     ArgmaxTieBreak, BoundBufferOwnership, CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner,
     DeviceGraphSlot, DeviceGraphToken, DeviceValidationOwner, DeviceValidationRegistration,
-    DeviceValidationToken, EpConfig, EpId, ExecutionProvider, ExecutorArtifactFinalization,
-    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
-    ExecutorRouteResidency, Fence, HostToDeviceCopier, RawDeviceAllocationSiteStats,
+    DeviceValidationToken, EpConfig, EpId, ExecutionProvider, ExecutorArtifactConfig,
+    ExecutorArtifactConfigAuthority, ExecutorArtifactFinalization, ExecutorArtifactPending,
+    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExecutorRouteResidency,
+    ExecutorRouteResidencyConfig, Fence, HostToDeviceCopier, RawDeviceAllocationSiteStats,
     SealedDeviceAllocation, StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};

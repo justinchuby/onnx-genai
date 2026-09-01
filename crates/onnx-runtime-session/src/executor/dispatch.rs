@@ -563,7 +563,7 @@ impl Executor {
         let has_lazy_inputs = in_infos.iter().any(|info| info.lazy_unresolved);
 
         let ep = self.ep.clone();
-        let instance_id = self.instance_id;
+        let artifact_config = self.artifact_config;
         let graph_tokens = std::array::from_fn(|index| self.slot_capture[index].device_graph_token);
 
         // Bind the mutated fields as disjoint borrows so `self` is never borrowed
@@ -653,7 +653,7 @@ impl Executor {
                     &constant_values,
                     opset,
                     node_capture_seq_independent(ctx.graph, node, capture_growing),
-                    instance_id,
+                    artifact_config,
                     provider_artifact_readiness,
                     ep.as_ref(),
                     graph_tokens,
@@ -673,7 +673,7 @@ impl Executor {
         // during runtime shape resolution. If lookup above created that
         // specialization, the cache publication chokepoint invalidated the
         // authority. Finalize it now, while no kernel work has been enqueued.
-        provider_artifact_readiness.finalize_if_needed(ep.as_ref(), instance_id, ctx.graph)?;
+        provider_artifact_readiness.finalize_if_needed(ep.as_ref(), artifact_config, ctx.graph)?;
         for (index, (view, info)) in views.iter_mut().zip(&in_infos).enumerate() {
             if let Some(sealed) = kernel.constant_input_override(index) {
                 *view = sealed;

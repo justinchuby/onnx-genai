@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    EpError, ExecutorInstanceId, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    EpError, ExecutorArtifactConfig, ExecutorArtifactConfigAuthority, ExecutorInstanceId,
+    ExecutorRouteResidencyConfig, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
@@ -1193,24 +1194,69 @@ impl FloatDtype {
 /// [`QMoERouteTelemetry`] source. A later specialization therefore cannot
 /// overwrite a sibling executor's producer or invalidate a boundary's source
 /// identity.
-#[derive(Default)]
 pub struct RouteTelemetrySourceRegistry {
+    authority: ExecutorArtifactConfigAuthority,
+    route_residency: ExecutorRouteResidencyConfig,
     compile_scope: Mutex<()>,
     active_executor: AtomicU64,
     sources: Mutex<HashMap<ExecutorInstanceId, HashMap<NodeId, Arc<QMoERouteTelemetry>>>>,
 }
 
+impl Default for RouteTelemetrySourceRegistry {
+    fn default() -> Self {
+        Self::new(
+            ExecutorArtifactConfigAuthority::UNSCOPED,
+            ExecutorRouteResidencyConfig::Disabled,
+        )
+    }
+}
+
 impl RouteTelemetrySourceRegistry {
+    pub(crate) fn new(
+        authority: ExecutorArtifactConfigAuthority,
+        route_residency: ExecutorRouteResidencyConfig,
+    ) -> Self {
+        Self {
+            authority,
+            route_residency,
+            compile_scope: Mutex::new(()),
+            active_executor: AtomicU64::new(0),
+            sources: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn validate_config(&self, config: ExecutorArtifactConfig) -> Result<()> {
+        if config.authority() != self.authority || config.route_residency() != self.route_residency
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: executor {} artifact configuration mismatch: token authority {} with \
+                 route residency {:?}, provider authority {} with route residency {:?}; rebuild \
+                 the executor from the provider's resolved configuration",
+                config.executor().get(),
+                config.authority().get(),
+                config.route_residency(),
+                self.authority.get(),
+                self.route_residency,
+            )));
+        }
+        Ok(())
+    }
+
     /// Run one factory lookup under an executor ownership scope.
     pub(crate) fn with_executor_scope<T>(
         &self,
-        executor: ExecutorInstanceId,
+        config: ExecutorArtifactConfig,
         f: impl FnOnce() -> T,
-    ) -> T {
+    ) -> Result<T> {
+        self.validate_config(config)?;
+        if config.route_residency() == ExecutorRouteResidencyConfig::Disabled {
+            return Ok(f());
+        }
         let _gate = self
             .compile_scope
             .lock()
             .expect("cuda_ep route-telemetry compile scope poisoned");
+        let executor = config.executor();
         self.active_executor
             .store(executor.get(), Ordering::Release);
         struct Reset<'a>(&'a AtomicU64);
@@ -1220,7 +1266,7 @@ impl RouteTelemetrySourceRegistry {
             }
         }
         let _reset = Reset(&self.active_executor);
-        f()
+        Ok(f())
     }
 
     fn source_for_current(
@@ -1229,7 +1275,7 @@ impl RouteTelemetrySourceRegistry {
         runtime: Arc<CudaRuntime>,
         routes_per_row: usize,
     ) -> Option<Arc<QMoERouteTelemetry>> {
-        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+        if self.route_residency == ExecutorRouteResidencyConfig::Disabled {
             return None;
         }
         let executor = ExecutorInstanceId::from_raw(self.active_executor.load(Ordering::Acquire));

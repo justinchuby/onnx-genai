@@ -469,10 +469,11 @@ impl ExecutionProvider for DeferredValidationEp {
 
     fn finalize_executor_artifacts(
         &self,
-        executor: ExecutorInstanceId,
+        config: ExecutorArtifactConfig,
         _graph: &Graph,
         _readiness: ExecutorArtifactReadinessEpoch,
     ) -> onnx_runtime_ep_api::Result<ExecutorArtifactFinalization> {
+        let executor = config.executor();
         Ok(ExecutorArtifactFinalization::Complete {
             route_residency: if self.route_boundary_required.load(Ordering::Relaxed) {
                 let owner = if self.return_foreign_route_owner.load(Ordering::Relaxed) {
@@ -494,10 +495,13 @@ fn route_residency_finalization_rejects_foreign_resolved_owner() {
     ep.route_boundary_required.store(true, Ordering::Relaxed);
     ep.return_foreign_route_owner.store(true, Ordering::Relaxed);
     let executor = ExecutorInstanceId::fresh();
+    let config = ep
+        .resolve_executor_artifact_config(executor)
+        .expect("resolve executor artifact config");
     let mut readiness = ProviderArtifactReadiness::default();
 
     let error = readiness
-        .finalize_if_needed(&ep, executor, &Graph::new())
+        .finalize_if_needed(&ep, config, &Graph::new())
         .expect_err("a provider cannot resolve another executor's route boundary");
     assert!(
         error.to_string().contains("returned route-residency owner")
@@ -6373,6 +6377,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         unsafe {
             let ptr = std::alloc::alloc(layout);
             assert!(!ptr.is_null(), "positive-control allocation");
+            std::hint::black_box(ptr);
             std::alloc::dealloc(ptr, layout);
         }
     });

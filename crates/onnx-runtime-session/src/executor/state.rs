@@ -106,11 +106,12 @@ impl ProviderArtifactReadiness {
     pub(super) fn finalize_if_needed(
         &mut self,
         ep: &dyn ExecutionProvider,
-        executor: ExecutorInstanceId,
+        config: ExecutorArtifactConfig,
         graph: &Graph,
     ) -> Result<()> {
+        let executor = config.executor();
         if self.needs_finalization() {
-            match ep.finalize_executor_artifacts(executor, graph, self.epoch) {
+            match ep.finalize_executor_artifacts(config, graph, self.epoch) {
                 Ok(ExecutorArtifactFinalization::Complete { route_residency }) => {
                     self.outcome = match route_residency.owner() {
                         Some(owner) if owner != executor => {
@@ -188,6 +189,9 @@ pub(crate) struct Executor {
     /// Process-unique ownership scope for provider artifacts published while
     /// this executor compiles kernels.
     pub(super) instance_id: ExecutorInstanceId,
+    /// Immutable provider configuration resolved once for this executor
+    /// generation and required by every artifact publication/finalization call.
+    pub(super) artifact_config: ExecutorArtifactConfig,
     pub(super) graph: Graph,
     /// Kept alive so external-weight memory maps outlive buffer population —
     /// **and**, since the weight-streaming change, so borrowed initializer

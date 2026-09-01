@@ -44,10 +44,11 @@ use std::sync::{Arc, Mutex, Weak};
 use onnx_runtime_ep_api::{
     BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities,
-    ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
-    ExecutorInstanceId, ExecutorRouteResidency, ExpertWeightGroup, Fence, HostToDeviceCopier,
-    Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, SealedDeviceAllocation,
-    WorkspaceAllocation, deny, structural_input_bytes,
+    ExecutorArtifactConfig, ExecutorArtifactConfigAuthority, ExecutorArtifactFinalization,
+    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
+    ExecutorRouteResidency, ExecutorRouteResidencyConfig, ExpertWeightGroup, Fence,
+    HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result,
+    SealedDeviceAllocation, WorkspaceAllocation, deny, structural_input_bytes,
 };
 #[cfg(any(test, feature = "gpu-tests"))]
 use onnx_runtime_ir::ValueId;
@@ -984,7 +985,8 @@ pub struct CudaExecutionProvider {
     /// Executor-scoped route-residency lifecycle state. Sibling/base/MTP
     /// executors may share this EP, but each owns an independent finalization
     /// outcome, boundary, and retained bank artifacts.
-    route_residency_enabled: bool,
+    route_residency_config: ExecutorRouteResidencyConfig,
+    artifact_config_authority: ExecutorArtifactConfigAuthority,
     route_executors: Mutex<HashMap<ExecutorInstanceId, ExecutorRouteResidencyState>>,
     #[cfg(any(test, feature = "gpu-tests"))]
     route_state_lock_acquisitions: AtomicU64,
@@ -1011,6 +1013,35 @@ impl std::fmt::Debug for CudaExecutionProvider {
 }
 
 impl CudaExecutionProvider {
+    fn executor_artifact_config(&self, executor: ExecutorInstanceId) -> ExecutorArtifactConfig {
+        ExecutorArtifactConfig::resolved(
+            self.artifact_config_authority,
+            executor,
+            self.route_residency_config,
+        )
+    }
+
+    fn validate_executor_artifact_config(
+        &self,
+        config: ExecutorArtifactConfig,
+    ) -> Result<ExecutorInstanceId> {
+        if config.authority() != self.artifact_config_authority
+            || config.route_residency() != self.route_residency_config
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: executor {} artifact configuration mismatch: token authority {} with \
+                 route residency {:?}, provider authority {} with route residency {:?}; rebuild \
+                 the executor from the provider's resolved configuration",
+                config.executor().get(),
+                config.authority().get(),
+                config.route_residency(),
+                self.artifact_config_authority.get(),
+                self.route_residency_config,
+            )));
+        }
+        Ok(config.executor())
+    }
+
     fn resolved_route_residency(
         executor: ExecutorInstanceId,
         state: &ExecutorRouteResidencyState,
@@ -1086,7 +1117,13 @@ impl CudaExecutionProvider {
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
     ) -> Result<Self> {
-        Self::new_with_policy_governor_and_manager(ordinal, offload_policy, None, None)
+        Self::new_with_policy_governor_manager_and_route_config(
+            ordinal,
+            offload_policy,
+            None,
+            None,
+            Self::route_residency_config_from_env(),
+        )
     }
 
     /// Construct a CUDA EP with the device authority available before the
@@ -1096,7 +1133,13 @@ impl CudaExecutionProvider {
         offload_policy: DeviceOffloadPolicy,
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
     ) -> Result<Self> {
-        Self::new_with_policy_governor_and_manager(ordinal, offload_policy, Some(governor), None)
+        Self::new_with_policy_governor_manager_and_route_config(
+            ordinal,
+            offload_policy,
+            Some(governor),
+            None,
+            Self::route_residency_config_from_env(),
+        )
     }
 
     /// Construct with a caller-owned process manager shared by sessions/devices.
@@ -1106,19 +1149,49 @@ impl CudaExecutionProvider {
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
         manager: ProcessMemoryManager,
     ) -> Result<Self> {
-        Self::new_with_policy_governor_and_manager(
+        Self::new_with_policy_governor_manager_and_route_config(
             ordinal,
             offload_policy,
             Some(governor),
             Some(manager),
+            Self::route_residency_config_from_env(),
         )
     }
 
-    fn new_with_policy_governor_and_manager(
+    /// Construct with an explicit immutable route-residency configuration.
+    ///
+    /// This is the non-environment construction path for embedding hosts and
+    /// tests that create sibling provider/executor generations with distinct
+    /// configurations.
+    pub fn new_with_offload_policy_governor_and_route_config(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+        route_residency_config: ExecutorRouteResidencyConfig,
+    ) -> Result<Self> {
+        Self::new_with_policy_governor_manager_and_route_config(
+            ordinal,
+            offload_policy,
+            Some(governor),
+            None,
+            route_residency_config,
+        )
+    }
+
+    fn route_residency_config_from_env() -> ExecutorRouteResidencyConfig {
+        if crate::coarse_residency::coarse_residency_profile_enabled() {
+            ExecutorRouteResidencyConfig::Enabled
+        } else {
+            ExecutorRouteResidencyConfig::Disabled
+        }
+    }
+
+    fn new_with_policy_governor_manager_and_route_config(
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
         governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
         manager: Option<ProcessMemoryManager>,
+        route_residency_config: ExecutorRouteResidencyConfig,
     ) -> Result<Self> {
         validate_offload_policy(&offload_policy)?;
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
@@ -1131,8 +1204,12 @@ impl CudaExecutionProvider {
             Some(governor) => CsaMetrics::with_governor(Arc::clone(governor)),
             None => CsaMetrics::default(),
         });
+        let artifact_config_authority = ExecutorArtifactConfigAuthority::fresh();
         let route_telemetry_registry =
-            Arc::new(crate::kernels::qmoe::RouteTelemetrySourceRegistry::default());
+            Arc::new(crate::kernels::qmoe::RouteTelemetrySourceRegistry::new(
+                artifact_config_authority,
+                route_residency_config,
+            ));
         let registry = build_cuda_registry_with_metrics(
             runtime.clone(),
             csa_metrics.clone(),
@@ -1311,7 +1388,8 @@ impl CudaExecutionProvider {
             retired_memory_mechanisms: Vec::new(),
             retired_allocator_teardown: Vec::new(),
             release_queue,
-            route_residency_enabled: crate::coarse_residency::coarse_residency_profile_enabled(),
+            route_residency_config,
+            artifact_config_authority,
             route_executors: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "gpu-tests"))]
             route_state_lock_acquisitions: AtomicU64::new(0),
@@ -1848,6 +1926,22 @@ impl CudaExecutionProvider {
         Ok(provider)
     }
 
+    pub fn initialized_with_offload_policy_governor_and_route_config(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+        route_residency_config: ExecutorRouteResidencyConfig,
+    ) -> Result<Self> {
+        let mut provider = Self::new_with_offload_policy_governor_and_route_config(
+            ordinal,
+            offload_policy,
+            governor,
+            route_residency_config,
+        )?;
+        <Self as ExecutionProvider>::initialize(&mut provider, &EpConfig::default())?;
+        Ok(provider)
+    }
+
     pub fn initialized_with_offload_policy_governor_and_manager(
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
@@ -2027,7 +2121,7 @@ impl CudaExecutionProvider {
         graph: &Graph,
         readiness: ExecutorArtifactReadinessEpoch,
     ) -> Result<ExecutorArtifactFinalization> {
-        if !self.route_residency_enabled {
+        if self.route_residency_config == ExecutorRouteResidencyConfig::Disabled {
             return Ok(ExecutorArtifactFinalization::Complete {
                 route_residency: ExecutorRouteResidency::Disabled,
             });
@@ -3311,23 +3405,21 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>> {
-        self.route_telemetry_registry
-            .with_executor_scope(ExecutorInstanceId::UNSCOPED, || {
-                self.create_registered_kernel(op, shapes, opset)
-            })
+        self.route_telemetry_registry.with_executor_scope(
+            self.executor_artifact_config(ExecutorInstanceId::UNSCOPED),
+            || self.create_registered_kernel(op, shapes, opset),
+        )?
     }
 
     fn get_kernel_for_executor(
         &self,
-        executor: ExecutorInstanceId,
+        config: ExecutorArtifactConfig,
         op: &Node,
         shapes: &[Vec<usize>],
         opset: u64,
     ) -> Result<Box<dyn Kernel>> {
         self.route_telemetry_registry
-            .with_executor_scope(executor, || {
-                self.create_registered_kernel(op, shapes, opset)
-            })
+            .with_executor_scope(config, || self.create_registered_kernel(op, shapes, opset))?
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
@@ -4317,17 +4409,27 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.consume_route_residency_for_executor(executor)
     }
 
-    fn finalize_executor_artifacts(
+    fn resolve_executor_artifact_config(
         &self,
         executor: ExecutorInstanceId,
+    ) -> Result<ExecutorArtifactConfig> {
+        Ok(self.executor_artifact_config(executor))
+    }
+
+    fn finalize_executor_artifacts(
+        &self,
+        config: ExecutorArtifactConfig,
         graph: &Graph,
         readiness: ExecutorArtifactReadinessEpoch,
     ) -> Result<ExecutorArtifactFinalization> {
+        let executor = self.validate_executor_artifact_config(config)?;
         self.finalize_route_residency_for_executor(executor, graph, readiness)
     }
 
-    fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {
-        self.drain_route_residency_for_executor(executor);
+    fn drain_executor_artifacts(&self, config: ExecutorArtifactConfig) {
+        if let Ok(executor) = self.validate_executor_artifact_config(config) {
+            self.drain_route_residency_for_executor(executor);
+        }
     }
 
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {

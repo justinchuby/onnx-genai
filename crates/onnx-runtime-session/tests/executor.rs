@@ -12,7 +12,7 @@ use std::sync::{
 };
 
 use onnx_runtime_ep_api::{
-    CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider,
+    CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider, ExecutorArtifactConfig,
     ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
     ExecutorInstanceId, ExecutorRouteResidency, Fence, Kernel, KernelMatch, Result as EpResult,
     TensorMetadata, TensorMut, TensorView, ViewOutput, WorkspaceRequirement,
@@ -320,10 +320,11 @@ impl Kernel for FinalizationCheckingKernel {
 impl ExecutionProvider for HostDownloadCountingEp {
     fn finalize_executor_artifacts(
         &self,
-        executor: ExecutorInstanceId,
+        config: ExecutorArtifactConfig,
         graph: &Graph,
         readiness: ExecutorArtifactReadinessEpoch,
     ) -> EpResult<ExecutorArtifactFinalization> {
+        let executor = config.executor();
         *self
             .route_readiness_checks
             .lock()
@@ -407,7 +408,8 @@ impl ExecutionProvider for HostDownloadCountingEp {
         }
     }
 
-    fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {
+    fn drain_executor_artifacts(&self, config: ExecutorArtifactConfig) {
+        let executor = config.executor();
         *self
             .route_drains
             .lock()
@@ -459,11 +461,12 @@ impl ExecutionProvider for HostDownloadCountingEp {
 
     fn get_kernel_for_executor(
         &self,
-        executor: ExecutorInstanceId,
+        config: ExecutorArtifactConfig,
         op: &Node,
         shapes: &[Vec<usize>],
         opset: u64,
     ) -> EpResult<Box<dyn Kernel>> {
+        let executor = config.executor();
         let kernel = self.cpu.get_kernel(op, shapes, opset)?;
         *self
             .kernel_compiles

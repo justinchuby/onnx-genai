@@ -1070,7 +1070,7 @@ impl KernelCache {
         constant_values: &[Option<KernelConstantInput<'_>>],
         opset: u64,
         capture_seq_independent: bool,
-        executor: ExecutorInstanceId,
+        artifact_config: ExecutorArtifactConfig,
         artifact_readiness: &mut ProviderArtifactReadiness,
         ep: &dyn ExecutionProvider,
         graph_tokens: [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT],
@@ -1105,7 +1105,12 @@ impl KernelCache {
                     reason,
                 ));
             }
-            let mut kernel = match ep.get_kernel_for_executor(executor, node, input_shapes, opset) {
+            let mut kernel = match ep.get_kernel_for_executor(
+                artifact_config,
+                node,
+                input_shapes,
+                opset,
+            ) {
                 Ok(kernel) => kernel,
                 Err(EpError::NoEpForOp {
                     domain,

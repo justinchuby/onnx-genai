@@ -51,12 +51,12 @@ use std::time::{Duration, Instant};
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
-    ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
-    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExecutorRouteResidency, ExternalMmapRegion,
-    Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
-    lazy_weight_candidates,
+    ExecutionProvider, ExecutorArtifactConfig, ExecutorArtifactFinalization,
+    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
+    ExecutorRouteResidency, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput,
+    KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline,
+    TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -828,7 +828,7 @@ impl Drop for Executor {
         // Drain only this executor's provider-owned artifacts before its
         // buffers/kernels are torn down. Sibling/MTP executors may share the same
         // EP and must retain their own producers and boundary state.
-        self.ep.drain_executor_artifacts(self.instance_id);
+        self.ep.drain_executor_artifacts(self.artifact_config);
         // Evict the global weight-transpose cache to prevent address-reuse
         // staleness: if a subsequently loaded model's mmap recycles a virtual
         // address, the cache must not serve the old model's transposed weights.

@@ -1,5 +1,6 @@
 #![cfg(all(feature = "cuda", feature = "gpu-tests"))]
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -22,26 +23,22 @@ use onnx_runtime_session::{InferenceSession, Tensor};
 
 static GPU_SERIAL: Mutex<()> = Mutex::new(());
 
-fn gate_on() {
-    unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
-}
-
-fn gate_off() {
-    unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
-}
-
-struct GateGuard;
+struct GateGuard(Option<OsString>);
 
 impl GateGuard {
     fn enable() -> Self {
-        gate_on();
-        Self
+        let previous = std::env::var_os(COARSE_RESIDENCY_ENABLE_ENV);
+        unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+        Self(previous)
     }
 }
 
 impl Drop for GateGuard {
     fn drop(&mut self) {
-        gate_off();
+        match self.0.take() {
+            Some(value) => unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, value) },
+            None => unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) },
+        }
     }
 }
 
@@ -259,7 +256,9 @@ fn symbolic_qmoe_finalizes_after_real_compile_and_shared_ep_state_is_isolated() 
     assert_eq!(
         provider
             .finalize_executor_artifacts(
-                first_id,
+                provider
+                    .resolve_executor_artifact_config(first_id)
+                    .expect("resolve first executor artifact config"),
                 first.graph(),
                 ExecutorArtifactReadinessEpoch::INITIAL,
             )

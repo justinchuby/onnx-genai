@@ -3598,6 +3598,40 @@ impl CudaWeightResidency {
         )
     }
 
+    /// Apply a coarse plan for an executor generation whose immutable artifact
+    /// configuration already resolved route residency as enabled.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_resolved_coarse_residency_plan(
+        &self,
+        plan: &onnx_runtime_ep_api::ResidencyPlan,
+        catalogs: &std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            onnx_runtime_loader::WeightRegionCatalog,
+        >,
+        allocators: &std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            Arc<onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator>,
+        >,
+        device_pool: &Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+        host_pool: &Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+        device_count: usize,
+        device_ordinal: i32,
+        expert_groups: &[onnx_runtime_ep_api::ExpertWeightGroup],
+    ) -> crate::coarse_residency::BoundaryApplicationOutcome {
+        crate::coarse_residency::apply_resolved_residency_plan_at_boundary(
+            &self.runtime,
+            self,
+            plan,
+            catalogs,
+            allocators,
+            device_pool,
+            host_pool,
+            device_count,
+            device_ordinal,
+            expert_groups,
+        )
+    }
+
     /// Prove residency for a QMoE-family dispatch and mint a guard that keeps
     /// this residency's resize seam closed until the guard is dropped.
     ///
