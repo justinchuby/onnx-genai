@@ -1224,7 +1224,9 @@ fn capture_replay_parity() {
     // Capture the warmed pipeline, then replay ≥3× and compare byte-for-byte.
     let capture_allocations = runtime.allocation_counts();
     let capture_transfers = runtime.transfer_counts();
-    runtime.begin_graph_capture(&[]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[], vec![admission.device_graph_resource()])
+        .unwrap();
     let capture_buffer_lengths = PlanarMoeBufferLengths::for_dims(&dims, false).unwrap();
     assert!(
         admit_planar_moe(

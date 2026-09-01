@@ -24,6 +24,9 @@
 //!
 //! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled.
 
+mod common;
+
+use common::reset_capture_error_for_isolated_test;
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMetadata,
@@ -484,7 +487,7 @@ fn run_gpu_capture_replay(
     };
 
     // A fresh generation starts un-poisoned.
-    runtime.reset_capture_error()?;
+    reset_capture_error_for_isolated_test(runtime)?;
 
     // Warmup: an eager execute compiles/caches the NVRTC kernel and sizes the
     // persistent scratch before capture. Only after this does the kernel
@@ -1697,7 +1700,7 @@ fn bench_config(
             .collect()
     };
 
-    runtime.reset_capture_error().expect("reset capture error");
+    reset_capture_error_for_isolated_test(runtime).expect("reset capture error");
     // Warmup compiles the NVRTC kernel and sizes the persistent workspace.
     {
         let mut out_views = make_out_views(&mut out_buffers);

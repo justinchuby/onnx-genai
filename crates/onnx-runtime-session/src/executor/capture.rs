@@ -250,8 +250,10 @@ pub enum DeviceGraphCaptureResult {
     NotCapturable(CaptureDeclineReport),
 }
 
+// Boxing the executed variant would allocate on every warmed device-bound run.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum ScopedRunResult {
-    Executed(Vec<Option<SessionOutput>>),
+    Executed(ScopedOutputs),
     NotCapturable(CaptureDeclineReport),
 }
 
@@ -365,15 +367,15 @@ impl OpCaptureTrace<'_> {
 /// [`disarm`]: SegmentCaptureGuard::disarm
 pub(super) struct SegmentCaptureGuard<'a> {
     pub(super) ep: &'a dyn ExecutionProvider,
-    pub(super) slot: DeviceGraphSlot,
+    pub(super) token: DeviceGraphToken,
     pub(super) armed: bool,
 }
 
 impl<'a> SegmentCaptureGuard<'a> {
-    pub(super) fn arm(ep: &'a dyn ExecutionProvider, slot: DeviceGraphSlot) -> Self {
+    pub(super) fn arm(ep: &'a dyn ExecutionProvider, token: DeviceGraphToken) -> Self {
         Self {
             ep,
-            slot,
+            token,
             armed: true,
         }
     }
@@ -388,7 +390,7 @@ impl Drop for SegmentCaptureGuard<'_> {
         if self.armed {
             // Best-effort: the abort itself may fail, but the caller is already
             // unwinding a capture failure and will reset the lifecycle next.
-            let _ = self.ep.abort_device_graph_capture_in(self.slot);
+            let _ = self.ep.abort_owned_device_graph_capture(self.token);
         }
     }
 }
@@ -441,6 +443,9 @@ pub(super) struct DeviceBindingSignature {
     pub(super) output_name: Option<String>,
     pub(super) dtype: DataType,
     pub(super) physical_shape: Vec<usize>,
+    pub(super) logical_shape: Vec<usize>,
+    pub(super) exposes_logical_input_shape: bool,
+    pub(super) mask_decode_freeze_safe: bool,
     pub(super) device_ptr: usize,
 }
 

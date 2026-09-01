@@ -23,6 +23,7 @@ use onnx_runtime_ir::{
     static_shape,
 };
 use onnx_runtime_loader::Model;
+use std::io::{Read, Seek, SeekFrom};
 
 const DOMAIN: &str = "pkg.nxrt";
 
@@ -511,6 +512,11 @@ fn format_info(format: &str) -> (usize, usize) {
         "iq3_s" => (256, 110),
         "iq1_s" => (256, 50),
         "iq1_m" => (256, 56),
+        "q2_k" => (256, 84),
+        "q3_k" => (256, 110),
+        "q5_k" => (256, 176),
+        "q6_k" => (256, 210),
+        "q8_0" => (32, 34),
         other => panic!("unknown test format {other}"),
     }
 }
@@ -544,6 +550,33 @@ fn random_case(format: &str, k: usize, n: usize) -> (Vec<f32>, Vec<u8>, Vec<f32>
                 let scale_nibble = (scale.to_bits() >> (4 * index)) & 0x0f;
                 block[offset..offset + 2]
                     .copy_from_slice(&((packed & 0x0fff) | (scale_nibble << 12)).to_le_bytes());
+            }
+        } else if format == "q2_k" {
+            for byte in &mut block[..80] {
+                *byte = random_u32(&mut state) as u8;
+            }
+            block[80..82].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+            block[82..84].copy_from_slice(&half::f16::from_f32(0.005).to_le_bytes());
+        } else if format == "q3_k" {
+            for byte in &mut block[..108] {
+                *byte = random_u32(&mut state) as u8;
+            }
+            block[108..110].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+        } else if format == "q5_k" {
+            block[..2].copy_from_slice(&half::f16::from_f32(0.002).to_le_bytes());
+            block[2..4].copy_from_slice(&half::f16::from_f32(0.001).to_le_bytes());
+            for byte in &mut block[4..] {
+                *byte = random_u32(&mut state) as u8;
+            }
+        } else if format == "q6_k" {
+            for byte in &mut block[..208] {
+                *byte = random_u32(&mut state) as u8;
+            }
+            block[208..210].copy_from_slice(&half::f16::from_f32(0.002).to_le_bytes());
+        } else if format == "q8_0" {
+            block[..2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+            for byte in &mut block[2..] {
+                *byte = random_u32(&mut state) as u8;
             }
         } else {
             let scale =
@@ -587,7 +620,7 @@ fn block_quantized_gemv_random_supported_formats_match_cpu() {
     let (k, n) = (1003usize, 37usize);
     for format in [
         "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
-        "iq1_m",
+        "iq1_m", "q2_k", "q3_k", "q5_k", "q6_k", "q8_0",
     ] {
         let (qk, block_bytes) = format_info(format);
         let packed_shape = [n, k.div_ceil(qk), block_bytes];
@@ -614,6 +647,8 @@ fn block_quantized_gemm_prefill_matches_cpu_for_partial_and_grid_stride_tiles() 
     for (format, a_shape, k, n, with_bias) in [
         ("mxfp4", vec![3, 99], 99usize, 13usize, true),
         ("iq4_xs", vec![1, 7, 515], 515usize, 11usize, false),
+        ("q2_k", vec![3, 512], 512usize, 7usize, false),
+        ("q8_0", vec![5, 96], 96usize, 9usize, true),
         ("mxfp4", vec![32_769, 32], 32usize, 2usize, false),
     ] {
         let m = a_shape[..a_shape.len() - 1].iter().product();
@@ -653,7 +688,7 @@ fn block_quantized_gemv_dequant_is_bit_exact_against_cpu() {
     let n = 2usize;
     for format in [
         "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
-        "iq1_m",
+        "iq1_m", "q2_k", "q3_k", "q5_k", "q6_k", "q8_0",
     ] {
         let (qk, block_bytes) = format_info(format);
         let k = qk;
@@ -942,7 +977,7 @@ fn supported_formats_and_prefill_route_to_cuda() {
     let ep = require_cuda();
     for format in [
         "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
-        "iq1_m",
+        "iq1_m", "q2_k", "q3_k", "q5_k", "q6_k", "q8_0",
     ] {
         let (qk, block_bytes) = format_info(format);
         let (graph, node) = model_node(
@@ -1056,4 +1091,78 @@ fn supported_formats_and_prefill_route_to_cuda() {
         ),
         KernelMatch::Supported { .. }
     ));
+}
+
+#[test]
+#[ignore = "opt-in real-checkpoint test; set ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT"]
+fn glm52_ud_iq1s_real_blocks_match_cpu_on_cuda() {
+    let root = std::env::var("ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT")
+        .expect("set ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT to the official checkpoint directory");
+    let ep = require_cuda();
+    let cases = [
+        (
+            "iq1_s",
+            "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            3_374_539_520u64,
+        ),
+        (
+            "iq2_xxs",
+            "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            17_617_400_576,
+        ),
+        (
+            "iq3_xxs",
+            "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            2_131_092_224,
+        ),
+        (
+            "iq4_xs",
+            "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            15_892_755_200,
+        ),
+        (
+            "q2_k",
+            "GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+            16_942_690_656,
+        ),
+        (
+            "q3_k",
+            "GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+            15_548_248_416,
+        ),
+        (
+            "q5_k",
+            "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            1_265_416_960,
+        ),
+        (
+            "q6_k",
+            "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            1_203_485_440,
+        ),
+        (
+            "q8_0",
+            "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            17_604_031_232,
+        ),
+    ];
+    for (format, shard, offset) in cases {
+        let (qk, block_bytes) = format_info(format);
+        let mut packed = vec![0u8; block_bytes];
+        let mut file = std::fs::File::open(std::path::Path::new(&root).join(shard)).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut packed).unwrap();
+        let activation: Vec<f32> = (0..qk)
+            .map(|index| ((index * 17 % 29) as f32 - 14.0) / 16.0)
+            .collect();
+        let packed_shape = [1, 1, block_bytes];
+        let inputs = [
+            HostTensor::f32(&[1, qk], &activation),
+            HostTensor::u8(&packed_shape, &packed),
+        ];
+        let (graph, node) = model_node(format, &[1, qk], &packed_shape, &[1, 1], qk, 1, false);
+        let expected = run_cpu(&graph, node, &inputs, &[1, 1]);
+        let actual = run_gpu(&ep, &graph, node, &inputs, &[1, 1]).unwrap();
+        assert_close(&actual, &expected);
+    }
 }

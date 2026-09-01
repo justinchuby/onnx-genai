@@ -1,3 +1,7 @@
+#[cfg(feature = "gpu-tests")]
+use std::alloc::{GlobalAlloc, Layout, System};
+#[cfg(feature = "gpu-tests")]
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
@@ -8,8 +12,77 @@ use onnx_runtime_memory_governor::MemoryRole;
 
 use super::*;
 
+#[cfg(feature = "gpu-tests")]
+struct CountingAllocator;
+
+#[cfg(feature = "gpu-tests")]
+thread_local! {
+    static COUNT_HOST_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+    static HOST_ALLOCATION_COUNT: Cell<u64> = const { Cell::new(0) };
+    static HOST_ALLOCATION_SIZES: Cell<[usize; 8]> = const { Cell::new([0; 8]) };
+}
+
+#[cfg(feature = "gpu-tests")]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        COUNT_HOST_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                HOST_ALLOCATION_COUNT.with(|count| {
+                    let index = count.get() as usize;
+                    count.set(count.get() + 1);
+                    HOST_ALLOCATION_SIZES.with(|sizes| {
+                        let mut values = sizes.get();
+                        if index < values.len() {
+                            values[index] = layout.size();
+                            sizes.set(values);
+                        }
+                    });
+                });
+            }
+        });
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        COUNT_HOST_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                HOST_ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+            }
+        });
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        COUNT_HOST_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                HOST_ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+            }
+        });
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+#[cfg(feature = "gpu-tests")]
+static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[cfg(feature = "gpu-tests")]
+fn count_host_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64) {
+    HOST_ALLOCATION_COUNT.with(|count| count.set(0));
+    HOST_ALLOCATION_SIZES.with(|sizes| sizes.set([0; 8]));
+    COUNT_HOST_ALLOCATIONS.with(|enabled| enabled.set(true));
+    let result = operation();
+    COUNT_HOST_ALLOCATIONS.with(|enabled| enabled.set(false));
+    (result, HOST_ALLOCATION_COUNT.with(Cell::get))
+}
+
 struct DeferredValidationKernel {
     fail_next: Arc<AtomicBool>,
+    panic_next: Arc<AtomicBool>,
     validation_latch: Arc<AtomicU32>,
     executions: Arc<AtomicUsize>,
 }
@@ -39,6 +112,9 @@ impl Kernel for DeferredValidationKernel {
         if self.fail_next.swap(false, Ordering::Relaxed) {
             self.validation_latch.store(0x40, Ordering::Relaxed);
         }
+        if self.panic_next.swap(false, Ordering::Relaxed) {
+            panic!("forced deferred validation kernel panic");
+        }
         Ok(())
     }
 }
@@ -51,8 +127,22 @@ struct DeferredValidationEp {
     synchronized_executions: Arc<AtomicUsize>,
     resets: Arc<AtomicUsize>,
     reset_failure_at: Arc<AtomicUsize>,
+    validation_state: Arc<std::sync::Mutex<DeferredValidationState>>,
+    next_validation_generation: Arc<AtomicU64>,
+    validation_consume_attempts: Arc<AtomicUsize>,
+    sync_calls: Arc<AtomicUsize>,
+    panic_next: Arc<AtomicBool>,
+    graph_reset_failure: Arc<AtomicBool>,
+    graph_reset_calls: Arc<AtomicUsize>,
     route_boundary_calls: Arc<AtomicUsize>,
     route_boundary_before_sync: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct DeferredValidationState {
+    active: Option<onnx_runtime_ep_api::DeviceValidationToken>,
+    recipients: Vec<onnx_runtime_ep_api::DeviceValidationOwner>,
+    owners: HashMap<onnx_runtime_ep_api::DeviceValidationOwner, Option<(u64, u32)>>,
 }
 
 impl DeferredValidationEp {
@@ -67,9 +157,64 @@ impl DeferredValidationEp {
             synchronized_executions: Arc::new(AtomicUsize::new(0)),
             resets: Arc::new(AtomicUsize::new(0)),
             reset_failure_at: Arc::new(AtomicUsize::new(0)),
+            validation_state: Arc::new(std::sync::Mutex::new(DeferredValidationState::default())),
+            next_validation_generation: Arc::new(AtomicU64::new(1)),
+            validation_consume_attempts: Arc::new(AtomicUsize::new(0)),
+            sync_calls: Arc::new(AtomicUsize::new(0)),
+            panic_next: Arc::new(AtomicBool::new(false)),
+            graph_reset_failure: Arc::new(AtomicBool::new(false)),
+            graph_reset_calls: Arc::new(AtomicUsize::new(0)),
             route_boundary_calls: Arc::new(AtomicUsize::new(0)),
             route_boundary_before_sync: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn consume_validation_token(
+        &self,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> onnx_runtime_ep_api::Result<u32> {
+        self.validation_consume_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let mut state = self.validation_state.lock().unwrap();
+        if let Some(Some((generation, flags))) = state.owners.get(&token.owner())
+            && *generation == token.generation()
+        {
+            return Ok(*flags);
+        }
+        match state.active {
+            Some(expected)
+                if expected.generation() == token.generation()
+                    && state.recipients.contains(&token.owner()) => {}
+            Some(expected) => {
+                return Err(EpError::KernelFailed(format!(
+                    "validation token owner={} generation={} cannot consume active owner={} \
+                     generation={}",
+                    token.owner().get(),
+                    token.generation(),
+                    expected.owner().get(),
+                    expected.generation()
+                )));
+            }
+            None => {
+                return Err(EpError::KernelFailed(format!(
+                    "validation token owner={} generation={} is stale",
+                    token.owner().get(),
+                    token.generation()
+                )));
+            }
+        }
+        let result = self
+            .check_validation_latch()
+            .and_then(|flags| self.reset_validation_latch().map(|()| flags));
+        if let Ok(flags) = &result {
+            let generation = token.generation();
+            for owner in state.recipients.clone() {
+                state.owners.insert(owner, Some((generation, *flags)));
+            }
+            state.active = None;
+            state.recipients.clear();
+        }
+        result
     }
 }
 
@@ -121,6 +266,7 @@ impl ExecutionProvider for DeferredValidationEp {
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
         Ok(Box::new(DeferredValidationKernel {
             fail_next: Arc::clone(&self.fail_next),
+            panic_next: Arc::clone(&self.panic_next),
             validation_latch: Arc::clone(&self.validation_latch),
             executions: Arc::clone(&self.executions),
         }))
@@ -152,32 +298,139 @@ impl ExecutionProvider for DeferredValidationEp {
         self.cpu.copy_async(src, dst, size)
     }
 
+    fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> onnx_runtime_ep_api::Result<()> {
+        self.sync()?;
+        self.cpu.copy_to_host(src, dst)
+    }
+
     fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.sync_calls.fetch_add(1, Ordering::Relaxed);
         self.synchronized_executions
             .store(self.executions.load(Ordering::Relaxed), Ordering::Relaxed);
         Ok(())
     }
 
-    fn reset_device_validation_error(&self) -> onnx_runtime_ep_api::Result<()> {
-        let call = self.resets.fetch_add(1, Ordering::Relaxed) + 1;
-        if self.reset_failure_at.load(Ordering::Relaxed) == call {
-            return Err(EpError::KernelFailed(
-                "forced device validation reset failure".into(),
-            ));
+    fn register_device_validation_owner(
+        &self,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::DeviceValidationRegistration> {
+        let owner = onnx_runtime_ep_api::DeviceValidationOwner::new();
+        let mut state = self.validation_state.lock().unwrap();
+        if state.owners.insert(owner, None).is_some() {
+            return Err(EpError::KernelFailed(format!(
+                "validation owner {} already registered",
+                owner.get()
+            )));
         }
-        self.validation_latch.store(0, Ordering::Relaxed);
+        Ok(onnx_runtime_ep_api::DeviceValidationRegistration::new(
+            owner,
+            (),
+        ))
+    }
+
+    fn unregister_device_validation_owner(
+        &self,
+        registration: &mut onnx_runtime_ep_api::DeviceValidationRegistration,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let owner = registration.owner();
+        let mut state = self.validation_state.lock().unwrap();
+        if state.active.is_some() && state.recipients.contains(&owner) {
+            return Err(EpError::KernelFailed(format!(
+                "validation owner {} still pending",
+                owner.get()
+            )));
+        }
+        state.owners.remove(&owner);
         Ok(())
     }
 
-    fn check_device_capture_error(&self) -> onnx_runtime_ep_api::Result<u32> {
-        if self.synchronized_executions.load(Ordering::Relaxed)
-            != self.executions.load(Ordering::Relaxed)
-        {
+    fn begin_device_validation(
+        &self,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        let owner = registration.owner();
+        let mut state = self.validation_state.lock().unwrap();
+        if let Some(token) = state.active {
+            return Err(EpError::KernelFailed(format!(
+                "previous deferred device validation is still pending (owner={} generation={})",
+                token.owner().get(),
+                token.generation()
+            )));
+        }
+        if !state.owners.contains_key(&owner) {
+            return Err(EpError::KernelFailed(format!(
+                "validation owner {} is unregistered",
+                owner.get()
+            )));
+        }
+        self.reset_validation_latch()?;
+        let generation = self
+            .next_validation_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let token = onnx_runtime_ep_api::DeviceValidationToken::new(owner, generation);
+        state.active = Some(token);
+        state.recipients.clear();
+        state.recipients.push(owner);
+        state.owners.insert(owner, None);
+        Ok(token)
+    }
+
+    fn add_device_validation_recipient(
+        &self,
+        submission: onnx_runtime_ep_api::DeviceValidationToken,
+        recipient: &onnx_runtime_ep_api::DeviceValidationRegistration,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        let recipient = recipient.owner();
+        let mut state = self.validation_state.lock().unwrap();
+        if state.active != Some(submission) || !state.owners.contains_key(&recipient) {
             return Err(EpError::KernelFailed(
-                "device validation latch checked before synchronization".into(),
+                "validation recipient does not belong to the active submission".into(),
             ));
         }
-        Ok(self.validation_latch.load(Ordering::Relaxed))
+        state.recipients.push(recipient);
+        state.owners.insert(recipient, None);
+        Ok(onnx_runtime_ep_api::DeviceValidationToken::new(
+            recipient,
+            submission.generation(),
+        ))
+    }
+
+    fn defers_device_validation(&self) -> bool {
+        true
+    }
+
+    fn abort_device_validation_submission(
+        &self,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> onnx_runtime_ep_api::Result<u32> {
+        self.consume_validation_token(token)
+    }
+
+    fn consume_device_validation_error(
+        &self,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> onnx_runtime_ep_api::Result<u32> {
+        if registration.owner() != token.owner() {
+            return Err(EpError::KernelFailed(format!(
+                "validation token owner={} is foreign to registration owner={}",
+                token.owner().get(),
+                registration.owner().get()
+            )));
+        }
+        self.consume_validation_token(token)
+    }
+
+    fn reset_owned_device_graph(
+        &self,
+        _token: onnx_runtime_ep_api::DeviceGraphToken,
+    ) -> onnx_runtime_ep_api::Result<bool> {
+        self.graph_reset_calls.fetch_add(1, Ordering::Relaxed);
+        if self.graph_reset_failure.load(Ordering::Relaxed) {
+            return Err(EpError::KernelFailed(
+                "forced device graph reset failure".into(),
+            ));
+        }
+        Ok(true)
     }
 
     fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
@@ -195,6 +448,79 @@ impl ExecutionProvider for DeferredValidationEp {
         self.route_boundary_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+}
+
+impl DeferredValidationEp {
+    fn reset_validation_latch(&self) -> onnx_runtime_ep_api::Result<()> {
+        let call = self.resets.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.reset_failure_at.load(Ordering::Relaxed) == call {
+            return Err(EpError::KernelFailed(
+                "forced device validation reset failure".into(),
+            ));
+        }
+        self.validation_latch.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn check_validation_latch(&self) -> onnx_runtime_ep_api::Result<u32> {
+        if self.synchronized_executions.load(Ordering::Relaxed)
+            != self.executions.load(Ordering::Relaxed)
+        {
+            return Err(EpError::KernelFailed(
+                "device validation latch checked before synchronization".into(),
+            ));
+        }
+        Ok(self.validation_latch.load(Ordering::Relaxed))
+    }
+}
+
+fn deferred_validation_bound_fixture_for_provider(
+    ep: Arc<DeferredValidationEp>,
+) -> (Executor, Vec<DeviceIoBinding>) {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+    )
+    .unwrap();
+    let mut bindings = vec![
+        executor
+            .allocate_device_binding("input".into(), None, DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+        executor
+            .allocate_device_output_binding("output".into(), DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+    ];
+    bindings[0]
+        .write_bytes(
+            0,
+            &[3.0f32, 7.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    (executor, bindings)
+}
+
+fn deferred_validation_bound_fixture() -> (Executor, Arc<DeferredValidationEp>, Vec<DeviceIoBinding>)
+{
+    let ep = Arc::new(DeferredValidationEp::new());
+    let (executor, bindings) = deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+    (executor, ep, bindings)
 }
 
 #[test]
@@ -247,6 +573,349 @@ fn deferred_device_validation_is_request_local_and_checked_after_sync() {
         4,
         "each request must reset the latch before execution and after checking it"
     );
+}
+
+#[test]
+fn unconsumed_bound_failure_rejects_later_success_or_failure_without_erasure() {
+    for second_would_fail in [false, true] {
+        let (mut executor, ep, mut bindings) = deferred_validation_bound_fixture();
+
+        executor
+            .run_with_device_bindings(&[], &mut bindings)
+            .expect("bound run A submits asynchronously");
+        assert_eq!(ep.executions.load(Ordering::Relaxed), 1);
+
+        ep.fail_next.store(second_would_fail, Ordering::Relaxed);
+        let second = executor
+            .run_with_device_bindings(&[], &mut bindings)
+            .expect_err("run B must be rejected until run A is consumed");
+        assert!(
+            second
+                .to_string()
+                .contains("previous deferred device validation is still pending"),
+            "unexpected run-B refusal: {second}"
+        );
+        assert_eq!(
+            ep.executions.load(Ordering::Relaxed),
+            1,
+            "rejected run B must not execute, regardless of whether it would succeed or fail"
+        );
+
+        let first = bindings[1].read_bytes_range(0, 4).unwrap_err();
+        assert!(
+            first
+                .to_string()
+                .contains("device validation failed (flags=0x40)"),
+            "run A's sticky failure must remain observable after run B: {first}"
+        );
+        assert!(ep.validation_state.lock().unwrap().active.is_none());
+    }
+}
+
+#[test]
+fn foreign_binding_executor_drop_and_reset_cannot_consume_owned_validation() {
+    #[derive(Clone, Copy, Debug)]
+    enum ForeignAction {
+        BindingDrop,
+        ExecutorDrop,
+        GraphReset,
+    }
+
+    for action in [
+        ForeignAction::BindingDrop,
+        ForeignAction::ExecutorDrop,
+        ForeignAction::GraphReset,
+    ] {
+        let ep = Arc::new(DeferredValidationEp::new());
+        let (mut owner, mut owner_bindings) =
+            deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+        let (foreign, mut foreign_bindings) =
+            deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+        assert_ne!(
+            owner.validation_registration.as_ref().unwrap().owner(),
+            foreign.validation_registration.as_ref().unwrap().owner()
+        );
+
+        owner
+            .run_with_device_bindings(&[], &mut owner_bindings)
+            .expect("the owner submits one deferred failing generation");
+        assert_eq!(
+            ep.executions.load(Ordering::Relaxed),
+            1,
+            "{action:?}: positive control must execute the owner's failing kernel"
+        );
+        let active = ep
+            .validation_state
+            .lock()
+            .unwrap()
+            .active
+            .expect("the owner's validation token must remain pending");
+        assert_eq!(
+            active.owner(),
+            owner.validation_registration.as_ref().unwrap().owner()
+        );
+
+        let sync_before = ep.sync_calls.load(Ordering::Relaxed);
+        let mut foreign = Some(foreign);
+        match action {
+            ForeignAction::BindingDrop => {
+                drop(foreign_bindings.remove(1));
+            }
+            ForeignAction::ExecutorDrop => {
+                drop(foreign.take());
+            }
+            ForeignAction::GraphReset => {
+                assert!(!foreign.as_mut().unwrap().reset_device_graph().unwrap());
+            }
+        }
+        assert!(
+            ep.sync_calls.load(Ordering::Relaxed) > sync_before,
+            "{action:?}: positive control must prove the foreign teardown/reset synchronized"
+        );
+        assert_eq!(
+            ep.validation_consume_attempts.load(Ordering::Relaxed),
+            0,
+            "{action:?}: a foreign owner must not even attempt to consume the active token"
+        );
+        assert_eq!(
+            ep.validation_state
+                .lock()
+                .unwrap()
+                .active
+                .expect("foreign action must preserve the owner's token"),
+            active
+        );
+
+        let error = owner_bindings[1].read_bytes_range(0, 4).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("device validation failed (flags=0x40)"),
+            "{action:?}: the submitting owner's unseen failure must remain observable: {error}"
+        );
+        assert_eq!(
+            ep.validation_consume_attempts.load(Ordering::Relaxed),
+            1,
+            "{action:?}: only the submitting binding may consume the token"
+        );
+        assert!(ep.validation_state.lock().unwrap().active.is_none());
+    }
+}
+
+#[test]
+fn completed_binding_receipt_survives_more_than_64_later_owner_submissions() {
+    const LATER_SUBMISSIONS: usize = 96;
+
+    let ep = Arc::new(DeferredValidationEp::new());
+    let (mut first, mut first_bindings) =
+        deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+    first
+        .run_with_device_bindings(&[], &mut first_bindings)
+        .expect("first owner submits one deferred failure");
+    assert_eq!(
+        first.check_device_capture_error().unwrap(),
+        0x40,
+        "the executor receipt must complete the shared submission while the binding stays unread"
+    );
+
+    ep.fail_next.store(false, Ordering::Relaxed);
+    for submission in 0..LATER_SUBMISSIONS {
+        let (mut sibling, mut sibling_bindings) =
+            deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+        sibling
+            .run_with_device_bindings(&[], &mut sibling_bindings)
+            .unwrap_or_else(|error| panic!("later submission {submission} failed: {error}"));
+        sibling_bindings[1]
+            .read_bytes_range(0, 4)
+            .unwrap_or_else(|error| panic!("later receipt {submission} failed: {error}"));
+        drop(sibling_bindings);
+        drop(sibling);
+    }
+
+    assert_eq!(
+        ep.validation_state.lock().unwrap().owners.len(),
+        3,
+        "all 96 sibling executor/binding registrations must retire without leaking"
+    );
+    for observation in 1..=2 {
+        let error = first_bindings[1].read_bytes_range(0, 4).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("device validation failed (flags=0x40)"),
+            "old receipt observation {observation} was overwritten after {LATER_SUBMISSIONS} \
+             later submissions: {error}"
+        );
+    }
+
+    drop(first_bindings);
+    drop(first);
+    assert_eq!(
+        ep.validation_state.lock().unwrap().owners.len(),
+        0,
+        "final owner teardown must retire every setup-time validation slot"
+    );
+    eprintln!(
+        "validation-lifetime old_receipt_observations=2 later_submissions={LATER_SUBMISSIONS} \
+         leaked_owner_slots=0"
+    );
+}
+
+#[test]
+fn stale_generation_cannot_consume_or_clear_current_submission() {
+    let (mut executor, ep, mut bindings) = deferred_validation_bound_fixture();
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("first submission");
+    let stale = bindings[1]
+        .device_validation_token_for_test()
+        .expect("first binding token");
+    assert_eq!(executor.check_device_capture_error().unwrap(), 0x40);
+
+    ep.fail_next.store(true, Ordering::Relaxed);
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("second submission");
+    let current = bindings[1]
+        .device_validation_token_for_test()
+        .expect("second binding token");
+    assert_ne!(stale.generation(), current.generation());
+    let error = ep
+        .consume_device_validation_error(bindings[1].validation_registration(), stale)
+        .expect_err("stale generation must fail closed");
+    assert!(
+        error.to_string().contains("cannot consume active"),
+        "stale token must be rejected without touching the active generation: {error}"
+    );
+    assert_eq!(
+        ep.validation_state.lock().unwrap().active,
+        Some(onnx_runtime_ep_api::DeviceValidationToken::new(
+            executor.validation_registration.as_ref().unwrap().owner(),
+            current.generation()
+        )),
+        "stale consume must not clear or replace the current active submission"
+    );
+    let current_error = bindings[1].read_bytes_range(0, 4).unwrap_err();
+    assert!(
+        current_error
+            .to_string()
+            .contains("device validation failed (flags=0x40)")
+    );
+}
+
+#[test]
+fn panicking_bound_run_consumes_deferred_validation_before_reuse() {
+    let (mut executor, ep, mut bindings) = deferred_validation_bound_fixture();
+    ep.panic_next.store(true, Ordering::Relaxed);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = executor.run_with_device_bindings(&[], &mut bindings);
+    }));
+    assert!(panic.is_err());
+    assert!(
+        ep.validation_state.lock().unwrap().active.is_none(),
+        "the unwind guard must consume the pending generation"
+    );
+    assert_eq!(
+        ep.validation_latch.load(Ordering::Acquire),
+        0,
+        "the failing latch must be cleared only after it was observed during unwind"
+    );
+
+    ep.fail_next.store(false, Ordering::Relaxed);
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("the executor must remain reusable after panic cleanup");
+    bindings[1]
+        .read_bytes_range(0, 4)
+        .expect("the healthy follow-up run must consume cleanly");
+}
+
+#[test]
+fn failed_graph_reset_preserves_the_exact_local_installation_token() {
+    let (mut executor, ep, _bindings) = deferred_validation_bound_fixture();
+    let token = onnx_runtime_ep_api::DeviceGraphToken::new(
+        executor.graph_owner,
+        DeviceGraphSlot::Primary,
+        7,
+    );
+    executor.cap_mut().device_graph_token = Some(token);
+    ep.graph_reset_failure.store(true, Ordering::Relaxed);
+
+    let error = executor.reset_device_graph().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("forced device graph reset failure"),
+        "unexpected reset error: {error}"
+    );
+    assert_eq!(
+        executor.cap().device_graph_token,
+        Some(token),
+        "host state must retain the token until provider reset succeeds"
+    );
+
+    ep.graph_reset_failure.store(false, Ordering::Relaxed);
+    assert!(executor.reset_device_graph().unwrap());
+    assert_eq!(executor.cap().device_graph_token, None);
+    assert_eq!(ep.graph_reset_calls.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn device_bound_validation_is_deferred_until_a_partial_host_read() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let ep = Arc::new(DeferredValidationEp::new());
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+    )
+    .unwrap();
+    let mut bindings = vec![
+        executor
+            .allocate_device_binding("input".into(), None, DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+        executor
+            .allocate_device_output_binding("output".into(), DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+    ];
+    bindings[0]
+        .write_bytes(
+            0,
+            &[3.0f32, 7.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+    let outputs = executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].is_none());
+    assert_eq!(ep.synchronized_executions.load(Ordering::Relaxed), 0);
+    let error = bindings[1].read_bytes_range(0, 4).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("device validation failed (flags=0x40)"),
+        "the partial binding read must surface the deferred validation failure: {error}"
+    );
+    assert_eq!(ep.synchronized_executions.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.resets.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -1478,7 +2147,7 @@ fn capture_shapes_seed_unresolved_external_values_without_overwriting_resolved_s
         dtype: DataType::Float32,
         shape,
         accepts_subshape: false,
-        ptr: std::ptr::null_mut(),
+        ptr: 0,
         len: 0,
         alignment: 1,
         device: onnx_runtime_ir::DeviceId::cpu(),
@@ -5281,6 +5950,7 @@ fn op_capture_trace_annotates_span_with_status_and_reason() {
             )
             .annotate();
         }
+
         let recorded = events.events();
         assert_eq!(recorded.len(), 1);
         let args = recorded[0].args.as_ref().unwrap();
@@ -5322,6 +5992,1788 @@ fn op_capture_trace_annotates_span_with_status_and_reason() {
             "eager ops carry no capture status"
         );
     }
+}
+
+#[cfg(feature = "gpu-tests")]
+fn sealed_bqmoe_session_graph() -> Graph {
+    fn q8_bank(experts: usize, out: usize, input: usize, seed: i8) -> Vec<u8> {
+        let blocks = input / 32;
+        let mut bytes = vec![0u8; experts * out * blocks * 34];
+        for (block_index, block) in bytes.chunks_exact_mut(34).enumerate() {
+            block[..2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+            for (index, value) in block[2..].iter_mut().enumerate() {
+                *value = seed
+                    .wrapping_add((block_index as i8).wrapping_mul(3))
+                    .wrapping_add(index as i8)
+                    .to_ne_bytes()[0];
+            }
+        }
+        bytes
+    }
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("pkg.nxrt".into(), 1);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 32]));
+    graph.add_input(x);
+    let router = graph.create_named_value("router", DataType::Float32, static_shape([1, 2]));
+    graph.add_input(router);
+    let add_bank = |graph: &mut Graph, name: &str, shape: Vec<usize>, bytes: Vec<u8>| {
+        let value =
+            graph.create_named_value(name, DataType::Uint8, static_shape(shape.iter().copied()));
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Uint8,
+                shape,
+                bytes,
+            )),
+        );
+        value
+    };
+    let fc1 = add_bank(
+        &mut graph,
+        "gate",
+        vec![2, 32, 1, 34],
+        q8_bank(2, 32, 32, 3),
+    );
+    let fc2 = add_bank(
+        &mut graph,
+        "down",
+        vec![2, 32, 1, 34],
+        q8_bank(2, 32, 32, 17),
+    );
+    let fc3 = add_bank(&mut graph, "up", vec![2, 32, 1, 34], q8_bank(2, 32, 32, 41));
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([1, 32]));
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![
+            Some(x),
+            Some(router),
+            Some(fc1),
+            None,
+            Some(fc2),
+            None,
+            Some(fc3),
+        ],
+        vec![output],
+    );
+    node.domain = "pkg.nxrt".into();
+    node.attributes.insert("k".into(), Attribute::Int(2));
+    node.attributes.insert(
+        "activation_type".into(),
+        Attribute::String(b"silu".to_vec()),
+    );
+    node.attributes
+        .insert("normalize_routing_weights".into(), Attribute::Int(1));
+    node.attributes
+        .insert("swiglu_fusion".into(), Attribute::Int(0));
+    for name in ["fc1_format", "fc2_format", "fc3_format"] {
+        node.attributes
+            .insert(name.into(), Attribute::String(b"q8_0".to_vec()));
+    }
+    node.attributes
+        .insert("block_layout_version".into(), Attribute::Int(1));
+    graph.insert_node(node);
+    graph.add_output(output);
+    graph
+}
+
+#[cfg(feature = "gpu-tests")]
+fn sealed_bqmoe_cuda_session_for_provider(
+    cuda: Arc<onnx_runtime_ep_cuda::CudaExecutionProvider>,
+) -> (
+    crate::InferenceSession,
+    Vec<DeviceIoBinding>,
+    Arc<onnx_runtime_ep_cuda::runtime::CudaRuntime>,
+) {
+    let runtime = Arc::clone(cuda.runtime());
+    let mut session = crate::InferenceSession::from_graph_with_provider(
+        sealed_bqmoe_session_graph(),
+        Arc::new(WeightStore::new()),
+        std::path::Path::new("."),
+        cuda,
+    )
+    .unwrap();
+    let mut bindings = vec![
+        session
+            .allocate_device_binding(
+                "x",
+                None::<String>,
+                DataType::Float32,
+                vec![1, 32],
+                vec![1, 32],
+            )
+            .unwrap(),
+        session
+            .allocate_device_binding(
+                "router",
+                None::<String>,
+                DataType::Float32,
+                vec![1, 2],
+                vec![1, 2],
+            )
+            .unwrap(),
+        session
+            .allocate_device_output_binding("output", DataType::Float32, vec![1, 32], vec![1, 32])
+            .unwrap(),
+    ];
+    let input = (0..32)
+        .flat_map(|index| ((index as f32 - 15.5) / 16.0).to_le_bytes())
+        .collect::<Vec<_>>();
+    let router = [3.0f32, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    bindings[0].write_bytes(0, &input).unwrap();
+    bindings[1].write_bytes(0, &router).unwrap();
+    session
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    bindings[2].read_bytes_range(0, 4).unwrap();
+    (session, bindings, runtime)
+}
+
+#[cfg(feature = "gpu-tests")]
+fn sealed_bqmoe_cuda_session_fixture() -> (
+    crate::InferenceSession,
+    Vec<DeviceIoBinding>,
+    Arc<onnx_runtime_ep_cuda::runtime::CudaRuntime>,
+) {
+    sealed_bqmoe_cuda_session_for_provider(Arc::new(
+        onnx_runtime_ep_cuda::CudaExecutionProvider::new_default().unwrap(),
+    ))
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn sealed_bqmoe_executes_through_production_session_path() {
+    use onnx_runtime_ep_cpu::kernels::block_quantized_moe::BLOCK_QUANT_MOE_DENSE_EXPANSIONS;
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    let input_values = (0..32)
+        .map(|index| (index as f32 - 15.5) / 16.0)
+        .collect::<Vec<_>>();
+    let input = Tensor::from_f32(&[1, 32], &input_values).unwrap();
+    let router = Tensor::from_f32(&[1, 2], &[3.0, 1.0]).unwrap();
+
+    let mut cpu = Executor::build(
+        sealed_bqmoe_session_graph(),
+        Arc::new(WeightStore::new()),
+        Arc::new(CpuExecutionProvider::new()),
+    )
+    .unwrap();
+    let expected = cpu.run(&[("x", &input), ("router", &router)]).unwrap()[0].to_vec_f32();
+
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let runtime = Arc::clone(cuda.runtime());
+    let dense_before = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);
+    let mut executor = Executor::build(
+        sealed_bqmoe_session_graph(),
+        Arc::new(WeightStore::new()),
+        cuda,
+    )
+    .unwrap();
+    let first = executor.run(&[("x", &input), ("router", &router)]).unwrap()[0].to_vec_f32();
+    let transfers = runtime.transfer_counts();
+    let allocations = runtime.allocation_counts();
+    let second = executor.run(&[("x", &input), ("router", &router)]).unwrap()[0].to_vec_f32();
+    let after_transfers = runtime.transfer_counts();
+    assert_eq!(
+        after_transfers.host_to_device - transfers.host_to_device,
+        2,
+        "only the two host boundary inputs may upload"
+    );
+    assert_eq!(
+        after_transfers.async_host_to_device, transfers.async_host_to_device,
+        "sealed weights must not enter the paging transfer path"
+    );
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(
+        BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed),
+        dense_before,
+        "CUDA production execution must not enter the CPU dense oracle"
+    );
+    for (index, ((actual, repeat), expected)) in
+        first.iter().zip(&second).zip(&expected).enumerate()
+    {
+        let tolerance = 3e-3f32.max(expected.abs() * 3e-3);
+        assert!(
+            (actual - expected).abs() <= tolerance && actual == repeat,
+            "output {index}: actual={actual} repeat={repeat} expected={expected}"
+        );
+    }
+
+    let mut bindings = vec![
+        executor
+            .allocate_device_binding(
+                "x".into(),
+                None,
+                DataType::Float32,
+                vec![1, 32],
+                vec![1, 32],
+            )
+            .unwrap(),
+        executor
+            .allocate_device_binding(
+                "router".into(),
+                None,
+                DataType::Float32,
+                vec![1, 2],
+                vec![1, 2],
+            )
+            .unwrap(),
+        executor
+            .allocate_device_output_binding(
+                "output".into(),
+                DataType::Float32,
+                vec![1, 32],
+                vec![1, 32],
+            )
+            .unwrap(),
+    ];
+    let input_bytes = input_values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    let router_bytes = [3.0f32, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    bindings[0].write_bytes(0, &input_bytes).unwrap();
+    bindings[1].write_bytes(0, &router_bytes).unwrap();
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    bindings[2].read_bytes_range(0, 4).unwrap();
+    let (_, positive_allocations) = count_host_allocations(|| {
+        let layout = Layout::from_size_align(64, 64).unwrap();
+        unsafe {
+            let ptr = std::alloc::alloc(layout);
+            assert!(!ptr.is_null(), "positive-control allocation");
+            std::alloc::dealloc(ptr, layout);
+        }
+    });
+    assert_eq!(
+        positive_allocations, 1,
+        "host-allocation falsifier must observe the one intentional allocation"
+    );
+    assert_eq!(
+        HOST_ALLOCATION_SIZES.with(Cell::get)[0],
+        64,
+        "host-allocation falsifier must report the intentional 64-byte layout"
+    );
+    eprintln!(
+        "validation-allocation positive-control allocations={positive_allocations} sizes={:?}",
+        HOST_ALLOCATION_SIZES.with(Cell::get)
+    );
+    let lock_before = runtime.graph_lifecycle_lock_acquisition_count();
+    runtime.test_acquire_graph_lifecycle_lock().unwrap();
+    assert!(
+        runtime.graph_lifecycle_lock_acquisition_count() > lock_before,
+        "graph-lock falsifier"
+    );
+    let alloc_before = runtime.allocation_counts();
+    let transfer_before = runtime.transfer_counts();
+    let sync_before = runtime.forced_synchronization_count();
+    let control_ptr = runtime.alloc_raw(4).unwrap();
+    assert!(
+        runtime.allocation_counts().allocations > alloc_before.allocations,
+        "CUDA allocation falsifier"
+    );
+    // SAFETY: `control_ptr` is a live four-byte allocation.
+    unsafe {
+        runtime.htod(&17u32.to_ne_bytes(), control_ptr).unwrap();
+    }
+    assert!(
+        runtime.transfer_counts().host_to_device > transfer_before.host_to_device,
+        "H2D transfer falsifier"
+    );
+    let mut control_value = [0u8; 4];
+    // SAFETY: both source and destination cover four bytes.
+    unsafe {
+        runtime.dtoh(&mut control_value, control_ptr).unwrap();
+    }
+    assert_eq!(u32::from_ne_bytes(control_value), 17);
+    assert!(
+        runtime.forced_synchronization_count() > sync_before,
+        "forced synchronization falsifier"
+    );
+    // SAFETY: `control_ptr` is still owned by this runtime and is freed once.
+    unsafe {
+        runtime.free_raw(control_ptr).unwrap();
+    }
+    runtime.test_drain_raw_pool();
+    assert!(
+        runtime.allocation_counts().frees > alloc_before.frees,
+        "CUDA free falsifier"
+    );
+
+    let preparation_before = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+    let mut preparation_control = Executor::build(
+        sealed_bqmoe_session_graph(),
+        Arc::new(WeightStore::new()),
+        Arc::new(CudaExecutionProvider::new_default().unwrap()),
+    )
+    .unwrap();
+    preparation_control
+        .run(&[("x", &input), ("router", &router)])
+        .unwrap();
+    let preparation_after = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+    assert!(
+        preparation_after.format_parse_calls > preparation_before.format_parse_calls,
+        "format-parse falsifier"
+    );
+    assert!(
+        preparation_after.workspace_layout_builds > preparation_before.workspace_layout_builds,
+        "workspace-layout falsifier"
+    );
+    drop(preparation_control);
+
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let synchronizations = runtime.forced_synchronization_count();
+    let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+    let locks = runtime.graph_lifecycle_lock_acquisition_count();
+    let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
+    let submissions = runtime.validation_submission_count();
+    let (warmed, host_allocations) =
+        count_host_allocations(|| executor.run_with_device_bindings(&[], &mut bindings));
+    warmed.unwrap();
+    assert_eq!(
+        host_allocations,
+        0,
+        "warmed production Executor allocations: {:?}",
+        HOST_ALLOCATION_SIZES.with(Cell::get)
+    );
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+    assert_eq!(
+        onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
+        preparation
+    );
+    assert_eq!(
+        runtime.graph_lifecycle_lock_acquisition_count(),
+        locks,
+        "warmed production Executor graph locks"
+    );
+    assert_eq!(
+        runtime.validation_registry_lock_acquisition_count(),
+        validation_registry_locks,
+        "warmed production Executor validation-registry locks"
+    );
+    assert_eq!(
+        runtime.validation_submission_count() - submissions,
+        1,
+        "warmed production measurement must execute exactly one real validation submission"
+    );
+    eprintln!(
+        "validation-allocation warmed-production allocations={host_allocations} submissions=1"
+    );
+    bindings[2].read_bytes_range(0, 4).unwrap();
+
+    assert!(matches!(
+        executor
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let synchronizations = runtime.forced_synchronization_count();
+    let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+    let locks = runtime.graph_lifecycle_lock_acquisition_count();
+    let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
+    let submissions = runtime.validation_submission_count();
+    let (replayed, host_allocations) =
+        count_host_allocations(|| executor.replay_device_graph(&mut bindings));
+    assert!(replayed.unwrap());
+    assert_eq!(
+        host_allocations,
+        0,
+        "production graph replay allocations: {:?}",
+        HOST_ALLOCATION_SIZES.with(Cell::get)
+    );
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+    assert_eq!(
+        onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
+        preparation
+    );
+    assert_eq!(
+        runtime.graph_lifecycle_lock_acquisition_count(),
+        locks,
+        "first captured launch lifecycle locks"
+    );
+    assert_eq!(
+        runtime.validation_registry_lock_acquisition_count(),
+        validation_registry_locks,
+        "first captured launch validation-registry locks"
+    );
+    assert_eq!(
+        runtime.validation_submission_count() - submissions,
+        1,
+        "first captured launch measurement must execute exactly one real submission"
+    );
+    eprintln!(
+        "validation-allocation first-captured-launch allocations={host_allocations} submissions=1"
+    );
+    bindings[2].read_bytes_range(0, 4).unwrap();
+
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let synchronizations = runtime.forced_synchronization_count();
+    let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+    let locks = runtime.graph_lifecycle_lock_acquisition_count();
+    let validation_registry_locks = runtime.validation_registry_lock_acquisition_count();
+    let submissions = runtime.validation_submission_count();
+    let (replayed, host_allocations) =
+        count_host_allocations(|| executor.replay_device_graph(&mut bindings));
+    assert!(replayed.unwrap());
+    assert_eq!(
+        host_allocations,
+        0,
+        "production graph replay allocations: {:?}",
+        HOST_ALLOCATION_SIZES.with(Cell::get)
+    );
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+    assert_eq!(
+        onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
+        preparation
+    );
+    assert_eq!(
+        runtime.graph_lifecycle_lock_acquisition_count(),
+        locks,
+        "production graph replay lifecycle locks"
+    );
+    assert_eq!(
+        runtime.validation_registry_lock_acquisition_count(),
+        validation_registry_locks,
+        "production graph replay validation-registry locks"
+    );
+    assert_eq!(
+        runtime.validation_submission_count() - submissions,
+        1,
+        "graph replay measurement must execute exactly one real submission"
+    );
+    eprintln!("validation-allocation replay allocations={host_allocations} submissions=1");
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn sealed_bqmoe_supported_observer_accumulates_eager_and_replay() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    const BANK_BYTES: u64 = 6_528;
+    const ROUTE_BYTES: u64 = 6_528;
+
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let mut session = crate::InferenceSession::from_graph_with_provider(
+        sealed_bqmoe_session_graph(),
+        Arc::new(WeightStore::new()),
+        std::path::Path::new("."),
+        cuda,
+    )
+    .unwrap();
+    let mut bindings = vec![
+        session
+            .allocate_device_binding(
+                "x",
+                None::<String>,
+                DataType::Float32,
+                vec![1, 32],
+                vec![1, 32],
+            )
+            .unwrap(),
+        session
+            .allocate_device_binding(
+                "router",
+                None::<String>,
+                DataType::Float32,
+                vec![1, 2],
+                vec![1, 2],
+            )
+            .unwrap(),
+        session
+            .allocate_device_output_binding("output", DataType::Float32, vec![1, 32], vec![1, 32])
+            .unwrap(),
+    ];
+    let input = (0..32)
+        .flat_map(|index| ((index as f32 - 15.5) / 16.0).to_le_bytes())
+        .collect::<Vec<_>>();
+    let router = [3.0f32, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    bindings[0].write_bytes(0, &input).unwrap();
+    bindings[1].write_bytes(0, &router).unwrap();
+    session
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+
+    let mut observer = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 77,
+        })
+        .unwrap();
+    let load = observer.snapshot().unwrap();
+    assert_eq!(load.phase, crate::BlockQuantizedMoeTrafficPhase::Load);
+    assert_eq!(load.request_id, 77);
+    assert_eq!(load.traffic.uploaded_whole_bank_bytes, BANK_BYTES);
+    assert_eq!(load.traffic.committed_whole_bank_bytes, BANK_BYTES);
+    assert_eq!(load.traffic.logical_route_demand_bytes, 0);
+    assert_eq!(load.traffic.unique_selected_expert_bytes, 0);
+    assert_eq!(load.traffic.physical_dram_bytes, None);
+    assert_eq!(load.traffic.page_ins, 0);
+    assert_eq!(load.traffic.byte_hit_rate, None);
+
+    observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    observer
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    let eager = observer.snapshot().unwrap();
+    assert_eq!(eager.phase, crate::BlockQuantizedMoeTrafficPhase::Decode);
+    assert_eq!(eager.traffic.logical_route_demand_bytes, ROUTE_BYTES);
+    assert_eq!(eager.traffic.unique_selected_expert_bytes, ROUTE_BYTES);
+
+    observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    assert!(matches!(
+        observer
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    assert!(observer.replay_device_graph(&mut bindings).unwrap());
+    let replay = observer.snapshot().unwrap();
+    assert_eq!(replay.traffic.logical_route_demand_bytes, ROUTE_BYTES);
+    assert_eq!(replay.traffic.unique_selected_expert_bytes, ROUTE_BYTES);
+    assert!(observer.replay_device_graph(&mut bindings).unwrap());
+    let repeated = observer.snapshot().unwrap();
+    assert_eq!(repeated.traffic.logical_route_demand_bytes, ROUTE_BYTES * 2);
+    assert_eq!(repeated.traffic.unique_selected_expert_bytes, ROUTE_BYTES);
+    drop(observer);
+    assert_eq!(session.captured_graph_segment_count(), 0);
+    let observer = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 78,
+        })
+        .unwrap();
+    observer.finish().unwrap();
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn shared_provider_graphs_are_owner_scoped_repeatable_and_logical_shape_safe() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let (mut first, mut first_bindings, _runtime) =
+        sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+    let (mut second, mut second_bindings, _runtime) =
+        sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+
+    assert!(matches!(
+        first
+            .try_capture_with_device_bindings(&[], &mut first_bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    let first_token = first.exec.cap().device_graph_token.unwrap();
+    assert!(matches!(
+        second
+            .try_capture_with_device_bindings(&[], &mut second_bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    let second_token = second.exec.cap().device_graph_token.unwrap();
+    assert_ne!(first_token.owner(), second_token.owner());
+
+    assert!(first.replay_device_graph(&mut first_bindings).unwrap());
+    first_bindings[2].read_bytes_range(0, 4).unwrap();
+    assert!(second.replay_device_graph(&mut second_bindings).unwrap());
+    second_bindings[2].read_bytes_range(0, 4).unwrap();
+
+    let wrong_owner = onnx_runtime_ep_api::DeviceGraphToken::new(
+        onnx_runtime_ep_api::DeviceGraphOwner::new(),
+        first_token.slot(),
+        first_token.generation(),
+    );
+    let error = cuda.replay_owned_device_graph(wrong_owner).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("retired executor-owned CUDA graph"),
+        "wrong-owner replay must fail closed: {error}"
+    );
+
+    assert!(matches!(
+        first
+            .try_capture_with_device_bindings(&[], &mut first_bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    let recaptured = first.exec.cap().device_graph_token.unwrap();
+    assert_eq!(recaptured.owner(), first_token.owner());
+    assert!(
+        recaptured.generation() > first_token.generation(),
+        "repeated capture must mint a new installation generation"
+    );
+    assert!(second.replay_device_graph(&mut second_bindings).unwrap());
+    second_bindings[2].read_bytes_range(0, 4).unwrap();
+
+    first_bindings[2].set_logical_shape(vec![1, 16]).unwrap();
+    let error = first.replay_device_graph(&mut first_bindings).unwrap_err();
+    assert!(
+        error.to_string().contains("logical/physical shape"),
+        "same-allocation logical shape change must invalidate replay: {error}"
+    );
+    assert_eq!(first.exec.cap().device_graph_token, None);
+
+    first_bindings[2].set_logical_shape(vec![1, 32]).unwrap();
+    assert!(matches!(
+        first
+            .try_capture_with_device_bindings(&[], &mut first_bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    assert!(first.replay_device_graph(&mut first_bindings).unwrap());
+    first_bindings[2].read_bytes_range(0, 4).unwrap();
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn supported_observer_rejects_every_corrupt_device_record_field() {
+    use onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoeTrafficFaultForTest::{
+        ForeignRequest, NonTopKMultipleCount, Overflow, Poison, StaleEpoch, WrongDevice,
+    };
+    const ROUTE_BYTES: u64 = 6_528;
+
+    let (mut session, mut bindings, _runtime) = sealed_bqmoe_cuda_session_fixture();
+    let mut observer = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 91,
+        })
+        .unwrap();
+
+    for (fault, expected) in [
+        (Poison, "poison"),
+        (Overflow, "overflow"),
+        (StaleEpoch, "epoch mismatch"),
+        (ForeignRequest, "request mismatch"),
+        (WrongDevice, "device mismatch"),
+        (NonTopKMultipleCount, "impossible"),
+    ] {
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+            .unwrap();
+        observer
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        let clean = observer.snapshot().unwrap();
+        assert_eq!(
+            clean.traffic.logical_route_demand_bytes, ROUTE_BYTES,
+            "{fault:?}: positive control must publish the validated top-k route extent"
+        );
+        observer.inject_fault_for_test(fault).unwrap();
+        let error = observer.snapshot().unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "{fault:?} must fail through the public typed observer: {error}"
+        );
+    }
+
+    observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    observer.finish().unwrap();
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn shared_cuda_provider_foreign_teardown_preserves_owned_validation_error() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    #[derive(Clone, Copy, Debug)]
+    enum ForeignAction {
+        BindingDrop,
+        ExecutorDrop,
+        GraphReset,
+    }
+
+    for action in [
+        ForeignAction::BindingDrop,
+        ForeignAction::ExecutorDrop,
+        ForeignAction::GraphReset,
+    ] {
+        let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+        let (mut owner, mut owner_bindings, runtime) =
+            sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+        let (foreign, mut foreign_bindings, _) =
+            sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+
+        owner
+            .run_with_device_bindings(&[], &mut owner_bindings)
+            .expect("the owner must submit one deferred device-bound run");
+        let flags = 0x40u32.to_ne_bytes();
+        // SAFETY: GPU-test-only fault injection into the runtime's live
+        // validation word, ordered after the owner's submitted work.
+        unsafe {
+            runtime.htod(&flags, runtime.capture_error_ptr()).unwrap();
+        }
+
+        let sync_before = runtime.forced_synchronization_count();
+        let mut foreign = Some(foreign);
+        match action {
+            ForeignAction::BindingDrop => drop(foreign_bindings.remove(2)),
+            ForeignAction::ExecutorDrop => drop(foreign.take()),
+            ForeignAction::GraphReset => {
+                assert!(!foreign.as_mut().unwrap().reset_device_graph().unwrap());
+            }
+        }
+        assert!(
+            runtime.forced_synchronization_count() > sync_before,
+            "{action:?}: positive control must prove the foreign teardown/reset synchronized"
+        );
+
+        for observation in 1..=2 {
+            let error = owner_bindings[2].read_bytes_range(0, 4).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("device validation failed (flags=0x40)"),
+                "{action:?} observation {observation}: the owner's sticky failure must survive: \
+                 {error}"
+            );
+        }
+        drop(owner_bindings);
+        drop(owner);
+        drop(foreign_bindings);
+        drop(foreign);
+        assert_eq!(
+            runtime.registered_validation_owner_count(),
+            0,
+            "{action:?}: executor/binding teardown must retire every owner-scoped slot"
+        );
+    }
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn isolated_raw_reset_cannot_clear_an_active_owner_generation() {
+    let (mut owner, mut bindings, runtime) = sealed_bqmoe_cuda_session_fixture();
+    owner
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("owner submits one deferred run");
+    let flags = 0x40u32.to_ne_bytes();
+    unsafe {
+        runtime.htod(&flags, runtime.capture_error_ptr()).unwrap();
+    }
+    let reset_error = unsafe { runtime.reset_capture_error_for_isolated_test() }
+        .expect_err("even the test-only raw reset must reject an active generation");
+    assert!(
+        reset_error.to_string().contains("phase Active"),
+        "reset refusal must identify the active authority: {reset_error}"
+    );
+    let error = bindings[2].read_bytes_range(0, 4).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("device validation failed (flags=0x40)"),
+        "refused raw reset must preserve the owner's pending failure: {error}"
+    );
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn concurrent_consume_and_executor_drop_share_exactly_one_cleanup() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    const ITERATIONS: u64 = 16;
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let runtime = Arc::clone(cuda.runtime());
+    for iteration in 0..ITERATIONS {
+        let (mut owner, mut bindings, _) =
+            sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+        let cleanup_before = runtime.validation_cleanup_count();
+        owner
+            .run_with_device_bindings(&[], &mut bindings)
+            .expect("owner submits one deferred run");
+        unsafe {
+            runtime
+                .htod(&0x40u32.to_ne_bytes(), runtime.capture_error_ptr())
+                .unwrap();
+        }
+
+        runtime.pause_validation_consumer_for_test(true);
+        let mut output = bindings.remove(2);
+        let consumer = std::thread::spawn(move || {
+            let first = output.read_bytes_range(0, 4).unwrap_err().to_string();
+            let second = output.read_bytes_range(0, 4).unwrap_err().to_string();
+            drop(output);
+            (first, second)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !runtime.validation_consumer_claimed_for_test() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "iteration {iteration}: binding consumer did not claim validation cleanup \
+                 authority"
+            );
+            std::thread::yield_now();
+        }
+
+        let dropper = std::thread::spawn(move || drop(owner));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            !dropper.is_finished(),
+            "iteration {iteration}: executor Drop must wait for the legitimate consuming \
+             recipient"
+        );
+        runtime.pause_validation_consumer_for_test(false);
+        dropper.join().expect("executor Drop must not panic");
+        let (first, second) = consumer.join().expect("binding consumer must not panic");
+        for (observation, error) in [(1, first), (2, second)] {
+            assert!(
+                error.contains("device validation failed (flags=0x40)"),
+                "iteration {iteration} sticky observation {observation} lost the exact result: \
+                 {error}"
+            );
+        }
+        drop(bindings);
+        assert_eq!(
+            runtime.validation_cleanup_count() - cleanup_before,
+            1,
+            "iteration {iteration}: the Active -> Consuming CAS must assign exactly one cleanup"
+        );
+        assert_eq!(
+            runtime.registered_validation_owner_count(),
+            0,
+            "iteration {iteration}: concurrent consume-vs-Drop leaked owner slots"
+        );
+    }
+    assert_eq!(
+        runtime.registered_validation_owner_count(),
+        0,
+        "concurrent consume-vs-Drop must retire every owner slot"
+    );
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn isolated_reset_and_begin_linearize_through_one_atomic_authority() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let runtime = Arc::clone(cuda.runtime());
+    let mut registration = cuda.register_device_validation_owner().unwrap();
+    const ITERATIONS: u64 = 16;
+    let cleanup_before = runtime.validation_cleanup_count();
+    for iteration in 0..ITERATIONS {
+        runtime.pause_validation_reset_for_test(true);
+        let reset_runtime = Arc::clone(&runtime);
+        let resetter = std::thread::spawn(move || unsafe {
+            reset_runtime.reset_capture_error_for_isolated_test()
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !runtime.validation_reset_claimed_for_test() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "iteration {iteration}: isolated reset did not claim the coordinator"
+            );
+            std::thread::yield_now();
+        }
+        let begin_error = cuda
+            .begin_device_validation(&registration)
+            .expect_err("begin must fail closed while reset owns the atomic authority");
+        assert!(
+            begin_error.to_string().contains("Resetting"),
+            "iteration {iteration}: begin refusal must identify the conflicting phase: \
+             {begin_error}"
+        );
+        runtime.pause_validation_reset_for_test(false);
+        resetter
+            .join()
+            .expect("isolated reset thread must not panic")
+            .expect("the reset that linearized first must complete");
+
+        let token = cuda.begin_device_validation(&registration).unwrap();
+        cuda.activate_device_validation(token).unwrap();
+        unsafe {
+            runtime
+                .htod(&0x40u32.to_ne_bytes(), runtime.capture_error_ptr())
+                .unwrap();
+        }
+        let reset_error = unsafe { runtime.reset_capture_error_for_isolated_test() }
+            .expect_err("reset must fail closed after begin/activation linearizes");
+        assert!(
+            reset_error.to_string().contains("Active"),
+            "iteration {iteration}: reset refusal must identify the active generation: \
+             {reset_error}"
+        );
+        cuda.sync().unwrap();
+        assert_eq!(
+            cuda.consume_device_validation_error(&registration, token)
+                .unwrap(),
+            0x40,
+            "iteration {iteration}: failed reset must never clear active work"
+        );
+        assert_eq!(
+            runtime.check_capture_error().unwrap(),
+            0,
+            "iteration {iteration}: consuming cleanup must leave the latch clear"
+        );
+    }
+    assert_eq!(
+        runtime.validation_cleanup_count() - cleanup_before,
+        ITERATIONS,
+        "each activated generation must have exactly one cleanup"
+    );
+    cuda.unregister_device_validation_owner(&mut registration)
+        .unwrap();
+    assert_eq!(runtime.registered_validation_owner_count(), 0);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn cuda_owner_slot_preserves_old_receipt_across_96_later_submissions() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    const LATER_SUBMISSIONS: u64 = 96;
+    let cuda = CudaExecutionProvider::new_default().unwrap();
+    let runtime = cuda.runtime();
+    let mut old_owner = cuda.register_device_validation_owner().unwrap();
+    let mut old_sibling = cuda.register_device_validation_owner().unwrap();
+
+    let old_submitter_token = cuda.begin_device_validation(&old_owner).unwrap();
+    let old_sibling_token = cuda
+        .add_device_validation_recipient(old_submitter_token, &old_sibling)
+        .unwrap();
+    cuda.activate_device_validation(old_submitter_token)
+        .unwrap();
+    let flags = 0x40u32.to_ne_bytes();
+    unsafe {
+        runtime.htod(&flags, runtime.capture_error_ptr()).unwrap();
+    }
+    cuda.sync().unwrap();
+    assert_eq!(
+        cuda.consume_device_validation_error(&old_sibling, old_sibling_token)
+            .unwrap(),
+        0x40
+    );
+
+    for _ in 0..LATER_SUBMISSIONS {
+        let mut owner = cuda.register_device_validation_owner().unwrap();
+        let token = cuda.begin_device_validation(&owner).unwrap();
+        cuda.activate_device_validation(token).unwrap();
+        cuda.sync().unwrap();
+        assert_eq!(
+            cuda.consume_device_validation_error(&owner, token).unwrap(),
+            0
+        );
+        cuda.unregister_device_validation_owner(&mut owner).unwrap();
+    }
+
+    assert_eq!(
+        cuda.consume_device_validation_error(&old_owner, old_submitter_token)
+            .unwrap(),
+        0x40,
+        "the old exact receipt must not be overwritten by later owners"
+    );
+    let replacement = cuda.begin_device_validation(&old_owner).unwrap();
+    cuda.activate_device_validation(replacement).unwrap();
+    let stale = cuda
+        .consume_device_validation_error(&old_owner, old_submitter_token)
+        .expect_err("an overwritten owner generation must fail closed");
+    assert!(stale.to_string().contains("stale"));
+    cuda.sync().unwrap();
+    assert_eq!(
+        cuda.consume_device_validation_error(&old_owner, replacement)
+            .unwrap(),
+        0,
+        "stale-token rejection must not consume or poison the replacement generation"
+    );
+    assert_eq!(
+        cuda.consume_device_validation_error(&old_sibling, old_sibling_token)
+            .unwrap(),
+        0x40,
+        "reusing one owner slot must not overwrite its sibling's independent completed slot"
+    );
+    cuda.unregister_device_validation_owner(&mut old_sibling)
+        .unwrap();
+    cuda.unregister_device_validation_owner(&mut old_owner)
+        .unwrap();
+    assert_eq!(runtime.registered_validation_owner_count(), 0);
+    assert_eq!(runtime.validation_submission_count(), LATER_SUBMISSIONS + 2);
+    eprintln!(
+        "cuda-validation-lifetime old_receipt_flags=0x40 later_submissions={LATER_SUBMISSIONS} \
+         leaked_owner_slots=0"
+    );
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn observer_reset_finish_drop_and_panic_consume_pending_validation() {
+    fn poison_validation(runtime: &onnx_runtime_ep_cuda::runtime::CudaRuntime) {
+        let flags = 0x40u32.to_ne_bytes();
+        // SAFETY: the runtime owns a live four-byte validation word for its
+        // lifetime; this GPU-test-only injection emulates an asynchronous
+        // kernel reporting a bounds violation after submission.
+        unsafe {
+            runtime.htod(&flags, runtime.capture_error_ptr()).unwrap();
+        }
+    }
+
+    let (mut session, mut bindings, runtime) = sealed_bqmoe_cuda_session_fixture();
+
+    let mut reset_observer = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 101,
+        })
+        .unwrap();
+    reset_observer
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    poison_validation(&runtime);
+    let reset_error = reset_observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap_err();
+    assert!(reset_error.to_string().contains("flags=0x40"));
+    reset_observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    reset_observer.finish().unwrap();
+
+    let mut finish_observer = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 102,
+        })
+        .unwrap();
+    finish_observer
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    poison_validation(&runtime);
+    let finish_error = finish_observer.finish().unwrap_err();
+    assert!(finish_error.to_string().contains("flags=0x40"));
+
+    {
+        let mut drop_observer = session
+            .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+                request_id: 103,
+            })
+            .unwrap();
+        drop_observer
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        poison_validation(&runtime);
+    }
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut panic_observer = session
+            .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+                request_id: 104,
+            })
+            .unwrap();
+        panic_observer
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        poison_validation(&runtime);
+        panic!("forced observer unwind");
+    }));
+    assert!(panic.is_err());
+
+    let mut healthy = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 105,
+        })
+        .expect("drop and unwind cleanup must leave the session reusable");
+    healthy
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    healthy
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    healthy.snapshot().unwrap();
+    healthy.finish().unwrap();
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+#[ignore = "opt-in official GLM-5.2 checkpoint proof; set ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT"]
+fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
+    use onnx_runtime_ep_cpu::kernels::block_quantized_moe::{
+        BLOCK_QUANT_MOE_DENSE_EXPANSIONS, decode_expert_projection_f64,
+    };
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    const H: usize = 6144;
+    const I: usize = 2048;
+    const EXPERTS: usize = 256;
+    const K: usize = 8;
+
+    struct Case {
+        label: &'static str,
+        shard: &'static str,
+        gate_format: &'static str,
+        down_format: &'static str,
+        gate_offset: usize,
+        up_offset: usize,
+        down_offset: usize,
+        expected_per_expert: u64,
+    }
+
+    fn format_info(format: &str) -> (usize, usize) {
+        match format {
+            "iq1_s" => (256, 50),
+            "iq2_xxs" => (256, 66),
+            "iq3_xxs" => (256, 98),
+            "iq4_xs" => (256, 136),
+            "q2_k" => (256, 84),
+            "q3_k" => (256, 110),
+            _ => panic!("unexpected real-checkpoint format {format}"),
+        }
+    }
+
+    fn projection_len(format: &str, out_features: usize, in_features: usize) -> usize {
+        let (qk, block_bytes) = format_info(format);
+        EXPERTS * out_features * (in_features / qk) * block_bytes
+    }
+
+    fn real_graph(path: &std::path::Path, case: &Case) -> (Graph, [ValueId; 3]) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        let rows = graph.intern_symbol("rows");
+        let x = graph.create_named_value(
+            "x",
+            DataType::Float32,
+            vec![Dim::Symbolic(rows), Dim::Static(H)],
+        );
+        graph.add_input(x);
+        let router = graph.create_named_value(
+            "router",
+            DataType::Float32,
+            vec![Dim::Symbolic(rows), Dim::Static(EXPERTS)],
+        );
+        graph.add_input(router);
+        let add_external = |graph: &mut Graph,
+                            name: &str,
+                            format: &str,
+                            offset: usize,
+                            out_features: usize,
+                            in_features: usize| {
+            let (qk, block_bytes) = format_info(format);
+            let dims = vec![EXPERTS, out_features, in_features / qk, block_bytes];
+            let value =
+                graph.create_named_value(name, DataType::Uint8, static_shape(dims.iter().copied()));
+            graph.set_initializer(
+                value,
+                WeightRef::External {
+                    path: path.to_path_buf(),
+                    offset,
+                    length: projection_len(format, out_features, in_features),
+                    dtype: DataType::Uint8,
+                    dims,
+                },
+            );
+            value
+        };
+        let gate = add_external(&mut graph, "gate", case.gate_format, case.gate_offset, I, H);
+        let down = add_external(&mut graph, "down", case.down_format, case.down_offset, H, I);
+        let up = add_external(&mut graph, "up", case.gate_format, case.up_offset, I, H);
+        let output = graph.create_named_value(
+            "output",
+            DataType::Float32,
+            vec![Dim::Symbolic(rows), Dim::Static(H)],
+        );
+        let mut node = Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            vec![
+                Some(x),
+                Some(router),
+                Some(gate),
+                None,
+                Some(down),
+                None,
+                Some(up),
+            ],
+            vec![output],
+        );
+        node.domain = "pkg.nxrt".into();
+        node.attributes.insert("k".into(), Attribute::Int(K as i64));
+        node.attributes.insert(
+            "activation_type".into(),
+            Attribute::String(b"silu".to_vec()),
+        );
+        node.attributes
+            .insert("normalize_routing_weights".into(), Attribute::Int(1));
+        node.attributes
+            .insert("swiglu_fusion".into(), Attribute::Int(0));
+        node.attributes.insert(
+            "fc1_format".into(),
+            Attribute::String(case.gate_format.as_bytes().to_vec()),
+        );
+        node.attributes.insert(
+            "fc2_format".into(),
+            Attribute::String(case.down_format.as_bytes().to_vec()),
+        );
+        node.attributes.insert(
+            "fc3_format".into(),
+            Attribute::String(case.gate_format.as_bytes().to_vec()),
+        );
+        node.attributes
+            .insert("block_layout_version".into(), Attribute::Int(1));
+        graph.insert_node(node);
+        graph.add_output(output);
+        (graph, [gate, down, up])
+    }
+
+    fn router_for(ids: &[usize; K]) -> Vec<f32> {
+        let mut logits = vec![-50.0f32; EXPERTS];
+        for (rank, &expert) in ids.iter().enumerate() {
+            logits[expert] = (K - rank) as f32;
+        }
+        logits
+    }
+
+    fn router_rows<const ROWS: usize>(routes: [&[usize; K]; ROWS]) -> Vec<f32> {
+        routes.into_iter().flat_map(router_for).collect()
+    }
+
+    fn f64_oracle(
+        case: &Case,
+        store: &WeightStore,
+        graph: &Graph,
+        weights: [ValueId; 3],
+        input: &[f32],
+        ids: &[usize; K],
+    ) -> Vec<f64> {
+        let banks = weights.map(|value| {
+            store
+                .bytes(graph.initializers.get(&value).unwrap())
+                .unwrap()
+        });
+        let gate_stride = projection_len(case.gate_format, I, H) / EXPERTS;
+        let down_stride = projection_len(case.down_format, H, I) / EXPERTS;
+        let logits = router_for(ids);
+        let maximum = ids
+            .iter()
+            .map(|&expert| f64::from(logits[expert]))
+            .fold(f64::NEG_INFINITY, f64::max);
+        let denominator: f64 = ids
+            .iter()
+            .map(|&expert| (f64::from(logits[expert]) - maximum).exp())
+            .sum();
+        let input = input.iter().copied().map(f64::from).collect::<Vec<_>>();
+        let mut output = vec![0.0f64; H];
+        for &expert in ids {
+            let gate = decode_expert_projection_f64(
+                case.gate_format,
+                &banks[0][expert * gate_stride..(expert + 1) * gate_stride],
+                I,
+                H,
+            )
+            .unwrap();
+            let up = decode_expert_projection_f64(
+                case.gate_format,
+                &banks[2][expert * gate_stride..(expert + 1) * gate_stride],
+                I,
+                H,
+            )
+            .unwrap();
+            let mut activated = vec![0.0f64; I];
+            for (feature, activated_value) in activated.iter_mut().enumerate() {
+                let row = feature * H;
+                let gate_value = gate[row..row + H]
+                    .iter()
+                    .zip(&input)
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f64>();
+                let up_value = up[row..row + H]
+                    .iter()
+                    .zip(&input)
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f64>();
+                *activated_value = gate_value / (1.0 + (-gate_value).exp()) * up_value;
+            }
+            drop(gate);
+            drop(up);
+            let down = decode_expert_projection_f64(
+                case.down_format,
+                &banks[1][expert * down_stride..(expert + 1) * down_stride],
+                H,
+                I,
+            )
+            .unwrap();
+            let route_weight = (f64::from(logits[expert]) - maximum).exp() / denominator;
+            for (feature, output_value) in output.iter_mut().enumerate() {
+                let row = feature * I;
+                let value = down[row..row + I]
+                    .iter()
+                    .zip(&activated)
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f64>();
+                *output_value += route_weight * value;
+            }
+        }
+        output
+    }
+
+    let root = std::path::PathBuf::from(
+        std::env::var("ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT")
+            .expect("set ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT"),
+    );
+    let cases = [
+        Case {
+            label: "layer56-iq1s-iq3xxs",
+            shard: "GLM-5.2-UD-IQ1_S-00005-of-00006.gguf",
+            gate_format: "iq1_s",
+            down_format: "iq3_xxs",
+            gate_offset: 2_668_820_832,
+            up_offset: 3_312_933_216,
+            down_offset: 1_425_373_536,
+            expected_per_expert: 9_732_096,
+        },
+        Case {
+            label: "layer74-iq2xxs-iq3xxs",
+            shard: "GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+            gate_format: "iq2_xxs",
+            down_format: "iq3_xxs",
+            gate_offset: 3_071_455_584,
+            up_offset: 3_916_894_560,
+            down_offset: 1_828_008_288,
+            expected_per_expert: 11_304_960,
+        },
+        Case {
+            label: "layer8-iq2xxs-iq4xs",
+            shard: "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            gate_format: "iq2_xxs",
+            down_format: "iq4_xs",
+            gate_offset: 17_617_400_576,
+            up_offset: 18_464_510_720,
+            down_offset: 15_892_755_200,
+            expected_per_expert: 13_172_736,
+        },
+        Case {
+            label: "layer78-q2k-q3k",
+            shard: "GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+            gate_format: "q2_k",
+            down_format: "q3_k",
+            gate_offset: 16_942_690_656,
+            up_offset: 18_014_622_048,
+            down_offset: 15_548_248_416,
+            expected_per_expert: 13_664_256,
+        },
+    ];
+    let input_values = (0..H)
+        .map(|index| ((index * 13 % 31) as f32 - 15.0) / 32.0)
+        .collect::<Vec<_>>();
+    let low = [0, 1, 2, 3, 4, 5, 6, 7];
+    let high = [248, 249, 250, 251, 252, 253, 254, 255];
+    let case_filter = std::env::var("ONNX_GENAI_GLM52_CASE").ok();
+
+    for case in cases {
+        if case_filter
+            .as_deref()
+            .is_some_and(|filter| filter != case.label)
+        {
+            continue;
+        }
+        let path = root.join(case.shard);
+        let (graph, weights) = real_graph(&path, &case);
+        let mut store = WeightStore::new();
+        store.map_external(&path).unwrap();
+        let oracle_graph = graph.clone();
+        let store = Arc::new(store);
+        let oracle_store = Arc::clone(&store);
+        let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+        let runtime = Arc::clone(cuda.runtime());
+        let dense_before = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);
+        let mut session =
+            crate::InferenceSession::from_graph_with_provider(graph, store, &root, cuda.clone())
+                .unwrap();
+        let assert_traffic = |phase: &str,
+                              traffic: onnx_runtime_ep_api::BlockQuantizedMoeTraffic,
+                              routes: u64,
+                              unique_experts: u64| {
+            assert_eq!(
+                traffic.uploaded_whole_bank_bytes,
+                case.expected_per_expert * EXPERTS as u64,
+                "{} {phase} uploaded whole-bank extent",
+                case.label
+            );
+            assert_eq!(
+                traffic.committed_whole_bank_bytes,
+                case.expected_per_expert * EXPERTS as u64,
+                "{} {phase} committed whole-bank extent",
+                case.label
+            );
+            assert_eq!(
+                traffic.logical_route_demand_bytes,
+                case.expected_per_expert * routes,
+                "{} {phase} logical route demand",
+                case.label
+            );
+            assert_eq!(
+                traffic.unique_selected_expert_bytes,
+                case.expected_per_expert * unique_experts,
+                "{} {phase} unique selected-expert extent",
+                case.label
+            );
+            assert_eq!(traffic.physical_dram_bytes, None);
+            assert_eq!(traffic.page_ins, 0);
+            assert_eq!(traffic.byte_hit_rate, None);
+        };
+
+        let mut prefill_bindings = vec![
+            session
+                .allocate_device_binding(
+                    "x",
+                    None::<String>,
+                    DataType::Float32,
+                    vec![2, H],
+                    vec![2, H],
+                )
+                .unwrap(),
+            session
+                .allocate_device_binding(
+                    "router",
+                    None::<String>,
+                    DataType::Float32,
+                    vec![2, EXPERTS],
+                    vec![2, EXPERTS],
+                )
+                .unwrap(),
+            session
+                .allocate_device_output_binding("output", DataType::Float32, vec![2, H], vec![2, H])
+                .unwrap(),
+        ];
+        let prefill_input_bytes = (0..2)
+            .flat_map(|_| input_values.iter())
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let repeated_router_bytes = router_rows([&low, &low])
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        prefill_bindings[0]
+            .write_bytes(0, &prefill_input_bytes)
+            .unwrap();
+        prefill_bindings[1]
+            .write_bytes(0, &repeated_router_bytes)
+            .unwrap();
+        let mut bindings = vec![
+            session
+                .allocate_device_binding(
+                    "x",
+                    None::<String>,
+                    DataType::Float32,
+                    vec![1, H],
+                    vec![1, H],
+                )
+                .unwrap(),
+            session
+                .allocate_device_binding(
+                    "router",
+                    None::<String>,
+                    DataType::Float32,
+                    vec![1, EXPERTS],
+                    vec![1, EXPERTS],
+                )
+                .unwrap(),
+            session
+                .allocate_device_output_binding("output", DataType::Float32, vec![1, H], vec![1, H])
+                .unwrap(),
+        ];
+        let input_bytes = input_values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let low_bytes = router_for(&low)
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        bindings[0].write_bytes(0, &input_bytes).unwrap();
+        bindings[1].write_bytes(0, &low_bytes).unwrap();
+
+        let before_admission_transfers = runtime.transfer_counts();
+        session
+            .run_with_device_bindings(&[], &mut prefill_bindings)
+            .unwrap();
+        prefill_bindings[2].read_bytes_range(0, 4).unwrap();
+        session
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        let after_admission_transfers = runtime.transfer_counts();
+        assert_eq!(
+            after_admission_transfers.host_to_device - before_admission_transfers.host_to_device,
+            3,
+            "{} must upload only the three sealed projection banks",
+            case.label
+        );
+        assert_eq!(
+            after_admission_transfers.async_host_to_device,
+            before_admission_transfers.async_host_to_device,
+            "{} sealed banks must not enter the paging transfer path",
+            case.label
+        );
+
+        let mut observer = session
+            .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+                request_id: 1,
+            })
+            .unwrap();
+        let load_snapshot = observer.snapshot().unwrap();
+        assert_eq!(load_snapshot.request_id, 1);
+        let load_traffic = load_snapshot.traffic;
+        assert_traffic("load", load_traffic, 0, 0);
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Warmup)
+            .unwrap();
+        observer
+            .warmup(&[
+                crate::WarmupShape {
+                    input_name: "x".into(),
+                    shape: vec![2, H],
+                },
+                crate::WarmupShape {
+                    input_name: "router".into(),
+                    shape: vec![2, EXPERTS],
+                },
+            ])
+            .unwrap();
+        let warmup = observer.snapshot().unwrap();
+        assert_eq!(warmup.phase, crate::BlockQuantizedMoeTrafficPhase::Warmup);
+        let warmup_traffic = warmup.traffic;
+        assert_traffic("warmup", warmup_traffic, 0, 0);
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Prefill)
+            .unwrap();
+        observer
+            .run_with_device_bindings(&[], &mut prefill_bindings)
+            .unwrap();
+        let output_values = |binding: &mut DeviceIoBinding| {
+            binding
+                .read_bytes()
+                .unwrap()
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let repeated_prefill = output_values(&mut prefill_bindings[2]);
+        assert_eq!(
+            &repeated_prefill[..H],
+            &repeated_prefill[H..],
+            "{} repeated-route prefill rows must be deterministic",
+            case.label
+        );
+        let repeated_snapshot = observer.snapshot().unwrap();
+        assert_eq!(
+            repeated_snapshot.phase,
+            crate::BlockQuantizedMoeTrafficPhase::Prefill
+        );
+        let prefill_repeated_traffic = repeated_snapshot.traffic;
+        assert_traffic("prefill repeated", prefill_repeated_traffic, 16, 8);
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Prefill)
+            .unwrap();
+        let broad_router_bytes = router_rows([&low, &high])
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        prefill_bindings[1]
+            .write_bytes(0, &broad_router_bytes)
+            .unwrap();
+        observer
+            .run_with_device_bindings(&[], &mut prefill_bindings)
+            .unwrap();
+        let broad_prefill = output_values(&mut prefill_bindings[2]);
+        assert_eq!(
+            &repeated_prefill[..H],
+            &broad_prefill[..H],
+            "{} low-ID row must not depend on the other row's routes",
+            case.label
+        );
+        let prefill_broad_traffic = observer.snapshot().unwrap().traffic;
+        assert_traffic("prefill broad", prefill_broad_traffic, 16, 16);
+        assert_eq!(
+            prefill_repeated_traffic.logical_route_demand_bytes,
+            prefill_broad_traffic.logical_route_demand_bytes,
+            "{} repeated and broad routes have equal logical demand",
+            case.label
+        );
+        assert!(
+            prefill_repeated_traffic.unique_selected_expert_bytes
+                < prefill_broad_traffic.unique_selected_expert_bytes,
+            "{} repeated routes must have a smaller unique extent",
+            case.label
+        );
+        drop(prefill_bindings);
+
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+            .unwrap();
+        let decode_load_traffic = observer.snapshot().unwrap().traffic;
+        assert_traffic("decode load", decode_load_traffic, 0, 0);
+        assert_eq!(
+            decode_load_traffic.uploaded_whole_bank_bytes, load_traffic.uploaded_whole_bank_bytes,
+            "{} decode shape must adopt the prefill shape's sealed banks",
+            case.label
+        );
+        observer
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        let eager_low = output_values(&mut bindings[2]);
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+            .unwrap();
+        let capture = observer
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        if !matches!(capture, DeviceGraphCaptureResult::Captured(_)) {
+            panic!("{} production session capture was declined", case.label);
+        }
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+            .unwrap();
+        assert!(observer.replay_device_graph(&mut bindings).unwrap());
+        let actual_low = output_values(&mut bindings[2]);
+        let decode_single_traffic = observer.snapshot().unwrap().traffic;
+        assert_traffic("decode single", decode_single_traffic, 8, 8);
+        assert_eq!(
+            eager_low, actual_low,
+            "{} eager/captured parity",
+            case.label
+        );
+        assert!(observer.replay_device_graph(&mut bindings).unwrap());
+        let repeat_low = output_values(&mut bindings[2]);
+        let decode_repeated_traffic = observer.snapshot().unwrap().traffic;
+        assert_traffic("decode repeated", decode_repeated_traffic, 16, 8);
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+            .unwrap();
+        assert!(observer.replay_device_graph(&mut bindings).unwrap());
+        let _ = output_values(&mut bindings[2]);
+        let high_bytes = router_for(&high)
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        bindings[1].write_bytes(0, &high_bytes).unwrap();
+        assert!(observer.replay_device_graph(&mut bindings).unwrap());
+        let actual_high = output_values(&mut bindings[2]);
+        let decode_broad_traffic = observer.snapshot().unwrap().traffic;
+        assert_traffic("decode broad", decode_broad_traffic, 16, 16);
+        assert_eq!(
+            decode_repeated_traffic.logical_route_demand_bytes,
+            decode_broad_traffic.logical_route_demand_bytes
+        );
+        assert!(
+            decode_repeated_traffic.unique_selected_expert_bytes
+                < decode_broad_traffic.unique_selected_expert_bytes
+        );
+        assert_eq!(actual_low, repeat_low, "{} repeatability", case.label);
+        assert!(
+            observer.session.captured_graph_segment_count() > 0,
+            "{} must capture the production path",
+            case.label
+        );
+        assert_eq!(
+            BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed),
+            dense_before,
+            "{} must not enter the CPU expert fallback",
+            case.label
+        );
+        let expected_low = f64_oracle(
+            &case,
+            &oracle_store,
+            &oracle_graph,
+            weights,
+            &input_values,
+            &low,
+        );
+        let expected_high = f64_oracle(
+            &case,
+            &oracle_store,
+            &oracle_graph,
+            weights,
+            &input_values,
+            &high,
+        );
+        for (label, actual, expected) in [
+            ("low", &actual_low, &expected_low),
+            ("high", &actual_high, &expected_high),
+        ] {
+            for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                let tolerance = 2e-2f64.max(expected.abs() * 8e-3);
+                assert!(
+                    (f64::from(actual) - expected).abs() <= tolerance,
+                    "{} {label} output {index}: actual={actual} expected={expected} tolerance={tolerance}",
+                    case.label
+                );
+            }
+        }
+        let gate_bytes = projection_len(case.gate_format, I, H) / EXPERTS;
+        let down_bytes = projection_len(case.down_format, H, I) / EXPERTS;
+        assert_eq!(
+            gate_bytes as u64 * 2 + down_bytes as u64,
+            case.expected_per_expert
+        );
+        assert_eq!(
+            case.expected_per_expert * K as u64,
+            case.expected_per_expert * 8
+        );
+        assert_eq!(
+            case.expected_per_expert * EXPERTS as u64,
+            case.expected_per_expert * 256
+        );
+        eprintln!(
+            "{} native_cuda=true H={H} I={I} top_k={K} captures>0 replays>0 fallbacks=0 \
+             load.uploaded_whole_bank_bytes={} warmup.logical_route_demand_bytes={} \
+             prefill_repeated.logical_route_demand_bytes={} \
+             prefill_repeated.unique_selected_expert_bytes={} \
+             prefill_broad.logical_route_demand_bytes={} \
+             prefill_broad.unique_selected_expert_bytes={} \
+             decode.logical_route_demand_bytes={} decode.unique_selected_expert_bytes={} \
+             decode_repeated.logical_route_demand_bytes={} \
+             decode_repeated.unique_selected_expert_bytes={} \
+             decode_broad.logical_route_demand_bytes={} \
+             decode_broad.unique_selected_expert_bytes={} \
+             physical_dram_bytes=None page_ins=0 byte_hit_rate=None",
+            case.label,
+            load_traffic.uploaded_whole_bank_bytes,
+            warmup_traffic.logical_route_demand_bytes,
+            prefill_repeated_traffic.logical_route_demand_bytes,
+            prefill_repeated_traffic.unique_selected_expert_bytes,
+            prefill_broad_traffic.logical_route_demand_bytes,
+            prefill_broad_traffic.unique_selected_expert_bytes,
+            decode_single_traffic.logical_route_demand_bytes,
+            decode_single_traffic.unique_selected_expert_bytes,
+            decode_repeated_traffic.logical_route_demand_bytes,
+            decode_repeated_traffic.unique_selected_expert_bytes,
+            decode_broad_traffic.logical_route_demand_bytes,
+            decode_broad_traffic.unique_selected_expert_bytes,
+        );
+        assert!(observer.reset_device_graph().unwrap());
+        observer.finish().unwrap();
+        drop(bindings);
+        drop(session);
+        runtime.synchronize().unwrap();
+        cuda.wait_for_deferred_releases().unwrap();
+    }
+    assert_eq!(
+        53 * 77_856_768u64 + 18 * 90_439_680 + 4 * 105_381_888 + 109_314_048,
+        6_285_164_544
+    );
 }
 
 #[test]
@@ -6873,7 +9325,7 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
             dtype: DataType::Int64,
             shape: vec![],
             accepts_subshape: false,
-            ptr: 0x1000 as *mut std::ffi::c_void,
+            ptr: 0x1000,
             len: 8,
             alignment: 8,
             device: onnx_runtime_ir::DeviceId::cpu(),

@@ -25,7 +25,10 @@
 
 use std::sync::{Arc, OnceLock};
 
-use onnx_runtime_ep_api::{DeviceBuffer, ExecutionProvider};
+use onnx_runtime_ep_api::{
+    DeviceBuffer, DeviceGraphToken, DeviceValidationRegistration, DeviceValidationToken,
+    ExecutionProvider,
+};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{DataType, DeviceId, TensorLayout, checked_expected_bytes, read_vec_le};
 
@@ -317,8 +320,6 @@ impl ExternalMemorySpec {
     }
 }
 
-/// An externally owned persistent device allocation bound to a graph input and
-/// optionally aliased by a graph output.
 pub struct DeviceIoBinding {
     input_name: String,
     bind_input: bool,
@@ -334,6 +335,14 @@ pub struct DeviceIoBinding {
     buffer: Option<DeviceBuffer>,
     allocator: Arc<dyn ExecutionProvider>,
     transfer_stats: DeviceBindingTransferStats,
+    /// Most recent graph generation that captured this address. A stale token
+    /// cannot reset another executor's graph.
+    device_graph_token: Option<DeviceGraphToken>,
+    /// Setup-time registered owner of this binding's sticky validation slot.
+    validation_registration: Option<DeviceValidationRegistration>,
+    /// Exact deferred-validation generation whose output was submitted into
+    /// this binding. Foreign bindings never receive this token.
+    device_validation: Option<DeviceValidationToken>,
 }
 
 impl DeviceIoBinding {
@@ -383,6 +392,13 @@ impl DeviceIoBinding {
             TensorLayout::contiguous().alignment,
             ranges,
         )?;
+        let validation_registration = match allocator.register_device_validation_owner() {
+            Ok(registration) => registration,
+            Err(error) => {
+                let _ = allocator.deallocate(buffer);
+                return Err(error.into());
+            }
+        };
         Ok(Self {
             input_name,
             bind_input,
@@ -395,6 +411,9 @@ impl DeviceIoBinding {
             buffer: Some(buffer),
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
+            device_graph_token: None,
+            validation_registration: Some(validation_registration),
+            device_validation: None,
         })
     }
 
@@ -480,6 +499,7 @@ impl DeviceIoBinding {
             binding: input_name.clone(),
             reason: "it is null; pass the address of a real allocation".to_string(),
         })?;
+        let validation_registration = allocator.register_device_validation_owner()?;
         Ok(Self {
             input_name,
             bind_input,
@@ -492,6 +512,9 @@ impl DeviceIoBinding {
             buffer: Some(buffer),
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
+            device_graph_token: None,
+            validation_registration: Some(validation_registration),
+            device_validation: None,
         })
     }
 
@@ -554,6 +577,25 @@ impl DeviceIoBinding {
     /// [`exposes_logical_input_shape`]: Self::exposes_logical_input_shape
     pub fn mask_decode_freeze_safe(&self) -> bool {
         self.bind_input && self.decode_freeze_safe_mask
+    }
+
+    pub(crate) fn set_device_graph_token(&mut self, token: DeviceGraphToken) {
+        self.device_graph_token = Some(token);
+    }
+
+    pub(crate) fn validation_registration(&self) -> &DeviceValidationRegistration {
+        self.validation_registration
+            .as_ref()
+            .expect("device binding validation registration exists until Drop")
+    }
+
+    pub(crate) fn set_device_validation(&mut self, token: DeviceValidationToken) {
+        self.device_validation = Some(token);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device_validation_token_for_test(&self) -> Option<DeviceValidationToken> {
+        self.device_validation
     }
 
     pub fn set_logical_shape(&mut self, shape: Vec<usize>) -> Result<()> {
@@ -756,9 +798,31 @@ impl DeviceIoBinding {
     }
 
     pub fn read_bytes_into(&mut self, bytes: &mut [u8]) -> Result<()> {
-        self.allocator.copy_to_host(self.buffer(), bytes)?;
+        if bytes.is_empty() {
+            self.allocator.sync()?;
+        } else {
+            self.allocator.copy_to_host(self.buffer(), bytes)?;
+        }
+        self.check_and_reset_device_validation()?;
         self.transfer_stats.host_download_calls += 1;
         self.transfer_stats.host_download_bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn check_and_reset_device_validation(&self) -> Result<()> {
+        let Some(token) = self.device_validation else {
+            return Ok(());
+        };
+        let flags = self
+            .allocator
+            .consume_device_validation_error(self.validation_registration(), token)?;
+        if flags != 0 {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "{}: device validation failed (flags=0x{flags:x})",
+                self.allocator.name()
+            ))
+            .into());
+        }
         Ok(())
     }
 
@@ -784,6 +848,8 @@ impl DeviceIoBinding {
         }
         let mut bytes = vec![0; byte_len];
         if byte_len == 0 {
+            self.allocator.sync()?;
+            self.check_and_reset_device_validation()?;
             return Ok(bytes);
         }
         // SAFETY: the offset range is checked inside the live allocation above;
@@ -797,6 +863,7 @@ impl DeviceIoBinding {
             )
         };
         self.allocator.copy_to_host(&alias, &mut bytes)?;
+        self.check_and_reset_device_validation()?;
         self.transfer_stats.host_download_calls += 1;
         self.transfer_stats.host_download_bytes += bytes.len() as u64;
         Ok(bytes)
@@ -965,8 +1032,69 @@ impl std::fmt::Debug for DeviceIoBinding {
 impl Drop for DeviceIoBinding {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            let _ = self.allocator.reset_device_graph();
-            let _ = self.allocator.deallocate(buffer);
+            let mut safe_to_release = true;
+            if let Err(error) = self.allocator.sync() {
+                safe_to_release = false;
+                eprintln!(
+                    "[onnx-runtime-session] device binding drop could not synchronize deferred \
+                     work before release: {error}"
+                );
+            }
+            if safe_to_release && let Some(token) = self.device_validation {
+                match self
+                    .allocator
+                    .consume_device_validation_error(self.validation_registration(), token)
+                {
+                    Ok(0) => {}
+                    Ok(flags) => eprintln!(
+                        "[onnx-runtime-session] device binding drop consumed its deferred \
+                         validation failure (flags=0x{flags:x})"
+                    ),
+                    Err(error) => {
+                        safe_to_release = false;
+                        eprintln!(
+                            "[onnx-runtime-session] device binding drop could not consume its \
+                             deferred validation: {error}"
+                        );
+                    }
+                }
+            }
+            if let Some(token) = self.device_graph_token.take()
+                && let Err(error) = self.allocator.reset_owned_device_graph(token)
+            {
+                safe_to_release = false;
+                eprintln!(
+                    "[onnx-runtime-session] device binding drop could not retire its captured \
+                     graph generation: {error}"
+                );
+            }
+            if safe_to_release {
+                let _ = self.allocator.deallocate(buffer);
+            } else {
+                // `DeviceBuffer` has no freeing Drop. Retaining the allocation
+                // is safer than releasing storage that in-flight work or an
+                // unretired graph may still reference.
+                eprintln!(
+                    "[onnx-runtime-session] quarantining device binding allocation after failed \
+                     drop cleanup"
+                );
+                drop(buffer);
+            }
+        }
+        if let Some(registration) = self.validation_registration.as_mut() {
+            let owner = registration.owner();
+            if let Err(error) = self
+                .allocator
+                .unregister_device_validation_owner(registration)
+            {
+                eprintln!(
+                    "[onnx-runtime-session] device binding drop could not unregister validation \
+                     owner {}: {error}",
+                    owner.get()
+                );
+            } else {
+                self.validation_registration = None;
+            }
         }
     }
 }
