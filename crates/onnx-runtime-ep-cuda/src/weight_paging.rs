@@ -27,9 +27,9 @@ use std::time::Duration;
 use cudarc::driver::sys;
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
-    ExecutorInstanceId, ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight,
-    LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary, MmapRegionSource, PagedWeight,
-    WeightHandleError,
+    ExecutorArtifactGeneration, ExecutorArtifactProviderId, ExecutorInstanceId, ExternalMmapRegion,
+    FinalizedExpertBank, FinalizedExpertWeight, LazyDeviceWeightBinder, LazyWeight,
+    LazyWeightBoundary, MmapRegionSource, PagedWeight, WeightHandleError,
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, NodeId, ValueId};
 use onnx_runtime_memory_governor::{AllocationReleaseState, Tier, VirtualBacking};
@@ -2892,9 +2892,11 @@ pub struct RouteReservationHealth {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RouteReservationIdentity {
+    provider: ExecutorArtifactProviderId,
     executor: ExecutorInstanceId,
+    artifact_generation: ExecutorArtifactGeneration,
     device_ordinal: u32,
-    generation: u64,
+    reservation_generation: u64,
 }
 
 const ROUTE_HEALTH_POISONED: u64 = 1;
@@ -3022,11 +3024,7 @@ impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for RouteReservationR
         &self,
     ) -> onnx_runtime_ep_api::Result<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>> {
         self.health
-            .acquire_use(
-                self.identity.executor,
-                self.identity.device_ordinal,
-                self.identity.generation,
-            )
+            .acquire_use_identity(self.identity)
             .map(|guard| Box::new(guard) as Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>)
             .map_err(|reason| {
                 onnx_runtime_ep_api::EpError::KernelFailed(format!(
@@ -3035,7 +3033,7 @@ impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for RouteReservationR
                      dispatch, capture, or replay",
                     self.identity.executor.get(),
                     self.identity.device_ordinal,
-                    self.identity.generation
+                    self.identity.reservation_generation
                 ))
             })
     }
@@ -3053,16 +3051,21 @@ impl RouteReservationHealth {
     }
 
     fn new_scoped(
+        provider: ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
+        artifact_generation: ExecutorArtifactGeneration,
         device_ordinal: u32,
         retirement_counters: Arc<RouteReservationRetirementCounters>,
     ) -> Option<Arc<Self>> {
-        let generation = next_route_reservation_generation(&NEXT_ROUTE_RESERVATION_GENERATION)?;
+        let reservation_generation =
+            next_route_reservation_generation(&NEXT_ROUTE_RESERVATION_GENERATION)?;
         Some(Arc::new(Self {
             identity: Some(RouteReservationIdentity {
+                provider,
                 executor,
+                artifact_generation,
                 device_ordinal,
-                generation,
+                reservation_generation,
             }),
             lifecycle: AtomicU64::new(0),
             reason: Mutex::new(None),
@@ -3072,22 +3075,25 @@ impl RouteReservationHealth {
     }
 
     pub(crate) fn generation(&self) -> Option<u64> {
-        self.identity.map(|identity| identity.generation)
+        self.identity
+            .map(|identity| identity.reservation_generation)
     }
 
-    pub(crate) fn requirement(
+    pub(crate) fn requirement_state(
         self: &Arc<Self>,
-    ) -> Result<onnx_runtime_ep_api::ExecutorArtifactRequirement, String> {
+    ) -> Result<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>, String> {
         let identity = self.identity.ok_or_else(|| {
-            "reservation health has no executor/device/generation identity; rebuild the executor"
+            "reservation health has no provider/executor/artifact/device/generation identity; \
+             rebuild the executor"
                 .to_string()
         })?;
-        Ok(onnx_runtime_ep_api::ExecutorArtifactRequirement::new(
-            Arc::new(RouteReservationRequirement {
-                health: Arc::clone(self),
-                identity,
-            }),
-        ))
+        Ok(Arc::new(RouteReservationRequirement {
+            health: Arc::clone(self),
+            identity,
+        })
+            as Arc<
+                dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState,
+            >)
     }
 
     pub(crate) fn mark_unusable(&self, reason: String) {
@@ -3126,58 +3132,103 @@ impl RouteReservationHealth {
         &self,
         executor: ExecutorInstanceId,
         device_ordinal: u32,
-        generation: u64,
+        reservation_generation: u64,
     ) -> Result<RouteReservationIdentity, String> {
         let Some(identity) = self.identity else {
             return Err(
-                "reservation health has no executor/device/generation identity; rebuild the \
-                 executor"
+                "reservation health has no provider/executor/artifact/device/generation identity; \
+                 rebuild the executor"
                     .to_string(),
             );
         };
         if identity.executor != executor
             || identity.device_ordinal != device_ordinal
-            || identity.generation != generation
+            || identity.reservation_generation != reservation_generation
         {
             return Err(format!(
                 "reservation generation {} belongs to executor {} on CUDA:{}, not executor {} on \
                  CUDA:{} generation {}",
-                identity.generation,
+                identity.reservation_generation,
                 identity.executor.get(),
                 identity.device_ordinal,
                 executor.get(),
                 device_ordinal,
-                generation
+                reservation_generation
             ));
         }
         Ok(identity)
+    }
+
+    pub(crate) fn validate_artifact_scope(
+        &self,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        artifact_generation: ExecutorArtifactGeneration,
+        device_ordinal: u32,
+    ) -> Result<(), String> {
+        let identity = self.identity.ok_or_else(|| {
+            "reservation health has no provider/executor/artifact/device/generation identity; \
+             rebuild the executor"
+                .to_string()
+        })?;
+        if identity.provider != provider
+            || identity.executor != executor
+            || identity.artifact_generation != artifact_generation
+            || identity.device_ordinal != device_ordinal
+        {
+            return Err(format!(
+                "reservation belongs to provider {} executor {} artifact generation {} on CUDA:{}, \
+                 not provider {} executor {} artifact generation {} on CUDA:{}",
+                identity.provider.get(),
+                identity.executor.get(),
+                identity.artifact_generation.get(),
+                identity.device_ordinal,
+                provider.get(),
+                executor.get(),
+                artifact_generation.get(),
+                device_ordinal,
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn acquire_use(
         self: &Arc<Self>,
         executor: ExecutorInstanceId,
         device_ordinal: u32,
-        generation: u64,
+        reservation_generation: u64,
     ) -> Result<RouteReservationUseGuard, String> {
-        let identity = self.validate_identity(executor, device_ordinal, generation)?;
+        let identity = self.validate_identity(executor, device_ordinal, reservation_generation)?;
+        self.acquire_use_identity(identity)
+    }
+
+    fn acquire_use_identity(
+        self: &Arc<Self>,
+        identity: RouteReservationIdentity,
+    ) -> Result<RouteReservationUseGuard, String> {
+        if self.identity != Some(identity) {
+            return Err(
+                "baked route-reservation identity no longer matches its health owner".into(),
+            );
+        }
         loop {
             let state = self.lifecycle.load(Ordering::Acquire);
             if state & ROUTE_HEALTH_RETIRED != 0 {
                 return Err(format!(
                     "reservation generation {} is retired; its mappings cannot be used",
-                    identity.generation
+                    identity.reservation_generation
                 ));
             }
             if state & ROUTE_HEALTH_RETIRING != 0 {
                 return Err(format!(
                     "reservation generation {} is retiring; no new launch may begin",
-                    identity.generation
+                    identity.reservation_generation
                 ));
             }
             if state & ROUTE_HEALTH_POISONED != 0 {
                 return Err(format!(
                     "reservation generation {} is poisoned: {}",
-                    identity.generation,
+                    identity.reservation_generation,
                     self.ensure_usable().unwrap_err()
                 ));
             }
@@ -3185,13 +3236,13 @@ impl RouteReservationHealth {
                 return Err(format!(
                     "reservation generation {} is in an atomic group transition; retry after the \
                      request boundary completes",
-                    identity.generation
+                    identity.reservation_generation
                 ));
             }
             let next = state.checked_add(ROUTE_HEALTH_USE).ok_or_else(|| {
                 format!(
                     "reservation generation {} use counter overflowed",
-                    identity.generation
+                    identity.reservation_generation
                 )
             })?;
             if self
@@ -4228,9 +4279,28 @@ impl CudaWeightResidency {
         }
     }
 
+    /// The per-bank *dedicated* VMM reservation the coarse route-residency plan
+    /// would remap for `value`, or `None` when this residency cannot provide one
+    /// (issue #1810 Slice 7E).
+    ///
+    /// The shipped residency admits every paged weight into **one shared** VMM
+    /// reservation ([`PhysicalAdmission::allocator`]) with per-key stable-VA
+    /// slots (issue #716), keyed by page-key rather than by expert-bank
+    /// [`ValueId`]. The coarse plan ([`Self::apply_coarse_residency_plan`])
+    /// addresses each bank at *catalog-relative* offsets, which only a dedicated
+    /// per-bank reservation (base at the bank's first byte) satisfies — so there
+    /// is no per-bank reservation in this layout to hand back, and the install
+    /// seam fail-closes with
+    /// [`RouteResidencyBindingReject::NoPerBankReservation`](crate::route_residency::RouteResidencyBindingReject::NoPerBankReservation)
+    /// rather than remapping the wrong bytes. The per-bank-reservation bridge is
+    /// the disclosed Slice-7E residual; when a later slice admits routed banks
+    /// into dedicated reservations this method returns `Some` and the same seam
+    /// installs a real binding.
     pub fn install_route_bank_reservations(
         &self,
+        provider: ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
+        artifact_generation: ExecutorArtifactGeneration,
         banks: &[FinalizedExpertBank],
         device_ordinal: i32,
     ) -> Result<RouteReservationAuthorities, RouteBankReservationReject> {
@@ -4268,6 +4338,17 @@ impl CudaWeightResidency {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = installed.get(&executor) {
+            existing
+                .health
+                .validate_artifact_scope(
+                    provider,
+                    executor,
+                    artifact_generation,
+                    device_ordinal as u32,
+                )
+                .map_err(
+                    |reason| RouteBankReservationReject::ExistingReservationMismatch { reason },
+                )?;
             validate_existing_route_reservations(existing, banks, device_ordinal).map_err(
                 |reason| RouteBankReservationReject::ExistingReservationMismatch { reason },
             )?;
@@ -4527,7 +4608,9 @@ impl CudaWeightResidency {
             as Arc<dyn onnx_runtime_cuda_memory::virtual_memory::DeferredReservationQueue>;
 
         let health = RouteReservationHealth::new_scoped(
+            provider,
             executor,
+            artifact_generation,
             device_ordinal as u32,
             Arc::clone(&self.route_retirement_counters),
         )
@@ -4736,7 +4819,7 @@ impl CudaWeightResidency {
     pub fn coarse_route_bank_reservation(
         &self,
         executor: ExecutorInstanceId,
-        value: ValueId,
+        value: onnx_runtime_ir::ValueId,
     ) -> Option<Arc<crate::vmm_allocator::CudaVmmAllocator>> {
         self.route_reservations
             .lock()
@@ -4798,6 +4881,40 @@ impl CudaWeightResidency {
         expert_groups: &[onnx_runtime_ep_api::ExpertWeightGroup],
     ) -> crate::coarse_residency::BoundaryApplicationOutcome {
         crate::coarse_residency::apply_residency_plan_at_boundary(
+            &self.runtime,
+            self,
+            plan,
+            catalogs,
+            allocators,
+            device_pool,
+            host_pool,
+            device_count,
+            device_ordinal,
+            expert_groups,
+        )
+    }
+
+    /// Apply a coarse plan for an executor generation whose immutable artifact
+    /// configuration already resolved route residency as enabled.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_resolved_coarse_residency_plan(
+        &self,
+        plan: &onnx_runtime_ep_api::ResidencyPlan,
+        catalogs: &std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            onnx_runtime_loader::WeightRegionCatalog,
+        >,
+        allocators: &std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            Arc<onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator>,
+        >,
+        device_pool: &Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+        host_pool: &Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+        device_count: usize,
+        device_ordinal: i32,
+        expert_groups: &[onnx_runtime_ep_api::ExpertWeightGroup],
+    ) -> crate::coarse_residency::BoundaryApplicationOutcome {
+        crate::coarse_residency::apply_resolved_residency_plan_at_boundary(
             &self.runtime,
             self,
             plan,
@@ -7686,10 +7803,21 @@ mod tests {
     ) {
         let counters = Arc::new(RouteReservationRetirementCounters::default());
         (
-            RouteReservationHealth::new_scoped(executor, device, Arc::clone(&counters))
-                .expect("test route generation"),
+            RouteReservationHealth::new_scoped(
+                ExecutorArtifactProviderId::from_raw(1),
+                executor,
+                ExecutorArtifactGeneration::from_raw(1),
+                device,
+                Arc::clone(&counters),
+            )
+            .expect("test route generation"),
             counters,
         )
+    }
+
+    fn fresh_executor() -> ExecutorInstanceId {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        ExecutorInstanceId::from_raw(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
     #[test]
@@ -7707,7 +7835,7 @@ mod tests {
 
     #[test]
     fn route_reservation_lifecycle_linearizes_use_transition_and_poison() {
-        let executor = ExecutorInstanceId::fresh();
+        let executor = fresh_executor();
         let (health, _) = scoped_health(executor, 3);
         let generation = health.generation().expect("scoped generation");
 
@@ -7741,8 +7869,8 @@ mod tests {
 
     #[test]
     fn route_reservation_lifecycle_rejects_sibling_and_device_aliases() {
-        let owner = ExecutorInstanceId::fresh();
-        let sibling = ExecutorInstanceId::fresh();
+        let owner = fresh_executor();
+        let sibling = fresh_executor();
         let (health, _) = scoped_health(owner, 1);
         let generation = health.generation().expect("scoped generation");
 
@@ -7769,10 +7897,45 @@ mod tests {
     }
 
     #[test]
+    fn route_reservation_requirement_rejects_foreign_provider_and_artifact_generation() {
+        let executor = fresh_executor();
+        let (health, _) = scoped_health(executor, 2);
+        let provider = ExecutorArtifactProviderId::from_raw(1);
+        let generation = ExecutorArtifactGeneration::from_raw(1);
+        health
+            .validate_artifact_scope(provider, executor, generation, 2)
+            .expect("exact private session scope");
+
+        let foreign_provider = health
+            .validate_artifact_scope(
+                ExecutorArtifactProviderId::from_raw(2),
+                executor,
+                generation,
+                2,
+            )
+            .expect_err("foreign provider cannot retain another owner's requirement");
+        assert!(foreign_provider.contains("provider 1"));
+        assert!(foreign_provider.contains("not provider 2"));
+
+        let stale_generation = health
+            .validate_artifact_scope(
+                provider,
+                executor,
+                ExecutorArtifactGeneration::from_raw(2),
+                2,
+            )
+            .expect_err("stale artifact generation cannot retain a replacement reservation");
+        assert!(stale_generation.contains("artifact generation 1"));
+        assert!(stale_generation.contains("artifact generation 2"));
+    }
+
+    #[test]
     fn route_reservation_retirement_returns_with_public_holder_and_cleans_on_last_release() {
-        let executor = ExecutorInstanceId::fresh();
+        let executor = fresh_executor();
         let (health, counters) = scoped_health(executor, 0);
-        let requirement = health.requirement().expect("public requirement");
+        let requirement = health
+            .requirement_state()
+            .expect("retained requirement state");
         let holder = requirement.acquire_use().expect("pre-retirement holder");
         let cleanups = Arc::new(AtomicU64::new(0));
         let teardown_health = Arc::clone(&health);
@@ -7834,8 +7997,8 @@ mod tests {
     }
 
     #[test]
-    fn stalled_transition_defers_without_deadlock_and_releases_cleanup_once() {
-        let executor = ExecutorInstanceId::fresh();
+    fn route_reservation_stalled_transition_defers_and_releases_cleanup_once() {
+        let executor = fresh_executor();
         let (health, counters) = scoped_health(executor, 0);
         let transition = health.begin_transition().expect("transition authority");
         let cleanups = Arc::new(AtomicU64::new(0));
@@ -7857,7 +8020,7 @@ mod tests {
     #[test]
     fn route_reservation_acquire_racing_retirement_never_launches_after_unmap() {
         for _ in 0..64 {
-            let executor = ExecutorInstanceId::fresh();
+            let executor = fresh_executor();
             let (health, _) = scoped_health(executor, 0);
             let generation = health.generation().expect("scoped generation");
             let gate = Arc::new(std::sync::Barrier::new(3));

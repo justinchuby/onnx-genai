@@ -1070,7 +1070,7 @@ impl KernelCache {
         constant_values: &[Option<KernelConstantInput<'_>>],
         opset: u64,
         capture_seq_independent: bool,
-        executor: ExecutorInstanceId,
+        artifact_config: ExecutorArtifactConfig,
         artifact_readiness: &mut ProviderArtifactReadiness,
         ep: &dyn ExecutionProvider,
         graph_tokens: [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT],
@@ -1082,6 +1082,14 @@ impl KernelCache {
         if self.entries.contains_key(&key) {
             self.hits += 1;
         } else {
+            let next_misses = self.misses.checked_add(1).ok_or_else(|| {
+                EpError::KernelFailed(
+                    "kernel cache miss counter exhausted; refusing to wrap provider artifact \
+                     readiness"
+                        .to_string(),
+                )
+            })?;
+            let next_readiness = artifact_readiness.checked_next_epoch()?;
             let shared_constant_state = self
                 .entries
                 .iter()
@@ -1105,7 +1113,14 @@ impl KernelCache {
                     reason,
                 ));
             }
-            let mut kernel = match ep.get_kernel_for_executor(executor, node, input_shapes, opset) {
+            let mut kernel = match ep.get_kernel_for_executor(
+                artifact_config.provider(),
+                artifact_config.executor(),
+                artifact_config.generation(),
+                node,
+                input_shapes,
+                opset,
+            ) {
                 Ok(kernel) => kernel,
                 Err(EpError::NoEpForOp {
                     domain,
@@ -1142,12 +1157,12 @@ impl KernelCache {
             self.entries.insert(key.clone(), kernel);
             self.last_used
                 .insert(key.clone(), AtomicU64::new(self.tick()));
-            self.misses += 1;
+            self.misses = next_misses;
             // Kernel creation is the single publication chokepoint for
             // executor-scoped provider artifacts. Invalidate permission here,
             // not in selected callers, so build preflight, binding preparation,
             // and runtime dispatch cannot disagree about readiness.
-            artifact_readiness.advance_to(ExecutorArtifactReadinessEpoch::new(self.misses));
+            artifact_readiness.advance_to(next_readiness);
             self.evict_surplus_variants(key.node, ep, graph_tokens)?;
         }
         self.touch(&key);

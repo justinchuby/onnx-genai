@@ -6,6 +6,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::epcontext::EpContext;
+use crate::error::{EpError, Result};
+use crate::kernel::{Kernel, KernelMatch};
+use crate::weight::ExecutionProviderCapabilities;
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
 };
@@ -13,11 +17,6 @@ use onnx_runtime_memory_governor::{
     AllocationIdentity, ManagedAllocation, MemoryLease, MemoryRole, OwningAllocation,
     ProviderContextIdentity,
 };
-
-use crate::epcontext::EpContext;
-use crate::error::{EpError, Result};
-use crate::kernel::{Kernel, KernelMatch};
-use crate::weight::ExecutionProviderCapabilities;
 
 /// Index of an EP within an [`crate::registry::EpRegistry`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -38,14 +37,6 @@ impl ExecutorInstanceId {
     /// session executor.
     pub const UNSCOPED: Self = Self(0);
 
-    /// Allocate a process-unique executor identity.
-    pub fn fresh() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(id, u64::MAX, "executor instance id space exhausted");
-        Self(id)
-    }
-
     /// Stable numeric representation for provider-owned maps and diagnostics.
     pub fn get(self) -> u64 {
         self.0
@@ -58,13 +49,136 @@ impl ExecutorInstanceId {
     }
 }
 
+/// Exact provider-instance label echoed through session artifact calls.
+///
+/// This is intentionally non-secret routing data, not a capability. The
+/// provider validates it against its own private instance state so a session
+/// cannot accidentally carry an artifact generation across provider rebuilds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExecutorArtifactProviderId(u64);
+
+impl ExecutorArtifactProviderId {
+    pub const UNSCOPED: Self = Self(0);
+
+    #[doc(hidden)]
+    pub const fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Immutable route-residency input resolved before an executor compiles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ExecutorRouteResidencyConfig {
+    /// Producer publication, telemetry, and request boundaries are forbidden.
+    #[default]
+    Disabled,
+    /// Producer publication is permitted; finalization may still decline when
+    /// the graph or provider artifacts cannot support route residency.
+    Enabled,
+}
+
+/// Whether a kernel factory requires a session-issued executor scope.
+///
+/// Ordinary providers and kernels remain [`Unscoped`](Self::Unscoped). A
+/// provider returns [`Required`](Self::Required) only for a factory that
+/// publishes executor-generation-owned artifacts while compiling. Calling
+/// [`ExecutionProvider::get_kernel`] for such a factory must fail clearly;
+/// session compilation uses [`ExecutionProvider::get_kernel_for_executor`]
+/// with the one capability issued for the executor generation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutorKernelScope {
+    #[default]
+    Unscoped,
+    Required,
+}
+
+/// Provider-supplied, non-authoritative policy data for one executor build.
+///
+/// This value deliberately contains no issuer, capability, proof, owner, or
+/// generation. The session snapshots it into a private lifecycle value and is
+/// the only crate that can turn a provider report into runnable readiness.
+/// Providers must treat every executor/generation identifier received through
+/// [`ExecutionProvider`] as untrusted routing data.
+///
+/// ```
+/// use onnx_runtime_ep_api::{
+///     ExecutorArtifactPolicy, ExecutorArtifactProviderId, ExecutorRouteResidencyConfig,
+/// };
+/// use onnx_runtime_ir::DeviceId;
+///
+/// let policy = ExecutorArtifactPolicy::new(
+///     ExecutorArtifactProviderId::from_raw(1),
+///     DeviceId::cpu(),
+///     ExecutorRouteResidencyConfig::Disabled,
+/// );
+/// assert_eq!(policy.device(), DeviceId::cpu());
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExecutorArtifactPolicy {
+    provider: ExecutorArtifactProviderId,
+    device: DeviceId,
+    route_residency: ExecutorRouteResidencyConfig,
+}
+
+impl ExecutorArtifactPolicy {
+    /// Describe immutable provider policy. This constructs data, not authority.
+    pub const fn new(
+        provider: ExecutorArtifactProviderId,
+        device: DeviceId,
+        route_residency: ExecutorRouteResidencyConfig,
+    ) -> Self {
+        Self {
+            provider,
+            device,
+            route_residency,
+        }
+    }
+
+    pub const fn provider(self) -> ExecutorArtifactProviderId {
+        self.provider
+    }
+
+    pub const fn device(self) -> DeviceId {
+        self.device
+    }
+
+    pub const fn route_residency(self) -> ExecutorRouteResidencyConfig {
+        self.route_residency
+    }
+}
+
+/// Process-unique generation label assigned by the session.
+///
+/// This is routing data, not an authority token. The constructor exists so the
+/// session can carry its private checked counter through the public EP trait;
+/// providers must validate it only against state already owned by the exact
+/// provider instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExecutorArtifactGeneration(u64);
+
+impl ExecutorArtifactGeneration {
+    #[doc(hidden)]
+    pub const fn from_raw(generation: u64) -> Self {
+        Self(generation)
+    }
+
+    /// Stable numeric representation for diagnostics.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Monotonic executor-local epoch for concrete kernel/producer readiness.
 ///
 /// The session advances this at the kernel-cache publication chokepoint whenever
 /// any build, binding-preparation, or runtime-dispatch path creates a new
-/// specialization. A provider that returns
-/// [`ExecutorArtifactFinalization::Pending`] is not called again for the same
-/// epoch: another attempt requires a concrete compilation transition.
+/// specialization. A provider that returns a pending proof is not called again
+/// for the same epoch: another attempt requires a concrete compilation
+/// transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExecutorArtifactReadinessEpoch(u64);
 
@@ -102,18 +216,73 @@ impl ExecutorArtifactPending {
     }
 }
 
-/// Result of the authoritative executor-artifact finalization transition.
+/// Provider-observed state for one artifact inspection.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ExecutorArtifactFinalization {
-    /// Every provider artifact required by this executor reached an honest
-    /// terminal outcome: installed, disabled, or structurally declined. Later
-    /// kernel specializations may reuse the executor-owned producer identity
-    /// without reinstalling.
-    Complete,
-    /// A readiness-dependent producer is not available yet. Nothing terminal
-    /// was latched. Execution and capture remain forbidden, and the executor
-    /// may invoke the transition again only after its readiness epoch advances.
+pub enum ExecutorArtifactState {
+    Disabled,
+    Declined,
+    Required,
     Pending(ExecutorArtifactPending),
+}
+
+/// Untrusted provider report for the current executor/generation/epoch.
+///
+/// This is intentionally data rather than a proof. A provider can report what
+/// it observed, but only the session's private lifecycle state can validate the
+/// echoed labels against immutable policy and turn it into runnable readiness.
+///
+/// A report has no public `Complete` state that an external caller can mint:
+///
+/// ```compile_fail
+/// use onnx_runtime_ep_api::ExecutorArtifactState;
+///
+/// let _forged = ExecutorArtifactState::Complete;
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutorArtifactReport {
+    provider: ExecutorArtifactProviderId,
+    executor: ExecutorInstanceId,
+    generation: ExecutorArtifactGeneration,
+    readiness: ExecutorArtifactReadinessEpoch,
+    state: ExecutorArtifactState,
+}
+
+impl ExecutorArtifactReport {
+    pub fn observed(
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        readiness: ExecutorArtifactReadinessEpoch,
+        state: ExecutorArtifactState,
+    ) -> Self {
+        Self {
+            provider,
+            executor,
+            generation,
+            readiness,
+            state,
+        }
+    }
+
+    pub const fn provider(&self) -> ExecutorArtifactProviderId {
+        self.provider
+    }
+
+    pub const fn executor(&self) -> ExecutorInstanceId {
+        self.executor
+    }
+
+    pub const fn generation(&self) -> ExecutorArtifactGeneration {
+        self.generation
+    }
+
+    pub const fn readiness(&self) -> ExecutorArtifactReadinessEpoch {
+        self.readiness
+    }
+
+    pub fn into_state(self) -> ExecutorArtifactState {
+        self.state
+    }
 }
 
 /// Tie-break policy for [`ExecutionProvider::device_argmax`] when two or more
@@ -278,40 +447,10 @@ pub struct DeviceValidationRegistration {
 /// transitions. Providers without mutable artifact state return `None`.
 pub trait ExecutorArtifactUseGuard: Send + Sync {}
 
-/// Stable proof that an executor requires one exact provider-owned artifact.
-///
-/// The requirement is captured when provider finalization completes and remains
-/// valid even after the provider's live registry entry begins retirement. A
-/// launch acquires through this value rather than rediscovering requirements
-/// from mutable registry presence, so "missing after teardown" cannot become
-/// "no artifact required."
-#[derive(Clone)]
-pub struct ExecutorArtifactRequirement {
-    state: Arc<dyn ExecutorArtifactRequirementState>,
-}
-
-impl ExecutorArtifactRequirement {
-    pub fn new<T>(state: Arc<T>) -> Self
-    where
-        T: ExecutorArtifactRequirementState + 'static,
-    {
-        Self { state }
-    }
-
-    pub fn acquire_use(&self) -> Result<Box<dyn ExecutorArtifactUseGuard>> {
-        self.state.acquire_use()
-    }
-}
-
-impl std::fmt::Debug for ExecutorArtifactRequirement {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ExecutorArtifactRequirement")
-            .finish_non_exhaustive()
-    }
-}
-
-/// Provider-specific state behind an [`ExecutorArtifactRequirement`].
+/// Provider-owned state retained by the session after it privately validates a
+/// `Required` artifact report. The session stores the returned `Arc` in its
+/// private executor state and in every baked graph requirement; there is no
+/// public constructor, issuer, binder, proof resolver, or finalization path.
 pub trait ExecutorArtifactRequirementState: Send + Sync {
     fn acquire_use(&self) -> Result<Box<dyn ExecutorArtifactUseGuard>>;
 }
@@ -1273,20 +1412,35 @@ pub trait ExecutionProvider: Send + Sync {
     /// opset-13 per-axis vs. the legacy opset-<13 2D-coercion `Softmax`).
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>>;
 
-    /// Executor-scoped kernel creation.
+    /// Executor-scoped kernel creation under a resolved artifact configuration.
     ///
     /// The default preserves providers that own no executor-scoped artifacts.
     /// Providers whose factories publish producer handles override this method
-    /// so compilation is attributed to the owning executor rather than to a
-    /// graph-local node id shared by sibling sessions.
+    /// so compilation is attributed to the owning executor/provider generation
+    /// rather than to a graph-local node id shared by sibling sessions. Such
+    /// providers must reject foreign provider labels and stale generations
+    /// before publishing producer state.
     fn get_kernel_for_executor(
         &self,
-        _executor: ExecutorInstanceId,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
         op: &Node,
         shapes: &[Vec<usize>],
         opset: u64,
     ) -> Result<Box<dyn Kernel>> {
+        let _ = (provider, executor, generation);
         self.get_kernel(op, shapes, opset)
+    }
+
+    /// Classify whether `op` may be compiled without a session-issued executor
+    /// generation.
+    ///
+    /// The default keeps generic providers and kernels unchanged. Providers
+    /// that publish executor-owned artifacts must return
+    /// [`ExecutorKernelScope::Required`] for exactly those factories.
+    fn executor_kernel_scope(&self, _op: &Node) -> ExecutorKernelScope {
+        ExecutorKernelScope::Unscoped
     }
 
     /// Apply EP-owned structural policy to one prospective capture-region node.
@@ -1898,64 +2052,34 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(0)
     }
 
-    /// Consume any completed coarse-boundary route-telemetry window and apply
-    /// the resulting per-expert residency plan through the provider's existing
-    /// coarse-residency lifecycle (issue #1810 Slice 7C).
+    /// Consume this executor's completed route-telemetry window.
     ///
-    /// This is a required part of the EP lifecycle contract — there is no
-    /// compatibility default, so every provider states its boundary behaviour
-    /// explicitly. Session executors call it **once per top-level request**, at
-    /// the single request-level host boundary that runs after [`Self::sync`] —
-    /// i.e. after every kernel and captured replay from the request has
-    /// completed and the stream is no longer capturing. It is never called per
-    /// token, per replay, or from a nested control-flow subgraph run.
-    ///
-    /// An EP with no coarse-residency lifecycle (every stock EP, and the CUDA EP
-    /// whenever device weight offload or the coarse-residency profile is
-    /// disabled — the shipped default) returns `Ok(())` and does nothing here.
-    /// A provider that participates must remain fail-closed and must perform no
-    /// mapping change during capture/replay — it reuses its own already-validated
-    /// safe-boundary authority to decide whether the boundary is safe before it
-    /// consumes or resets anything, and surfaces a typed outcome to its own
-    /// diagnostics rather than failing silently.
-    fn consume_route_residency_at_boundary(&self) -> Result<()>;
-
-    /// Executor-scoped form of
-    /// [`Self::consume_route_residency_at_boundary`].
-    ///
-    /// The default delegates to the historical unscoped hook. A provider that
-    /// can be shared by sibling executors overrides this method so one
-    /// executor's request boundary cannot consume another executor's producer.
+    /// The session invokes this only after synchronizing device work and
+    /// consuming the exact owner-scoped deferred-validation receipt. The
+    /// executor identity is mandatory: providers must not consult unscoped or
+    /// process-global producer state to satisfy this boundary. Non-participating
+    /// providers have no route lifecycle and keep the no-op default.
     fn consume_route_residency_at_boundary_for_executor(
         &self,
         _executor: ExecutorInstanceId,
     ) -> Result<()> {
-        self.consume_route_residency_at_boundary()
+        Ok(())
     }
 
-    /// Whether `executor` has installed route-residency state that requires the
-    /// session to finish validation at the request return boundary.
+    /// Report immutable provider policy for a session executor.
     ///
-    /// Providers return false by default, preserving deferred output-binding
-    /// validation. A participating provider returns true only while an
-    /// executor-scoped boundary is installed, because that boundary must be
-    /// synchronized, consumed, and reset before another submission can append
-    /// telemetry to the same window.
-    fn requires_route_residency_request_boundary(&self, _executor: ExecutorInstanceId) -> bool {
-        false
+    /// The returned value is untrusted policy data. It contains no session
+    /// owner, generation, capability, or finalization authority. The session
+    /// snapshots it once into private state before compilation.
+    fn executor_artifact_policy(&self) -> Result<ExecutorArtifactPolicy> {
+        Ok(ExecutorArtifactPolicy::new(
+            ExecutorArtifactProviderId::UNSCOPED,
+            self.device_id(),
+            ExecutorRouteResidencyConfig::Disabled,
+        ))
     }
 
-    /// Whether the session should retain finalized expert-bank descriptors for
-    /// this provider's executor-artifact finalization transition.
-    ///
-    /// The default is false, so non-participating providers and the shipped
-    /// default-off CUDA path allocate and retain no route-residency metadata.
-    fn wants_finalized_route_residency_banks(&self) -> bool {
-        false
-    }
-
-    /// Authoritative transition for "all provider artifacts required by this
-    /// executor's resolved compilation are finalized."
+    /// Inspect provider artifacts required by one executor generation.
     ///
     /// Static build and every newly compiled symbolic/dynamic specialization
     /// invoke this same idempotent path after kernel factories have published
@@ -1963,43 +2087,67 @@ pub trait ExecutionProvider: Send + Sync {
     /// `readiness` advances at every executor kernel-cache miss, including
     /// binding preparation and runtime dispatch; the executor never calls a
     /// provider twice for the same pending/failed epoch. Structural declines
-    /// may latch as [`ExecutorArtifactFinalization::Complete`];
-    /// readiness-dependent absence returns
-    /// [`ExecutorArtifactFinalization::Pending`] without poisoning a later
-    /// epoch. An `Err` is also fail-closed and may be retried only after a later
-    /// compilation epoch. The default completes without side effects.
-    fn finalize_executor_artifacts(
-        &self,
-        _executor: ExecutorInstanceId,
-        _graph: &Graph,
-        _readiness: ExecutorArtifactReadinessEpoch,
-        _banks: &[crate::FinalizedExpertBank],
-    ) -> Result<ExecutorArtifactFinalization> {
-        Ok(ExecutorArtifactFinalization::Complete)
-    }
-
-    /// Capture the exact requirement installed by artifact finalization.
+    /// may be terminal; readiness-dependent absence returns a pending report
+    /// without poisoning a later epoch. An `Err` is also fail-closed and may be
+    /// retried only after a later compilation epoch.
     ///
-    /// The executor retains this value for ordinary execution and also copies it
-    /// into every baked graph slot. Providers must return the same terminal
-    /// requirement while an installed artifact is active, retiring, or retired;
-    /// returning `None` is reserved for executors that never installed one.
-    fn executor_artifact_requirement(
+    /// This method supplies data only. It cannot finalize a session: the
+    /// session validates the report against its private immutable policy and
+    /// readiness epoch before publishing a runnable state.
+    fn inspect_executor_artifacts(
         &self,
-        _executor: ExecutorInstanceId,
-    ) -> Result<Option<ExecutorArtifactRequirement>> {
-        Ok(None)
+        _provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        readiness: ExecutorArtifactReadinessEpoch,
+        _graph: &Graph,
+        _banks: &[crate::FinalizedExpertBank],
+    ) -> Result<ExecutorArtifactReport> {
+        Ok(ExecutorArtifactReport::observed(
+            self.executor_artifact_policy()?.provider(),
+            executor,
+            generation,
+            readiness,
+            match self.executor_artifact_policy()?.route_residency() {
+                ExecutorRouteResidencyConfig::Disabled => ExecutorArtifactState::Disabled,
+                ExecutorRouteResidencyConfig::Enabled => ExecutorArtifactState::Declined,
+            },
+        ))
     }
 
     /// Drain exactly the artifacts owned by `executor`.
     ///
     /// The default is a no-op. Participating providers must make this
-    /// idempotent and non-blocking: reject new acquisitions immediately, then
-    /// transfer any mapping ownership still protected by a use/transition
-    /// guard to a deferred reclamation authority. The last guard releases that
-    /// ownership exactly once. Implementations must not clear producer/boundary
-    /// state owned by sibling executors sharing the same provider.
-    fn drain_executor_artifacts(&self, _executor: ExecutorInstanceId) {}
+    /// idempotent and must not clear producer/boundary state owned by sibling
+    /// executors sharing the same provider. A foreign or stale scope must fail
+    /// without consuming another executor's artifacts.
+    fn drain_executor_artifacts(
+        &self,
+        _provider: ExecutorArtifactProviderId,
+        _executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Retain the exact requirement installed by a privately validated
+    /// `Required` report.
+    ///
+    /// This is a provider-owned use lease source, not session finalization
+    /// authority. The session calls it only after validating the report's exact
+    /// provider/executor/generation/readiness labels against private immutable
+    /// state. Providers must return the same retained state while the artifact
+    /// is active, retiring, or retired so baked graphs fail closed after
+    /// teardown instead of interpreting missing live registry state as
+    /// "nothing required."
+    fn executor_artifact_requirement(
+        &self,
+        _provider: ExecutorArtifactProviderId,
+        _executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+    ) -> Result<Option<Arc<dyn ExecutorArtifactRequirementState>>> {
+        Ok(None)
+    }
 
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
@@ -2330,6 +2478,20 @@ mod tests {
     }
 
     #[test]
+    fn artifact_policy_is_non_authoritative_provider_data() {
+        let policy = ExecutorArtifactPolicy::new(
+            ExecutorArtifactProviderId::UNSCOPED,
+            DeviceId::cpu(),
+            ExecutorRouteResidencyConfig::Enabled,
+        );
+        assert_eq!(policy.device(), DeviceId::cpu());
+        assert_eq!(
+            policy.route_residency(),
+            ExecutorRouteResidencyConfig::Enabled
+        );
+    }
+
+    #[test]
     fn buffer_metadata_and_single_free() {
         let mut buf = host_alloc(128, 64);
         assert_eq!(buf.len(), 128);
@@ -2546,10 +2708,6 @@ mod tests {
         }
 
         impl ExecutionProvider for WorkspaceDeallocationEp {
-            fn consume_route_residency_at_boundary(&self) -> Result<()> {
-                Ok(())
-            }
-
             fn name(&self) -> &str {
                 "workspace-deallocation-test"
             }

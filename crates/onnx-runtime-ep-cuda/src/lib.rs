@@ -169,7 +169,7 @@ pub use kernels::{
 };
 pub use pinned_pool::{PinnedStagingPool, global_pinned_alloc_calls, global_pinned_reuses};
 #[doc(hidden)]
-pub use provider::RouteFinalizationCommitInterlock;
+pub use provider::RoutePrepareCommitInterlock;
 pub use provider::{
     CudaExecutionProvider, DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES, dynamic_kv_weight_lending_enabled,
 };

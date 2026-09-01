@@ -319,10 +319,6 @@ fn copy_host_bytes(src: &[u8], dst: &mut [u8]) {
 }
 
 impl ExecutionProvider for CpuExecutionProvider {
-    fn consume_route_residency_at_boundary(&self) -> Result<()> {
-        Ok(())
-    }
-
     fn name(&self) -> &str {
         "cpu_ep"
     }

@@ -51,12 +51,12 @@ use std::time::{Duration, Instant};
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
-    ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
-    ExecutorArtifactReadinessEpoch, ExecutorArtifactRequirement, ExecutorInstanceId,
-    ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight, Kernel, KernelConstantInput,
-    KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight,
-    StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle,
-    WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    ExecutionProvider, ExecutorArtifactGeneration, ExecutorArtifactPending, ExecutorArtifactPolicy,
+    ExecutorArtifactReadinessEpoch, ExecutorArtifactState, ExecutorInstanceId,
+    ExecutorRouteResidencyConfig, ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight,
+    Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
+    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
+    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
     expert_weight_groups, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
@@ -85,6 +85,151 @@ use crate::sequence::{
     ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
 use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor};
+
+static NEXT_EXECUTOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
+static NEXT_ARTIFACT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_non_reusable_identity(counter: &AtomicU64, exhausted: &'static str) -> Result<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| EpError::KernelFailed(exhausted.to_string()).into())
+}
+
+fn issue_executor_instance_id() -> Result<ExecutorInstanceId> {
+    allocate_non_reusable_identity(
+        &NEXT_EXECUTOR_INSTANCE,
+        "executor instance id space exhausted; refusing to wrap and create an ABA collision",
+    )
+    .map(ExecutorInstanceId::from_raw)
+}
+
+fn issue_artifact_generation() -> Result<ExecutorArtifactGeneration> {
+    allocate_non_reusable_identity(
+        &NEXT_ARTIFACT_GENERATION,
+        "executor artifact generation space exhausted; refusing to wrap and create an ABA collision",
+    )
+    .map(ExecutorArtifactGeneration::from_raw)
+}
+
+/// The session-private lifecycle value. Public EP crates see only its routing
+/// labels and can return reports; they cannot construct, clone, or finalize
+/// this authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExecutorArtifactConfig {
+    policy: ExecutorArtifactPolicy,
+    executor: ExecutorInstanceId,
+    generation: ExecutorArtifactGeneration,
+}
+
+impl ExecutorArtifactConfig {
+    fn issue(policy: ExecutorArtifactPolicy, executor: ExecutorInstanceId) -> Result<Self> {
+        Ok(Self {
+            policy,
+            executor,
+            generation: issue_artifact_generation()?,
+        })
+    }
+
+    fn executor(self) -> ExecutorInstanceId {
+        self.executor
+    }
+
+    fn provider(self) -> onnx_runtime_ep_api::ExecutorArtifactProviderId {
+        self.policy.provider()
+    }
+
+    fn generation(self) -> ExecutorArtifactGeneration {
+        self.generation
+    }
+
+    fn route_residency(self) -> ExecutorRouteResidencyConfig {
+        self.policy.route_residency()
+    }
+}
+
+fn drain_executor_artifacts_panic_safe(
+    ep: &dyn ExecutionProvider,
+    config: ExecutorArtifactConfig,
+) -> onnx_runtime_ep_api::Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ep.drain_executor_artifacts(config.provider(), config.executor(), config.generation())
+    }))
+    .unwrap_or_else(|_| {
+        Err(EpError::KernelFailed(format!(
+            "{} executor {} generation {} provider-artifact rollback panicked; provider cleanup \
+             must be panic-free",
+            ep.name(),
+            config.executor().get(),
+            config.generation().get(),
+        )))
+    })
+}
+
+/// Owns provider artifacts published before a runnable [`Executor`] exists.
+///
+/// Build/finalization is a transaction: every error explicitly aborts this
+/// exact provider/executor/generation, while unwinding through a panic uses the
+/// same one-shot cleanup from `Drop`. Ownership transfers to `Executor` only
+/// after construction has completed successfully.
+struct ExecutorArtifactBuildTransaction {
+    ep: Arc<dyn ExecutionProvider>,
+    config: ExecutorArtifactConfig,
+    active: bool,
+}
+
+impl ExecutorArtifactBuildTransaction {
+    fn new(ep: Arc<dyn ExecutionProvider>, config: ExecutorArtifactConfig) -> Self {
+        Self {
+            ep,
+            config,
+            active: true,
+        }
+    }
+
+    fn config(&self) -> ExecutorArtifactConfig {
+        self.config
+    }
+
+    fn rebind(
+        &mut self,
+        ep: Arc<dyn ExecutionProvider>,
+        config: ExecutorArtifactConfig,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.abort()?;
+        self.ep = ep;
+        self.config = config;
+        self.active = true;
+        Ok(())
+    }
+
+    fn abort(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        if !std::mem::replace(&mut self.active, false) {
+            return Ok(());
+        }
+        drain_executor_artifacts_panic_safe(self.ep.as_ref(), self.config)
+    }
+
+    fn commit(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ExecutorArtifactBuildTransaction {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = self.abort()
+        {
+            eprintln!(
+                "[onnx-runtime-session] panic-time provider-artifact rollback failed for executor \
+                 {} generation {}: {error}",
+                self.config.executor().get(),
+                self.config.generation().get(),
+            );
+        }
+    }
+}
 
 pub(super) struct DeviceValidationSubmission {
     ep: Arc<dyn ExecutionProvider>,
@@ -902,7 +1047,19 @@ impl Drop for Executor {
         // authority excludes concurrent external drain/use races and transfers
         // externally held leases to deferred reclamation; Drop never waits for
         // another owner to release one.
-        self.ep.drain_executor_artifacts(self.instance_id);
+        if self.artifact_teardown_armed {
+            self.artifact_teardown_armed = false;
+            if let Err(error) =
+                drain_executor_artifacts_panic_safe(self.ep.as_ref(), self.artifact_config)
+            {
+                eprintln!(
+                    "[onnx-runtime-session] executor {} generation {} provider-artifact teardown \
+                     failed: {error}",
+                    self.artifact_config.executor().get(),
+                    self.artifact_config.generation().get(),
+                );
+            }
+        }
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
             if safe_to_release {

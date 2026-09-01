@@ -765,6 +765,158 @@ fn run_concurrent_safe_point_loss_case(fixture: &Fixture) {
 
 #[test]
 #[ignore = "requires an idle CUDA device with HOST_NUMA VMM support"]
+fn failed_parent_build_retires_child_reservations_once_and_clean_retry_isolated() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let _gate = GateGuard::enable();
+    let fixture = Fixture::create(false, 1);
+    let Some((provider, ledger)) = provider_or_skip(0) else {
+        return;
+    };
+    let provider_baseline = ledger.used(Tier::Device);
+
+    let sibling = InferenceSession::builder()
+        .model(&fixture.model)
+        .execution_provider(Arc::clone(&provider) as Arc<dyn ExecutionProvider>)
+        .build()
+        .expect("build sibling reservation owner");
+    let sibling_scope = *provider
+        .route_residency_scopes()
+        .last()
+        .expect("sibling installs one route-residency scope");
+    let sibling_baseline = ledger.used(Tier::Device);
+    let claims_before_failure = provider.executor_artifact_generation_claims();
+    let census_before = provider.route_residency_retirement_census();
+
+    provider.fail_next_allocation_after_required_artifact_report_for_test();
+    let error = match InferenceSession::builder()
+        .model(&fixture.model)
+        .execution_provider(Arc::clone(&provider) as Arc<dyn ExecutionProvider>)
+        .build()
+    {
+        Ok(_) => panic!("post-finalization allocation failure must abort the parent transaction"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("device OOM"),
+        "the initiating parent-build failure remains actionable: {error}"
+    );
+
+    let claims_after_failure = provider.executor_artifact_generation_claims();
+    let failed_claims = claims_after_failure
+        .iter()
+        .filter(|claim| !claims_before_failure.contains(claim))
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failed_claims.len(),
+        1,
+        "the failed build must claim exactly one provider/executor/generation"
+    );
+    let (failed_executor, failed_generation) = failed_claims[0];
+    assert_ne!(failed_executor, sibling_scope);
+    assert!(
+        provider
+            .retired_executor_artifact_generations()
+            .contains(&(failed_executor, failed_generation)),
+        "the exact failed generation remains a sticky tombstone"
+    );
+
+    for _ in 0..500 {
+        let census = provider.route_residency_retirement_census();
+        if census.reservation_registry_entries == 1
+            && census.cleanups_executed == census_before.cleanups_executed + 1
+            && ledger.used(Tier::Device) == sibling_baseline
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let failed = provider.route_residency_executor_status(failed_executor);
+    let census_after = provider.route_residency_retirement_census();
+    assert_eq!(failed.producer_nodes, 0);
+    assert_eq!(failed.retained_banks, 0);
+    assert!(
+        !provider.route_residency_scopes().contains(&failed_executor),
+        "the failed owner has no live reservation scope"
+    );
+    assert_eq!(
+        census_after.retirements_started,
+        census_before.retirements_started + 1,
+        "parent rollback retires exactly one committed child reservation"
+    );
+    assert_eq!(
+        census_after.cleanups_executed,
+        census_before.cleanups_executed + 1
+    );
+    assert_eq!(
+        census_after.reservation_registry_entries, 1,
+        "only the sibling reservation remains live"
+    );
+    assert_eq!(ledger.used(Tier::Device), sibling_baseline);
+    assert!(
+        provider.route_residency_scopes().contains(&sibling_scope),
+        "failed rollback cannot consume the sibling owner"
+    );
+
+    let retry = InferenceSession::builder()
+        .model(&fixture.model)
+        .execution_provider(Arc::clone(&provider) as Arc<dyn ExecutionProvider>)
+        .build()
+        .expect("a fresh generation retries cleanly on real CUDA");
+    let retry_scope = provider
+        .route_residency_scopes()
+        .into_iter()
+        .find(|scope| *scope != sibling_scope)
+        .expect("retry publishes a distinct reservation scope");
+    assert_ne!(retry_scope, failed_executor);
+    assert!(matches!(
+        provider
+            .route_residency_executor_status(retry_scope)
+            .outcome,
+        Some(onnx_runtime_ep_cuda::route_residency::RouteResidencyInstallOutcome::Installed { .. })
+    ));
+
+    drop(retry);
+    for _ in 0..500 {
+        if provider
+            .route_residency_retirement_census()
+            .reservation_registry_entries
+            == 1
+            && ledger.used(Tier::Device) == sibling_baseline
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(sibling);
+    for _ in 0..500 {
+        if provider
+            .route_residency_retirement_census()
+            .reservation_registry_entries
+            == 0
+            && ledger.used(Tier::Device) == provider_baseline
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        provider
+            .route_residency_retirement_census()
+            .reservation_registry_entries,
+        0
+    );
+    assert_eq!(ledger.used(Tier::Device), provider_baseline);
+
+    let mut provider = Arc::try_unwrap(provider)
+        .unwrap_or_else(|_| panic!("failed-build rollback provider still shared"));
+    provider.sync().expect("sync rollback provider");
+    provider.shutdown().expect("shutdown rollback provider");
+    wait_for_accounting(&ledger, 0, 0);
+}
+
+#[test]
+#[ignore = "requires an idle CUDA device with HOST_NUMA VMM support"]
 fn executor_drop_is_bounded_while_public_artifact_guard_is_held() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let _gate = GateGuard::enable();
@@ -774,8 +926,17 @@ fn executor_drop_is_bounded_while_public_artifact_guard_is_held() {
     };
     let mut case = build_case(&fixture, Arc::clone(&provider), Arc::clone(&ledger), 1);
     let scope = run_first_prefill(&mut case, 1);
+    let generation = provider
+        .executor_artifact_generation_claims()
+        .into_iter()
+        .find_map(|(executor, generation)| (executor == scope).then_some(generation))
+        .expect("installed executor generation claim");
+    let provider_id = provider
+        .executor_artifact_policy()
+        .expect("provider artifact policy")
+        .provider();
     let requirement = provider
-        .executor_artifact_requirement(scope)
+        .executor_artifact_requirement(provider_id, scope, generation)
         .expect("query executor requirement")
         .expect("resolved QMoE executor installed route reservations");
     let holder = requirement

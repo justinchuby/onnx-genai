@@ -70,10 +70,6 @@ impl PluginExecutionProvider {
 }
 
 impl ExecutionProvider for PluginExecutionProvider {
-    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
-        self.cpu.consume_route_residency_at_boundary()
-    }
-
     fn name(&self) -> &str {
         &self.provider_name
     }

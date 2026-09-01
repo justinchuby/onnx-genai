@@ -620,7 +620,7 @@ impl Executor {
                 &constant_values,
                 opset,
                 seq_independent,
-                self.instance_id,
+                self.artifact_config,
                 &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
                 graph_tokens,
@@ -748,9 +748,14 @@ impl Executor {
                 }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let mut kernel =
-                self.ep
-                    .get_kernel(node, &input_shapes, effective_opset(&self.graph, node))?;
+            let mut kernel = self.ep.get_kernel_for_executor(
+                self.artifact_config.provider(),
+                self.artifact_config.executor(),
+                self.artifact_config.generation(),
+                node,
+                &input_shapes,
+                effective_opset(&self.graph, node),
+            )?;
             let constant_inputs = node
                 .inputs
                 .iter()
@@ -1099,10 +1104,13 @@ impl Executor {
         // latched until a later cache miss advances the epoch.
         self.provider_artifact_readiness.finalize_if_needed(
             self.ep.as_ref(),
-            self.instance_id,
+            self.artifact_config,
             &self.graph,
             &self.finalized_expert_banks,
         )?;
+        let route_residency = self
+            .provider_artifact_readiness
+            .route_residency(self.ep.name(), self.instance_id)?;
         if !self.bindings_match_graph_signature(bindings) {
             self.reset_device_graph()?;
             return Err(SessionError::Internal(
@@ -1142,7 +1150,7 @@ impl Executor {
             let exact_requirement = &self.cap().provider_artifact_requirement;
             let artifact_use = self.provider_artifact_readiness.acquire_use(
                 self.ep.as_ref(),
-                self.instance_id,
+                self.artifact_config,
                 Some(exact_requirement),
             )?;
             let mut validation_submission =
@@ -1151,7 +1159,7 @@ impl Executor {
                 let sync = self.ep.sync();
                 drop(artifact_use);
                 let validation = match sync {
-                    Ok(()) => self.finish_device_validation_boundary_after_sync(),
+                    Ok(()) => self.finish_device_validation_boundary_after_sync(route_residency),
                     Err(error) => Err(error.into()),
                 };
                 validation_submission.disarm();
@@ -1166,7 +1174,7 @@ impl Executor {
             let sync = self.ep.sync();
             drop(artifact_use);
             let validation = match sync {
-                Ok(()) => self.finish_device_validation_boundary_after_sync(),
+                Ok(()) => self.finish_device_validation_boundary_after_sync(route_residency),
                 Err(error) => Err(error.into()),
             };
             validation_submission.disarm();

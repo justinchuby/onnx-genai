@@ -123,9 +123,12 @@ impl Executor {
         // provider terminal outcome. Pending or failed finalization returns
         // before buffers are bound and before eager, capture, or replay work.
         self.ensure_provider_artifacts_ready(&resolved)?;
+        let route_residency = self
+            .provider_artifact_readiness
+            .route_residency(self.ep.name(), self.instance_id)?;
         let artifact_use = self.provider_artifact_readiness.acquire_use(
             self.ep.as_ref(),
-            self.instance_id,
+            self.artifact_config,
             artifact_requirement.as_ref(),
         )?;
         let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
@@ -161,22 +164,17 @@ impl Executor {
                     .outputs
                     .iter()
                     .all(|output| external.outputs.contains_key(output))
-                && !self
-                    .ep
-                    .requires_route_residency_request_boundary(self.instance_id);
+                && !route_residency.is_required();
             if artifact_use.is_some() {
-                // A reservation-backed artifact lease must remain live through
-                // the completion sync, then be released before the boundary
-                // starts the next atomic residency transition.
                 let sync = self.ep.sync();
                 drop(artifact_use);
                 match sync {
-                    Ok(()) => self.finish_device_validation_boundary_after_sync(),
+                    Ok(()) => self.finish_device_validation_boundary_after_sync(route_residency),
                     Err(error) => Err(error.into()),
                 }
             } else {
                 drop(artifact_use);
-                self.finish_device_validation(defer_until_binding_read)
+                self.finish_device_validation(defer_until_binding_read, route_residency)
             }
         };
         if let Some(submission) = validation_submission.as_mut() {
@@ -194,22 +192,39 @@ impl Executor {
         }
     }
 
-    fn finish_device_validation(&mut self, defer_until_binding_read: bool) -> Result<()> {
+    fn finish_device_validation(
+        &mut self,
+        defer_until_binding_read: bool,
+        route_residency: ExecutorRouteResidency,
+    ) -> Result<()> {
         if defer_until_binding_read && self.ep.defers_device_validation() {
             return Ok(());
         }
-        self.finish_device_validation_boundary()
+        self.finish_device_validation_boundary_with(route_residency)
     }
 
     pub(crate) fn finish_device_validation_boundary(&mut self) -> Result<()> {
+        let route_residency = self
+            .provider_artifact_readiness
+            .route_residency(self.ep.name(), self.instance_id)?;
+        self.finish_device_validation_boundary_with(route_residency)
+    }
+
+    fn finish_device_validation_boundary_with(
+        &mut self,
+        route_residency: ExecutorRouteResidency,
+    ) -> Result<()> {
         // This is the one request-level host boundary for deferred eager work
         // and for captured replay. The CUDA EP's explicit sync is unconditional,
         // so the latch read observes every kernel from this request.
         self.ep.sync()?;
-        self.finish_device_validation_boundary_after_sync()
+        self.finish_device_validation_boundary_after_sync(route_residency)
     }
 
-    pub(super) fn finish_device_validation_boundary_after_sync(&mut self) -> Result<()> {
+    pub(super) fn finish_device_validation_boundary_after_sync(
+        &mut self,
+        route_residency: ExecutorRouteResidency,
+    ) -> Result<()> {
         let flags = match self.pending_device_validation.take() {
             Some(token) => match self.ep.consume_device_validation_error(
                 self.validation_registration
@@ -223,6 +238,15 @@ impl Executor {
                     return Err(error.into());
                 }
             },
+            None if route_residency.is_required() => {
+                return Err(EpError::KernelFailed(format!(
+                    "{}: route-residency boundary for executor {} is missing its \
+                     owner-scoped device-validation receipt",
+                    self.ep.name(),
+                    self.instance_id.get()
+                ))
+                .into());
+            }
             None => 0,
         };
         match flags {
@@ -231,11 +255,13 @@ impl Executor {
                 // captured replay have completed (the sync above), the stream is
                 // no longer capturing, and the device validation latch is clean.
                 // Consume any completed route-telemetry window here and nowhere
-                // else (issue #1810 Slice 7C). Every EP declares this explicitly;
-                // non-residency EPs return Ok(()) and the CUDA EP is gated off by
-                // default, so this is byte-identical unless a provider opts in.
-                self.ep
-                    .consume_route_residency_at_boundary_for_executor(self.instance_id)?;
+                // else (issue #1810 Slice 7C). Non-residency EPs use the no-op
+                // default and the CUDA EP is gated off by default, so this is
+                // byte-identical unless a provider opts in.
+                if let Some(owner) = route_residency.owner() {
+                    self.ep
+                        .consume_route_residency_at_boundary_for_executor(owner)?;
+                }
                 Ok(())
             }
             flags => Err(EpError::KernelFailed(format!(

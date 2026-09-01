@@ -4,7 +4,8 @@
 //! Slice 7B (`route_residency_consume_gpu.rs`) proved the raw consumer
 //! (`consume_route_window_at_boundary`) drives a real VMM transition. Slice 7C
 //! wires that consumer into the real request lifecycle: the session executor
-//! calls `ExecutionProvider::consume_route_residency_at_boundary` once per
+//! calls `ExecutionProvider::consume_route_residency_at_boundary_for_executor`
+//! once per
 //! top-level request at the single coarse safe boundary
 //! (`Executor::finish_device_validation`, after `sync()`), and the CUDA EP
 //! override drives snapshot → consume → reset through an installed
@@ -48,9 +49,7 @@ use onnx_runtime_cuda_memory::virtual_memory::{PhysicalHandlePool, PhysicalLocat
 use onnx_runtime_cuda_memory::vmm_allocator::{
     CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV, CudaVmmAllocator,
 };
-use onnx_runtime_ep_api::{
-    ExecutionProvider, ExpertWeightGroup, LazyWeightBoundary, Result, expert_weight_groups,
-};
+use onnx_runtime_ep_api::{ExpertWeightGroup, LazyWeightBoundary, Result, expert_weight_groups};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
 use onnx_runtime_ep_cuda::kernels::expert_route_telemetry::{
@@ -149,6 +148,23 @@ impl RouteTelemetrySource for WindowSource {
 // ---------------------------------------------------------------------------
 
 static GPU_SERIAL: Mutex<()> = Mutex::new(());
+
+#[cfg(not(feature = "gpu-tests"))]
+trait RouteResidencyGpuTestSupport {
+    fn install_route_residency_boundary(&self, boundary: Arc<RouteResidencyBoundary>);
+    fn consume_route_residency_at_boundary(&self) -> Result<()>;
+}
+
+#[cfg(not(feature = "gpu-tests"))]
+impl RouteResidencyGpuTestSupport for CudaExecutionProvider {
+    fn install_route_residency_boundary(&self, _boundary: Arc<RouteResidencyBoundary>) {
+        panic!("route-residency GPU test support requires feature `gpu-tests`")
+    }
+
+    fn consume_route_residency_at_boundary(&self) -> Result<()> {
+        panic!("route-residency GPU test support requires feature `gpu-tests`")
+    }
+}
 
 fn provider_or_skip(label: &str) -> Option<CudaExecutionProvider> {
     match CudaExecutionProvider::new(0) {
@@ -1284,12 +1300,18 @@ fn builder_assembles_firing_binding_from_graph_banks() {
     assert_eq!(pat_fc1, got_fc1, "fc1 content corrupted");
     assert_eq!(pat_fc2, got_fc2, "fc2 content corrupted");
 
-    // Draining removes the binding: the consumer is inert again.
+    // Draining removes the binding. A caller that still claims the boundary is
+    // required must fail closed rather than silently treating retirement as
+    // default-off.
     gate_on();
     provider.drain_route_residency_boundary();
-    provider
+    let error = provider
         .consume_route_residency_at_boundary()
-        .expect("drained boundary Ok");
+        .expect_err("a drained required boundary must fail closed");
+    assert!(
+        error.to_string().contains("no live owner-scoped boundary"),
+        "drained-boundary diagnostic: {error}"
+    );
     assert_eq!(
         source.snapshot_calls(),
         2,
@@ -1350,10 +1372,16 @@ fn try_install_fail_closed_installs_nothing() {
     );
     assert_eq!(outcome, RouteResidencyInstallOutcome::OffloadDisabled);
     assert_eq!(diag.declines(), 1, "offload-disabled decline recorded");
-    // Nothing installed: a gate-on boundary runs no consumer.
-    provider
+    // Nothing installed: a caller that nevertheless claims a required
+    // boundary fails closed. Production requests consume the resolved
+    // `Declined` capability and never enter this method.
+    let error = provider
         .consume_route_residency_at_boundary()
-        .expect("no-binding boundary Ok");
+        .expect_err("a missing required boundary must fail closed");
+    assert!(
+        error.to_string().contains("no live owner-scoped boundary"),
+        "missing-boundary diagnostic: {error}"
+    );
     assert_eq!(diag.boundaries(), 0, "no binding was installed");
 
     // Gate off -> GateDisabled before any discovery/allocation.
@@ -1435,9 +1463,13 @@ fn try_install_on_offload_authority_installs_and_fires() {
         "dense-only graph must be a typed reject, got {rejected:?}"
     );
     assert_eq!(diag.installs(), 0, "reject installs nothing");
-    provider
+    let error = provider
         .consume_route_residency_at_boundary()
-        .expect("post-reject boundary Ok");
+        .expect_err("a rejected installation cannot satisfy a required boundary");
+    assert!(
+        error.to_string().contains("no live owner-scoped boundary"),
+        "rejected-install diagnostic: {error}"
+    );
     assert_eq!(diag.boundaries(), 0, "no binding installed after reject");
 
     // A valid two-bank graph installs a real binding through the EP seam.
@@ -1481,9 +1513,13 @@ fn try_install_on_offload_authority_installs_and_fires() {
 
     // Teardown drains the binding (mirrors `shutdown`).
     provider.drain_route_residency_boundary();
-    provider
+    let error = provider
         .consume_route_residency_at_boundary()
-        .expect("drained boundary Ok");
+        .expect_err("a drained required boundary must fail closed");
+    assert!(
+        error.to_string().contains("no live owner-scoped boundary"),
+        "drained-boundary diagnostic: {error}"
+    );
     assert_eq!(
         source.snapshot_calls(),
         1,

@@ -1,100 +1,228 @@
-use std::path::PathBuf;
+//! #1810 Slice 7E — GPU tests for the *real-producer* route-residency install
+//! seam on the CUDA EP.
+//!
+//! Slice 7D (`route_residency_boundary_gpu.rs`) drove the boundary *consumer*
+//! through the production caller, but its producer window came from a
+//! controllable `RouteTelemetrySource` double, its per-bank artifacts were not
+//! retained by the EP, and no session/model-build call constructed the binding.
+//! Slice 7E removes those three limitations. These tests therefore use **no**
+//! telemetry double: they register the **actual** executing
+//! [`QMoEKernel`](onnx_runtime_ep_cuda) producer through the EP's own kernel
+//! factory (exactly as the session's `compile_all` pre-warm does), then invoke
+//! the **same trait method the session executor calls after resolved compile**
+//! (`ExecutionProvider::inspect_executor_artifacts`) and
+//! assert the whole real seam:
+//!
+//! * the EP owns the real producer source for the compiled `QMoE` node,
+//! * the enabled build path discovers the bank, retains its per-bank artifacts,
+//!   and reaches the shipped honest typed decline
+//!   (`RouteResidencyBindingReject::NoPerBankReservation`) — the residual is the
+//!   per-bank dedicated VMM reservation, disclosed in the decision record — with
+//!   **no** silent whole-bank / default-success and **no** boundary installed,
+//! * the default-off path allocates/registers no producer, installs nothing,
+//!   retains nothing, and touches no route diagnostics at all (a pure inert
+//!   early return).
+//!
+//! No transition is fabricated: on the shipped shared-reservation residency the
+//! honest outcome is a typed decline, and these tests assert exactly that.
+//!
+//! Requires an idle CUDA device. Run solo, after verifying the target GPU is
+//! idle with `nvidia-smi`:
+//! ```text
+//! CUDA_VISIBLE_DEVICES=<idle> cargo test -p onnx-runtime-ep-cuda \
+//!   --features cuda,cuda-13000,gpu-tests --release \
+//!   --test route_residency_install_gpu \
+//!   -- --ignored --nocapture --test-threads=1
+//! ```
+
+#![allow(clippy::uninlined_format_args)]
+
+use std::ffi::OsString;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
-    ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
-    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExternalMmapRegion, FinalizedExpertBank,
-    FinalizedExpertWeight, LazyWeight, LazyWeightBoundary, ResidentWeight, expert_weight_groups,
+    ExecutionProvider, ExecutorArtifactGeneration, ExecutorArtifactPending,
+    ExecutorArtifactProviderId, ExecutorArtifactReadinessEpoch, ExecutorArtifactState,
+    ExecutorInstanceId, ExecutorRouteResidencyConfig,
 };
+use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
-use onnx_runtime_ep_cuda::route_residency::{
-    RouteResidencyBindingReject, RouteResidencyInstallOutcome,
+use onnx_runtime_ep_cuda::weight_paging::DeviceOffloadPolicy;
+use onnx_runtime_ir::{
+    Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
-use onnx_runtime_ep_cuda::weight_paging::{DeviceOffloadPolicy, RouteBankReservationReject};
-use onnx_runtime_ep_cuda::{CudaExecutionProvider, RouteFinalizationCommitInterlock};
-use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, ValueId, WeightRef, static_shape};
-use onnx_runtime_loader::{ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog};
-use onnx_runtime_memory_governor::{DeviceKey, LeaseLedger, LedgerGovernor, MemoryGovernor};
+use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
 
-const EXPERTS: usize = 4;
-const EXPERT_BYTES: usize = 2 << 20;
-const TENSOR_BYTES: usize = EXPERTS * EXPERT_BYTES;
-static SERIAL: Mutex<()> = Mutex::new(());
+// Serialize GPU test bodies in this binary: the coarse gate is a process-global
+// env var, so two tests toggling it concurrently would race.
+static GPU_SERIAL: Mutex<()> = Mutex::new(());
 
-struct GateGuard(Option<String>);
+#[derive(Clone, Copy)]
+struct TestArtifactScope {
+    provider: ExecutorArtifactProviderId,
+    executor: ExecutorInstanceId,
+    generation: ExecutorArtifactGeneration,
+    route_residency: ExecutorRouteResidencyConfig,
+}
 
-impl GateGuard {
-    fn set(enabled: bool) -> Self {
-        let previous = std::env::var(COARSE_RESIDENCY_ENABLE_ENV).ok();
+impl TestArtifactScope {
+    fn route_residency(self) -> ExecutorRouteResidencyConfig {
+        self.route_residency
+    }
+}
+
+fn fresh_executor() -> ExecutorInstanceId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    ExecutorInstanceId::from_raw(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+fn artifact_config(
+    provider: &CudaExecutionProvider,
+    executor: ExecutorInstanceId,
+) -> TestArtifactScope {
+    let policy = provider
+        .executor_artifact_policy()
+        .expect("resolve executor artifact policy");
+    assert_eq!(policy.device(), provider.device_id());
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    TestArtifactScope {
+        provider: policy.provider(),
+        executor,
+        generation: ExecutorArtifactGeneration::from_raw(NEXT.fetch_add(1, Ordering::Relaxed)),
+        route_residency: policy.route_residency(),
+    }
+}
+
+fn finalize_artifacts(
+    provider: &CudaExecutionProvider,
+    config: TestArtifactScope,
+    graph: &Graph,
+    readiness: ExecutorArtifactReadinessEpoch,
+) -> onnx_runtime_ep_api::Result<ExecutorArtifactState> {
+    let report = provider.inspect_executor_artifacts(
+        config.provider,
+        config.executor,
+        config.generation,
+        readiness,
+        graph,
+        &[],
+    )?;
+    assert_eq!(report.executor(), config.executor);
+    assert_eq!(report.provider(), config.provider);
+    assert_eq!(report.generation(), config.generation);
+    assert_eq!(report.readiness(), readiness);
+    Ok(report.into_state())
+}
+
+struct ScopedGate {
+    previous: Option<OsString>,
+}
+
+impl ScopedGate {
+    fn disabled() -> Self {
+        let previous = std::env::var_os(COARSE_RESIDENCY_ENABLE_ENV);
+        unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
+        Self { previous }
+    }
+
+    fn enabled() -> Self {
+        let previous = std::env::var_os(COARSE_RESIDENCY_ENABLE_ENV);
+        unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+        Self { previous }
+    }
+
+    fn set_enabled(&self, enabled: bool) {
         if enabled {
             unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
         } else {
             unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
         }
-        Self(previous)
     }
 }
 
-impl Drop for GateGuard {
+impl Drop for ScopedGate {
     fn drop(&mut self) {
-        match self.0.take() {
+        match self.previous.take() {
             Some(value) => unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, value) },
             None => unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) },
         }
     }
 }
 
-fn provider_or_skip(label: &str) -> Option<CudaExecutionProvider> {
-    let ledger = LeaseLedger::new_for_device(DeviceKey::device(0), 1 << 30, 1 << 30, 0);
-    let governor: Arc<dyn MemoryGovernor + Send + Sync> = Arc::new(LedgerGovernor::new(ledger));
+/// A CUDA EP with weight offload/coarse residency *available* (so `self.residency`
+/// is `Some` and the install seam can get past `OffloadDisabled`), or `None` when
+/// no CUDA device is present (the test then skips, staying green on CPU-only CI).
+fn offload_provider_or_skip(label: &str) -> Option<CudaExecutionProvider> {
+    let governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+        Arc::new(LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0)));
     let policy = DeviceOffloadPolicy {
         enabled: true,
-        device_budget_bytes: Some(64 << 20),
+        device_budget_bytes: Some((2usize << 20) as u64),
         ..DeviceOffloadPolicy::default()
     };
     match CudaExecutionProvider::initialized_with_offload_policy_and_governor(0, policy, governor) {
-        Ok(provider) => Some(provider),
-        Err(error) => {
-            eprintln!("SKIP {label}: {error}");
+        Ok(p) => Some(p),
+        Err(e) => {
+            println!("SKIP [{label}]: no CUDA device / offload EP unavailable: {e}");
             None
         }
     }
 }
 
-fn external_initializer(graph: &mut Graph, name: &str, dtype: DataType, offset: usize) -> ValueId {
-    let storage_elements = match dtype {
-        DataType::Uint8 => EXPERT_BYTES,
-        DataType::Float32 => EXPERT_BYTES / 4,
-        _ => unreachable!(),
+fn offload_provider_with_route_config_or_skip(
+    label: &str,
+    route_config: ExecutorRouteResidencyConfig,
+) -> Option<CudaExecutionProvider> {
+    let governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+        Arc::new(LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0)));
+    let policy = DeviceOffloadPolicy {
+        enabled: true,
+        device_budget_bytes: Some((2usize << 20) as u64),
+        ..DeviceOffloadPolicy::default()
     };
-    let value = graph.create_named_value(name, dtype, static_shape([EXPERTS, 1, storage_elements]));
+    match CudaExecutionProvider::initialized_with_offload_policy_governor_and_route_config(
+        0,
+        policy,
+        governor,
+        route_config,
+    ) {
+        Ok(provider) => Some(provider),
+        Err(error) => {
+            println!("SKIP [{label}]: no CUDA device / offload EP unavailable: {error}");
+            None
+        }
+    }
+}
+
+fn inline_u8_initializer(graph: &mut Graph, name: &str) -> ValueId {
+    let value = graph.create_named_value(name, DataType::Uint8, static_shape([4]));
     graph.set_initializer(
         value,
-        WeightRef::External {
-            path: PathBuf::from("route-bank.bin"),
-            offset,
-            length: TENSOR_BYTES,
-            dtype,
-            dims: vec![EXPERTS, 1, storage_elements],
-        },
+        WeightRef::Inline(TensorData::from_raw(DataType::Uint8, vec![4], vec![0u8; 4])),
     );
     value
 }
 
-fn qmoe_graph_and_bank(mapping_id: usize) -> (Graph, NodeId, FinalizedExpertBank) {
+/// A shape-faithful single-layer `QMoE` graph: the routed multi-tensor expert
+/// group (fc1/fc2/fc3 weights+scales+bias, `com.microsoft` layout) that
+/// `expert_weight_groups` discovers, carrying the attributes a real
+/// `QMoEKernel` needs to be constructed (`create_kernel` reads only attributes,
+/// no weight *data* is required to build the executing kernel instance). Returns
+/// the inserted node id and its ordered bank member `ValueId`s.
+fn qmoe_graph() -> (Graph, NodeId, Vec<ValueId>) {
     let mut graph = Graph::new();
     graph.opset_imports.insert("com.microsoft".into(), 1);
-    let input = graph.create_named_value("hidden", DataType::Float32, static_shape([1, 4]));
-    let router = graph.create_named_value(
-        "router_probs",
-        DataType::Float32,
-        static_shape([1, EXPERTS]),
-    );
-    let fc1_w = external_initializer(&mut graph, "fc1_w", DataType::Uint8, 0);
-    let fc1_s = external_initializer(&mut graph, "fc1_s", DataType::Float32, TENSOR_BYTES);
-    let fc2_w = external_initializer(&mut graph, "fc2_w", DataType::Uint8, 2 * TENSOR_BYTES);
-    let fc2_s = external_initializer(&mut graph, "fc2_s", DataType::Float32, 3 * TENSOR_BYTES);
-    let output = graph.create_named_value("output", DataType::Float32, static_shape([1, 4]));
+    let input = graph.create_named_value("hidden", DataType::Float32, static_shape([4]));
+    let router = graph.create_named_value("router_probs", DataType::Float32, static_shape([4]));
+    let fc1_w = inline_u8_initializer(&mut graph, "fc1_experts_weights");
+    let fc1_s = inline_u8_initializer(&mut graph, "fc1_scales");
+    let fc1_b = inline_u8_initializer(&mut graph, "fc1_experts_bias");
+    let fc2_w = inline_u8_initializer(&mut graph, "fc2_experts_weights");
+    let fc2_s = inline_u8_initializer(&mut graph, "fc2_scales");
+    let fc3_w = inline_u8_initializer(&mut graph, "fc3_experts_weights");
+    let fc3_s = inline_u8_initializer(&mut graph, "fc3_scales");
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
     let mut node = Node::new(
         NodeId(0),
         "QMoE",
@@ -103,20 +231,20 @@ fn qmoe_graph_and_bank(mapping_id: usize) -> (Graph, NodeId, FinalizedExpertBank
             Some(router),
             Some(fc1_w),
             Some(fc1_s),
-            None,
+            Some(fc1_b),
             Some(fc2_w),
             Some(fc2_s),
             None,
-            None,
-            None,
+            Some(fc3_w),
+            Some(fc3_s),
         ],
         vec![output],
     );
-    node.domain = "com.microsoft".into();
+    node.domain = "com.microsoft".to_string();
     for (name, value) in [
         ("expert_weight_bits", Attribute::Int(4)),
         ("block_size", Attribute::Int(16)),
-        ("k", Attribute::Int(1)),
+        ("k", Attribute::Int(2)),
         ("activation_type", Attribute::String(b"silu".to_vec())),
         ("normalize_routing_weights", Attribute::Int(0)),
         ("swiglu_fusion", Attribute::Int(0)),
@@ -124,723 +252,793 @@ fn qmoe_graph_and_bank(mapping_id: usize) -> (Graph, NodeId, FinalizedExpertBank
         node.attributes.insert(name.into(), value);
     }
     let node_id = graph.insert_node(node);
-    let group = expert_weight_groups(&graph)
-        .into_iter()
-        .next()
-        .expect("QMoE group");
-    let members = group
-        .members
-        .iter()
-        .map(|&value| {
-            let weight_ref = graph.initializers[&value].clone();
-            let (path, offset, dtype, shape) = match &weight_ref {
-                WeightRef::External {
-                    path,
-                    offset,
-                    dtype,
-                    dims,
-                    ..
-                } => (path.clone(), *offset, *dtype, dims.clone()),
-                WeightRef::Inline(_) => unreachable!(),
-            };
-            let layout = ExpertTensorLayout {
-                version: 1,
-                experts: EXPERTS,
-                rows_per_expert: 1,
-                storage_elements_per_row: shape[2],
-                order: ExpertStorageOrder::ExpertMajor,
-                quantization: None,
-            };
-            let catalog = WeightRegionCatalog::classify(&weight_ref, layout);
-            assert!(catalog.is_pageable());
-            let bytes: Arc<[u8]> = vec![value.0 as u8 + 1; TENSOR_BYTES].into();
-            let resident_shape = shape.clone();
-            let lazy = LazyWeight::new(
-                LazyWeightBoundary::QMoe,
-                dtype,
-                shape,
-                vec![ExternalMmapRegion {
-                    mapping_id,
-                    offset,
-                    len: TENSOR_BYTES,
-                }],
-                move || ResidentWeight::new(dtype, resident_shape.clone(), Arc::clone(&bytes)),
-            )
-            .expect("lazy weight");
-            FinalizedExpertWeight {
-                value,
-                external_path: path,
-                weight: lazy,
-                catalog,
-            }
-        })
-        .collect();
-    (graph, node_id, FinalizedExpertBank { group, members })
+    graph.add_output(output);
+    (
+        graph,
+        node_id,
+        vec![fc1_w, fc1_s, fc1_b, fc2_w, fc2_s, fc3_w, fc3_s],
+    )
 }
 
-fn compile_real_qmoe(
+fn block_quantized_moe_graph() -> (Graph, NodeId) {
+    const ROWS: usize = 1;
+    const HIDDEN: usize = 32;
+    const EXPERTS: usize = 2;
+    const INTERMEDIATE: usize = 32;
+    const MXFP4_QK: usize = 32;
+    const MXFP4_BLOCK_BYTES: usize = 17;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("pkg.nxrt".into(), 1);
+    let input = graph.create_named_value("hidden", DataType::Float32, static_shape([ROWS, HIDDEN]));
+    graph.add_input(input);
+    let router = graph.create_named_value(
+        "router_probs",
+        DataType::Float32,
+        static_shape([ROWS, EXPERTS]),
+    );
+    graph.add_input(router);
+    let weight_shape = [EXPERTS, INTERMEDIATE, HIDDEN / MXFP4_QK, MXFP4_BLOCK_BYTES];
+    let fc1_weight =
+        graph.create_named_value("fc1_experts", DataType::Uint8, static_shape(weight_shape));
+    graph.set_initializer(
+        fc1_weight,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Uint8,
+            weight_shape.to_vec(),
+            vec![0u8; weight_shape.iter().product()],
+        )),
+    );
+    let fc2_weight =
+        graph.create_named_value("fc2_experts", DataType::Uint8, static_shape(weight_shape));
+    graph.set_initializer(
+        fc2_weight,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Uint8,
+            weight_shape.to_vec(),
+            vec![0u8; weight_shape.iter().product()],
+        )),
+    );
+    let output =
+        graph.create_named_value("output", DataType::Float32, static_shape([ROWS, HIDDEN]));
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![
+            Some(input),
+            Some(router),
+            Some(fc1_weight),
+            None,
+            Some(fc2_weight),
+            None,
+        ],
+        vec![output],
+    );
+    node.domain = "pkg.nxrt".to_string();
+    for (name, value) in [
+        ("k", Attribute::Int(2)),
+        ("activation_type", Attribute::String(b"silu".to_vec())),
+        ("normalize_routing_weights", Attribute::Int(0)),
+        ("swiglu_fusion", Attribute::Int(0)),
+        ("fc1_format", Attribute::String(b"mxfp4".to_vec())),
+        ("fc2_format", Attribute::String(b"mxfp4".to_vec())),
+    ] {
+        node.attributes.insert(name.into(), value);
+    }
+    let node_id = graph.insert_node(node);
+    graph.add_output(output);
+    (graph, node_id)
+}
+
+/// Compile the graph's `QMoE` node through the EP's own factory so the actual
+/// executing `QMoEKernel` registers as this EP's route-telemetry producer —
+/// exactly the path the session's `compile_all` pre-warm takes. Returns the
+/// boxed kernel so it (and thus the shared `Arc`) stays alive for the assertion.
+fn compile_qmoe_through_ep(
     provider: &CudaExecutionProvider,
-    executor: ExecutorInstanceId,
+    config: TestArtifactScope,
     graph: &Graph,
-    node: NodeId,
+    node_id: NodeId,
 ) -> Box<dyn onnx_runtime_ep_api::Kernel> {
     provider
-        .get_kernel_for_executor(executor, graph.node(node), &[], 1)
-        .expect("compile real QMoE producer")
+        .get_kernel_for_executor(
+            config.provider,
+            config.executor,
+            config.generation,
+            graph.node(node_id),
+            &[],
+            1,
+        )
+        .expect("EP constructs the real QMoE kernel from its attributes")
 }
 
-#[test]
-#[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
-fn real_producer_installs_executor_scoped_banks_once() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let _gate = GateGuard::set(true);
-    let Some(provider) = provider_or_skip("install") else {
-        return;
-    };
-    let provider = Arc::new(provider);
-    let (graph, node, bank) = qmoe_graph_and_bank(11);
-    let first = ExecutorInstanceId::fresh();
-    let second = ExecutorInstanceId::fresh();
-    let _first_kernel = compile_real_qmoe(&provider, first, &graph, node);
-    let _second_kernel = compile_real_qmoe(&provider, second, &graph, node);
-
-    assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                first,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-                std::slice::from_ref(&bank),
-            )
-            .expect("finalize first executor"),
-        ExecutorArtifactFinalization::Complete
-    );
-    assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                second,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-                std::slice::from_ref(&bank),
-            )
-            .expect("finalize second executor"),
-        ExecutorArtifactFinalization::Complete
-    );
-    for executor in [first, second] {
-        let status = provider.route_residency_executor_status(executor);
-        assert_eq!(status.finalization_attempts, 1);
-        assert_eq!(
-            status.outcome,
-            Some(RouteResidencyInstallOutcome::Installed { banks: 4 })
-        );
-    }
-    assert_eq!(
-        provider
-            .residency()
-            .expect("residency")
-            .route_reservation_count(),
-        2
-    );
-    let first_ranges: Vec<_> = bank
-        .group
-        .members
-        .iter()
-        .map(|&value| {
-            provider
-                .residency()
-                .unwrap()
-                .coarse_route_bank_reservation(first, value)
-                .unwrap()
-                .with_reservation_mut(|reservation, _| reservation.base_ptr())
-        })
-        .collect();
-    let second_ranges: Vec<_> = bank
-        .group
-        .members
-        .iter()
-        .map(|&value| {
-            provider
-                .residency()
-                .unwrap()
-                .coarse_route_bank_reservation(second, value)
-                .unwrap()
-                .with_reservation_mut(|reservation, _| reservation.base_ptr())
-        })
-        .collect();
-    assert!(
-        first_ranges
-            .iter()
-            .all(|first| !second_ranges.contains(first)),
-        "sibling executors own distinct stable addresses"
-    );
-    let first_requirement = provider
-        .executor_artifact_requirement(first)
-        .expect("query first executor requirement")
-        .expect("installed reservations publish an exact requirement");
-
-    let _specialization = provider
-        .get_kernel_for_executor(first, graph.node(node), &[vec![2, 4]], 1)
-        .expect("dynamic specialization");
-    assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                first,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(2),
-                std::slice::from_ref(&bank),
-            )
-            .expect("finalize later specialization"),
-        ExecutorArtifactFinalization::Complete
-    );
-    assert_eq!(
-        provider
-            .route_residency_executor_status(first)
-            .finalization_attempts,
-        1
-    );
-
-    let holder = first_requirement
-        .acquire_use()
-        .expect("acquire pre-retirement use lease");
-    let releases_before = provider.deferred_release_stats();
-    let drain_provider = Arc::clone(&provider);
-    let (returned_tx, returned_rx) = std::sync::mpsc::channel();
-    let drain = std::thread::spawn(move || {
-        drain_provider.drain_executor_artifacts(first);
-        returned_tx.send(()).unwrap();
-    });
-    returned_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("public drain must return without waiting for the held requirement guard");
-    drain.join().unwrap();
-    let replay_rejection = first_requirement
-        .acquire_use()
-        .err()
-        .expect("retiring requirement rejects replay");
-    assert!(replay_rejection.to_string().contains("retiring"));
-    assert_eq!(
-        provider.residency().unwrap().route_reservation_count(),
-        2,
-        "the deferred authority must keep the first executor's mappings owned while held"
-    );
-    assert_eq!(
-        provider
-            .route_residency_executor_status(first)
-            .reservation_removals,
-        0
-    );
-    let deferred = provider.route_residency_retirement_census();
-    assert_eq!(deferred.active_registry_entries, 1);
-    assert_eq!(deferred.retirement_registry_entries, 1);
-    assert_eq!(deferred.live_retirement_records, 1);
-    assert_eq!(deferred.reservation_registry_entries, 2);
-    assert_eq!(deferred.retirements_started, 1);
-    assert_eq!(deferred.deferred_cleanups, 1);
-    assert_eq!(deferred.cleanups_scheduled, 0);
-    assert_eq!(deferred.cleanups_executed, 0);
-    drop(holder);
-    assert!(
-        provider
-            .release_queue()
-            .wait_until_idle(std::time::Duration::from_secs(30)),
-        "last guard release must enqueue and complete deferred cleanup: {:?}",
-        provider.deferred_release_stats()
-    );
-    provider.drain_executor_artifacts(first);
-    assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
-    assert!(provider.route_residency_scopes().contains(&second));
-    assert_eq!(
-        provider.route_residency_executor_status(first).drain_calls,
-        1
-    );
-    assert_eq!(
-        provider
-            .route_residency_executor_status(first)
-            .reservation_removals,
-        1
-    );
-    let releases_after = provider.deferred_release_stats();
-    assert!(
-        releases_after.completed >= releases_before.completed + 5,
-        "one cleanup action plus four reservation unmaps must complete: before={releases_before:?} \
-         after={releases_after:?}"
-    );
-    assert!(
-        releases_after.mapped_refunded_bytes
-            >= releases_before.mapped_refunded_bytes + 4 * TENSOR_BYTES as u64,
-        "all four exact bank reservations must report their unmapped bytes"
-    );
-    let completed = provider.route_residency_retirement_census();
-    assert_eq!(completed.cleanups_scheduled, 1);
-    assert_eq!(completed.cleanups_executed, 1);
-    let retired = first_requirement
-        .acquire_use()
-        .err()
-        .expect("requirement survives registry removal as retired");
-    assert!(retired.to_string().contains("retired"));
-    drop(first_requirement);
-    assert_eq!(
-        provider
-            .route_residency_retirement_census()
-            .retirement_registry_entries,
-        0,
-        "dead generation tombstones are pruned once no graph/requirement/lease can reference them"
-    );
-    provider.drain_executor_artifacts(second);
-}
+// ---------------------------------------------------------------------------
+// Test 1: the enabled build path binds this EP's *real* producer and reaches the
+// shipped honest typed decline over real, retained artifacts — no double, no
+// silent success, no boundary installed.
+// ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
-fn repeated_retirement_invalidates_admitted_finalizer_and_rolls_back_once_per_epoch() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let _gate = GateGuard::set(true);
-    let Some(provider) = provider_or_skip("retire before finalization commit") else {
-        return;
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn enabled_report_without_finalized_banks_typed_declines_without_install() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\n=== enabled_report_without_finalized_banks_typed_declines_without_install ===");
+    let _environment = ScopedGate::enabled();
+    let provider = match offload_provider_or_skip("enabled") {
+        Some(p) => p,
+        None => return,
     };
-    let provider = Arc::new(provider);
-    let (graph, node, bank) = qmoe_graph_and_bank(13);
-    let executor = ExecutorInstanceId::fresh();
-    let rollbacks_before = provider
-        .route_residency_retirement_census()
-        .prepared_rollbacks;
 
-    for cycle in 0..4 {
-        let kernel = compile_real_qmoe(&provider, executor, &graph, node);
-        let interlock = Arc::new(RouteFinalizationCommitInterlock::new());
-        std::thread::scope(|scope| {
-            let finalize_provider = Arc::clone(&provider);
-            let finalize_interlock = Arc::clone(&interlock);
-            let finalize_graph = &graph;
-            let finalize_bank = &bank;
-            let finalize = scope.spawn(move || {
-                finalize_provider.finalize_route_residency_for_executor_with_commit_interlock(
-                    executor,
-                    finalize_graph,
-                    ExecutorArtifactReadinessEpoch::new(cycle + 1),
-                    std::slice::from_ref(finalize_bank),
-                    &finalize_interlock,
-                )
-            });
-            interlock.wait_until_admitted();
-            assert_eq!(
-                provider.residency().unwrap().route_reservation_count(),
-                1,
-                "cycle {cycle} must pause after a real reservation was prepared"
-            );
+    let (graph, node_id, _members) = qmoe_graph();
+    let executor = fresh_executor();
+    let config = artifact_config(&provider, executor);
 
-            provider.drain_executor_artifacts(executor);
-            interlock.resume_commit();
-            let error = finalize
-                .join()
-                .expect("finalizer thread")
-                .expect_err("retirement must invalidate the admitted commit");
-            assert!(error.to_string().contains("invalidated before commit"));
-        });
-        drop(kernel);
-
-        assert_eq!(
-            provider.residency().unwrap().route_reservation_count(),
-            0,
-            "cycle {cycle} must remove the rejected preparation exactly once"
-        );
-        let census = provider.route_residency_retirement_census();
-        assert_eq!(census.active_registry_entries, 0, "cycle {cycle}");
-        assert_eq!(census.retirement_registry_entries, 0, "cycle {cycle}");
-        assert_eq!(census.reservation_registry_entries, 0, "cycle {cycle}");
-        assert_eq!(
-            census.prepared_rollbacks,
-            rollbacks_before + cycle + 1,
-            "cycle {cycle} must transfer rollback ownership exactly once"
-        );
-    }
-
-    let replacement_kernel = compile_real_qmoe(&provider, executor, &graph, node);
-    assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                executor,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(5),
-                std::slice::from_ref(&bank),
-            )
-            .expect("replacement after stale rollback"),
-        ExecutorArtifactFinalization::Complete
+    // Before compile the EP owns no producer source and has retained nothing.
+    assert!(
+        provider.route_telemetry_sources(executor).is_empty(),
+        "no producer registered before the QMoE node is compiled"
     );
-    assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
-    provider.drain_executor_artifacts(executor);
-    drop(replacement_kernel);
-}
+    assert!(
+        provider
+            .retained_route_residency_artifacts(executor)
+            .is_none(),
+        "nothing retained before an enabled build"
+    );
 
-#[test]
-#[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
-fn commit_authority_admits_exactly_one_concurrent_finalizer() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let _gate = GateGuard::set(true);
-    let Some(provider) = provider_or_skip("commit before retirement") else {
-        return;
-    };
-    let provider = Arc::new(provider);
-    let (graph, node, bank) = qmoe_graph_and_bank(15);
-    let executor = ExecutorInstanceId::fresh();
-    let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
-    let interlock = Arc::new(RouteFinalizationCommitInterlock::new());
+    // Compile the QMoE node through the EP's factory: the executing kernel
+    // registers itself as the EP-owned producer (goal 2, no test double).
+    let _kernel = compile_qmoe_through_ep(&provider, config, &graph, node_id);
+    let sources = provider.route_telemetry_sources(executor);
+    assert!(
+        sources.contains_key(&node_id),
+        "the actual executing QMoE kernel is the EP-owned producer for its node"
+    );
+    assert!(
+        provider
+            .route_telemetry_producer(executor, node_id)
+            .is_some(),
+        "the concrete QMoE producer is reachable by node id"
+    );
 
-    std::thread::scope(|scope| {
-        let finalize_provider = Arc::clone(&provider);
-        let finalize_interlock = Arc::clone(&interlock);
-        let finalize_graph = &graph;
-        let finalize_bank = &bank;
-        let finalize = scope.spawn(move || {
-            finalize_provider.finalize_route_residency_for_executor_with_commit_interlock(
-                executor,
-                finalize_graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-                std::slice::from_ref(finalize_bank),
-                &finalize_interlock,
-            )
-        });
-        interlock.wait_until_admitted();
-        let sibling = provider
-            .finalize_executor_artifacts(
-                executor,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-                std::slice::from_ref(&bank),
-            )
-            .expect("concurrent finalizer observes admission");
-        assert!(matches!(
-            sibling,
-            ExecutorArtifactFinalization::Pending(
-                ExecutorArtifactPending::ProviderReadiness { .. }
-            )
-        ));
-        assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
-
-        interlock.resume_commit();
-        assert_eq!(
-            finalize
-                .join()
-                .expect("finalizer thread")
-                .expect("admitted finalizer commits"),
-            ExecutorArtifactFinalization::Complete
-        );
-    });
-
+    // Invoke the exact transition the session executor calls after resolved
+    // compilation.
+    assert_eq!(
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("finalize compiled executor"),
+        ExecutorArtifactState::Declined
+    );
     let status = provider.route_residency_executor_status(executor);
     assert_eq!(status.finalization_attempts, 1);
-    assert!(matches!(
-        status.outcome,
-        Some(RouteResidencyInstallOutcome::Installed { banks: 4 })
+    let stable_source = provider
+        .route_telemetry_producer(executor, node_id)
+        .expect("compiled QMoE has a stable producer");
+    let _specialization = provider
+        .get_kernel_for_executor(
+            config.provider,
+            config.executor,
+            config.generation,
+            graph.node(node_id),
+            &[vec![2]],
+            1,
+        )
+        .expect("dynamic QMoE specialization compiles");
+    assert!(Arc::ptr_eq(
+        &stable_source,
+        &provider
+            .route_telemetry_producer(executor, node_id)
+            .expect("specialization retains the source")
     ));
-    assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
-    provider.drain_executor_artifacts(executor);
-}
-
-#[test]
-#[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
-fn retirement_registry_reclaims_churn_and_blocks_live_generation_aba() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let _gate = GateGuard::set(true);
-    let Some(provider) = provider_or_skip("retirement churn") else {
-        return;
-    };
-    let provider = Arc::new(provider);
-    let (graph, node, bank) = qmoe_graph_and_bank(17);
-    let reused = ExecutorInstanceId::fresh();
-    let mut first_generation = None;
-
-    for cycle in 0..8 {
-        let executor = if cycle == 0 {
-            reused
-        } else {
-            ExecutorInstanceId::fresh()
-        };
-        let kernel = compile_real_qmoe(&provider, executor, &graph, node);
-        assert_eq!(
-            provider
-                .finalize_executor_artifacts(
-                    executor,
-                    &graph,
-                    ExecutorArtifactReadinessEpoch::new(1),
-                    std::slice::from_ref(&bank),
-                )
-                .expect("finalize churn executor"),
-            ExecutorArtifactFinalization::Complete
-        );
-        let requirement = provider
-            .executor_artifact_requirement(executor)
-            .expect("query churn requirement")
-            .expect("installed generation");
-        let generation = provider
-            .route_residency_executor_status(executor)
-            .reservation_generation
-            .expect("generation");
-        first_generation.get_or_insert(generation);
-        provider.drain_executor_artifacts(executor);
-        assert!(
-            provider
-                .release_queue()
-                .wait_until_idle(std::time::Duration::from_secs(30)),
-            "cycle {cycle} cleanup must drain: {:?}",
-            provider.deferred_release_stats()
-        );
-        if cycle == 0 {
-            let error = provider
-                .finalize_executor_artifacts(
-                    executor,
-                    &graph,
-                    ExecutorArtifactReadinessEpoch::new(2),
-                    std::slice::from_ref(&bank),
-                )
-                .expect_err("a live baked requirement must block executor-id reuse");
-            assert!(error.to_string().contains("identities cannot be reused"));
-            assert_eq!(
-                provider
-                    .route_residency_retirement_census()
-                    .retirement_registry_entries,
-                1
-            );
-        }
-        drop(requirement);
-        drop(kernel);
-        let census = provider.route_residency_retirement_census();
-        assert_eq!(census.active_registry_entries, 0, "cycle {cycle}");
-        assert_eq!(census.retirement_registry_entries, 0, "cycle {cycle}");
-        assert_eq!(census.live_retirement_records, 0, "cycle {cycle}");
-        assert_eq!(census.reservation_registry_entries, 0, "cycle {cycle}");
-    }
-
-    let replacement_kernel = compile_real_qmoe(&provider, reused, &graph, node);
+    assert_eq!(
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(2),
+        )
+        .expect("finalize specialized executor"),
+        ExecutorArtifactState::Declined
+    );
     assert_eq!(
         provider
-            .finalize_executor_artifacts(
-                reused,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(3),
-                std::slice::from_ref(&bank),
-            )
-            .expect("reuse is safe only after the old generation has no references"),
-        ExecutorArtifactFinalization::Complete
+            .route_residency_executor_status(executor)
+            .finalization_attempts,
+        1,
+        "terminal structural outcome must latch exactly once"
     );
-    let replacement_generation = provider
-        .route_residency_executor_status(reused)
-        .reservation_generation
-        .expect("replacement generation");
-    assert_ne!(replacement_generation, first_generation.unwrap());
-    let replacement_requirement = provider
-        .executor_artifact_requirement(reused)
-        .expect("replacement requirement")
-        .expect("replacement installed");
-    provider.drain_executor_artifacts(reused);
-    drop(replacement_requirement);
-    drop(replacement_kernel);
+    let diag = provider.route_residency_diagnostics();
+    // Direct provider inspection without the session's exact finalized-bank
+    // descriptors must fail closed before reservation or publication.
+    assert_eq!(
+        diag.installs(),
+        0,
+        "no boundary is installed without finalized bank descriptors"
+    );
+    assert_eq!(
+        diag.boundaries(),
+        0,
+        "no consumer boundary runs from a declined install"
+    );
+    assert!(diag.declines() >= 1, "the enabled build recorded a decline");
+    let reason = diag
+        .last_install_reason()
+        .expect("a decline reason is surfaced to diagnostics");
+    assert!(
+        reason.contains("no finalized routed expert banks"),
+        "the decline names the missing session-owned descriptors: {reason}"
+    );
+
     assert!(
         provider
-            .release_queue()
-            .wait_until_idle(std::time::Duration::from_secs(30))
+            .retained_route_residency_artifacts(executor)
+            .is_none(),
+        "a rejected inspection publishes no partial bank state"
     );
-    let census = provider.route_residency_retirement_census();
-    assert_eq!(census.retirement_registry_entries, 0);
-    assert_eq!(census.reservation_registry_entries, 0);
-    assert_eq!(census.retirements_started, 9);
-    assert_eq!(census.cleanups_scheduled, 9);
-    assert_eq!(census.cleanups_executed, 9);
 }
 
 #[test]
-#[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
-fn readiness_absence_is_pending_and_concurrent_finalize_is_idempotent() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let _gate = GateGuard::set(true);
-    let Some(provider) = provider_or_skip("readiness") else {
-        return;
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _environment = ScopedGate::enabled();
+    let provider = match offload_provider_or_skip("readiness") {
+        Some(provider) => Arc::new(provider),
+        None => return,
     };
-    let provider = Arc::new(provider);
-    let (graph, node, bank) = qmoe_graph_and_bank(21);
+    let (graph, node_id, _) = qmoe_graph();
     let graph = Arc::new(graph);
-    let bank = Arc::new(bank);
-    let executor = ExecutorInstanceId::fresh();
-    let declines = provider.route_residency_diagnostics().declines();
+    let executor = fresh_executor();
+    let foreign_executor = fresh_executor();
+    let config = artifact_config(&provider, executor);
+    let foreign_config = artifact_config(&provider, foreign_executor);
+    let declines_before = provider.route_residency_diagnostics().declines();
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                executor,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-                std::slice::from_ref(bank.as_ref()),
-            )
-            .expect("missing producer is pending"),
-        ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProducerUnavailable {
-            node
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("pending finalization is not an EP error"),
+        ExecutorArtifactState::Pending(ExecutorArtifactPending::ProducerUnavailable {
+            node: node_id
         })
     );
-    assert_eq!(provider.route_residency_diagnostics().declines(), declines);
-    assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
-    let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
+    let pending = provider.route_residency_executor_status(executor);
+    assert_eq!(pending.finalization_attempts, 1);
+    assert_eq!(
+        pending.readiness_epoch,
+        Some(ExecutorArtifactReadinessEpoch::new(1))
+    );
+    assert_eq!(
+        pending.pending,
+        Some(ExecutorArtifactPending::ProducerUnavailable { node: node_id })
+    );
+    assert_eq!(
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("same pending epoch is cached"),
+        ExecutorArtifactState::Pending(ExecutorArtifactPending::ProducerUnavailable {
+            node: node_id
+        })
+    );
+    assert_eq!(
+        provider
+            .route_residency_executor_status(executor)
+            .finalization_attempts,
+        1,
+        "same readiness epoch must not busy-retry provider finalization"
+    );
+    assert!(pending.outcome.is_none());
+    assert_eq!(
+        provider.route_residency_diagnostics().declines(),
+        declines_before,
+        "readiness absence is not a structural decline"
+    );
 
-    let results = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
+    let _kernel = compile_qmoe_through_ep(&provider, config, &graph, node_id);
+    assert!(
+        provider
+            .route_telemetry_sources(foreign_executor)
+            .is_empty(),
+        "a sibling executor cannot observe the owner's registered producer"
+    );
+    assert_eq!(
+        finalize_artifacts(
+            &provider,
+            foreign_config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(2),
+        )
+        .expect("foreign owner remains a readiness miss"),
+        ExecutorArtifactState::Pending(ExecutorArtifactPending::ProducerUnavailable {
+            node: node_id
+        }),
+        "another executor's real producer cannot satisfy this owner"
+    );
+    std::thread::scope(|scope| {
         for _ in 0..2 {
             let provider = Arc::clone(&provider);
             let graph = Arc::clone(&graph);
-            let bank = Arc::clone(&bank);
-            handles.push(scope.spawn(move || {
-                provider
-                    .finalize_executor_artifacts(
-                        executor,
+            scope.spawn(move || {
+                assert_eq!(
+                    finalize_artifacts(
+                        &provider,
+                        config,
                         &graph,
                         ExecutorArtifactReadinessEpoch::new(2),
-                        std::slice::from_ref(bank.as_ref()),
                     )
-                    .expect("concurrent finalization")
-            }));
+                    .expect("concurrent finalization"),
+                    ExecutorArtifactState::Declined
+                );
+            });
         }
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("finalizer thread"))
-            .collect::<Vec<_>>()
     });
-    assert!(results.contains(&ExecutorArtifactFinalization::Complete));
-    assert!(results.iter().all(|result| matches!(
-        result,
-        ExecutorArtifactFinalization::Complete
-            | ExecutorArtifactFinalization::Pending(
-                ExecutorArtifactPending::ProviderReadiness { .. }
-            )
-    )));
+    let finalized = provider.route_residency_executor_status(executor);
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                executor,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(2),
-                std::slice::from_ref(bank.as_ref()),
+        finalized.finalization_attempts, 2,
+        "one pending epoch plus one terminal install attempt; concurrent duplicate is idempotent"
+    );
+    assert!(matches!(
+        finalized.outcome,
+        Some(
+            onnx_runtime_ep_cuda::route_residency::RouteResidencyInstallOutcome::Rejected(
+                onnx_runtime_ep_cuda::route_residency::RouteResidencyBindingReject::Reservation(
+                    onnx_runtime_ep_cuda::weight_paging::RouteBankReservationReject::NoBanks
+                )
             )
-            .expect("idempotent retry after concurrent admission"),
-        ExecutorArtifactFinalization::Complete
+        )
+    ));
+
+    let foreign_drain = artifact_config(&provider, foreign_executor);
+    let stale_drain = provider
+        .drain_executor_artifacts(
+            foreign_drain.provider,
+            foreign_drain.executor,
+            foreign_drain.generation,
+        )
+        .expect_err("a stale sibling generation must fail closed");
+    assert!(
+        stale_drain
+            .to_string()
+            .contains("refusing to consume another owner's artifacts"),
+        "unexpected stale teardown diagnostic: {stale_drain}"
+    );
+    assert!(
+        provider
+            .route_telemetry_producer(executor, node_id)
+            .is_some(),
+        "draining a sibling executor cannot tear down the owner's producer"
+    );
+    provider
+        .drain_executor_artifacts(config.provider, config.executor, config.generation)
+        .expect("drain exact owner");
+    provider
+        .drain_executor_artifacts(config.provider, config.executor, config.generation)
+        .expect("repeat exact drain is idempotent");
+    assert!(
+        provider.route_telemetry_sources(executor).is_empty(),
+        "exact repeated drain removes the owner's producer once"
+    );
+    #[cfg(feature = "gpu-tests")]
+    assert!(
+        provider
+            .retired_executor_artifact_generations()
+            .contains(&(executor, config.generation)),
+        "exact repeated drain preserves the generation tombstone"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 2: BQMoE has no executor-scoped producer publication path, so source
+// absence is a terminal typed decline rather than permanent Pending.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn block_quantized_moe_without_producer_is_terminal_not_pending() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _environment = ScopedGate::enabled();
+    let provider = match offload_provider_or_skip("bqmoe-terminal") {
+        Some(provider) => provider,
+        None => return,
+    };
+    let (graph, node_id) = block_quantized_moe_graph();
+    let executor = fresh_executor();
+    let config = artifact_config(&provider, executor);
+    let valid_shapes = vec![
+        vec![1, 32],
+        vec![1, 2],
+        vec![2, 32, 1, 17],
+        vec![],
+        vec![2, 32, 1, 17],
+        vec![],
+    ];
+    let _kernel = provider
+        .get_kernel_for_executor(
+            config.provider,
+            config.executor,
+            config.generation,
+            graph.node(node_id),
+            &valid_shapes,
+            1,
+        )
+        .expect("production-shape BlockQuantizedMoE passes parser and kernel admission");
+    let mut malformed_shapes = valid_shapes.clone();
+    malformed_shapes[4][3] = 16;
+    let malformed_config = artifact_config(&provider, fresh_executor());
+    let malformed = match provider.get_kernel_for_executor(
+        malformed_config.provider,
+        malformed_config.executor,
+        malformed_config.generation,
+        graph.node(node_id),
+        &malformed_shapes,
+        1,
+    ) {
+        Ok(_) => panic!("malformed fc2 block width must fail before readiness classification"),
+        Err(error) => error,
+    };
+    assert!(
+        malformed.to_string().contains("fc2"),
+        "mutation control must fail at fc2 shape admission: {malformed}"
+    );
+    assert!(
+        provider.route_telemetry_sources(executor).is_empty(),
+        "BlockQuantizedMoE compilation has no executor-scoped producer publication path"
+    );
+
+    assert_eq!(
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("unsupported producer capability is a typed decline"),
+        ExecutorArtifactState::Declined
+    );
+    let status = provider.route_residency_executor_status(executor);
+    assert_eq!(status.finalization_attempts, 1);
+    assert!(status.pending.is_none(), "BQMoE must not remain pending");
+    assert!(matches!(
+        status.outcome,
+        Some(onnx_runtime_ep_cuda::route_residency::RouteResidencyInstallOutcome::Rejected(
+            onnx_runtime_ep_cuda::route_residency::RouteResidencyBindingReject::UnsupportedBoundary {
+                node,
+                boundary: onnx_runtime_ep_api::LazyWeightBoundary::BlockQuantizedMoe,
+            }
+        )) if node == node_id
+    ));
+
+    assert_eq!(
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(2),
+        )
+        .expect("terminal decline remains idempotent"),
+        ExecutorArtifactState::Declined
     );
     assert_eq!(
         provider
             .route_residency_executor_status(executor)
             .finalization_attempts,
-        2,
-        "one pending attempt plus one serialized install"
+        1,
+        "unsupported producer capability cannot busy-retry"
     );
-    assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
-    provider.drain_executor_artifacts(executor);
 }
 
+// ---------------------------------------------------------------------------
+// Test 3: the default-off build path is inert — no producer allocation or
+// registration, no install/retention, and no route diagnostics.
+// ---------------------------------------------------------------------------
+
 #[test]
-#[ignore = "requires idle CUDA device"]
-fn default_off_retains_allocates_and_registers_nothing() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let _gate = GateGuard::set(false);
-    let Some(provider) = provider_or_skip("default-off") else {
-        return;
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn disabled_build_installs_and_retains_nothing() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\n=== disabled_build_installs_and_retains_nothing ===");
+    let environment = ScopedGate::disabled();
+    let provider = match offload_provider_or_skip("disabled") {
+        Some(p) => p,
+        None => return,
     };
-    let (graph, node, bank) = qmoe_graph_and_bank(31);
-    let executor = ExecutorInstanceId::fresh();
-    let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
-    assert!(!provider.wants_finalized_route_residency_banks());
+
+    let (graph, node_id, _members) = qmoe_graph();
+    let executor = fresh_executor();
+    let config = artifact_config(&provider, executor);
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                executor,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-                &[bank],
-            )
-            .expect("default-off finalization"),
-        ExecutorArtifactFinalization::Complete
+        config.route_residency(),
+        ExecutorRouteResidencyConfig::Disabled
     );
-    assert_eq!(provider.route_residency_diagnostics().installs(), 0);
-    assert_eq!(provider.route_residency_diagnostics().declines(), 0);
-    assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
-    assert!(provider.route_residency_scopes().is_empty());
+    let _kernel = compile_qmoe_through_ep(&provider, config, &graph, node_id);
+    assert!(
+        provider.route_telemetry_sources(executor).is_empty(),
+        "default-off compilation must not register a producer"
+    );
     assert!(
         provider
-            .executor_artifact_requirement(executor)
-            .expect("query default-off requirement")
+            .route_telemetry_producer(executor, node_id)
             .is_none(),
-        "NeverInstalled is the only state represented by no requirement"
+        "default-off compilation must not allocate/retain a telemetry Arc"
     );
-    provider.drain_executor_artifacts(executor);
-}
 
-#[test]
-#[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
-fn bqmoe_without_real_telemetry_and_catalog_contract_typed_declines() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let _gate = GateGuard::set(true);
-    let Some(provider) = provider_or_skip("BQMoE decline") else {
-        return;
-    };
-    let (mut graph, node, bank) = qmoe_graph_and_bank(41);
-    let bqmoe = graph.nodes.get_mut(node).expect("QMoE node");
-    bqmoe.domain = "pkg.nxrt".into();
-    bqmoe.op_type = "BlockQuantizedMoE".into();
-    let executor = ExecutorInstanceId::fresh();
-
+    #[cfg(feature = "gpu-tests")]
+    let locks_before_finalization = provider.route_state_lock_acquisition_count();
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                executor,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-                &[bank],
-            )
-            .expect("BQMoE finalization"),
-        ExecutorArtifactFinalization::Complete
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("default-off finalization"),
+        ExecutorArtifactState::Disabled
     );
-    let outcome = provider.route_residency_executor_status(executor).outcome;
+    #[cfg(feature = "gpu-tests")]
+    assert_eq!(
+        provider.route_state_lock_acquisition_count(),
+        locks_before_finalization,
+        "resolved default-off capability must return before the route-state lock"
+    );
+    environment.set_enabled(true);
+    let _late_specialization = provider
+        .get_kernel_for_executor(
+            config.provider,
+            config.executor,
+            config.generation,
+            graph.node(node_id),
+            &[vec![2]],
+            1,
+        )
+        .expect("late specialization remains valid without publishing telemetry");
     assert!(
-        matches!(
-            outcome,
-            Some(RouteResidencyInstallOutcome::Rejected(
-                RouteResidencyBindingReject::UnsupportedBoundary {
-                    boundary: LazyWeightBoundary::BlockQuantizedMoe,
-                    ..
-                }
-            ))
-        ),
-        "unexpected BQMoE outcome: {outcome:?}"
+        provider.route_telemetry_sources(executor).is_empty()
+            && provider
+                .route_telemetry_producer(executor, node_id)
+                .is_none(),
+        "a finalized Disabled executor cannot publish a producer after a late env enable"
     );
-    assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
-    provider.drain_executor_artifacts(executor);
+    assert_eq!(
+        finalize_artifacts(
+            &provider,
+            config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(2),
+        )
+        .expect("late process-env changes do not mutate resolved provider configuration"),
+        ExecutorArtifactState::Disabled
+    );
+    #[cfg(feature = "gpu-tests")]
+    assert_eq!(
+        provider.route_state_lock_acquisition_count(),
+        locks_before_finalization,
+        "late env changes cannot reopen route state or add a lock to the disabled provider"
+    );
+    let diag = provider.route_residency_diagnostics();
+    assert_eq!(diag.installs(), 0, "default-off installs nothing");
+    assert_eq!(diag.boundaries(), 0, "default-off runs no consumer");
+    assert_eq!(
+        diag.declines(),
+        0,
+        "default-off is a pure inert early return: it records no decline"
+    );
+    assert!(
+        diag.last_install_reason().is_none(),
+        "default-off touches no install diagnostics"
+    );
+    assert!(
+        provider
+            .retained_route_residency_artifacts(executor)
+            .is_none(),
+        "default-off retains no bank artifacts"
+    );
+    let status = provider.route_residency_executor_status(executor);
+    assert_eq!(status.producer_nodes, 0);
+    assert_eq!(status.finalization_attempts, 0);
+    assert!(status.pending.is_none());
+    assert!(status.outcome.is_none());
+
+    let enabled_provider = match offload_provider_or_skip("enabled-rebuild") {
+        Some(provider) => provider,
+        None => return,
+    };
+    let enabled_executor = fresh_executor();
+    let enabled_config = artifact_config(&enabled_provider, enabled_executor);
+    assert_eq!(
+        enabled_config.route_residency(),
+        ExecutorRouteResidencyConfig::Enabled,
+        "a newly constructed provider resolves the updated environment"
+    );
+    let _enabled_kernel =
+        compile_qmoe_through_ep(&enabled_provider, enabled_config, &graph, node_id);
+    assert!(
+        enabled_provider
+            .route_telemetry_producer(enabled_executor, node_id)
+            .is_some(),
+        "the rebuilt enabled executor publishes its QMoE producer normally"
+    );
+    assert_eq!(
+        finalize_artifacts(
+            &enabled_provider,
+            enabled_config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("rebuilt enabled executor finalizes normally"),
+        ExecutorArtifactState::Declined,
+        "the current shared-reservation artifact retains its typed per-bank decline"
+    );
+
+    // Draining the never-installed boundary is a safe no-op.
+    provider
+        .drain_executor_artifacts(config.provider, config.executor, config.generation)
+        .expect("drain disabled exact scope");
+    assert!(
+        provider.route_telemetry_sources(executor).is_empty(),
+        "teardown drains the EP-owned producer registry"
+    );
+    assert!(
+        provider
+            .retained_route_residency_artifacts(executor)
+            .is_none(),
+        "teardown leaves nothing retained"
+    );
 }
 
 #[test]
-#[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
-fn overlapping_external_bank_properties_decline_before_reservation() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let _gate = GateGuard::set(true);
-    let Some(provider) = provider_or_skip("overlap decline") else {
-        return;
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let _environment = ScopedGate::disabled();
+    let disabled = match offload_provider_with_route_config_or_skip(
+        "explicit-disabled",
+        ExecutorRouteResidencyConfig::Disabled,
+    ) {
+        Some(provider) => Arc::new(provider),
+        None => return,
     };
-    let (graph, node, mut bank) = qmoe_graph_and_bank(51);
-    bank.members[1].weight.regions[0].offset = bank.members[0].weight.regions[0].offset;
-    let executor = ExecutorInstanceId::fresh();
-    let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
+    let enabled = match offload_provider_with_route_config_or_skip(
+        "explicit-enabled",
+        ExecutorRouteResidencyConfig::Enabled,
+    ) {
+        Some(provider) => provider,
+        None => return,
+    };
+    let (graph, node_id, _) = qmoe_graph();
+    let graph = Arc::new(graph);
+    let disabled_executor = fresh_executor();
+    let enabled_executor = fresh_executor();
+    let disabled_config = artifact_config(&disabled, disabled_executor);
+    let enabled_config = artifact_config(&enabled, enabled_executor);
 
-    assert_eq!(
-        provider
-            .finalize_executor_artifacts(
-                executor,
-                &graph,
-                ExecutorArtifactReadinessEpoch::new(1),
-                &[bank],
-            )
-            .expect("overlap finalization"),
-        ExecutorArtifactFinalization::Complete
+    let _disabled_kernel = compile_qmoe_through_ep(&disabled, disabled_config, &graph, node_id);
+    let _enabled_kernel = compile_qmoe_through_ep(&enabled, enabled_config, &graph, node_id);
+    assert!(
+        disabled
+            .route_telemetry_producer(disabled_executor, node_id)
+            .is_none(),
+        "the explicit Disabled sibling cannot publish telemetry"
     );
-    assert!(matches!(
-        provider.route_residency_executor_status(executor).outcome,
-        Some(RouteResidencyInstallOutcome::Rejected(
-            RouteResidencyBindingReject::Reservation(
-                RouteBankReservationReject::OverlappingExternalRange { .. }
-            )
-        ))
-    ));
-    assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
-    provider.drain_executor_artifacts(executor);
+    assert!(
+        enabled
+            .route_telemetry_producer(enabled_executor, node_id)
+            .is_some(),
+        "the explicit Enabled sibling publishes independently"
+    );
+    let stale_enabled_config = artifact_config(&enabled, enabled_executor);
+    assert_ne!(
+        stale_enabled_config.generation, enabled_config.generation,
+        "the stale-generation control must construct a distinct capability"
+    );
+    let stale_error = enabled
+        .inspect_executor_artifacts(
+            stale_enabled_config.provider,
+            stale_enabled_config.executor,
+            stale_enabled_config.generation,
+            ExecutorArtifactReadinessEpoch::new(1),
+            &graph,
+            &[],
+        )
+        .expect_err("a later capability for the same executor identity must fail closed");
+    assert!(
+        stale_error.to_string().contains("artifact generation")
+            && stale_error.to_string().contains("is stale"),
+        "unexpected stale-generation diagnostic: {stale_error}"
+    );
+    assert_eq!(
+        enabled
+            .route_residency_executor_status(enabled_executor)
+            .finalization_attempts,
+        0,
+        "stale generation rejection must precede route-state publication"
+    );
+    assert_eq!(
+        finalize_artifacts(
+            &disabled,
+            disabled_config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("explicit Disabled sibling finalizes"),
+        ExecutorArtifactState::Disabled
+    );
+
+    let registration_error = match disabled.get_kernel_for_executor(
+        enabled_config.provider,
+        enabled_config.executor,
+        enabled_config.generation,
+        graph.node(node_id),
+        &[vec![4]],
+        1,
+    ) {
+        Ok(_) => panic!("a foreign configuration token must not publish a producer"),
+        Err(error) => error,
+    };
+    assert!(
+        registration_error.to_string().contains("artifact provider")
+            && registration_error
+                .to_string()
+                .contains("rebuild the executor"),
+        "mismatched publication must explain the invariant and repair: {registration_error}"
+    );
+    assert!(
+        disabled
+            .route_telemetry_producer(enabled_executor, node_id)
+            .is_none(),
+        "a rejected foreign token publishes nothing into the Disabled provider"
+    );
+
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let disabled = Arc::clone(&disabled);
+            let graph = Arc::clone(&graph);
+            scope.spawn(move || {
+                let error = disabled
+                    .inspect_executor_artifacts(
+                        enabled_config.provider,
+                        enabled_config.executor,
+                        enabled_config.generation,
+                        ExecutorArtifactReadinessEpoch::new(2),
+                        &graph,
+                        &[],
+                    )
+                    .expect_err("concurrent mismatched finalization must fail closed");
+                assert!(
+                    error.to_string().contains("artifact provider")
+                        && error.to_string().contains("rebuild the executor"),
+                    "unexpected mismatched-finalization diagnostic: {error}"
+                );
+            });
+        }
+    });
+    assert_eq!(
+        finalize_artifacts(
+            &disabled,
+            disabled_config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(2),
+        )
+        .expect("matching Disabled token remains valid"),
+        ExecutorArtifactState::Disabled
+    );
+    assert_eq!(
+        finalize_artifacts(
+            &enabled,
+            enabled_config,
+            &graph,
+            ExecutorArtifactReadinessEpoch::new(1),
+        )
+        .expect("matching Enabled token remains isolated"),
+        ExecutorArtifactState::Declined
+    );
 }

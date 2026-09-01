@@ -12,11 +12,11 @@ use std::sync::{
 };
 
 use onnx_runtime_ep_api::{
-    CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider,
-    ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
-    ExecutorArtifactRequirement, ExecutorArtifactRequirementState, ExecutorArtifactUseGuard,
-    ExecutorInstanceId, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata, TensorMut,
-    TensorView, ViewOutput, WorkspaceRequirement,
+    CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider, ExecutorArtifactGeneration,
+    ExecutorArtifactPending, ExecutorArtifactPolicy, ExecutorArtifactReadinessEpoch,
+    ExecutorArtifactReport, ExecutorArtifactState, ExecutorInstanceId,
+    ExecutorRouteResidencyConfig, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata,
+    TensorMut, TensorView, ViewOutput, WorkspaceRequirement,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{
@@ -116,10 +116,23 @@ fn i64_tensor(shape: &[usize], data: &[i64]) -> Tensor {
 #[derive(Clone, Copy)]
 enum TestArtifactFinalization {
     Complete,
+    Required,
     PendingOnce,
     StructuralDecline,
     FailOnce,
     ReadyPendingFailedReady,
+}
+
+struct TestArtifactUseGuard;
+
+impl onnx_runtime_ep_api::ExecutorArtifactUseGuard for TestArtifactUseGuard {}
+
+struct TestArtifactRequirement;
+
+impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for TestArtifactRequirement {
+    fn acquire_use(&self) -> EpResult<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>> {
+        Ok(Box::new(TestArtifactUseGuard))
+    }
 }
 
 struct HostDownloadCountingEp {
@@ -130,9 +143,9 @@ struct HostDownloadCountingEp {
     route_readiness_checks: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_finalizations: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_terminal_outcomes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
-    route_boundary_consumes: Arc<AtomicUsize>,
     route_drains: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_install_graph_nodes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    route_boundaries: Arc<Mutex<Vec<ExecutorInstanceId>>>,
     assert_finalized_before_execute: bool,
     capture_checks: Arc<AtomicUsize>,
     artifact_finalization: TestArtifactFinalization,
@@ -141,51 +154,6 @@ struct HostDownloadCountingEp {
     graph_installed: Arc<AtomicBool>,
     graph_segment_replays: Arc<AtomicUsize>,
     graph_fast_replays: Arc<AtomicUsize>,
-    artifact_requirement: Option<Arc<TestArtifactRequirementState>>,
-}
-
-#[derive(Default)]
-struct TestArtifactRequirementCounters {
-    retired: AtomicBool,
-    active: AtomicUsize,
-    acquisitions: AtomicUsize,
-}
-
-struct TestArtifactRequirementState {
-    counters: Arc<TestArtifactRequirementCounters>,
-}
-
-struct TestArtifactUseGuard {
-    counters: Arc<TestArtifactRequirementCounters>,
-}
-
-impl ExecutorArtifactUseGuard for TestArtifactUseGuard {}
-
-impl Drop for TestArtifactUseGuard {
-    fn drop(&mut self) {
-        self.counters.active.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-impl ExecutorArtifactRequirementState for TestArtifactRequirementState {
-    fn acquire_use(&self) -> EpResult<Box<dyn ExecutorArtifactUseGuard>> {
-        if self.counters.retired.load(Ordering::SeqCst) {
-            return Err(EpError::KernelFailed(
-                "test executor artifact requirement is retired".into(),
-            ));
-        }
-        self.counters.active.fetch_add(1, Ordering::SeqCst);
-        if self.counters.retired.load(Ordering::SeqCst) {
-            self.counters.active.fetch_sub(1, Ordering::SeqCst);
-            return Err(EpError::KernelFailed(
-                "test executor artifact requirement retired during acquisition".into(),
-            ));
-        }
-        self.counters.acquisitions.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(TestArtifactUseGuard {
-            counters: Arc::clone(&self.counters),
-        }))
-    }
 }
 
 impl HostDownloadCountingEp {
@@ -200,9 +168,9 @@ impl HostDownloadCountingEp {
             route_readiness_checks: Arc::new(Mutex::new(HashMap::new())),
             route_finalizations: Arc::new(Mutex::new(HashMap::new())),
             route_terminal_outcomes: Arc::new(Mutex::new(HashMap::new())),
-            route_boundary_consumes: Arc::new(AtomicUsize::new(0)),
             route_drains: Arc::new(Mutex::new(HashMap::new())),
             route_install_graph_nodes: Arc::new(Mutex::new(HashMap::new())),
+            route_boundaries: Arc::new(Mutex::new(Vec::new())),
             assert_finalized_before_execute: false,
             capture_checks: Arc::new(AtomicUsize::new(0)),
             artifact_finalization: TestArtifactFinalization::Complete,
@@ -211,7 +179,6 @@ impl HostDownloadCountingEp {
             graph_installed: Arc::new(AtomicBool::new(false)),
             graph_segment_replays: Arc::new(AtomicUsize::new(0)),
             graph_fast_replays: Arc::new(AtomicUsize::new(0)),
-            artifact_requirement: None,
         }
     }
 
@@ -226,6 +193,14 @@ impl HostDownloadCountingEp {
         Self {
             assert_finalized_before_execute: true,
             artifact_finalization: TestArtifactFinalization::PendingOnce,
+            ..Self::new(host_downloads)
+        }
+    }
+
+    fn new_required_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            artifact_finalization: TestArtifactFinalization::Required,
             ..Self::new(host_downloads)
         }
     }
@@ -255,23 +230,6 @@ impl HostDownloadCountingEp {
         }
     }
 
-    fn new_retirable_fast_replay(
-        host_downloads: Arc<AtomicUsize>,
-    ) -> (Self, Arc<TestArtifactRequirementCounters>) {
-        let counters = Arc::new(TestArtifactRequirementCounters::default());
-        (
-            Self {
-                assert_finalized_before_execute: true,
-                fake_device_graph: true,
-                artifact_requirement: Some(Arc::new(TestArtifactRequirementState {
-                    counters: Arc::clone(&counters),
-                })),
-                ..Self::new(host_downloads)
-            },
-            counters,
-        )
-    }
-
     fn kernel_compiles(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
         Arc::clone(&self.kernel_compiles)
     }
@@ -292,16 +250,16 @@ impl HostDownloadCountingEp {
         Arc::clone(&self.route_terminal_outcomes)
     }
 
-    fn route_boundary_consumes(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.route_boundary_consumes)
-    }
-
     fn route_drains(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
         Arc::clone(&self.route_drains)
     }
 
     fn route_install_graph_nodes(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
         Arc::clone(&self.route_install_graph_nodes)
+    }
+
+    fn route_boundaries(&self) -> Arc<Mutex<Vec<ExecutorInstanceId>>> {
+        Arc::clone(&self.route_boundaries)
     }
 
     fn capture_checks(&self) -> Arc<AtomicUsize> {
@@ -388,18 +346,42 @@ impl Kernel for FinalizationCheckingKernel {
 }
 
 impl ExecutionProvider for HostDownloadCountingEp {
-    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
-        self.route_boundary_consumes.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    fn executor_artifact_policy(&self) -> EpResult<ExecutorArtifactPolicy> {
+        let route_residency = match self.artifact_finalization {
+            TestArtifactFinalization::Complete => ExecutorRouteResidencyConfig::Disabled,
+            TestArtifactFinalization::Required
+            | TestArtifactFinalization::PendingOnce
+            | TestArtifactFinalization::StructuralDecline
+            | TestArtifactFinalization::FailOnce
+            | TestArtifactFinalization::ReadyPendingFailedReady => {
+                ExecutorRouteResidencyConfig::Enabled
+            }
+        };
+        Ok(ExecutorArtifactPolicy::new(
+            onnx_runtime_ep_api::ExecutorArtifactProviderId::UNSCOPED,
+            self.device_id(),
+            route_residency,
+        ))
     }
 
-    fn finalize_executor_artifacts(
+    fn inspect_executor_artifacts(
         &self,
+        _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
-        graph: &Graph,
+        generation: ExecutorArtifactGeneration,
         readiness: ExecutorArtifactReadinessEpoch,
-        _finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
-    ) -> EpResult<ExecutorArtifactFinalization> {
+        graph: &Graph,
+        _banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
+    ) -> EpResult<ExecutorArtifactReport> {
+        let report = |state| {
+            ExecutorArtifactReport::observed(
+                onnx_runtime_ep_api::ExecutorArtifactProviderId::UNSCOPED,
+                executor,
+                generation,
+                readiness,
+                state,
+            )
+        };
         *self
             .route_readiness_checks
             .lock()
@@ -412,7 +394,11 @@ impl ExecutionProvider for HostDownloadCountingEp {
                 TestArtifactFinalization::ReadyPendingFailedReady
             )
         {
-            return Ok(ExecutorArtifactFinalization::Complete);
+            return Ok(report(match self.artifact_finalization {
+                TestArtifactFinalization::Required => ExecutorArtifactState::Required,
+                TestArtifactFinalization::Complete => ExecutorArtifactState::Disabled,
+                _ => ExecutorArtifactState::Declined,
+            }));
         }
         assert!(
             self.kernel_compiles
@@ -431,28 +417,28 @@ impl ExecutionProvider for HostDownloadCountingEp {
             *attempt
         };
         match self.artifact_finalization {
-            TestArtifactFinalization::PendingOnce if attempt == 1 => Ok(
-                ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProviderReadiness {
+            TestArtifactFinalization::PendingOnce if attempt == 1 => Ok(report(
+                ExecutorArtifactState::Pending(ExecutorArtifactPending::ProviderReadiness {
                     reason: format!(
                         "test provider awaits a later compiled specialization after epoch {}",
                         readiness.get()
                     ),
                 }),
-            ),
+            )),
             TestArtifactFinalization::FailOnce if attempt == 1 => {
                 Err(EpError::KernelFailed(format!(
                     "injected artifact finalization failure at epoch {}",
                     readiness.get()
                 )))
             }
-            TestArtifactFinalization::ReadyPendingFailedReady if attempt == 2 => Ok(
-                ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProviderReadiness {
+            TestArtifactFinalization::ReadyPendingFailedReady if attempt == 2 => Ok(report(
+                ExecutorArtifactState::Pending(ExecutorArtifactPending::ProviderReadiness {
                     reason: format!(
                         "test provider awaits a later compiled specialization after epoch {}",
                         readiness.get()
                     ),
                 }),
-            ),
+            )),
             TestArtifactFinalization::ReadyPendingFailedReady if attempt == 3 => {
                 Err(EpError::KernelFailed(format!(
                     "injected artifact finalization failure at epoch {}",
@@ -460,6 +446,7 @@ impl ExecutionProvider for HostDownloadCountingEp {
                 )))
             }
             TestArtifactFinalization::Complete
+            | TestArtifactFinalization::Required
             | TestArtifactFinalization::PendingOnce
             | TestArtifactFinalization::FailOnce
             | TestArtifactFinalization::StructuralDecline
@@ -474,31 +461,52 @@ impl ExecutionProvider for HostDownloadCountingEp {
                     .lock()
                     .unwrap()
                     .insert(executor, graph.num_nodes());
-                Ok(ExecutorArtifactFinalization::Complete)
+                Ok(report(match self.artifact_finalization {
+                    TestArtifactFinalization::Required => ExecutorArtifactState::Required,
+                    TestArtifactFinalization::Complete => ExecutorArtifactState::Disabled,
+                    _ => ExecutorArtifactState::Declined,
+                }))
             }
         }
     }
 
-    fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {
-        if let Some(requirement) = &self.artifact_requirement {
-            requirement.counters.retired.store(true, Ordering::SeqCst);
-        }
+    fn executor_artifact_requirement(
+        &self,
+        _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        _executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+    ) -> EpResult<Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>> {
+        Ok(matches!(
+            self.artifact_finalization,
+            TestArtifactFinalization::Required
+        )
+        .then(|| {
+            Arc::new(TestArtifactRequirement)
+                as Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>
+        }))
+    }
+
+    fn consume_route_residency_at_boundary_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> EpResult<()> {
+        self.route_boundaries.lock().unwrap().push(executor);
+        Ok(())
+    }
+
+    fn drain_executor_artifacts(
+        &self,
+        _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+    ) -> EpResult<()> {
         *self
             .route_drains
             .lock()
             .unwrap()
             .entry(executor)
             .or_default() += 1;
-    }
-
-    fn executor_artifact_requirement(
-        &self,
-        _executor: ExecutorInstanceId,
-    ) -> EpResult<Option<ExecutorArtifactRequirement>> {
-        Ok(self
-            .artifact_requirement
-            .as_ref()
-            .map(|state| ExecutorArtifactRequirement::new(Arc::clone(state))))
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -544,7 +552,9 @@ impl ExecutionProvider for HostDownloadCountingEp {
 
     fn get_kernel_for_executor(
         &self,
+        _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
         op: &Node,
         shapes: &[Vec<usize>],
         opset: u64,
@@ -2288,6 +2298,30 @@ fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
 }
 
 #[test]
+fn public_session_entry_owns_required_artifact_lifecycle() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_required_lifecycle(downloads);
+    let finalizations = ep.route_finalizations();
+    let boundaries = ep.route_boundaries();
+    let ep = Arc::new(ep);
+
+    let mut session = InferenceSession::builder()
+        .model_bytes(&static_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("public session builder finalizes a Required lifecycle");
+    let executor = session.executor_instance_id();
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert!(boundaries.lock().unwrap().is_empty());
+
+    let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    session
+        .run(&[("x", &x)])
+        .expect("Required lifecycle executes through its owned boundary");
+    assert_eq!(boundaries.lock().unwrap().as_slice(), &[executor]);
+}
+
+#[test]
 fn static_build_pending_fails_closed_and_drains_unpublished_executor() {
     let downloads = Arc::new(AtomicUsize::new(0));
     let ep = HostDownloadCountingEp::new_pending_once_lifecycle(downloads);
@@ -2560,7 +2594,6 @@ fn single_graph_fast_replay_obeys_pending_failed_and_ready_specializations() {
     let ep = HostDownloadCountingEp::new_fast_replay_lifecycle(downloads);
     let finalizations = ep.route_finalizations();
     let terminal_outcomes = ep.route_terminal_outcomes();
-    let boundary_consumes = ep.route_boundary_consumes();
     let executions = ep.kernel_executions();
     let drains = ep.route_drains();
     let segment_replays = ep.graph_segment_replays();
@@ -2657,73 +2690,15 @@ fn single_graph_fast_replay_obeys_pending_failed_and_ready_specializations() {
     assert_eq!(scoped_count(&finalizations, executor), 4);
     assert_eq!(scoped_count(&terminal_outcomes, executor), 2);
     assert_eq!(scoped_count(&executions, executor), 2);
-    let boundaries_before_fast_replay = boundary_consumes.load(Ordering::SeqCst);
     assert!(
         session
             .replay_device_graph(&mut bindings)
             .expect("ready authority permits the installed fast replay")
     );
     assert_eq!(fast_replays.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        boundary_consumes.load(Ordering::SeqCst),
-        boundaries_before_fast_replay + 1,
-        "single-graph fast replay must traverse the production request boundary"
-    );
 
     drop(session);
     assert_eq!(scoped_count(&drains, executor), 1);
-}
-
-#[test]
-fn baked_graph_retains_retired_artifact_requirement_after_provider_drain() {
-    let downloads = Arc::new(AtomicUsize::new(0));
-    let (ep, requirement) = HostDownloadCountingEp::new_retirable_fast_replay(downloads);
-    let fast_replays = ep.graph_fast_replays();
-    let ep = Arc::new(ep);
-    let mut session = InferenceSession::builder()
-        .model_bytes(&symbolic_gelu_model())
-        .execution_provider(Arc::clone(&ep) as Arc<dyn ExecutionProvider>)
-        .build()
-        .expect("build retirable fast-replay session");
-    let executor = session.executor_instance_id();
-    let input = session
-        .allocate_device_binding("x", None::<String>, DataType::Float32, vec![2], vec![2])
-        .expect("allocate persistent capture input");
-    let output = session
-        .allocate_device_output_binding("y", DataType::Float32, vec![2], vec![2])
-        .expect("allocate persistent capture output");
-    let mut bindings = vec![input, output];
-    bindings[0]
-        .write_bytes(0, &f32_bytes(&[-1.0, 1.0]))
-        .expect("seed persistent capture input");
-    assert!(matches!(
-        session
-            .try_capture_with_device_bindings(&[], &mut bindings)
-            .expect("capture with exact artifact requirement"),
-        DeviceGraphCaptureResult::Captured(_)
-    ));
-    assert_eq!(requirement.acquisitions.load(Ordering::SeqCst), 1);
-    assert_eq!(requirement.active.load(Ordering::SeqCst), 0);
-
-    ep.drain_executor_artifacts(executor);
-    assert!(requirement.retired.load(Ordering::SeqCst));
-    let error = session
-        .replay_device_graph(&mut bindings)
-        .expect_err("retired captured requirement must reject before graph launch");
-    assert!(
-        error.to_string().contains("requirement is retired"),
-        "unexpected retirement error: {error}"
-    );
-    assert_eq!(
-        fast_replays.load(Ordering::SeqCst),
-        0,
-        "retired requirement must reject before the provider graph launch"
-    );
-    assert_eq!(
-        requirement.acquisitions.load(Ordering::SeqCst),
-        1,
-        "post-drain replay must not acquire a new use lease"
-    );
 }
 
 #[test]

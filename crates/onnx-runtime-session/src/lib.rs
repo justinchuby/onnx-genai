@@ -249,6 +249,16 @@ mod error {
             reason: String,
         },
 
+        #[error(
+            "session build failed: {build}; exact provider-artifact rollback also failed: \
+             {rollback}"
+        )]
+        ExecutionProviderArtifactRollbackFailed {
+            #[source]
+            build: Box<SessionError>,
+            rollback: onnx_runtime_ep_api::EpError,
+        },
+
         #[error("shape element count overflows usize for value {value} (dims {dims:?})")]
         ShapeOverflow { value: String, dims: Vec<usize> },
 
@@ -1096,6 +1106,14 @@ impl Drop for BlockQuantizedMoeTrafficObserver<'_> {
 }
 
 /// A loaded model ready to run inference (§20.2).
+/// Loaded, executable inference session.
+///
+/// Executor artifact authority is deliberately owned by a private session
+/// module and cannot be named by path/git consumers:
+///
+/// ```compile_fail
+/// use onnx_runtime_session::executor::ExecutorArtifactConfig;
+/// ```
 pub struct InferenceSession {
     inputs: Vec<IoMeta>,
     outputs: Vec<IoMeta>,

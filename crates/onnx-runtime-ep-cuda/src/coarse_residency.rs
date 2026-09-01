@@ -472,6 +472,42 @@ pub fn apply_residency_plan_at_boundary(
     expert_groups: &[ExpertWeightGroup],
 ) -> BoundaryApplicationOutcome {
     apply_residency_plan_at_boundary_inner(
+        coarse_residency_profile_enabled(),
+        runtime,
+        residency,
+        plan,
+        catalogs,
+        allocators,
+        device_pool,
+        host_pool,
+        device_count,
+        device_ordinal,
+        expert_groups,
+        #[cfg(any(test, feature = "gpu-tests"))]
+        None,
+        #[cfg(any(test, feature = "gpu-tests"))]
+        None,
+    )
+}
+
+/// Apply a plan after the owning executor has already resolved route residency
+/// as enabled. The executor lifecycle uses this entry point so a later process
+/// environment change cannot disable an installed generation in place.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_resolved_residency_plan_at_boundary(
+    runtime: &Arc<CudaRuntime>,
+    residency: &crate::weight_paging::CudaWeightResidency,
+    plan: &ResidencyPlan,
+    catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+    allocators: &HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    device_pool: &Arc<PhysicalHandlePool>,
+    host_pool: &Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expert_groups: &[ExpertWeightGroup],
+) -> BoundaryApplicationOutcome {
+    apply_residency_plan_at_boundary_inner(
+        true,
         runtime,
         residency,
         plan,
@@ -516,6 +552,7 @@ pub fn apply_residency_plan_at_boundary_with_phase8_faults(
     phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
 ) -> BoundaryApplicationOutcome {
     apply_residency_plan_at_boundary_inner(
+        coarse_residency_profile_enabled(),
         runtime,
         residency,
         plan,
@@ -548,6 +585,7 @@ pub fn apply_residency_plan_at_boundary_with_rollback_interlock(
     rollback_interlock: Arc<RollbackSafePointInterlock>,
 ) -> BoundaryApplicationOutcome {
     apply_residency_plan_at_boundary_inner(
+        true,
         runtime,
         residency,
         plan,
@@ -565,6 +603,7 @@ pub fn apply_residency_plan_at_boundary_with_rollback_interlock(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_residency_plan_at_boundary_inner(
+    route_residency_enabled: bool,
     runtime: &Arc<CudaRuntime>,
     residency: &crate::weight_paging::CudaWeightResidency,
     plan: &ResidencyPlan,
@@ -588,7 +627,7 @@ fn apply_residency_plan_at_boundary_inner(
     };
 
     // 1. Feature gate.
-    if !coarse_residency_profile_enabled() {
+    if !route_residency_enabled {
         outcome.fallback_reason = Some("feature gate disabled".to_string());
         return outcome;
     }

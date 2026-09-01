@@ -59,11 +59,12 @@ pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{
     ArgmaxTieBreak, BoundBufferOwnership, CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner,
     DeviceGraphSlot, DeviceGraphToken, DeviceValidationOwner, DeviceValidationRegistration,
-    DeviceValidationToken, EpConfig, EpId, ExecutionProvider, ExecutorArtifactFinalization,
-    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorArtifactRequirement,
-    ExecutorArtifactRequirementState, ExecutorArtifactUseGuard, ExecutorInstanceId, Fence,
-    HostToDeviceCopier, RawDeviceAllocationSiteStats, SealedDeviceAllocation,
-    StructuralCaptureDecline, WorkspaceAllocation,
+    DeviceValidationToken, EpConfig, EpId, ExecutionProvider, ExecutorArtifactGeneration,
+    ExecutorArtifactPending, ExecutorArtifactPolicy, ExecutorArtifactProviderId,
+    ExecutorArtifactReadinessEpoch, ExecutorArtifactReport, ExecutorArtifactRequirementState,
+    ExecutorArtifactState, ExecutorArtifactUseGuard, ExecutorInstanceId, ExecutorKernelScope,
+    ExecutorRouteResidencyConfig, Fence, HostToDeviceCopier, RawDeviceAllocationSiteStats,
+    SealedDeviceAllocation, StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{

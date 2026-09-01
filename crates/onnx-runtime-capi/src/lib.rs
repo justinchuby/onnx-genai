@@ -137,7 +137,8 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         E::Ep(_)
         | E::ExecutionProviderUnavailable(_)
         | E::ExecutionProviderArtifactsPending { .. }
-        | E::ExecutionProviderArtifactFinalizationFailed { .. } => OrtErrorCode::EpFail,
+        | E::ExecutionProviderArtifactFinalizationFailed { .. }
+        | E::ExecutionProviderArtifactRollbackFailed { .. } => OrtErrorCode::EpFail,
         // The graph carries a per-node opset the ONNX format cannot represent,
         // so it cannot be written out. That is a property of the graph, like
         // the other members of this arm, rather than a runtime failure.
