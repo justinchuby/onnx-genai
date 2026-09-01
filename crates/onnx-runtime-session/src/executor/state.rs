@@ -134,7 +134,7 @@ impl ProviderArtifactReadiness {
     ) -> Result<()> {
         let executor = config.executor();
         if self.needs_finalization() {
-            let proof = config.finalization_proof(self.epoch);
+            let proof = config.finalization_proof(&SESSION_ARTIFACT_AUTHORITY, self.epoch);
             match ep
                 .finalize_executor_artifacts(proof, graph)
                 .and_then(|finalization| finalization.resolve(config, self.epoch))

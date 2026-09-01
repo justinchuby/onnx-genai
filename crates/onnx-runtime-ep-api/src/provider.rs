@@ -46,8 +46,10 @@ impl ExecutorInstanceId {
     /// session executor.
     pub const UNSCOPED: Self = Self(0);
 
-    /// Allocate a process-unique executor identity.
-    pub fn fresh() -> Self {
+    /// Allocate a process-unique executor identity under the session's
+    /// lifecycle authority.
+    pub fn fresh(authority: &ExecutorArtifactSessionAuthority) -> Self {
+        let () = authority.private;
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self(allocate_non_reusable_identity(
             &NEXT,
@@ -121,26 +123,37 @@ pub enum ExecutorKernelScope {
     Required,
 }
 
+/// Opaque capability held only by the crate that owns executor lifecycle
+/// issuance.
+///
+/// Cargo features deliberately do not grant this authority: features are
+/// additive across a dependency graph and therefore cannot identify the
+/// caller that is allowed to issue a session capability.
+///
+/// ```compile_fail
+/// # use onnx_runtime_ep_api::ExecutorArtifactSessionAuthority;
+/// let _forged = ExecutorArtifactSessionAuthority { private: () };
+/// ```
+pub struct ExecutorArtifactSessionAuthority {
+    private: (),
+}
+
 /// Provider-owned half of an executor artifact configuration.
 ///
 /// A provider resolves only its own authority and immutable feature policy.
 /// The session binds this template to the executor identity and a fresh
 /// generation, so a provider cannot choose the owner accepted by the session.
 ///
-/// External crates cannot mint the bound capability:
+/// Receiving a template and executor identity is insufficient to bind the
+/// capability without the session's private issuer:
 ///
 /// ```compile_fail
 /// # use onnx_runtime_ep_api::{
-/// #     ExecutorArtifactConfigAuthority, ExecutorArtifactConfigTemplate, ExecutorInstanceId,
-/// #     ExecutorRouteResidencyConfig,
+/// #     ExecutorArtifactConfigTemplate, ExecutorInstanceId,
 /// # };
-/// # use onnx_runtime_ir::DeviceId;
-/// let template = ExecutorArtifactConfigTemplate::resolved(
-///     ExecutorArtifactConfigAuthority::fresh(),
-///     DeviceId::cpu(),
-///     ExecutorRouteResidencyConfig::Enabled,
-/// );
-/// let _forged = template.bind(ExecutorInstanceId::fresh());
+/// fn forge(template: ExecutorArtifactConfigTemplate, executor: ExecutorInstanceId) {
+///     let _forged = template.bind(executor);
+/// }
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ExecutorArtifactConfigTemplate {
@@ -174,9 +187,12 @@ impl ExecutorArtifactConfigTemplate {
 
     /// Bind this provider policy to one session-issued executor generation.
     #[must_use]
-    #[cfg(any(test, feature = "runtime-session-authority"))]
-    #[doc(hidden)]
-    pub fn bind(self, executor: ExecutorInstanceId) -> ExecutorArtifactConfig {
+    pub fn bind(
+        self,
+        authority: &ExecutorArtifactSessionAuthority,
+        executor: ExecutorInstanceId,
+    ) -> ExecutorArtifactConfig {
+        let () = authority.private;
         ExecutorArtifactConfig {
             authority: self.authority,
             executor,
@@ -192,7 +208,6 @@ impl ExecutorArtifactConfigTemplate {
 pub struct ExecutorArtifactGeneration(u64);
 
 impl ExecutorArtifactGeneration {
-    #[cfg(any(test, feature = "runtime-session-authority"))]
     fn fresh() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self(allocate_non_reusable_identity(
@@ -214,11 +229,13 @@ impl ExecutorArtifactGeneration {
 /// finalization, and teardown. Environment variables may be inputs when the EP
 /// is constructed, but are never consulted to mutate this token afterwards.
 ///
-/// External crates cannot issue a finalization request even if they receive a
-/// capability for diagnostics:
+/// Receiving a bound configuration for diagnostics is insufficient to issue a
+/// finalization proof without the session's private issuer:
 ///
 /// ```compile_fail
-/// # use onnx_runtime_ep_api::{ExecutorArtifactConfig, ExecutorArtifactReadinessEpoch};
+/// # use onnx_runtime_ep_api::{
+/// #     ExecutorArtifactConfig, ExecutorArtifactReadinessEpoch,
+/// # };
 /// fn forge(config: ExecutorArtifactConfig) {
 ///     let _proof = config.finalization_proof(ExecutorArtifactReadinessEpoch::INITIAL);
 /// }
@@ -255,12 +272,12 @@ impl ExecutorArtifactConfig {
 
     /// Issue a scoped finalization proof for exactly this readiness epoch.
     #[must_use]
-    #[cfg(any(test, feature = "runtime-session-authority"))]
-    #[doc(hidden)]
     pub fn finalization_proof(
         &self,
+        authority: &ExecutorArtifactSessionAuthority,
         readiness: ExecutorArtifactReadinessEpoch,
     ) -> ExecutorArtifactFinalizationProof<'_> {
+        let () = authority.private;
         match self.route_residency {
             ExecutorRouteResidencyConfig::Disabled => {
                 ExecutorArtifactFinalizationProof::Disabled(ExecutorArtifactDisabledFinalization {
@@ -355,21 +372,8 @@ impl ExecutorArtifactFinalizationProof<'_> {
 /// constructor:
 ///
 /// ```compile_fail
-/// # use onnx_runtime_ep_api::{
-/// #     ExecutorArtifactConfigAuthority, ExecutorArtifactConfigTemplate,
-/// #     ExecutorArtifactFinalizationProof, ExecutorArtifactReadinessEpoch,
-/// #     ExecutorInstanceId, ExecutorRouteResidencyConfig,
-/// # };
-/// # use onnx_runtime_ir::DeviceId;
-/// let config = ExecutorArtifactConfigTemplate::resolved(
-///     ExecutorArtifactConfigAuthority::UNSCOPED,
-///     DeviceId::cpu(),
-///     ExecutorRouteResidencyConfig::Disabled,
-/// )
-/// .bind(ExecutorInstanceId::fresh());
-/// if let ExecutorArtifactFinalizationProof::Disabled(disabled) =
-///     config.finalization_proof(ExecutorArtifactReadinessEpoch::INITIAL)
-/// {
+/// # use onnx_runtime_ep_api::ExecutorArtifactDisabledFinalization;
+/// fn forge(disabled: ExecutorArtifactDisabledFinalization<'_>) {
 ///     disabled.required();
 /// }
 /// ```
@@ -2627,6 +2631,9 @@ fn is_control_flow_or_sequence(node: &Node) -> bool {
 mod tests {
     use super::*;
 
+    static TEST_SESSION_AUTHORITY: ExecutorArtifactSessionAuthority =
+        ExecutorArtifactSessionAuthority { private: () };
+
     fn _assert_send_sync<T: Send + Sync>() {}
 
     /// Leak a boxed byte slice as a stand-in host allocation.
@@ -2661,9 +2668,9 @@ mod tests {
             DeviceId::cpu(),
             ExecutorRouteResidencyConfig::Enabled,
         );
-        let executor = ExecutorInstanceId::fresh();
-        let first = template.bind(executor);
-        let second = template.bind(executor);
+        let executor = ExecutorInstanceId::fresh(&TEST_SESSION_AUTHORITY);
+        let first = template.bind(&TEST_SESSION_AUTHORITY, executor);
+        let second = template.bind(&TEST_SESSION_AUTHORITY, executor);
         assert_eq!(first.executor(), executor);
         assert_eq!(first.device(), DeviceId::cpu());
         assert_ne!(first.generation(), second.generation());
@@ -2697,10 +2704,13 @@ mod tests {
             DeviceId::cpu(),
             ExecutorRouteResidencyConfig::Enabled,
         )
-        .bind(ExecutorInstanceId::fresh());
+        .bind(
+            &TEST_SESSION_AUTHORITY,
+            ExecutorInstanceId::fresh(&TEST_SESSION_AUTHORITY),
+        );
         let epoch = ExecutorArtifactReadinessEpoch::new(7);
         let ExecutorArtifactFinalizationProof::Enabled(enabled) =
-            expected.finalization_proof(epoch)
+            expected.finalization_proof(&TEST_SESSION_AUTHORITY, epoch)
         else {
             unreachable!("test configuration is enabled")
         };
@@ -2719,9 +2729,12 @@ mod tests {
             DeviceId::cuda(1),
             ExecutorRouteResidencyConfig::Enabled,
         )
-        .bind(ExecutorInstanceId::fresh());
+        .bind(
+            &TEST_SESSION_AUTHORITY,
+            ExecutorInstanceId::fresh(&TEST_SESSION_AUTHORITY),
+        );
         let ExecutorArtifactFinalizationProof::Enabled(foreign_proof) =
-            foreign.finalization_proof(epoch)
+            foreign.finalization_proof(&TEST_SESSION_AUTHORITY, epoch)
         else {
             unreachable!("foreign test configuration is enabled")
         };
@@ -2731,9 +2744,10 @@ mod tests {
             .expect_err("foreign provider/device/executor/generation must fail closed");
         assert!(error.to_string().contains("finalization proof mismatch"));
 
-        let ExecutorArtifactFinalizationProof::Enabled(stale_epoch) =
-            expected.finalization_proof(ExecutorArtifactReadinessEpoch::new(6))
-        else {
+        let ExecutorArtifactFinalizationProof::Enabled(stale_epoch) = expected.finalization_proof(
+            &TEST_SESSION_AUTHORITY,
+            ExecutorArtifactReadinessEpoch::new(6),
+        ) else {
             unreachable!("test configuration is enabled")
         };
         let error = stale_epoch

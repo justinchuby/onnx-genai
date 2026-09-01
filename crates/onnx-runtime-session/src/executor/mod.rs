@@ -52,11 +52,12 @@ use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
     ExecutionProvider, ExecutorArtifactConfig, ExecutorArtifactFinalizationOutcome,
-    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
-    ExecutorRouteResidency, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput,
-    KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline,
-    TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation,
-    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
+    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorArtifactSessionAuthority,
+    ExecutorInstanceId, ExecutorRouteResidency, ExternalMmapRegion, Kernel, KernelConstantInput,
+    KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight,
+    StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle,
+    WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -84,6 +85,12 @@ use crate::sequence::{
     ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
 use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor};
+
+// SAFETY: `ExecutorArtifactSessionAuthority` is a zero-sized token whose only
+// field is `()`, so it has no invalid bit pattern. This is the one production
+// construction site, and the private static is never returned by session APIs.
+static SESSION_ARTIFACT_AUTHORITY: ExecutorArtifactSessionAuthority =
+    unsafe { std::mem::MaybeUninit::uninit().assume_init() };
 
 pub(super) struct DeviceValidationSubmission {
     ep: Arc<dyn ExecutionProvider>,

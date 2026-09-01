@@ -116,6 +116,7 @@ fn i64_tensor(shape: &[usize], data: &[i64]) -> Tensor {
 #[derive(Clone, Copy)]
 enum TestArtifactFinalization {
     Complete,
+    Required,
     PendingOnce,
     StructuralDecline,
     FailOnce,
@@ -132,6 +133,7 @@ struct HostDownloadCountingEp {
     route_terminal_outcomes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_drains: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_install_graph_nodes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    route_boundaries: Arc<Mutex<Vec<ExecutorInstanceId>>>,
     artifact_config_authority: ExecutorArtifactConfigAuthority,
     assert_finalized_before_execute: bool,
     capture_checks: Arc<AtomicUsize>,
@@ -157,6 +159,7 @@ impl HostDownloadCountingEp {
             route_terminal_outcomes: Arc::new(Mutex::new(HashMap::new())),
             route_drains: Arc::new(Mutex::new(HashMap::new())),
             route_install_graph_nodes: Arc::new(Mutex::new(HashMap::new())),
+            route_boundaries: Arc::new(Mutex::new(Vec::new())),
             artifact_config_authority: ExecutorArtifactConfigAuthority::fresh(),
             assert_finalized_before_execute: false,
             capture_checks: Arc::new(AtomicUsize::new(0)),
@@ -180,6 +183,14 @@ impl HostDownloadCountingEp {
         Self {
             assert_finalized_before_execute: true,
             artifact_finalization: TestArtifactFinalization::PendingOnce,
+            ..Self::new(host_downloads)
+        }
+    }
+
+    fn new_required_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            artifact_finalization: TestArtifactFinalization::Required,
             ..Self::new(host_downloads)
         }
     }
@@ -235,6 +246,10 @@ impl HostDownloadCountingEp {
 
     fn route_install_graph_nodes(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
         Arc::clone(&self.route_install_graph_nodes)
+    }
+
+    fn route_boundaries(&self) -> Arc<Mutex<Vec<ExecutorInstanceId>>> {
+        Arc::clone(&self.route_boundaries)
     }
 
     fn capture_checks(&self) -> Arc<AtomicUsize> {
@@ -324,7 +339,8 @@ impl ExecutionProvider for HostDownloadCountingEp {
     fn resolve_executor_artifact_config(&self) -> EpResult<ExecutorArtifactConfigTemplate> {
         let route_residency = match self.artifact_finalization {
             TestArtifactFinalization::Complete => ExecutorRouteResidencyConfig::Disabled,
-            TestArtifactFinalization::PendingOnce
+            TestArtifactFinalization::Required
+            | TestArtifactFinalization::PendingOnce
             | TestArtifactFinalization::StructuralDecline
             | TestArtifactFinalization::FailOnce
             | TestArtifactFinalization::ReadyPendingFailedReady => {
@@ -358,9 +374,16 @@ impl ExecutionProvider for HostDownloadCountingEp {
                 TestArtifactFinalization::ReadyPendingFailedReady
             )
         {
-            return Ok(match proof {
-                ExecutorArtifactFinalizationProof::Disabled(disabled) => disabled.complete(),
-                ExecutorArtifactFinalizationProof::Enabled(enabled) => enabled.declined(),
+            return Ok(match (self.artifact_finalization, proof) {
+                (
+                    TestArtifactFinalization::Required,
+                    ExecutorArtifactFinalizationProof::Enabled(enabled),
+                ) => enabled.required(),
+                (TestArtifactFinalization::Required, _) => {
+                    unreachable!("required lifecycle resolves an enabled configuration")
+                }
+                (_, ExecutorArtifactFinalizationProof::Disabled(disabled)) => disabled.complete(),
+                (_, ExecutorArtifactFinalizationProof::Enabled(enabled)) => enabled.declined(),
             });
         }
         assert!(
@@ -419,6 +442,7 @@ impl ExecutionProvider for HostDownloadCountingEp {
                 )))
             }
             TestArtifactFinalization::Complete
+            | TestArtifactFinalization::Required
             | TestArtifactFinalization::PendingOnce
             | TestArtifactFinalization::FailOnce
             | TestArtifactFinalization::StructuralDecline
@@ -433,12 +457,29 @@ impl ExecutionProvider for HostDownloadCountingEp {
                     .lock()
                     .unwrap()
                     .insert(executor, graph.num_nodes());
-                Ok(match proof {
-                    ExecutorArtifactFinalizationProof::Disabled(disabled) => disabled.complete(),
-                    ExecutorArtifactFinalizationProof::Enabled(enabled) => enabled.declined(),
+                Ok(match (self.artifact_finalization, proof) {
+                    (
+                        TestArtifactFinalization::Required,
+                        ExecutorArtifactFinalizationProof::Enabled(enabled),
+                    ) => enabled.required(),
+                    (TestArtifactFinalization::Required, _) => {
+                        unreachable!("required lifecycle resolves an enabled configuration")
+                    }
+                    (_, ExecutorArtifactFinalizationProof::Disabled(disabled)) => {
+                        disabled.complete()
+                    }
+                    (_, ExecutorArtifactFinalizationProof::Enabled(enabled)) => enabled.declined(),
                 })
             }
         }
+    }
+
+    fn consume_route_residency_at_boundary_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> EpResult<()> {
+        self.route_boundaries.lock().unwrap().push(executor);
+        Ok(())
     }
 
     fn drain_executor_artifacts(&self, config: ExecutorArtifactConfig) {
@@ -2236,6 +2277,30 @@ fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
     drop(session);
     assert_eq!(scoped_count(&drains, executor), 1);
     assert_eq!(scoped_count(&finalizations, executor), 1);
+}
+
+#[test]
+fn public_session_entry_owns_required_artifact_lifecycle() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_required_lifecycle(downloads);
+    let finalizations = ep.route_finalizations();
+    let boundaries = ep.route_boundaries();
+    let ep = Arc::new(ep);
+
+    let mut session = InferenceSession::builder()
+        .model_bytes(&static_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("public session builder finalizes a Required lifecycle");
+    let executor = session.executor_instance_id();
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert!(boundaries.lock().unwrap().is_empty());
+
+    let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    session
+        .run(&[("x", &x)])
+        .expect("Required lifecycle executes through its owned boundary");
+    assert_eq!(boundaries.lock().unwrap().as_slice(), &[executor]);
 }
 
 #[test]

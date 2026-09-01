@@ -888,7 +888,7 @@ impl Executor {
             }
         }
 
-        let instance_id = ExecutorInstanceId::fresh();
+        let instance_id = ExecutorInstanceId::fresh(&SESSION_ARTIFACT_AUTHORITY);
         let mut artifact_config = Self::resolve_artifact_config(ep.as_ref(), instance_id)?;
         let execution_provider_fallback_report = Self::place_graph(
             &mut graph,
@@ -1286,7 +1286,7 @@ impl Executor {
             ))
             .into());
         }
-        Ok(artifact_template.bind(instance_id))
+        Ok(artifact_template.bind(&SESSION_ARTIFACT_AUTHORITY, instance_id))
     }
 
     fn place_graph(

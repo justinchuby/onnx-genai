@@ -10,9 +10,6 @@ categories = ["science", "hardware-support"]
 
 [features]
 default = []
-# Internal trust-boundary surface used by onnx-runtime-session. Ordinary EP
-# consumers cannot bind executor generations or issue finalization requests.
-runtime-session-authority = []
 
 [dependencies]
 onnx-runtime-memory-governor = { workspace = true }

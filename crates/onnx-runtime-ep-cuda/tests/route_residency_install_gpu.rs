@@ -42,8 +42,8 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
     ExecutionProvider, ExecutorArtifactConfig, ExecutorArtifactFinalizationOutcome,
-    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
-    ExecutorRouteResidency, ExecutorRouteResidencyConfig,
+    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorArtifactSessionAuthority,
+    ExecutorInstanceId, ExecutorRouteResidency, ExecutorRouteResidencyConfig,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
@@ -57,6 +57,16 @@ use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
 // env var, so two tests toggling it concurrently would race.
 static GPU_SERIAL: Mutex<()> = Mutex::new(());
 
+// SAFETY: the opaque authority is a zero-sized token containing only `()`.
+// This raw construction is compiled only into this integration-test binary;
+// `gpu-tests` exposes no production constructor or accessor.
+static GPU_TEST_SESSION_AUTHORITY: ExecutorArtifactSessionAuthority =
+    unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+
+fn fresh_executor() -> ExecutorInstanceId {
+    ExecutorInstanceId::fresh(&GPU_TEST_SESSION_AUTHORITY)
+}
+
 fn artifact_config(
     provider: &CudaExecutionProvider,
     executor: ExecutorInstanceId,
@@ -64,7 +74,7 @@ fn artifact_config(
     provider
         .resolve_executor_artifact_config()
         .expect("resolve executor artifact config")
-        .bind(executor)
+        .bind(&GPU_TEST_SESSION_AUTHORITY, executor)
 }
 
 fn finalize_artifacts(
@@ -74,7 +84,10 @@ fn finalize_artifacts(
     readiness: ExecutorArtifactReadinessEpoch,
 ) -> onnx_runtime_ep_api::Result<ExecutorArtifactFinalizationOutcome> {
     provider
-        .finalize_executor_artifacts(config.finalization_proof(readiness), graph)?
+        .finalize_executor_artifacts(
+            config.finalization_proof(&GPU_TEST_SESSION_AUTHORITY, readiness),
+            graph,
+        )?
         .resolve(config, readiness)
 }
 
@@ -328,7 +341,7 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
     };
 
     let (graph, node_id, members) = qmoe_graph();
-    let executor = ExecutorInstanceId::fresh();
+    let executor = fresh_executor();
     let config = artifact_config(&provider, executor);
 
     // Before compile the EP owns no producer source and has retained nothing.
@@ -451,8 +464,8 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
     };
     let (graph, node_id, _) = qmoe_graph();
     let graph = Arc::new(graph);
-    let executor = ExecutorInstanceId::fresh();
-    let foreign_executor = ExecutorInstanceId::fresh();
+    let executor = fresh_executor();
+    let foreign_executor = fresh_executor();
     let config = artifact_config(&provider, executor);
     let foreign_config = artifact_config(&provider, foreign_executor);
     let declines_before = provider.route_residency_diagnostics().declines();
@@ -587,7 +600,7 @@ fn block_quantized_moe_without_producer_is_terminal_not_pending() {
         None => return,
     };
     let (graph, node_id) = block_quantized_moe_graph();
-    let executor = ExecutorInstanceId::fresh();
+    let executor = fresh_executor();
     let config = artifact_config(&provider, executor);
     let valid_shapes = vec![
         vec![1, 32],
@@ -603,7 +616,7 @@ fn block_quantized_moe_without_producer_is_terminal_not_pending() {
     let mut malformed_shapes = valid_shapes.clone();
     malformed_shapes[4][3] = 16;
     let malformed = match provider.get_kernel_for_executor(
-        artifact_config(&provider, ExecutorInstanceId::fresh()),
+        artifact_config(&provider, fresh_executor()),
         graph.node(node_id),
         &malformed_shapes,
         1,
@@ -683,7 +696,7 @@ fn disabled_build_installs_and_retains_nothing() {
     };
 
     let (graph, node_id, _members) = qmoe_graph();
-    let executor = ExecutorInstanceId::fresh();
+    let executor = fresh_executor();
     let config = artifact_config(&provider, executor);
     assert_eq!(
         config.route_residency(),
@@ -778,7 +791,7 @@ fn disabled_build_installs_and_retains_nothing() {
         Some(provider) => provider,
         None => return,
     };
-    let enabled_executor = ExecutorInstanceId::fresh();
+    let enabled_executor = fresh_executor();
     let enabled_config = artifact_config(&enabled_provider, enabled_executor);
     assert_eq!(
         enabled_config.route_residency(),
@@ -842,8 +855,8 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
     };
     let (graph, node_id, _) = qmoe_graph();
     let graph = Arc::new(graph);
-    let disabled_executor = ExecutorInstanceId::fresh();
-    let enabled_executor = ExecutorInstanceId::fresh();
+    let disabled_executor = fresh_executor();
+    let enabled_executor = fresh_executor();
     let disabled_config = artifact_config(&disabled, disabled_executor);
     let enabled_config = artifact_config(&enabled, enabled_executor);
 
@@ -869,7 +882,10 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
     );
     let stale_error = enabled
         .finalize_executor_artifacts(
-            stale_enabled_config.finalization_proof(ExecutorArtifactReadinessEpoch::new(1)),
+            stale_enabled_config.finalization_proof(
+                &GPU_TEST_SESSION_AUTHORITY,
+                ExecutorArtifactReadinessEpoch::new(1),
+            ),
             &graph,
         )
         .expect_err("a later capability for the same executor identity must fail closed");
@@ -930,7 +946,10 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
             scope.spawn(move || {
                 let error = disabled
                     .finalize_executor_artifacts(
-                        enabled_config.finalization_proof(ExecutorArtifactReadinessEpoch::new(2)),
+                        enabled_config.finalization_proof(
+                            &GPU_TEST_SESSION_AUTHORITY,
+                            ExecutorArtifactReadinessEpoch::new(2),
+                        ),
                         &graph,
                     )
                     .expect_err("concurrent mismatched finalization must fail closed");

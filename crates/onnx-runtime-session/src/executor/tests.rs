@@ -509,9 +509,12 @@ impl ExecutionProvider for DeferredValidationEp {
                 onnx_runtime_ir::DeviceId::cuda(0),
                 ExecutorRouteResidencyConfig::Enabled,
             )
-            .bind(ExecutorInstanceId::fresh());
+            .bind(
+                &SESSION_ARTIFACT_AUTHORITY,
+                ExecutorInstanceId::fresh(&SESSION_ARTIFACT_AUTHORITY),
+            );
             let ExecutorArtifactFinalizationProof::Enabled(foreign) =
-                foreign.finalization_proof(proof.readiness())
+                foreign.finalization_proof(&SESSION_ARTIFACT_AUTHORITY, proof.readiness())
             else {
                 unreachable!("foreign test configuration is enabled")
             };
@@ -537,11 +540,11 @@ fn route_residency_finalization_rejects_foreign_capability() {
     ep.route_boundary_required.store(true, Ordering::Relaxed);
     ep.return_foreign_artifact_finalization
         .store(true, Ordering::Relaxed);
-    let executor = ExecutorInstanceId::fresh();
+    let executor = ExecutorInstanceId::fresh(&SESSION_ARTIFACT_AUTHORITY);
     let config = ep
         .resolve_executor_artifact_config()
         .expect("resolve executor artifact config")
-        .bind(executor);
+        .bind(&SESSION_ARTIFACT_AUTHORITY, executor);
     let mut readiness = ProviderArtifactReadiness::default();
 
     let error = readiness
@@ -596,11 +599,11 @@ fn disabled_artifact_config_rejects_required_finalization_without_publication() 
     let ep = DeferredValidationEp::new();
     ep.return_foreign_artifact_finalization
         .store(true, Ordering::Relaxed);
-    let executor = ExecutorInstanceId::fresh();
+    let executor = ExecutorInstanceId::fresh(&SESSION_ARTIFACT_AUTHORITY);
     let config = ep
         .resolve_executor_artifact_config()
         .expect("resolve disabled executor artifact config")
-        .bind(executor);
+        .bind(&SESSION_ARTIFACT_AUTHORITY, executor);
     assert_eq!(
         config.route_residency(),
         ExecutorRouteResidencyConfig::Disabled
@@ -622,11 +625,11 @@ fn disabled_artifact_config_rejects_required_finalization_without_publication() 
 fn stale_finalization_epoch_replay_fails_closed() {
     let ep = DeferredValidationEp::new();
     ep.route_boundary_required.store(true, Ordering::Relaxed);
-    let executor = ExecutorInstanceId::fresh();
+    let executor = ExecutorInstanceId::fresh(&SESSION_ARTIFACT_AUTHORITY);
     let config = ep
         .resolve_executor_artifact_config()
         .expect("resolve enabled executor artifact config")
-        .bind(executor);
+        .bind(&SESSION_ARTIFACT_AUTHORITY, executor);
     let mut readiness = ProviderArtifactReadiness::default();
     readiness
         .finalize_if_needed(&ep, config, &Graph::new())
@@ -653,7 +656,10 @@ fn readiness_exhaustion_rejects_before_kernel_publication_and_stays_exhausted() 
     let config = ep
         .resolve_executor_artifact_config()
         .expect("resolve artifact config")
-        .bind(ExecutorInstanceId::fresh());
+        .bind(
+            &SESSION_ARTIFACT_AUTHORITY,
+            ExecutorInstanceId::fresh(&SESSION_ARTIFACT_AUTHORITY),
+        );
     let mut cache = KernelCache::default();
     let mut readiness = ProviderArtifactReadiness::at_epoch_for_test(u64::MAX);
     let node = Node::new(NodeId(0), "Relu", vec![Some(ValueId(0))], vec![ValueId(1)]);
@@ -8283,10 +8289,10 @@ fn coverage_collector_surfaces_ep_decline_reason() {
     ));
 
     let ep = CpuExecutionProvider::new();
-    let artifact_config = ep
-        .resolve_executor_artifact_config()
-        .unwrap()
-        .bind(ExecutorInstanceId::fresh());
+    let artifact_config = ep.resolve_executor_artifact_config().unwrap().bind(
+        &SESSION_ARTIFACT_AUTHORITY,
+        ExecutorInstanceId::fresh(&SESSION_ARTIFACT_AUTHORITY),
+    );
     let mut issues = Vec::new();
     collect_cuda_coverage_issues(&graph, &graph, &ep, artifact_config, "graph", &mut issues);
 
@@ -8349,10 +8355,10 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     );
-    let artifact_config = ep
-        .resolve_executor_artifact_config()
-        .unwrap()
-        .bind(ExecutorInstanceId::fresh());
+    let artifact_config = ep.resolve_executor_artifact_config().unwrap().bind(
+        &SESSION_ARTIFACT_AUTHORITY,
+        ExecutorInstanceId::fresh(&SESSION_ARTIFACT_AUTHORITY),
+    );
     let report = || {
         cuda_fallback_report(&graph, &ep, artifact_config)
             .expect("CUDA declines must produce a fallback report")

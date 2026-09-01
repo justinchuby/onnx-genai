@@ -64,10 +64,10 @@ pub use provider::{
     ExecutorArtifactDisabledFinalization, ExecutorArtifactEnabledFinalization,
     ExecutorArtifactFinalization, ExecutorArtifactFinalizationOutcome,
     ExecutorArtifactFinalizationProof, ExecutorArtifactGeneration, ExecutorArtifactPending,
-    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExecutorKernelScope,
-    ExecutorRouteResidency, ExecutorRouteResidencyConfig, Fence, HostToDeviceCopier,
-    RawDeviceAllocationSiteStats, SealedDeviceAllocation, StructuralCaptureDecline,
-    WorkspaceAllocation,
+    ExecutorArtifactReadinessEpoch, ExecutorArtifactSessionAuthority, ExecutorInstanceId,
+    ExecutorKernelScope, ExecutorRouteResidency, ExecutorRouteResidencyConfig, Fence,
+    HostToDeviceCopier, RawDeviceAllocationSiteStats, SealedDeviceAllocation,
+    StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{
