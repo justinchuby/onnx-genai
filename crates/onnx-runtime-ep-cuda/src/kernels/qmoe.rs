@@ -1295,14 +1295,14 @@ impl RouteTelemetrySourceRegistry {
     pub(crate) fn remove(&self, executor: ExecutorInstanceId) {
         self.sources
             .lock()
-            .expect("cuda_ep route-telemetry registry poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&executor);
     }
 
     pub(crate) fn clear(&self) {
         self.sources
             .lock()
-            .expect("cuda_ep route-telemetry registry poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
     }
 }
@@ -1514,6 +1514,16 @@ impl QMoERouteTelemetry {
         let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         if let Some(previous) = telemetry.take() {
             previous.free(&self.runtime);
+        }
+    }
+
+    pub(crate) fn disarm_route_telemetry_after_stream_fences(&self) {
+        let mut telemetry = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = telemetry.take() {
+            previous.free_after_stream_fences(&self.runtime);
         }
     }
 

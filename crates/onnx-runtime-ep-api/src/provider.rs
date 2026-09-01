@@ -1994,8 +1994,11 @@ pub trait ExecutionProvider: Send + Sync {
     /// Drain exactly the artifacts owned by `executor`.
     ///
     /// The default is a no-op. Participating providers must make this
-    /// idempotent and must not clear producer/boundary state owned by sibling
-    /// executors sharing the same provider.
+    /// idempotent and non-blocking: reject new acquisitions immediately, then
+    /// transfer any mapping ownership still protected by a use/transition
+    /// guard to a deferred reclamation authority. The last guard releases that
+    /// ownership exactly once. Implementations must not clear producer/boundary
+    /// state owned by sibling executors sharing the same provider.
     fn drain_executor_artifacts(&self, _executor: ExecutorInstanceId) {}
 
     /// Explicit device allocation/free counters, when the EP exposes them.

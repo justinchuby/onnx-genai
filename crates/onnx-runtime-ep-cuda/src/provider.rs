@@ -62,7 +62,8 @@ use onnx_runtime_memory_governor::{
 };
 
 use crate::deferred_release::{
-    CudaDeferredReleaseQueue, CudaStreamFences, DEFAULT_DEFERRED_RELEASE_CAPACITY, ReleaseObserver,
+    CudaDeferredReleaseQueue, CudaStreamFences, DEFAULT_DEFERRED_RELEASE_CAPACITY,
+    DeferredActionOutcome, DeferredReleaseAction, ReleaseObserver,
 };
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
@@ -72,7 +73,10 @@ use crate::route_residency::{
     RouteResidencyInstallOutcome, build_route_residency_boundaries,
 };
 use crate::runtime::{CudaRuntime, cuptr};
-use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy, PrefillRoute};
+use crate::weight_paging::{
+    CudaWeightResidency, DeviceOffloadPolicy, PrefillRoute, RouteReservationRetirementCleanup,
+    RouteReservationRetirementStart, RouteReservationRetirementStats,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteResidencyExecutorStatus {
@@ -86,6 +90,18 @@ pub struct RouteResidencyExecutorStatus {
     pub retained_banks: usize,
     pub reservation_generation: Option<u64>,
     pub reservation_removals: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteResidencyRetirementCensus {
+    pub active_registry_entries: usize,
+    pub retirement_registry_entries: usize,
+    pub live_retirement_records: usize,
+    pub reservation_registry_entries: usize,
+    pub retirements_started: u64,
+    pub deferred_cleanups: u64,
+    pub cleanups_scheduled: u64,
+    pub cleanups_executed: u64,
 }
 
 #[derive(Default)]
@@ -102,6 +118,86 @@ struct ExecutorRouteResidencyState {
     reservation_health: Option<Arc<crate::weight_paging::RouteReservationHealth>>,
     reservation_generation: Option<u64>,
     reservation_removals: u64,
+}
+
+struct RouteReservationRetirementAction {
+    executor: ExecutorInstanceId,
+    generation: Option<u64>,
+    boundaries: Vec<Arc<RouteResidencyBoundary>>,
+    armed_sources: Vec<Arc<crate::kernels::qmoe::QMoERouteTelemetry>>,
+    residency: Arc<CudaWeightResidency>,
+    reservation_count: usize,
+    bytes: u64,
+    health: Weak<crate::weight_paging::RouteReservationHealth>,
+}
+
+impl std::fmt::Debug for RouteReservationRetirementAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteReservationRetirementAction")
+            .field("executor", &self.executor)
+            .field("generation", &self.generation)
+            .field("boundaries", &self.boundaries.len())
+            .field("armed_sources", &self.armed_sources.len())
+            .field("reservations", &self.reservation_count)
+            .finish()
+    }
+}
+
+impl DeferredReleaseAction for RouteReservationRetirementAction {
+    fn execute(self: Box<Self>) -> DeferredActionOutcome {
+        let mut action = *self;
+        let health = action.health.upgrade();
+        for source in action.armed_sources.drain(..) {
+            source.disarm_route_telemetry_after_stream_fences();
+        }
+        action.boundaries.clear();
+        drop(
+            action
+                .residency
+                .take_route_bank_reservations(action.executor),
+        );
+        if let Some(health) = health {
+            health.complete_retirement();
+        }
+        DeferredActionOutcome::released(0)
+    }
+
+    fn label(&self) -> &'static str {
+        "route-reservation-retirement"
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+struct RouteReservationRetirementSubmission {
+    queue: Arc<CudaDeferredReleaseQueue>,
+    action: RouteReservationRetirementAction,
+}
+
+impl std::fmt::Debug for RouteReservationRetirementSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteReservationRetirementSubmission")
+            .field("action", &self.action)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RouteReservationRetirementCleanup for RouteReservationRetirementSubmission {
+    fn schedule(self: Box<Self>) {
+        let Self { queue, action } = *self;
+        if let Err(refused) = queue.enqueue(action) {
+            let detail = format!(
+                "route-reservation retirement enqueue was refused as {}; exact mapping ownership \
+                 remains quarantined",
+                refused.rejection.name()
+            );
+            queue.retain_refused(refused, detail);
+        }
+    }
 }
 
 /// The provider-owned mapped-attribution zone.
@@ -989,6 +1085,11 @@ pub struct CudaExecutionProvider {
     /// executors may share this EP, but each owns an independent finalization
     /// outcome, boundary, and retained bank artifacts.
     route_executors: Mutex<HashMap<ExecutorInstanceId, ExecutorRouteResidencyState>>,
+    /// Generation-scoped weak records for installed artifacts that have left
+    /// the live registry. Exact baked requirements keep their record alive;
+    /// dead weak entries are pruned on every lookup and census.
+    route_retirements:
+        Mutex<HashMap<ExecutorInstanceId, Weak<crate::weight_paging::RouteReservationHealth>>>,
     route_diag: Arc<RouteResidencyDiagnostics>,
     /// EP-owned registry of live `QMoE` route-telemetry producer sources,
     /// keyed by call-site `NodeId` (issue #1810 Slice 7E). Shared with the
@@ -1252,6 +1353,7 @@ impl CudaExecutionProvider {
             retired_allocator_teardown: Vec::new(),
             release_queue,
             route_executors: Mutex::new(HashMap::new()),
+            route_retirements: Mutex::new(HashMap::new()),
             route_diag: Arc::new(RouteResidencyDiagnostics::default()),
             route_telemetry_registry,
         };
@@ -1941,20 +2043,90 @@ impl CudaExecutionProvider {
             .route_executors
             .lock()
             .expect("cuda_ep route-residency executors poisoned");
-        let state = states.get(&executor);
+        if let Some(state) = states.get(&executor) {
+            return RouteResidencyExecutorStatus {
+                finalization_attempts: state.finalization_attempts,
+                readiness_epoch: state.readiness_epoch,
+                pending: state.pending.clone(),
+                drain_calls: state.drain_calls,
+                drained: state.drained,
+                outcome: state.outcome.clone(),
+                producer_nodes: self.route_telemetry_registry.len(executor),
+                retained_banks: state
+                    .retained_artifacts
+                    .as_ref()
+                    .map_or(0, |artifacts| artifacts.len()),
+                reservation_generation: state.reservation_generation,
+                reservation_removals: state.reservation_removals,
+            };
+        }
+        drop(states);
+        let retired = self.retired_route_reservation(executor);
+        let (retiring, fully_retired) = retired
+            .as_ref()
+            .map_or((false, false), |health| health.retirement_status());
         RouteResidencyExecutorStatus {
-            finalization_attempts: state.map_or(0, |state| state.finalization_attempts),
-            readiness_epoch: state.and_then(|state| state.readiness_epoch),
-            pending: state.and_then(|state| state.pending.clone()),
-            drain_calls: state.map_or(0, |state| state.drain_calls),
-            drained: state.is_some_and(|state| state.drained),
-            outcome: state.and_then(|state| state.outcome.clone()),
-            producer_nodes: self.route_telemetry_registry.len(executor),
-            retained_banks: state
-                .and_then(|state| state.retained_artifacts.as_ref())
-                .map_or(0, |artifacts| artifacts.len()),
-            reservation_generation: state.and_then(|state| state.reservation_generation),
-            reservation_removals: state.map_or(0, |state| state.reservation_removals),
+            finalization_attempts: 0,
+            readiness_epoch: None,
+            pending: None,
+            drain_calls: u64::from(retiring || fully_retired),
+            drained: retiring || fully_retired,
+            outcome: None,
+            producer_nodes: 0,
+            retained_banks: 0,
+            reservation_generation: retired.as_ref().and_then(|health| health.generation()),
+            reservation_removals: u64::from(fully_retired),
+        }
+    }
+
+    fn retired_route_reservation(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Option<Arc<crate::weight_paging::RouteReservationHealth>> {
+        let mut retirements = self
+            .route_retirements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retirements.retain(|_, health| health.strong_count() != 0);
+        retirements.get(&executor).and_then(Weak::upgrade)
+    }
+
+    pub fn route_residency_retirement_census(&self) -> RouteResidencyRetirementCensus {
+        let active_registry_entries = self
+            .route_executors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        let (retirement_registry_entries, live_retirement_records) = {
+            let mut retirements = self
+                .route_retirements
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            retirements.retain(|_, health| health.strong_count() != 0);
+            let live = retirements
+                .values()
+                .filter(|health| health.upgrade().is_some())
+                .count();
+            (retirements.len(), live)
+        };
+        let (reservation_registry_entries, stats) = self.residency.as_ref().map_or(
+            (0, RouteReservationRetirementStats::default()),
+            |residency| {
+                (
+                    residency.route_reservation_count(),
+                    residency.route_reservation_retirement_stats(),
+                )
+            },
+        );
+        RouteResidencyRetirementCensus {
+            active_registry_entries,
+            retirement_registry_entries,
+            live_retirement_records,
+            reservation_registry_entries,
+            retirements_started: stats.retirements_started,
+            deferred_cleanups: stats.deferred_cleanups,
+            cleanups_scheduled: stats.cleanups_scheduled,
+            cleanups_executed: stats.cleanups_executed,
         }
     }
 
@@ -1994,6 +2166,25 @@ impl CudaExecutionProvider {
     ) -> Result<ExecutorArtifactFinalization> {
         if !crate::coarse_residency::coarse_residency_profile_enabled() {
             return Ok(ExecutorArtifactFinalization::Complete);
+        }
+
+        if let Some(health) = self.retired_route_reservation(executor) {
+            let generation = health.generation();
+            let (retiring, retired) = health.retirement_status();
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: executor {} route-bank artifact generation {:?} is {}; executor \
+                 identities cannot be reused while a baked requirement or lease still references \
+                 the retired generation",
+                executor.get(),
+                generation,
+                if retired {
+                    "retired"
+                } else if retiring {
+                    "retiring"
+                } else {
+                    "not live"
+                }
+            )));
         }
 
         let mut states = self
@@ -2276,7 +2467,7 @@ impl CudaExecutionProvider {
             let states = self
                 .route_executors
                 .lock()
-                .expect("cuda_ep route-residency executors poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             states
                 .get(&executor)
                 .and_then(|state| state.reservation_health.clone())
@@ -2285,113 +2476,77 @@ impl CudaExecutionProvider {
             let mut states = self
                 .route_executors
                 .lock()
-                .expect("cuda_ep route-residency executors poisoned");
-            if let Some(state) = states.get_mut(&executor)
-                && !state.drained
-            {
-                state.drain_calls += 1;
-                state.drained = true;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(mut state) = states.remove(&executor) {
                 state.pending = None;
             }
+            drop(states);
+            self.route_telemetry_registry.remove(executor);
             return;
         };
-        let Some(retirement) = health.begin_retirement() else {
+        if health.begin_retirement() != RouteReservationRetirementStart::Started {
             return;
-        };
+        }
+        // Publish the retiring generation before removing the live entry. This
+        // closes the only ABA window: a concurrent finalization either still
+        // observes the installed live state or observes this retirement record,
+        // but can never create a replacement between the two registry updates.
+        self.route_retirements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(executor, Arc::downgrade(&health));
 
-        let (boundaries, armed_sources) = {
-            let mut states = self
-                .route_executors
-                .lock()
-                .expect("cuda_ep route-residency executors poisoned");
-            let state = states
-                .get_mut(&executor)
-                .expect("installed reservation keeps its executor state");
-            state.drain_calls += 1;
-            state.drained = true;
-            state.pending = None;
-            (state.boundaries.clone(), state.armed_sources.clone())
-        };
-
-        let mut safe_to_unmap = true;
-        if let Err(error) = self.runtime.drain_for_unmap() {
-            safe_to_unmap = false;
-            eprintln!(
-                "cuda_ep: WARNING: executor {} route teardown could not drain CUDA work; \
-                 reservation mappings remain retained and retired: {error}",
-                executor.get()
-            );
-        }
-        if let Err(error) = self.runtime.sync_copy_stream() {
-            safe_to_unmap = false;
-            eprintln!(
-                "cuda_ep: WARNING: executor {} route teardown could not drain copies; \
-                 reservation mappings remain retained and retired: {error}",
-                executor.get()
-            );
-        }
-        if !self
-            .release_queue
-            .wait_until_idle(std::time::Duration::from_secs(30))
-        {
-            safe_to_unmap = false;
-            eprintln!(
-                "cuda_ep: WARNING: executor {} route teardown release queue did not drain; \
-                 reservation mappings remain retained and retired",
-                executor.get()
-            );
-        }
-        if safe_to_unmap {
-            for boundary in &boundaries {
-                if let Err(error) = boundary.restore_host_ranges_to_device(&self.runtime) {
-                    safe_to_unmap = false;
-                    health.mark_unusable(format!(
-                        "route-bank restore during executor teardown failed: {error}"
-                    ));
-                    break;
-                }
-            }
-        }
-        if !safe_to_unmap {
-            eprintln!(
-                "cuda_ep: WARNING: executor {} route-bank teardown failed closed; no later \
-                 dispatch or replay can acquire generation {:?}",
-                executor.get(),
-                health.generation()
-            );
-        }
-        for source in armed_sources {
-            source.disarm_route_telemetry();
-        }
-        self.route_telemetry_registry.remove(executor);
-        if safe_to_unmap {
-            if let Some(residency) = self.residency.as_ref() {
-                residency.remove_route_bank_reservations(executor);
-            }
-            let mut states = self
-                .route_executors
-                .lock()
-                .expect("cuda_ep route-residency executors poisoned");
-            let state = states
-                .get_mut(&executor)
-                .expect("retired reservation keeps its executor tombstone");
-            state.boundaries.clear();
-            state.armed_sources.clear();
-            state.retained_artifacts = None;
-            state.reservation_removals += 1;
-        } else {
+        let Some(mut state) = self
+            .route_executors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&executor)
+        else {
             health.mark_unusable(
-                "reservation teardown could not prove all mappings safe to release".to_string(),
+                "reservation retirement lost its live executor registry entry".to_string(),
+            );
+            return;
+        };
+        state.pending = None;
+        self.route_telemetry_registry.remove(executor);
+
+        let Some(residency) = self.residency.as_ref().map(Arc::clone) else {
+            health.mark_unusable(
+                "installed route-bank reservation lost its residency owner during retirement"
+                    .to_string(),
+            );
+            return;
+        };
+        let (reservation_count, bytes) = residency
+            .route_reservation_resource_stats(executor)
+            .unwrap_or_default();
+        if reservation_count == 0 {
+            health.mark_unusable(
+                "installed route-bank reservation lost its mapped ownership during retirement"
+                    .to_string(),
             );
         }
-        retirement.complete();
+        let cleanup = RouteReservationRetirementSubmission {
+            queue: Arc::clone(&self.release_queue),
+            action: RouteReservationRetirementAction {
+                executor,
+                generation: health.generation(),
+                boundaries: std::mem::take(&mut state.boundaries),
+                armed_sources: std::mem::take(&mut state.armed_sources),
+                residency,
+                reservation_count,
+                bytes,
+                health: Arc::downgrade(&health),
+            },
+        };
+        health.install_retirement_cleanup(Box::new(cleanup));
     }
 
     fn drain_all_route_residency(&self) {
         let executors: Vec<_> = self
             .route_executors
             .lock()
-            .expect("cuda_ep route-residency executors poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .keys()
             .copied()
             .collect();
@@ -4640,28 +4795,43 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         executor: ExecutorInstanceId,
     ) -> Result<Option<onnx_runtime_ep_api::ExecutorArtifactRequirement>> {
-        let (health, expected_generation) = {
+        let active = {
             let states = self
                 .route_executors
                 .lock()
-                .expect("cuda_ep route-residency executors poisoned");
-            let Some(state) = states.get(&executor) else {
-                return Ok(None);
-            };
-            if !matches!(
-                state.outcome,
-                Some(RouteResidencyInstallOutcome::Installed { .. })
-            ) {
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            states.get(&executor).map(|state| {
+                (
+                    state.outcome.clone(),
+                    state.reservation_health.clone(),
+                    state.reservation_generation,
+                )
+            })
+        };
+        let (health, expected_generation) = match active {
+            Some((outcome, _, _))
+                if !matches!(
+                    outcome,
+                    Some(RouteResidencyInstallOutcome::Installed { .. })
+                ) =>
+            {
                 return Ok(None);
             }
-            let Some(health) = state.reservation_health.clone() else {
+            Some((_, Some(health), generation)) => (health, generation),
+            Some((_, None, _)) => {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep: executor {} recorded installed route-bank reservations without \
                      retaining their lifecycle requirement; tear down and rebuild the executor",
                     executor.get()
                 )));
-            };
-            (health, state.reservation_generation)
+            }
+            None => {
+                let Some(health) = self.retired_route_reservation(executor) else {
+                    return Ok(None);
+                };
+                let generation = health.generation();
+                (health, generation)
+            }
         };
         if health.generation() != expected_generation {
             return Err(EpError::KernelFailed(format!(
@@ -4908,6 +5078,7 @@ impl Drop for CudaExecutionProvider {
         // releases before provider teardown retires the allocator.
         let _ = self.runtime.reset_graph();
         let _ = self.runtime.reset_graph_in(DeviceGraphSlot::Verify);
+        self.drain_all_route_residency();
         // Residency is retired first so its pages can still enqueue, then the
         // queue is closed: nothing else can reach this provider afterwards.
         self.retire_residency();

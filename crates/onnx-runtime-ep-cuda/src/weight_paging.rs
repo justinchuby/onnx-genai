@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use cudarc::driver::sys;
@@ -2787,6 +2787,7 @@ pub struct CudaWeightResidency {
     /// Exact executor-owned routed-bank reservations. Each reservation owns one
     /// dedicated allocator/VA and is removed only by that executor's teardown.
     route_reservations: Mutex<HashMap<ExecutorInstanceId, Arc<RouteReservationSet>>>,
+    route_retirement_counters: Arc<RouteReservationRetirementCounters>,
     inner: Mutex<ResidencyInner>,
     /// Count of live [`onnx_runtime_ep_api::RoutedResidencyProof`] guards
     /// acquired via [`CudaWeightResidency::acquire_routed_residency`]. Only
@@ -2873,13 +2874,20 @@ struct RouteReservationSet {
     health: Arc<RouteReservationHealth>,
 }
 
+#[derive(Debug)]
+pub(crate) struct RouteReservationRetirementResources {
+    _allocators: Vec<Arc<crate::vmm_allocator::CudaVmmAllocator>>,
+    _device_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+    _host_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+}
+
 #[doc(hidden)]
 pub struct RouteReservationHealth {
     identity: Option<RouteReservationIdentity>,
     lifecycle: AtomicU64,
     reason: Mutex<Option<String>>,
-    lifecycle_wait: Mutex<()>,
-    lifecycle_changed: Condvar,
+    retirement_cleanup: Mutex<Option<Box<dyn RouteReservationRetirementCleanup>>>,
+    retirement_counters: Arc<RouteReservationRetirementCounters>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2896,6 +2904,52 @@ const ROUTE_HEALTH_RETIRED: u64 = 1 << 3;
 const ROUTE_HEALTH_USE: u64 = 1 << 4;
 static NEXT_ROUTE_RESERVATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteReservationRetirementStats {
+    pub retirements_started: u64,
+    pub deferred_cleanups: u64,
+    pub cleanups_scheduled: u64,
+    pub cleanups_executed: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RouteReservationRetirementCounters {
+    retirements_started: AtomicU64,
+    deferred_cleanups: AtomicU64,
+    cleanups_scheduled: AtomicU64,
+    cleanups_executed: AtomicU64,
+}
+
+impl RouteReservationRetirementCounters {
+    fn snapshot(&self) -> RouteReservationRetirementStats {
+        RouteReservationRetirementStats {
+            retirements_started: self.retirements_started.load(Ordering::Acquire),
+            deferred_cleanups: self.deferred_cleanups.load(Ordering::Acquire),
+            cleanups_scheduled: self.cleanups_scheduled.load(Ordering::Acquire),
+            cleanups_executed: self.cleanups_executed.load(Ordering::Acquire),
+        }
+    }
+
+    pub(crate) fn record_cleanup_executed(&self) {
+        self.cleanups_executed.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) trait RouteReservationRetirementCleanup: Send + std::fmt::Debug {
+    /// Transfer cleanup to a non-blocking reclamation authority.
+    ///
+    /// This runs from the final use/transition guard's `Drop`, so it must not
+    /// wait for a thread, stream, condition variable, or externally held guard.
+    fn schedule(self: Box<Self>);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteReservationRetirementStart {
+    Started,
+    AlreadyRetiring,
+    Retired,
+}
+
 pub(crate) struct RouteReservationUseGuard {
     health: Arc<RouteReservationHealth>,
 }
@@ -2904,18 +2958,10 @@ impl onnx_runtime_ep_api::ExecutorArtifactUseGuard for RouteReservationUseGuard 
 
 impl Drop for RouteReservationUseGuard {
     fn drop(&mut self) {
-        let _wait = self
-            .health
-            .lifecycle_wait
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let prior = self
-            .health
+        self.health
             .lifecycle
             .fetch_sub(ROUTE_HEALTH_USE, Ordering::AcqRel);
-        if prior & ROUTE_HEALTH_RETIRING != 0 {
-            self.health.lifecycle_changed.notify_all();
-        }
+        self.health.try_schedule_retirement_cleanup();
     }
 }
 
@@ -2927,32 +2973,19 @@ pub(crate) struct RouteReservationTransitionGuard {
 impl RouteReservationTransitionGuard {
     pub(crate) fn complete(mut self) {
         self.completed = true;
-        let _wait = self
-            .health
-            .lifecycle_wait
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let prior = self
-            .health
+        self.health
             .lifecycle
             .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::AcqRel);
-        if prior & ROUTE_HEALTH_RETIRING != 0 {
-            self.health.lifecycle_changed.notify_all();
-        }
+        self.health.try_schedule_retirement_cleanup();
     }
 
     pub(crate) fn poison(mut self, reason: String) {
         self.health.mark_unusable(reason);
         self.completed = true;
-        let _wait = self
-            .health
-            .lifecycle_wait
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.health
             .lifecycle
             .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::Release);
-        self.health.lifecycle_changed.notify_all();
+        self.health.try_schedule_retirement_cleanup();
     }
 }
 
@@ -2963,57 +2996,10 @@ impl Drop for RouteReservationTransitionGuard {
                 "reservation transition authority exited without publishing a terminal outcome"
                     .to_string(),
             );
-            let _wait = self
-                .health
-                .lifecycle_wait
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.health
                 .lifecycle
                 .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::Release);
-            self.health.lifecycle_changed.notify_all();
-        }
-    }
-}
-
-pub(crate) struct RouteReservationRetirementGuard {
-    health: Arc<RouteReservationHealth>,
-    completed: bool,
-}
-
-impl RouteReservationRetirementGuard {
-    pub(crate) fn complete(mut self) {
-        self.completed = true;
-        let _wait = self
-            .health
-            .lifecycle_wait
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let poisoned = self.health.lifecycle.load(Ordering::Acquire) & ROUTE_HEALTH_POISONED;
-        self.health
-            .lifecycle
-            .store(poisoned | ROUTE_HEALTH_RETIRED, Ordering::Release);
-        self.health.lifecycle_changed.notify_all();
-    }
-}
-
-impl Drop for RouteReservationRetirementGuard {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.health.mark_unusable(
-                "reservation teardown exited without publishing a terminal retirement outcome"
-                    .to_string(),
-            );
-            let _wait = self
-                .health
-                .lifecycle_wait
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.health.lifecycle.store(
-                ROUTE_HEALTH_POISONED | ROUTE_HEALTH_RETIRED,
-                Ordering::Release,
-            );
-            self.health.lifecycle_changed.notify_all();
+            self.health.try_schedule_retirement_cleanup();
         }
     }
 }
@@ -3053,12 +3039,16 @@ impl RouteReservationHealth {
             identity: None,
             lifecycle: AtomicU64::new(0),
             reason: Mutex::new(None),
-            lifecycle_wait: Mutex::new(()),
-            lifecycle_changed: Condvar::new(),
+            retirement_cleanup: Mutex::new(None),
+            retirement_counters: Arc::new(RouteReservationRetirementCounters::default()),
         })
     }
 
-    fn new_scoped(executor: ExecutorInstanceId, device_ordinal: u32) -> Arc<Self> {
+    fn new_scoped(
+        executor: ExecutorInstanceId,
+        device_ordinal: u32,
+        retirement_counters: Arc<RouteReservationRetirementCounters>,
+    ) -> Arc<Self> {
         let generation = NEXT_ROUTE_RESERVATION_GENERATION.fetch_add(1, Ordering::Relaxed);
         Arc::new(Self {
             identity: Some(RouteReservationIdentity {
@@ -3068,8 +3058,8 @@ impl RouteReservationHealth {
             }),
             lifecycle: AtomicU64::new(0),
             reason: Mutex::new(None),
-            lifecycle_wait: Mutex::new(()),
-            lifecycle_changed: Condvar::new(),
+            retirement_cleanup: Mutex::new(None),
+            retirement_counters,
         })
     }
 
@@ -3240,24 +3230,14 @@ impl RouteReservationHealth {
         }
     }
 
-    pub(crate) fn begin_retirement(self: &Arc<Self>) -> Option<RouteReservationRetirementGuard> {
+    pub(crate) fn begin_retirement(&self) -> RouteReservationRetirementStart {
         loop {
             let state = self.lifecycle.load(Ordering::Acquire);
             if state & ROUTE_HEALTH_RETIRED != 0 {
-                return None;
+                return RouteReservationRetirementStart::Retired;
             }
             if state & ROUTE_HEALTH_RETIRING != 0 {
-                let mut wait = self
-                    .lifecycle_wait
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                while self.lifecycle.load(Ordering::Acquire) & ROUTE_HEALTH_RETIRED == 0 {
-                    wait = self
-                        .lifecycle_changed
-                        .wait(wait)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
-                return None;
+                return RouteReservationRetirementStart::AlreadyRetiring;
             }
             if self
                 .lifecycle
@@ -3271,28 +3251,84 @@ impl RouteReservationHealth {
             {
                 continue;
             }
-            break;
+            self.retirement_counters
+                .retirements_started
+                .fetch_add(1, Ordering::AcqRel);
+            return RouteReservationRetirementStart::Started;
         }
+    }
 
-        let mut wait = self
-            .lifecycle_wait
+    pub(crate) fn install_retirement_cleanup(
+        &self,
+        cleanup: Box<dyn RouteReservationRetirementCleanup>,
+    ) {
+        let state = self.lifecycle.load(Ordering::Acquire);
+        if state / ROUTE_HEALTH_USE != 0 || state & ROUTE_HEALTH_TRANSITIONING != 0 {
+            self.retirement_counters
+                .deferred_cleanups
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        let mut slot = self
+            .retirement_cleanup
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        loop {
-            let state = self.lifecycle.load(Ordering::Acquire);
-            if state / ROUTE_HEALTH_USE == 0 && state & ROUTE_HEALTH_TRANSITIONING == 0 {
-                break;
-            }
-            wait = self
-                .lifecycle_changed
-                .wait(wait)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_some() {
+            self.mark_unusable(
+                "reservation retirement attempted to install cleanup ownership twice".to_string(),
+            );
+            return;
         }
-        drop(wait);
-        Some(RouteReservationRetirementGuard {
-            health: Arc::clone(self),
-            completed: false,
-        })
+        *slot = Some(cleanup);
+        drop(slot);
+        self.try_schedule_retirement_cleanup();
+    }
+
+    fn try_schedule_retirement_cleanup(&self) {
+        let state = self.lifecycle.load(Ordering::Acquire);
+        if state & ROUTE_HEALTH_RETIRING == 0
+            || state & ROUTE_HEALTH_RETIRED != 0
+            || state / ROUTE_HEALTH_USE != 0
+            || state & ROUTE_HEALTH_TRANSITIONING != 0
+        {
+            return;
+        }
+        let cleanup = {
+            let mut slot = self
+                .retirement_cleanup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = self.lifecycle.load(Ordering::Acquire);
+            if state & ROUTE_HEALTH_RETIRING == 0
+                || state & ROUTE_HEALTH_RETIRED != 0
+                || state / ROUTE_HEALTH_USE != 0
+                || state & ROUTE_HEALTH_TRANSITIONING != 0
+            {
+                return;
+            }
+            slot.take()
+        };
+        let Some(cleanup) = cleanup else {
+            return;
+        };
+        self.retirement_counters
+            .cleanups_scheduled
+            .fetch_add(1, Ordering::AcqRel);
+        cleanup.schedule();
+    }
+
+    pub(crate) fn complete_retirement(&self) {
+        let poisoned = self.lifecycle.load(Ordering::Acquire) & ROUTE_HEALTH_POISONED;
+        self.lifecycle
+            .store(poisoned | ROUTE_HEALTH_RETIRED, Ordering::Release);
+        self.retirement_counters.record_cleanup_executed();
+    }
+
+    pub(crate) fn retirement_status(&self) -> (bool, bool) {
+        let state = self.lifecycle.load(Ordering::Acquire);
+        (
+            state & ROUTE_HEALTH_RETIRING != 0,
+            state & ROUTE_HEALTH_RETIRED != 0,
+        )
     }
 }
 
@@ -3967,6 +4003,7 @@ impl CudaWeightResidency {
             context_terminated: AtomicBool::new(false),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             route_reservations: Mutex::new(HashMap::new()),
+            route_retirement_counters: Arc::new(RouteReservationRetirementCounters::default()),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(budget_bytes),
                 lease: None,
@@ -4035,6 +4072,7 @@ impl CudaWeightResidency {
             context_terminated: AtomicBool::new(false),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             route_reservations: Mutex::new(HashMap::new()),
+            route_retirement_counters: Arc::new(RouteReservationRetirementCounters::default()),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(lease.bytes()),
                 lease: Some(lease),
@@ -4480,7 +4518,11 @@ impl CudaWeightResidency {
         > = Arc::clone(queue)
             as Arc<dyn onnx_runtime_cuda_memory::virtual_memory::DeferredReservationQueue>;
 
-        let health = RouteReservationHealth::new_scoped(executor, device_ordinal as u32);
+        let health = RouteReservationHealth::new_scoped(
+            executor,
+            device_ordinal as u32,
+            Arc::clone(&self.route_retirement_counters),
+        );
         let mut by_key = HashMap::new();
         let mut catalogs = HashMap::new();
         let mut allocators = HashMap::new();
@@ -4571,13 +4613,24 @@ impl CudaWeightResidency {
             .map(|set| Self::authorities_from_set(set))
     }
 
-    pub fn remove_route_bank_reservations(&self, executor: ExecutorInstanceId) -> bool {
+    pub(crate) fn take_route_bank_reservations(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Option<RouteReservationRetirementResources> {
         let removed = self
             .route_reservations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&executor);
-        removed.is_some()
+        removed.map(|set| RouteReservationRetirementResources {
+            _allocators: set.allocators.values().cloned().collect(),
+            _device_pool: Arc::clone(&set.device_pool),
+            _host_pool: Arc::clone(&set.host_pool),
+        })
+    }
+
+    pub fn remove_route_bank_reservations(&self, executor: ExecutorInstanceId) -> bool {
+        self.take_route_bank_reservations(executor).is_some()
     }
 
     pub fn route_reservation_count(&self) -> usize {
@@ -4585,6 +4638,29 @@ impl CudaWeightResidency {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
+    }
+
+    pub(crate) fn route_reservation_resource_stats(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Option<(usize, u64)> {
+        self.route_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&executor)
+            .map(|set| {
+                (
+                    set.allocators.len(),
+                    set.by_key
+                        .values()
+                        .map(|reservation| reservation.len as u64)
+                        .sum(),
+                )
+            })
+    }
+
+    pub fn route_reservation_retirement_stats(&self) -> RouteReservationRetirementStats {
+        self.route_retirement_counters.snapshot()
     }
 
     pub(crate) fn route_weight_page(
@@ -7573,10 +7649,39 @@ mod tests {
     use super::*;
     use crate::test_support::EnvVarGuard;
 
+    #[derive(Debug)]
+    struct CountingRetirementCleanup {
+        runs: Arc<AtomicU64>,
+        health: std::sync::Weak<RouteReservationHealth>,
+    }
+
+    impl RouteReservationRetirementCleanup for CountingRetirementCleanup {
+        fn schedule(self: Box<Self>) {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if let Some(health) = self.health.upgrade() {
+                health.complete_retirement();
+            }
+        }
+    }
+
+    fn scoped_health(
+        executor: ExecutorInstanceId,
+        device: u32,
+    ) -> (
+        Arc<RouteReservationHealth>,
+        Arc<RouteReservationRetirementCounters>,
+    ) {
+        let counters = Arc::new(RouteReservationRetirementCounters::default());
+        (
+            RouteReservationHealth::new_scoped(executor, device, Arc::clone(&counters)),
+            counters,
+        )
+    }
+
     #[test]
     fn route_reservation_lifecycle_linearizes_use_transition_and_poison() {
         let executor = ExecutorInstanceId::fresh();
-        let health = RouteReservationHealth::new_scoped(executor, 3);
+        let (health, _) = scoped_health(executor, 3);
         let generation = health.generation().expect("scoped generation");
 
         let use_guard = health
@@ -7611,7 +7716,7 @@ mod tests {
     fn route_reservation_lifecycle_rejects_sibling_and_device_aliases() {
         let owner = ExecutorInstanceId::fresh();
         let sibling = ExecutorInstanceId::fresh();
-        let health = RouteReservationHealth::new_scoped(owner, 1);
+        let (health, _) = scoped_health(owner, 1);
         let generation = health.generation().expect("scoped generation");
 
         let sibling_error = health
@@ -7637,49 +7742,43 @@ mod tests {
     }
 
     #[test]
-    fn route_reservation_retirement_waits_for_holder_and_rejects_later_replay() {
+    fn route_reservation_retirement_returns_with_public_holder_and_cleans_on_last_release() {
         let executor = ExecutorInstanceId::fresh();
-        let health = RouteReservationHealth::new_scoped(executor, 0);
-        let generation = health.generation().expect("scoped generation");
-        let holder = health
-            .acquire_use(executor, 0, generation)
-            .expect("pre-retirement holder");
-        let unmaps = Arc::new(AtomicU64::new(0));
+        let (health, counters) = scoped_health(executor, 0);
+        let requirement = health.requirement().expect("public requirement");
+        let holder = requirement.acquire_use().expect("pre-retirement holder");
+        let cleanups = Arc::new(AtomicU64::new(0));
         let teardown_health = Arc::clone(&health);
-        let teardown_unmaps = Arc::clone(&unmaps);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let teardown_cleanups = Arc::clone(&cleanups);
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
         let teardown = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let retirement = teardown_health
-                .begin_retirement()
-                .expect("one caller owns retirement");
             assert_eq!(
-                teardown_unmaps.fetch_add(1, Ordering::SeqCst),
-                0,
-                "unmap executes exactly once after all holders release"
+                teardown_health.begin_retirement(),
+                RouteReservationRetirementStart::Started
             );
-            retirement.complete();
+            teardown_health.install_retirement_cleanup(Box::new(CountingRetirementCleanup {
+                runs: teardown_cleanups,
+                health: Arc::downgrade(&teardown_health),
+            }));
+            returned_tx.send(()).unwrap();
         });
-        started_rx.recv().unwrap();
+        returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retirement must not wait for a public use guard");
 
-        let rejection = loop {
-            match health.acquire_use(executor, 0, generation) {
-                Ok(probe) => {
-                    drop(probe);
-                    std::thread::yield_now();
-                }
-                Err(error) => break error,
-            }
-        };
-        assert!(rejection.contains("retiring"));
+        let rejection = requirement
+            .acquire_use()
+            .err()
+            .expect("retirement rejects later public acquisition");
+        assert!(rejection.to_string().contains("retiring"));
         assert_eq!(
-            unmaps.load(Ordering::SeqCst),
+            cleanups.load(Ordering::SeqCst),
             0,
-            "teardown must not unmap while the original use lease is active"
+            "cleanup must remain quarantined while the original lease is active"
         );
 
         let replay_launches = AtomicU64::new(0);
-        if health.acquire_use(executor, 0, generation).is_ok() {
+        if requirement.acquire_use().is_ok() {
             replay_launches.fetch_add(1, Ordering::SeqCst);
         }
         assert_eq!(
@@ -7690,19 +7789,49 @@ mod tests {
 
         drop(holder);
         teardown.join().unwrap();
-        assert_eq!(unmaps.load(Ordering::SeqCst), 1);
-        let retired = health
-            .acquire_use(executor, 0, generation)
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+        let retired = requirement
+            .acquire_use()
             .err()
             .expect("completed teardown remains a requirement, but is retired");
-        assert!(retired.contains("retired"));
+        assert!(retired.to_string().contains("retired"));
+        assert_eq!(
+            counters.snapshot(),
+            RouteReservationRetirementStats {
+                retirements_started: 1,
+                deferred_cleanups: 1,
+                cleanups_scheduled: 1,
+                cleanups_executed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn stalled_transition_defers_without_deadlock_and_releases_cleanup_once() {
+        let executor = ExecutorInstanceId::fresh();
+        let (health, counters) = scoped_health(executor, 0);
+        let transition = health.begin_transition().expect("transition authority");
+        let cleanups = Arc::new(AtomicU64::new(0));
+        assert_eq!(
+            health.begin_retirement(),
+            RouteReservationRetirementStart::Started
+        );
+        health.install_retirement_cleanup(Box::new(CountingRetirementCleanup {
+            runs: Arc::clone(&cleanups),
+            health: Arc::downgrade(&health),
+        }));
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+        transition.complete();
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.snapshot().deferred_cleanups, 1);
+        assert_eq!(counters.snapshot().cleanups_scheduled, 1);
     }
 
     #[test]
     fn route_reservation_acquire_racing_retirement_never_launches_after_unmap() {
         for _ in 0..64 {
             let executor = ExecutorInstanceId::fresh();
-            let health = RouteReservationHealth::new_scoped(executor, 0);
+            let (health, _) = scoped_health(executor, 0);
             let generation = health.generation().expect("scoped generation");
             let gate = Arc::new(std::sync::Barrier::new(3));
             let launches = Arc::new(AtomicU64::new(0));
@@ -7737,11 +7866,14 @@ mod tests {
             let retire_unmaps = Arc::clone(&unmaps);
             let retire = std::thread::spawn(move || {
                 retire_gate.wait();
-                let retirement = retire_health
-                    .begin_retirement()
-                    .expect("one caller owns retirement");
-                assert_eq!(retire_unmaps.fetch_add(1, Ordering::SeqCst), 0);
-                retirement.complete();
+                assert_eq!(
+                    retire_health.begin_retirement(),
+                    RouteReservationRetirementStart::Started
+                );
+                retire_health.install_retirement_cleanup(Box::new(CountingRetirementCleanup {
+                    runs: retire_unmaps,
+                    health: Arc::downgrade(&retire_health),
+                }));
             });
 
             gate.wait();

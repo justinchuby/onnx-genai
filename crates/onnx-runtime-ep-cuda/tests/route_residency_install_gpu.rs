@@ -302,27 +302,26 @@ fn real_producer_installs_executor_scoped_banks_once() {
     let holder = first_requirement
         .acquire_use()
         .expect("acquire pre-retirement use lease");
+    let releases_before = provider.deferred_release_stats();
     let drain_provider = Arc::clone(&provider);
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (returned_tx, returned_rx) = std::sync::mpsc::channel();
     let drain = std::thread::spawn(move || {
-        started_tx.send(()).unwrap();
         drain_provider.drain_executor_artifacts(first);
+        returned_tx.send(()).unwrap();
     });
-    started_rx.recv().unwrap();
-    let replay_rejection = loop {
-        match first_requirement.acquire_use() {
-            Ok(probe) => {
-                drop(probe);
-                std::thread::yield_now();
-            }
-            Err(error) => break error,
-        }
-    };
+    returned_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("public drain must return without waiting for the held requirement guard");
+    drain.join().unwrap();
+    let replay_rejection = first_requirement
+        .acquire_use()
+        .err()
+        .expect("retiring requirement rejects replay");
     assert!(replay_rejection.to_string().contains("retiring"));
     assert_eq!(
         provider.residency().unwrap().route_reservation_count(),
         2,
-        "teardown must not remove the first executor's reservation while its holder is active"
+        "the deferred authority must keep the first executor's mappings owned while held"
     );
     assert_eq!(
         provider
@@ -330,8 +329,23 @@ fn real_producer_installs_executor_scoped_banks_once() {
             .reservation_removals,
         0
     );
+    let deferred = provider.route_residency_retirement_census();
+    assert_eq!(deferred.active_registry_entries, 1);
+    assert_eq!(deferred.retirement_registry_entries, 1);
+    assert_eq!(deferred.live_retirement_records, 1);
+    assert_eq!(deferred.reservation_registry_entries, 2);
+    assert_eq!(deferred.retirements_started, 1);
+    assert_eq!(deferred.deferred_cleanups, 1);
+    assert_eq!(deferred.cleanups_scheduled, 0);
+    assert_eq!(deferred.cleanups_executed, 0);
     drop(holder);
-    drain.join().unwrap();
+    assert!(
+        provider
+            .release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "last guard release must enqueue and complete deferred cleanup: {:?}",
+        provider.deferred_release_stats()
+    );
     provider.drain_executor_artifacts(first);
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
     assert!(provider.route_residency_scopes().contains(&second));
@@ -345,12 +359,145 @@ fn real_producer_installs_executor_scoped_banks_once() {
             .reservation_removals,
         1
     );
+    let releases_after = provider.deferred_release_stats();
+    assert!(
+        releases_after.completed >= releases_before.completed + 5,
+        "one cleanup action plus four reservation unmaps must complete: before={releases_before:?} \
+         after={releases_after:?}"
+    );
+    assert!(
+        releases_after.mapped_refunded_bytes
+            >= releases_before.mapped_refunded_bytes + 4 * TENSOR_BYTES as u64,
+        "all four exact bank reservations must report their unmapped bytes"
+    );
+    let completed = provider.route_residency_retirement_census();
+    assert_eq!(completed.cleanups_scheduled, 1);
+    assert_eq!(completed.cleanups_executed, 1);
     let retired = first_requirement
         .acquire_use()
         .err()
         .expect("requirement survives registry removal as retired");
     assert!(retired.to_string().contains("retired"));
+    drop(first_requirement);
+    assert_eq!(
+        provider
+            .route_residency_retirement_census()
+            .retirement_registry_entries,
+        0,
+        "dead generation tombstones are pruned once no graph/requirement/lease can reference them"
+    );
     provider.drain_executor_artifacts(second);
+}
+
+#[test]
+#[ignore = "requires idle CUDA device with HOST_NUMA VMM support"]
+fn retirement_registry_reclaims_churn_and_blocks_live_generation_aba() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let _gate = GateGuard::set(true);
+    let Some(provider) = provider_or_skip("retirement churn") else {
+        return;
+    };
+    let provider = Arc::new(provider);
+    let (graph, node, bank) = qmoe_graph_and_bank(17);
+    let reused = ExecutorInstanceId::fresh();
+    let mut first_generation = None;
+
+    for cycle in 0..8 {
+        let executor = if cycle == 0 {
+            reused
+        } else {
+            ExecutorInstanceId::fresh()
+        };
+        let kernel = compile_real_qmoe(&provider, executor, &graph, node);
+        assert_eq!(
+            provider
+                .finalize_executor_artifacts(
+                    executor,
+                    &graph,
+                    ExecutorArtifactReadinessEpoch::new(1),
+                    std::slice::from_ref(&bank),
+                )
+                .expect("finalize churn executor"),
+            ExecutorArtifactFinalization::Complete
+        );
+        let requirement = provider
+            .executor_artifact_requirement(executor)
+            .expect("query churn requirement")
+            .expect("installed generation");
+        let generation = provider
+            .route_residency_executor_status(executor)
+            .reservation_generation
+            .expect("generation");
+        first_generation.get_or_insert(generation);
+        provider.drain_executor_artifacts(executor);
+        assert!(
+            provider
+                .release_queue()
+                .wait_until_idle(std::time::Duration::from_secs(30)),
+            "cycle {cycle} cleanup must drain: {:?}",
+            provider.deferred_release_stats()
+        );
+        if cycle == 0 {
+            let error = provider
+                .finalize_executor_artifacts(
+                    executor,
+                    &graph,
+                    ExecutorArtifactReadinessEpoch::new(2),
+                    std::slice::from_ref(&bank),
+                )
+                .expect_err("a live baked requirement must block executor-id reuse");
+            assert!(error.to_string().contains("identities cannot be reused"));
+            assert_eq!(
+                provider
+                    .route_residency_retirement_census()
+                    .retirement_registry_entries,
+                1
+            );
+        }
+        drop(requirement);
+        drop(kernel);
+        let census = provider.route_residency_retirement_census();
+        assert_eq!(census.active_registry_entries, 0, "cycle {cycle}");
+        assert_eq!(census.retirement_registry_entries, 0, "cycle {cycle}");
+        assert_eq!(census.live_retirement_records, 0, "cycle {cycle}");
+        assert_eq!(census.reservation_registry_entries, 0, "cycle {cycle}");
+    }
+
+    let replacement_kernel = compile_real_qmoe(&provider, reused, &graph, node);
+    assert_eq!(
+        provider
+            .finalize_executor_artifacts(
+                reused,
+                &graph,
+                ExecutorArtifactReadinessEpoch::new(3),
+                std::slice::from_ref(&bank),
+            )
+            .expect("reuse is safe only after the old generation has no references"),
+        ExecutorArtifactFinalization::Complete
+    );
+    let replacement_generation = provider
+        .route_residency_executor_status(reused)
+        .reservation_generation
+        .expect("replacement generation");
+    assert_ne!(replacement_generation, first_generation.unwrap());
+    let replacement_requirement = provider
+        .executor_artifact_requirement(reused)
+        .expect("replacement requirement")
+        .expect("replacement installed");
+    provider.drain_executor_artifacts(reused);
+    drop(replacement_requirement);
+    drop(replacement_kernel);
+    assert!(
+        provider
+            .release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30))
+    );
+    let census = provider.route_residency_retirement_census();
+    assert_eq!(census.retirement_registry_entries, 0);
+    assert_eq!(census.reservation_registry_entries, 0);
+    assert_eq!(census.retirements_started, 9);
+    assert_eq!(census.cleanups_scheduled, 9);
+    assert_eq!(census.cleanups_executed, 9);
 }
 
 #[test]

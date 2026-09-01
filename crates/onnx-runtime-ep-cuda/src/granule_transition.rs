@@ -751,6 +751,7 @@ fn transition_granule_range_inner(
             reservation.swap_block(
                 old_block,
                 MappedBlock::new(stable_offset, granularity, new_handle),
+                Arc::clone(new_pool),
             );
 
             total_new_owned = total_new_owned.saturating_add(charged);

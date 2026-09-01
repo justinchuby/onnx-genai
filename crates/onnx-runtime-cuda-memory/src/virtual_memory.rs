@@ -173,6 +173,7 @@ pub struct ReservationTeardownTicket {
     len: usize,
     context: Arc<CudaContext>,
     pool: Option<Arc<PhysicalHandlePool>>,
+    block_pools: HashMap<cu::CUmemGenericAllocationHandle, Arc<PhysicalHandlePool>>,
     blocks: Vec<MappedBlock>,
     quarantined: Vec<MappedBlock>,
     #[cfg(any(test, feature = "gpu-tests"))]
@@ -325,17 +326,26 @@ impl ReservationTeardownTicket {
                 continue;
             }
             unmapped = unmapped.saturating_add(block.len as u64);
+            let pool = self
+                .block_pools
+                .get(&block.handle)
+                .cloned()
+                .or_else(|| self.pool.clone());
             if self.injected_fault(DriverOperation::Dispose).is_some() {
-                if let Some(pool) = &self.pool {
+                if let Some(pool) = &pool {
                     let _ = pool.retain_unmapped_handle(block.handle);
                 }
                 retained_unmapped.push(block);
-            } else if let Some(pool) = &self.pool {
+            } else if let Some(pool) = &pool {
                 if !pool.return_after_unmap(block.handle, true).is_settled() {
                     retained_unmapped.push(block);
+                } else {
+                    self.block_pools.remove(&block.handle);
                 }
             } else if unsafe { cu::cuMemRelease(block.handle) } != cu::CUresult::CUDA_SUCCESS {
                 retained_unmapped.push(block);
+            } else {
+                self.block_pools.remove(&block.handle);
             }
         }
         let retained = retained_mapped.len() + retained_unmapped.len();
@@ -440,6 +450,7 @@ impl Drop for ReservationTeardownTicket {
             len: std::mem::take(&mut self.len),
             context: Arc::clone(&self.context),
             pool: self.pool.clone(),
+            block_pools: std::mem::take(&mut self.block_pools),
             blocks: std::mem::take(&mut self.blocks),
             quarantined: std::mem::take(&mut self.quarantined),
             #[cfg(any(test, feature = "gpu-tests"))]
@@ -474,7 +485,7 @@ impl ReservationEnqueueRejection {
 #[derive(Debug)]
 pub struct ReservationEnqueueError {
     pub rejection: ReservationEnqueueRejection,
-    pub ticket: ReservationTeardownTicket,
+    pub ticket: Box<ReservationTeardownTicket>,
 }
 
 /// A queue that owns reservation teardown until in-flight work has finished.
@@ -2665,6 +2676,8 @@ pub struct CudaReservation {
     faults: Option<Arc<crate::release::DriverFaultPlan>>,
     /// Every block currently mapped into this reservation.
     blocks: Vec<MappedBlock>,
+    /// Pool provenance for mappings whose backing differs from `pool`.
+    block_pools: HashMap<cu::CUmemGenericAllocationHandle, Arc<PhysicalHandlePool>>,
     /// Blocks that were unmapped but whose physical handle could not be given
     /// back, on a backing with no pool to hold it.
     ///
@@ -2762,9 +2775,18 @@ impl CudaReservation {
         &mut self,
         old_block: crate::release::MappedBlock,
         new_block: crate::release::MappedBlock,
+        new_pool: Arc<PhysicalHandlePool>,
     ) {
         if let Some(pos) = self.blocks.iter().position(|b| *b == old_block) {
             self.blocks[pos] = new_block;
+            self.block_pools.remove(&old_block.handle);
+            if !self
+                .pool
+                .as_ref()
+                .is_some_and(|pool| Arc::ptr_eq(pool, &new_pool))
+            {
+                self.block_pools.insert(new_block.handle, new_pool);
+            }
         }
     }
 
@@ -2806,6 +2828,7 @@ impl CudaReservation {
             len: self.len,
             context: Arc::clone(&self.context),
             pool: self.pool.clone(),
+            block_pools: std::mem::take(&mut self.block_pools),
             #[cfg(any(test, feature = "gpu-tests"))]
             faults: self.faults.clone(),
             blocks: std::mem::take(&mut self.blocks),
@@ -2922,6 +2945,7 @@ unsafe impl VirtualBacking for CudaVirtualBacking {
             len,
             context: Arc::clone(&self.context),
             pool: self.pool.clone(),
+            block_pools: HashMap::new(),
             teardown_synchronizer: self.teardown_synchronizer.clone(),
             reservation_queue: self.reservation_queue.clone(),
             #[cfg(any(test, feature = "gpu-tests"))]

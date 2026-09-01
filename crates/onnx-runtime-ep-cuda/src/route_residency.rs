@@ -95,7 +95,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use onnx_runtime_cuda_memory::virtual_memory::{PhysicalHandlePool, PhysicalLocation};
+use onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_ep_api::{
     EpError, ExpertWeightGroup, LazyWeightBoundary, ResidencyPlan, Result,
@@ -650,73 +650,6 @@ impl RouteResidencyBoundary {
             None
         }
     }
-
-    pub(crate) fn restore_host_ranges_to_device(
-        &self,
-        runtime: &Arc<crate::runtime::CudaRuntime>,
-    ) -> std::result::Result<(), String> {
-        let mut state = self
-            .transition_state
-            .lock()
-            .expect("route-residency transition state poisoned");
-        if state.host_ranges.is_empty() {
-            return Ok(());
-        }
-        let verified = crate::granule_transition::verify_safe_point(
-            self.residency.resize_safe_point(self.device_count),
-        )
-        .map_err(str::to_string)?;
-        for (&value, ranges) in &state.host_ranges {
-            let allocator = self
-                .allocators
-                .get(&value)
-                .ok_or_else(|| format!("route-bank value {value:?} lost its allocator"))?;
-            for &(offset, len) in ranges {
-                let outcome = allocator.with_reservation_mut(|reservation, backing| {
-                    crate::granule_transition::transition_granule_range(
-                        runtime,
-                        reservation,
-                        backing,
-                        offset,
-                        len,
-                        PhysicalLocation::Device {
-                            ordinal: self.device_ordinal,
-                        },
-                        &self.host_pool,
-                        &self.device_pool,
-                        &verified,
-                        || self.residency.resize_safe_point(self.device_count),
-                    )
-                });
-                if !matches!(
-                    outcome,
-                    crate::granule_transition::TransitionOutcome::Committed { .. }
-                ) {
-                    return Err(format!(
-                        "route-bank value {value:?} range {offset}..{} restore failed: \
-                         {outcome:?}",
-                        offset.saturating_add(len)
-                    ));
-                }
-                if let Some(queue) = self.residency.deferred_release_queue()
-                    && !queue.wait_until_idle(Duration::from_secs(30))
-                {
-                    return Err(format!(
-                        "route-bank value {value:?} range {offset}..{} old backing did not settle",
-                        offset.saturating_add(len)
-                    ));
-                }
-            }
-        }
-        state.host_ranges.clear();
-        state.installed = false;
-        onnx_runtime_cuda_memory::virtual_memory::trim_physical_handle_pools(
-            self.host_pool.authority(),
-            u64::MAX,
-        )
-        .map_err(|error| format!("cannot trim route-residency physical pools: {error}"))?;
-        Ok(())
-    }
 }
 
 fn observe_route_window_without_transition(
@@ -1268,10 +1201,6 @@ pub fn run_route_residency_boundary(
              dispatch, capture, or replay may use this executor until it is rebuilt"
         )));
     }
-    if let Some(guard) = transition_guard {
-        guard.complete();
-    }
-
     if window_was_consumed(&outcome) {
         binding.source.reset_route_telemetry_boundary()?;
         binding.advance_epoch();
@@ -1279,6 +1208,9 @@ pub fn run_route_residency_boundary(
 
     diag.record_outcome(&outcome);
     diag.record_boundary_host_time(started.elapsed());
+    if let Some(guard) = transition_guard {
+        guard.complete();
+    }
     Ok(())
 }
 
@@ -1403,10 +1335,6 @@ fn run_route_residency_boundary_with_phase8_faults_inner(
              dispatch, capture, or replay may use this executor until it is rebuilt"
         )));
     }
-    if let Some(guard) = transition_guard {
-        guard.complete();
-    }
-
     if window_was_consumed(&outcome) {
         binding.source.reset_route_telemetry_boundary()?;
         binding.advance_epoch();
@@ -1414,6 +1342,9 @@ fn run_route_residency_boundary_with_phase8_faults_inner(
 
     diag.record_outcome(&outcome);
     diag.record_boundary_host_time(started.elapsed());
+    if let Some(guard) = transition_guard {
+        guard.complete();
+    }
     Ok(())
 }
 

@@ -899,8 +899,9 @@ impl Drop for Executor {
         }
         // All executor work is synchronized and every baked graph is retired
         // before reservation teardown begins. The provider's retirement
-        // authority still excludes concurrent external drain/use races, but
-        // ordinary Drop never waits on a lease owned by this executor itself.
+        // authority excludes concurrent external drain/use races and transfers
+        // externally held leases to deferred reclamation; Drop never waits for
+        // another owner to release one.
         self.ep.drain_executor_artifacts(self.instance_id);
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {

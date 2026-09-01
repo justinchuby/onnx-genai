@@ -765,6 +765,78 @@ fn run_concurrent_safe_point_loss_case(fixture: &Fixture) {
 
 #[test]
 #[ignore = "requires an idle CUDA device with HOST_NUMA VMM support"]
+fn executor_drop_is_bounded_while_public_artifact_guard_is_held() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let _gate = GateGuard::enable();
+    let fixture = Fixture::create(true, 1);
+    let Some((provider, ledger)) = provider_or_skip(0) else {
+        return;
+    };
+    let mut case = build_case(&fixture, Arc::clone(&provider), Arc::clone(&ledger), 1);
+    let scope = run_first_prefill(&mut case, 1);
+    let requirement = provider
+        .executor_artifact_requirement(scope)
+        .expect("query executor requirement")
+        .expect("resolved QMoE executor installed route reservations");
+    let holder = requirement
+        .acquire_use()
+        .expect("hold public artifact guard across executor Drop");
+    let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+    let drop_thread = std::thread::spawn(move || {
+        drop(case);
+        returned_tx.send(()).unwrap();
+    });
+    returned_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("Executor::drop must not wait for an externally held artifact guard");
+    drop_thread.join().expect("executor drop thread");
+    assert_eq!(
+        provider
+            .residency()
+            .expect("residency")
+            .route_reservation_count(),
+        1,
+        "the mapping remains quarantined while the public guard is live"
+    );
+    let census = provider.route_residency_retirement_census();
+    assert_eq!(census.active_registry_entries, 0);
+    assert_eq!(census.retirement_registry_entries, 1);
+    assert_eq!(census.deferred_cleanups, 1);
+    assert_eq!(census.cleanups_scheduled, 0);
+
+    drop(holder);
+    assert!(
+        provider
+            .release_queue()
+            .wait_until_idle(Duration::from_secs(30)),
+        "last public guard release must complete cleanup: {:?}",
+        provider.deferred_release_stats()
+    );
+    assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
+    assert!(
+        requirement
+            .acquire_use()
+            .err()
+            .expect("retired requirement remains fail-closed")
+            .to_string()
+            .contains("retired")
+    );
+    drop(requirement);
+    assert_eq!(
+        provider
+            .route_residency_retirement_census()
+            .retirement_registry_entries,
+        0
+    );
+
+    let mut provider =
+        Arc::try_unwrap(provider).unwrap_or_else(|_| panic!("drop test provider shared"));
+    provider.shutdown().expect("shutdown drop-test provider");
+    wait_for_accounting(&ledger, 0, 0);
+}
+
+#[test]
+#[ignore = "requires an idle CUDA device with HOST_NUMA VMM support"]
 fn symbolic_real_qmoe_route_residency_lifecycle() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let _gate = GateGuard::enable();
