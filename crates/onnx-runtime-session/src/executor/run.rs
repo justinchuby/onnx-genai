@@ -122,6 +122,9 @@ impl Executor {
         // provider terminal outcome. Pending or failed finalization returns
         // before buffers are bound and before eager, capture, or replay work.
         self.ensure_provider_artifacts_ready(&resolved)?;
+        let artifact_use = self
+            .provider_artifact_readiness
+            .acquire_use(self.ep.as_ref(), self.instance_id)?;
         let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
         let measure_activation_plan = !nested
             && mode == RunMode::Eager
@@ -144,6 +147,7 @@ impl Executor {
             measure_activation_plan,
         );
         let validation = if nested {
+            drop(artifact_use);
             Ok(())
         } else {
             let defer_until_binding_read = !self.graph.outputs.is_empty()
@@ -157,7 +161,20 @@ impl Executor {
                 && !self
                     .ep
                     .requires_route_residency_request_boundary(self.instance_id);
-            self.finish_device_validation(defer_until_binding_read)
+            if artifact_use.is_some() {
+                // A reservation-backed artifact lease must remain live through
+                // the completion sync, then be released before the boundary
+                // starts the next atomic residency transition.
+                let sync = self.ep.sync();
+                drop(artifact_use);
+                match sync {
+                    Ok(()) => self.finish_device_validation_boundary_after_sync(),
+                    Err(error) => Err(error.into()),
+                }
+            } else {
+                drop(artifact_use);
+                self.finish_device_validation(defer_until_binding_read)
+            }
         };
         if let Some(submission) = validation_submission.as_mut() {
             submission.disarm();
@@ -186,6 +203,10 @@ impl Executor {
         // and for captured replay. The CUDA EP's explicit sync is unconditional,
         // so the latch read observes every kernel from this request.
         self.ep.sync()?;
+        self.finish_device_validation_boundary_after_sync()
+    }
+
+    pub(super) fn finish_device_validation_boundary_after_sync(&mut self) -> Result<()> {
         let flags = match self.pending_device_validation.take() {
             Some(token) => match self.ep.consume_device_validation_error(
                 self.validation_registration

@@ -350,6 +350,48 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
     expert_groups: &[ExpertWeightGroup],
     phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
 ) -> RouteWindowConsumeOutcome {
+    consume_route_window_at_boundary_with_phase8_faults_inner(
+        runtime,
+        residency,
+        snapshot,
+        expected_epoch,
+        expected_request,
+        expected_device,
+        bank_values,
+        boundary,
+        catalogs,
+        allocators,
+        device_pool,
+        host_pool,
+        device_count,
+        device_ordinal,
+        expert_groups,
+        phase8_faults,
+        None,
+    )
+}
+
+#[cfg(any(test, feature = "gpu-tests"))]
+#[allow(clippy::too_many_arguments)]
+fn consume_route_window_at_boundary_with_phase8_faults_inner(
+    runtime: &Arc<crate::runtime::CudaRuntime>,
+    residency: &CudaWeightResidency,
+    snapshot: &TelemetrySnapshot,
+    expected_epoch: u32,
+    expected_request: u32,
+    expected_device: u32,
+    bank_values: &[ValueId],
+    boundary: LazyWeightBoundary,
+    catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+    allocators: &HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    device_pool: &Arc<PhysicalHandlePool>,
+    host_pool: &Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expert_groups: &[ExpertWeightGroup],
+    phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
+    rollback_interlock: Option<Arc<crate::coarse_residency::RollbackSafePointInterlock>>,
+) -> RouteWindowConsumeOutcome {
     match prepare_route_window(
         residency,
         snapshot,
@@ -368,8 +410,24 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
             epoch,
             count,
         } => {
-            let outcome =
-                crate::coarse_residency::apply_residency_plan_at_boundary_with_phase8_faults(
+            let outcome = match rollback_interlock {
+                Some(interlock) => {
+                    crate::coarse_residency::apply_residency_plan_at_boundary_with_rollback_interlock(
+                        runtime,
+                        residency,
+                        &plan,
+                        catalogs,
+                        allocators,
+                        device_pool,
+                        host_pool,
+                        device_count,
+                        device_ordinal,
+                        expert_groups,
+                        phase8_faults,
+                        interlock,
+                    )
+                }
+                None => crate::coarse_residency::apply_residency_plan_at_boundary_with_phase8_faults(
                     runtime,
                     residency,
                     &plan,
@@ -381,7 +439,8 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
                     device_ordinal,
                     expert_groups,
                     phase8_faults,
-                );
+                ),
+            };
             RouteWindowConsumeOutcome::Applied {
                 routed_experts,
                 epoch,
@@ -535,30 +594,15 @@ impl RouteResidencyBoundary {
         state: &mut StableTransitionState,
         outcome: &RouteWindowConsumeOutcome,
     ) {
-        let RouteWindowConsumeOutcome::Applied {
-            routed_experts,
-            outcome,
-            ..
-        } = outcome
-        else {
+        let RouteWindowConsumeOutcome::Applied { outcome, .. } = outcome else {
             return;
         };
-        if outcome.values_touched == 0 {
-            return;
-        }
-        let hot: std::collections::HashSet<_> = routed_experts.iter().copied().collect();
-        for value in &outcome.committed_values {
-            let Some(catalog) = self.catalogs.get(value) else {
-                continue;
-            };
-            let cold = (0..catalog.layout().experts)
-                .filter(|expert| !hot.contains(expert))
-                .filter_map(|expert| catalog.relative_range(expert))
-                .map(|range| (range.start, range.end - range.start))
-                .collect::<Vec<_>>();
-            if !cold.is_empty() {
-                state.host_ranges.insert(*value, cold);
-            }
+        for range in &outcome.host_resident_ranges {
+            state
+                .host_ranges
+                .entry(range.value)
+                .or_default()
+                .push((range.offset, range.len));
         }
         state.installed = !state.host_ranges.is_empty();
     }
@@ -585,14 +629,15 @@ impl RouteResidencyBoundary {
                 "{} route-bank rollback(s) failed to restore device residency",
                 outcome.rollback_failures.len()
             ))
-        } else if outcome.values_touched > 0
-            && (outcome.failure_count > 0 || !outcome.per_value_fallbacks.is_empty())
+        } else if !outcome.host_resident_ranges.is_empty()
+            && (outcome.failure_count > 0 || !outcome.fatal_progress.is_empty())
         {
             Some(format!(
-                "logical expert group transitioned only {} value(s) while {} member transition(s) \
-                 failed or fell back",
+                "logical expert group left {} HOST_NUMA range(s) across {} value(s) after {} \
+                 member transition failure(s)",
+                outcome.host_resident_ranges.len(),
                 outcome.values_touched,
-                outcome.failure_count.max(outcome.per_value_fallbacks.len())
+                outcome.failure_count + outcome.fatal_progress.len()
             ))
         } else {
             None
@@ -600,7 +645,6 @@ impl RouteResidencyBoundary {
         if let Some(reason) = reason {
             state.poisoned = Some(reason.clone());
             state.installed = false;
-            self.reservation_health.mark_unusable(reason.clone());
             Some(reason)
         } else {
             None
@@ -1181,9 +1225,18 @@ pub fn run_route_residency_boundary(
              {reason}; tear down and rebuild the executor"
         )));
     }
+    let mut transition_guard = None;
     let outcome = if transition_state.installed {
         observe_route_window_without_transition(binding, &snapshot)
     } else {
+        transition_guard = Some(binding.reservation_health.begin_transition().map_err(
+            |reason| {
+                EpError::KernelFailed(format!(
+                    "route-residency could not linearize the executor reservation transition: \
+                 {reason}"
+                ))
+            },
+        )?);
         consume_route_window_at_boundary(
             &binding.residency,
             &snapshot,
@@ -1203,12 +1256,20 @@ pub fn run_route_residency_boundary(
     };
     binding.record_host_ranges(&mut transition_state, &outcome);
     if let Some(reason) = binding.poison_after_incomplete_group(&mut transition_state, &outcome) {
+        if let Some(guard) = transition_guard.take() {
+            guard.poison(reason.clone());
+        } else {
+            binding.reservation_health.mark_unusable(reason.clone());
+        }
         diag.record_outcome(&outcome);
         diag.record_boundary_host_time(started.elapsed());
         return Err(EpError::KernelFailed(format!(
             "route-residency invalidated the executor-scoped bank reservation: {reason}; no \
              dispatch, capture, or replay may use this executor until it is rebuilt"
         )));
+    }
+    if let Some(guard) = transition_guard {
+        guard.complete();
     }
 
     if window_was_consumed(&outcome) {
@@ -1232,6 +1293,40 @@ pub fn run_route_residency_boundary_with_phase8_faults(
     binding: &RouteResidencyBoundary,
     diag: &RouteResidencyDiagnostics,
     phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
+) -> Result<()> {
+    run_route_residency_boundary_with_phase8_faults_inner(
+        runtime,
+        binding,
+        diag,
+        phase8_faults,
+        None,
+    )
+}
+
+#[cfg(any(test, feature = "gpu-tests"))]
+pub fn run_route_residency_boundary_with_rollback_interlock(
+    runtime: &Arc<crate::runtime::CudaRuntime>,
+    binding: &RouteResidencyBoundary,
+    diag: &RouteResidencyDiagnostics,
+    phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
+    rollback_interlock: Arc<crate::coarse_residency::RollbackSafePointInterlock>,
+) -> Result<()> {
+    run_route_residency_boundary_with_phase8_faults_inner(
+        runtime,
+        binding,
+        diag,
+        phase8_faults,
+        Some(rollback_interlock),
+    )
+}
+
+#[cfg(any(test, feature = "gpu-tests"))]
+fn run_route_residency_boundary_with_phase8_faults_inner(
+    runtime: &Arc<crate::runtime::CudaRuntime>,
+    binding: &RouteResidencyBoundary,
+    diag: &RouteResidencyDiagnostics,
+    phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
+    rollback_interlock: Option<Arc<crate::coarse_residency::RollbackSafePointInterlock>>,
 ) -> Result<()> {
     let started = Instant::now();
     diag.boundaries.fetch_add(1, Ordering::Relaxed);
@@ -1262,10 +1357,19 @@ pub fn run_route_residency_boundary_with_phase8_faults(
              {reason}; tear down and rebuild the executor"
         )));
     }
+    let mut transition_guard = None;
     let outcome = if transition_state.installed {
         observe_route_window_without_transition(binding, &snapshot)
     } else {
-        consume_route_window_at_boundary_with_phase8_faults(
+        transition_guard = Some(binding.reservation_health.begin_transition().map_err(
+            |reason| {
+                EpError::KernelFailed(format!(
+                    "route-residency could not linearize the executor reservation transition: \
+                 {reason}"
+                ))
+            },
+        )?);
+        consume_route_window_at_boundary_with_phase8_faults_inner(
             runtime,
             &binding.residency,
             &snapshot,
@@ -1282,16 +1386,25 @@ pub fn run_route_residency_boundary_with_phase8_faults(
             binding.device_ordinal,
             &binding.expert_groups,
             phase8_faults,
+            rollback_interlock,
         )
     };
     binding.record_host_ranges(&mut transition_state, &outcome);
     if let Some(reason) = binding.poison_after_incomplete_group(&mut transition_state, &outcome) {
+        if let Some(guard) = transition_guard.take() {
+            guard.poison(reason.clone());
+        } else {
+            binding.reservation_health.mark_unusable(reason.clone());
+        }
         diag.record_outcome(&outcome);
         diag.record_boundary_host_time(started.elapsed());
         return Err(EpError::KernelFailed(format!(
             "route-residency invalidated the executor-scoped bank reservation: {reason}; no \
              dispatch, capture, or replay may use this executor until it is rebuilt"
         )));
+    }
+    if let Some(guard) = transition_guard {
+        guard.complete();
     }
 
     if window_was_consumed(&outcome) {

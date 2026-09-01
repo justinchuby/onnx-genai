@@ -1130,10 +1130,18 @@ impl Executor {
             .as_ref()
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
+            let artifact_use = self
+                .provider_artifact_readiness
+                .acquire_use(self.ep.as_ref(), self.instance_id)?;
             let mut validation_submission =
                 self.begin_device_validation_submission_for_bindings(bindings)?;
             if let Err(replay_error) = self.ep.replay_owned_device_graph(token) {
-                let validation = self.finish_device_validation_boundary();
+                let sync = self.ep.sync();
+                drop(artifact_use);
+                let validation = match sync {
+                    Ok(()) => self.finish_device_validation_boundary_after_sync(),
+                    Err(error) => Err(error.into()),
+                };
                 validation_submission.disarm();
                 return match validation {
                     Ok(()) => Err(replay_error.into()),
@@ -1143,7 +1151,12 @@ impl Executor {
                     ))),
                 };
             }
-            let validation = self.finish_device_validation_boundary();
+            let sync = self.ep.sync();
+            drop(artifact_use);
+            let validation = match sync {
+                Ok(()) => self.finish_device_validation_boundary_after_sync(),
+                Err(error) => Err(error.into()),
+            };
             validation_submission.disarm();
             validation?;
             return Ok(true);

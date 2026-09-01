@@ -121,12 +121,22 @@ impl ProviderArtifactReadiness {
                 }
             }
         }
-        if matches!(self.outcome, ProviderArtifactOutcome::Complete)
-            && let Err(error) = ep.validate_executor_artifacts(executor)
-        {
-            self.outcome = ProviderArtifactOutcome::Failed(error.to_string());
-        }
         self.require_complete(ep.name(), executor)
+    }
+
+    /// Acquire the provider's exact artifact-use lease after finalization.
+    ///
+    /// Unlike finalization failures, a mutable health failure is not copied
+    /// into `outcome`: the provider's reservation health remains the authority
+    /// and every later attempt must consult it again.
+    pub(super) fn acquire_use(
+        &self,
+        ep: &dyn ExecutionProvider,
+        executor: ExecutorInstanceId,
+    ) -> Result<Option<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>>> {
+        self.require_complete(ep.name(), executor)?;
+        ep.acquire_executor_artifact_use(executor)
+            .map_err(Into::into)
     }
 
     pub(super) fn require_complete(

@@ -270,6 +270,14 @@ pub struct DeviceValidationRegistration {
     state: Box<dyn Any + Send + Sync>,
 }
 
+/// Opaque lease proving provider-owned executor artifacts are safe to use.
+///
+/// Providers with mutable reservation-backed artifacts return a lease that
+/// remains live from the final health check through the last kernel or graph
+/// launch. This closes the check-then-launch race with boundary-time artifact
+/// transitions. Providers without mutable artifact state return `None`.
+pub trait ExecutorArtifactUseGuard: Send + Sync {}
+
 impl DeviceValidationRegistration {
     /// Construct a registration carrying provider-specific state.
     pub fn new<T>(owner: DeviceValidationOwner, state: T) -> Self
@@ -1932,15 +1940,18 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(ExecutorArtifactFinalization::Complete)
     }
 
-    /// Verify that already-finalized artifacts remain safe to use.
+    /// Acquire permission to use already-finalized artifacts.
     ///
-    /// The executor invokes this before every eager execution, capture, and
-    /// replay, including when no kernel specialization changed. Providers with
-    /// mutable backing state use it to invalidate an artifact after an
-    /// asynchronous or boundary-time failure; the default has no mutable
-    /// artifact state.
-    fn validate_executor_artifacts(&self, _executor: ExecutorInstanceId) -> Result<()> {
-        Ok(())
+    /// The executor holds the returned lease across eager execution, capture,
+    /// or replay and drops it only after the launched work reaches its
+    /// completion boundary. Providers with mutable reservation-backed state
+    /// must linearize this acquisition against every transition of that state
+    /// and fail closed when the exact executor-owned artifact is poisoned.
+    fn acquire_executor_artifact_use(
+        &self,
+        _executor: ExecutorInstanceId,
+    ) -> Result<Option<Box<dyn ExecutorArtifactUseGuard>>> {
+        Ok(None)
     }
 
     /// Drain exactly the artifacts owned by `executor`.

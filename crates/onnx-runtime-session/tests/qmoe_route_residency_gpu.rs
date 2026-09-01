@@ -11,9 +11,11 @@ use std::time::{Duration, Instant};
 
 use onnx_runtime_cuda_memory::capability::host_numa_capability;
 use onnx_runtime_cuda_memory::release::{DriverFaultPlan, DriverOperation};
-use onnx_runtime_ep_api::{ExecutionProvider, ExecutorInstanceId};
+use onnx_runtime_ep_api::{ExecutionProvider, ExecutorInstanceId, RoutedResidencyRequirement};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
-use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
+use onnx_runtime_ep_cuda::coarse_residency::{
+    COARSE_RESIDENCY_ENABLE_ENV, RollbackSafePointInterlock,
+};
 use onnx_runtime_ep_cuda::weight_paging::DeviceOffloadPolicy;
 use onnx_runtime_ir::DataType;
 use onnx_runtime_memory_governor::{DeviceKey, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier};
@@ -480,7 +482,27 @@ fn shutdown_provider(
     wait_for_accounting(&ledger, 0, 0);
 }
 
-fn run_fault_case(fixture: &Fixture, quarantine: bool) {
+#[derive(Clone, Copy)]
+enum FaultMember {
+    First,
+    Middle,
+    Last,
+}
+
+fn selected_member(
+    members: &[onnx_runtime_ir::ValueId],
+    position: FaultMember,
+) -> onnx_runtime_ir::ValueId {
+    let mut members = members.to_vec();
+    members.sort_unstable_by_key(|value| value.0);
+    members[match position {
+        FaultMember::First => 0,
+        FaultMember::Middle => members.len() / 2,
+        FaultMember::Last => members.len() - 1,
+    }]
+}
+
+fn run_fault_case(fixture: &Fixture, quarantine: bool, position: FaultMember) {
     let Some((provider, ledger)) = provider_or_skip(0) else {
         return;
     };
@@ -519,20 +541,15 @@ fn run_fault_case(fixture: &Fixture, quarantine: bool) {
         .expect("fault groups");
     let mut faults = HashMap::new();
     if quarantine {
-        for value in groups
-            .iter()
-            .flat_map(|group| group.members.iter())
-            .copied()
-        {
-            faults.insert(
-                value,
-                Arc::new(
-                    DriverFaultPlan::new()
-                        .fail_nth(DriverOperation::Remap, 1)
-                        .fail_nth(DriverOperation::Remap, 2),
-                ),
-            );
-        }
+        let value = selected_member(&groups[0].members, position);
+        faults.insert(
+            value,
+            Arc::new(
+                DriverFaultPlan::new()
+                    .fail_nth(DriverOperation::Remap, 1)
+                    .fail_nth(DriverOperation::Remap, 2),
+            ),
+        );
     } else {
         let value = groups[0].members[0];
         faults.insert(
@@ -552,39 +569,198 @@ fn run_fault_case(fixture: &Fixture, quarantine: bool) {
             error.to_string().contains("invalidated"),
             "unexpected quarantine error: {error}"
         );
-        assert!(diag.quarantined_blocks() > quarantine_before);
+        assert_eq!(
+            diag.quarantined_blocks(),
+            quarantine_before + 1,
+            "one injected ambiguous granule must have exactly one quarantine owner"
+        );
+        unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
         let replay_error = case
             .session
             .replay_device_graph(&mut case.bindings)
-            .expect_err("poisoned reservations must block captured replay");
+            .expect_err("gate-off poisoned reservations must block captured replay");
         assert!(
             replay_error
                 .to_string()
                 .contains("route-bank reservation is unusable"),
             "unexpected replay rejection: {replay_error}"
         );
-    } else {
-        boundary_result.expect("range-precise rollback keeps the reservation usable");
-        assert_eq!(diag.quarantined_blocks(), quarantine_before);
+        let dispatch_error = case
+            .session
+            .run_with_device_bindings(&[], &mut case.bindings)
+            .expect_err("gate-off poisoned reservations must block ordinary dispatch");
         assert!(
-            case.session
-                .replay_device_graph(&mut case.bindings)
-                .expect("replay after range rollback")
+            dispatch_error
+                .to_string()
+                .contains("route-bank reservation is unusable"),
+            "unexpected dispatch rejection: {dispatch_error}"
         );
-        let post_rollback = case.bindings[output_index]
-            .read_bytes()
-            .expect("consume post-rollback validation receipt");
-        provider.sync().expect("complete post-rollback replay");
-        assert_eq!(
-            post_rollback, baseline,
-            "mapping failure rollback preserves the real QMoE bank"
-        );
+        unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+    } else {
+        assert_eq!(diag.quarantined_blocks(), quarantine_before);
+        match boundary_result {
+            Ok(()) => {
+                assert!(
+                    case.session
+                        .replay_device_graph(&mut case.bindings)
+                        .expect("replay after range rollback")
+                );
+                let post_rollback = case.bindings[output_index]
+                    .read_bytes()
+                    .expect("consume post-rollback validation receipt");
+                provider.sync().expect("complete post-rollback replay");
+                assert_eq!(
+                    post_rollback, baseline,
+                    "mapping failure rollback preserves the real QMoE bank"
+                );
+            }
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("invalidated"),
+                    "an incomplete rollback must fail closed: {error}"
+                );
+                unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
+                let replay_error = case
+                    .session
+                    .replay_device_graph(&mut case.bindings)
+                    .expect_err("incomplete rollback must block replay");
+                assert!(
+                    replay_error
+                        .to_string()
+                        .contains("route-bank reservation is unusable")
+                );
+                unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+            }
+        }
     }
     drop(case);
     let mut provider =
         Arc::try_unwrap(provider).unwrap_or_else(|_| panic!("fault provider shared"));
     provider.sync().expect("settle fault case");
     provider.shutdown().expect("shutdown fault provider");
+}
+
+fn run_concurrent_safe_point_loss_case(fixture: &Fixture) {
+    let Some((provider, ledger)) = provider_or_skip(0) else {
+        return;
+    };
+    let mut case = build_case(fixture, Arc::clone(&provider), Arc::clone(&ledger), 2);
+    let scope = run_first_prefill(&mut case, 2);
+    set_routes(&mut case, 2, [0; ROWS]);
+    unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
+    assert!(matches!(
+        case.session
+            .try_capture_with_device_bindings(&[], &mut case.bindings)
+            .expect("capture concurrent rollback case"),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    provider.sync().expect("finish concurrent rollback capture");
+    unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+
+    let groups = provider
+        .retained_route_residency_artifacts(scope)
+        .expect("concurrent rollback groups");
+    let target = selected_member(&groups[0].members, FaultMember::Middle);
+    let mut faults = HashMap::new();
+    faults.insert(
+        target,
+        Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Remap, 1)),
+    );
+    let interlock = RollbackSafePointInterlock::new();
+    let touched_before = provider.route_residency_diagnostics().values_touched();
+    let quarantine_before = provider.route_residency_diagnostics().quarantined_blocks();
+    let worker_provider = Arc::clone(&provider);
+    let worker_interlock = Arc::clone(&interlock);
+    let worker = std::thread::spawn(move || {
+        worker_provider.consume_route_residency_with_rollback_interlock_for_executor(
+            scope,
+            faults,
+            worker_interlock,
+        )
+    });
+
+    interlock.wait_until_forward_failure();
+    let authorities = provider
+        .residency()
+        .expect("residency")
+        .route_reservation_authorities(scope)
+        .expect("route authorities");
+    let blocker_catalog = authorities
+        .catalogs
+        .get(&groups[0].members[0])
+        .expect("blocker catalog");
+    let blocker = provider
+        .residency()
+        .expect("residency")
+        .acquire_routed_residency(
+            RoutedResidencyRequirement::FusedRoutingUnknown,
+            blocker_catalog,
+        );
+    assert!(
+        provider
+            .residency()
+            .expect("residency")
+            .resize_safe_point(1)
+            .routed_guards_active
+            > 0,
+        "the concurrent safe-point blocker must be live before rollback resumes"
+    );
+    interlock.resume_rollback();
+    let error = worker
+        .join()
+        .expect("rollback worker panicked")
+        .expect_err("safe-point loss with surviving transitions must poison");
+    assert!(
+        error.to_string().contains("invalidated"),
+        "unexpected concurrent rollback error: {error}"
+    );
+    assert!(
+        provider.route_residency_diagnostics().values_touched() > touched_before,
+        "surviving HOST_NUMA transitions must be journaled before poison"
+    );
+    assert_eq!(
+        provider.route_residency_diagnostics().quarantined_blocks(),
+        quarantine_before,
+        "safe-point loss itself must not fabricate quarantine"
+    );
+    drop(blocker);
+
+    unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
+    let replay_error = case
+        .session
+        .replay_device_graph(&mut case.bindings)
+        .expect_err("poison after safe-point loss must block replay with gate off");
+    assert!(
+        replay_error
+            .to_string()
+            .contains("route-bank reservation is unusable")
+    );
+    let dispatch_error = case
+        .session
+        .run_with_device_bindings(&[], &mut case.bindings)
+        .expect_err("poison after safe-point loss must block dispatch with gate off");
+    assert!(
+        dispatch_error
+            .to_string()
+            .contains("route-bank reservation is unusable")
+    );
+    unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+    let retry = provider
+        .consume_route_residency_at_boundary_with_phase8_faults_for_executor(scope, HashMap::new());
+    assert!(
+        retry
+            .expect_err("poisoned transition retry must remain blocked")
+            .to_string()
+            .contains("earlier atomic transition failure")
+    );
+
+    drop(authorities);
+    drop(case);
+    let mut provider =
+        Arc::try_unwrap(provider).unwrap_or_else(|_| panic!("concurrent provider shared"));
+    provider.sync().expect("settle concurrent rollback case");
+    provider.shutdown().expect("shutdown concurrent provider");
+    wait_for_accounting(&ledger, 0, 0);
 }
 
 #[test]
@@ -781,8 +957,11 @@ fn symbolic_real_qmoe_route_residency_lifecycle() {
         shutdown_provider(device_one, device_one_ledger, device_one_baseline);
     }
 
-    run_fault_case(&fixture, false);
-    run_fault_case(&fixture, true);
+    run_fault_case(&fixture, false, FaultMember::First);
+    run_fault_case(&fixture, true, FaultMember::First);
+    run_fault_case(&fixture, true, FaultMember::Middle);
+    run_fault_case(&fixture, true, FaultMember::Last);
+    run_concurrent_safe_point_loss_case(&fixture);
     shutdown_provider(provider, ledger, baseline);
 }
 

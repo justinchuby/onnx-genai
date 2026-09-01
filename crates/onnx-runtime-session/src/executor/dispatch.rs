@@ -1849,19 +1849,22 @@ impl KernelDispatchContext<'_> {
             .matches(&node.domain, &node.op_type)
             || LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type)
         {
-            inputs.iter().find_map(|value| {
-                let value = (*value)?;
-                let catalog = self.expert_region_candidates.get(&value)?;
-                self.ep
-                    .acquire_routed_residency_for_executor(
-                        self.executor,
-                        value.0 as u64,
-                        onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
-                        catalog,
-                    )
-                    .ok()
-                    .flatten()
-            })
+            let mut guard = None;
+            for value in inputs.iter().flatten() {
+                let Some(catalog) = self.expert_region_candidates.get(value) else {
+                    continue;
+                };
+                guard = self.ep.acquire_routed_residency_for_executor(
+                    self.executor,
+                    value.0 as u64,
+                    onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+                    catalog,
+                )?;
+                if guard.is_some() {
+                    break;
+                }
+            }
+            guard
         } else {
             None
         };

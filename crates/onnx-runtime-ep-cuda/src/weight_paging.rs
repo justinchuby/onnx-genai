@@ -2826,6 +2826,7 @@ pub struct CudaWeightResidency {
 pub struct RoutedResidencyGuard {
     proof: onnx_runtime_ep_api::RoutedResidencyProof,
     residency: Arc<CudaWeightResidency>,
+    _reservation_use: Option<RouteReservationUseGuard>,
 }
 
 impl RoutedResidencyGuard {
@@ -2874,29 +2875,116 @@ struct RouteReservationSet {
 
 #[doc(hidden)]
 pub struct RouteReservationHealth {
-    usable: AtomicBool,
+    identity: Option<RouteReservationIdentity>,
+    lifecycle: AtomicU64,
     reason: Mutex<Option<String>>,
+}
+
+#[derive(Clone, Copy)]
+struct RouteReservationIdentity {
+    executor: ExecutorInstanceId,
+    device_ordinal: u32,
+    generation: u64,
+}
+
+const ROUTE_HEALTH_POISONED: u64 = 1;
+const ROUTE_HEALTH_TRANSITIONING: u64 = 1 << 1;
+const ROUTE_HEALTH_USE: u64 = 1 << 2;
+static NEXT_ROUTE_RESERVATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) struct RouteReservationUseGuard {
+    health: Arc<RouteReservationHealth>,
+}
+
+impl onnx_runtime_ep_api::ExecutorArtifactUseGuard for RouteReservationUseGuard {}
+
+impl Drop for RouteReservationUseGuard {
+    fn drop(&mut self) {
+        self.health
+            .lifecycle
+            .fetch_sub(ROUTE_HEALTH_USE, Ordering::AcqRel);
+    }
+}
+
+pub(crate) struct RouteReservationTransitionGuard {
+    health: Arc<RouteReservationHealth>,
+    completed: bool,
+}
+
+impl RouteReservationTransitionGuard {
+    pub(crate) fn complete(mut self) {
+        self.completed = true;
+        let _ = self.health.lifecycle.compare_exchange(
+            ROUTE_HEALTH_TRANSITIONING,
+            0,
+            Ordering::Release,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn poison(mut self, reason: String) {
+        self.health.mark_unusable(reason);
+        self.completed = true;
+        self.health
+            .lifecycle
+            .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::Release);
+    }
+}
+
+impl Drop for RouteReservationTransitionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.health.mark_unusable(
+                "reservation transition authority exited without publishing a terminal outcome"
+                    .to_string(),
+            );
+            self.health
+                .lifecycle
+                .fetch_and(!ROUTE_HEALTH_TRANSITIONING, Ordering::Release);
+        }
+    }
 }
 
 impl RouteReservationHealth {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            usable: AtomicBool::new(true),
+            identity: None,
+            lifecycle: AtomicU64::new(0),
             reason: Mutex::new(None),
         })
     }
 
+    fn new_scoped(executor: ExecutorInstanceId, device_ordinal: u32) -> Arc<Self> {
+        let generation = NEXT_ROUTE_RESERVATION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        Arc::new(Self {
+            identity: Some(RouteReservationIdentity {
+                executor,
+                device_ordinal,
+                generation,
+            }),
+            lifecycle: AtomicU64::new(0),
+            reason: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.identity.map(|identity| identity.generation)
+    }
+
     pub(crate) fn mark_unusable(&self, reason: String) {
-        if self.usable.swap(false, Ordering::AcqRel) {
-            *self
-                .reason
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
+        let mut stored = self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.lifecycle.load(Ordering::Acquire) & ROUTE_HEALTH_POISONED == 0 {
+            *stored = Some(reason);
+            self.lifecycle
+                .fetch_or(ROUTE_HEALTH_POISONED, Ordering::Release);
         }
     }
 
     pub(crate) fn ensure_usable(&self) -> Result<(), String> {
-        if self.usable.load(Ordering::Acquire) {
+        if self.lifecycle.load(Ordering::Acquire) & ROUTE_HEALTH_POISONED == 0 {
             return Ok(());
         }
         let reason = self
@@ -2906,6 +2994,98 @@ impl RouteReservationHealth {
             .clone()
             .unwrap_or_else(|| "reservation health was invalidated".to_string());
         Err(reason)
+    }
+
+    fn validate_identity(
+        &self,
+        executor: ExecutorInstanceId,
+        device_ordinal: u32,
+    ) -> Result<RouteReservationIdentity, String> {
+        let Some(identity) = self.identity else {
+            return Err(
+                "reservation health has no executor/device/generation identity; rebuild the \
+                 executor"
+                    .to_string(),
+            );
+        };
+        if identity.executor != executor || identity.device_ordinal != device_ordinal {
+            return Err(format!(
+                "reservation generation {} belongs to executor {} on CUDA:{}, not executor {} on \
+                 CUDA:{}",
+                identity.generation,
+                identity.executor.get(),
+                identity.device_ordinal,
+                executor.get(),
+                device_ordinal
+            ));
+        }
+        Ok(identity)
+    }
+
+    pub(crate) fn acquire_use(
+        self: &Arc<Self>,
+        executor: ExecutorInstanceId,
+        device_ordinal: u32,
+    ) -> Result<RouteReservationUseGuard, String> {
+        let identity = self.validate_identity(executor, device_ordinal)?;
+        loop {
+            let state = self.lifecycle.load(Ordering::Acquire);
+            if state & ROUTE_HEALTH_POISONED != 0 {
+                return Err(format!(
+                    "reservation generation {} is poisoned: {}",
+                    identity.generation,
+                    self.ensure_usable().unwrap_err()
+                ));
+            }
+            if state & ROUTE_HEALTH_TRANSITIONING != 0 {
+                return Err(format!(
+                    "reservation generation {} is in an atomic group transition; retry after the \
+                     request boundary completes",
+                    identity.generation
+                ));
+            }
+            let next = state.checked_add(ROUTE_HEALTH_USE).ok_or_else(|| {
+                format!(
+                    "reservation generation {} use counter overflowed",
+                    identity.generation
+                )
+            })?;
+            if self
+                .lifecycle
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(RouteReservationUseGuard {
+                    health: Arc::clone(self),
+                });
+            }
+        }
+    }
+
+    pub(crate) fn begin_transition(
+        self: &Arc<Self>,
+    ) -> Result<RouteReservationTransitionGuard, String> {
+        match self.lifecycle.compare_exchange(
+            0,
+            ROUTE_HEALTH_TRANSITIONING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(RouteReservationTransitionGuard {
+                health: Arc::clone(self),
+                completed: false,
+            }),
+            Err(state) if state & ROUTE_HEALTH_POISONED != 0 => self
+                .ensure_usable()
+                .map(|_| unreachable!("poisoned reservation unexpectedly reported usable")),
+            Err(state) if state & ROUTE_HEALTH_TRANSITIONING != 0 => {
+                Err("another route-bank group transition is already active".to_string())
+            }
+            Err(state) => Err(format!(
+                "{} reservation-backed dispatch/replay lease(s) are still active",
+                state / ROUTE_HEALTH_USE
+            )),
+        }
     }
 }
 
@@ -4093,7 +4273,7 @@ impl CudaWeightResidency {
         > = Arc::clone(queue)
             as Arc<dyn onnx_runtime_cuda_memory::virtual_memory::DeferredReservationQueue>;
 
-        let health = RouteReservationHealth::new();
+        let health = RouteReservationHealth::new_scoped(executor, device_ordinal as u32);
         let mut by_key = HashMap::new();
         let mut catalogs = HashMap::new();
         let mut allocators = HashMap::new();
@@ -4271,6 +4451,21 @@ impl CudaWeightResidency {
             .cloned()
     }
 
+    pub(crate) fn route_reservation_health(
+        &self,
+        executor: ExecutorInstanceId,
+        value: ValueId,
+    ) -> Option<Arc<RouteReservationHealth>> {
+        let installed = self
+            .route_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let set = installed.get(&executor)?;
+        set.allocators
+            .contains_key(&value)
+            .then(|| Arc::clone(&set.health))
+    }
+
     /// #1810 Slice 5 — Apply a [`ResidencyPlan`] at the model-load coarse
     /// boundary, delegating to
     /// [`crate::coarse_residency::apply_residency_plan_at_boundary`].
@@ -4344,7 +4539,26 @@ impl CudaWeightResidency {
         RoutedResidencyGuard {
             proof,
             residency: Arc::clone(self),
+            _reservation_use: None,
         }
+    }
+
+    pub(crate) fn acquire_route_reservation_use(
+        self: &Arc<Self>,
+        executor: ExecutorInstanceId,
+        device_ordinal: u32,
+        requirement: onnx_runtime_ep_api::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+        health: Arc<RouteReservationHealth>,
+    ) -> Result<RoutedResidencyGuard, String> {
+        let reservation_use = health.acquire_use(executor, device_ordinal)?;
+        let proof = onnx_runtime_ep_api::prove_routed_residency(requirement, catalog);
+        self.routed_guards_active.fetch_add(1, Ordering::SeqCst);
+        Ok(RoutedResidencyGuard {
+            proof,
+            residency: Arc::clone(self),
+            _reservation_use: Some(reservation_use),
+        })
     }
 
     /// Execute an accepted [`onnx_runtime_ep_api::ResidencyResizePlan`].
@@ -7148,6 +7362,61 @@ impl ResidencyInner {
 mod tests {
     use super::*;
     use crate::test_support::EnvVarGuard;
+
+    #[test]
+    fn route_reservation_lifecycle_linearizes_use_transition_and_poison() {
+        let executor = ExecutorInstanceId::fresh();
+        let health = RouteReservationHealth::new_scoped(executor, 3);
+        let generation = health.generation().expect("scoped generation");
+
+        let use_guard = health
+            .acquire_use(executor, 3)
+            .expect("exact owner acquires use");
+        let blocked = health
+            .begin_transition()
+            .err()
+            .expect("active use must block transition");
+        assert!(blocked.contains("dispatch/replay lease"));
+        drop(use_guard);
+
+        let transition = health
+            .begin_transition()
+            .expect("transition starts after use completes");
+        let blocked = health
+            .acquire_use(executor, 3)
+            .err()
+            .expect("transition must block a new use");
+        assert!(blocked.contains("atomic group transition"));
+        transition.poison("incomplete logical expert group".to_string());
+
+        let poisoned = health
+            .acquire_use(executor, 3)
+            .err()
+            .expect("poison is irreversible");
+        assert!(poisoned.contains(&format!("generation {generation}")));
+        assert!(poisoned.contains("incomplete logical expert group"));
+    }
+
+    #[test]
+    fn route_reservation_lifecycle_rejects_sibling_and_device_aliases() {
+        let owner = ExecutorInstanceId::fresh();
+        let sibling = ExecutorInstanceId::fresh();
+        let health = RouteReservationHealth::new_scoped(owner, 1);
+
+        let sibling_error = health
+            .acquire_use(sibling, 1)
+            .err()
+            .expect("sibling executor must not borrow owner's generation");
+        assert!(sibling_error.contains(&format!("executor {}", owner.get())));
+        assert!(sibling_error.contains(&format!("not executor {}", sibling.get())));
+
+        let device_error = health
+            .acquire_use(owner, 2)
+            .err()
+            .expect("wrong device must not borrow owner's generation");
+        assert!(device_error.contains("CUDA:1"));
+        assert!(device_error.contains("CUDA:2"));
+    }
 
     #[test]
     fn slot_operation_state_never_reopens_after_poison() {
