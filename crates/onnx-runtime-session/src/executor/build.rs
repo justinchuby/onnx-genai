@@ -2589,14 +2589,14 @@ impl Executor {
         )
     }
 
-    fn acquire_setup_artifact_use(
+    fn retain_binding_artifact_requirement(
         &self,
-    ) -> Result<Option<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>>> {
+    ) -> Result<Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>> {
         if !self.provider_artifact_readiness.is_complete() {
             return Ok(None);
         }
         self.provider_artifact_readiness
-            .acquire_use(self.ep.as_ref(), self.artifact_config, None)
+            .retained_requirement_state(self.ep.as_ref(), self.artifact_config)
     }
 
     pub(crate) fn allocate_device_binding(
@@ -2623,9 +2623,10 @@ impl Executor {
             .input_index
             .get(&input_name)
             .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
-        let _artifact_use = self.acquire_setup_artifact_use()?;
+        let artifact_requirement = self.retain_binding_artifact_requirement()?;
         DeviceIoBinding::allocate(
             self.ep.clone(),
+            artifact_requirement,
             DeviceBindingSpec {
                 input_name,
                 bind_input: true,
@@ -2651,9 +2652,10 @@ impl Executor {
         logical_shape: Vec<usize>,
     ) -> Result<DeviceIoBinding> {
         let bind_input = !input_name.is_empty();
-        let _artifact_use = self.acquire_setup_artifact_use()?;
+        let artifact_requirement = self.retain_binding_artifact_requirement()?;
         DeviceIoBinding::allocate(
             self.ep.clone(),
+            artifact_requirement,
             DeviceBindingSpec {
                 input_name,
                 bind_input,
@@ -2697,9 +2699,10 @@ impl Executor {
             .input_index
             .get(&input_name)
             .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
-        let _artifact_use = self.acquire_setup_artifact_use()?;
+        let artifact_requirement = self.retain_binding_artifact_requirement()?;
         DeviceIoBinding::allocate(
             self.ep.clone(),
+            artifact_requirement,
             DeviceBindingSpec {
                 input_name,
                 bind_input: true,
@@ -2765,6 +2768,7 @@ impl Executor {
         unsafe {
             DeviceIoBinding::from_external_memory(
                 self.ep.clone(),
+                self.retain_binding_artifact_requirement()?,
                 DeviceBindingSpec {
                     input_name,
                     bind_input,
@@ -2796,9 +2800,10 @@ impl Executor {
                 "persistent output device-binding allocation",
             ));
         }
-        let _artifact_use = self.acquire_setup_artifact_use()?;
+        let artifact_requirement = self.retain_binding_artifact_requirement()?;
         DeviceIoBinding::allocate(
             self.ep.clone(),
+            artifact_requirement,
             DeviceBindingSpec {
                 input_name: String::new(),
                 bind_input: false,

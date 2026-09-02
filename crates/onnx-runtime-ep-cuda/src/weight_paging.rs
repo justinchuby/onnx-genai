@@ -2287,7 +2287,7 @@ impl CudaWeightPage {
             return Err(WeightHandleError::MissingRegions);
         }
         let recorder = runtime
-            .observed_byte_recorder()
+            .retained_observed_byte_recorder()
             .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let alloc_start = std::time::Instant::now();
         let ptr = runtime
@@ -2351,7 +2351,7 @@ impl CudaWeightPage {
             )));
         }
         let recorder = runtime
-            .observed_byte_recorder()
+            .retained_observed_byte_recorder()
             .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let alloc_start = std::time::Instant::now();
         let ptr = runtime
@@ -2433,7 +2433,7 @@ impl CudaWeightPage {
             )));
         }
         let recorder = runtime
-            .observed_byte_recorder()
+            .retained_observed_byte_recorder()
             .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let alloc_start = std::time::Instant::now();
         let ptr = runtime
@@ -2671,7 +2671,7 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
         // on any copy failure we free it before returning so no VRAM leaks.
         let recorder = self
             .runtime
-            .observed_byte_recorder()
+            .retained_observed_byte_recorder()
             .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let ptr = self
             .runtime
@@ -3258,6 +3258,26 @@ impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for RouteReservationR
                     self.identity.reservation_generation
                 ))
             })
+    }
+
+    fn with_use(
+        &self,
+        operation: &mut dyn FnMut() -> onnx_runtime_ep_api::Result<()>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let _guard = self
+            .health
+            .acquire_use_identity(self.identity)
+            .map_err(|reason| {
+                onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} CUDA:{} route-bank reservation is unusable \
+                     (generation {}): {reason}; tear down and rebuild the executor before \
+                     dispatch, capture, or replay",
+                    self.identity.executor.get(),
+                    self.identity.device_ordinal,
+                    self.identity.reservation_generation
+                ))
+            })?;
+        operation()
     }
 }
 
@@ -5782,7 +5802,7 @@ impl CudaWeightResidency {
         fill_staging_from_regions(&self.runtime, weight, source, staging.staging_mut())?;
         let recorder = self
             .runtime
-            .observed_byte_recorder()
+            .retained_observed_byte_recorder()
             .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let ptr = self
             .runtime
@@ -6271,7 +6291,7 @@ impl CudaWeightResidency {
         }
         let recorder = self
             .runtime
-            .observed_byte_recorder()
+            .retained_observed_byte_recorder()
             .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let page = Arc::new(CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
@@ -6717,7 +6737,7 @@ impl CudaWeightResidency {
         };
         let recorder = self
             .runtime
-            .observed_byte_recorder()
+            .retained_observed_byte_recorder()
             .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let page = Arc::new(CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
@@ -9213,12 +9233,11 @@ mod tests {
         observed
             .set_phase(ObservedPhase::Failure)
             .expect("set rollback phase");
-        let registry = Arc::new(crate::byte_telemetry::ExecutionRecorderRegistry::default());
         runtime
-            .install_observed_byte_registry(Arc::clone(&registry))
-            .expect("install rollback recorder registry");
+            .enable_observed_bytes()
+            .expect("enable rollback recorder");
         let recorder = observed.recorder().expect("acquire rollback recorder");
-        let _observed_use = registry.enter(recorder);
+        let _observed_use = recorder.enter().expect("enter rollback recorder");
         let granule = 2usize << 20;
         let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(
             (granule * 2) as u64,

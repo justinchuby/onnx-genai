@@ -469,13 +469,14 @@ pub struct DeviceValidationRegistration {
 /// transitions. Providers without mutable artifact state return `None`.
 pub trait ExecutorArtifactUseGuard: Send + Sync {}
 
-/// Transactional receipt for one state tensor publication.
+/// Transactional receipt for bound state/output publication.
 ///
-/// The session prepares this while the exact executor artifact-use guard is
-/// active, before submitting kernels that produce the state. It publishes only
-/// after successful execution, or rolls back the attempted publication when
-/// execution fails.
+/// The provider prepares this in caller-owned stack scope while exact
+/// observation authority is active. Attempted bytes are marked at submission;
+/// useful bytes publish only after synchronization and owner validation, or
+/// roll back when execution/completion fails.
 pub trait StatePublicationReceipt: Send {
+    fn mark_submitted(&mut self);
     fn publish(&mut self) -> Result<()>;
     fn roll_back(&mut self) -> Result<()>;
 }
@@ -486,6 +487,24 @@ pub trait StatePublicationReceipt: Send {
 /// public constructor, issuer, binder, proof resolver, or finalization path.
 pub trait ExecutorArtifactRequirementState: Send + Sync {
     fn acquire_use(&self) -> Result<Box<dyn ExecutorArtifactUseGuard>>;
+
+    /// Execute one operation under this exact retained requirement.
+    ///
+    /// The default preserves providers that only expose an owned guard. A
+    /// provider with a preallocated hot-path context overrides this method so
+    /// executor entry, binding transfers, capture and replay do not allocate a
+    /// boxed guard merely to establish scoped authority.
+    fn with_use(&self, operation: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        let _guard = self.acquire_use()?;
+        operation()
+    }
+
+    /// Execute under provider-specific production observation authority without
+    /// acquiring a mutable artifact lease. Device bindings use this after the
+    /// session privately attached the exact retained requirement.
+    fn with_observation(&self, operation: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        operation()
+    }
 
     /// Provider-specific observation control retained by the exact session
     /// lifecycle owner.
@@ -2196,17 +2215,21 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(None)
     }
 
-    /// Reserve telemetry for state outputs that this session explicitly marks
-    /// as authoritative state publications.
+    /// Run one output-publication transaction with preflighted state/output
+    /// telemetry.
     ///
-    /// Non-participating providers return `None`. Participating providers must
-    /// reserve before execution so a capacity/overflow failure prevents the
-    /// state-producing operation from being submitted.
-    fn prepare_state_publication(
+    /// Non-participating providers invoke `operation` with no receipt.
+    /// Participating providers reserve before invoking it so capacity/overflow
+    /// failure prevents the state-producing operation from being submitted.
+    /// The callback shape keeps the provider receipt stack-owned and allocation
+    /// free on warmed eager/capture/replay paths.
+    fn with_output_publication(
         &self,
-        _bytes: u64,
-    ) -> Result<Option<Box<dyn StatePublicationReceipt>>> {
-        Ok(None)
+        _state_bytes: u64,
+        _output_bytes: u64,
+        operation: &mut dyn FnMut(Option<&mut dyn StatePublicationReceipt>) -> Result<()>,
+    ) -> Result<()> {
+        operation(None)
     }
 
     /// Explicit device allocation/free counters, when the EP exposes them.
@@ -2438,6 +2461,18 @@ pub trait ExecutionProvider: Send + Sync {
             "{}: device-to-device copy is not implemented",
             self.name()
         )))
+    }
+
+    /// Snapshot or restore a complete externally bound output before semantic
+    /// publication. Host/synchronous providers use their ordinary copy;
+    /// stream-ordered providers override this to preserve capture safety.
+    fn copy_for_publication(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> Result<()> {
+        self.copy(src, dst, bytes)
     }
 
     /// EP-specific optimization passes, run after the generic optimizer.

@@ -486,7 +486,7 @@ fn build_arm(fixture: &Fixture, route_config: ExecutorRouteResidencyConfig) -> R
         vec![ROWS, hidden],
         vec![ROWS, hidden],
     )?;
-    state_output.mark_state_publication();
+    state_output.mark_state_publication()?;
     bindings.push(state_output);
 
     let hidden_bytes = (0..ROWS * hidden)
@@ -574,23 +574,43 @@ struct ArmReport {
     optimization_mode: &'static str,
     route_residency_outcome: String,
     events: usize,
+    phase_events: BTreeMap<ObservedPhase, usize>,
     event_totals: BTreeMap<
         onnx_runtime_ep_cuda::byte_telemetry::ObservedCategory,
         BTreeMap<ObservedStatus, u64>,
     >,
     cold_h2d: u64,
     warm_h2d: u64,
+    cold_d2h: u64,
+    warm_d2h: u64,
+    cold_d2d_submitted: u64,
+    warm_d2d_submitted: u64,
+    cold_memset_submitted: u64,
+    warm_memset_submitted: u64,
     replay_events: usize,
     state_publications: u64,
+    output_publications: u64,
+    recorder_context_entries: u64,
+    recorder_batch_reservations: u64,
+    recorder_retained_clones: u64,
+    warm_recorder_retained_clones: u64,
+    recorder_mutex_acquisitions: u64,
+    recorder_thread_id_lookups: u64,
+    recorder_vector_growths: u64,
     device_bytes_without_release_receipt: u64,
     mapped_bytes_without_unmap_receipt: u64,
     proofs: Vec<StepProof>,
 }
 
-fn completed_h2d(snapshot: &ObservedSnapshot, phases: &[ObservedPhase]) -> u64 {
+fn phase_bytes(
+    snapshot: &ObservedSnapshot,
+    phases: &[ObservedPhase],
+    category: ObservedCategory,
+    status: ObservedStatus,
+) -> u64 {
     phases
         .iter()
-        .map(|phase| snapshot.phase_bytes(*phase, ObservedCategory::H2d, ObservedStatus::Completed))
+        .map(|phase| snapshot.phase_bytes(*phase, category, status))
         .sum()
 }
 
@@ -616,6 +636,7 @@ fn run_arm(fixture: &Fixture, optimized: bool) -> Result<ArmReport> {
         &routes(fixture.kind, 0),
         false,
     )?];
+    let retained_clones_before_warm = observation(&arm)?.hot_path_stats().retained_recorder_clones;
 
     observation(&arm)?.set_phase(ObservedPhase::DirectWarmup)?;
     proofs.push(execute_step(
@@ -674,6 +695,7 @@ fn run_arm(fixture: &Fixture, optimized: bool) -> Result<ArmReport> {
             false,
         )?);
     }
+    let retained_clones_after_warm = observation(&arm)?.hot_path_stats().retained_recorder_clones;
 
     let distinct_outputs = proofs
         .iter()
@@ -726,10 +748,35 @@ fn run_arm(fixture: &Fixture, optimized: bool) -> Result<ArmReport> {
         .iter()
         .filter(|event| event.phase == ObservedPhase::Replay)
         .count();
+    let phase_events = ObservedPhase::ALL
+        .into_iter()
+        .map(|phase| {
+            (
+                phase,
+                snapshot
+                    .events
+                    .iter()
+                    .filter(|event| event.phase == phase)
+                    .count(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let state_publications = snapshot.bytes(
         ObservedCategory::StatePublication,
         ObservedStatus::Published,
     );
+    let output_publications = snapshot.bytes(
+        ObservedCategory::OutputPublication,
+        ObservedStatus::Published,
+    );
+    let hot_path = reader.hot_path_stats();
+    let cold_phases = [ObservedPhase::Setup, ObservedPhase::Prefill];
+    let warm_phases = [
+        ObservedPhase::DirectWarmup,
+        ObservedPhase::CaptureSetup,
+        ObservedPhase::Replay,
+        ObservedPhase::DecodeSteady,
+    ];
     let device_bytes_without_release_receipt = snapshot
         .bytes(
             ObservedCategory::DeviceAllocation,
@@ -743,24 +790,91 @@ fn run_arm(fixture: &Fixture, optimized: bool) -> Result<ArmReport> {
         .context("VMM unmap receipts exceed observed maps")?;
     ensure!(replay_events >= REPLAYS);
     ensure!(state_publications > 0);
+    ensure!(output_publications > 0);
+    ensure!(retained_clones_after_warm == retained_clones_before_warm);
+    ensure!(
+        hot_path.mutex_acquisitions == 0
+            && hot_path.thread_id_lookups == 0
+            && hot_path.vector_growths == 0
+    );
+    for phase in [
+        ObservedPhase::DirectWarmup,
+        ObservedPhase::CaptureSetup,
+        ObservedPhase::Replay,
+        ObservedPhase::DecodeSteady,
+    ] {
+        ensure!(
+            phase_events.get(&phase).copied().unwrap_or(0) > 0,
+            "enabled production telemetry recorded no {phase:?} events"
+        );
+    }
     Ok(ArmReport {
         scope: snapshot.scope,
         optimization_mode: if optimized { "freetoken" } else { "baseline" },
         route_residency_outcome,
         events: snapshot.events.len(),
+        phase_events,
         event_totals,
-        cold_h2d: completed_h2d(&snapshot, &[ObservedPhase::Setup, ObservedPhase::Prefill]),
-        warm_h2d: completed_h2d(
+        cold_h2d: phase_bytes(
             &snapshot,
-            &[
-                ObservedPhase::DirectWarmup,
-                ObservedPhase::CaptureSetup,
-                ObservedPhase::Replay,
-                ObservedPhase::DecodeSteady,
-            ],
+            &cold_phases,
+            ObservedCategory::H2d,
+            ObservedStatus::Completed,
+        ),
+        warm_h2d: phase_bytes(
+            &snapshot,
+            &warm_phases,
+            ObservedCategory::H2d,
+            ObservedStatus::Completed,
+        ),
+        cold_d2h: phase_bytes(
+            &snapshot,
+            &cold_phases,
+            ObservedCategory::D2h,
+            ObservedStatus::Completed,
+        ),
+        warm_d2h: phase_bytes(
+            &snapshot,
+            &warm_phases,
+            ObservedCategory::D2h,
+            ObservedStatus::Completed,
+        ),
+        cold_d2d_submitted: phase_bytes(
+            &snapshot,
+            &cold_phases,
+            ObservedCategory::D2d,
+            ObservedStatus::Submitted,
+        ),
+        warm_d2d_submitted: phase_bytes(
+            &snapshot,
+            &warm_phases,
+            ObservedCategory::D2d,
+            ObservedStatus::Submitted,
+        ),
+        cold_memset_submitted: phase_bytes(
+            &snapshot,
+            &cold_phases,
+            ObservedCategory::CudaMemset,
+            ObservedStatus::Submitted,
+        ),
+        warm_memset_submitted: phase_bytes(
+            &snapshot,
+            &warm_phases,
+            ObservedCategory::CudaMemset,
+            ObservedStatus::Submitted,
         ),
         replay_events,
         state_publications,
+        output_publications,
+        recorder_context_entries: hot_path.context_entries,
+        recorder_batch_reservations: hot_path.batch_reservations,
+        recorder_retained_clones: hot_path.retained_recorder_clones,
+        warm_recorder_retained_clones: retained_clones_after_warm
+            .checked_sub(retained_clones_before_warm)
+            .context("warm recorder-retain counter regressed")?,
+        recorder_mutex_acquisitions: hot_path.mutex_acquisitions,
+        recorder_thread_id_lookups: hot_path.thread_id_lookups,
+        recorder_vector_growths: hot_path.vector_growths,
         device_bytes_without_release_receipt,
         mapped_bytes_without_unmap_receipt,
         proofs,
@@ -779,6 +893,10 @@ struct ComparisonReport {
     optimized: ArmReport,
     cold_h2d_delta: i128,
     warm_h2d_delta: i128,
+    cold_d2h_delta: i128,
+    warm_d2h_delta: i128,
+    cold_d2d_submitted_delta: i128,
+    warm_d2d_submitted_delta: i128,
     limitation: &'static str,
 }
 
@@ -809,8 +927,28 @@ fn production_session_ab_proves_outputs_state_routes_capture_and_replay() -> Res
         );
         ensure!(baseline.scope.provider != optimized.scope.provider);
         ensure!(baseline.scope.executor != optimized.scope.executor);
+        let (minimum_cold_d2h, minimum_warm_h2d, minimum_warm_d2h) = match kind {
+            FixtureKind::ManyExpertHybrid => (131_072, 590_976, 1_179_648),
+            FixtureKind::GroupedRecurrent => (262_144, 1_181_376, 2_359_296),
+        };
+        for (name, arm) in [("baseline", &baseline), ("optimized", &optimized)] {
+            ensure!(
+                arm.warm_h2d >= minimum_warm_h2d,
+                "{name} {} warm H2D omitted known route/state binding traffic: {} < {}",
+                kind.label(),
+                arm.warm_h2d,
+                minimum_warm_h2d
+            );
+            ensure!(
+                arm.cold_d2h >= minimum_cold_d2h && arm.warm_d2h >= minimum_warm_d2h,
+                "{name} {} D2H omitted known output/state readback traffic: cold={} warm={}",
+                kind.label(),
+                arm.cold_d2h,
+                arm.warm_d2h
+            );
+        }
         let report = ComparisonReport {
-            schema: "onnx-genai.freetoken-production-ab.v2",
+            schema: "onnx-genai.freetoken-production-ab.v3",
             fixture: kind,
             dimensions: BTreeMap::from([
                 ("experts", EXPERTS),
@@ -826,6 +964,12 @@ fn production_session_ab_proves_outputs_state_routes_capture_and_replay() -> Res
             replay_calls_per_arm: REPLAYS,
             cold_h2d_delta: optimized.cold_h2d as i128 - baseline.cold_h2d as i128,
             warm_h2d_delta: optimized.warm_h2d as i128 - baseline.warm_h2d as i128,
+            cold_d2h_delta: optimized.cold_d2h as i128 - baseline.cold_d2h as i128,
+            warm_d2h_delta: optimized.warm_d2h as i128 - baseline.warm_d2h as i128,
+            cold_d2d_submitted_delta: optimized.cold_d2d_submitted as i128
+                - baseline.cold_d2d_submitted as i128,
+            warm_d2d_submitted_delta: optimized.warm_d2d_submitted as i128
+                - baseline.warm_d2d_submitted as i128,
             baseline,
             optimized,
             limitation: "synthetic structurally typed QMoE fixture; not a full checkpoint or \
@@ -1072,6 +1216,166 @@ fn direct_provider_runtime_cannot_record_into_a_session_owned_ledger() -> Result
     ensure!(
         observed.snapshot()?.events.is_empty(),
         "direct provider/runtime work attached to a session-owned recorder"
+    );
+    Ok(())
+}
+
+#[test]
+fn exact_binding_h2d_and_d2h_bytes_match_authoritative_cuda_call_totals() -> Result<()> {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::create(FixtureKind::ManyExpertHybrid)?;
+    let mut arm = build_arm(&fixture, ExecutorRouteResidencyConfig::Disabled)?;
+    observation(&arm)?.set_phase(ObservedPhase::Verification)?;
+    let ledger_before = observation(&arm)?.snapshot()?;
+    let raw_before = arm.provider.runtime().transfer_byte_counts();
+    let bytes = vec![0x5a; ROWS * fixture.kind.hidden() * 4];
+
+    arm.bindings[0].write_bytes(0, &bytes)?;
+    let downloaded = arm.bindings[0].read_bytes()?;
+    ensure!(downloaded == bytes);
+
+    let raw_after = arm.provider.runtime().transfer_byte_counts();
+    let ledger_after = observation(&arm)?.snapshot()?;
+    let expected = bytes.len() as u64;
+    let ledger_h2d = ledger_after
+        .phase_bytes(
+            ObservedPhase::Verification,
+            ObservedCategory::H2d,
+            ObservedStatus::Completed,
+        )
+        .checked_sub(ledger_before.phase_bytes(
+            ObservedPhase::Verification,
+            ObservedCategory::H2d,
+            ObservedStatus::Completed,
+        ))
+        .context("verification H2D ledger delta underflow")?;
+    let ledger_d2h = ledger_after
+        .phase_bytes(
+            ObservedPhase::Verification,
+            ObservedCategory::D2h,
+            ObservedStatus::Completed,
+        )
+        .checked_sub(ledger_before.phase_bytes(
+            ObservedPhase::Verification,
+            ObservedCategory::D2h,
+            ObservedStatus::Completed,
+        ))
+        .context("verification D2H ledger delta underflow")?;
+    ensure!(ledger_h2d == expected && ledger_d2h == expected);
+    ensure!(raw_after.h2d_completed - raw_before.h2d_completed == ledger_h2d);
+    ensure!(raw_after.d2h_completed - raw_before.d2h_completed == ledger_d2h);
+    ensure!(raw_after.h2d_attempted - raw_before.h2d_attempted == expected);
+    ensure!(raw_after.d2h_attempted - raw_before.d2h_attempted == expected);
+    Ok(())
+}
+
+#[test]
+fn eager_capture_and_replay_publish_only_after_sync_and_validation() -> Result<()> {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::create(FixtureKind::ManyExpertHybrid)?;
+    let mut arm = build_arm(&fixture, ExecutorRouteResidencyConfig::Disabled)?;
+    let read_outputs = |arm: &mut LiveArm| -> Result<(Vec<u8>, Vec<u8>)> {
+        Ok((
+            arm.bindings[arm.output_index].read_bytes()?,
+            arm.bindings[arm.state_output_index].read_bytes()?,
+        ))
+    };
+
+    set_routes(&mut arm, fixture.kind, &routes(fixture.kind, 0))?;
+    arm.session
+        .run_with_device_bindings(&[], &mut arm.bindings)?;
+    let mut previous = read_outputs(&mut arm)?;
+    ensure!(previous.0 == previous.1);
+
+    let before_eager = observation(&arm)?.snapshot()?;
+    set_routes(&mut arm, fixture.kind, &routes(fixture.kind, 1))?;
+    arm.provider.fail_next_validation_for_test();
+    let eager_error = arm
+        .session
+        .run_with_device_bindings(&[], &mut arm.bindings)
+        .expect_err("eager validation failure must reject publication");
+    ensure!(eager_error.to_string().contains("flags=0x40000000"));
+    ensure!(read_outputs(&mut arm)? == previous);
+    let after_eager = observation(&arm)?.snapshot()?;
+    ensure!(
+        after_eager.bytes(
+            ObservedCategory::StatePublication,
+            ObservedStatus::Published
+        ) == before_eager.bytes(
+            ObservedCategory::StatePublication,
+            ObservedStatus::Published
+        )
+    );
+    ensure!(
+        after_eager.bytes(
+            ObservedCategory::StatePublication,
+            ObservedStatus::RolledBack
+        ) > before_eager.bytes(
+            ObservedCategory::StatePublication,
+            ObservedStatus::RolledBack
+        )
+    );
+    arm.session
+        .run_with_device_bindings(&[], &mut arm.bindings)
+        .context("retry eager after validation rollback")?;
+    previous = read_outputs(&mut arm)?;
+    arm.bindings[arm.state_index].write_bytes(0, &previous.1)?;
+
+    set_routes(&mut arm, fixture.kind, &routes(fixture.kind, 2))?;
+    arm.provider.fail_next_sync_for_test();
+    let capture_error = match arm
+        .session
+        .try_capture_with_device_bindings(&[], &mut arm.bindings)
+    {
+        Ok(_) => anyhow::bail!("capture synchronization failure unexpectedly published"),
+        Err(error) => error,
+    };
+    ensure!(
+        capture_error
+            .to_string()
+            .contains("injected synchronization failure")
+    );
+    ensure!(read_outputs(&mut arm)? == previous);
+    let capture = arm
+        .session
+        .try_capture_with_device_bindings(&[], &mut arm.bindings)
+        .context("retry capture after synchronization rollback")?;
+    ensure!(matches!(capture, DeviceGraphCaptureResult::Captured(_)));
+    previous = read_outputs(&mut arm)?;
+    ensure!(previous.0 == previous.1);
+    arm.bindings[arm.state_index].write_bytes(0, &previous.1)?;
+
+    let before_replay = observation(&arm)?.snapshot()?;
+    arm.provider.fail_next_validation_for_test();
+    let replay_error = arm
+        .session
+        .replay_device_graph(&mut arm.bindings)
+        .expect_err("replay validation failure must reject publication");
+    ensure!(replay_error.to_string().contains("flags=0x40000000"));
+    ensure!(read_outputs(&mut arm)? == previous);
+    let after_replay = observation(&arm)?.snapshot()?;
+    ensure!(
+        after_replay.bytes(
+            ObservedCategory::StatePublication,
+            ObservedStatus::Published
+        ) == before_replay.bytes(
+            ObservedCategory::StatePublication,
+            ObservedStatus::Published
+        )
+    );
+    ensure!(
+        after_replay.bytes(
+            ObservedCategory::StatePublication,
+            ObservedStatus::RolledBack
+        ) > before_replay.bytes(
+            ObservedCategory::StatePublication,
+            ObservedStatus::RolledBack
+        )
+    );
+    ensure!(
+        arm.session
+            .replay_device_graph(&mut arm.bindings)
+            .context("retry replay after validation rollback")?
     );
     Ok(())
 }

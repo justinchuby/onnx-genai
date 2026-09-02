@@ -1,16 +1,15 @@
 //! Bounded production-boundary byte telemetry.
 //!
-//! The ledger is opt-in and owned by one exact
-//! provider/device/executor/generation/logical-session scope. Production
-//! boundaries receive a private recorder only when the owning CUDA provider
-//! opens an exact executor session. The
-//! default runtime contains no recorder and performs no telemetry allocation,
-//! lock, lookup, copy, synchronization, or environment read.
+//! One provider-owned ledger belongs to one exact provider/device/executor/
+//! generation/logical-session scope. The shipped default has no recorder and
+//! performs one `Option` check before taking the original operation path.
 //!
-//! Enabled recording uses a construction-time preallocated event ring. A
-//! submission is prepared in fixed stack storage, validated in full, then
-//! committed under one short atomic gate. Snapshot/reset use the same
-//! linearization authority, so readers see the complete batch or none of it.
+//! Enabled recording is preallocated. An authenticated executor requirement
+//! installs a borrowed recorder pointer in a fixed-capacity thread-local stack;
+//! CUDA operation boundaries reserve fixed event slots and byte totals with
+//! atomics. The warmed path performs no mutex acquisition, hash lookup, vector
+//! growth, reference-count clone, heap allocation, thread-id lookup, formatting,
+//! or blocking synchronization. Snapshot/reset/close are cold lifecycle paths.
 //!
 //! Downstream code can read the returned ledger but cannot construct or clone
 //! its mutation authority:
@@ -64,21 +63,38 @@
 //! ```
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::fmt;
+use std::mem::MaybeUninit;
+use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use serde::Serialize;
 
-pub const OBSERVED_BYTE_SCHEMA: &str = "onnx-genai.freetoken-observed-bytes.v1";
+pub const OBSERVED_BYTE_SCHEMA: &str = "onnx-genai.freetoken-observed-bytes.v2";
 
 const MAX_BATCH_EVENTS: usize = 16;
+const MAX_CONTEXT_DEPTH: usize = 8;
 const PHASE_COUNT: usize = 9;
-const CATEGORY_COUNT: usize = 16;
-const STATUS_COUNT: usize = 9;
+const CATEGORY_COUNT: usize = 17;
+const STATUS_COUNT: usize = 10;
 const TOTAL_COUNT: usize = CATEGORY_COUNT * STATUS_COUNT;
 const PHASE_TOTAL_COUNT: usize = PHASE_COUNT * TOTAL_COUNT;
+
+const LIFECYCLE_ACTIVE: u8 = 0;
+const LIFECYCLE_SNAPSHOT_ACTIVE: u8 = 1;
+const LIFECYCLE_RETIRING: u8 = 2;
+const LIFECYCLE_SNAPSHOT_RETIRING: u8 = 3;
+const LIFECYCLE_CLOSED: u8 = 4;
+
+const SLOT_EMPTY: u8 = 0;
+const SLOT_COMMITTED: u8 = 1;
+
+const FAULT_NONE: u8 = 0;
+const FAULT_SUBMISSION_ABANDONED: u8 = 1;
+const FAULT_STALE_RECORDER: u8 = 2;
+const FAULT_UNREPORTED_OPERATION: u8 = 3;
+const FAULT_CONTEXT_ORDER: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,17 +109,6 @@ pub enum ObservedPhase {
     Verification,
     Failure,
     Teardown,
-}
-
-#[derive(Clone)]
-pub struct ObservedByteReadHandle {
-    inner: Arc<LedgerInner>,
-}
-
-impl ObservedByteReadHandle {
-    pub fn snapshot(&self) -> Result<ObservedSnapshot, LedgerError> {
-        snapshot_inner(&self.inner)
-    }
 }
 
 impl ObservedPhase {
@@ -122,26 +127,10 @@ impl ObservedPhase {
     const fn index(self) -> usize {
         self as usize
     }
-}
 
-fn snapshot_inner(inner: &Arc<LedgerInner>) -> Result<ObservedSnapshot, LedgerError> {
-    let guard = inner.lock();
-    let state = guard.state();
-    ensure_unfaulted(state)?;
-    if state.pending != 0 {
-        return Err(LedgerError::PendingSubmissions {
-            count: state.pending,
-        });
+    fn from_index(index: u8) -> Self {
+        Self::ALL[index as usize]
     }
-    Ok(ObservedSnapshot {
-        schema: OBSERVED_BYTE_SCHEMA,
-        scope: inner.scope,
-        epoch: state.epoch,
-        phase: state.phase,
-        events: state.events[..state.event_len].to_vec(),
-        totals: state.totals,
-        phase_totals: state.phase_totals,
-    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -164,6 +153,7 @@ pub enum ObservedCategory {
     PageIn,
     ExpertPublication,
     StatePublication,
+    OutputPublication,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -196,6 +186,7 @@ impl ObservedCategory {
         Self::PageIn,
         Self::ExpertPublication,
         Self::StatePublication,
+        Self::OutputPublication,
     ];
 
     const fn index(self) -> usize {
@@ -210,9 +201,10 @@ impl ObservedCategory {
             Self::H2d | Self::D2h | Self::D2d => ObservedLayer::Transport,
             Self::CudaMemset => ObservedLayer::DeviceMutation,
             Self::VmmReserve | Self::VmmMap | Self::VmmUnmap => ObservedLayer::MappingTopology,
-            Self::PageIn | Self::ExpertPublication | Self::StatePublication => {
-                ObservedLayer::LogicalPublication
-            }
+            Self::PageIn
+            | Self::ExpertPublication
+            | Self::StatePublication
+            | Self::OutputPublication => ObservedLayer::LogicalPublication,
         }
     }
 }
@@ -230,6 +222,7 @@ pub enum ObservedStatus {
     Quarantined,
     Reclaimed,
     Unsupported,
+    Elided,
 }
 
 impl ObservedStatus {
@@ -243,6 +236,7 @@ impl ObservedStatus {
         Self::Quarantined,
         Self::Reclaimed,
         Self::Unsupported,
+        Self::Elided,
     ];
 
     const fn index(self) -> usize {
@@ -252,6 +246,17 @@ impl ObservedStatus {
     pub const fn is_useful(self) -> bool {
         matches!(self, Self::Completed | Self::Committed | Self::Published)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum ObservedStream {
+    Host,
+    Compute,
+    Transfer,
+    LegacyDefault,
+    Logical,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -276,10 +281,25 @@ pub enum ObservedBoundary {
     WeightPageIn,
     WeightExpertPublish,
     StatePublish,
+    OutputPublish,
     AsyncCompletionUnsupported,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+impl ObservedBoundary {
+    const fn stream(self) -> ObservedStream {
+        match self {
+            Self::RuntimeH2d | Self::RuntimeD2h => ObservedStream::LegacyDefault,
+            Self::RuntimeD2d | Self::RuntimeCudaMemset => ObservedStream::Compute,
+            Self::StatePublish | Self::OutputPublish | Self::WeightExpertPublish => {
+                ObservedStream::Logical
+            }
+            Self::AsyncCompletionUnsupported => ObservedStream::Transfer,
+            _ => ObservedStream::Host,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ObservedScope {
     pub provider: u64,
     pub device: u32,
@@ -295,6 +315,7 @@ pub struct ObservedEvent {
     pub sequence: u64,
     pub submission: u64,
     pub phase: ObservedPhase,
+    pub stream: ObservedStream,
     pub category: ObservedCategory,
     pub boundary: ObservedBoundary,
     pub status: ObservedStatus,
@@ -343,6 +364,7 @@ pub enum LedgerFault {
     SubmissionAbandoned,
     StaleRecorderUse,
     UnreportedOperation,
+    ContextOrderViolation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -368,6 +390,9 @@ pub enum LedgerError {
         requested: usize,
     },
     BatchCapacityExceeded {
+        capacity: usize,
+    },
+    ContextCapacityExceeded {
         capacity: usize,
     },
     ByteTotalOverflow {
@@ -412,8 +437,9 @@ impl fmt::Display for LedgerError {
             }
             Self::SubmissionExhausted => formatter
                 .write_str("observed-byte submission identity space exhausted; refusing ABA reuse"),
-            Self::SequenceExhausted => formatter
-                .write_str("observed-byte event sequence space exhausted; refusing wraparound"),
+            Self::SequenceExhausted => {
+                formatter.write_str("observed-byte event sequence identity space exhausted")
+            }
             Self::EventCapacityExceeded {
                 capacity,
                 committed,
@@ -421,11 +447,17 @@ impl fmt::Display for LedgerError {
             } => write!(
                 formatter,
                 "observed-byte event capacity {capacity} cannot hold {requested} additional \
-                 event(s) after {committed}; no event was committed"
+                 event(s) after {committed}; no event was committed and no production operation \
+                 was submitted"
             ),
             Self::BatchCapacityExceeded { capacity } => write!(
                 formatter,
                 "observed-byte submission exceeds its fixed {capacity}-event batch capacity"
+            ),
+            Self::ContextCapacityExceeded { capacity } => write!(
+                formatter,
+                "observed-byte authenticated context depth exceeds fixed capacity {capacity}; \
+                 refusing an unmeasured nested operation"
             ),
             Self::ByteTotalOverflow {
                 phase,
@@ -436,7 +468,7 @@ impl fmt::Display for LedgerError {
             } => write!(
                 formatter,
                 "observed-byte {phase:?}/{category:?}/{status:?} total overflows at {current} + \
-                 {added}; no event was committed"
+                 {added}; no production operation was submitted"
             ),
             Self::SnapshotTotalOverflow { category } => write!(
                 formatter,
@@ -480,83 +512,234 @@ impl EventSpec {
     }
 }
 
-#[derive(Debug)]
-struct LedgerState {
-    epoch: u64,
-    next_submission: u64,
-    next_sequence: u64,
-    phase: ObservedPhase,
-    events: Box<[ObservedEvent]>,
-    event_len: usize,
-    totals: [u64; TOTAL_COUNT],
-    phase_totals: [u64; PHASE_TOTAL_COUNT],
-    reserved_events: usize,
-    reserved_totals: [u64; TOTAL_COUNT],
-    reserved_phase_totals: [u64; PHASE_TOTAL_COUNT],
-    pending: usize,
-    active_recorders: usize,
-    retiring: bool,
-    closed: bool,
-    fault: Option<LedgerFault>,
+struct EventSlot {
+    state: AtomicU8,
+    event: UnsafeCell<MaybeUninit<ObservedEvent>>,
 }
+
+impl EventSlot {
+    fn empty() -> Self {
+        Self {
+            state: AtomicU8::new(SLOT_EMPTY),
+            event: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+}
+
+// A slot has one writer selected by `next_event`; readers access it only after
+// lifecycle admission is frozen and `active_batches == 0`.
+unsafe impl Send for EventSlot {}
+unsafe impl Sync for EventSlot {}
 
 struct LedgerInner {
     scope: ObservedScope,
     runtime_id: u64,
-    gate: AtomicBool,
-    state: UnsafeCell<LedgerState>,
-}
-
-// Every access to `state` is serialized by `gate`. The gate is never held
-// across a CUDA call or allocation.
-unsafe impl Send for LedgerInner {}
-unsafe impl Sync for LedgerInner {}
-
-struct GateGuard<'a> {
-    inner: &'a LedgerInner,
-}
-
-impl Drop for GateGuard<'_> {
-    fn drop(&mut self) {
-        self.inner.gate.store(false, Ordering::Release);
-    }
-}
-
-impl GateGuard<'_> {
-    fn state(&self) -> &LedgerState {
-        // SAFETY: this guard holds the sole gate for immutable access.
-        unsafe { &*self.inner.state.get() }
-    }
-
-    fn state_mut(&mut self) -> &mut LedgerState {
-        // SAFETY: this mutable guard holds the sole gate for mutable access.
-        unsafe { &mut *self.inner.state.get() }
-    }
+    lifecycle: AtomicU8,
+    epoch: AtomicU64,
+    phase: AtomicU8,
+    next_submission: AtomicU64,
+    next_event: AtomicUsize,
+    active_batches: AtomicUsize,
+    active_recorders: AtomicUsize,
+    fault: AtomicU8,
+    events: Box<[EventSlot]>,
+    accepted_totals: [AtomicU64; TOTAL_COUNT],
+    totals: [AtomicU64; TOTAL_COUNT],
+    phase_totals: [AtomicU64; PHASE_TOTAL_COUNT],
+    context_entries: AtomicU64,
+    batch_reservations: AtomicU64,
+    retained_recorder_clones: AtomicU64,
 }
 
 impl LedgerInner {
-    fn lock(&self) -> GateGuard<'_> {
-        let mut spins = 0_u32;
-        while self
-            .gate
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            if spins < 64 {
-                spins += 1;
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
+    fn fault(&self) -> Option<LedgerFault> {
+        match self.fault.load(Ordering::Acquire) {
+            FAULT_NONE => None,
+            FAULT_SUBMISSION_ABANDONED => Some(LedgerFault::SubmissionAbandoned),
+            FAULT_STALE_RECORDER => Some(LedgerFault::StaleRecorderUse),
+            FAULT_UNREPORTED_OPERATION => Some(LedgerFault::UnreportedOperation),
+            FAULT_CONTEXT_ORDER => Some(LedgerFault::ContextOrderViolation),
+            _ => Some(LedgerFault::UnreportedOperation),
+        }
+    }
+
+    fn set_fault(&self, fault: LedgerFault) {
+        let code = match fault {
+            LedgerFault::SubmissionAbandoned => FAULT_SUBMISSION_ABANDONED,
+            LedgerFault::StaleRecorderUse => FAULT_STALE_RECORDER,
+            LedgerFault::UnreportedOperation => FAULT_UNREPORTED_OPERATION,
+            LedgerFault::ContextOrderViolation => FAULT_CONTEXT_ORDER,
+        };
+        let _ = self
+            .fault
+            .compare_exchange(FAULT_NONE, code, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn ensure_unfaulted(&self) -> Result<(), LedgerError> {
+        self.fault()
+            .map_or(Ok(()), |fault| Err(LedgerError::Faulted { fault }))
+    }
+
+    fn ensure_epoch(&self, expected: u64) -> Result<(), LedgerError> {
+        let actual = self.epoch.load(Ordering::Acquire);
+        if actual != expected {
+            self.set_fault(LedgerFault::StaleRecorderUse);
+            return Err(LedgerError::StaleEpoch { expected, actual });
+        }
+        Ok(())
+    }
+
+    fn begin_batch(&self, epoch: u64, allow_retiring: bool) -> Result<(), LedgerError> {
+        self.ensure_unfaulted()?;
+        self.ensure_epoch(epoch)?;
+        loop {
+            match self.lifecycle.load(Ordering::Acquire) {
+                LIFECYCLE_ACTIVE => {}
+                LIFECYCLE_RETIRING if allow_retiring => {}
+                LIFECYCLE_RETIRING | LIFECYCLE_SNAPSHOT_RETIRING => {
+                    return Err(LedgerError::Retiring);
+                }
+                LIFECYCLE_CLOSED => return Err(LedgerError::Closed),
+                LIFECYCLE_SNAPSHOT_ACTIVE => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                _ => return Err(LedgerError::Closed),
+            }
+            self.active_batches.fetch_add(1, Ordering::AcqRel);
+            let admitted = self.lifecycle.load(Ordering::Acquire);
+            if admitted == LIFECYCLE_ACTIVE || (allow_retiring && admitted == LIFECYCLE_RETIRING) {
+                if let Err(error) = self
+                    .ensure_unfaulted()
+                    .and_then(|()| self.ensure_epoch(epoch))
+                {
+                    self.active_batches.fetch_sub(1, Ordering::AcqRel);
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            self.active_batches.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn end_batch(&self) {
+        self.active_batches.fetch_sub(1, Ordering::Release);
+    }
+
+    fn freeze(&self) -> Result<FrozenLifecycle<'_>, LedgerError> {
+        loop {
+            let current = self.lifecycle.load(Ordering::Acquire);
+            let frozen = match current {
+                LIFECYCLE_ACTIVE => LIFECYCLE_SNAPSHOT_ACTIVE,
+                LIFECYCLE_RETIRING => LIFECYCLE_SNAPSHOT_RETIRING,
+                LIFECYCLE_CLOSED => {
+                    return Ok(FrozenLifecycle {
+                        inner: self,
+                        restore: LIFECYCLE_CLOSED,
+                        owns_transition: false,
+                    });
+                }
+                LIFECYCLE_SNAPSHOT_ACTIVE | LIFECYCLE_SNAPSHOT_RETIRING => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                _ => return Err(LedgerError::Closed),
+            };
+            if self
+                .lifecycle
+                .compare_exchange(current, frozen, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let pending = self.active_batches.load(Ordering::Acquire);
+                if pending != 0 {
+                    self.lifecycle.store(current, Ordering::Release);
+                    return Err(LedgerError::PendingSubmissions { count: pending });
+                }
+                return Ok(FrozenLifecycle {
+                    inner: self,
+                    restore: current,
+                    owns_transition: true,
+                });
             }
         }
-        GateGuard { inner: self }
     }
 }
 
-/// The unique public read/reset/close handle for one observed ledger.
-///
-/// This type is intentionally not `Clone`. Production mutation is possible
-/// only through the private recorder installed by `CudaRuntime::new_observed`.
+struct FrozenLifecycle<'a> {
+    inner: &'a LedgerInner,
+    restore: u8,
+    owns_transition: bool,
+}
+
+impl FrozenLifecycle<'_> {
+    fn close(mut self) {
+        self.inner
+            .lifecycle
+            .store(LIFECYCLE_CLOSED, Ordering::Release);
+        self.owns_transition = false;
+    }
+}
+
+impl Drop for FrozenLifecycle<'_> {
+    fn drop(&mut self) {
+        if self.owns_transition {
+            self.inner.lifecycle.store(self.restore, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ObservedByteReadHandle {
+    inner: Arc<LedgerInner>,
+}
+
+impl ObservedByteReadHandle {
+    pub fn snapshot(&self) -> Result<ObservedSnapshot, LedgerError> {
+        snapshot_inner(&self.inner)
+    }
+
+    pub fn hot_path_stats(&self) -> ObservedHotPathStats {
+        hot_path_stats(&self.inner)
+    }
+}
+
+fn snapshot_inner(inner: &Arc<LedgerInner>) -> Result<ObservedSnapshot, LedgerError> {
+    let _frozen = inner.freeze()?;
+    inner.ensure_unfaulted()?;
+    let event_len = inner.next_event.load(Ordering::Acquire);
+    let mut events = Vec::with_capacity(event_len);
+    for slot in &inner.events[..event_len] {
+        if slot.state.load(Ordering::Acquire) != SLOT_COMMITTED {
+            return Err(LedgerError::PendingSubmissions { count: 1 });
+        }
+        // SAFETY: committed slots were initialized before the release store;
+        // lifecycle admission is frozen and no batch remains active.
+        events.push(unsafe { (*slot.event.get()).assume_init() });
+    }
+    Ok(ObservedSnapshot {
+        schema: OBSERVED_BYTE_SCHEMA,
+        scope: inner.scope,
+        epoch: inner.epoch.load(Ordering::Acquire),
+        phase: ObservedPhase::from_index(inner.phase.load(Ordering::Acquire)),
+        events,
+        totals: std::array::from_fn(|index| inner.totals[index].load(Ordering::Acquire)),
+        phase_totals: std::array::from_fn(|index| {
+            inner.phase_totals[index].load(Ordering::Acquire)
+        }),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservedHotPathStats {
+    pub context_entries: u64,
+    pub batch_reservations: u64,
+    pub retained_recorder_clones: u64,
+    pub mutex_acquisitions: u64,
+    pub thread_id_lookups: u64,
+    pub vector_growths: u64,
+}
+
+/// Unique public read/reset/close handle for one observed ledger.
 pub struct ObservedByteLedger {
     inner: Arc<LedgerInner>,
 }
@@ -584,40 +767,28 @@ impl ObservedByteLedger {
         if event_capacity == 0 {
             return Err(LedgerError::ZeroCapacity);
         }
-        let empty = ObservedEvent {
-            scope,
-            epoch: 0,
-            sequence: 0,
-            submission: 0,
-            phase: ObservedPhase::Setup,
-            category: ObservedCategory::SourceRead,
-            boundary: ObservedBoundary::AsyncCompletionUnsupported,
-            status: ObservedStatus::Unsupported,
-            bytes: 0,
-        };
         Ok(Self {
             inner: Arc::new(LedgerInner {
                 scope,
                 runtime_id,
-                gate: AtomicBool::new(false),
-                state: UnsafeCell::new(LedgerState {
-                    epoch: 1,
-                    next_submission: 1,
-                    next_sequence: 1,
-                    phase: ObservedPhase::Setup,
-                    events: vec![empty; event_capacity].into_boxed_slice(),
-                    event_len: 0,
-                    totals: [0; TOTAL_COUNT],
-                    phase_totals: [0; PHASE_TOTAL_COUNT],
-                    reserved_events: 0,
-                    reserved_totals: [0; TOTAL_COUNT],
-                    reserved_phase_totals: [0; PHASE_TOTAL_COUNT],
-                    pending: 0,
-                    active_recorders: 0,
-                    retiring: false,
-                    closed: false,
-                    fault: None,
-                }),
+                lifecycle: AtomicU8::new(LIFECYCLE_ACTIVE),
+                epoch: AtomicU64::new(1),
+                phase: AtomicU8::new(ObservedPhase::Setup as u8),
+                next_submission: AtomicU64::new(1),
+                next_event: AtomicUsize::new(0),
+                active_batches: AtomicUsize::new(0),
+                active_recorders: AtomicUsize::new(0),
+                fault: AtomicU8::new(FAULT_NONE),
+                events: (0..event_capacity)
+                    .map(|_| EventSlot::empty())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                accepted_totals: std::array::from_fn(|_| AtomicU64::new(0)),
+                totals: std::array::from_fn(|_| AtomicU64::new(0)),
+                phase_totals: std::array::from_fn(|_| AtomicU64::new(0)),
+                context_entries: AtomicU64::new(0),
+                batch_reservations: AtomicU64::new(0),
+                retained_recorder_clones: AtomicU64::new(0),
             }),
         })
     }
@@ -627,15 +798,9 @@ impl ObservedByteLedger {
     }
 
     pub fn set_phase(&self, phase: ObservedPhase) -> Result<(), LedgerError> {
-        let mut guard = self.inner.lock();
-        let state = guard.state_mut();
-        ensure_available(state)?;
-        if state.pending != 0 {
-            return Err(LedgerError::PendingSubmissions {
-                count: state.pending,
-            });
-        }
-        state.phase = phase;
+        let _frozen = self.inner.freeze()?;
+        self.inner.ensure_unfaulted()?;
+        self.inner.phase.store(phase as u8, Ordering::Release);
         Ok(())
     }
 
@@ -649,61 +814,85 @@ impl ObservedByteLedger {
         }
     }
 
+    pub fn hot_path_stats(&self) -> ObservedHotPathStats {
+        hot_path_stats(&self.inner)
+    }
+}
+
+fn hot_path_stats(inner: &LedgerInner) -> ObservedHotPathStats {
+    ObservedHotPathStats {
+        context_entries: inner.context_entries.load(Ordering::Acquire),
+        batch_reservations: inner.batch_reservations.load(Ordering::Acquire),
+        retained_recorder_clones: inner.retained_recorder_clones.load(Ordering::Acquire),
+        mutex_acquisitions: 0,
+        thread_id_lookups: 0,
+        vector_growths: 0,
+    }
+}
+
+impl ObservedByteLedger {
     pub fn reset(&self) -> Result<(), LedgerError> {
-        let mut guard = self.inner.lock();
-        let state = guard.state_mut();
-        if state.closed {
-            return Err(LedgerError::Closed);
-        }
-        if state.pending != 0 {
-            return Err(LedgerError::PendingSubmissions {
-                count: state.pending,
-            });
-        }
-        state.epoch = state
+        let _frozen = self.inner.freeze()?;
+        let next_epoch = self
+            .inner
             .epoch
+            .load(Ordering::Acquire)
             .checked_add(1)
             .ok_or(LedgerError::SequenceExhausted)?;
-        state.next_submission = 1;
-        state.next_sequence = 1;
-        state.event_len = 0;
-        state.totals.fill(0);
-        state.phase_totals.fill(0);
-        state.reserved_events = 0;
-        state.reserved_totals.fill(0);
-        state.reserved_phase_totals.fill(0);
-        state.fault = None;
+        let event_len = self.inner.next_event.swap(0, Ordering::AcqRel);
+        for slot in &self.inner.events[..event_len] {
+            slot.state.store(SLOT_EMPTY, Ordering::Release);
+        }
+        self.inner.next_submission.store(1, Ordering::Release);
+        self.inner.epoch.store(next_epoch, Ordering::Release);
+        self.inner
+            .phase
+            .store(ObservedPhase::Setup as u8, Ordering::Release);
+        self.inner.fault.store(FAULT_NONE, Ordering::Release);
+        for total in &self.inner.accepted_totals {
+            total.store(0, Ordering::Release);
+        }
+        for total in &self.inner.totals {
+            total.store(0, Ordering::Release);
+        }
+        for total in &self.inner.phase_totals {
+            total.store(0, Ordering::Release);
+        }
         Ok(())
     }
 
     pub fn close(&self) -> Result<(), LedgerError> {
-        let mut guard = self.inner.lock();
-        let state = guard.state_mut();
-        if state.closed {
+        if self.inner.lifecycle.load(Ordering::Acquire) == LIFECYCLE_CLOSED {
             return Ok(());
         }
-        if state.pending != 0 {
-            return Err(LedgerError::PendingSubmissions {
-                count: state.pending,
-            });
-        }
-        state.closed = true;
-        state.retiring = false;
+        self.inner.freeze()?.close();
         Ok(())
     }
 
     pub(crate) fn recorder(&self) -> Result<ProductionByteRecorder, LedgerError> {
-        let mut guard = self.inner.lock();
-        let state = guard.state_mut();
-        ensure_available(state)?;
-        state.active_recorders = state
-            .active_recorders
-            .checked_add(1)
-            .ok_or(LedgerError::SubmissionExhausted)?;
+        match self.inner.lifecycle.load(Ordering::Acquire) {
+            LIFECYCLE_ACTIVE => {}
+            LIFECYCLE_RETIRING | LIFECYCLE_SNAPSHOT_RETIRING => {
+                return Err(LedgerError::Retiring);
+            }
+            LIFECYCLE_CLOSED => return Err(LedgerError::Closed),
+            _ => {}
+        }
+        self.inner.ensure_unfaulted()?;
+        self.inner.active_recorders.fetch_add(1, Ordering::AcqRel);
         Ok(ProductionByteRecorder {
             inner: Arc::clone(&self.inner),
-            epoch: state.epoch,
+            epoch: AtomicU64::new(self.inner.epoch.load(Ordering::Acquire)),
+            refreshable: false,
+            allow_retiring: false,
         })
+    }
+
+    pub(crate) fn persistent_recorder(&self) -> Result<ProductionByteRecorder, LedgerError> {
+        let mut recorder = self.recorder()?;
+        recorder.refreshable = true;
+        recorder.allow_retiring = true;
+        Ok(recorder)
     }
 
     #[cfg(test)]
@@ -712,29 +901,46 @@ impl ObservedByteLedger {
     }
 
     pub(crate) fn retire(&self) {
-        let mut guard = self.inner.lock();
-        let state = guard.state_mut();
-        state.retiring = true;
-        if state.active_recorders == 0 {
-            state.closed = true;
+        loop {
+            match self.inner.lifecycle.load(Ordering::Acquire) {
+                LIFECYCLE_ACTIVE => {
+                    if self
+                        .inner
+                        .lifecycle
+                        .compare_exchange(
+                            LIFECYCLE_ACTIVE,
+                            LIFECYCLE_RETIRING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                LIFECYCLE_SNAPSHOT_ACTIVE => std::hint::spin_loop(),
+                LIFECYCLE_RETIRING | LIFECYCLE_SNAPSHOT_RETIRING | LIFECYCLE_CLOSED => break,
+                _ => break,
+            }
+        }
+        if self.inner.active_recorders.load(Ordering::Acquire) == 0
+            && self.inner.active_batches.load(Ordering::Acquire) == 0
+        {
+            let _ = self.inner.lifecycle.compare_exchange(
+                LIFECYCLE_RETIRING,
+                LIFECYCLE_CLOSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 }
 
 pub(crate) struct ProductionByteRecorder {
     inner: Arc<LedgerInner>,
-    epoch: u64,
-}
-
-impl Drop for ProductionByteRecorder {
-    fn drop(&mut self) {
-        let mut guard = self.inner.lock();
-        let state = guard.state_mut();
-        state.active_recorders = state.active_recorders.saturating_sub(1);
-        if state.active_recorders == 0 && state.retiring {
-            state.closed = true;
-        }
-    }
+    epoch: AtomicU64,
+    refreshable: bool,
+    allow_retiring: bool,
 }
 
 impl fmt::Debug for ProductionByteRecorder {
@@ -742,201 +948,104 @@ impl fmt::Debug for ProductionByteRecorder {
         formatter
             .debug_struct("ProductionByteRecorder")
             .field("scope", &self.inner.scope)
-            .field("epoch", &self.epoch)
+            .field("epoch", &self.epoch.load(Ordering::Acquire))
             .finish()
     }
 }
 
+impl Drop for ProductionByteRecorder {
+    fn drop(&mut self) {
+        let prior = self.inner.active_recorders.fetch_sub(1, Ordering::AcqRel);
+        if prior == 1
+            && self.inner.active_batches.load(Ordering::Acquire) == 0
+            && self.inner.lifecycle.load(Ordering::Acquire) == LIFECYCLE_RETIRING
+        {
+            let _ = self.inner.lifecycle.compare_exchange(
+                LIFECYCLE_RETIRING,
+                LIFECYCLE_CLOSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
 impl ProductionByteRecorder {
-    pub(crate) fn taint_unreported_operation(&self) {
-        let mut guard = self.inner.lock();
-        guard.state_mut().fault = Some(LedgerFault::UnreportedOperation);
+    fn active_epoch(&self) -> Result<u64, LedgerError> {
+        let expected = self.epoch.load(Ordering::Acquire);
+        let actual = self.inner.epoch.load(Ordering::Acquire);
+        if expected == actual {
+            return Ok(actual);
+        }
+        if self.refreshable {
+            self.inner.ensure_unfaulted()?;
+            self.epoch.store(actual, Ordering::Release);
+            return Ok(actual);
+        }
+        self.inner.ensure_epoch(expected)?;
+        unreachable!("ensure_epoch returns on a mismatch")
     }
 
-    pub(crate) fn duplicate(&self) -> Result<Self, LedgerError> {
-        let mut guard = self.inner.lock();
-        let state = guard.state_mut();
-        ensure_recorder(state, self.epoch)?;
-        state.active_recorders = state
-            .active_recorders
-            .checked_add(1)
-            .ok_or(LedgerError::SubmissionExhausted)?;
+    pub(crate) fn taint_unreported_operation(&self) {
+        self.inner.set_fault(LedgerFault::UnreportedOperation);
+    }
+
+    /// Cold-path ownership retained by a deferred release receipt. Executor
+    /// entry and every ordinary CUDA operation borrow the prebuilt recorder
+    /// instead and never call this.
+    pub(crate) fn retain_for_deferred(&self) -> Result<Self, LedgerError> {
+        let epoch = self.active_epoch()?;
+        self.inner.ensure_unfaulted()?;
+        self.inner
+            .retained_recorder_clones
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.active_recorders.fetch_add(1, Ordering::AcqRel);
         Ok(Self {
             inner: Arc::clone(&self.inner),
-            epoch: self.epoch,
+            epoch: AtomicU64::new(epoch),
+            refreshable: true,
+            allow_retiring: true,
         })
     }
 
-    pub(crate) fn begin(&self) -> Result<PendingObservedBatch, LedgerError> {
-        let mut guard = self.inner.lock();
-        let state = guard.state_mut();
-        ensure_recorder(state, self.epoch)?;
-        let submission = state.next_submission;
-        state.next_submission = submission
-            .checked_add(1)
-            .ok_or(LedgerError::SubmissionExhausted)?;
-        state.pending = state
-            .pending
-            .checked_add(1)
-            .ok_or(LedgerError::SubmissionExhausted)?;
-        state.active_recorders = state
-            .active_recorders
-            .checked_add(1)
-            .ok_or(LedgerError::SubmissionExhausted)?;
-        Ok(PendingObservedBatch {
-            recorder: ProductionByteRecorder {
-                inner: Arc::clone(&self.inner),
-                epoch: self.epoch,
-            },
-            epoch: self.epoch,
-            submission,
-            phase: state.phase,
-            specs: [EventSpec::new(
-                ObservedCategory::SourceRead,
-                ObservedBoundary::AsyncCompletionUnsupported,
-                ObservedStatus::Unsupported,
-                0,
-            ); MAX_BATCH_EVENTS],
-            reserved_specs: [EventSpec::new(
-                ObservedCategory::SourceRead,
-                ObservedBoundary::AsyncCompletionUnsupported,
-                ObservedStatus::Unsupported,
-                0,
-            ); MAX_BATCH_EVENTS],
-            len: 0,
-            reserved: false,
-            terminal: false,
+    pub(crate) fn enter(&self) -> Result<RecorderContextGuard, LedgerError> {
+        self.active_epoch()?;
+        self.inner.ensure_unfaulted()?;
+        RECORDER_CONTEXT.with(|context| {
+            // SAFETY: thread-local storage is accessed only by its owning thread.
+            let stack = unsafe { &mut *context.get() };
+            if stack.len == MAX_CONTEXT_DEPTH {
+                return Err(LedgerError::ContextCapacityExceeded {
+                    capacity: MAX_CONTEXT_DEPTH,
+                });
+            }
+            let generation = stack
+                .next_generation
+                .checked_add(1)
+                .ok_or(LedgerError::SequenceExhausted)?;
+            stack.next_generation = generation;
+            let index = stack.len;
+            stack.entries[index] = ContextEntry {
+                runtime_id: self.inner.runtime_id,
+                recorder: NonNull::from(self),
+                generation,
+            };
+            stack.len += 1;
+            self.inner.context_entries.fetch_add(1, Ordering::Relaxed);
+            Ok(RecorderContextGuard {
+                index,
+                generation,
+                recorder: NonNull::from(self),
+            })
         })
     }
 
     pub(crate) fn prepare(&self, specs: &[EventSpec]) -> Result<PendingObservedBatch, LedgerError> {
-        if specs.len() > MAX_BATCH_EVENTS {
-            return Err(LedgerError::BatchCapacityExceeded {
-                capacity: MAX_BATCH_EVENTS,
-            });
-        }
-        let mut guard = self.inner.lock();
-        let state = guard.state_mut();
-        ensure_recorder(state, self.epoch)?;
-        reserve_specs(state, specs, state.phase)?;
-        let submission = state.next_submission;
-        state.next_submission = submission
-            .checked_add(1)
-            .ok_or(LedgerError::SubmissionExhausted)?;
-        state.pending = state
-            .pending
-            .checked_add(1)
-            .ok_or(LedgerError::SubmissionExhausted)?;
-        state.active_recorders = state
-            .active_recorders
-            .checked_add(1)
-            .ok_or(LedgerError::SubmissionExhausted)?;
-        let mut batch = PendingObservedBatch {
-            recorder: ProductionByteRecorder {
-                inner: Arc::clone(&self.inner),
-                epoch: self.epoch,
-            },
-            epoch: self.epoch,
-            submission,
-            phase: state.phase,
-            specs: [EventSpec::new(
-                ObservedCategory::SourceRead,
-                ObservedBoundary::AsyncCompletionUnsupported,
-                ObservedStatus::Unsupported,
-                0,
-            ); MAX_BATCH_EVENTS],
-            reserved_specs: [EventSpec::new(
-                ObservedCategory::SourceRead,
-                ObservedBoundary::AsyncCompletionUnsupported,
-                ObservedStatus::Unsupported,
-                0,
-            ); MAX_BATCH_EVENTS],
-            len: specs.len(),
-            reserved: true,
-            terminal: false,
-        };
-        batch.specs[..specs.len()].copy_from_slice(specs);
-        batch.reserved_specs[..specs.len()].copy_from_slice(specs);
-        Ok(batch)
-    }
-}
-
-pub(crate) struct ExecutionRecorderRegistry {
-    active: std::sync::Mutex<HashMap<std::thread::ThreadId, Vec<ProductionByteRecorder>>>,
-}
-
-impl Default for ExecutionRecorderRegistry {
-    fn default() -> Self {
-        Self {
-            active: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl ExecutionRecorderRegistry {
-    pub(crate) fn enter(
-        self: &Arc<Self>,
-        recorder: ProductionByteRecorder,
-    ) -> RecorderContextGuard {
-        let thread = std::thread::current().id();
-        self.active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(thread)
-            .or_default()
-            .push(recorder);
-        RecorderContextGuard {
-            registry: Arc::clone(self),
-            thread,
-        }
+        PendingObservedBatch::prepare(self, specs)
     }
 
-    pub(crate) fn current(
-        &self,
-        runtime_id: u64,
-    ) -> Result<Option<ProductionByteRecorder>, LedgerError> {
-        let active = self
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        active
-            .get(&std::thread::current().id())
-            .and_then(|stack| {
-                stack
-                    .iter()
-                    .rev()
-                    .find(|recorder| recorder.inner.runtime_id == runtime_id)
-            })
-            .map(ProductionByteRecorder::duplicate)
-            .transpose()
-    }
-}
-
-pub(crate) struct RecorderContextGuard {
-    registry: Arc<ExecutionRecorderRegistry>,
-    thread: std::thread::ThreadId,
-}
-
-impl Drop for RecorderContextGuard {
-    fn drop(&mut self) {
-        let mut active = self
-            .registry
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(stack) = active.get_mut(&self.thread) {
-            stack.pop();
-            if stack.is_empty() {
-                active.remove(&self.thread);
-            }
-        }
-    }
-}
-
-impl ProductionByteRecorder {
     pub(crate) fn record(&self, spec: EventSpec) -> Result<(), LedgerError> {
-        let mut batch = self.begin()?;
-        batch.push(spec)?;
+        let mut batch = self.prepare(std::slice::from_ref(&spec))?;
         batch.commit()
     }
 
@@ -945,26 +1054,185 @@ impl ProductionByteRecorder {
         first: EventSpec,
         second: EventSpec,
     ) -> Result<(), LedgerError> {
-        let mut batch = self.begin()?;
-        batch.push(first)?;
-        batch.push(second)?;
+        let mut batch = self.prepare(&[first, second])?;
         batch.commit()
     }
 }
 
+#[derive(Clone, Copy)]
+struct ContextEntry {
+    runtime_id: u64,
+    recorder: NonNull<ProductionByteRecorder>,
+    generation: u64,
+}
+
+const EMPTY_CONTEXT_ENTRY: ContextEntry = ContextEntry {
+    runtime_id: 0,
+    recorder: NonNull::dangling(),
+    generation: 0,
+};
+
+struct ContextStack {
+    entries: [ContextEntry; MAX_CONTEXT_DEPTH],
+    len: usize,
+    next_generation: u64,
+}
+
+thread_local! {
+    static RECORDER_CONTEXT: UnsafeCell<ContextStack> = const {
+        UnsafeCell::new(ContextStack {
+            entries: [EMPTY_CONTEXT_ENTRY; MAX_CONTEXT_DEPTH],
+            len: 0,
+            next_generation: 0,
+        })
+    };
+}
+
+pub(crate) struct RecorderContextGuard {
+    index: usize,
+    generation: u64,
+    recorder: NonNull<ProductionByteRecorder>,
+}
+
+impl Drop for RecorderContextGuard {
+    fn drop(&mut self) {
+        RECORDER_CONTEXT.with(|context| {
+            // SAFETY: thread-local storage is accessed only by its owning thread.
+            let stack = unsafe { &mut *context.get() };
+            let valid = stack.len == self.index + 1
+                && stack.entries[self.index].generation == self.generation
+                && stack.entries[self.index].recorder == self.recorder;
+            if valid {
+                stack.len -= 1;
+                stack.entries[self.index] = EMPTY_CONTEXT_ENTRY;
+            } else {
+                // SAFETY: the guard cannot outlive the borrowed recorder whose
+                // `enter` method created it.
+                unsafe { self.recorder.as_ref() }
+                    .inner
+                    .set_fault(LedgerFault::ContextOrderViolation);
+            }
+        });
+    }
+}
+
+pub(crate) fn current_recorder(runtime_id: u64) -> Option<&'static ProductionByteRecorder> {
+    RECORDER_CONTEXT.with(|context| {
+        // SAFETY: callers use the reference only synchronously while the
+        // authenticated outer guard is live. The pointer is never retained by
+        // an ordinary batch; deferred cold paths explicitly clone ownership.
+        let stack = unsafe { &*context.get() };
+        stack.entries[..stack.len]
+            .iter()
+            .rev()
+            .find(|entry| entry.runtime_id == runtime_id)
+            .map(|entry| unsafe { entry.recorder.as_ref() })
+    })
+}
+
 pub(crate) struct PendingObservedBatch {
-    recorder: ProductionByteRecorder,
+    inner: NonNull<LedgerInner>,
     epoch: u64,
     submission: u64,
     phase: ObservedPhase,
+    slot_start: usize,
     specs: [EventSpec; MAX_BATCH_EVENTS],
     reserved_specs: [EventSpec; MAX_BATCH_EVENTS],
     len: usize,
-    reserved: bool,
+    submitted: bool,
     terminal: bool,
 }
 
+// The ledger storage is stable behind an Arc retained by the exact provider
+// state for at least as long as any CUDA/deferred operation can own a batch.
+unsafe impl Send for PendingObservedBatch {}
+
 impl PendingObservedBatch {
+    fn empty_spec() -> EventSpec {
+        EventSpec::new(
+            ObservedCategory::SourceRead,
+            ObservedBoundary::AsyncCompletionUnsupported,
+            ObservedStatus::Unsupported,
+            0,
+        )
+    }
+
+    fn prepare(
+        recorder: &ProductionByteRecorder,
+        specs: &[EventSpec],
+    ) -> Result<Self, LedgerError> {
+        if specs.len() > MAX_BATCH_EVENTS {
+            return Err(LedgerError::BatchCapacityExceeded {
+                capacity: MAX_BATCH_EVENTS,
+            });
+        }
+        let inner = recorder.inner.as_ref();
+        let epoch = recorder.active_epoch()?;
+        inner.begin_batch(epoch, recorder.allow_retiring)?;
+        let phase = ObservedPhase::from_index(inner.phase.load(Ordering::Acquire));
+        if let Err(error) = reserve_total_alternatives(inner, specs, phase) {
+            inner.end_batch();
+            return Err(error);
+        }
+        let slot_start =
+            match inner
+                .next_event
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |committed| {
+                    committed
+                        .checked_add(specs.len())
+                        .filter(|next| *next <= inner.events.len())
+                }) {
+                Ok(start) => start,
+                Err(committed) => {
+                    release_total_alternatives(inner, specs);
+                    inner.end_batch();
+                    return Err(LedgerError::EventCapacityExceeded {
+                        capacity: inner.events.len(),
+                        committed,
+                        requested: specs.len(),
+                    });
+                }
+            };
+        let submission = match inner.next_submission.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| current.checked_add(1),
+        ) {
+            Ok(current) => current,
+            Err(_) => {
+                release_total_alternatives(inner, specs);
+                inner.set_fault(LedgerFault::SubmissionAbandoned);
+                inner.end_batch();
+                return Err(LedgerError::SubmissionExhausted);
+            }
+        };
+        let mut batch = Self {
+            inner: NonNull::from(inner),
+            epoch,
+            submission,
+            phase,
+            slot_start,
+            specs: [Self::empty_spec(); MAX_BATCH_EVENTS],
+            reserved_specs: [Self::empty_spec(); MAX_BATCH_EVENTS],
+            len: specs.len(),
+            submitted: false,
+            terminal: false,
+        };
+        batch.specs[..specs.len()].copy_from_slice(specs);
+        batch.reserved_specs[..specs.len()].copy_from_slice(specs);
+        inner.batch_reservations.fetch_add(1, Ordering::Relaxed);
+        Ok(batch)
+    }
+
+    fn inner(&self) -> &LedgerInner {
+        // SAFETY: see the Send invariant above.
+        unsafe { self.inner.as_ref() }
+    }
+
+    pub(crate) fn mark_submitted(&mut self) {
+        self.submitted = true;
+    }
+
     pub(crate) fn set_boundary(&mut self, index: usize, boundary: ObservedBoundary) {
         if !self.terminal && index < self.len {
             self.specs[index].boundary = boundary;
@@ -982,247 +1250,79 @@ impl PendingObservedBatch {
         Ok(())
     }
 
-    pub(crate) fn push(&mut self, spec: EventSpec) -> Result<(), LedgerError> {
-        if self.terminal {
-            return Err(LedgerError::SubmissionTerminal);
-        }
-        if self.len == MAX_BATCH_EVENTS {
-            return Err(LedgerError::BatchCapacityExceeded {
-                capacity: MAX_BATCH_EVENTS,
-            });
-        }
-        self.specs[self.len] = spec;
-        self.len += 1;
-        Ok(())
-    }
-
     pub(crate) fn commit(&mut self) -> Result<(), LedgerError> {
-        if self.terminal {
-            return Ok(());
-        }
-        let mut guard = self.recorder.inner.lock();
-        let state = guard.state_mut();
-        ensure_recorder(state, self.epoch)?;
-        if self.reserved {
-            release_reserved_specs(state, &self.reserved_specs[..self.len], self.phase);
-            self.reserved = false;
-        }
-        let new_len =
-            state
-                .event_len
-                .checked_add(self.len)
-                .ok_or(LedgerError::EventCapacityExceeded {
-                    capacity: state.events.len(),
-                    committed: state.event_len,
-                    requested: self.len,
-                })?;
-        if new_len > state.events.len() {
-            return Err(LedgerError::EventCapacityExceeded {
-                capacity: state.events.len(),
-                committed: state.event_len,
-                requested: self.len,
-            });
-        }
-        let sequence_after = state
-            .next_sequence
-            .checked_add(self.len as u64)
-            .ok_or(LedgerError::SequenceExhausted)?;
-
-        let mut totals = state.totals;
-        let mut phase_totals = state.phase_totals;
-        for spec in &self.specs[..self.len] {
-            let total = total_index(spec.category, spec.status);
-            totals[total] =
-                totals[total]
-                    .checked_add(spec.bytes)
-                    .ok_or(LedgerError::ByteTotalOverflow {
-                        phase: self.phase,
-                        category: spec.category,
-                        status: spec.status,
-                        current: totals[total],
-                        added: spec.bytes,
-                    })?;
-            let phase_total = phase_total_index(self.phase, spec.category, spec.status);
-            phase_totals[phase_total] = phase_totals[phase_total].checked_add(spec.bytes).ok_or(
-                LedgerError::ByteTotalOverflow {
-                    phase: self.phase,
-                    category: spec.category,
-                    status: spec.status,
-                    current: phase_totals[phase_total],
-                    added: spec.bytes,
-                },
-            )?;
-        }
-
-        for (offset, spec) in self.specs[..self.len].iter().enumerate() {
-            state.events[state.event_len + offset] = ObservedEvent {
-                scope: self.recorder.inner.scope,
-                epoch: self.epoch,
-                sequence: state.next_sequence + offset as u64,
-                submission: self.submission,
-                phase: self.phase,
-                category: spec.category,
-                boundary: spec.boundary,
-                status: spec.status,
-                bytes: spec.bytes,
-            };
-        }
-        state.totals = totals;
-        state.phase_totals = phase_totals;
-        state.next_sequence = sequence_after;
-        state.event_len = new_len;
-        state.pending -= 1;
-        self.terminal = true;
-        Ok(())
+        self.finish(None)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn abort(&mut self, status: ObservedStatus) -> Result<(), LedgerError> {
-        if self.terminal {
-            return Ok(());
-        }
         if !matches!(
             status,
             ObservedStatus::Failed | ObservedStatus::RolledBack | ObservedStatus::Quarantined
         ) {
             return Err(LedgerError::InvalidAbortStatus { status });
         }
-        for spec in &mut self.specs[..self.len] {
-            spec.status = status;
-        }
-        self.commit()
+        self.finish(Some(status))
     }
 
-    #[cfg(test)]
-    fn abandon(&mut self) {
-        self.abandon_inner();
+    fn finish(&mut self, abort: Option<ObservedStatus>) -> Result<(), LedgerError> {
+        if self.terminal {
+            return Ok(());
+        }
+        let inner = self.inner();
+        inner.ensure_epoch(self.epoch)?;
+        inner.ensure_unfaulted()?;
+
+        let mut actual = self.specs;
+        if let Some(status) = abort {
+            for spec in &mut actual[..self.len] {
+                if !(self.submitted && spec.status == ObservedStatus::Submitted) {
+                    spec.status = status;
+                }
+            }
+        }
+
+        for (offset, spec) in actual[..self.len].iter().enumerate() {
+            let slot = &inner.events[self.slot_start + offset];
+            // SAFETY: this batch exclusively owns its contiguous reserved slots.
+            unsafe {
+                (*slot.event.get()).write(ObservedEvent {
+                    scope: inner.scope,
+                    epoch: self.epoch,
+                    sequence: (self.slot_start + offset + 1) as u64,
+                    submission: self.submission,
+                    phase: self.phase,
+                    stream: spec.boundary.stream(),
+                    category: spec.category,
+                    boundary: spec.boundary,
+                    status: spec.status,
+                    bytes: spec.bytes,
+                });
+            }
+            inner.totals[total_index(spec.category, spec.status)]
+                .fetch_add(spec.bytes, Ordering::Relaxed);
+            inner.phase_totals[phase_total_index(self.phase, spec.category, spec.status)]
+                .fetch_add(spec.bytes, Ordering::Relaxed);
+            slot.state.store(SLOT_COMMITTED, Ordering::Release);
+        }
+        release_unused_total_alternatives(
+            inner,
+            &self.reserved_specs[..self.len],
+            &actual[..self.len],
+        );
+        inner.end_batch();
+        self.terminal = true;
+        Ok(())
     }
 
     fn abandon_inner(&mut self) {
         if self.terminal {
             return;
         }
-        let mut guard = self.recorder.inner.lock();
-        let state = guard.state_mut();
-        if state.epoch == self.epoch && state.pending > 0 {
-            if self.reserved {
-                release_reserved_specs(state, &self.reserved_specs[..self.len], self.phase);
-                self.reserved = false;
-            }
-            state.pending -= 1;
-            state.fault = Some(LedgerFault::SubmissionAbandoned);
-        }
-
+        let inner = self.inner();
+        release_total_alternatives(inner, &self.reserved_specs[..self.len]);
+        inner.set_fault(LedgerFault::SubmissionAbandoned);
+        inner.end_batch();
         self.terminal = true;
-    }
-}
-
-fn reserve_specs(
-    state: &mut LedgerState,
-    specs: &[EventSpec],
-    phase: ObservedPhase,
-) -> Result<(), LedgerError> {
-    let requested = state.reserved_events.checked_add(specs.len()).ok_or(
-        LedgerError::EventCapacityExceeded {
-            capacity: state.events.len(),
-            committed: state.event_len,
-            requested: specs.len(),
-        },
-    )?;
-    let occupied =
-        state
-            .event_len
-            .checked_add(requested)
-            .ok_or(LedgerError::EventCapacityExceeded {
-                capacity: state.events.len(),
-                committed: state.event_len,
-                requested: specs.len(),
-            })?;
-    if occupied > state.events.len() {
-        return Err(LedgerError::EventCapacityExceeded {
-            capacity: state.events.len(),
-            committed: state.event_len + state.reserved_events,
-            requested: specs.len(),
-        });
-    }
-    state
-        .next_sequence
-        .checked_add(requested as u64)
-        .ok_or(LedgerError::SequenceExhausted)?;
-    let mut reserved_totals = state.reserved_totals;
-    let mut reserved_phase_totals = state.reserved_phase_totals;
-    for spec in specs {
-        let total = total_index(spec.category, spec.status);
-        let current = state.totals[total]
-            .checked_add(reserved_totals[total])
-            .ok_or(LedgerError::ByteTotalOverflow {
-                phase,
-                category: spec.category,
-                status: spec.status,
-                current: state.totals[total],
-                added: reserved_totals[total],
-            })?;
-        reserved_totals[total] = reserved_totals[total].checked_add(spec.bytes).ok_or(
-            LedgerError::ByteTotalOverflow {
-                phase,
-                category: spec.category,
-                status: spec.status,
-                current,
-                added: spec.bytes,
-            },
-        )?;
-        state.totals[total]
-            .checked_add(reserved_totals[total])
-            .ok_or(LedgerError::ByteTotalOverflow {
-                phase,
-                category: spec.category,
-                status: spec.status,
-                current,
-                added: spec.bytes,
-            })?;
-        let phase_total = phase_total_index(phase, spec.category, spec.status);
-        let current_phase = state.phase_totals[phase_total]
-            .checked_add(reserved_phase_totals[phase_total])
-            .ok_or(LedgerError::ByteTotalOverflow {
-                phase,
-                category: spec.category,
-                status: spec.status,
-                current: state.phase_totals[phase_total],
-                added: reserved_phase_totals[phase_total],
-            })?;
-        reserved_phase_totals[phase_total] = reserved_phase_totals[phase_total]
-            .checked_add(spec.bytes)
-            .ok_or(LedgerError::ByteTotalOverflow {
-                phase,
-                category: spec.category,
-                status: spec.status,
-                current: current_phase,
-                added: spec.bytes,
-            })?;
-        state.phase_totals[phase_total]
-            .checked_add(reserved_phase_totals[phase_total])
-            .ok_or(LedgerError::ByteTotalOverflow {
-                phase,
-                category: spec.category,
-                status: spec.status,
-                current: current_phase,
-                added: spec.bytes,
-            })?;
-    }
-    state.reserved_events = requested;
-    state.reserved_totals = reserved_totals;
-    state.reserved_phase_totals = reserved_phase_totals;
-    Ok(())
-}
-
-fn release_reserved_specs(state: &mut LedgerState, specs: &[EventSpec], phase: ObservedPhase) {
-    state.reserved_events = state.reserved_events.saturating_sub(specs.len());
-    for spec in specs {
-        let total = total_index(spec.category, spec.status);
-        state.reserved_totals[total] = state.reserved_totals[total].saturating_sub(spec.bytes);
-        let phase_total = phase_total_index(phase, spec.category, spec.status);
-        state.reserved_phase_totals[phase_total] =
-            state.reserved_phase_totals[phase_total].saturating_sub(spec.bytes);
     }
 }
 
@@ -1232,35 +1332,85 @@ impl Drop for PendingObservedBatch {
     }
 }
 
-fn ensure_available(state: &LedgerState) -> Result<(), LedgerError> {
-    if state.closed {
-        return Err(LedgerError::Closed);
-    }
-    if state.retiring {
-        return Err(LedgerError::Retiring);
-    }
-    ensure_unfaulted(state)
+fn alternative_statuses(success: ObservedStatus) -> [ObservedStatus; 4] {
+    [
+        success,
+        ObservedStatus::Failed,
+        ObservedStatus::RolledBack,
+        ObservedStatus::Quarantined,
+    ]
 }
 
-fn ensure_unfaulted(state: &LedgerState) -> Result<(), LedgerError> {
-    state
-        .fault
-        .map_or(Ok(()), |fault| Err(LedgerError::Faulted { fault }))
-}
-
-fn ensure_recorder(state: &mut LedgerState, epoch: u64) -> Result<(), LedgerError> {
-    if state.closed {
-        return Err(LedgerError::Closed);
-    }
-    ensure_unfaulted(state)?;
-    if state.epoch != epoch {
-        state.fault = Some(LedgerFault::StaleRecorderUse);
-        return Err(LedgerError::StaleEpoch {
-            expected: epoch,
-            actual: state.epoch,
-        });
+fn reserve_total_alternatives(
+    inner: &LedgerInner,
+    specs: &[EventSpec],
+    phase: ObservedPhase,
+) -> Result<(), LedgerError> {
+    let mut reserved = [(0usize, 0u64); MAX_BATCH_EVENTS * 4];
+    let mut reserved_len = 0usize;
+    for spec in specs {
+        let statuses = alternative_statuses(spec.status);
+        for (status_index, status) in statuses.into_iter().enumerate() {
+            if statuses[..status_index].contains(&status) {
+                continue;
+            }
+            let index = total_index(spec.category, status);
+            if let Err(current) = inner.accepted_totals[index].fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |value| value.checked_add(spec.bytes),
+            ) {
+                for &(reserved_index, bytes) in reserved[..reserved_len].iter().rev() {
+                    inner.accepted_totals[reserved_index].fetch_sub(bytes, Ordering::AcqRel);
+                }
+                return Err(LedgerError::ByteTotalOverflow {
+                    phase,
+                    category: spec.category,
+                    status,
+                    current,
+                    added: spec.bytes,
+                });
+            }
+            reserved[reserved_len] = (index, spec.bytes);
+            reserved_len += 1;
+        }
     }
     Ok(())
+}
+
+fn release_total_alternatives(inner: &LedgerInner, specs: &[EventSpec]) {
+    for spec in specs {
+        let statuses = alternative_statuses(spec.status);
+        for (index, status) in statuses.into_iter().enumerate() {
+            if statuses[..index].contains(&status) {
+                continue;
+            }
+            inner.accepted_totals[total_index(spec.category, status)]
+                .fetch_sub(spec.bytes, Ordering::AcqRel);
+        }
+    }
+}
+
+fn release_unused_total_alternatives(
+    inner: &LedgerInner,
+    reserved: &[EventSpec],
+    actual: &[EventSpec],
+) {
+    for (reserved, actual) in reserved.iter().zip(actual) {
+        let statuses = alternative_statuses(reserved.status);
+        for (index, status) in statuses.into_iter().enumerate() {
+            if statuses[..index].contains(&status) {
+                continue;
+            }
+            let keep = if status == actual.status {
+                actual.bytes
+            } else {
+                0
+            };
+            inner.accepted_totals[total_index(reserved.category, status)]
+                .fetch_sub(reserved.bytes - keep, Ordering::AcqRel);
+        }
+    }
 }
 
 const fn total_index(category: ObservedCategory, status: ObservedStatus) -> usize {
@@ -1278,7 +1428,60 @@ const fn phase_total_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Barrier;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::{Arc, Barrier};
+
+    struct CountingAllocator;
+
+    thread_local! {
+        static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            COUNT_ALLOCATIONS.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            COUNT_ALLOCATIONS.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            COUNT_ALLOCATIONS.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    fn count_allocations(operation: impl FnOnce()) -> u64 {
+        ALLOCATIONS.with(|count| count.set(0));
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+        operation();
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+        ALLOCATIONS.with(Cell::get)
+    }
 
     fn scope() -> ObservedScope {
         ObservedScope {
@@ -1300,333 +1503,134 @@ mod tests {
     }
 
     #[test]
-    fn exact_overflow_probe_commits_nothing_and_keeps_submission_pending() {
-        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
-        let recorder = ledger.attach().unwrap();
-        let mut batch = recorder.begin().unwrap();
-        batch.push(completed(u64::MAX)).unwrap();
-        batch.push(completed(1)).unwrap();
-        let error = batch.commit().unwrap_err();
-        assert!(matches!(error, LedgerError::ByteTotalOverflow { .. }));
-        assert!(matches!(
-            ledger.snapshot(),
-            Err(LedgerError::PendingSubmissions { count: 1 })
-        ));
-        {
-            let guard = ledger.inner.lock();
-            let state = guard.state();
-            assert_eq!(state.event_len, 0);
-            assert_eq!(
-                state.totals[total_index(ObservedCategory::H2d, ObservedStatus::Completed)],
-                0
-            );
-        }
-
-        batch.abandon();
-        assert!(matches!(
-            ledger.snapshot(),
-            Err(LedgerError::Faulted {
-                fault: LedgerFault::SubmissionAbandoned
-            })
-        ));
-    }
-
-    #[test]
-    fn prepared_operation_reserves_capacity_and_failure_releases_the_success_totals() {
+    fn bounded_capacity_fails_before_a_new_batch_exists() {
         let ledger = ObservedByteLedger::new(scope(), 1).unwrap();
         let recorder = ledger.attach().unwrap();
-        let mut first = recorder.prepare(&[completed(7)]).unwrap();
+        recorder.record(completed(3)).unwrap();
         assert!(matches!(
             recorder.prepare(&[completed(1)]),
-            Err(LedgerError::EventCapacityExceeded {
-                capacity: 1,
-                committed: 1,
-                requested: 1,
-            })
+            Err(LedgerError::EventCapacityExceeded { .. })
         ));
-        first.abort(ObservedStatus::Failed).unwrap();
-        let snapshot = ledger.snapshot().unwrap();
-        assert_eq!(
-            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed),
-            0
-        );
-        assert_eq!(
-            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Failed),
-            7
-        );
+        assert_eq!(ledger.snapshot().unwrap().events.len(), 1);
     }
 
     #[test]
-    fn prepared_operation_detects_total_overflow_before_submission() {
-        let ledger = ObservedByteLedger::new(scope(), 2).unwrap();
+    fn total_overflow_is_preflighted_without_partial_publication() {
+        let ledger = ObservedByteLedger::new(scope(), 3).unwrap();
         let recorder = ledger.attach().unwrap();
         recorder.record(completed(u64::MAX)).unwrap();
         assert!(matches!(
             recorder.prepare(&[completed(1)]),
-            Err(LedgerError::ByteTotalOverflow {
-                current: u64::MAX,
-                added: 1,
-                ..
-            })
+            Err(LedgerError::ByteTotalOverflow { .. })
         ));
-        assert_eq!(ledger.snapshot().unwrap().events.len(), 1);
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed),
+            u64::MAX
+        );
     }
 
     #[test]
-    fn capacity_exhaustion_at_first_middle_and_last_event_is_atomic() {
-        for capacity in [0_usize, 1, 2] {
-            let ledger = ObservedByteLedger::new(scope(), 2).unwrap();
-            let recorder = ledger.attach().unwrap();
-            if capacity > 0 {
-                let mut initial = recorder.begin().unwrap();
-                for _ in 0..capacity {
-                    initial.push(completed(1)).unwrap();
-                }
-                initial.commit().unwrap();
-            }
-            let before = ledger.snapshot().unwrap();
-            let mut batch = recorder.begin().unwrap();
-            for _ in 0..3 {
-                batch.push(completed(1)).unwrap();
-            }
-            assert!(matches!(
-                batch.commit(),
-                Err(LedgerError::EventCapacityExceeded { .. })
-            ));
-            {
-                let guard = ledger.inner.lock();
-                assert_eq!(guard.state().event_len, before.events.len());
-            }
-            batch.abandon();
-        }
-    }
-
-    #[test]
-    fn total_overflow_at_first_middle_and_last_event_never_publishes_a_prefix() {
-        for overflow_index in 0..3 {
-            let ledger = ObservedByteLedger::new(scope(), 8).unwrap();
-            let recorder = ledger.attach().unwrap();
-            {
-                let mut guard = ledger.inner.lock();
-                let state = guard.state_mut();
-                state.totals[total_index(ObservedCategory::H2d, ObservedStatus::Completed)] =
-                    u64::MAX;
-                state.phase_totals[phase_total_index(
-                    ObservedPhase::Setup,
-                    ObservedCategory::H2d,
+    fn abort_after_submission_preserves_attempt_and_records_failure() {
+        let ledger = ObservedByteLedger::new(scope(), 2).unwrap();
+        let recorder = ledger.attach().unwrap();
+        let mut batch = recorder
+            .prepare(&[
+                EventSpec::new(
+                    ObservedCategory::D2h,
+                    ObservedBoundary::RuntimeD2h,
+                    ObservedStatus::Submitted,
+                    9,
+                ),
+                EventSpec::new(
+                    ObservedCategory::D2h,
+                    ObservedBoundary::RuntimeD2h,
                     ObservedStatus::Completed,
-                )] = u64::MAX;
-            }
-            let mut batch = recorder.begin().unwrap();
-            for index in 0..3 {
-                batch
-                    .push(if index == overflow_index {
-                        completed(1)
-                    } else {
-                        EventSpec::new(
-                            ObservedCategory::D2d,
-                            ObservedBoundary::RuntimeD2d,
-                            ObservedStatus::Completed,
-                            1,
-                        )
-                    })
-                    .unwrap();
-            }
-            assert!(matches!(
-                batch.commit(),
-                Err(LedgerError::ByteTotalOverflow { .. })
-            ));
-            {
-                let guard = ledger.inner.lock();
-                let state = guard.state();
-                assert_eq!(state.event_len, 0);
-                assert_eq!(
-                    state.totals[total_index(ObservedCategory::D2d, ObservedStatus::Completed)],
-                    0
-                );
-            }
-            batch.abandon();
-        }
-    }
-
-    #[test]
-    fn sequence_and_submission_exhaustion_fail_before_visible_mutation() {
-        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
-        let recorder = ledger.attach().unwrap();
-        {
-            let mut guard = ledger.inner.lock();
-            guard.state_mut().next_sequence = u64::MAX;
-        }
-        let mut batch = recorder.begin().unwrap();
-        batch.push(completed(1)).unwrap();
-        assert!(matches!(
-            batch.commit(),
-            Err(LedgerError::SequenceExhausted)
-        ));
-        {
-            let guard = ledger.inner.lock();
-            assert_eq!(guard.state().event_len, 0);
-        }
-        batch.abandon();
-
-        let second = ObservedByteLedger::new(scope(), 4).unwrap();
-        let second_recorder = second.attach().unwrap();
-        {
-            let mut guard = second.inner.lock();
-            guard.state_mut().next_submission = u64::MAX;
-        }
-        assert!(matches!(
-            second_recorder.begin(),
-            Err(LedgerError::SubmissionExhausted)
-        ));
-        assert!(second.snapshot().unwrap().events.is_empty());
-    }
-
-    #[test]
-    fn abort_is_idempotent_and_keeps_non_useful_bytes_distinct() {
-        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
-        let recorder = ledger.attach().unwrap();
-        let mut batch = recorder.begin().unwrap();
-        batch
-            .push(EventSpec::new(
-                ObservedCategory::H2d,
-                ObservedBoundary::RuntimeH2d,
-                ObservedStatus::Submitted,
-                64,
-            ))
+                    9,
+                ),
+            ])
             .unwrap();
-        batch.abort(ObservedStatus::RolledBack).unwrap();
-        batch.abort(ObservedStatus::RolledBack).unwrap();
+        batch.mark_submitted();
+        batch.abort(ObservedStatus::Failed).unwrap();
         let snapshot = ledger.snapshot().unwrap();
         assert_eq!(
-            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::RolledBack),
-            64
+            snapshot.bytes(ObservedCategory::D2h, ObservedStatus::Submitted),
+            9
         );
-        assert_eq!(snapshot.useful_bytes(ObservedCategory::H2d).unwrap(), 0);
-        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::D2h, ObservedStatus::Failed),
+            9
+        );
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::D2h, ObservedStatus::Completed),
+            0
+        );
     }
 
     #[test]
-    fn failed_completion_can_retry_without_promoting_failed_bytes() {
+    fn concurrent_producers_reserve_unique_slots_without_global_lock() {
+        let ledger = Arc::new(ObservedByteLedger::new(scope(), 128).unwrap());
+        let start = Arc::new(Barrier::new(9));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let ledger = Arc::clone(&ledger);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                let recorder = ledger.attach().unwrap();
+                start.wait();
+                for _ in 0..16 {
+                    recorder.record(completed(1)).unwrap();
+                }
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.events.len(), 128);
+        let mut sequences = snapshot
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        sequences.dedup();
+        assert_eq!(sequences.len(), 128);
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed),
+            128
+        );
+        let stats = ledger.hot_path_stats();
+        assert_eq!(stats.mutex_acquisitions, 0);
+        assert_eq!(stats.thread_id_lookups, 0);
+        assert_eq!(stats.vector_growths, 0);
+    }
+
+    #[test]
+    fn tls_context_is_bounded_lifo_and_rejects_stale_epoch() {
         let ledger = ObservedByteLedger::new(scope(), 8).unwrap();
         let recorder = ledger.attach().unwrap();
-        let mut failed = recorder.begin().unwrap();
-        failed
-            .push(EventSpec::new(
-                ObservedCategory::H2d,
-                ObservedBoundary::RuntimeH2d,
-                ObservedStatus::Submitted,
-                32,
-            ))
-            .unwrap();
-        failed.abort(ObservedStatus::Failed).unwrap();
-        recorder
-            .record_pair(
-                EventSpec::new(
-                    ObservedCategory::H2d,
-                    ObservedBoundary::RuntimeH2d,
-                    ObservedStatus::Submitted,
-                    32,
-                ),
-                completed(32),
-            )
-            .unwrap();
-        let snapshot = ledger.snapshot().unwrap();
-        assert_eq!(
-            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Failed),
-            32
-        );
-        assert_eq!(snapshot.useful_bytes(ObservedCategory::H2d).unwrap(), 32);
-    }
-
-    #[test]
-    fn sibling_with_same_public_scope_has_distinct_instance_state() {
-        let first = ObservedByteLedger::new(scope(), 4).unwrap();
-        let second = ObservedByteLedger::new(scope(), 4).unwrap();
-        let first_recorder = first.attach().unwrap();
-        let second_recorder = second.attach().unwrap();
-        first_recorder.record(completed(3)).unwrap();
-        second_recorder.record(completed(5)).unwrap();
-        assert_eq!(
-            first
-                .snapshot()
-                .unwrap()
-                .bytes(ObservedCategory::H2d, ObservedStatus::Completed),
-            3
-        );
-        assert_eq!(
-            second
-                .snapshot()
-                .unwrap()
-                .bytes(ObservedCategory::H2d, ObservedStatus::Completed),
-            5
-        );
-    }
-
-    #[test]
-    fn moved_ledger_remains_bound_and_stale_recorder_fails_after_reset() {
-        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
-        let recorder = ledger.attach().unwrap();
-        let moved = ledger;
-        recorder.record(completed(2)).unwrap();
-        assert_eq!(moved.snapshot().unwrap().events.len(), 1);
-        moved.reset().unwrap();
+        let guard = recorder.enter().unwrap();
+        assert!(std::ptr::eq(
+            current_recorder(ledger.inner.runtime_id).unwrap(),
+            &recorder
+        ));
+        drop(guard);
+        assert!(current_recorder(ledger.inner.runtime_id).is_none());
+        ledger.reset().unwrap();
         assert!(matches!(
-            recorder.record(completed(2)),
+            recorder.enter(),
             Err(LedgerError::StaleEpoch { .. })
         ));
-        assert!(matches!(
-            moved.snapshot(),
-            Err(LedgerError::Faulted {
-                fault: LedgerFault::StaleRecorderUse
-            })
-        ));
     }
 
     #[test]
-    fn duplicate_finish_and_close_are_idempotent() {
-        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
+    fn reset_and_close_refuse_live_batches_and_stale_handles_cannot_publish() {
+        let ledger = ObservedByteLedger::new(scope(), 8).unwrap();
         let recorder = ledger.attach().unwrap();
-        let mut batch = recorder.begin().unwrap();
-        batch.push(completed(9)).unwrap();
-        batch.commit().unwrap();
-        batch.commit().unwrap();
-        assert_eq!(ledger.snapshot().unwrap().events.len(), 1);
-        ledger.close().unwrap();
-        ledger.close().unwrap();
-        assert_eq!(ledger.snapshot().unwrap().events.len(), 1);
-    }
-
-    #[test]
-    fn snapshot_race_observes_only_whole_batches() {
-        let ledger = Arc::new(ObservedByteLedger::new(scope(), 128).unwrap());
-        let recorder = ledger.attach().unwrap();
-        let barrier = Arc::new(Barrier::new(2));
-        let reader_ledger = Arc::clone(&ledger);
-        let reader_barrier = Arc::clone(&barrier);
-        let reader = std::thread::spawn(move || {
-            reader_barrier.wait();
-            for _ in 0..1000 {
-                match reader_ledger.snapshot() {
-                    Ok(snapshot) => assert_eq!(snapshot.events.len() % 2, 0),
-                    Err(LedgerError::PendingSubmissions { .. }) => {}
-                    Err(error) => panic!("unexpected snapshot error: {error}"),
-                }
-            }
-        });
-        barrier.wait();
-        for _ in 0..32 {
-            recorder.record_pair(completed(1), completed(1)).unwrap();
-        }
-        reader.join().unwrap();
-        assert_eq!(ledger.snapshot().unwrap().events.len(), 64);
-    }
-
-    #[test]
-    fn reset_and_close_refuse_in_flight_submission() {
-        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
-        let recorder = ledger.attach().unwrap();
-        let mut batch = recorder.begin().unwrap();
+        let batch = recorder.prepare(&[completed(1)]).unwrap();
         assert!(matches!(
             ledger.reset(),
             Err(LedgerError::PendingSubmissions { count: 1 })
@@ -1635,16 +1639,165 @@ mod tests {
             ledger.close(),
             Err(LedgerError::PendingSubmissions { count: 1 })
         ));
-        batch.push(completed(1)).unwrap();
-        batch.commit().unwrap();
+        drop(batch);
+        assert!(matches!(
+            ledger.snapshot(),
+            Err(LedgerError::Faulted {
+                fault: LedgerFault::SubmissionAbandoned
+            })
+        ));
         ledger.reset().unwrap();
+        ledger.close().unwrap();
+        assert!(matches!(
+            recorder.record(completed(1)),
+            Err(LedgerError::Closed | LedgerError::StaleEpoch { .. })
+        ));
     }
 
     #[test]
-    fn post_close_recorder_is_stale_and_cannot_publish() {
-        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
+    fn nested_context_capacity_fails_before_unmeasured_work() {
+        let ledger = ObservedByteLedger::new(scope(), 8).unwrap();
         let recorder = ledger.attach().unwrap();
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONTEXT_DEPTH {
+            guards.push(recorder.enter().unwrap());
+        }
+        assert!(matches!(
+            recorder.enter(),
+            Err(LedgerError::ContextCapacityExceeded {
+                capacity: MAX_CONTEXT_DEPTH
+            })
+        ));
+        drop(guards);
+    }
+
+    #[test]
+    fn warmed_recording_has_zero_allocations_locks_thread_lookups_or_arc_retains() {
+        let ledger = ObservedByteLedger::new(scope(), 512).unwrap();
+        let recorder = ledger.attach().unwrap();
+        let allocations = count_allocations(|| {
+            let _context = recorder.enter().unwrap();
+            for _ in 0..128 {
+                recorder.record(completed(1)).unwrap();
+            }
+        });
+        assert_eq!(allocations, 0);
+        let stats = ledger.hot_path_stats();
+        assert_eq!(stats.context_entries, 1);
+        assert_eq!(stats.batch_reservations, 128);
+        assert_eq!(stats.retained_recorder_clones, 0);
+        assert_eq!(stats.mutex_acquisitions, 0);
+        assert_eq!(stats.thread_id_lookups, 0);
+        assert_eq!(stats.vector_growths, 0);
+    }
+
+    #[test]
+    fn first_middle_and_last_capacity_boundaries_are_atomic() {
+        for used in 0..=3 {
+            let ledger = ObservedByteLedger::new(scope(), 3).unwrap();
+            let recorder = ledger.attach().unwrap();
+            for _ in 0..used {
+                recorder.record(completed(1)).unwrap();
+            }
+            let before = ledger.snapshot().unwrap();
+            let result = recorder.prepare(&[completed(2)]);
+            if used == 3 {
+                assert!(matches!(
+                    result,
+                    Err(LedgerError::EventCapacityExceeded { .. })
+                ));
+                assert_eq!(ledger.snapshot().unwrap(), before);
+            } else {
+                result.unwrap().commit().unwrap();
+                assert_eq!(ledger.snapshot().unwrap().events.len(), used + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_terminal_calls_publish_once() {
+        let ledger = ObservedByteLedger::new(scope(), 2).unwrap();
+        let recorder = ledger.attach().unwrap();
+        let mut batch = recorder.prepare(&[completed(9)]).unwrap();
+        batch.commit().unwrap();
+        batch.commit().unwrap();
+        batch.abort(ObservedStatus::RolledBack).unwrap();
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed),
+            9
+        );
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::RolledBack),
+            0
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_an_active_batch_then_observes_its_atomic_terminal_state() {
+        let ledger = ObservedByteLedger::new(scope(), 2).unwrap();
+        let recorder = ledger.attach().unwrap();
+        let mut batch = recorder.prepare(&[completed(5)]).unwrap();
+        assert!(matches!(
+            ledger.snapshot(),
+            Err(LedgerError::PendingSubmissions { count: 1 })
+        ));
+        batch.abort(ObservedStatus::RolledBack).unwrap();
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::RolledBack),
+            5
+        );
+    }
+
+    #[test]
+    fn persistent_owner_refreshes_after_reset_but_stale_handle_does_not() {
+        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
+        let persistent = ledger.persistent_recorder().unwrap();
+        let stale = ledger.attach().unwrap();
+        persistent.record(completed(1)).unwrap();
+        ledger.reset().unwrap();
+        persistent.record(completed(2)).unwrap();
+        assert!(matches!(
+            stale.record(completed(3)),
+            Err(LedgerError::StaleEpoch { .. })
+        ));
+        let snapshot = ledger.snapshot().unwrap_err();
+        assert!(matches!(
+            snapshot,
+            LedgerError::Faulted {
+                fault: LedgerFault::StaleRecorderUse
+            }
+        ));
+    }
+
+    #[test]
+    fn retirement_blocks_fresh_authority_but_allows_preissued_teardown_receipts() {
+        let ledger = ObservedByteLedger::new(scope(), 2).unwrap();
+        let persistent = ledger.persistent_recorder().unwrap();
+        ledger.retire();
+        assert!(matches!(ledger.attach(), Err(LedgerError::Retiring)));
+        persistent
+            .record(EventSpec::new(
+                ObservedCategory::DeviceRelease,
+                ObservedBoundary::RuntimeDeviceRelease,
+                ObservedStatus::Reclaimed,
+                64,
+            ))
+            .unwrap();
+        assert_eq!(ledger.snapshot().unwrap().events.len(), 1);
+    }
+
+    #[test]
+    fn closed_snapshot_is_immutable_and_post_close_recording_is_rejected() {
+        let ledger = ObservedByteLedger::new(scope(), 2).unwrap();
+        let recorder = ledger.attach().unwrap();
+        recorder.record(completed(7)).unwrap();
         ledger.close().unwrap();
+        ledger.close().unwrap();
+        assert_eq!(ledger.snapshot().unwrap().events.len(), 1);
         assert!(matches!(
             recorder.record(completed(1)),
             Err(LedgerError::Closed)

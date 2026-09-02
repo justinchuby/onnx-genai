@@ -1667,7 +1667,12 @@ impl HeterogeneousExecutor {
                 );
                 // SAFETY: each output resident is a distinct governed allocation
                 // owned for the complete child run.
-                bindings.push(unsafe { child.device_binding_from_external_memory(spec)? });
+                let mut binding = unsafe { child.device_binding_from_external_memory(spec)? };
+                // The heterogeneous coordinator, not this child partition,
+                // owns publication of the resident into the cross-partition
+                // value table after the child succeeds.
+                binding.disable_output_publication_transaction();
+                bindings.push(binding);
             }
 
             let returned = child.run_with_device_bindings(&normal_inputs, &mut bindings)?;

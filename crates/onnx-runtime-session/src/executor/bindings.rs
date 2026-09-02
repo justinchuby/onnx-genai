@@ -992,6 +992,11 @@ impl Executor {
         );
         self.scratch_external_bindings = external;
         self.release_step_workspace()?;
+        if result.is_err() {
+            for binding in bindings.iter_mut() {
+                binding.clear_device_validation();
+            }
+        }
         let outputs = match result? {
             ScopedRunResult::Executed(outputs) => outputs,
             ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
@@ -1062,7 +1067,20 @@ impl Executor {
         );
         self.scratch_external_bindings = external;
         self.release_step_workspace()?;
-        match result? {
+        if let Err(primary) = result {
+            for binding in bindings.iter_mut() {
+                binding.clear_device_validation();
+            }
+            let cleanup = self.discard_failed_device_graph();
+            return match cleanup {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(SessionError::Internal(format!(
+                    "{primary}; captured graph cleanup after failed synchronization/validation \
+                     also failed: {cleanup}"
+                ))),
+            };
+        }
+        match result.expect("capture error returned above") {
             ScopedRunResult::Executed(outputs) => {
                 let mut tensors = Vec::with_capacity(outputs.len());
                 for output in outputs {
@@ -1159,73 +1177,162 @@ impl Executor {
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
             let exact_requirement = &self.cap().provider_artifact_requirement;
-            let artifact_use = self.provider_artifact_readiness.acquire_use(
+            let artifact_context = self.provider_artifact_readiness.use_context(
                 self.ep.as_ref(),
                 self.artifact_config,
                 Some(exact_requirement),
             )?;
-            let mut validation_submission =
-                self.begin_device_validation_submission_for_bindings(bindings)?;
-            let state_publication_bytes = bindings.iter().try_fold(0_u64, |total, binding| {
-                total
-                    .checked_add(binding.state_publication_bytes())
-                    .ok_or_else(|| {
-                        SessionError::Internal(
-                            "captured state-publication output byte total overflowed u64".into(),
-                        )
-                    })
-            })?;
-            let mut state_publication = if state_publication_bytes == 0 {
-                None
-            } else {
-                self.ep.prepare_state_publication(state_publication_bytes)?
-            };
-            if let Err(replay_error) = self.ep.replay_owned_device_graph(token) {
-                let publication = state_publication
-                    .as_mut()
-                    .map(|receipt| receipt.roll_back())
-                    .transpose();
-                let sync = self.ep.sync();
-                drop(artifact_use);
-                let validation = match sync {
-                    Ok(()) => self.finish_device_validation_boundary_after_sync(route_residency),
-                    Err(error) => Err(error.into()),
-                };
-                validation_submission.disarm();
-                if let Err(publication_error) = publication {
-                    return Err(SessionError::Internal(format!(
-                        "device graph replay failed: {replay_error}; state-publication rollback \
-                         also failed: {publication_error}"
-                    )));
+            let ep_ptr = Arc::as_ptr(&self.ep);
+            let mut replay_under_observation = || {
+                let mut validation_submission =
+                    self.begin_device_validation_submission_for_bindings(bindings)?;
+                for binding in bindings.iter_mut() {
+                    binding.snapshot_publication()?;
                 }
-                return match validation {
-                    Ok(()) => Err(replay_error.into()),
-                    Err(validation_error) => Err(SessionError::Internal(format!(
-                        "device graph replay failed: {replay_error}; deferred validation cleanup \
-                         also failed: {validation_error}"
-                    ))),
+                let (state_publication_bytes, output_publication_bytes) = bindings
+                    .iter()
+                    .try_fold((0_u64, 0_u64), |(state_total, output_total), binding| {
+                        Ok::<(u64, u64), SessionError>((
+                            state_total
+                                .checked_add(binding.state_publication_bytes())
+                                .ok_or_else(|| {
+                                    SessionError::Internal(
+                                        "captured state-publication output byte total \
+                                             overflowed u64"
+                                            .into(),
+                                    )
+                                })?,
+                            output_total
+                                .checked_add(binding.output_publication_bytes())
+                                .ok_or_else(|| {
+                                    SessionError::Internal(
+                                        "captured ordinary-output publication byte total \
+                                             overflowed u64"
+                                            .into(),
+                                    )
+                                })?,
+                        ))
+                    })?;
+                let mut transaction_result = None;
+                let mut transaction = |mut state_publication: Option<
+                    &mut dyn onnx_runtime_ep_api::StatePublicationReceipt,
+                >| {
+                    transaction_result = Some({
+                        let mut replay_and_sync = || {
+                            if let Some(receipt) = state_publication.as_mut() {
+                                receipt.mark_submitted();
+                            }
+                            let replay =
+                                self.ep.replay_owned_device_graph(token).map_err(Into::into);
+                            let sync = self.ep.sync().map_err(Into::into);
+                            Ok((replay, sync))
+                        };
+                        let execution = match artifact_context {
+                            Some(context) => context.with_use(replay_and_sync),
+                            None => replay_and_sync(),
+                        };
+                        let (replay, sync) = match execution {
+                            Ok(execution) => execution,
+                            Err(error) => (Err(error), Ok(())),
+                        };
+                        let sync_succeeded = sync.is_ok();
+                        let validation = match sync {
+                            Ok(()) => {
+                                self.finish_device_validation_boundary_after_sync(route_residency)
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if sync_succeeded {
+                            validation_submission.disarm();
+                        }
+                        let succeeded = replay.is_ok() && validation.is_ok();
+                        let state_restore = if succeeded {
+                            Ok(())
+                        } else {
+                            let mut errors = Vec::new();
+                            for binding in bindings.iter_mut() {
+                                if let Err(error) = binding.restore_publication() {
+                                    errors.push(error);
+                                }
+                            }
+                            let sync = self.ep.sync().map_err(SessionError::from);
+                            if errors.is_empty() {
+                                sync
+                            } else {
+                                Err(SessionError::Internal(format!(
+                                    "captured replay failed to restore {} output publication(s): \
+                                     {}; cleanup sync={:?}",
+                                    errors.len(),
+                                    errors
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join("; "),
+                                    sync.err()
+                                )))
+                            }
+                        };
+                        let publication = match state_publication.as_mut() {
+                            Some(receipt) if succeeded => receipt.publish().map_err(Into::into),
+                            Some(receipt) => receipt.roll_back().map_err(Into::into),
+                            None => Ok(()),
+                        };
+                        match (replay, validation, state_restore, publication) {
+                            (Err(primary), _, Ok(()), Ok(())) => Err(primary),
+                            (Err(primary), validation, state_restore, publication) => {
+                                Err(SessionError::Internal(format!(
+                                    "{primary}; replay failure cleanup also failed: \
+                                     validation={:?}, state_restore={:?}, publication={:?}",
+                                    validation.err(),
+                                    state_restore.err(),
+                                    publication.err()
+                                )))
+                            }
+                            (Ok(()), Err(primary), Ok(()), Ok(())) => Err(primary),
+                            (Ok(()), Err(primary), state_restore, publication) => {
+                                Err(SessionError::Internal(format!(
+                                    "{primary}; replay validation cleanup also failed: \
+                                     state_restore={:?}, publication={:?}",
+                                    state_restore.err(),
+                                    publication.err()
+                                )))
+                            }
+                            (Ok(()), Ok(()), Err(error), publication) => {
+                                Err(SessionError::Internal(format!(
+                                    "{error}; publication rollback after restore failure={:?}",
+                                    publication.err()
+                                )))
+                            }
+                            (Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
+                            (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(true),
+                        }
+                    });
+                    Ok(())
                 };
+                // SAFETY: `self.ep` retains this allocation for the complete replay.
+                unsafe { &*ep_ptr }.with_output_publication(
+                    state_publication_bytes,
+                    output_publication_bytes,
+                    &mut transaction,
+                )?;
+                transaction_result.unwrap_or_else(|| {
+                    Err(SessionError::Internal(
+                        "execution provider returned from captured output-publication transaction \
+                         without invoking the replay"
+                            .into(),
+                    ))
+                })
+            };
+            let result = match artifact_context {
+                Some(context) => context.with_observation(replay_under_observation),
+                None => replay_under_observation(),
+            };
+            if result.is_err() {
+                for binding in bindings.iter_mut() {
+                    binding.clear_device_validation();
+                }
             }
-            let sync = self.ep.sync();
-            let publication = match sync.as_ref() {
-                Ok(()) => state_publication
-                    .as_mut()
-                    .map(|receipt| receipt.publish())
-                    .transpose(),
-                Err(_) => state_publication
-                    .as_mut()
-                    .map(|receipt| receipt.roll_back())
-                    .transpose(),
-            };
-            drop(artifact_use);
-            let validation = match sync {
-                Ok(()) => self.finish_device_validation_boundary_after_sync(route_residency),
-                Err(error) => Err(error.into()),
-            };
-            validation_submission.disarm();
-            publication?;
-            validation?;
-            return Ok(true);
+            return result;
         }
         let validation_submission =
             self.begin_device_validation_submission_for_bindings(bindings)?;
@@ -1241,6 +1348,11 @@ impl Executor {
         );
         self.scratch_external_bindings = external;
         self.release_step_workspace()?;
+        if result.is_err() {
+            for binding in bindings.iter_mut() {
+                binding.clear_device_validation();
+            }
+        }
         match result? {
             // `run_scoped_mode` clears `capture_schedule` when a branch flip
             // retired the graph this step; report that so the caller re-arms.
@@ -1274,6 +1386,21 @@ impl Executor {
             cap.capture_warm_seeded.clear();
         }
         Ok(reset)
+    }
+
+    fn discard_failed_device_graph(&mut self) -> Result<()> {
+        let token = self.cap().device_graph_token;
+        if let Some(token) = token {
+            self.ep.reset_owned_device_graph(token)?;
+            let cap = self.cap_mut();
+            cap.device_graph_token = None;
+            cap.provider_artifact_requirement = CapturedProviderArtifactRequirement::Uncaptured;
+            cap.device_graph_signature = None;
+            cap.capture_schedule = None;
+            cap.capture_cf_shapes.clear();
+            cap.capture_warm_seeded.clear();
+        }
+        Ok(())
     }
 
     /// Which of the EP's captured-graph slots this executor drives.
@@ -1561,6 +1688,17 @@ impl Executor {
             }
         }
         for binding in bindings.iter_mut() {
+            if binding.publication_is_poisoned() {
+                return Err(SessionError::Internal(format!(
+                    "device binding '{}' is poisoned after an output-publication rollback failed; \
+                     reset or close the exact session before retrying",
+                    binding.input_name()
+                )));
+            }
+            let state_publication = binding.state_publication_bytes() != 0;
+            let output_publication = binding.output_publication_bytes() != 0;
+            let publication_rollback_ptr = binding.publication_rollback_ptr();
+            let publication_poison_ptr = binding.publication_poison_ptr() as usize;
             let ptr = binding.buffer_mut().as_mut_ptr();
             let input_name = binding.input_name();
             let bind_input = binding.binds_input();
@@ -1603,6 +1741,9 @@ impl Executor {
                         alignment,
                         device,
                         state_publication: false,
+                        output_publication: false,
+                        publication_rollback_ptr: None,
+                        publication_poison_ptr: 0,
                     });
                 value.dtype = dtype;
                 value.shape.clear();
@@ -1669,13 +1810,19 @@ impl Executor {
                         len,
                         alignment,
                         device,
-                        state_publication: binding.state_publication_bytes() != 0,
+                        state_publication,
+                        output_publication,
+                        publication_rollback_ptr,
+                        publication_poison_ptr,
                     });
                 value.dtype = dtype;
                 value.shape.clear();
                 value.shape.extend_from_slice(binding.physical_shape());
                 value.accepts_subshape = binding.logical_shape() != binding.physical_shape();
-                value.state_publication = binding.state_publication_bytes() != 0;
+                value.state_publication = state_publication;
+                value.output_publication = output_publication;
+                value.publication_rollback_ptr = publication_rollback_ptr;
+                value.publication_poison_ptr = publication_poison_ptr;
                 if fixed_physical_strides {
                     dispatch::refill_contiguous_strides(
                         value.strides.get_or_insert_default(),

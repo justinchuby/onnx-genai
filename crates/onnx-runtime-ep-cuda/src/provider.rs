@@ -165,11 +165,10 @@ struct ExecutorRouteResidencyState {
 struct CudaArtifactRequirement {
     route: Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>,
     observed: Option<Arc<crate::byte_telemetry::ObservedByteLedger>>,
-    registry: Option<Arc<crate::byte_telemetry::ExecutionRecorderRegistry>>,
+    recorder: Option<crate::byte_telemetry::ProductionByteRecorder>,
 }
 
 struct CudaArtifactUseGuard {
-    _observed: Option<crate::byte_telemetry::RecorderContextGuard>,
     _route: Option<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>>,
 }
 
@@ -178,6 +177,12 @@ struct CudaStatePublicationReceipt {
 }
 
 impl onnx_runtime_ep_api::StatePublicationReceipt for CudaStatePublicationReceipt {
+    fn mark_submitted(&mut self) {
+        if let Some(receipt) = self.receipt.as_mut() {
+            receipt.mark_submitted();
+        }
+    }
+
     fn publish(&mut self) -> Result<()> {
         if let Some(receipt) = self.receipt.as_mut() {
             receipt.commit().map_err(|error| {
@@ -214,26 +219,28 @@ impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for CudaArtifactRequi
             .as_ref()
             .map(|requirement| requirement.acquire_use())
             .transpose()?;
-        let observed = match (&self.observed, &self.registry) {
-            (Some(observed), Some(registry)) => {
-                let recorder = observed.recorder().map_err(|error| {
-                    EpError::KernelFailed(format!(
-                        "cuda_ep: acquire exact session observed-byte recorder: {error}"
-                    ))
-                })?;
-                Some(registry.enter(recorder))
-            }
-            (None, None) => None,
-            _ => {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: observed-byte requirement lost its execution registry".into(),
-                ));
-            }
-        };
-        Ok(Box::new(CudaArtifactUseGuard {
-            _observed: observed,
-            _route: route,
-        }))
+        Ok(Box::new(CudaArtifactUseGuard { _route: route }))
+    }
+
+    fn with_use(&self, operation: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        match self.route.as_ref() {
+            Some(route) => route.with_use(operation),
+            None => operation(),
+        }
+    }
+
+    fn with_observation(&self, operation: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        let _observed = self
+            .recorder
+            .as_ref()
+            .map(crate::byte_telemetry::ProductionByteRecorder::enter)
+            .transpose()
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: enter exact session observed-byte context: {error}"
+                ))
+            })?;
+        operation()
     }
 
     fn observation(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
@@ -1350,7 +1357,6 @@ pub struct CudaExecutionProvider {
     route_residency_config: ExecutorRouteResidencyConfig,
     artifact_provider_id: ExecutorArtifactProviderId,
     observed_byte_capacity: Option<usize>,
-    observed_byte_registry: Option<Arc<crate::byte_telemetry::ExecutionRecorderRegistry>>,
     route_executors: Mutex<HashMap<ExecutorInstanceId, ExecutorRouteResidencyState>>,
     /// Weak retirement records outlive the live registry only while a baked
     /// requirement or active lease still retains the exact reservation health.
@@ -1366,6 +1372,10 @@ pub struct CudaExecutionProvider {
     fail_allocation_after_required_report: AtomicBool,
     #[cfg(any(test, feature = "gpu-tests"))]
     fail_next_allocation: AtomicBool,
+    #[cfg(feature = "gpu-tests")]
+    fail_next_sync: AtomicBool,
+    #[cfg(feature = "gpu-tests")]
+    fail_next_validation: AtomicBool,
     #[cfg(feature = "gpu-tests")]
     route_prepare_commit_interlock: Mutex<Option<Arc<RoutePrepareCommitInterlock>>>,
     route_diag: Arc<RouteResidencyDiagnostics>,
@@ -1424,11 +1434,8 @@ impl CudaExecutionProvider {
                     .into(),
             ));
         }
-        let registry = Arc::new(crate::byte_telemetry::ExecutionRecorderRegistry::default());
-        self.runtime
-            .install_observed_byte_registry(Arc::clone(&registry))?;
+        self.runtime.enable_observed_bytes()?;
         self.observed_byte_capacity = Some(event_capacity);
-        self.observed_byte_registry = Some(registry);
         Ok(())
     }
 
@@ -1591,6 +1598,18 @@ impl CudaExecutionProvider {
     pub fn fail_next_allocation_after_required_artifact_report_for_test(&self) {
         self.fail_allocation_after_required_report
             .store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    #[doc(hidden)]
+    pub fn fail_next_sync_for_test(&self) {
+        self.fail_next_sync.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    #[doc(hidden)]
+    pub fn fail_next_validation_for_test(&self) {
+        self.fail_next_validation.store(true, Ordering::Release);
     }
 
     #[cfg(feature = "gpu-tests")]
@@ -1909,7 +1928,6 @@ impl CudaExecutionProvider {
             route_residency_config,
             artifact_provider_id,
             observed_byte_capacity: None,
-            observed_byte_registry: None,
             route_executors: Mutex::new(HashMap::new()),
             route_retirements: Mutex::new(HashMap::new()),
             next_route_finalization_admission: AtomicU64::new(1),
@@ -1922,6 +1940,10 @@ impl CudaExecutionProvider {
             fail_allocation_after_required_report: AtomicBool::new(false),
             #[cfg(any(test, feature = "gpu-tests"))]
             fail_next_allocation: AtomicBool::new(false),
+            #[cfg(feature = "gpu-tests")]
+            fail_next_sync: AtomicBool::new(false),
+            #[cfg(feature = "gpu-tests")]
+            fail_next_validation: AtomicBool::new(false),
             #[cfg(feature = "gpu-tests")]
             route_prepare_commit_interlock: Mutex::new(None),
             route_diag: Arc::new(RouteResidencyDiagnostics::default()),
@@ -3636,7 +3658,7 @@ impl CudaExecutionProvider {
                 0
             },
         };
-        let allocation_recorder = self.runtime.observed_byte_recorder()?;
+        let allocation_recorder = self.runtime.retained_observed_byte_recorder()?;
         let mut observation =
             self.runtime
                 .prepare_observation(&[crate::byte_telemetry::EventSpec::new(
@@ -3734,7 +3756,7 @@ impl CudaExecutionProvider {
         let grant = std::cell::RefCell::new(Some(grant));
         let additional_owned = std::cell::Cell::new(0_u64);
         let newly_mapped = std::cell::Cell::new(0_u64);
-        let allocation_recorder = self.runtime.observed_byte_recorder()?;
+        let allocation_recorder = self.runtime.retained_observed_byte_recorder()?;
         let mut observation =
             self.runtime
                 .prepare_observation(&[crate::byte_telemetry::EventSpec::new(
@@ -5103,23 +5125,32 @@ impl ExecutionProvider for CudaExecutionProvider {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match observed.get(&ownership.owner().identity()) {
                 Some((recorder, allocation_bytes)) => {
-                    let receipt = recorder
-                        .prepare(&[crate::byte_telemetry::EventSpec::new(
-                            crate::byte_telemetry::ObservedCategory::DeviceRelease,
-                            crate::byte_telemetry::ObservedBoundary::RuntimeDeviceRelease,
-                            crate::byte_telemetry::ObservedStatus::Reclaimed,
-                            *allocation_bytes,
-                        )])
-                        .map_err(|error| {
-                            EpError::KernelFailed(format!(
+                    let receipt = match recorder.prepare(&[crate::byte_telemetry::EventSpec::new(
+                        crate::byte_telemetry::ObservedCategory::DeviceRelease,
+                        crate::byte_telemetry::ObservedBoundary::RuntimeDeviceRelease,
+                        crate::byte_telemetry::ObservedStatus::Reclaimed,
+                        *allocation_bytes,
+                    )]) {
+                        Ok(receipt) => Some(receipt),
+                        Err(crate::byte_telemetry::LedgerError::Closed) => {
+                            eprintln!(
+                                "cuda_ep: observed-byte ledger was explicitly closed before \
+                                 allocation teardown; releasing ownership without mutating the \
+                                 closed report"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            return Err(EpError::KernelFailed(format!(
                                 "cuda_ep: reserve exact allocation-release receipt before \
                                  queueing teardown: {error}"
-                            ))
-                        })?;
+                            )));
+                        }
+                    };
                     let (_, allocation_bytes) = observed
                         .remove(&ownership.owner().identity())
                         .expect("observed allocation remains registered under its lock");
-                    Some((receipt, allocation_bytes))
+                    receipt.map(|receipt| (receipt, allocation_bytes))
                 }
                 None => None,
             }
@@ -5233,7 +5264,14 @@ impl ExecutionProvider for CudaExecutionProvider {
             )));
         }
         if size == 0 {
-            return Ok(());
+            return self
+                .runtime
+                .observe_bytes(crate::byte_telemetry::EventSpec::new(
+                    crate::byte_telemetry::ObservedCategory::D2d,
+                    crate::byte_telemetry::ObservedBoundary::RuntimeD2d,
+                    crate::byte_telemetry::ObservedStatus::Elided,
+                    0,
+                ));
         }
         let src_p = cuptr(src.as_ptr());
         let dst_p = cuptr(dst.as_mut_ptr());
@@ -5256,6 +5294,13 @@ impl ExecutionProvider for CudaExecutionProvider {
             )));
         }
         if size == 0 {
+            self.runtime
+                .observe_bytes(crate::byte_telemetry::EventSpec::new(
+                    crate::byte_telemetry::ObservedCategory::D2d,
+                    crate::byte_telemetry::ObservedBoundary::RuntimeD2d,
+                    crate::byte_telemetry::ObservedStatus::Elided,
+                    0,
+                ))?;
             return Ok(Fence::signalled());
         }
         let dst_p = cuptr(dst.as_mut_ptr());
@@ -5375,7 +5420,14 @@ impl ExecutionProvider for CudaExecutionProvider {
             )));
         }
         if src.is_empty() {
-            return Ok(());
+            return self
+                .runtime
+                .observe_bytes(crate::byte_telemetry::EventSpec::new(
+                    crate::byte_telemetry::ObservedCategory::H2d,
+                    crate::byte_telemetry::ObservedBoundary::RuntimeH2d,
+                    crate::byte_telemetry::ObservedStatus::Elided,
+                    0,
+                ));
         }
         // SAFETY: `dst` is a live allocation on this CUDA device with enough
         // capacity (checked above), and the synchronous copy completes here.
@@ -5403,7 +5455,14 @@ impl ExecutionProvider for CudaExecutionProvider {
             )));
         }
         if src.is_empty() {
-            return Ok(());
+            return self
+                .runtime
+                .observe_bytes(crate::byte_telemetry::EventSpec::new(
+                    crate::byte_telemetry::ObservedCategory::H2d,
+                    crate::byte_telemetry::ObservedBoundary::RuntimeH2d,
+                    crate::byte_telemetry::ObservedStatus::Elided,
+                    0,
+                ));
         }
         let ptr = cuptr(dst.as_mut_ptr())
             .checked_add(byte_offset as u64)
@@ -5431,7 +5490,14 @@ impl ExecutionProvider for CudaExecutionProvider {
             )));
         }
         if dst.is_empty() {
-            return Ok(());
+            return self
+                .runtime
+                .observe_bytes(crate::byte_telemetry::EventSpec::new(
+                    crate::byte_telemetry::ObservedCategory::D2h,
+                    crate::byte_telemetry::ObservedBoundary::RuntimeD2h,
+                    crate::byte_telemetry::ObservedStatus::Elided,
+                    0,
+                ));
         }
         // SAFETY: `src` is a live allocation on this CUDA device with enough
         // readable bytes (checked above); `dtoh` synchronizes before returning.
@@ -5457,7 +5523,14 @@ impl ExecutionProvider for CudaExecutionProvider {
             "cuda_ep::copy_device_to_device: foreign dst buffer"
         );
         if bytes == 0 {
-            return Ok(());
+            return self
+                .runtime
+                .observe_bytes(crate::byte_telemetry::EventSpec::new(
+                    crate::byte_telemetry::ObservedCategory::D2d,
+                    crate::byte_telemetry::ObservedBoundary::RuntimeD2d,
+                    crate::byte_telemetry::ObservedStatus::Elided,
+                    0,
+                ));
         }
         let src_end = src_offset.checked_add(bytes).ok_or_else(|| {
             EpError::KernelFailed("cuda_ep::copy_device_to_device: src range overflows".into())
@@ -5495,6 +5568,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         // allocations that outlive the enqueued copy; the copy is ordered on the
         // EP stream against the surrounding forward passes that read/write them.
         unsafe { self.runtime.dtod_async(src_ptr, dst_ptr, bytes) }
+    }
+
+    fn copy_for_publication(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> Result<()> {
+        self.copy_device_to_device(src, 0, dst, 0, bytes)
     }
 
     fn begin_device_graph_capture(&self, kernels: &[&dyn Kernel]) -> Result<()> {
@@ -5653,7 +5735,14 @@ impl ExecutionProvider for CudaExecutionProvider {
         registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
         token: onnx_runtime_ep_api::DeviceValidationToken,
     ) -> Result<u32> {
-        self.runtime.consume_device_validation(registration, token)
+        let flags = self
+            .runtime
+            .consume_device_validation(registration, token)?;
+        #[cfg(feature = "gpu-tests")]
+        if self.fail_next_validation.swap(false, Ordering::AcqRel) {
+            return Ok(flags | 0x4000_0000);
+        }
+        Ok(flags)
     }
 
     /// Slice-7C: the coarse safe-boundary route-telemetry consumer, called once
@@ -5690,25 +5779,30 @@ impl ExecutionProvider for CudaExecutionProvider {
     ) -> Result<ExecutorArtifactReport> {
         self.validate_artifact_provider(provider, executor)?;
         let observed = self.ensure_observed_byte_session(executor, generation, logical_session)?;
-        let _observed_use = match (observed.as_ref(), self.observed_byte_registry.as_ref()) {
-            (Some(observed), Some(registry)) => {
-                let recorder = observed.recorder().map_err(|error| {
-                    EpError::KernelFailed(format!(
-                        "cuda_ep: enter observed-byte finalization context for executor {} \
-                         generation {}: {error}",
-                        executor.get(),
-                        generation.get()
-                    ))
-                })?;
-                Some(registry.enter(recorder))
-            }
-            (None, None) => None,
-            _ => {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: observed-byte finalization lost its execution registry".into(),
-                ));
-            }
-        };
+        let observed_recorder = observed
+            .as_ref()
+            .map(|observed| observed.persistent_recorder())
+            .transpose()
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: prepare observed-byte finalization context for executor {} \
+                     generation {}: {error}",
+                    executor.get(),
+                    generation.get()
+                ))
+            })?;
+        let _observed_use = observed_recorder
+            .as_ref()
+            .map(crate::byte_telemetry::ProductionByteRecorder::enter)
+            .transpose()
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: enter observed-byte finalization context for executor {} generation \
+                     {}: {error}",
+                    executor.get(),
+                    generation.get()
+                ))
+            })?;
         let outcome =
             self.route_telemetry_registry
                 .with_executor_scope(executor, generation, || {
@@ -5808,30 +5902,80 @@ impl ExecutionProvider for CudaExecutionProvider {
         if route.is_none() && observed.is_none() {
             return Ok(None);
         }
+        let recorder = observed
+            .as_ref()
+            .map(|observed| observed.persistent_recorder())
+            .transpose()
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: retain exact observed-byte recorder for executor {} generation {} \
+                     logical session {}: {error}",
+                    executor.get(),
+                    generation.get(),
+                    logical_session.get()
+                ))
+            })?;
         Ok(Some(Arc::new(CudaArtifactRequirement {
             route,
             observed,
-            registry: self.observed_byte_registry.clone(),
+            recorder,
         })))
     }
 
-    fn prepare_state_publication(
+    fn with_output_publication(
         &self,
-        bytes: u64,
-    ) -> Result<Option<Box<dyn onnx_runtime_ep_api::StatePublicationReceipt>>> {
-        let receipt =
-            self.runtime
-                .prepare_observation(&[crate::byte_telemetry::EventSpec::new(
-                    crate::byte_telemetry::ObservedCategory::StatePublication,
-                    crate::byte_telemetry::ObservedBoundary::StatePublish,
-                    crate::byte_telemetry::ObservedStatus::Published,
-                    bytes,
-                )])?;
-        Ok(receipt.map(|receipt| {
-            Box::new(CudaStatePublicationReceipt {
-                receipt: Some(receipt),
-            }) as Box<dyn onnx_runtime_ep_api::StatePublicationReceipt>
-        }))
+        state_bytes: u64,
+        output_bytes: u64,
+        operation: &mut dyn FnMut(
+            Option<&mut dyn onnx_runtime_ep_api::StatePublicationReceipt>,
+        ) -> Result<()>,
+    ) -> Result<()> {
+        let empty = crate::byte_telemetry::EventSpec::new(
+            crate::byte_telemetry::ObservedCategory::OutputPublication,
+            crate::byte_telemetry::ObservedBoundary::OutputPublish,
+            crate::byte_telemetry::ObservedStatus::Elided,
+            0,
+        );
+        let mut specs = [empty; 4];
+        let mut len = 0;
+        for (category, boundary, bytes) in [
+            (
+                crate::byte_telemetry::ObservedCategory::StatePublication,
+                crate::byte_telemetry::ObservedBoundary::StatePublish,
+                state_bytes,
+            ),
+            (
+                crate::byte_telemetry::ObservedCategory::OutputPublication,
+                crate::byte_telemetry::ObservedBoundary::OutputPublish,
+                output_bytes,
+            ),
+        ] {
+            if bytes == 0 {
+                continue;
+            }
+            specs[len] = crate::byte_telemetry::EventSpec::new(
+                category,
+                boundary,
+                crate::byte_telemetry::ObservedStatus::Submitted,
+                bytes,
+            );
+            specs[len + 1] = crate::byte_telemetry::EventSpec::new(
+                category,
+                boundary,
+                crate::byte_telemetry::ObservedStatus::Published,
+                bytes,
+            );
+            len += 2;
+        }
+        let receipt = self.runtime.prepare_observation(&specs[..len])?;
+        let mut receipt = receipt.map(|receipt| CudaStatePublicationReceipt {
+            receipt: Some(receipt),
+        });
+        operation(
+            receipt
+                .as_mut()
+                .map(|receipt| receipt as &mut dyn onnx_runtime_ep_api::StatePublicationReceipt),
+        )
     }
 
     fn drain_executor_artifacts(
@@ -6071,6 +6215,12 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn sync(&self) -> Result<()> {
+        #[cfg(feature = "gpu-tests")]
+        if self.fail_next_sync.swap(false, Ordering::AcqRel) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: injected synchronization failure after operation submission".into(),
+            ));
+        }
         // `ExecutionProvider::sync` is an explicit host/cross-stream completion
         // boundary, not a trailing per-op eager sync that may be deferred.
         self.runtime.drain_for_unmap()?;

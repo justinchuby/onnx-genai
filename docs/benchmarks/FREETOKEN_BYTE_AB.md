@@ -25,16 +25,26 @@ executor, generation, or logical-session labels.
 
 The session-private provider-artifact lifecycle creates one recorder for the
 exact provider/device/executor/generation/logical-session identity during
-finalization. The validated artifact requirement installs that recorder only
-while the owning executor performs setup, eager execution, capture, or replay.
+finalization. The validated artifact requirement installs that recorder while
+the owning executor performs setup, binding allocation/upload/readback, eager
+execution, capture, replay, output rollback, or teardown.
 Sibling executors sharing one provider receive distinct ledgers. Operations on
 another provider/runtime cannot see the active recorder.
 
 The owning `InferenceSession` can borrow its provider-specific observation
 control through `provider_artifact_observation`. No labels are accepted at this
 boundary. Recorder construction and runtime attachment remain crate-private.
-Executor teardown retires the exact recorder; stale/reset/closed recorders reject
-new operations, and identities never wrap or reuse.
+Executor teardown retires the exact recorder while already-issued binding and
+deferred-release owners may finish their teardown receipts. Stale foreign
+handles and closed recorders reject new measured operations, and identities
+never wrap or reuse.
+
+The active context is a fixed-capacity TLS stack of borrowed recorder pointers.
+The event ledger reserves preallocated slots and totals with atomics. The
+warmed operation path has no mutex, hash map, growing vector, thread-id lookup,
+reference-count clone, heap allocation, formatting, or host synchronization.
+Context depth/capacity exhaustion fails before the CUDA operation. Cold
+snapshot/reset/teardown may allocate while aggregating results.
 
 ## Operation/telemetry transactions
 
@@ -53,7 +63,29 @@ explicit diagnostic; a later snapshot cannot silently omit the operation.
 
 Events remain bounded, ordered, and versioned. They carry provider, device,
 executor, generation, logical session, epoch, submission, sequence, phase,
-category, boundary, status, and exact bytes.
+stream, category, boundary, status, and exact bytes. Zero-byte elision and
+asynchronous completion that is not independently witnessed are explicit
+`elided` / `unsupported` outcomes rather than inferred useful bytes.
+
+## Binding transfers and completion-aware publication
+
+`DeviceIoBinding` retains the exact private artifact requirement issued by its
+session. Its allocation, `write_bytes` H2D, `read_bytes[_into]` D2H, D2D state
+snapshot/restore, and teardown therefore use the same authenticated recorder as
+executor work. Raw CUDA byte counters at the `cuMemcpy*`/`cuMemset*` call sites
+provide an independent known-byte control; the production test compares raw and
+ledger deltas for exact H2D and D2H payloads.
+
+Externally bound outputs use a preallocated rollback allocation. Eager, first
+capture, and replay snapshot the previously visible bytes before submission.
+The provider prepares a stack-owned publication receipt (no boxed hot-path
+receipt), records attempted bytes when work is submitted, synchronizes through
+the request contract, consumes the exact owner/device/generation validation
+receipt, and only then publishes useful state/output bytes. Sync or validation
+failure restores every prepared output, publishes zero useful bytes, records
+rolled-back bytes, clears the failed binding receipt, and permits a clean retry.
+If restoration itself fails, the exact binding is poisoned and the primary
+error is returned with cleanup context.
 
 ## Host materialization receipts
 
@@ -123,9 +155,10 @@ cargo test -p onnx-genai-bench --no-default-features \
   --test-threads=1 --nocapture
 ```
 
-The report includes structural dimensions, exact scope identities, event counts,
-cold/warm completed H2D bytes, exact deltas, capture/replay calls,
-state-publication bytes, all semantic proofs, and explicit
+The report includes structural dimensions, exact scope identities, per-phase
+event counts, cold/warm completed H2D and D2H bytes, submitted D2D and memset
+bytes, exact deltas, capture/replay calls, state/output-publication bytes,
+warmed recorder-retain and lock/lookup/growth counters, all semantic proofs, and explicit
 `device_bytes_without_release_receipt` /
 `mapped_bytes_without_unmap_receipt` residuals for provider-lifetime resources
 whose teardown is not represented by an allocation-specific receipt.
@@ -134,13 +167,40 @@ whose teardown is not represented by an allocation-specific receipt.
 
 - Capacity-one control: the first session-owned CUDA allocation records one
   event; the second returns the exact capacity error before allocation.
-- Ledger tests cover first/middle/last capacity and total overflow, `u64`
-  overflow, failure rollback, duplicate completion, concurrent snapshot,
-  reset/close, stale epoch, moved handles, and same-label instance isolation.
+- Ledger tests cover bounded capacity and total overflow, submitted failure
+  classification, concurrent producers, reset/close, TLS capacity and ABA-stale
+  handles. The warmed recorder micro-control observes 128 positive events with
+  zero host allocations, mutex acquisitions, thread-id lookups, vector growth,
+  or retained recorder clones.
+- Production fault controls inject eager deferred-validation failure, first
+  capture synchronization failure, and replay deferred-validation failure after
+  submission. Each preserves the prior output/state bytes and successfully
+  retries.
 - Public compile-fail tests reject ledger construction/cloning, direct runtime
   attachment, and the removed label-based provider opener.
-- Without capacity configuration, the runtime owns no registry or recorder.
-  Production operations take the unchanged `OnceLock::None` branch.
+- Without capacity configuration, the runtime owns no ledger or recorder.
+  Production operations take one false atomic gate and never touch TLS.
+
+## A100 observed result (2026-09-02)
+
+Serialized on one idle A100-SXM4-80GB (`CUDA_VISIBLE_DEVICES=7`,
+`gpu-tests,cuda-13000`, one test thread). These are absolute production-boundary
+bytes, not a reduction claim:
+
+| Fixture / arm | cold H2D | warm H2D | cold D2H | warm D2H | cold D2D submitted | warm D2D submitted |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| deepseek-like baseline | 100,860,080 | 590,976 | 131,076 | 1,179,684 | 196,608 | 1,769,472 |
+| deepseek-like FreeToken | 100,860,192 | 591,480 | 131,132 | 1,180,188 | 196,608 | 26,935,296 |
+| glm52-like baseline | 151,388,400 | 1,181,376 | 262,148 | 2,359,332 | 393,216 | 3,538,944 |
+| glm52-like FreeToken | 151,388,568 | 1,182,132 | 262,232 | 2,360,088 | 393,216 | 41,287,680 |
+
+The previously omitted binding minima are now present exactly in baseline warm
+H2D (590,976 B / 1,181,376 B). D2H additionally includes nine four-byte
+owner-validation reads per arm, yielding 1,179,684 B / 2,359,332 B warm.
+FreeToken adds route-telemetry traffic (+504/+756 B warm H2D and D2H) and
+substantial measured D2D route-residency work; it does **not** reduce transfer
+bytes in these fixtures. Both arms remain exactly equivalent for routes,
+outputs, carried state, one capture, and three replays.
 
 ## Limitations
 

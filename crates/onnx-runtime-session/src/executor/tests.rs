@@ -132,6 +132,7 @@ struct DeferredValidationEp {
     next_validation_generation: Arc<AtomicU64>,
     validation_consume_attempts: Arc<AtomicUsize>,
     sync_calls: Arc<AtomicUsize>,
+    sync_failure: Arc<AtomicBool>,
     panic_next: Arc<AtomicBool>,
     graph_reset_failure: Arc<AtomicBool>,
     graph_reset_calls: Arc<AtomicUsize>,
@@ -165,6 +166,13 @@ impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for TestArtifactRequi
         &self,
     ) -> onnx_runtime_ep_api::Result<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>> {
         Ok(Box::new(TestArtifactUseGuard))
+    }
+
+    fn with_use(
+        &self,
+        operation: &mut dyn FnMut() -> onnx_runtime_ep_api::Result<()>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        operation()
     }
 }
 
@@ -223,6 +231,7 @@ impl DeferredValidationEp {
             next_validation_generation: Arc::new(AtomicU64::new(1)),
             validation_consume_attempts: Arc::new(AtomicUsize::new(0)),
             sync_calls: Arc::new(AtomicUsize::new(0)),
+            sync_failure: Arc::new(AtomicBool::new(false)),
             panic_next: Arc::new(AtomicBool::new(false)),
             graph_reset_failure: Arc::new(AtomicBool::new(false)),
             graph_reset_calls: Arc::new(AtomicUsize::new(0)),
@@ -374,11 +383,40 @@ impl ExecutionProvider for DeferredValidationEp {
         self.cpu.copy_to_host(src, dst)
     }
 
+    fn copy_device_to_device(
+        &self,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        dst: &mut DeviceBuffer,
+        dst_offset: usize,
+        bytes: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        if src_offset + bytes > src.len() || dst_offset + bytes > dst.len() {
+            return Err(EpError::KernelFailed(
+                "test D2D publication copy exceeds its host buffers".into(),
+            ));
+        }
+        // SAFETY: both test buffers are host allocations and ranges were checked.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().cast::<u8>().add(src_offset),
+                dst.as_mut_ptr().cast::<u8>().add(dst_offset),
+                bytes,
+            );
+        }
+        Ok(())
+    }
+
     fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
         self.sync_calls.fetch_add(1, Ordering::Relaxed);
         self.synchronized_executions
             .store(self.executions.load(Ordering::Relaxed), Ordering::Relaxed);
         self.route_lifecycle_events.lock().unwrap().push("sync");
+        if self.sync_failure.swap(false, Ordering::Relaxed) {
+            return Err(EpError::KernelFailed(
+                "forced deferred-validation synchronization failure".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1307,6 +1345,70 @@ fn route_residency_owner_boundary_forces_device_bound_receipt_synchronization() 
         1,
         "a failed owner receipt must prevent route-boundary consumption"
     );
+}
+
+#[test]
+fn bound_output_publication_waits_for_sync_and_owner_validation_and_retry_is_clean() {
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
+    ep.fail_next.store(false, Ordering::Relaxed);
+    let (mut executor, mut bindings) =
+        deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+
+    let bytes = |values: [f32; 2]| {
+        values
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    let read = |binding: &mut DeviceIoBinding| {
+        binding
+            .read_bytes()
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
+            .collect::<Vec<_>>()
+    };
+
+    bindings[0].write_bytes(0, &bytes([3.0, 7.0])).unwrap();
+    bindings[1].write_bytes(0, &bytes([11.0, 13.0])).unwrap();
+    ep.fail_next.store(true, Ordering::Relaxed);
+    let validation = executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect_err("owner validation must reject the prepared output");
+    assert!(
+        validation
+            .to_string()
+            .contains("device validation failed (flags=0x40)"),
+        "{validation}"
+    );
+    assert_eq!(read(&mut bindings[1]), vec![11.0, 13.0]);
+
+    ep.fail_next.store(false, Ordering::Relaxed);
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("retry after validation rollback");
+    assert_eq!(read(&mut bindings[1]), vec![3.0, 7.0]);
+
+    bindings[0].write_bytes(0, &bytes([17.0, 19.0])).unwrap();
+    bindings[1].write_bytes(0, &bytes([23.0, 29.0])).unwrap();
+    ep.sync_failure.store(true, Ordering::Relaxed);
+    let sync = executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect_err("synchronization must reject the prepared output");
+    assert!(
+        sync.to_string()
+            .contains("forced deferred-validation synchronization failure"),
+        "{sync}"
+    );
+    assert_eq!(read(&mut bindings[1]), vec![23.0, 29.0]);
+
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("retry after synchronization rollback");
+    assert_eq!(read(&mut bindings[1]), vec![17.0, 19.0]);
 }
 
 #[test]
@@ -2582,6 +2684,9 @@ fn capture_shapes_seed_unresolved_external_values_without_overwriting_resolved_s
         alignment: 1,
         device: onnx_runtime_ir::DeviceId::cpu(),
         state_publication: false,
+        output_publication: false,
+        publication_rollback_ptr: None,
+        publication_poison_ptr: 0,
     };
     let mut external = ExternalBindings::default();
     external
@@ -6849,8 +6954,24 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         HOST_ALLOCATION_SIZES.with(Cell::get)
     );
     assert_eq!(runtime.allocation_counts(), allocations);
-    assert_eq!(runtime.transfer_counts(), transfers);
-    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+    let replay_transfers = runtime.transfer_counts();
+    assert_eq!(replay_transfers.host_to_device, transfers.host_to_device);
+    let validation_reads = replay_transfers.device_to_host - transfers.device_to_host;
+    assert!(
+        (1..=3).contains(&validation_reads),
+        "the first completion-correct replay must read its owner/capture validation receipts \
+         before publishing bound output/state; observed {validation_reads} D2H read(s)"
+    );
+    assert_eq!(
+        replay_transfers.async_host_to_device,
+        transfers.async_host_to_device
+    );
+    assert_eq!(
+        runtime.forced_synchronization_count(),
+        synchronizations + 2,
+        "the first captured launch synchronizes for completion validation and the publication \
+         boundary"
+    );
     assert_eq!(
         onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
         preparation
@@ -6896,8 +7017,17 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         });
         host_allocations += replay_allocations;
         assert_eq!(runtime.allocation_counts(), allocations);
-        assert_eq!(runtime.transfer_counts(), transfers);
-        assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+        let replay_transfers = runtime.transfer_counts();
+        assert_eq!(replay_transfers.host_to_device, transfers.host_to_device);
+        assert_eq!(
+            replay_transfers.device_to_host,
+            transfers.device_to_host + 1
+        );
+        assert_eq!(
+            replay_transfers.async_host_to_device,
+            transfers.async_host_to_device
+        );
+        assert_eq!(runtime.forced_synchronization_count(), synchronizations + 2);
         assert_eq!(
             onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
             preparation
@@ -10769,6 +10899,9 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
             alignment: 8,
             device: onnx_runtime_ir::DeviceId::cpu(),
             state_publication: false,
+            output_publication: false,
+            publication_rollback_ptr: None,
+            publication_poison_ptr: 0,
         },
     );
     exec.seed_warm_decode_capture_shapes(&mut mismatched, &other);

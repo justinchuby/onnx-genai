@@ -191,4 +191,4 @@ pub fn device_argmax_scratch_words(elements: usize, batch: usize) -> usize {
     kernels::device_argmax::scratch_words(elements, batch)
 }
 pub use onnx_runtime_ep_api::RawDeviceAllocationSiteStats as CudaRawAllocationSiteStats;
-pub use runtime::{CudaAllocationCounts, CudaRuntime};
+pub use runtime::{CudaAllocationCounts, CudaRuntime, CudaTransferByteCounts};
