@@ -39,6 +39,13 @@ pub struct CudaAllocationCounts {
     pub frees: u64,
 }
 
+/// Counts successful CUDA graph capture installations and executable launches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaGraphExecutionCounts {
+    pub captures: u64,
+    pub replays: u64,
+}
+
 /// Counts explicit host/device transfers made through a runtime.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CudaTransferCounts {
@@ -1170,6 +1177,12 @@ impl CudaRuntime {
         self.graph.current_segment_count()
     }
 
+    /// Snapshot successful primary-slot graph captures and executable launches.
+    pub fn graph_execution_counts(&self) -> CudaGraphExecutionCounts {
+        let (captures, replays) = self.graph.execution_counts();
+        CudaGraphExecutionCounts { captures, replays }
+    }
+
     /// Destroy the installed graph and graph-exec handles.
     ///
     /// Returns whether an executable was invalidated. Reset is rejected while a
@@ -1943,6 +1956,12 @@ impl CudaRuntime {
     /// Slot-aware [`graph_segment_count`](Self::graph_segment_count).
     pub fn graph_segment_count_in(&self, slot: DeviceGraphSlot) -> Result<usize> {
         self.graph_slot(slot).current_segment_count()
+    }
+
+    /// Snapshot successful graph captures and executable launches for `slot`.
+    pub fn graph_execution_counts_in(&self, slot: DeviceGraphSlot) -> CudaGraphExecutionCounts {
+        let (captures, replays) = self.graph_slot(slot).execution_counts();
+        CudaGraphExecutionCounts { captures, replays }
     }
 
     /// Slot-aware [`reset_graph`](Self::reset_graph).

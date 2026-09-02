@@ -31,18 +31,23 @@ use crate::runtime::{CudaRuntime, cuptr};
 /// Counters proving which CUDA Einsum route executed and what persistent state
 /// it established. Values are process-global diagnostics, so GPU tests serialize
 /// around reset/read windows.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EinsumExecutionStats {
     pub plan_builds: u64,
     pub plan_cache_hits: u64,
     pub view_aliases: u64,
     pub view_materializations: u64,
     pub gemm_launches: u64,
+    pub canonical_gemm_launches: u64,
+    pub descriptor_transpose_gemm_launches: u64,
     pub zero_fill_launches: u64,
     pub capture_recordings: u64,
+    pub claim_fallbacks: u64,
+    pub last_fallback_reason: Option<String>,
     pub workspace_bytes: u64,
     pub workspace_ptr: u64,
     pub setup_ns: u64,
+    pub persistent_metadata_bytes: u64,
     pub materialization_bytes: u64,
 }
 
@@ -51,25 +56,40 @@ static PLAN_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static VIEW_ALIASES: AtomicU64 = AtomicU64::new(0);
 static VIEW_MATERIALIZATIONS: AtomicU64 = AtomicU64::new(0);
 static GEMM_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static CANONICAL_GEMM_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static DESCRIPTOR_TRANSPOSE_GEMM_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 static ZERO_FILL_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 static CAPTURE_RECORDINGS: AtomicU64 = AtomicU64::new(0);
+static CLAIM_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static LAST_FALLBACK_REASON: Mutex<Option<String>> = Mutex::new(None);
 static WORKSPACE_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
 static WORKSPACE_PTR_LAST: AtomicU64 = AtomicU64::new(0);
 static SETUP_NS_LAST: AtomicU64 = AtomicU64::new(0);
+static PERSISTENT_METADATA_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZATION_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub fn einsum_execution_stats() -> EinsumExecutionStats {
+    let last_fallback_reason = LAST_FALLBACK_REASON
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
     EinsumExecutionStats {
         plan_builds: PLAN_BUILDS.load(Ordering::Relaxed),
         plan_cache_hits: PLAN_CACHE_HITS.load(Ordering::Relaxed),
         view_aliases: VIEW_ALIASES.load(Ordering::Relaxed),
         view_materializations: VIEW_MATERIALIZATIONS.load(Ordering::Relaxed),
         gemm_launches: GEMM_LAUNCHES.load(Ordering::Relaxed),
+        canonical_gemm_launches: CANONICAL_GEMM_LAUNCHES.load(Ordering::Relaxed),
+        descriptor_transpose_gemm_launches: DESCRIPTOR_TRANSPOSE_GEMM_LAUNCHES
+            .load(Ordering::Relaxed),
         zero_fill_launches: ZERO_FILL_LAUNCHES.load(Ordering::Relaxed),
         capture_recordings: CAPTURE_RECORDINGS.load(Ordering::Relaxed),
+        claim_fallbacks: CLAIM_FALLBACKS.load(Ordering::Relaxed),
+        last_fallback_reason,
         workspace_bytes: WORKSPACE_BYTES_LAST.load(Ordering::Relaxed),
         workspace_ptr: WORKSPACE_PTR_LAST.load(Ordering::Relaxed),
         setup_ns: SETUP_NS_LAST.load(Ordering::Relaxed),
+        persistent_metadata_bytes: PERSISTENT_METADATA_BYTES_LAST.load(Ordering::Relaxed),
         materialization_bytes: MATERIALIZATION_BYTES.load(Ordering::Relaxed),
     }
 }
@@ -80,11 +100,18 @@ pub fn reset_einsum_execution_stats() {
     VIEW_ALIASES.store(0, Ordering::Relaxed);
     VIEW_MATERIALIZATIONS.store(0, Ordering::Relaxed);
     GEMM_LAUNCHES.store(0, Ordering::Relaxed);
+    CANONICAL_GEMM_LAUNCHES.store(0, Ordering::Relaxed);
+    DESCRIPTOR_TRANSPOSE_GEMM_LAUNCHES.store(0, Ordering::Relaxed);
     ZERO_FILL_LAUNCHES.store(0, Ordering::Relaxed);
     CAPTURE_RECORDINGS.store(0, Ordering::Relaxed);
+    CLAIM_FALLBACKS.store(0, Ordering::Relaxed);
+    *LAST_FALLBACK_REASON
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
     WORKSPACE_BYTES_LAST.store(0, Ordering::Relaxed);
     WORKSPACE_PTR_LAST.store(0, Ordering::Relaxed);
     SETUP_NS_LAST.store(0, Ordering::Relaxed);
+    PERSISTENT_METADATA_BYTES_LAST.store(0, Ordering::Relaxed);
     MATERIALIZATION_BYTES.store(0, Ordering::Relaxed);
 }
 
@@ -247,7 +274,7 @@ fn layout_is_contiguous(layout: &TensorLayout, shape: &Shape) -> bool {
 
 /// Return an actionable claim decline for an Einsum the current CUDA lowering
 /// cannot execute without an unsupported materialization.
-pub fn unsupported_reason(
+fn unsupported_reason_impl(
     node: &Node,
     shapes: &[Shape],
     input_dtypes: &[DataType],
@@ -322,6 +349,22 @@ pub fn unsupported_reason(
             "cuda_ep Einsum `{equation}`: canonical planner classified this contraction as unsupported: {reason}"
         )),
     }
+}
+
+pub fn unsupported_reason(
+    node: &Node,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+    layouts: &[TensorLayout],
+) -> Option<String> {
+    let reason = unsupported_reason_impl(node, shapes, input_dtypes, layouts);
+    if let Some(reason) = &reason {
+        CLAIM_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        *LAST_FALLBACK_REASON
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(reason.clone());
+    }
+    reason
 }
 
 pub struct EinsumFactory {
@@ -903,6 +946,13 @@ impl EinsumKernel {
             ExecutionKind::Gemm(gemm) => {
                 gemm.launch(&cached.layout, &self.runtime, a_ptr, b_ptr, c_ptr)?;
                 GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                if cached.layout.left_order == StorageOrder::Transposed
+                    || cached.layout.right_order == StorageOrder::Transposed
+                {
+                    DESCRIPTOR_TRANSPOSE_GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    CANONICAL_GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         if capturing {
@@ -1039,16 +1089,16 @@ impl EinsumKernel {
             self.last_call_capture_safe.store(true, Ordering::Relaxed);
             return Ok(());
         }
-        let metadata_ptr = self
-            .view_metadata
-            .lock()
-            .map_err(|_| {
+        let (metadata_ptr, metadata_bytes) = {
+            let mut metadata = self.view_metadata.lock().map_err(|_| {
                 EpError::KernelFailed(format!(
                     "cuda_ep Einsum `{}`: view metadata lock was poisoned",
                     self.plan.equation()
                 ))
-            })?
-            .prepare(&warmed.as_ref().unwrap().metadata, "Einsum view")?;
+            })?;
+            let ptr = metadata.prepare(&warmed.as_ref().unwrap().metadata, "Einsum view")?;
+            (ptr, metadata.allocation_bytes())
+        };
         launch_persistent_metadata(
             &self.runtime,
             "transpose_bytes",
@@ -1057,6 +1107,7 @@ impl EinsumKernel {
             metadata_ptr,
         )?;
         VIEW_MATERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+        PERSISTENT_METADATA_BYTES_LAST.store(metadata_bytes as u64, Ordering::Relaxed);
         MATERIALIZATION_BYTES.fetch_add(outputs[0].byte_size() as u64, Ordering::Relaxed);
         if capturing {
             CAPTURE_RECORDINGS.fetch_add(1, Ordering::Relaxed);

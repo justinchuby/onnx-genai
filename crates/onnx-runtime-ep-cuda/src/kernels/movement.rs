@@ -1,6 +1,7 @@
 //! Dtype-agnostic CUDA kernels for ONNX construction and movement operators.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
@@ -14,6 +15,37 @@ use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
+
+/// Production-path counters for explicit CUDA `Transpose` materialization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MovementExecutionStats {
+    pub transpose_launches: u64,
+    pub capture_recordings: u64,
+    pub persistent_metadata_bytes: u64,
+    pub materialization_bytes: u64,
+}
+
+static TRANSPOSE_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static TRANSPOSE_CAPTURE_RECORDINGS: AtomicU64 = AtomicU64::new(0);
+static TRANSPOSE_METADATA_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+static TRANSPOSE_MATERIALIZATION_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+
+pub fn movement_execution_stats() -> MovementExecutionStats {
+    MovementExecutionStats {
+        transpose_launches: TRANSPOSE_LAUNCHES.load(Ordering::Relaxed),
+        capture_recordings: TRANSPOSE_CAPTURE_RECORDINGS.load(Ordering::Relaxed),
+        persistent_metadata_bytes: TRANSPOSE_METADATA_BYTES_LAST.load(Ordering::Relaxed),
+        materialization_bytes: TRANSPOSE_MATERIALIZATION_BYTES_LAST.load(Ordering::Relaxed),
+    }
+}
+
+pub fn reset_movement_execution_stats() {
+    TRANSPOSE_LAUNCHES.store(0, Ordering::Relaxed);
+    TRANSPOSE_CAPTURE_RECORDINGS.store(0, Ordering::Relaxed);
+    TRANSPOSE_METADATA_BYTES_LAST.store(0, Ordering::Relaxed);
+    TRANSPOSE_MATERIALIZATION_BYTES_LAST.store(0, Ordering::Relaxed);
+}
+
 const MOVEMENT_SOURCE: &str = r#"
 extern "C" __global__ void expand_bytes(
     const unsigned char* input, unsigned char* output,
@@ -208,6 +240,7 @@ fn host_ints(runtime: &CudaRuntime, view: &TensorView, op: &str) -> Result<Vec<i
 struct PersistentMetadataAllocation {
     runtime: Arc<CudaRuntime>,
     ptr: CUdeviceptr,
+    bytes: usize,
 }
 
 impl Drop for PersistentMetadataAllocation {
@@ -266,8 +299,15 @@ impl PersistentMetadata {
         self.allocation = Some(Arc::new(PersistentMetadataAllocation {
             runtime: Arc::clone(&self.runtime),
             ptr,
+            bytes: bytes.len(),
         }));
         Ok(ptr)
+    }
+
+    pub(super) fn allocation_bytes(&self) -> usize {
+        self.allocation
+            .as_ref()
+            .map_or(0, |allocation| allocation.bytes)
     }
 
     pub(super) fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
@@ -799,13 +839,13 @@ impl Kernel for TransposeKernel {
                 "cuda_ep Transpose: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
             ));
         }
-        let metadata_ptr = self
-            .metadata
-            .lock()
-            .map_err(|_| {
+        let (metadata_ptr, metadata_bytes) = {
+            let mut persistent = self.metadata.lock().map_err(|_| {
                 EpError::KernelFailed("cuda_ep Transpose: metadata lock was poisoned".into())
-            })?
-            .prepare(&metadata, "Transpose")?;
+            })?;
+            let ptr = persistent.prepare(&metadata, "Transpose")?;
+            (ptr, persistent.allocation_bytes())
+        };
         launch_persistent_metadata(
             &self.runtime,
             "transpose_bytes",
@@ -813,6 +853,13 @@ impl Kernel for TransposeKernel {
             &mut outputs[0],
             metadata_ptr,
         )?;
+        TRANSPOSE_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+        TRANSPOSE_METADATA_BYTES_LAST.store(metadata_bytes as u64, Ordering::Relaxed);
+        TRANSPOSE_MATERIALIZATION_BYTES_LAST
+            .store(outputs[0].byte_size() as u64, Ordering::Relaxed);
+        if capturing {
+            TRANSPOSE_CAPTURE_RECORDINGS.fetch_add(1, Ordering::Relaxed);
+        }
         if !capturing {
             *warmed_signature = Some(signature);
         }

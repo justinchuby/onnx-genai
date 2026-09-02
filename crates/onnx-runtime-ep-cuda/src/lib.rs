@@ -146,6 +146,9 @@ pub use kernels::group_query_attention::{
 pub use kernels::index_share::INDEX_SHARE_CAPTURE_ERROR_INDEX;
 pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::kv_cache_capacity_append::KV_CAPACITY_APPEND_CAPTURE_ERROR_POSITION;
+pub use kernels::movement::{
+    MovementExecutionStats, movement_execution_stats, reset_movement_execution_stats,
+};
 pub use kernels::non_max_suppression::{
     NmsExecutionStats, nms_execution_stats, reset_nms_execution_stats,
 };
@@ -193,4 +196,4 @@ pub fn device_argmax_scratch_words(elements: usize, batch: usize) -> usize {
     kernels::device_argmax::scratch_words(elements, batch)
 }
 pub use onnx_runtime_ep_api::RawDeviceAllocationSiteStats as CudaRawAllocationSiteStats;
-pub use runtime::{CudaAllocationCounts, CudaRuntime};
+pub use runtime::{CudaAllocationCounts, CudaGraphExecutionCounts, CudaRuntime};

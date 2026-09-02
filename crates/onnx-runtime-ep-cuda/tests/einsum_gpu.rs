@@ -228,6 +228,7 @@ fn registry_reachability_and_claim_declines_are_intentional() {
         "CPU/CUDA registration difference is deliberate in this CUDA-only change"
     );
 
+    reset_einsum_execution_stats();
     for (equation, shapes, expected_reason) in [
         (
             "ik,kj->ji",
@@ -277,6 +278,14 @@ fn registry_reachability_and_claim_declines_are_intentional() {
             claim.reason()
         );
     }
+    let fallback_stats = einsum_execution_stats();
+    assert_eq!(fallback_stats.claim_fallbacks, 3);
+    assert!(
+        fallback_stats
+            .last_fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("reductions/elementwise"))
+    );
 
     let strided = [
         TensorLayout::strided(vec![1, 2]),
@@ -300,6 +309,7 @@ fn descriptor_transpose_contractions_match_f64_reference() {
         ("ik,jk->ij", &[3, 5][..], &[4, 5][..], false, true),
         ("ki,jk->ij", &[5, 3][..], &[4, 5][..], true, true),
     ] {
+        reset_einsum_execution_stats();
         run_gemm_case(
             &ep,
             equation,
@@ -316,6 +326,15 @@ fn descriptor_transpose_contractions_match_f64_reference() {
             0,
             0,
         );
+        let stats = einsum_execution_stats();
+        assert_eq!(stats.gemm_launches, 1, "{equation}");
+        if transpose_a || transpose_b {
+            assert_eq!(stats.descriptor_transpose_gemm_launches, 1, "{equation}");
+            assert_eq!(stats.canonical_gemm_launches, 0, "{equation}");
+        } else {
+            assert_eq!(stats.descriptor_transpose_gemm_launches, 0, "{equation}");
+            assert_eq!(stats.canonical_gemm_launches, 1, "{equation}");
+        }
     }
 }
 
@@ -579,6 +598,45 @@ fn permutation_and_diagonal_use_zero_copy_views_and_materialize_correctly() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn explicit_transpose_reports_production_materialization_counters() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    onnx_runtime_ep_cuda::reset_movement_execution_stats();
+    let output = run_cuda(
+        &ep,
+        "Transpose",
+        "",
+        13,
+        &[float_input(
+            DataType::Float32,
+            &[2, 3],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )],
+        &[(DataType::Float32, vec![3, 2])],
+        &[("perm", Attribute::Ints(vec![1, 0]))],
+    );
+    assert_eq!(
+        decode_floats(&output[0], DataType::Float32),
+        vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+    );
+    let stats = onnx_runtime_ep_cuda::movement_execution_stats();
+    assert_eq!(stats.transpose_launches, 1);
+    assert_eq!(stats.capture_recordings, 0);
+    assert_eq!(
+        stats.persistent_metadata_bytes,
+        4 * std::mem::size_of::<u64>() as u64
+    );
+    assert_eq!(
+        stats.materialization_bytes,
+        6 * std::mem::size_of::<f32>() as u64
+    );
+}
+
 fn make_direct_kernel(
     ep: &CudaExecutionProvider,
     equation: &str,
@@ -705,6 +763,7 @@ fn warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay
     );
     assert_eq!(runtime.allocation_counts(), allocations);
 
+    let graph_before = runtime.graph_execution_counts();
     runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
     execute(&mut output);
     assert!(runtime.is_capturing().unwrap());
@@ -720,6 +779,9 @@ fn warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay
         runtime.replay_graph().unwrap();
     }
     runtime.synchronize().unwrap();
+    let graph_after = runtime.graph_execution_counts();
+    assert_eq!(graph_after.captures - graph_before.captures, 1);
+    assert_eq!(graph_after.replays - graph_before.replays, 5);
     assert_eq!(runtime.allocation_counts(), allocations);
     assert!(runtime.reset_graph().unwrap());
 
@@ -1158,6 +1220,35 @@ struct BenchFixture {
     dtype: DataType,
 }
 
+const BENCH_M: usize = 256;
+const BENCH_K: usize = 512;
+const BENCH_N: usize = 384;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchArm {
+    Descriptor,
+    Materialized,
+    Control,
+}
+
+impl BenchArm {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Descriptor => "descriptor-transpose",
+            Self::Materialized => "explicit-materialization",
+            Self::Control => "canonical-control",
+        }
+    }
+
+    fn expected_route(self) -> &'static str {
+        match self {
+            Self::Descriptor => "descriptor-transpose",
+            Self::Materialized => "explicit-materialization",
+            Self::Control => "canonical",
+        }
+    }
+}
+
 impl BenchFixture {
     fn kernel_refs(&self) -> Vec<&dyn onnx_runtime_ep_api::Kernel> {
         match &self.mode {
@@ -1244,6 +1335,17 @@ impl BenchFixture {
         }
         ep.deallocate(output).unwrap();
     }
+
+    fn output_bytes(&self, ep: &CudaExecutionProvider) -> Vec<u8> {
+        ep.runtime().synchronize().unwrap();
+        let mut bytes = vec![0; self.dtype.storage_bytes(self.output_shape.iter().product())];
+        unsafe {
+            ep.runtime()
+                .dtoh(&mut bytes, cuptr(self.output.as_ptr()))
+                .unwrap()
+        };
+        bytes
+    }
 }
 
 fn bench_kernel(
@@ -1275,20 +1377,36 @@ fn bench_kernel(
 
 fn bench_fixture(
     ep: &CudaExecutionProvider,
-    materialized: bool,
-    canonical: bool,
+    arm: BenchArm,
     dtype: DataType,
+    logical_a: &[f32],
+    b_values: &[f32],
 ) -> BenchFixture {
-    const M: usize = 256;
-    const K: usize = 512;
-    const N: usize = 384;
-    let a_shape = if canonical { vec![M, K] } else { vec![K, M] };
-    let a = float_input(dtype, &a_shape, &values(M * K, 13));
-    let b = float_input(dtype, &[K, N], &values(K * N, 17));
-    let output_shape = vec![M, N];
+    let canonical = arm == BenchArm::Control;
+    let a_shape = if canonical {
+        vec![BENCH_M, BENCH_K]
+    } else {
+        vec![BENCH_K, BENCH_M]
+    };
+    let physical_a = if canonical {
+        logical_a.to_vec()
+    } else {
+        let mut transposed = vec![0.0; logical_a.len()];
+        for row in 0..BENCH_M {
+            for reduction in 0..BENCH_K {
+                transposed[reduction * BENCH_M + row] = logical_a[row * BENCH_K + reduction];
+            }
+        }
+        transposed
+    };
+    let a = float_input(dtype, &a_shape, &physical_a);
+    let b = float_input(dtype, &[BENCH_K, BENCH_N], b_values);
+    let output_shape = vec![BENCH_M, BENCH_N];
     let a_buffer = ep.allocate(a.bytes.len(), 256).unwrap();
     let b_buffer = ep.allocate(b.bytes.len(), 256).unwrap();
-    let output = ep.allocate(dtype.storage_bytes(M * N), 256).unwrap();
+    let output = ep
+        .allocate(dtype.storage_bytes(BENCH_M * BENCH_N), 256)
+        .unwrap();
     unsafe {
         ep.runtime()
             .htod(&a.bytes, cuptr(a_buffer.as_ptr()))
@@ -1298,16 +1416,19 @@ fn bench_fixture(
             .unwrap();
     }
 
-    if materialized {
-        let temporary = ep.allocate(dtype.storage_bytes(M * K), 256).unwrap();
+    if arm == BenchArm::Materialized {
+        let temporary = ep
+            .allocate(dtype.storage_bytes(BENCH_M * BENCH_K), 256)
+            .unwrap();
         let transpose = bench_kernel(
             ep,
             "Transpose",
             std::slice::from_ref(&a),
-            &[M, K],
+            &[BENCH_M, BENCH_K],
             &[("perm", Attribute::Ints(vec![1, 0]))],
         );
-        let temporary_tensor = float_input(dtype, &[M, K], &vec![0.0; M * K]);
+        let temporary_tensor =
+            float_input(dtype, &[BENCH_M, BENCH_K], &vec![0.0; BENCH_M * BENCH_K]);
         let einsum = bench_kernel(
             ep,
             "Einsum",
@@ -1354,69 +1475,291 @@ fn bench_fixture(
 }
 
 fn physical_gpu() -> String {
-    std::env::var("ONNX_GENAI_CUDA_PHYSICAL_DEVICE")
-        .ok()
-        .or_else(|| {
-            std::env::var("CUDA_VISIBLE_DEVICES")
-                .ok()
-                .and_then(|visible| visible.split(',').next().map(str::to_owned))
-        })
-        .unwrap_or_else(|| "0".into())
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES")
+        .expect("benchmark requires CUDA_VISIBLE_DEVICES=<one physical index or UUID>");
+    assert!(
+        !visible.is_empty() && !visible.contains(','),
+        "benchmark requires exactly one CUDA_VISIBLE_DEVICES selector, got `{visible}`"
+    );
+    let physical =
+        std::env::var("ONNX_GENAI_CUDA_PHYSICAL_DEVICE").unwrap_or_else(|_| visible.clone());
+    assert_eq!(
+        physical, visible,
+        "ONNX_GENAI_CUDA_PHYSICAL_DEVICE must identify the one CUDA_VISIBLE_DEVICES device"
+    );
+    assert_eq!(
+        std::env::var("ONNX_GENAI_CUDA_DEVICE").as_deref(),
+        Ok("0"),
+        "logical CUDA mapping must be pinned with ONNX_GENAI_CUDA_DEVICE=0"
+    );
+    physical
 }
 
-fn gpu_state(label: &str, require_idle: bool) {
+#[derive(Clone, Debug)]
+struct GpuState {
+    utilization: u32,
+    clock_mhz: u32,
+    max_clock_mhz: u32,
+    power_w: f64,
+    memory_mib: u64,
+    foreign_processes: Vec<String>,
+}
+
+fn gpu_state(label: &str, phase: &str) -> GpuState {
+    let physical = physical_gpu();
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "-i",
-            &physical_gpu(),
-            "--query-gpu=utilization.gpu,clocks.sm,power.draw,memory.used",
+            &physical,
+            "--query-gpu=utilization.gpu,clocks.sm,clocks.max.sm,power.draw,memory.used",
             "--format=csv,noheader,nounits",
         ])
         .output()
         .expect("nvidia-smi");
     assert!(output.status.success(), "nvidia-smi failed");
     let state = String::from_utf8(output.stdout).unwrap();
-    println!("GPU_STATE,{label},{}", state.trim());
-    if require_idle {
-        let utilization = state
-            .split(',')
-            .next()
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
+    let fields = state.trim().split(',').map(str::trim).collect::<Vec<_>>();
+    assert_eq!(fields.len(), 5, "unexpected nvidia-smi state row: {state}");
+    let processes = std::process::Command::new("nvidia-smi")
+        .args([
+            "-i",
+            &physical,
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .expect("nvidia-smi compute process query");
+    assert!(
+        processes.status.success(),
+        "nvidia-smi compute process query failed"
+    );
+    let own_pid = std::process::id();
+    let foreign_processes = String::from_utf8(processes.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(',').map(str::trim);
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let memory = fields.next().unwrap_or("unknown");
+            (pid != own_pid).then(|| format!("{pid}:{memory}MiB"))
+        })
+        .collect::<Vec<_>>();
+    let state = GpuState {
+        utilization: fields[0].parse().unwrap(),
+        clock_mhz: fields[1].parse().unwrap(),
+        max_clock_mhz: fields[2].parse().unwrap(),
+        power_w: fields[3].parse().unwrap(),
+        memory_mib: fields[4].parse().unwrap(),
+        foreign_processes,
+    };
+    println!(
+        "GPU_STATE,label={label},phase={phase},util_pct={},clock_mhz={},max_clock_mhz={},power_w={:.2},memory_mib={},foreign_processes={}",
+        state.utilization,
+        state.clock_mhz,
+        state.max_clock_mhz,
+        state.power_w,
+        state.memory_mib,
+        if state.foreign_processes.is_empty() {
+            "none".to_string()
+        } else {
+            state.foreign_processes.join(";")
+        }
+    );
+    state
+}
+
+fn hostlock_provenance(label: &str, expect_runnable: u32) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = std::process::Command::new(root.join("scripts/hostlock.sh"))
+        .args([
+            "provenance",
+            "--oneline",
+            "--expect-runnable",
+            &expect_runnable.to_string(),
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("hostlock provenance");
+    assert!(
+        output.status.success(),
+        "hostlock provenance failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let row = String::from_utf8(output.stdout).unwrap();
+    let field = |key: &str| {
+        row.split_whitespace()
+            .find_map(|entry| entry.strip_prefix(&format!("{key}=")))
+    };
+    assert_eq!(field("hostlock_state"), Some("HELD"), "{row}");
+    assert_eq!(field("declared"), Some("yes"), "{row}");
+    assert_eq!(field("held_owner_source"), Some("flag"), "{row}");
+    assert_eq!(
+        field("held_by"),
+        std::env::var("HOSTLOCK_OWNER").ok().as_deref(),
+        "{row}"
+    );
+    assert!(
+        field("gate").is_some_and(|gate| gate.starts_with("satisfied:")),
+        "{row}"
+    );
+    assert_eq!(field("contended"), Some("no"), "{row}");
+    assert_eq!(field("lock_scope"), Some("box"), "{row}");
+    println!("HOSTLOCK,label={label},{}", row.trim());
+}
+
+fn wait_for_idle_gpu(label: &str) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let mut consecutive = 0;
+    loop {
+        let state = gpu_state(label, "idle-precheck");
+        if state.utilization <= 2 && state.foreign_processes.is_empty() {
+            consecutive += 1;
+            if consecutive == 2 {
+                return;
+            }
+        } else {
+            consecutive = 0;
+        }
         assert!(
-            utilization <= 2,
-            "GPU must be idle before every benchmark arm, observed {utilization}%"
+            Instant::now() < deadline,
+            "{label}: GPU did not become idle and foreign-process-free within 60 seconds"
         );
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
 
 struct BenchResult {
-    label: &'static str,
+    arm: BenchArm,
+    batch: usize,
+    slot: usize,
+    route: &'static str,
     kernel_us: f32,
-    setup_us: f64,
+    fixture_setup_us: f64,
+    warm_execute_us: f64,
     plan_setup_us: f64,
+    capture_us: f64,
+    ramp_ms: f64,
+    captures: u64,
+    ramp_replays: u64,
+    timed_replays: u64,
+    captured_kernel_launches: u64,
     workspace_bytes: u64,
-    launches: u64,
+    persistent_metadata_bytes: u64,
     materialization_bytes: u64,
+    gemm_launches: u64,
+    canonical_gemm_launches: u64,
+    descriptor_gemm_launches: u64,
+    transpose_launches: u64,
+    fallback_count: u64,
+    fallback_reason: String,
+    allocations_before: onnx_runtime_ep_cuda::CudaAllocationCounts,
+    allocations_after_warm: onnx_runtime_ep_cuda::CudaAllocationCounts,
+    allocations_after_capture: onnx_runtime_ep_cuda::CudaAllocationCounts,
+    allocations_after_timed: onnx_runtime_ep_cuda::CudaAllocationCounts,
+    allocations_after_finish: onnx_runtime_ep_cuda::CudaAllocationCounts,
+    clock_pre_mhz: u32,
+    clock_post_mhz: u32,
+    power_pre_w: f64,
+    power_post_w: f64,
+    oracle_max_abs: f64,
+    oracle_max_rel: f64,
+    output_digest: u64,
+}
+
+fn digest(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn oracle_metrics(got: &[f32], expected: &[f64], dtype: DataType) -> (f64, f64) {
+    assert_close(got, expected, dtype, "256x512x384 captured benchmark");
+    got.iter().zip(expected).fold(
+        (0.0_f64, 0.0_f64),
+        |(max_abs, max_rel), (&got, &expected)| {
+            let error = (f64::from(got) - expected).abs();
+            (
+                max_abs.max(error),
+                max_rel.max(error / expected.abs().max(1e-12)),
+            )
+        },
+    )
+}
+
+fn delta_graph_counts(
+    after: onnx_runtime_ep_cuda::CudaGraphExecutionCounts,
+    before: onnx_runtime_ep_cuda::CudaGraphExecutionCounts,
+) -> onnx_runtime_ep_cuda::CudaGraphExecutionCounts {
+    onnx_runtime_ep_cuda::CudaGraphExecutionCounts {
+        captures: after.captures - before.captures,
+        replays: after.replays - before.replays,
+    }
+}
+
+fn ramp_graph(
+    runtime: &onnx_runtime_ep_cuda::runtime::CudaRuntime,
+    label: &str,
+    ramp_seconds: u64,
+) -> (f64, u64) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let witness_stop = Arc::clone(&stop);
+    let witness_label = label.to_string();
+    let witness = std::thread::spawn(move || {
+        while !witness_stop.load(Ordering::Relaxed) {
+            gpu_state(&witness_label, "warm-sample");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    });
+    let graph_before = runtime.graph_execution_counts();
+    let start = Instant::now();
+    while start.elapsed().as_secs() < ramp_seconds {
+        for _ in 0..1024 {
+            runtime.replay_graph().unwrap();
+        }
+        runtime.synchronize().unwrap();
+    }
+    let elapsed = start.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    witness.join().unwrap();
+    let graph_after = runtime.graph_execution_counts();
+    assert!(
+        elapsed >= std::time::Duration::from_secs(ramp_seconds),
+        "{label}: warmup ended before its wall-clock floor"
+    );
+    (
+        elapsed.as_secs_f64() * 1000.0,
+        graph_after.replays - graph_before.replays,
+    )
 }
 
 fn measure_bench_arm(
     ep: &CudaExecutionProvider,
-    label: &'static str,
-    materialized: bool,
-    canonical: bool,
+    arm: BenchArm,
     dtype: DataType,
-    batch: usize,
+    batch_index: usize,
+    slot: usize,
+    logical_a: &[f32],
+    b_values: &[f32],
+    expected: &[f64],
+    replay_batch: usize,
     ramp_seconds: u64,
+    expect_runnable: u32,
 ) -> BenchResult {
-    gpu_state(label, true);
+    let label = format!("{}-{dtype:?}-b{batch_index}-s{slot}", arm.label());
+    hostlock_provenance(&label, expect_runnable);
+    wait_for_idle_gpu(&label);
     reset_einsum_execution_stats();
+    onnx_runtime_ep_cuda::reset_movement_execution_stats();
     let runtime = ep.runtime();
-    let setup = Instant::now();
-    let fixture = bench_fixture(ep, materialized, canonical, dtype);
+    let allocations_before = runtime.allocation_counts();
+    let fixture_setup = Instant::now();
+    let fixture = bench_fixture(ep, arm, dtype, logical_a, b_values);
+    let fixture_setup_us = fixture_setup.elapsed().as_secs_f64() * 1e6;
+
+    let warm_execute = Instant::now();
     fixture.execute(ep);
+    runtime.synchronize().unwrap();
+    let warm_execute_us = warm_execute.elapsed().as_secs_f64() * 1e6;
     assert!(
         fixture
             .kernel_refs()
@@ -1424,80 +1767,234 @@ fn measure_bench_arm(
             .all(|kernel| kernel.capture_support().is_supported()),
         "{label}: every kernel must be warmed and capturable"
     );
-    let allocations = runtime.allocation_counts();
+    let allocations_after_warm = runtime.allocation_counts();
+    let graph_before_capture = runtime.graph_execution_counts();
+    let capture = Instant::now();
     runtime.begin_graph_capture(&fixture.kernel_refs()).unwrap();
     fixture.execute(ep);
     runtime.end_graph_capture().unwrap();
-    let setup_us = setup.elapsed().as_secs_f64() * 1e6;
-    assert_eq!(runtime.allocation_counts(), allocations);
+    let capture_us = capture.elapsed().as_secs_f64() * 1e6;
+    let graph_after_capture = runtime.graph_execution_counts();
+    let capture_counts = delta_graph_counts(graph_after_capture, graph_before_capture);
+    assert_eq!(capture_counts.captures, 1, "{label}: capture count");
+    assert_eq!(capture_counts.replays, 0, "{label}: capture is not replay");
+    let allocations_after_capture = runtime.allocation_counts();
+    assert_eq!(
+        allocations_after_capture, allocations_after_warm,
+        "{label}: capture allocated after warmup"
+    );
 
-    if ramp_seconds != 0 {
-        let stop = Arc::new(AtomicBool::new(false));
-        let witness_stop = stop.clone();
-        let witness = std::thread::spawn(move || {
-            while !witness_stop.load(Ordering::Relaxed) {
-                gpu_state("ramp", false);
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        });
-        let start = Instant::now();
-        while start.elapsed().as_secs() < ramp_seconds {
-            for _ in 0..64 {
-                runtime.replay_graph().unwrap();
-            }
-            runtime.synchronize().unwrap();
-        }
-        stop.store(true, Ordering::Relaxed);
-        witness.join().unwrap();
-    }
+    let (ramp_ms, ramp_replays) = ramp_graph(runtime, &label, ramp_seconds);
+    let clock_pre = gpu_state(&label, "timed-pre");
+    assert!(
+        clock_pre.clock_mhz as f64 >= f64::from(clock_pre.max_clock_mhz) * 0.90,
+        "{label}: timed region started below 90% of maximum SM clock: {clock_pre:?}"
+    );
 
     let start = event::create(CUevent_flags::CU_EVENT_DEFAULT).unwrap();
     let end = event::create(CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+    let graph_before_timed = runtime.graph_execution_counts();
     unsafe { event::record(start, runtime.stream_ptr()) }.unwrap();
-    for _ in 0..batch {
+    for _ in 0..replay_batch {
         runtime.replay_graph().unwrap();
     }
     unsafe { event::record(end, runtime.stream_ptr()) }.unwrap();
     unsafe { event::synchronize(end) }.unwrap();
-    let kernel_us = unsafe { event::elapsed(start, end) }.unwrap() * 1000.0 / batch as f32;
+    let kernel_us = unsafe { event::elapsed(start, end) }.unwrap() * 1000.0 / replay_batch as f32;
     unsafe {
         event::destroy(start).unwrap();
         event::destroy(end).unwrap();
     }
-    assert_eq!(runtime.allocation_counts(), allocations);
-    runtime.reset_graph().unwrap();
+    let graph_after_timed = runtime.graph_execution_counts();
+    let timed_replays = graph_after_timed.replays - graph_before_timed.replays;
+    assert_eq!(
+        timed_replays, replay_batch as u64,
+        "{label}: timed replay count"
+    );
+    let allocations_after_timed = runtime.allocation_counts();
+    assert_eq!(
+        allocations_after_timed, allocations_after_warm,
+        "{label}: replay allocated after warmup"
+    );
+    let clock_post = gpu_state(&label, "timed-post");
+    assert!(
+        clock_post.clock_mhz as f64 >= f64::from(clock_post.max_clock_mhz) * 0.90,
+        "{label}: timed region ended below 90% of maximum SM clock: {clock_post:?}"
+    );
+    let clock_drift =
+        (f64::from(clock_post.clock_mhz) / f64::from(clock_pre.clock_mhz) - 1.0).abs();
+    assert!(
+        clock_drift <= 0.05,
+        "{label}: SM clock moved {:.2}% across timed region",
+        clock_drift * 100.0
+    );
+
+    let output_bytes = fixture.output_bytes(ep);
+    let output = decode_floats(&output_bytes, dtype);
+    let (oracle_max_abs, oracle_max_rel) = oracle_metrics(&output, expected, dtype);
+    let output_digest = digest(&output_bytes);
     let stats = einsum_execution_stats();
+    let movement = onnx_runtime_ep_cuda::movement_execution_stats();
+    let route = if movement.capture_recordings != 0 {
+        "explicit-materialization"
+    } else if stats.descriptor_transpose_gemm_launches != 0 {
+        "descriptor-transpose"
+    } else if stats.canonical_gemm_launches != 0 {
+        "canonical"
+    } else {
+        "unknown"
+    };
+    assert_eq!(route, arm.expected_route(), "{label}: actual route");
+    assert_eq!(
+        stats.claim_fallbacks, 0,
+        "{label}: benchmark arm fell back: {:?}",
+        stats.last_fallback_reason
+    );
+    let captured_kernel_launches = stats.capture_recordings + movement.capture_recordings;
+    assert_eq!(
+        captured_kernel_launches,
+        if arm == BenchArm::Materialized { 2 } else { 1 },
+        "{label}: captured kernel launch count"
+    );
+    let persistent_metadata_bytes =
+        stats.persistent_metadata_bytes + movement.persistent_metadata_bytes;
+    let materialization_bytes = stats.materialization_bytes + movement.materialization_bytes;
+
+    assert!(runtime.reset_graph().unwrap());
     fixture.finish(ep);
+    let allocations_after_finish = runtime.allocation_counts();
     BenchResult {
-        label,
+        arm,
+        batch: batch_index,
+        slot,
+        route,
         kernel_us,
-        setup_us,
+        fixture_setup_us,
+        warm_execute_us,
         plan_setup_us: stats.setup_ns as f64 / 1000.0,
+        capture_us,
+        ramp_ms,
+        captures: capture_counts.captures,
+        ramp_replays,
+        timed_replays,
+        captured_kernel_launches,
         workspace_bytes: stats.workspace_bytes,
-        launches: if materialized { 2 } else { 1 },
-        materialization_bytes: if materialized {
-            (256 * 512 * dtype.byte_size()) as u64
-        } else {
-            0
-        },
+        persistent_metadata_bytes,
+        materialization_bytes,
+        gemm_launches: stats.gemm_launches,
+        canonical_gemm_launches: stats.canonical_gemm_launches,
+        descriptor_gemm_launches: stats.descriptor_transpose_gemm_launches,
+        transpose_launches: movement.transpose_launches,
+        fallback_count: stats.claim_fallbacks,
+        fallback_reason: stats
+            .last_fallback_reason
+            .unwrap_or_else(|| "none".to_string())
+            .replace(',', ";")
+            .replace('\n', " "),
+        allocations_before,
+        allocations_after_warm,
+        allocations_after_capture,
+        allocations_after_timed,
+        allocations_after_finish,
+        clock_pre_mhz: clock_pre.clock_mhz,
+        clock_post_mhz: clock_post.clock_mhz,
+        power_pre_w: clock_pre.power_w,
+        power_post_w: clock_post.power_w,
+        oracle_max_abs,
+        oracle_max_rel,
+        output_digest,
     }
 }
 
-/// Host-locked captured replay benchmark used for the PR evidence table.
-///
-/// Run only on an idle, pinned GPU:
-/// `scripts/hostlock.sh run --owner batty --reason "CUDA Einsum captured sweep" -- \
-///  cargo test ... einsum_captured_descriptor_benchmark -- --ignored --exact --nocapture`
+fn print_bench_result(dtype: DataType, result: &BenchResult) {
+    println!(
+        "BENCH,{dtype:?},{},{},{},{},{:.6},{:.1},{:.1},{:.1},{:.1},{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{:.2},{:.8e},{:.8e},{:016x}",
+        result.batch,
+        result.slot,
+        result.arm.label(),
+        result.route,
+        result.kernel_us,
+        result.fixture_setup_us,
+        result.warm_execute_us,
+        result.plan_setup_us,
+        result.capture_us,
+        result.ramp_ms,
+        result.captures,
+        result.ramp_replays,
+        result.timed_replays,
+        result.captured_kernel_launches,
+        result.gemm_launches,
+        result.canonical_gemm_launches,
+        result.descriptor_gemm_launches,
+        result.transpose_launches,
+        result.fallback_count,
+        result.fallback_reason,
+        result.workspace_bytes,
+        result.persistent_metadata_bytes,
+        result.materialization_bytes,
+        result.allocations_before.allocations,
+        result.allocations_before.frees,
+        result.allocations_after_warm.allocations,
+        result.allocations_after_warm.frees,
+        result.allocations_after_capture.allocations,
+        result.allocations_after_capture.frees,
+        result.allocations_after_timed.allocations,
+        result.allocations_after_timed.frees,
+        result.allocations_after_finish.allocations,
+        result.allocations_after_finish.frees,
+        result.clock_pre_mhz,
+        result.clock_post_mhz,
+        result.power_pre_w,
+        result.power_post_w,
+        result.oracle_max_abs,
+        result.oracle_max_rel,
+        result.output_digest,
+    );
+}
+
+fn median_range(values: &[f32]) -> (f32, f32, f32) {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap());
+    let median = if sorted.len().is_multiple_of(2) {
+        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+    } else {
+        sorted[sorted.len() / 2]
+    };
+    (median, sorted[0], sorted[sorted.len() - 1])
+}
+
+fn gpu_identity(ep: &CudaExecutionProvider) {
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES").unwrap();
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "-i",
+            &physical_gpu(),
+            "--query-gpu=index,uuid,name,driver_version,pci.bus_id",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .expect("nvidia-smi identity");
+    assert!(output.status.success(), "nvidia-smi identity query failed");
+    assert_eq!(ep.runtime().ordinal(), 0);
+    println!(
+        "GPU_IDENTITY,logical_ordinal=0,cuda_visible_devices={},physical={}",
+        visible,
+        String::from_utf8(output.stdout).unwrap().trim()
+    );
+}
+
+/// Host-locked, captured CUDA-event benchmark for the synthetic 256x512x384
+/// transpose contraction. `scripts/bench_cuda_einsum.sh` is the only supported
+/// entry point because it proves the lock, build, tree, and device mapping.
 #[test]
 #[ignore = "requires an idle pinned CUDA GPU and the host lock"]
 fn einsum_captured_descriptor_benchmark() {
     let _lock = suite_lock();
-    let ep = require_cuda();
-    let batch = std::env::var("EINSUM_BENCH_BATCH")
+    let replay_batch = std::env::var("EINSUM_BENCH_REPLAYS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(2048);
-    let repeats = std::env::var("EINSUM_BENCH_REPEATS")
+    let batches = std::env::var("EINSUM_BENCH_BATCHES")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3);
@@ -1505,79 +2002,209 @@ fn einsum_captured_descriptor_benchmark() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(8);
-    let dtype = match std::env::var("EINSUM_BENCH_DTYPE")
-        .unwrap_or_else(|_| "f16".into())
-        .as_str()
-    {
-        "f16" => DataType::Float16,
-        "f32" => DataType::Float32,
-        other => panic!("EINSUM_BENCH_DTYPE must be f16 or f32, got {other}"),
-    };
-    assert!(repeats >= 3, "benchmark evidence requires n >= 3");
+    let expect_runnable = std::env::var("EINSUM_BENCH_EXPECT_RUNNABLE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    let max_drift_percent = std::env::var("EINSUM_BENCH_MAX_DRIFT_PERCENT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5.0);
+    let max_control_spread_percent = std::env::var("EINSUM_BENCH_MAX_CONTROL_SPREAD_PERCENT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5.0);
+    assert!(batches >= 3, "benchmark evidence requires n >= 3 batches");
+    assert!(
+        ramp_seconds >= 8,
+        "benchmark evidence requires at least 8 seconds of continuous warmup per arm"
+    );
+    hostlock_provenance("sweep-start", expect_runnable);
+    let ep = require_cuda();
+    gpu_identity(&ep);
     println!(
-        "BENCH_CONFIG,gpu={},dtype={dtype:?},M=256,K=512,N=384,batch={},repeats={},ramp_seconds={}",
-        physical_gpu(),
-        batch,
-        repeats,
-        ramp_seconds
+        "BENCH_SCOPE,synthetic_captured_contraction_only=true,model_or_end_to_end_claim=false,M={BENCH_M},K={BENCH_K},N={BENCH_N}"
     );
     println!(
-        "BENCH_HEADER,label,rep,kernel_us,setup_us,plan_setup_us,workspace_bytes,launches,materialization_bytes"
+        "BENCH_CONFIG,gpu={},dtypes=Float16|Float32,replay_batch={},batches={},abba=true,ramp_seconds={},expect_runnable={},max_drift_percent={:.3},max_control_spread_percent={:.3}",
+        physical_gpu(),
+        replay_batch,
+        batches,
+        ramp_seconds,
+        expect_runnable,
+        max_drift_percent,
+        max_control_spread_percent,
+    );
+    println!(
+        "BENCH_HEADER,dtype,batch,slot,arm,route,kernel_us,fixture_setup_us,warm_execute_us,plan_setup_us,capture_us,ramp_ms,captures,ramp_replays,timed_replays,captured_kernel_launches,gemm_launches,canonical_gemm_launches,descriptor_gemm_launches,transpose_launches,fallback_count,fallback_reason,workspace_bytes,persistent_metadata_bytes,materialization_bytes,alloc_before,free_before,alloc_after_warm,free_after_warm,alloc_after_capture,free_after_capture,alloc_after_timed,free_after_timed,alloc_after_finish,free_after_finish,clock_pre_mhz,clock_post_mhz,power_pre_w,power_post_w,oracle_max_abs,oracle_max_rel,output_digest"
     );
 
-    let mut first_descriptor = None;
-    for rep in 0..repeats {
-        for (label, materialized, canonical) in [
-            ("descriptor", false, false),
-            ("materialized", true, false),
-            ("control-a", false, true),
-            ("control-b", false, true),
-        ] {
-            let result = measure_bench_arm(
-                &ep,
-                label,
-                materialized,
-                canonical,
-                dtype,
-                batch,
-                if rep == 0 && label == "descriptor" {
-                    ramp_seconds
-                } else {
-                    0
-                },
-            );
-            if first_descriptor.is_none() && label == "descriptor" {
-                first_descriptor = Some(result.kernel_us);
+    let logical_a = values(BENCH_M * BENCH_K, 13);
+    let b_values = values(BENCH_K * BENCH_N, 17);
+    for dtype in [DataType::Float16, DataType::Float32] {
+        let expected = f64_gemm_reference(
+            &quantize(&logical_a, dtype),
+            &quantize(&b_values, dtype),
+            1,
+            BENCH_M,
+            BENCH_K,
+            BENCH_N,
+            false,
+            false,
+            0,
+            0,
+        );
+        let logical_a_bytes = float_input(dtype, &[BENCH_M, BENCH_K], &logical_a).bytes;
+        let b_bytes = float_input(dtype, &[BENCH_K, BENCH_N], &b_values).bytes;
+        let math_digest = digest(&[logical_a_bytes, b_bytes].concat());
+        println!(
+            "ORACLE_CONFIG,dtype={dtype:?},kind=independent-f64-cpu,input_math_digest={math_digest:016x},output_elements={}",
+            expected.len()
+        );
+
+        let mut results = Vec::new();
+        for batch_index in 0..batches {
+            let order = if batch_index % 2 == 0 {
+                [
+                    BenchArm::Descriptor,
+                    BenchArm::Materialized,
+                    BenchArm::Control,
+                    BenchArm::Materialized,
+                    BenchArm::Descriptor,
+                ]
+            } else {
+                [
+                    BenchArm::Materialized,
+                    BenchArm::Descriptor,
+                    BenchArm::Control,
+                    BenchArm::Descriptor,
+                    BenchArm::Materialized,
+                ]
+            };
+            let block_start = results.len();
+            for (slot, arm) in order.into_iter().enumerate() {
+                let result = measure_bench_arm(
+                    &ep,
+                    arm,
+                    dtype,
+                    batch_index,
+                    slot,
+                    &logical_a,
+                    &b_values,
+                    &expected,
+                    replay_batch,
+                    ramp_seconds,
+                    expect_runnable,
+                );
+                println!(
+                    "ORACLE_PASS,dtype={dtype:?},batch={batch_index},slot={slot},arm={},math_digest={math_digest:016x},max_abs={:.8e},max_rel={:.8e},output_digest={:016x}",
+                    arm.label(),
+                    result.oracle_max_abs,
+                    result.oracle_max_rel,
+                    result.output_digest
+                );
+                print_bench_result(dtype, &result);
+                results.push(result);
             }
+            for (pair, (left, right)) in [(0, (0, 1)), (1, (3, 4))] {
+                let pair_results = [&results[block_start + left], &results[block_start + right]];
+                let descriptor = pair_results
+                    .iter()
+                    .find(|result| result.arm == BenchArm::Descriptor)
+                    .unwrap();
+                let materialized = pair_results
+                    .iter()
+                    .find(|result| result.arm == BenchArm::Materialized)
+                    .unwrap();
+                println!(
+                    "PAIR_RATIO,dtype={dtype:?},batch={batch_index},pair={pair},descriptor_us={:.6},materialized_us={:.6},materialized_over_descriptor={:.6}",
+                    descriptor.kernel_us,
+                    materialized.kernel_us,
+                    materialized.kernel_us / descriptor.kernel_us
+                );
+            }
+        }
+
+        let first_descriptor = results
+            .iter()
+            .find(|result| result.arm == BenchArm::Descriptor)
+            .unwrap()
+            .kernel_us;
+        let drift = measure_bench_arm(
+            &ep,
+            BenchArm::Descriptor,
+            dtype,
+            batches,
+            0,
+            &logical_a,
+            &b_values,
+            &expected,
+            replay_batch,
+            ramp_seconds,
+            expect_runnable,
+        );
+        print_bench_result(dtype, &drift);
+        let drift_percent = (drift.kernel_us / first_descriptor - 1.0) * 100.0;
+        println!(
+            "BENCH_DRIFT,dtype={dtype:?},descriptor_first_us={first_descriptor:.6},descriptor_last_us={:.6},percent={drift_percent:.3}",
+            drift.kernel_us
+        );
+        assert!(
+            drift_percent.abs() <= max_drift_percent,
+            "{dtype:?}: first/last descriptor drift {drift_percent:.3}% exceeds \
+             {max_drift_percent:.3}%"
+        );
+
+        for arm in [
+            BenchArm::Descriptor,
+            BenchArm::Materialized,
+            BenchArm::Control,
+        ] {
+            let values = results
+                .iter()
+                .filter(|result| result.arm == arm)
+                .map(|result| result.kernel_us)
+                .collect::<Vec<_>>();
+            let (median, min, max) = median_range(&values);
             println!(
-                "BENCH,{},{},{:.4},{:.1},{:.1},{},{},{}",
-                result.label,
-                rep,
-                result.kernel_us,
-                result.setup_us,
-                result.plan_setup_us,
-                result.workspace_bytes,
-                result.launches,
-                result.materialization_bytes
+                "BENCH_SUMMARY,dtype={dtype:?},arm={},n={},median_us={median:.6},min_us={min:.6},max_us={max:.6}",
+                arm.label(),
+                values.len()
             );
         }
+        let controls = results
+            .iter()
+            .filter(|result| result.arm == BenchArm::Control)
+            .map(|result| result.kernel_us)
+            .collect::<Vec<_>>();
+        let (_, control_min, control_max) = median_range(&controls);
+        let control_spread_percent = (control_max / control_min - 1.0) * 100.0;
+        println!(
+            "CONTROL_GATE,dtype={dtype:?},n={},min_us={control_min:.6},max_us={control_max:.6},spread_percent={control_spread_percent:.3}",
+            controls.len()
+        );
+        assert!(
+            control_spread_percent <= max_control_spread_percent,
+            "{dtype:?}: unaffected control spread {control_spread_percent:.3}% exceeds \
+             {max_control_spread_percent:.3}%"
+        );
+
+        let descriptor = results
+            .iter()
+            .filter(|result| result.arm == BenchArm::Descriptor)
+            .map(|result| result.kernel_us)
+            .collect::<Vec<_>>();
+        let materialized = results
+            .iter()
+            .filter(|result| result.arm == BenchArm::Materialized)
+            .map(|result| result.kernel_us)
+            .collect::<Vec<_>>();
+        let (descriptor_median, _, _) = median_range(&descriptor);
+        let (materialized_median, _, _) = median_range(&materialized);
+        println!(
+            "BENCH_CONCLUSION,dtype={dtype:?},scope=captured-synthetic-256x512x384-only,descriptor_median_us={descriptor_median:.6},materialized_median_us={materialized_median:.6},materialized_over_descriptor={:.6}",
+            materialized_median / descriptor_median
+        );
     }
-    let last = measure_bench_arm(&ep, "descriptor-last", false, false, dtype, batch, 0);
-    println!(
-        "BENCH,{},{},{:.4},{:.1},{:.1},{},{},{}",
-        last.label,
-        repeats,
-        last.kernel_us,
-        last.setup_us,
-        last.plan_setup_us,
-        last.workspace_bytes,
-        last.launches,
-        last.materialization_bytes
-    );
-    let first = first_descriptor.unwrap();
-    println!(
-        "BENCH_DRIFT,descriptor_first_us={first:.4},descriptor_last_us={:.4},percent={:.3}",
-        last.kernel_us,
-        (last.kernel_us / first - 1.0) * 100.0
-    );
+    hostlock_provenance("sweep-end", expect_runnable);
 }
