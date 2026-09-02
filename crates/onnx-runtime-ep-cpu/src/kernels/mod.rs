@@ -381,8 +381,13 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // a real KV-cache node with an f16 cache and Int64 indices passes.
         ("TensorScatter", "") => ARITH_DTYPES,
 
-        // MatMul supports f32 natively + f16/bf16 via half_gemm.
+        // MatMul/Gemm support f64 as well as the three native compute dtypes.
         ("MatMul", "") | ("Gemm", "") => FLOAT_DTYPES,
+
+        // Einsum deliberately advertises only the native compute types. The
+        // canonical planner understands wider ONNX numeric types, but this
+        // kernel accumulates through the CPU MatMul/f32-compute paths.
+        ("Einsum", "") => FLOAT_COMPUTE_DTYPES,
 
         // Float-only ops (dispatch_float! or explicit float handling).
         ("Sqrt", "")
@@ -588,6 +593,7 @@ pub mod dense_elementwise;
 pub mod dft;
 pub mod dropout;
 pub mod dsa_index_select;
+pub mod einsum;
 pub mod elementwise;
 pub mod expand;
 pub mod eye_like;
@@ -698,6 +704,7 @@ pub mod nchwc;
 /// The set of ops the CPU EP implements for the Phase-1 BERT-on-CPU milestone.
 pub const PHASE1_OPS: &[&str] = &[
     "MatMul",
+    "Einsum",
     "Add",
     "Relu",
     "Reshape",
@@ -1031,6 +1038,10 @@ fn build_cpu_registry_recorded_inner(
     //
     // All subsequent registrations go through the recording wrapper.
     rec.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
+    rec.register(
+        OpKey::new("Einsum", "", 12),
+        Box::new(einsum::EinsumFactory),
+    );
     rec.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
         Box::new(matmul_nbits::MatMulNBitsFactory),

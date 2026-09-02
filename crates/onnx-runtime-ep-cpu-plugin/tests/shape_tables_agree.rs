@@ -241,9 +241,33 @@ fn dft_opset17_default_axis_agrees() {
     );
 }
 
+fn einsum_agrees_on_canonical_gemm_shape() {
+    let mut einsum = node("Einsum", 2, &[], 12);
+    einsum
+        .attributes
+        .insert("equation".into(), Attribute::String(b"ik,kj->ij".to_vec()));
+    let left = [0.0f32; 6];
+    let right = [0.0f32; 12];
+    let left_view = view(DataType::Float32, &[2, 3], &[3, 1], left.as_ptr().cast());
+    let right_view = view(DataType::Float32, &[3, 4], &[4, 1], right.as_ptr().cast());
+    let input_shapes = vec![vec![Some(2), Some(3)], vec![Some(3), Some(4)]];
+    let plugin_rule = ShapeInference::for_node(&einsum, &input_shapes, 1);
+    assert_agree(
+        "Einsum canonical GEMM",
+        &einsum,
+        12,
+        plugin_rule,
+        &[left_view, right_view],
+        vec![
+            typed(DataType::Float32, &[2, 3]),
+            typed(DataType::Float32, &[3, 4]),
+        ],
+    );
+}
+
 #[test]
 fn migrated_shared_rules_agree() {
-    const EXPECTED_RULES: &[&str] = &["ConstantOfShape", "DFT", "Expand", "STFT", "Tile"];
+    const EXPECTED_RULES: &[&str] = &["ConstantOfShape", "DFT", "Einsum", "Expand", "STFT", "Tile"];
     let rules = onnx_runtime_ep_plugin::compute::shared_native_rule_names_for_test();
     assert_eq!(
         rules, EXPECTED_RULES,
@@ -254,6 +278,7 @@ fn migrated_shared_rules_agree() {
         match rule {
             "ConstantOfShape" => constant_of_shape_agrees(),
             "DFT" => dft_opset17_default_axis_agrees(),
+            "Einsum" => einsum_agrees_on_canonical_gemm_shape(),
             "Expand" => expand_agrees_on_bidirectional_broadcast(),
             "STFT" => stft_agrees_on_overlapping_frames_and_onesided_bins(),
             "Tile" => tile_agrees(),

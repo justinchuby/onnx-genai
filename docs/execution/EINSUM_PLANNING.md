@@ -61,4 +61,9 @@ logical axis marked `requires_runtime_check` against concrete runtime shapes.
 reparsing, and `resolve_concrete_gemm_geometry` returns overflow-checked concrete
 batch/M/K/N geometry for `Gemm` plans.
 
-No execution kernel is defined by this contract.
+The native CPU EP implements the four executable classes for
+`Float32`/`Float16`/`BFloat16`: zero-copy view/diagonal outputs where the
+executor permits aliases, canonical reduction/elementwise loops, and binary
+GEMM/BMM lowering through the existing MatMul kernel. `Unsupported` remains a
+claim-time refusal with the plan's structured reason. Other EPs may implement
+different subsets without changing this shared contract.

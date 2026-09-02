@@ -472,6 +472,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "Einsum"
+            && op.domain.is_empty()
+            && let Some(reason) =
+                crate::kernels::einsum::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         // Attribute-level capability limits for the attention and MoE family.
         //
         // Every one of these mirrors a rejection its kernel factory raises, and
@@ -1161,11 +1168,21 @@ mod tests {
         let ep = CpuExecutionProvider::new();
         for (i, op) in crate::kernels::PHASE1_OPS.iter().enumerate() {
             let mut node = Node::new(onnx_runtime_ir::NodeId(i as u32), *op, vec![], vec![]);
+            let shapes = if *op == "Einsum" {
+                node.attributes
+                    .insert("equation".into(), Attribute::String(b"i->i".to_vec()));
+                vec![vec![2]]
+            } else {
+                Vec::new()
+            };
             if *op == "BitShift" {
                 node.attributes
                     .insert("direction".into(), Attribute::String(b"RIGHT".to_vec()));
             }
-            assert!(ep.get_kernel(&node, &[], 18).is_ok(), "no kernel for {op}");
+            assert!(
+                ep.get_kernel(&node, &shapes, 18).is_ok(),
+                "no kernel for {op}"
+            );
         }
         let bad = Node::new(onnx_runtime_ir::NodeId(99), "UnknownOp", vec![], vec![]);
         assert!(ep.get_kernel(&bad, &[], 17).is_err());
