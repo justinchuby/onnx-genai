@@ -2488,8 +2488,7 @@ impl Executor {
             let opset = effective_opset(&self.graph, node);
             let seq_independent =
                 node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
-            let graph_tokens =
-                std::array::from_fn(|index| self.slot_capture[index].device_graph_token);
+            let graph_tokens = self.captured_graph_tokens_for_plan_index(i);
             let (_, key) = self.cache.get_or_create(
                 node_id,
                 node,
@@ -2573,6 +2572,34 @@ impl Executor {
                 logical_shape,
                 expose_logical_input_shape,
                 decode_freeze_safe_mask,
+                fixed_physical_strides: false,
+                allocation_bytes: None,
+                committed_ranges: None,
+            },
+        )
+    }
+
+    pub(crate) fn allocate_device_binding_fixed_strides(
+        &self,
+        input_name: String,
+        output_name: String,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+    ) -> Result<DeviceIoBinding> {
+        let bind_input = !input_name.is_empty();
+        DeviceIoBinding::allocate(
+            self.ep.clone(),
+            DeviceBindingSpec {
+                input_name,
+                bind_input,
+                output_name: Some(output_name),
+                dtype,
+                physical_shape,
+                logical_shape,
+                expose_logical_input_shape: bind_input,
+                decode_freeze_safe_mask: false,
+                fixed_physical_strides: true,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -2617,6 +2644,7 @@ impl Executor {
                 logical_shape,
                 expose_logical_input_shape,
                 decode_freeze_safe_mask,
+                fixed_physical_strides: false,
                 allocation_bytes: Some(allocation_bytes),
                 committed_ranges: Some(committed_ranges),
             },
@@ -2681,6 +2709,7 @@ impl Executor {
                     logical_shape,
                     expose_logical_input_shape,
                     decode_freeze_safe_mask,
+                    fixed_physical_strides: false,
                     allocation_bytes: None,
                     committed_ranges: None,
                 },
@@ -2713,6 +2742,7 @@ impl Executor {
                 logical_shape,
                 expose_logical_input_shape: false,
                 decode_freeze_safe_mask: false,
+                fixed_physical_strides: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -2812,10 +2842,12 @@ impl Executor {
                 }
             }
         }
-        // Fast path: every direct consumer already reads the physical extent
-        // (`Shape`/`ReduceSum`), as in dense GQA masks (mask → ReduceSum→seqlens_k
-        // and Shape only).
-        if found && all_direct_padded {
+        // A bare Shape read may intentionally observe capacity, but once its
+        // result is consumed the downstream topology decides whether substituting
+        // physical capacity for logical length is sound. Fall through to the
+        // topology classifier instead of letting the direct-op allowlist decide
+        // that separate question.
+        if found && all_direct_padded && !binding_shape_result_is_observed(&self.graph, input) {
             return true;
         }
         // Topology-gated path: the mask binding feeds *only* the standard additive

@@ -3,20 +3,20 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(not(feature = "native-cuda"))]
+use onnx_genai_engine::CompressedStateLoadRefusal;
+#[cfg(feature = "native-cuda")]
+use onnx_genai_engine::NativeDecodeMetadataRefusal;
 use onnx_genai_engine::{
     CompressedRecordStateInfo, NativeDecodeDevice, NativeDecodeSession, NativeStateOperation,
-    NativeStateOperationRefusal,
-};
-#[cfg(feature = "native-cuda")]
-use onnx_genai_engine::{
-    CompressedStateLoadRefusal, NativeDecodeMetadataRefusal,
-    native_cuda_provider_construction_attempts,
+    NativeStateOperationRefusal, native_cuda_provider_construction_attempts,
 };
 use onnx_genai_metadata::{CompressionRatio, StateGroupProperties, StateKind, StatePortRole};
 use onnx_runtime_ir::DataType;
 use onnx_runtime_memory_governor::Tier;
-
 #[cfg(feature = "native-cuda")]
+use onnx_runtime_session::{DevicePreference, InferenceSession};
+
 static CUDA_METADATA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn fixture_dir() -> PathBuf {
@@ -88,8 +88,159 @@ fn build_cpu_session(dir: &Path) -> NativeDecodeSession {
     .expect("load canonical workflow metadata and native CPU model")
 }
 
+#[cfg(feature = "native-cuda")]
+fn remove_textproto_message(text: &mut String, marker: &str) {
+    let start = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing textproto message marker {marker:?}"));
+    let mut depth = 0usize;
+    let mut end = None;
+    for (offset, byte) in text.as_bytes()[start..].iter().copied().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1).expect("balanced textproto braces");
+                if depth == 0 {
+                    end = Some(start + offset + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut end = end.expect("complete textproto message");
+    if text.as_bytes().get(end) == Some(&b'\n') {
+        end += 1;
+    }
+    text.replace_range(start..end, "");
+}
+
+#[cfg(feature = "native-cuda")]
+fn five_output_fixture_dir(source: &Path) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-fixtures/tiny-deepseek-v4-csa-five-output");
+    std::fs::create_dir_all(&dir).expect("create governed five-output fixture directory");
+    let mut model = std::fs::read_to_string(source.join("model.onnx.textproto"))
+        .expect("read canonical CSA fixture");
+    let node_output = "    output: \"selected_indices.0\"\n";
+    assert_eq!(
+        model.matches(node_output).count(),
+        1,
+        "selected_indices must be one CSA node output"
+    );
+    model = model.replacen(node_output, "", 1);
+    remove_textproto_message(&mut model, "  output {\n    name: \"selected_indices.0\"\n");
+    std::fs::write(dir.join("model.onnx.textproto"), model).expect("write five-output CSA fixture");
+    std::fs::copy(
+        source.join("inference_metadata.yaml"),
+        dir.join("inference_metadata.yaml"),
+    )
+    .expect("copy canonical CSA metadata");
+    dir
+}
+
+#[cfg(feature = "native-cuda")]
+fn build_cuda_session(dir: &Path) -> NativeDecodeSession {
+    let metadata = onnx_genai_metadata::load_metadata_from_dir(dir)
+        .expect("load CSA fixture metadata")
+        .expect("CSA fixture metadata");
+    let io = metadata.decoder_io().expect("derive canonical decoder ABI");
+    let session = InferenceSession::builder()
+        .model(dir.join("model.onnx.textproto"))
+        .device(DevicePreference::Gpu { index: Some(0) })
+        .option("optimization", "basic")
+        .build()
+        .expect("build native CUDA session over the CSA fixture");
+    NativeDecodeSession::from_session_with_io(session, io)
+        .expect("wrap canonical CSA decoder with fixed-stride CUDA state")
+}
+
 fn schedule_fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-deepseek-v4-csa-schedule")
+}
+
+#[cfg(feature = "native-cuda")]
+#[test]
+fn cuda_native_five_output_ratio4_scatter_preserves_fixed_stride_state() {
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping native fixed-stride five-output CSA test: {error}");
+        return;
+    }
+    let dir = five_output_fixture_dir(&fixture_dir());
+    let graph =
+        onnx_runtime_loader::load_model(dir.join("model.onnx.textproto")).expect("load fixture");
+    let ratio4 = graph
+        .nodes
+        .iter()
+        .map(|(_, node)| node)
+        .find(|node| {
+            node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+                && node.op_type == "CompressedSparseAttention"
+                && node
+                    .attr("compression_ratio")
+                    .and_then(|value| value.as_int())
+                    == Some(4)
+        })
+        .expect("ratio-4 CSA node");
+    assert_eq!(
+        ratio4.outputs.len(),
+        5,
+        "fixture must exercise the valid five-output CSA schema"
+    );
+
+    let mut cuda = build_cuda_session(&dir);
+    let initial = cuda.cuda_kv_debug_stats().expect("CUDA state stats");
+    assert_eq!(initial.csa_record_device_ptrs.len(), 3);
+    assert!(
+        initial
+            .csa_record_logical_shapes
+            .iter()
+            .all(|shape| shape[0] == 1)
+    );
+    let pointers = initial.csa_record_device_ptrs;
+
+    for total in 1..=9 {
+        let past = total - 1;
+        let token = ((total * 3) % 97 + 1) as u32;
+        let logits = cuda
+            .decode(&[token], past)
+            .unwrap_or_else(|error| panic!("five-output CUDA token {total} failed: {error:#}"));
+        assert!(
+            logits[0].iter().all(|value| value.is_finite()),
+            "five-output CUDA token {total} produced non-finite logits"
+        );
+    }
+
+    let stats = cuda.cuda_kv_debug_stats().expect("CUDA state stats");
+    assert_eq!(stats.csa_record_device_ptrs, pointers);
+    assert!(
+        stats
+            .csa_record_logical_shapes
+            .iter()
+            .zip(&stats.csa_record_physical_shapes)
+            .all(|(logical, physical)| {
+                logical[0] == 1
+                    && logical[1] <= physical[1]
+                    && logical[2] == physical[2]
+                    && physical[1] > logical[1]
+            })
+    );
+    assert!(
+        stats.csa_record_growth_events >= 2,
+        "ratio-4 record cursors must grow while fixed physical strides stay stable"
+    );
+
+    cuda.reset().expect("reset fixed-stride CSA state");
+    let reset = cuda.cuda_kv_debug_stats().expect("reset CUDA state stats");
+    assert_eq!(reset.csa_record_device_ptrs, pointers);
+    assert!(
+        reset
+            .csa_record_logical_shapes
+            .iter()
+            .all(|shape| shape[1] == 0)
+    );
+    let logits = cuda.decode(&[17], 0).expect("decode after CSA reset");
+    assert!(logits[0].iter().all(|value| value.is_finite()));
 }
 
 fn argmax(row: &[f32]) -> u32 {
@@ -408,14 +559,13 @@ fn failed_step_retry_and_reset_do_not_reuse_stale_state() {
     );
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(not(feature = "native-cuda"))]
 #[test]
 fn native_cuda_declines_compressed_state_before_provider_allocation() {
     let _serial = CUDA_METADATA_TEST_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let dir = fixture_dir();
-    onnx_runtime_ep_cuda::vmm_allocator::reset_global_vmm_stats();
     let constructions = native_cuda_provider_construction_attempts();
     let error = match NativeDecodeSession::load_with_resolved_io(
         dir.join("model.onnx.textproto"),
@@ -435,7 +585,7 @@ fn native_cuda_declines_compressed_state_before_provider_allocation() {
     assert!(
         error
             .to_string()
-            .contains("native decode will not fall back the whole session to CPU"),
+            .contains("never falls back the whole session to CPU"),
         "typed CUDA decline must explain the no-fallback policy: {error:#}"
     );
     assert_eq!(
@@ -443,11 +593,118 @@ fn native_cuda_declines_compressed_state_before_provider_allocation() {
         constructions,
         "typed compressed-state refusal must precede CUDA provider construction"
     );
-    let stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
-    assert_eq!(stats.reserved_bytes, 0);
-    assert_eq!(stats.committed_bytes, 0);
-    assert_eq!(stats.allocations, 0);
-    assert_eq!(stats.commits, 0);
+}
+
+#[cfg(feature = "native-cuda")]
+#[test]
+fn native_cuda_loader_materializes_all_governed_state_once() {
+    let _serial = CUDA_METADATA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    onnx_runtime_ep_cuda::vmm_allocator::reset_global_vmm_stats();
+    let constructions = native_cuda_provider_construction_attempts();
+    let mut session = NativeDecodeSession::load_with_resolved_io(
+        fixture_dir().join("model.onnx.textproto"),
+        NativeDecodeDevice::Cuda { index: Some(0) },
+    )
+    .expect("strict CUDA must materialize the governed compressed-state groups");
+    assert_eq!(
+        native_cuda_provider_construction_attempts(),
+        constructions + 1,
+        "the supported path must construct exactly one CUDA provider"
+    );
+
+    let initial = session
+        .cuda_kv_debug_stats()
+        .expect("strict CUDA loader must expose device state");
+    assert_eq!(initial.csa_record_device_ptrs.len(), 3);
+    assert!(
+        initial
+            .csa_record_device_ptrs
+            .iter()
+            .all(|pointer| *pointer != 0),
+        "every compressed record must own a real CUDA allocation"
+    );
+    assert!(
+        initial
+            .csa_record_logical_shapes
+            .iter()
+            .all(|shape| shape[1] == 0),
+        "new logical generations must publish zero-length record cursors"
+    );
+    let loader = session.compressed_state_path_stats();
+    assert_eq!(loader.manifest_lookups, 1);
+    assert_eq!(loader.source_opens, 0);
+    assert_eq!(loader.source_reads, 0);
+    assert_eq!(loader.source_bytes_read, 0);
+    assert_eq!(loader.source_mmaps, 0);
+    assert_eq!(loader.device_allocations, 6);
+    assert_eq!(loader.device_zero_fills, 6);
+    assert_eq!(
+        loader.device_zero_fill_bytes, 697_728,
+        "the metadata-bounded fixture must report every initialized record/carry byte exactly"
+    );
+    assert_eq!(loader.telemetry_updates, 1);
+    assert_eq!(loader.host_output_allocations, 0);
+    assert_eq!(loader.host_output_bytes, 0);
+    assert_eq!(loader.host_to_device_copies, 0);
+    assert_eq!(loader.device_to_host_copies, 0);
+    assert_eq!(loader.device_to_device_copies, 0);
+    assert_eq!(loader.synchronizations, 0);
+    assert_eq!(loader.device_events, 0);
+
+    for token in 1..=9 {
+        session
+            .decode(&[token], session.current_len())
+            .unwrap_or_else(|error| panic!("strict CUDA token {token} failed: {error:#}"));
+    }
+    assert_eq!(
+        session.compressed_state_path_stats(),
+        loader,
+        "warmed decode, first capture, and replay must not repeat loader work"
+    );
+    let warmed = session
+        .cuda_kv_debug_stats()
+        .expect("warmed CUDA state stats");
+    assert_eq!(
+        warmed.csa_record_device_ptrs,
+        initial.csa_record_device_ptrs
+    );
+    assert_eq!(warmed.graph.captures, 1);
+    assert_eq!(warmed.graph.replays, 7);
+    assert_eq!(warmed.graph.fallbacks, 0);
+    assert_eq!(warmed.graph.invalidations, 0);
+    assert_eq!(warmed.cuda_decode_submissions, 9);
+    assert_eq!(warmed.csa_record_growth_events, 2);
+
+    let vmm = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
+    assert!(vmm.reserved_bytes > 0);
+    assert!(vmm.allocations > 0);
+    eprintln!(
+        "loaded-state CUDA proof: manifest={} source_opens={} source_reads={} source_bytes={} \
+         source_mmaps={} device_allocations={} device_zero_fills={} device_zero_fill_bytes={} \
+         telemetry_updates={} host_allocations={} h2d={} d2h={} d2d={} sync={} events={} \
+         submissions={} captures={} replays={} record_growths={}",
+        loader.manifest_lookups,
+        loader.source_opens,
+        loader.source_reads,
+        loader.source_bytes_read,
+        loader.source_mmaps,
+        loader.device_allocations,
+        loader.device_zero_fills,
+        loader.device_zero_fill_bytes,
+        loader.telemetry_updates,
+        loader.host_output_allocations,
+        loader.host_to_device_copies,
+        loader.device_to_host_copies,
+        loader.device_to_device_copies,
+        loader.synchronizations,
+        loader.device_events,
+        warmed.cuda_decode_submissions,
+        warmed.graph.captures,
+        warmed.graph.replays,
+        warmed.csa_record_growth_events
+    );
 }
 
 #[cfg(feature = "native-cuda")]
@@ -468,6 +725,15 @@ fn malformed_state_metadata_refuses_before_cuda_provider_and_vmm_construction() 
             document.replacen(
                 "            kind: compressed_attention\n            properties:",
                 "            kind: compressed_attention\n            future_layout: tiled\n            properties:",
+                1,
+            ),
+            ExpectedRefusal::InvalidDocument,
+        ),
+        (
+            "arbitrary-state-source",
+            document.replacen(
+                "            kind: compressed_attention\n            properties:",
+                "            kind: compressed_attention\n            source:\n              path: ../../foreign-state.bin\n            properties:",
                 1,
             ),
             ExpectedRefusal::InvalidDocument,

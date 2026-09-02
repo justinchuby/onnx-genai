@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 /// needed for that slot, `None` when the input was used in place.
 type MaterializedInputs = Vec<Option<(Vec<u8>, Vec<i64>)>>;
 
-fn refill_contiguous_strides(strides: &mut Vec<i64>, shape: &[usize]) {
+pub(super) fn refill_contiguous_strides(strides: &mut Vec<i64>, shape: &[usize]) {
     strides.clear();
     strides.resize(shape.len(), 0);
     let mut stride = 1_i64;
@@ -565,7 +565,9 @@ impl Executor {
 
         let ep = self.ep.clone();
         let artifact_config = self.artifact_config;
-        let graph_tokens = std::array::from_fn(|index| self.slot_capture[index].device_graph_token);
+        // Eager seam variants are not baked into the installed executable, so
+        // evicting one must not reset an otherwise valid segmented graph.
+        let graph_tokens = self.captured_graph_tokens_for_plan_index(pi);
 
         // Bind the mutated fields as disjoint borrows so `self` is never borrowed
         // whole while the kernel (from `cache`) and the buffers/views are held.
@@ -581,6 +583,7 @@ impl Executor {
             executor: self.instance_id,
             ep: &ep,
             graph: &self.graph,
+            external,
             weight_handles: &self.weight_handles,
             expert_region_candidates: &self.expert_region_candidates,
             buffers: &mut self.buffers,
@@ -808,8 +811,17 @@ impl Executor {
         let mut out_strides = std::mem::take(&mut self.scratch_output_strides);
         out_strides.resize_with(output_shapes.len(), Vec::new);
         out_strides.truncate(output_shapes.len());
-        for (strides, shape) in out_strides.iter_mut().zip(&output_shapes) {
-            refill_contiguous_strides(strides, shape);
+        for ((strides, shape), output) in out_strides.iter_mut().zip(&output_shapes).zip(outputs) {
+            if let Some(fixed) = external
+                .outputs
+                .get(output)
+                .and_then(|value| value.strides.as_deref())
+            {
+                strides.clear();
+                strides.extend_from_slice(fixed);
+            } else {
+                refill_contiguous_strides(strides, shape);
+            }
         }
         let (out_bufs, mut outs) = ctx.build_output_bindings(
             outputs,
@@ -1165,7 +1177,7 @@ impl Executor {
                     true,
                     value.dtype,
                     &value.shape,
-                    None,
+                    value.strides.as_deref(),
                     0,
                     value.ptr as *const std::ffi::c_void,
                     value.device,
@@ -1294,29 +1306,43 @@ impl Executor {
                 continue;
             }
             let root = self.root_of(vid);
-            let buf = self.buffers.get(&root).ok_or_else(|| {
-                SessionError::Internal(format!("missing buffer for input value#{}", vid.0))
-            })?;
-            let root_len = buf.len();
-            let base_ptr = buf.as_ptr();
+            let external_root = external
+                .inputs
+                .get(&root)
+                .or_else(|| external.outputs.get(&root));
+            let (root_len, base_ptr, device, backing, root_strides) =
+                if let Some(value) = external_root {
+                    (
+                        value.len,
+                        value.ptr as *const std::ffi::c_void,
+                        value.device,
+                        TensorBacking::Opaque,
+                        value.strides.as_deref(),
+                    )
+                } else {
+                    let buf = self.buffers.get(&root).ok_or_else(|| {
+                        SessionError::Internal(format!("missing buffer for input value#{}", vid.0))
+                    })?;
+                    let backing = self
+                        .graph
+                        .initializers
+                        .get(&root)
+                        .filter(|_| buf.is_borrowed())
+                        .and_then(|weight| self.weights.external_mmap_provenance(weight))
+                        .map(|(mapping_id, offset, len)| {
+                            TensorBacking::ExternalMmap(ExternalMmapRegion {
+                                mapping_id,
+                                offset,
+                                len,
+                            })
+                        })
+                        .unwrap_or(TensorBacking::Opaque);
+                    (buf.len(), buf.as_ptr(), buf.device(), backing, None)
+                };
             let view = self.views.get(&vid);
             let shape = view.map_or(input_shapes[i].as_slice(), |view| view.shape.as_slice());
-            let strides = view.map(|view| view.strides.as_slice());
+            let strides = view.map(|view| view.strides.as_slice()).or(root_strides);
             let byte_offset = view.map_or(0, |view| view.byte_offset);
-            let backing = self
-                .graph
-                .initializers
-                .get(&root)
-                .filter(|_| buf.is_borrowed())
-                .and_then(|weight| self.weights.external_mmap_provenance(weight))
-                .map(|(mapping_id, offset, len)| {
-                    TensorBacking::ExternalMmap(ExternalMmapRegion {
-                        mapping_id,
-                        offset,
-                        len,
-                    })
-                })
-                .unwrap_or(TensorBacking::Opaque);
             refill_in_info(
                 info,
                 true,
@@ -1325,7 +1351,7 @@ impl Executor {
                 strides,
                 byte_offset,
                 base_ptr,
-                buf.device(),
+                device,
                 backing,
                 root_len,
                 false,
@@ -1533,6 +1559,7 @@ struct KernelDispatchContext<'a> {
     executor: ExecutorInstanceId,
     ep: &'a Arc<dyn ExecutionProvider>,
     graph: &'a Graph,
+    external: &'a ExternalBindings,
     weight_handles: &'a HashMap<ValueId, WeightHandle>,
     expert_region_candidates: &'a HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
     buffers: &'a mut HashMap<ValueId, DeviceBuffer>,
@@ -1624,9 +1651,20 @@ impl KernelDispatchContext<'_> {
                 Some(v) => v.source,
                 None => in_vid,
             };
-            let root_len = self.buffers.get(&root).map(|b| b.len()).ok_or_else(|| {
-                SessionError::Internal(format!("view source value#{} has no buffer", root.0))
-            })?;
+            let root_len = self
+                .buffers
+                .get(&root)
+                .map(|buffer| buffer.len())
+                .or_else(|| {
+                    self.external
+                        .inputs
+                        .get(&root)
+                        .or_else(|| self.external.outputs.get(&root))
+                        .map(|value| value.len)
+                })
+                .ok_or_else(|| {
+                    SessionError::Internal(format!("view source value#{} has no buffer", root.0))
+                })?;
             // Bounds-gate the composed view against the source allocation.
             view_bounds(
                 &spec.shape,

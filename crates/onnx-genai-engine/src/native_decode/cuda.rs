@@ -356,6 +356,190 @@ pub(crate) fn resolve_cuda_kv_layout(
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CsaRecordBindingSpec {
+    pub(crate) group: String,
+    pub(crate) past: String,
+    pub(crate) present: String,
+    pub(crate) role: onnx_genai_metadata::StatePortRole,
+    pub(crate) ratio: onnx_genai_metadata::CompressionRatio,
+    pub(crate) batch_axis: usize,
+    pub(crate) sequence_axis: usize,
+    pub(crate) dtype: DataType,
+    pub(crate) record_width_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CsaCarryBindingSpec {
+    pub(crate) group: String,
+    pub(crate) past: String,
+    pub(crate) present: String,
+    pub(crate) role: onnx_genai_metadata::StatePortRole,
+    pub(crate) batch_axis: usize,
+    pub(crate) dtype: DataType,
+}
+
+#[derive(Clone, Debug)]
+struct CsaRecordLayout {
+    binding_index: usize,
+    role: onnx_genai_metadata::StatePortRole,
+    ratio: usize,
+    batch: usize,
+    capacity_records: usize,
+    row_width: usize,
+    element_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CsaSelectedIndicesLayout {
+    binding_index: usize,
+    ratio: usize,
+    batch: usize,
+    index_heads: usize,
+    topk: usize,
+}
+
+impl CsaSelectedIndicesLayout {
+    fn physical_shape(&self) -> Vec<usize> {
+        vec![self.batch, self.index_heads, 1, self.topk]
+    }
+
+    fn logical_shape(&self, tokens: usize) -> Vec<usize> {
+        vec![
+            self.batch,
+            self.index_heads,
+            1,
+            (tokens / self.ratio).min(self.topk),
+        ]
+    }
+}
+
+impl CsaRecordLayout {
+    fn records_for_tokens(&self, tokens: usize) -> usize {
+        tokens / self.ratio
+    }
+
+    fn csa_selected_indices_persistent_shape(
+        graph: &onnx_runtime_ir::Graph,
+        output_name: &str,
+        batch: usize,
+    ) -> Option<CsaSelectedIndicesLayout> {
+        let value_id = graph
+            .outputs
+            .iter()
+            .copied()
+            .find(|&value_id| graph.value(value_id).name.as_deref() == Some(output_name))?;
+        let producer = graph.value(value_id).producer?;
+        let node = graph.node(producer);
+        if node.domain != onnx_runtime_ir::RUNTIME_DOMAIN
+            || node.op_type != "CompressedSparseAttention"
+            || node.outputs.get(5).copied() != Some(value_id)
+        {
+            return None;
+        }
+        let ratio = usize::try_from(node.attr("compression_ratio")?.as_int()?).ok()?;
+        let index_heads = usize::try_from(node.attr("index_num_heads")?.as_int()?).ok()?;
+        let topk = usize::try_from(node.attr("index_topk")?.as_int()?).ok()?;
+        (ratio > 0 && index_heads > 0 && topk > 0).then_some(CsaSelectedIndicesLayout {
+            binding_index: 0,
+            ratio,
+            batch,
+            index_heads,
+            topk,
+        })
+    }
+
+    fn logical_shape(&self, tokens: usize) -> Vec<usize> {
+        vec![self.batch, self.records_for_tokens(tokens), self.row_width]
+    }
+
+    fn row_stride_bytes(&self) -> anyhow::Result<usize> {
+        self.capacity_records
+            .checked_mul(self.row_width)
+            .and_then(|value| value.checked_mul(self.element_bytes))
+            .context("CSA record row stride overflow")
+    }
+
+    fn record_offset_bytes(&self, batch: usize, record: usize) -> anyhow::Result<usize> {
+        if batch >= self.batch || record >= self.capacity_records {
+            bail!(
+                "CSA {:?} record coordinate ({batch}, {record}) exceeds [{}, {}]",
+                self.role,
+                self.batch,
+                self.capacity_records
+            );
+        }
+        batch
+            .checked_mul(self.row_stride_bytes()?)
+            .and_then(|offset| {
+                record
+                    .checked_mul(self.row_width)?
+                    .checked_mul(self.element_bytes)?
+                    .checked_add(offset)
+            })
+            .context("CSA record byte offset overflow")
+    }
+}
+
+#[cfg(test)]
+mod csa_record_layout_tests {
+    use super::CsaRecordLayout;
+    use onnx_genai_metadata::StatePortRole;
+
+    fn layout(batch: usize, ratio: usize, capacity: usize, width: usize) -> CsaRecordLayout {
+        CsaRecordLayout {
+            binding_index: 0,
+            role: StatePortRole::CompressedKv,
+            ratio,
+            batch,
+            capacity_records: capacity,
+            row_width: width,
+            element_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn batch_rows_are_disjoint_for_one_two_and_three_requests() {
+        for batch in 1..=3 {
+            let layout = layout(batch, 4, 65, 583);
+            let stride = layout.row_stride_bytes().unwrap();
+            for row in 0..batch {
+                assert_eq!(layout.record_offset_bytes(row, 0).unwrap(), row * stride);
+                assert_eq!(
+                    layout.record_offset_bytes(row, 64).unwrap(),
+                    row * stride + 64 * 583
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_ratio_cursors_cross_the_exact_boundaries() {
+        let ratio4 = layout(2, 4, 128, 583);
+        let ratio128 = layout(3, 128, 4, 1024);
+        for (tokens, r4, r128) in [
+            (127, 31, 0),
+            (128, 32, 1),
+            (129, 32, 1),
+            (255, 63, 1),
+            (256, 64, 2),
+            (257, 64, 2),
+        ] {
+            assert_eq!(ratio4.records_for_tokens(tokens), r4);
+            assert_eq!(ratio128.records_for_tokens(tokens), r128);
+        }
+    }
+
+    #[test]
+    fn record_offsets_reject_bounds_and_overflow() {
+        let bounded = layout(2, 4, 8, 16);
+        assert!(bounded.record_offset_bytes(2, 0).is_err());
+        assert!(bounded.record_offset_bytes(0, 8).is_err());
+        let overflowing = layout(2, 4, usize::MAX, 2);
+        assert!(overflowing.row_stride_bytes().is_err());
+    }
+}
+
 /// Purely structural signals that gate whether whole-step CUDA graph capture is
 /// *auto-attempted* on the native decode path. Never derived from a model or
 /// architecture name (RULES.md §2/§2.1) — only from device placement and the
@@ -875,6 +1059,10 @@ pub struct CudaKvDebugStats {
     /// Successful single-token CUDA decode submissions. This counts eager
     /// warmup, capture execution, and graph replay exactly once each.
     pub cuda_decode_submissions: u64,
+    pub csa_record_device_ptrs: Vec<usize>,
+    pub csa_record_logical_shapes: Vec<Vec<usize>>,
+    pub csa_record_physical_shapes: Vec<Vec<usize>>,
+    pub csa_record_growth_events: u64,
     /// `true` when the KV bindings are stored seq-major (BSNH) and the binding
     /// layer accounts residency by the dense live-prefix rule; `false` for the
     /// default head-major (BNSH) flat-bucket accounting. Surfaced so the
@@ -1009,6 +1197,12 @@ pub(crate) struct DecodeCudaState {
     pub(crate) bindings: Vec<DeviceIoBinding>,
     pub(crate) base_binding_count: usize,
     pub(crate) kv_binding_range: std::ops::Range<usize>,
+    csa_record_binding_range: std::ops::Range<usize>,
+    csa_record_layouts: Vec<CsaRecordLayout>,
+    csa_selected_indices_layouts: Vec<CsaSelectedIndicesLayout>,
+    csa_record_growth_events: u64,
+    csa_initialization_fills: u64,
+    csa_initialization_bytes: u64,
     /// Bindings for fixed-size recurrent/conv states (hybrid linear-attention
     /// `conv_state`/`recurrent_state`). Unlike growable KV — which is masked and
     /// tracked by `logical_len`, so stale slots are inert — these are wholesale
@@ -3747,10 +3941,15 @@ impl DecodeCudaState {
         session: &InferenceSession,
         present_to_past: &HashMap<String, String>,
         fixed_state_inputs: &HashSet<String>,
+        csa_record_specs: &[CsaRecordBindingSpec],
     ) -> anyhow::Result<usize> {
         let mut bytes = std::mem::size_of::<i64>();
+        let csa_record_inputs = csa_record_specs
+            .iter()
+            .map(|spec| spec.past.as_str())
+            .collect::<HashSet<_>>();
         for past in present_to_past.values() {
-            if fixed_state_inputs.contains(past) {
+            if fixed_state_inputs.contains(past) || csa_record_inputs.contains(past.as_str()) {
                 continue;
             }
             let meta = session
@@ -3803,6 +4002,46 @@ impl DecodeCudaState {
                     format!(
                         "CUDA KV bytes-per-token overflow for '{past}' shape {:?}",
                         meta.shape
+                    )
+                })?;
+        }
+        for spec in csa_record_specs {
+            let meta = session
+                .inputs()
+                .iter()
+                .find(|meta| meta.name == spec.past)
+                .with_context(|| {
+                    format!(
+                        "missing CUDA CSA {:?} input metadata for '{}'",
+                        spec.role, spec.past
+                    )
+                })?;
+            let row_width = match meta.shape.as_slice() {
+                [_, _, Dim::Static(width)] if *width > 0 => *width,
+                _ => bail!(
+                    "CUDA CSA {:?} input '{}' must be rank-3 [batch, records, static width], got \
+                     {:?}",
+                    spec.role,
+                    spec.past,
+                    meta.shape
+                ),
+            };
+            let record_bytes = meta
+                .dtype
+                .checked_storage_bytes(row_width)
+                .with_context(|| {
+                    format!(
+                        "CUDA CSA {:?} input '{}' record byte size overflows for dtype {:?} width \
+                         {row_width}",
+                        spec.role, spec.past, meta.dtype
+                    )
+                })?;
+            bytes = bytes
+                .checked_add(record_bytes.div_ceil(spec.ratio.tokens_per_record()))
+                .with_context(|| {
+                    format!(
+                        "CUDA CSA {:?} input '{}' amortized bytes-per-token overflow",
+                        spec.role, spec.past
                     )
                 })?;
         }
@@ -4664,18 +4903,172 @@ impl DecodeCudaState {
         Ok(shape)
     }
 
+    pub(crate) fn validate_csa_binding_specs(
+        session: &InferenceSession,
+        records: &[CsaRecordBindingSpec],
+        carries: &[CsaCarryBindingSpec],
+    ) -> anyhow::Result<()> {
+        let invalid =
+            |message| anyhow::Error::new(CompressedStateLoadRefusal::InvalidRecordLayout(message));
+        for spec in records {
+            if spec.batch_axis != 0 || spec.sequence_axis != 1 {
+                return Err(invalid(format!(
+                    "CUDA compressed-attention record group '{}' role {:?} requires the operator \
+                     ABI [batch, records, width] with batch_axis 0 and sequence_axis 1, got \
+                     batch_axis {} and sequence_axis {}",
+                    spec.group, spec.role, spec.batch_axis, spec.sequence_axis
+                )));
+            }
+            let input = session
+                .inputs()
+                .iter()
+                .find(|meta| meta.name == spec.past)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "CUDA compressed-attention record group '{}' is missing input '{}'",
+                        spec.group, spec.past
+                    ))
+                })?;
+            let output = session
+                .outputs()
+                .iter()
+                .find(|meta| meta.name == spec.present)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "CUDA compressed-attention record group '{}' is missing output '{}'",
+                        spec.group, spec.present
+                    ))
+                })?;
+            if input.dtype != spec.dtype || output.dtype != spec.dtype {
+                return Err(invalid(format!(
+                    "CUDA compressed-attention record group '{}' role {:?} requires dtype {:?}, \
+                     got input {:?} and output {:?}",
+                    spec.group, spec.role, spec.dtype, input.dtype, output.dtype
+                )));
+            }
+            let (input_width, output_width) =
+                match (input.shape.as_slice(), output.shape.as_slice()) {
+                    ([_, _, Dim::Static(input_width)], [_, _, Dim::Static(output_width)])
+                        if *input_width > 0 && *output_width > 0 =>
+                    {
+                        (*input_width, *output_width)
+                    }
+                    _ => {
+                        return Err(invalid(format!(
+                            "CUDA compressed-attention record group '{}' role {:?} requires rank-3 \
+                         [batch, records, static width] input/output tensors, got {:?} and {:?}",
+                            spec.group, spec.role, input.shape, output.shape
+                        )));
+                    }
+                };
+            if input_width != output_width {
+                return Err(invalid(format!(
+                    "CUDA compressed-attention record group '{}' role {:?} changes record width \
+                     from {input_width} to {output_width}",
+                    spec.group, spec.role
+                )));
+            }
+            let width_bytes = spec
+                .dtype
+                .checked_storage_bytes(input_width)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "CUDA compressed-attention record group '{}' role {:?} has no \
+                         representable byte width for {:?}[{input_width}]",
+                        spec.group, spec.role, spec.dtype
+                    ))
+                })?;
+            if width_bytes != spec.record_width_bytes {
+                return Err(invalid(format!(
+                    "CUDA compressed-attention record group '{}' role {:?} resolved \
+                     {width_bytes} bytes per record, metadata admission resolved {}",
+                    spec.group, spec.role, spec.record_width_bytes
+                )));
+            }
+        }
+        for spec in carries {
+            if spec.batch_axis != 0 {
+                return Err(invalid(format!(
+                    "CUDA compressed-attention carry group '{}' role {:?} requires a \
+                     request-batch axis at position 0, got {}",
+                    spec.group, spec.role, spec.batch_axis
+                )));
+            }
+            let input = session
+                .inputs()
+                .iter()
+                .find(|meta| meta.name == spec.past)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "CUDA compressed-attention carry group '{}' is missing input '{}'",
+                        spec.group, spec.past
+                    ))
+                })?;
+            let output = session
+                .outputs()
+                .iter()
+                .find(|meta| meta.name == spec.present)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "CUDA compressed-attention carry group '{}' is missing output '{}'",
+                        spec.group, spec.present
+                    ))
+                })?;
+            if input.dtype != spec.dtype || output.dtype != spec.dtype {
+                return Err(invalid(format!(
+                    "CUDA compressed-attention carry group '{}' role {:?} requires dtype {:?}, \
+                     got input {:?} and output {:?}",
+                    spec.group, spec.role, spec.dtype, input.dtype, output.dtype
+                )));
+            }
+            if input.shape.len() != output.shape.len() || input.shape.is_empty() {
+                return Err(invalid(format!(
+                    "CUDA compressed-attention carry group '{}' role {:?} requires matching \
+                     non-scalar input/output ranks, got {:?} and {:?}",
+                    spec.group, spec.role, input.shape, output.shape
+                )));
+            }
+            for (axis, (past, present)) in input
+                .shape
+                .iter()
+                .copied()
+                .zip(output.shape.iter().copied())
+                .enumerate()
+            {
+                let valid = if axis == 0 {
+                    matches!((past, present), (Dim::Symbolic(_), Dim::Symbolic(_)))
+                        || matches!((past, present), (Dim::Static(a), Dim::Static(b)) if a == b)
+                } else {
+                    matches!((past, present), (Dim::Static(a), Dim::Static(b)) if a == b)
+                };
+                if !valid {
+                    return Err(invalid(format!(
+                        "CUDA compressed-attention carry group '{}' role {:?} axis {axis} must \
+                         preserve one fixed extent outside request-batch axis 0, got {past:?} \
+                         and {present:?}",
+                        spec.group, spec.role
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session: &mut InferenceSession,
         io: DecodeCudaIo<'_>,
         present_to_past: &HashMap<String, String>,
         fixed_state_inputs: &HashSet<String>,
+        csa_record_specs: &[CsaRecordBindingSpec],
+        csa_carry_specs: &[CsaCarryBindingSpec],
         capacity: CudaKvCapacity,
         mut graph_capture: GraphCaptureDecision,
         position_rank: usize,
         kv_layout: KvCommitLayout,
         requested_batch: Option<usize>,
     ) -> anyhow::Result<Self> {
+        Self::validate_csa_binding_specs(session, csa_record_specs, csa_carry_specs)?;
         let kv_commits_on_demand = session.commits_on_demand();
         // Stage 2b-impl-4 (#750): the persistent decode bindings are shaped for
         // `batch` sequences and batch-N is now turned ON. The batch extent comes
@@ -4786,13 +5179,16 @@ impl DecodeCudaState {
             .collect::<Vec<_>>();
         pairs.sort_unstable_by(|left, right| left.1.cmp(&right.1));
         pairs.sort_by_key(|(_, past)| fixed_state_inputs.contains(past));
+        let csa_record_inputs = csa_record_specs
+            .iter()
+            .map(|spec| spec.past.as_str())
+            .collect::<HashSet<_>>();
         let mut bindings = Vec::with_capacity(4 + pairs.len());
         bindings.push(mask);
         let kv_start = bindings.len();
-        for (present, past) in pairs
-            .iter()
-            .filter(|(_, past)| !fixed_state_inputs.contains(past))
-        {
+        for (present, past) in pairs.iter().filter(|(_, past)| {
+            !fixed_state_inputs.contains(past) && !csa_record_inputs.contains(past.as_str())
+        }) {
             let meta = session
                 .inputs()
                 .iter()
@@ -4871,6 +5267,104 @@ impl DecodeCudaState {
                 native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
             }
         }
+        let csa_record_start = bindings.len();
+        let mut csa_record_layouts = Vec::with_capacity(csa_record_specs.len());
+        let mut csa_initialization_fills = 0_u64;
+        let mut csa_initialization_bytes = 0_u64;
+        for spec in csa_record_specs {
+            let meta = session
+                .inputs()
+                .iter()
+                .find(|meta| meta.name == spec.past)
+                .with_context(|| {
+                    format!("missing CUDA CSA record input metadata for '{}'", spec.past)
+                })?;
+            if meta.shape.len() != 3 {
+                bail!(
+                    "CUDA CSA {:?} input '{}' must be rank 3 [batch, records, width], got {:?}",
+                    spec.role,
+                    spec.past,
+                    meta.shape
+                );
+            }
+            let row_width = match meta.shape[2] {
+                Dim::Static(width) if width > 0 => width,
+                _ => bail!(
+                    "CUDA CSA {:?} input '{}' requires a static non-zero record width, got {:?}",
+                    spec.role,
+                    spec.past,
+                    meta.shape
+                ),
+            };
+            let ratio = spec.ratio.tokens_per_record();
+            let capacity_records = vmm_reserved_max_len.div_ceil(ratio);
+            let physical_shape = vec![batch, capacity_records, row_width];
+            let logical_shape = vec![batch, 0, row_width];
+            let binding_index = bindings.len();
+            let binding = session.allocate_device_binding_fixed_strides(
+                spec.past.clone(),
+                spec.present.clone(),
+                meta.dtype,
+                physical_shape.clone(),
+                logical_shape,
+            )?;
+            let bytes = checked_shape_bytes(&physical_shape, meta.dtype).with_context(|| {
+                format!(
+                    "CUDA CSA {:?} allocation size overflow for '{}' shape {physical_shape:?}",
+                    spec.role, spec.past
+                )
+            })?;
+            native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
+            csa_initialization_fills = csa_initialization_fills
+                .checked_add(1)
+                .context("CUDA compressed-state initialization count overflow")?;
+            csa_initialization_bytes = csa_initialization_bytes
+                .checked_add(
+                    u64::try_from(bytes)
+                        .context("CUDA compressed-state initialization byte count exceeds u64")?,
+                )
+                .context("CUDA compressed-state initialization byte census overflow")?;
+            let element_bytes = meta.dtype.checked_storage_bytes(1).with_context(|| {
+                format!(
+                    "CUDA CSA {:?} input '{}' has unsupported dtype {:?}",
+                    spec.role, spec.past, meta.dtype
+                )
+            })?;
+            let layout = CsaRecordLayout {
+                binding_index,
+                role: spec.role,
+                ratio,
+                batch,
+                capacity_records,
+                row_width,
+                element_bytes,
+            };
+            if batch > 1 && capacity_records > 1 {
+                let first_last = layout.record_offset_bytes(0, capacity_records - 1)?;
+                let second_first = layout.record_offset_bytes(1, 0)?;
+                let record_bytes = row_width
+                    .checked_mul(element_bytes)
+                    .context("CSA record byte width overflow")?;
+                if first_last
+                    .checked_add(record_bytes)
+                    .context("CSA record row end overflow")?
+                    > second_first
+                {
+                    bail!(
+                        "CUDA CSA {:?} layout aliases batch rows for '{}'",
+                        spec.role,
+                        spec.past
+                    );
+                }
+            }
+            bindings.push(binding);
+            csa_record_layouts.push(layout);
+        }
+        let csa_record_end = bindings.len();
+        let csa_carry_inputs = csa_carry_specs
+            .iter()
+            .map(|spec| spec.past.as_str())
+            .collect::<HashSet<_>>();
         for (present, past) in pairs
             .iter()
             .filter(|(_, past)| fixed_state_inputs.contains(past))
@@ -4889,17 +5383,36 @@ impl DecodeCudaState {
                 physical_shape.clone(),
                 logical_shape,
             )?;
-            native_cuda_memset_zero(
-                binding.device_ptr() as usize,
-                checked_shape_bytes(&physical_shape, meta.dtype).with_context(|| {
+            let bytes = checked_shape_bytes(&physical_shape, meta.dtype).with_context(|| {
                     format!(
                         "fixed CUDA decoder state allocation size overflow for '{past}' shape {physical_shape:?}"
                     )
-                })?,
-            )?;
+                })?;
+            native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
+            if csa_carry_inputs.contains(past.as_str()) {
+                csa_initialization_fills = csa_initialization_fills
+                    .checked_add(1)
+                    .context("CUDA compressed-state initialization count overflow")?;
+                csa_initialization_bytes =
+                    csa_initialization_bytes
+                        .checked_add(u64::try_from(bytes).context(
+                            "CUDA compressed-state initialization byte count exceeds u64",
+                        )?)
+                        .context("CUDA compressed-state initialization byte census overflow")?;
+            }
             bindings.push(binding);
         }
         let fixed_state_end = bindings.len();
+        let expected_csa_bindings = csa_record_specs
+            .len()
+            .checked_add(csa_carry_specs.len())
+            .context("CUDA compressed-state binding count overflow")?;
+        if usize::try_from(csa_initialization_fills).ok() != Some(expected_csa_bindings) {
+            bail!(
+                "CUDA compressed-state setup initialized {csa_initialization_fills} of \
+                 {expected_csa_bindings} governed record/carry bindings"
+            );
+        }
 
         let logits_meta = session
             .outputs()
@@ -4981,8 +5494,16 @@ impl DecodeCudaState {
 
         let auxiliary_start = bindings.len();
         let mut declined_auxiliary: Vec<String> = Vec::new();
+        let mut csa_selected_indices_layouts = Vec::new();
         for meta in auxiliary_meta {
-            if let Some((axis, symbol)) = Self::unresolved_symbolic_axis(&meta.shape, &unit_symbols)
+            let csa_selected_layout = CsaRecordLayout::csa_selected_indices_persistent_shape(
+                session.graph(),
+                &meta.name,
+                batch,
+            );
+            if csa_selected_layout.is_none()
+                && let Some((axis, symbol)) =
+                    Self::unresolved_symbolic_axis(&meta.shape, &unit_symbols)
             {
                 // The output's extent on this axis is data-dependent and not
                 // structurally identifiable as batch or query-seq. Collapsing
@@ -5012,22 +5533,50 @@ impl DecodeCudaState {
             // unit) axis → `1`; the `unresolved_symbolic_axis` gate above has
             // already declined any output with a non-unit symbolic axis. At
             // `batch == 1` this is byte-identical to the historical collapse.
-            let shape = Self::persistent_output_shape(&meta.name, meta.dtype, &meta.shape, batch)?;
-            bindings.push(
-                session
-                    .allocate_device_output_binding(
-                        &meta.name,
-                        meta.dtype,
-                        shape.clone(),
-                        shape,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "failed to allocate persistent CUDA device binding for auxiliary graph output '{}'; CUDA graph capture requires every declared output to keep a stable device address",
-                            meta.name
-                        )
-                    })?,
-            );
+            match csa_selected_layout {
+                Some(mut layout) => {
+                    layout.binding_index = bindings.len();
+                    let physical_shape = layout.physical_shape();
+                    let logical_shape = layout.logical_shape(0);
+                    bindings.push(
+                        session
+                            .allocate_device_binding_fixed_strides(
+                                "",
+                                &meta.name,
+                                meta.dtype,
+                                physical_shape,
+                                logical_shape,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "failed to allocate fixed-stride CUDA device binding for \
+                                     compressed-state auxiliary output '{}'",
+                                    meta.name
+                                )
+                            })?,
+                    );
+                    csa_selected_indices_layouts.push(layout);
+                }
+                None => {
+                    let shape =
+                        Self::persistent_output_shape(&meta.name, meta.dtype, &meta.shape, batch)?;
+                    bindings.push(
+                        session
+                            .allocate_device_output_binding(
+                                &meta.name,
+                                meta.dtype,
+                                shape.clone(),
+                                shape,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "failed to allocate persistent CUDA device binding for auxiliary graph output '{}'; CUDA graph capture requires every declared output to keep a stable device address",
+                                    meta.name
+                                )
+                            })?,
+                    );
+                }
+            }
         }
         let auxiliary_end = bindings.len();
         let base_binding_count = bindings.len();
@@ -5152,31 +5701,25 @@ impl DecodeCudaState {
             vec![2 * batch],
         )?;
 
-        // A graph records launch geometry, so replay is unsafe when a persistent
-        // binding exposes a growing logical prefix instead of fixed capacity.
-        // Surfacing *which* bindings force the eager fallback is essential for
-        // capture bring-up of new architectures, so the decision below retains
-        // their names for the session warning and debug/profile statistics.
-        let dynamic_logical: Vec<String> = bindings
-            .iter()
-            .filter(|binding| binding.has_dynamic_logical_input_shape())
-            .map(|binding| {
-                format!(
-                    "{} (physical {:?} vs logical {:?})",
-                    binding.input_name(),
-                    binding.physical_shape(),
-                    binding.logical_shape()
-                )
-            })
-            .collect();
-        if graph_capture.is_enabled() && !dynamic_logical.is_empty() {
-            graph_capture.decline_if_enabled(
-                "persistent_inputs_have_fixed_logical_shapes",
-                format_args!(
-                    "input binding(s) {} expose a growing logical prefix instead of fixed capacity",
-                    dynamic_logical.join(", ")
-                ),
-            );
+        // CSA record sessions use segmented capture: nodes whose geometry
+        // depends on a growing logical prefix remain eager seams while stable
+        // device islands capture. Preserve the historical whole-run decline for
+        // every other decoder until it has an equivalent state contract.
+        if graph_capture.is_enabled() && csa_record_specs.is_empty() {
+            let dynamic_logical = bindings
+                .iter()
+                .filter(|binding| binding.has_dynamic_logical_input_shape())
+                .map(|binding| binding.input_name())
+                .collect::<Vec<_>>();
+            if !dynamic_logical.is_empty() {
+                graph_capture.decline_if_enabled(
+                    "persistent_inputs_have_fixed_logical_shapes",
+                    format_args!(
+                        "input binding(s) {} expose a growing logical prefix instead of fixed capacity",
+                        dynamic_logical.join(", ")
+                    ),
+                );
+            }
         }
         // The attention-mask binding (bindings[0]) is allocated with the
         // consumer-scoped capacity policy: it exposes its logical valid length
@@ -5204,7 +5747,11 @@ impl DecodeCudaState {
         let mask_decode_freeze_safe = bindings
             .first()
             .is_some_and(DeviceIoBinding::mask_decode_freeze_safe);
-        if graph_capture.is_enabled() && mask_exposes_logical && !mask_decode_freeze_safe {
+        if graph_capture.is_enabled()
+            && csa_record_specs.is_empty()
+            && mask_exposes_logical
+            && !mask_decode_freeze_safe
+        {
             graph_capture.decline_if_enabled(
                 "attention_mask_consumers_are_capacity_aware",
                 format_args!(
@@ -5328,7 +5875,13 @@ impl DecodeCudaState {
             bindings,
             base_binding_count,
             kv_binding_range: kv_start..kv_end,
-            fixed_state_binding_range: kv_end..fixed_state_end,
+            csa_record_binding_range: csa_record_start..csa_record_end,
+            csa_record_layouts,
+            csa_selected_indices_layouts,
+            csa_record_growth_events: 0,
+            csa_initialization_fills,
+            csa_initialization_bytes,
+            fixed_state_binding_range: csa_record_end..fixed_state_end,
             state_restore_poison: None,
             state_identity: CudaStateIdentity {
                 instance: state_instance,
@@ -5531,6 +6084,27 @@ impl DecodeCudaState {
             let mut shape = binding.physical_shape().to_vec();
             shape[2] = len;
             binding.set_logical_shape(shape)?;
+        }
+        let grew_records = self.csa_record_layouts.iter().any(|layout| {
+            layout.records_for_tokens(len) > layout.records_for_tokens(self.logical_len)
+        });
+        for layout in &self.csa_record_layouts {
+            let shape = layout.logical_shape(len);
+            if shape[1] > layout.capacity_records {
+                bail!(
+                    "CUDA CSA {:?} needs {} records at token {len}, capacity is {}",
+                    layout.role,
+                    shape[1],
+                    layout.capacity_records
+                );
+            }
+            self.bindings[layout.binding_index].set_logical_shape(shape)?;
+        }
+        for layout in &self.csa_selected_indices_layouts {
+            self.bindings[layout.binding_index].set_logical_shape(layout.logical_shape(len))?;
+        }
+        if grew_records {
+            self.csa_record_growth_events = self.csa_record_growth_events.saturating_add(1);
         }
         self.logical_len = len;
         Ok(())
@@ -5912,8 +6486,29 @@ impl DecodeCudaState {
                     })?;
                 native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
             }
+            for index in self.csa_record_binding_range.clone() {
+                let binding = &self.bindings[index];
+                let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
+                    .with_context(|| {
+                        format!(
+                            "CSA record state re-zero size overflow for binding {index} shape {:?}",
+                            binding.physical_shape()
+                        )
+                    })?;
+                native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
+            }
         }
         self.set_logical_len(target_len)
+    }
+
+    pub(crate) fn snapshot_state_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.csa_record_binding_range
+            .clone()
+            .chain(self.fixed_state_binding_range.clone())
+    }
+
+    pub(crate) fn csa_initialization_census(&self) -> (u64, u64) {
+        (self.csa_initialization_fills, self.csa_initialization_bytes)
     }
 
     fn allocate_fixed_state_scratch(
@@ -5923,9 +6518,11 @@ impl DecodeCudaState {
     ) -> anyhow::Result<Vec<(usize, OwnedCudaScratch)>> {
         let mut scratch = Vec::new();
         scratch
-            .try_reserve_exact(self.fixed_state_binding_range.len())
+            .try_reserve_exact(
+                self.csa_record_binding_range.len() + self.fixed_state_binding_range.len(),
+            )
             .with_context(|| format!("allocate fixed-state {role} journal"))?;
-        for index in self.fixed_state_binding_range.clone() {
+        for index in self.snapshot_state_indices() {
             let binding = &self.bindings[index];
             let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
                 .with_context(|| {
@@ -6173,11 +6770,12 @@ impl DecodeCudaState {
                 self.state_identity.logical
             );
         }
-        if snapshot.buffers.len() != self.fixed_state_binding_range.len() {
+        let expected = self.snapshot_state_indices().count();
+        if snapshot.buffers.len() != expected {
             bail!(
                 "device recurrent restore requested before a matching device snapshot (have {} scratch buffers, need {})",
                 snapshot.buffers.len(),
-                self.fixed_state_binding_range.len()
+                expected
             );
         }
         if let Some(target_len) = target_len
@@ -6962,6 +7560,19 @@ impl DecodeCudaState {
             kv_growth_events: self.kv_growth_events,
             kv_growth_d2d_copy_bytes: self.kv_growth_d2d_copy_bytes,
             cuda_decode_submissions: self.cuda_decode_submissions,
+            csa_record_device_ptrs: self.bindings[self.csa_record_binding_range.clone()]
+                .iter()
+                .map(|binding| binding.device_ptr() as usize)
+                .collect(),
+            csa_record_logical_shapes: self.bindings[self.csa_record_binding_range.clone()]
+                .iter()
+                .map(|binding| binding.logical_shape().to_vec())
+                .collect(),
+            csa_record_physical_shapes: self.bindings[self.csa_record_binding_range.clone()]
+                .iter()
+                .map(|binding| binding.physical_shape().to_vec())
+                .collect(),
+            csa_record_growth_events: self.csa_record_growth_events,
             kv_layout_seq_major: self.kv_layout.is_seq_major(),
             graph: CudaGraphDebugStats {
                 enabled: self.graph_enabled,

@@ -40,7 +40,7 @@ pub(super) struct CarryStateSpec {
     pub input: String,
     pub output: String,
     pub dtype: DataType,
-    batch_axis: usize,
+    pub batch_axis: usize,
     rank: usize,
     fixed_extents: Vec<(usize, usize)>,
 }
@@ -81,8 +81,16 @@ impl CompressedStatePlan {
         self.records.len()
     }
 
+    pub fn device_binding_count(&self) -> usize {
+        self.records.len() + self.carries.len()
+    }
+
     pub fn records(&self) -> impl Iterator<Item = &RecordStateSpec> {
         self.records.iter()
+    }
+
+    pub fn carries(&self) -> impl Iterator<Item = &CarryStateSpec> {
+        self.carries.iter()
     }
 
     pub fn transition_for_present(
@@ -246,11 +254,10 @@ impl std::fmt::Display for CompressedStateLoadRefusal {
                 role_name(*role)
             ),
             Self::UnsupportedDevice => formatter.write_str(
-                "compressed-attention record state is unavailable in this native CUDA decoder: \
-                 graph-visible records require typed fixed-capacity device bindings with a \
-                 compression-cadence cursor, snapshot/restore ownership, and capture-stable \
-                 addresses. Use native CPU or a CUDA implementation that advertises this \
-                 state-group capability; native decode will not fall back the whole session to CPU",
+                "compressed-attention record state requires the native CUDA state implementation, \
+                 but this build does not include the 'native-cuda' feature; rebuild with \
+                 '--features native-cuda' or explicitly select native CPU. Strict CUDA loading \
+                 fails closed and never falls back the whole session to CPU",
             ),
         }
     }
@@ -1205,15 +1212,45 @@ pub(super) fn refuse_compressed_records_on_cuda(
     groups: &[DecoderStateGroup],
     device_is_cuda: bool,
 ) -> anyhow::Result<()> {
-    if device_is_cuda
-        && groups.iter().any(|group| {
-            group.kind == StateKind::CompressedAttention
-                && !matches!(group.update, Some(StateUpdate::Replace))
-        })
+    if !device_is_cuda {
+        return Ok(());
+    }
+    if !groups
+        .iter()
+        .any(|group| group.kind == StateKind::CompressedAttention)
     {
+        return Ok(());
+    }
+    if !cfg!(feature = "native-cuda") {
         return Err(anyhow::Error::new(
             CompressedStateLoadRefusal::UnsupportedDevice,
         ));
+    }
+    for group in groups
+        .iter()
+        .filter(|group| group.kind == StateKind::CompressedAttention)
+    {
+        let sequence_axis = group.sequence_axis;
+        if !matches!(group.update, Some(StateUpdate::Replace)) && sequence_axis != Some(1) {
+            return Err(anyhow::Error::new(
+                CompressedStateLoadRefusal::InvalidRecordLayout(format!(
+                    "CUDA compressed-attention record group '{}' requires the operator ABI \
+                     [batch, records, width] with sequence_axis 1, got {sequence_axis:?}",
+                    group.name
+                )),
+            ));
+        }
+        for port in &group.ports {
+            if port.batch_axis != Some(0) {
+                return Err(anyhow::Error::new(
+                    CompressedStateLoadRefusal::InvalidBatchAxis(format!(
+                        "CUDA compressed-attention state group '{}' role {:?} requires \
+                         request-batch axis 0, got {:?}",
+                        group.name, port.role, port.batch_axis
+                    )),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -2070,6 +2107,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "native-cuda"))]
     #[test]
     fn cuda_decline_is_typed() {
         let groups = vec![group(
@@ -2085,5 +2123,36 @@ mod tests {
                 .downcast_ref::<CompressedStateLoadRefusal>()
                 .is_some_and(|reason| *reason == CompressedStateLoadRefusal::UnsupportedDevice)
         );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_admission_rejects_noncanonical_axes_without_guessing() {
+        let mut records = group(
+            "records",
+            CompressionRatio::Ratio128,
+            CompressedRecordFormat::F32,
+            StateUpdate::Append,
+            vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
+        );
+        refuse_compressed_records_on_cuda(&[records.clone()], true)
+            .expect("canonical CUDA record axes");
+
+        records.sequence_axis = Some(0);
+        let error = refuse_compressed_records_on_cuda(&[records.clone()], true).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<CompressedStateLoadRefusal>(),
+            Some(CompressedStateLoadRefusal::InvalidRecordLayout(message))
+                if message.contains("sequence_axis 1")
+        ));
+
+        records.sequence_axis = Some(1);
+        records.ports[0].batch_axis = Some(1);
+        let error = refuse_compressed_records_on_cuda(&[records], true).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<CompressedStateLoadRefusal>(),
+            Some(CompressedStateLoadRefusal::InvalidBatchAxis(message))
+                if message.contains("request-batch axis 0")
+        ));
     }
 }

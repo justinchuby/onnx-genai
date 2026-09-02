@@ -449,6 +449,7 @@ pub(super) struct DeviceBindingSignature {
     pub(super) accepts_output_subshape: bool,
     pub(super) exposes_logical_input_shape: bool,
     pub(super) mask_decode_freeze_safe: bool,
+    pub(super) fixed_physical_strides: bool,
     pub(super) device_ptr: usize,
 }
 

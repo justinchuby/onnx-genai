@@ -1660,6 +1660,26 @@ impl InferenceSession {
         )
     }
 
+    /// Allocate a fixed-stride persistent binding. An empty `input_name`
+    /// creates an output-only binding whose logical output may be a subshape of
+    /// the capture-stable physical allocation.
+    pub fn allocate_device_binding_fixed_strides(
+        &self,
+        input_name: impl Into<String>,
+        output_name: impl Into<String>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+    ) -> Result<DeviceIoBinding> {
+        self.exec.allocate_device_binding_fixed_strides(
+            input_name.into(),
+            output_name.into(),
+            dtype,
+            physical_shape,
+            logical_shape,
+        )
+    }
+
     /// Allocate a persistent binding whose virtual allocation is larger than
     /// the shape currently exposed to kernels.
     ///

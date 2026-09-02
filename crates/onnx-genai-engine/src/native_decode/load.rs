@@ -239,15 +239,14 @@ impl NativeDecodeSession {
         let path = path.as_ref();
         let metadata = resolve_io_metadata_from_model_path(path)?;
         let io = metadata.as_ref().and_then(|metadata| metadata.decoder_io());
-        Self::load_with_cuda_options_and_io(
-            path,
-            device,
-            NativeDecodeCudaOptions::default(),
-            io,
-            None,
-            None,
-            None,
-        )
+        let options = NativeDecodeCudaOptions {
+            metadata_max_len: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.model.as_ref())
+                .and_then(|model| model.max_sequence_length),
+            ..NativeDecodeCudaOptions::default()
+        };
+        Self::load_with_cuda_options_and_io(path, device, options, io, None, None, None)
     }
 
     pub(crate) fn load_with_weight_offload_host_cache(
@@ -861,6 +860,31 @@ impl NativeDecodeSession {
             io.map(|io| io.state_groups.as_slice()).unwrap_or_default(),
             session.device_id().device_type == DeviceType::Cuda,
         )?;
+        let csa_record_specs = compressed_state
+            .records()
+            .map(|spec| CsaRecordBindingSpec {
+                group: spec.group.clone(),
+                past: spec.input.clone(),
+                present: spec.output.clone(),
+                role: spec.role,
+                ratio: spec.ratio,
+                batch_axis: spec.batch_axis,
+                sequence_axis: spec.sequence_axis,
+                dtype: spec.dtype,
+                record_width_bytes: spec.record_width_bytes,
+            })
+            .collect::<Vec<_>>();
+        let csa_carry_specs = compressed_state
+            .carries()
+            .map(|spec| CsaCarryBindingSpec {
+                group: spec.group.clone(),
+                past: spec.input.clone(),
+                present: spec.output.clone(),
+                role: spec.role,
+                batch_axis: spec.batch_axis,
+                dtype: spec.dtype,
+            })
+            .collect::<Vec<_>>();
         // Only the fixed carries and hybrid recurrent states are wholesale-swap
         // "fixed" state; the growable CSA record buffers are explicitly excluded
         // so the CUDA/accounting/growth paths treat them as growable, matching
@@ -1036,6 +1060,7 @@ impl NativeDecodeSession {
                 &session,
                 &present_to_past,
                 &fixed_state_inputs,
+                &csa_record_specs,
             )?;
             let device_memory = cuda_device_memory_snapshot(session.device_id().index as i32).ok();
             let max_len = match cuda_options.kv_max_len {
@@ -1102,6 +1127,8 @@ impl NativeDecodeSession {
                 },
                 &present_to_past,
                 &fixed_state_inputs,
+                &csa_record_specs,
+                &csa_carry_specs,
                 capacity,
                 graph_capture,
                 position_rank,
@@ -1134,6 +1161,19 @@ impl NativeDecodeSession {
 
         let has_plugin_fused = graph_has_plugin_fused(session.graph());
         let uses_decode_pool = graph_uses_decode_pool(session.graph());
+        let mut compressed_state_stats = CompressedStatePathStats {
+            manifest_lookups: u64::from(!compressed_state.is_empty()),
+            ..CompressedStatePathStats::default()
+        };
+        if let Some(cuda) = &cuda {
+            let device_allocations = u64::try_from(compressed_state.device_binding_count())
+                .context("compressed-state device binding count exceeds u64")?;
+            let (device_zero_fills, device_zero_fill_bytes) = cuda.csa_initialization_census();
+            compressed_state_stats.device_allocations = device_allocations;
+            compressed_state_stats.device_zero_fills = device_zero_fills;
+            compressed_state_stats.device_zero_fill_bytes = device_zero_fill_bytes;
+            compressed_state_stats.telemetry_updates = u64::from(device_allocations > 0);
+        }
         Ok(Self {
             session,
             step_inputs,
@@ -1142,7 +1182,7 @@ impl NativeDecodeSession {
             kv_inputs,
             present_to_past,
             compressed_state,
-            compressed_state_stats: CompressedStatePathStats::default(),
+            compressed_state_stats,
             past: HashMap::new(),
             cuda,
             cpu_kv,
