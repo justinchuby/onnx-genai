@@ -5029,6 +5029,55 @@ fn einsum_node(equation: &str, n_in: usize) -> Node {
 }
 
 #[test]
+fn einsum_requires_a_decodable_string_equation_attribute() {
+    let input = vec![f32in(vec![c(2), c(3)])];
+
+    let missing = try_run(&node("Einsum", 1, 1), input.clone(), 12).unwrap_err();
+    assert_eq!(
+        missing,
+        ShapeInferError::MissingAttribute {
+            op: "Einsum".into(),
+            attr: "equation".into(),
+        }
+    );
+
+    let wrong_type = try_run(
+        &with_attr(node("Einsum", 1, 1), "equation", Attribute::Int(0)),
+        input.clone(),
+        12,
+    )
+    .unwrap_err();
+    assert_eq!(
+        wrong_type,
+        ShapeInferError::MissingAttribute {
+            op: "Einsum".into(),
+            attr: "equation".into(),
+        }
+    );
+
+    let invalid_utf8 = try_run(
+        &with_attr(
+            node("Einsum", 1, 1),
+            "equation",
+            Attribute::String(vec![b'i', 0xff, b'-', b'>', b'i']),
+        ),
+        input.clone(),
+        12,
+    )
+    .unwrap_err();
+    assert_eq!(
+        invalid_utf8,
+        ShapeInferError::Invalid {
+            op: "Einsum".into(),
+            detail: "attribute `equation` is not valid UTF-8: invalid byte sequence of length 1 starts at byte offset 1".into(),
+        }
+    );
+
+    let valid = run(&einsum_node("ij->ji", 1), input, 12);
+    assert_eq!(out_shape(&valid), vec![c(3), c(2)]);
+}
+
+#[test]
 fn einsum_matmul_transpose_and_implicit() {
     // Explicit matmul.
     let out = run(
@@ -5170,6 +5219,21 @@ fn einsum_rejects_unequal_explicit_ellipsis_ranks_and_non_space_whitespace() {
             "Einsum",
             &format!("invalid character `{invalid}` at normalized byte offset 1"),
         );
+    }
+
+    for (equation, detail) in [
+        (
+            "iJ->i",
+            "input term #0 has invalid character `J` at normalized byte offset 1",
+        ),
+        (
+            "ij->iJ",
+            "output term has invalid character `J` at normalized byte offset 1",
+        ),
+    ] {
+        let error =
+            try_run(&einsum_node(equation, 1), vec![f32in(vec![c(2), c(3)])], 12).unwrap_err();
+        assert_invalid(error, "Einsum", detail);
     }
 }
 

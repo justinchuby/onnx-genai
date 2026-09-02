@@ -14,9 +14,30 @@ use crate::error::ShapeInferError;
 use crate::registry::InferenceRegistry;
 
 fn einsum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    let Some(equation) = ctx.node.attr("equation").and_then(Attribute::as_str) else {
-        return Ok(());
+    let equation_bytes = match ctx.node.attr("equation") {
+        Some(Attribute::String(bytes)) => bytes,
+        _ => {
+            return Err(ShapeInferError::MissingAttribute {
+                op: ctx.op().to_owned(),
+                attr: "equation".into(),
+            });
+        }
     };
+    let equation = std::str::from_utf8(equation_bytes).map_err(|error| {
+        let location = error.valid_up_to();
+        let detail = match error.error_len() {
+            Some(length) => format!(
+                "attribute `equation` is not valid UTF-8: invalid byte sequence of length {length} starts at byte offset {location}"
+            ),
+            None => format!(
+                "attribute `equation` is not valid UTF-8: incomplete byte sequence starts at byte offset {location}"
+            ),
+        };
+        ShapeInferError::Invalid {
+            op: ctx.op().to_owned(),
+            detail,
+        }
+    })?;
 
     // Clone before planning so output resolution can mutably use the context's
     // broadcast chokepoint without retaining immutable borrows into `ctx`.
