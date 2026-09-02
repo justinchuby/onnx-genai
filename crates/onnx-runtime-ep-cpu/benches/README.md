@@ -22,18 +22,53 @@ Use a filter while iterating, for example:
 cargo bench -p onnx-runtime-ep-cpu -- matmul/medium
 ```
 
-The native Einsum target has its own exact governed invocation:
+Set the physical-core budget and fresh raw-evidence directory first:
+
+```console
+export ONNX_GENAI_CPU_DECODE_THREADS=16
+export CARGO_TARGET_DIR="$PWD/target-einsum-evidence"
+```
+
+The native Einsum target then has one exact governed invocation:
 
 ```bash
-scripts/hostlock.sh run --owner your_name --reason "CPU Einsum synthetic Criterion sweep" -- \
+scripts/hostlock.sh run --owner your_name --reason "CPU Einsum evidence sweep" \
+  --wait --gate 3 --strict-reap -- \
   cargo bench -p onnx-runtime-ep-cpu --bench einsum -- --noplot
 ```
 
-The outer `hostlock.sh run` is mandatory for publishable benchmark results. The
-benchmark also records lock provenance, but observing a lock from inside the
-binary does not protect Cargo compilation, warmup, or the interval before the
-binary starts. Replace `your_name` with a stable identifier containing only
+Use a thread count the host can realize as one logical CPU per physical core.
+Use a fresh `CARGO_TARGET_DIR` for every evidence run. The benchmark refuses
+before measuring when the outer lock, gate, ownership, box scope, worktree
+provenance, physical-core affinity, CPU model/frequency, or raw Criterion
+destination cannot be verified. It also fails the run if any measurement window
+has foreign/sibling contention, more than 20% median-frequency drift, or an
+unstable MatMul control.
+
+The outer `hostlock.sh run` is mandatory because it covers Cargo compilation as
+well as warmup and timing. Reading the lock from the benchmark cannot substitute
+for custody. Replace `your_name` with a stable identifier containing only
 letters, digits, `_`, `.`, or `-`.
+
+The target emits:
+
+- exact commit/tree/branch, host-lock provenance, CPU model, realized
+  logical-to-package/core mapping, and frequency samples;
+- setup/planning time, warmed allocation counts/bytes, reusable workspace,
+  shared-input hashes, nonzero oracle counts, numeric error, and the native
+  route that actually fired;
+- three independent absolute repetitions per synthetic case, plus six
+  deterministic ABBA/BAAB repetitions per arm for the equivalent
+  `ik,kj->ij` Einsum/MatMul comparison and the MatMul A/A null;
+- per-window wall/CPU efficiency, `foreign_pct`, `sibling_peak_pct`, frequency,
+  and two-ended host-lock attribution;
+- Criterion's ten-sample raw JSON under
+  `target-einsum-evidence/criterion/{einsum,einsum_view,einsum_control}`.
+
+The f64 generic evaluator is validation-only and never appears as a timed arm.
+Only the contiguous f32 `gemm_friendly` row is compared with MatMul, using the
+same input buffers, shape, dtype, layout, output, and underlying native MatMul
+kernel.
 
 Criterion reports the estimated time interval and change versus the prior local
 baseline. HTML reports are written under

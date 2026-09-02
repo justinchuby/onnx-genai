@@ -35,6 +35,27 @@ enum ExecutionMode {
     Oracle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EinsumRoute {
+    ViewCopy,
+    Reduction,
+    Oracle,
+    MatMulDirect,
+    MatMulMaterialized,
+}
+
+impl EinsumRoute {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ViewCopy => "view-copy",
+            Self::Reduction => "reduction-native",
+            Self::Oracle => "oracle-diagnostic",
+            Self::MatMulDirect => "matmul-direct",
+            Self::MatMulMaterialized => "matmul-materialized",
+        }
+    }
+}
+
 #[derive(Default)]
 struct EinsumScratch {
     f32_output: Vec<f32>,
@@ -199,34 +220,7 @@ impl Kernel for EinsumKernel {
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.validate_execution(inputs, outputs)?;
-        match self.plan.classification() {
-            EinsumClassification::ViewOnlyPermutation(permutation)
-            | EinsumClassification::DiagonalView(permutation) => {
-                self.record_route(1);
-                self.execute_view_copy(inputs, outputs, permutation)
-            }
-            EinsumClassification::ReductionOrElementwise(reduction) => {
-                self.record_route(if self.mode == ExecutionMode::Oracle {
-                    4
-                } else {
-                    2
-                });
-                self.execute_reduction(inputs, outputs, reduction)
-            }
-            EinsumClassification::Gemm(gemm) if self.mode == ExecutionMode::Optimized => {
-                self.execute_gemm(inputs, outputs, gemm)
-            }
-            EinsumClassification::Gemm(_) => {
-                self.record_route(4);
-                self.execute_oracle(inputs, outputs)
-            }
-            EinsumClassification::Unsupported(reason) => Err(EpError::KernelFailed(format!(
-                "Einsum equation `{}` reached execution with an unsupported canonical plan: \
-                 {reason}",
-                self.plan.equation()
-            ))),
-        }
+        self.execute_with_route(inputs, outputs).map(|_| ())
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -289,6 +283,47 @@ impl Kernel for EinsumKernel {
 }
 
 impl EinsumKernel {
+    fn execute_with_route(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> Result<EinsumRoute> {
+        self.validate_execution(inputs, outputs)?;
+        match self.plan.classification() {
+            EinsumClassification::ViewOnlyPermutation(permutation)
+            | EinsumClassification::DiagonalView(permutation) => {
+                self.record_route(1);
+                self.execute_view_copy(inputs, outputs, permutation)?;
+                Ok(EinsumRoute::ViewCopy)
+            }
+            EinsumClassification::ReductionOrElementwise(reduction) => {
+                self.record_route(if self.mode == ExecutionMode::Oracle {
+                    4
+                } else {
+                    2
+                });
+                self.execute_reduction(inputs, outputs, reduction)?;
+                Ok(if self.mode == ExecutionMode::Oracle {
+                    EinsumRoute::Oracle
+                } else {
+                    EinsumRoute::Reduction
+                })
+            }
+            EinsumClassification::Gemm(gemm) if self.mode == ExecutionMode::Optimized => {
+                self.execute_gemm(inputs, outputs, gemm)
+            }
+            EinsumClassification::Gemm(_) => {
+                self.record_route(4);
+                self.execute_oracle(inputs, outputs)?;
+                Ok(EinsumRoute::Oracle)
+            }
+            EinsumClassification::Unsupported(reason) => Err(EpError::KernelFailed(format!(
+                "Einsum equation `{}` reached execution with an unsupported canonical plan: \
+                 {reason}",
+                self.plan.equation()
+            ))),
+        }
+    }
     fn validate_execution(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(
             "Einsum",
@@ -628,7 +663,7 @@ impl EinsumKernel {
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
         gemm: &EinsumContractionPlan,
-    ) -> Result<()> {
+    ) -> Result<EinsumRoute> {
         let geometry = self
             .plan
             .resolve_concrete_gemm_geometry(
@@ -698,9 +733,9 @@ impl EinsumKernel {
                 outputs[0].device,
             )
             .with_byte_offset(outputs[0].byte_offset);
-            return self
-                .matmul
-                .execute(&[left_view, right_view], &mut [output_view]);
+            self.matmul
+                .execute(&[left_view, right_view], &mut [output_view])?;
+            return Ok(EinsumRoute::MatMulDirect);
         }
 
         self.record_route(5);
@@ -764,7 +799,8 @@ impl EinsumKernel {
         );
         self.matmul
             .execute(&[left_f32, right_f32], &mut [canonical_output])?;
-        write_canonical_output(&self.plan, gemm, &scratch.f32_output, &mut outputs[0])
+        write_canonical_output(&self.plan, gemm, &scratch.f32_output, &mut outputs[0])?;
+        Ok(EinsumRoute::MatMulMaterialized)
     }
 
     #[cfg(test)]
@@ -1119,6 +1155,25 @@ pub fn benchmark_scratch_capacity_bytes(kernel: &dyn Kernel) -> Option<usize> {
         })
 }
 
+/// Execute one validation dispatch and return the native branch that fired.
+///
+/// The timed benchmark continues to call [`Kernel::execute`]. This probe uses
+/// the same dispatcher once before timing so route evidence is observed rather
+/// than inferred from the equation or expected layout.
+#[doc(hidden)]
+pub fn benchmark_execute_route(
+    kernel: &dyn Kernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> Result<Option<&'static str>> {
+    let Some(kernel) = kernel.as_any().downcast_ref::<EinsumKernel>() else {
+        return Ok(None);
+    };
+    kernel
+        .execute_with_route(inputs, outputs)
+        .map(|route| Some(route.label()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1162,6 +1217,23 @@ mod tests {
                 "index {index}: got {actual}, expected {expected}, tolerance {tolerance}"
             );
         }
+    }
+
+    #[test]
+    fn benchmark_route_probe_reports_the_branch_that_executed() {
+        let direct = kernel(
+            "ik,kj->ij",
+            &[vec![2, 3], vec![3, 2]],
+            ExecutionMode::Optimized,
+        );
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[3, 2], &[1., 0., 0., 1., 1., 1.]);
+        let mut output = Owned::zeros_f32(&[2, 2]);
+        let route =
+            benchmark_execute_route(&*direct, &[a.view(), b.view()], &mut [output.view_mut()])
+                .unwrap();
+        assert_eq!(route, Some("matmul-direct"));
+        assert_eq!(output.to_f32(), [4., 5., 10., 11.]);
     }
 
     #[test]
