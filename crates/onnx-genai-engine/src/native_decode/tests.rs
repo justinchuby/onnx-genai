@@ -2287,6 +2287,70 @@ fn native_cuda_fixed_state_restore_is_atomic_at_every_copy_stage() -> anyhow::Re
             }
             Ok(logits)
         };
+
+    let mut partial_snapshot = build_cuda_recurrent_logits_decoder(16)?;
+    let partial_snapshot_probe = partial_snapshot
+        .cuda
+        .as_ref()
+        .expect("CUDA state")
+        .scratch_journal_probe();
+    advance(&mut partial_snapshot, &PROMPT)?;
+    let allocation_failure = cuda::fail_cuda_scratch_allocation_at(1);
+    let failure = match partial_snapshot.snapshot_recurrent_state() {
+        Ok(_) => panic!("partial snapshot allocation must fail"),
+        Err(error) => error,
+    };
+    drop(allocation_failure);
+    assert!(
+        failure
+            .to_string()
+            .contains("injected CUDA scratch allocation failure at attempt 1")
+    );
+    let partial = partial_snapshot_probe.stats();
+    assert_eq!(partial.snapshot_allocations, 1);
+    assert_eq!(partial.live_allocations, 0);
+    assert_eq!(partial.pending_allocations, 1);
+    assert_eq!(partial.quarantined_allocations, 0);
+    partial_snapshot_probe.settle()?;
+    assert_eq!(partial_snapshot_probe.stats().pending_allocations, 0);
+
+    for (failure_attempt, expected_undo) in [(1usize, 1u64), (3usize, 3u64)] {
+        let mut partial_restore = build_cuda_recurrent_logits_decoder(16)?;
+        let partial_restore_probe = partial_restore
+            .cuda
+            .as_ref()
+            .expect("CUDA state")
+            .scratch_journal_probe();
+        advance(&mut partial_restore, &PROMPT)?;
+        let snapshot = partial_restore.snapshot_recurrent_state()?;
+        advance(&mut partial_restore, &[11])?;
+        let allocation_failure = cuda::fail_cuda_scratch_allocation_at(failure_attempt);
+        let failure = partial_restore
+            .restore_state_snapshot_at(&snapshot, PROMPT.len())
+            .expect_err("partial undo allocation must fail before mutation");
+        drop(allocation_failure);
+        assert!(
+            failure.to_string().contains(&format!(
+                "injected CUDA scratch allocation failure at attempt {failure_attempt}"
+            )),
+            "allocation refusal must name its exact attempt: {failure:#}"
+        );
+        let partial = partial_restore_probe.stats();
+        assert_eq!(partial.snapshot_allocations, 3);
+        assert_eq!(partial.restore_undo_allocations, expected_undo);
+        assert_eq!(partial.mask_undo_allocations, 0);
+        assert_eq!(partial.live_allocations, 3);
+        assert_eq!(partial.pending_allocations, expected_undo);
+        drop(snapshot);
+        let retired = partial_restore_probe.stats();
+        assert_eq!(retired.live_allocations, 0);
+        assert_eq!(retired.pending_allocations, expected_undo + 3);
+        partial_restore_probe.settle()?;
+        let settled = partial_restore_probe.stats();
+        assert_eq!(settled.pending_allocations, 0);
+        assert_eq!(settled.quarantined_allocations, 0);
+    }
+
     for failure in [0usize, 1, 2] {
         let expected = {
             let mut oracle = build_cuda_recurrent_logits_decoder(16)?;
@@ -2294,18 +2358,30 @@ fn native_cuda_fixed_state_restore_is_atomic_at_every_copy_stage() -> anyhow::Re
             advance(&mut oracle, &[17])?
         };
         let mut session = build_cuda_recurrent_logits_decoder(16)?;
+        let scratch = session
+            .cuda
+            .as_ref()
+            .expect("CUDA state")
+            .scratch_journal_probe();
         advance(&mut session, &PROMPT)?;
         let snapshot = session.snapshot_recurrent_state()?;
         assert_eq!(
-            session
-                .cuda
+            snapshot
+                .device_scratch
                 .as_ref()
-                .expect("CUDA state")
-                .fixed_state_snapshot_scratch
+                .expect("CUDA snapshot")
+                .buffers
                 .len(),
             3,
             "fixed-state fixture census drifted"
         );
+        let after_snapshot = scratch.stats();
+        assert_eq!(after_snapshot.snapshot_allocations, 3);
+        assert_eq!(after_snapshot.restore_undo_allocations, 0);
+        assert_eq!(after_snapshot.mask_undo_allocations, 0);
+        assert_eq!(after_snapshot.live_allocations, 3);
+        assert!(after_snapshot.live_bytes > 0);
+        assert_eq!(after_snapshot.pending_allocations, 0);
         advance(&mut session, &[11, 13])?;
         let before_len = session.current_len();
         let before = identity(&mut session)?;
@@ -2328,16 +2404,57 @@ fn native_cuda_fixed_state_restore_is_atomic_at_every_copy_stage() -> anyhow::Re
             before,
             "failure at CUDA fixed-state slot {failure} published a partial dense/fixed rollback"
         );
+        let after_undo = scratch.stats();
+        assert_eq!(after_undo.snapshot_allocations, 3);
+        assert_eq!(after_undo.restore_undo_allocations, 3);
+        assert_eq!(after_undo.mask_undo_allocations, 1);
+        assert_eq!(after_undo.live_allocations, 3);
+        assert_eq!(after_undo.pending_allocations, 4);
+        assert_eq!(after_undo.quarantined_allocations, 0);
 
         session.restore_state_snapshot_at(&snapshot, PROMPT.len())?;
+        let after_retry = scratch.stats();
+        assert_eq!(after_retry.restore_undo_allocations, 6);
+        assert_eq!(after_retry.mask_undo_allocations, 2);
+        assert_eq!(after_retry.live_allocations, 3);
+        assert_eq!(after_retry.pending_allocations, 8);
         assert_eq!(
             advance(&mut session, &[17])?,
             expected,
             "retry after CUDA fixed-state slot {failure} must match a clean session"
         );
+        drop(snapshot);
+        let retired = scratch.stats();
+        assert_eq!(retired.live_allocations, 0);
+        assert_eq!(retired.retirement_submissions, 11);
+        assert_eq!(retired.pending_allocations, 11);
+        assert_eq!(retired.allocated_bytes, retired.retirement_bytes);
+        assert_eq!(retired.pending_bytes, retired.retirement_bytes);
+        scratch.settle()?;
+        let settled = scratch.stats();
+        assert_eq!(settled.pending_allocations, 0);
+        assert_eq!(settled.pending_bytes, 0);
+        assert_eq!(settled.settled_allocations, 11);
+        assert_eq!(settled.settled_bytes, settled.retirement_bytes);
+        assert_eq!(settled.quarantined_allocations, 0);
+        assert_eq!(settled.quarantined_bytes, 0);
     }
 
     let mut poisoned = build_cuda_recurrent_logits_decoder(16)?;
+    let poisoned_identity = NativeLogicalStateIdentity {
+        session_id: SessionId::from(41_u64),
+        generation: 7,
+    };
+    let sibling_identity = NativeLogicalStateIdentity {
+        session_id: SessionId::from(42_u64),
+        generation: 3,
+    };
+    poisoned.bind_logical_state(poisoned_identity)?;
+    let poisoned_scratch = poisoned
+        .cuda
+        .as_ref()
+        .expect("CUDA state")
+        .scratch_journal_probe();
     advance(&mut poisoned, &PROMPT)?;
     let snapshot = poisoned.snapshot_recurrent_state()?;
     advance(&mut poisoned, &[11])?;
@@ -2356,11 +2473,125 @@ fn native_cuda_fixed_state_restore_is_atomic_at_every_copy_stage() -> anyhow::Re
     );
     let retry = poisoned
         .decode(&[17], poisoned.current_len())
-        .expect_err("a failed undo must permanently block dispatch");
+        .expect_err("a failed undo must block the poisoned physical generation");
     assert!(
         retry
             .to_string()
             .contains("state restore transaction is poisoned")
+    );
+    assert!(
+        format!("{retry:#}").contains("logical session 41 generation 7"),
+        "physical poison must retain its exact logical owner: {retry:#}"
+    );
+    let poisoned_census = poisoned_scratch.stats();
+    assert_eq!(poisoned_census.snapshot_allocations, 3);
+    assert_eq!(poisoned_census.restore_undo_allocations, 3);
+    assert_eq!(poisoned_census.mask_undo_allocations, 1);
+    assert_eq!(poisoned_census.live_allocations, 3);
+    assert_eq!(poisoned_census.pending_allocations, 4);
+    assert_eq!(poisoned_census.quarantined_allocations, 0);
+    let mut foreign = build_cuda_recurrent_logits_decoder(16)?;
+    foreign.bind_logical_state(poisoned_identity)?;
+    let foreign_error = foreign
+        .restore_state_snapshot_at(&snapshot, PROMPT.len())
+        .expect_err("a foreign decoder instance must reject the snapshot");
+    assert!(
+        foreign_error
+            .to_string()
+            .contains("stale or foreign snapshot"),
+        "foreign identity refusal must be actionable: {foreign_error:#}"
+    );
+    poisoned.reset()?;
+    poisoned.bind_logical_state(sibling_identity)?;
+    let stale = poisoned
+        .restore_state_snapshot_at(&snapshot, PROMPT.len())
+        .expect_err("a reset must reject the prior physical generation's snapshot");
+    assert!(
+        stale.to_string().contains("stale or foreign snapshot"),
+        "stale generation refusal must be actionable: {stale:#}"
+    );
+    drop(snapshot);
+    let retired = poisoned_scratch.stats();
+    assert_eq!(retired.live_allocations, 0);
+    assert_eq!(retired.retirement_submissions, 7);
+    assert_eq!(retired.pending_allocations, 7);
+    assert_eq!(retired.pending_bytes, retired.retirement_bytes);
+    eprintln!(
+        "CUDA_ROLLBACK_FAILED_SESSION_CENSUS allocations={} bytes={} pending={} \
+         pending_bytes={} quarantined={}",
+        retired.retirement_submissions,
+        retired.retirement_bytes,
+        retired.pending_allocations,
+        retired.pending_bytes,
+        retired.quarantined_allocations
+    );
+    poisoned_scratch.settle()?;
+    let settled = poisoned_scratch.stats();
+    assert_eq!(settled.pending_allocations, 0);
+    assert_eq!(settled.pending_bytes, 0);
+    assert_eq!(settled.settled_allocations, 7);
+    assert_eq!(settled.quarantined_allocations, 0);
+    let mut clean = build_cuda_recurrent_logits_decoder(16)?;
+    assert_eq!(
+        poisoned.decode(&[17], 0)?,
+        clean.decode(&[17], 0)?,
+        "physical recovery must start a byte-clean generation"
+    );
+
+    let mut repeated = build_cuda_recurrent_logits_decoder(16)?;
+    let repeated_scratch = repeated
+        .cuda
+        .as_ref()
+        .expect("CUDA state")
+        .scratch_journal_probe();
+    for iteration in 0..64usize {
+        repeated.reset()?;
+        advance(&mut repeated, &PROMPT)?;
+        let snapshot = repeated.snapshot_recurrent_state()?;
+        advance(&mut repeated, &[11])?;
+        let _failure = cuda::fail_cuda_fixed_restore_at(iteration % 3);
+        repeated
+            .restore_state_snapshot_at(&snapshot, PROMPT.len())
+            .expect_err("every injected restore must fail");
+        drop(_failure);
+        drop(snapshot);
+        let census = repeated_scratch.stats();
+        let transactions = u64::try_from(iteration + 1)?;
+        assert_eq!(census.snapshot_allocations, transactions * 3);
+        assert_eq!(census.restore_undo_allocations, transactions * 3);
+        assert_eq!(census.mask_undo_allocations, transactions);
+        assert_eq!(census.live_allocations, 0);
+        assert_eq!(census.retirement_submissions, transactions * 7);
+        assert_eq!(census.pending_allocations, transactions * 7);
+        assert_eq!(census.quarantined_allocations, 0);
+    }
+    let repeated_pending = repeated_scratch.stats();
+    assert_eq!(
+        repeated_pending.pending_bytes,
+        repeated_pending.retirement_bytes
+    );
+    repeated_scratch.settle()?;
+    let repeated_settled = repeated_scratch.stats();
+    assert_eq!(repeated_settled.pending_allocations, 0);
+    assert_eq!(repeated_settled.pending_bytes, 0);
+    assert_eq!(repeated_settled.settled_allocations, 64 * 7);
+    assert_eq!(
+        repeated_settled.settled_bytes,
+        repeated_settled.retirement_bytes
+    );
+    assert_eq!(repeated_settled.quarantined_allocations, 0);
+    eprintln!(
+        "CUDA_ROLLBACK_SCRATCH_CENSUS iterations=64 allocations={} bytes={} \
+         retirement_submissions={} settled={} pending={} pending_bytes={} quarantined={}",
+        repeated_settled.snapshot_allocations
+            + repeated_settled.restore_undo_allocations
+            + repeated_settled.mask_undo_allocations,
+        repeated_settled.allocated_bytes,
+        repeated_settled.retirement_submissions,
+        repeated_settled.settled_allocations,
+        repeated_settled.pending_allocations,
+        repeated_settled.pending_bytes,
+        repeated_settled.quarantined_allocations
     );
     Ok(())
 }

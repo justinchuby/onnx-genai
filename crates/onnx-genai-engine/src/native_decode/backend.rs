@@ -172,6 +172,14 @@ impl NativeDecodeSession {
     }
 
     pub(super) fn rewind_inner(&mut self, target_len: usize) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(remaining) = self.fail_rewind_after.as_mut() {
+            if *remaining == 0 {
+                self.fail_rewind_after = None;
+                bail!("injected native decoder rewind failure");
+            }
+            *remaining -= 1;
+        }
         if let Some(cuda) = &self.cuda {
             cuda.ensure_state_restore_healthy()?;
         }

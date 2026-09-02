@@ -2,12 +2,18 @@ use super::*;
 
 use super::kv_commit::{self, KvBindingGeometry, KvCommitLayout};
 
+static CUDA_STATE_INSTANCE_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[cfg(all(test, feature = "native-cuda"))]
 thread_local! {
     static CUDA_FIXED_RESTORE_FAILURE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
     static CUDA_FIXED_UNDO_FAILURE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static CUDA_SCRATCH_ALLOCATION_FAILURE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static CUDA_SCRATCH_ALLOCATION_ATTEMPT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(all(test, feature = "native-cuda"))]
@@ -18,6 +24,8 @@ impl Drop for CudaFixedRestoreFailureGuard {
     fn drop(&mut self) {
         CUDA_FIXED_RESTORE_FAILURE.set(None);
         CUDA_FIXED_UNDO_FAILURE.set(None);
+        CUDA_SCRATCH_ALLOCATION_FAILURE.set(None);
+        CUDA_SCRATCH_ALLOCATION_ATTEMPT.set(0);
     }
 }
 
@@ -37,6 +45,13 @@ pub(crate) fn fail_cuda_fixed_restore_and_undo_at(
     CudaFixedRestoreFailureGuard
 }
 
+#[cfg(all(test, feature = "native-cuda"))]
+pub(crate) fn fail_cuda_scratch_allocation_at(attempt: usize) -> CudaFixedRestoreFailureGuard {
+    CUDA_SCRATCH_ALLOCATION_ATTEMPT.set(0);
+    CUDA_SCRATCH_ALLOCATION_FAILURE.set(Some(attempt));
+    CudaFixedRestoreFailureGuard
+}
+
 fn check_cuda_fixed_restore_stage(slot: usize, binding: usize) -> anyhow::Result<()> {
     #[cfg(all(test, feature = "native-cuda"))]
     if CUDA_FIXED_RESTORE_FAILURE.get() == Some(slot) {
@@ -53,6 +68,267 @@ fn check_cuda_fixed_undo_stage(slot: usize, binding: usize) -> anyhow::Result<()
     }
     let _ = (slot, binding);
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CudaScratchRole {
+    Snapshot,
+    RestoreUndo,
+    MaskUndo,
+}
+
+#[derive(Default)]
+struct CudaScratchJournalTelemetry {
+    snapshot_allocations: std::sync::atomic::AtomicU64,
+    restore_undo_allocations: std::sync::atomic::AtomicU64,
+    mask_undo_allocations: std::sync::atomic::AtomicU64,
+    allocated_bytes: std::sync::atomic::AtomicU64,
+    live_allocations: std::sync::atomic::AtomicU64,
+    live_bytes: std::sync::atomic::AtomicU64,
+    retirement_submissions: std::sync::atomic::AtomicU64,
+    retirement_bytes: std::sync::atomic::AtomicU64,
+    pending_allocations: std::sync::atomic::AtomicU64,
+    pending_bytes: std::sync::atomic::AtomicU64,
+    #[cfg(all(test, feature = "native-cuda"))]
+    settled_allocations: std::sync::atomic::AtomicU64,
+    #[cfg(all(test, feature = "native-cuda"))]
+    settled_bytes: std::sync::atomic::AtomicU64,
+    quarantined_allocations: std::sync::atomic::AtomicU64,
+    quarantined_bytes: std::sync::atomic::AtomicU64,
+    allocators: std::sync::Mutex<Vec<Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>>,
+}
+
+#[cfg(all(test, feature = "native-cuda"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CudaScratchJournalStats {
+    pub(crate) snapshot_allocations: u64,
+    pub(crate) restore_undo_allocations: u64,
+    pub(crate) mask_undo_allocations: u64,
+    pub(crate) allocated_bytes: u64,
+    pub(crate) live_allocations: u64,
+    pub(crate) live_bytes: u64,
+    pub(crate) retirement_submissions: u64,
+    pub(crate) retirement_bytes: u64,
+    pub(crate) pending_allocations: u64,
+    pub(crate) pending_bytes: u64,
+    pub(crate) settled_allocations: u64,
+    pub(crate) settled_bytes: u64,
+    pub(crate) quarantined_allocations: u64,
+    pub(crate) quarantined_bytes: u64,
+}
+
+impl CudaScratchJournalTelemetry {
+    fn allocated(
+        self: &Arc<Self>,
+        role: CudaScratchRole,
+        bytes: usize,
+        allocator: &Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+    ) {
+        match role {
+            CudaScratchRole::Snapshot => {
+                self.snapshot_allocations
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            CudaScratchRole::RestoreUndo => {
+                self.restore_undo_allocations
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            CudaScratchRole::MaskUndo => {
+                self.mask_undo_allocations
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.allocated_bytes
+            .fetch_add(bytes, AtomicOrdering::Relaxed);
+        self.live_allocations.fetch_add(1, AtomicOrdering::Relaxed);
+        self.live_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+        let mut allocators = self
+            .allocators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = allocator.runtime_identity();
+        if !allocators.iter().any(|current| {
+            (runtime.is_some() && current.runtime_identity() == runtime)
+                || Arc::ptr_eq(current, allocator)
+        }) {
+            allocators.push(Arc::clone(allocator));
+        }
+    }
+
+    fn retirement_submitted(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.live_allocations.fetch_sub(1, AtomicOrdering::Relaxed);
+        self.live_bytes.fetch_sub(bytes, AtomicOrdering::Relaxed);
+        self.retirement_submissions
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.retirement_bytes
+            .fetch_add(bytes, AtomicOrdering::Relaxed);
+        self.pending_allocations
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.pending_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+    }
+
+    fn retirement_quarantined(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.pending_allocations
+            .fetch_sub(1, AtomicOrdering::Relaxed);
+        self.pending_bytes.fetch_sub(bytes, AtomicOrdering::Relaxed);
+        self.quarantined_allocations
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.quarantined_bytes
+            .fetch_add(bytes, AtomicOrdering::Relaxed);
+    }
+
+    #[cfg(all(test, feature = "native-cuda"))]
+    fn settle(&self) -> anyhow::Result<()> {
+        let allocators = self
+            .allocators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for allocator in allocators {
+            allocator
+                .wait_for_deferred_releases()
+                .with_context(|| format!("settle {} CUDA scratch retirements", allocator.name()))?;
+        }
+        let allocations = self.pending_allocations.swap(0, AtomicOrdering::Relaxed);
+        let bytes = self.pending_bytes.swap(0, AtomicOrdering::Relaxed);
+        self.settled_allocations
+            .fetch_add(allocations, AtomicOrdering::Relaxed);
+        self.settled_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "native-cuda"))]
+    fn stats(&self) -> CudaScratchJournalStats {
+        CudaScratchJournalStats {
+            snapshot_allocations: self.snapshot_allocations.load(AtomicOrdering::Relaxed),
+            restore_undo_allocations: self.restore_undo_allocations.load(AtomicOrdering::Relaxed),
+            mask_undo_allocations: self.mask_undo_allocations.load(AtomicOrdering::Relaxed),
+            allocated_bytes: self.allocated_bytes.load(AtomicOrdering::Relaxed),
+            live_allocations: self.live_allocations.load(AtomicOrdering::Relaxed),
+            live_bytes: self.live_bytes.load(AtomicOrdering::Relaxed),
+            retirement_submissions: self.retirement_submissions.load(AtomicOrdering::Relaxed),
+            retirement_bytes: self.retirement_bytes.load(AtomicOrdering::Relaxed),
+            pending_allocations: self.pending_allocations.load(AtomicOrdering::Relaxed),
+            pending_bytes: self.pending_bytes.load(AtomicOrdering::Relaxed),
+            settled_allocations: self.settled_allocations.load(AtomicOrdering::Relaxed),
+            settled_bytes: self.settled_bytes.load(AtomicOrdering::Relaxed),
+            quarantined_allocations: self.quarantined_allocations.load(AtomicOrdering::Relaxed),
+            quarantined_bytes: self.quarantined_bytes.load(AtomicOrdering::Relaxed),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "native-cuda"))]
+#[derive(Clone)]
+pub(crate) struct CudaScratchJournalProbe(Arc<CudaScratchJournalTelemetry>);
+
+#[cfg(all(test, feature = "native-cuda"))]
+impl CudaScratchJournalProbe {
+    pub(crate) fn settle(&self) -> anyhow::Result<()> {
+        self.0.settle()
+    }
+
+    pub(crate) fn stats(&self) -> CudaScratchJournalStats {
+        self.0.stats()
+    }
+}
+
+/// One CUDA scratch allocation paired with the exact provider that issued it.
+///
+/// CUDA provider deallocation is already stream-fenced and non-blocking: it
+/// records both stream tails and transfers ownership to the provider's deferred
+/// release queue. Keeping the provider beside the buffer therefore gives every
+/// rollback journal an exact-once teardown path without synchronizing in Drop.
+pub(crate) struct OwnedCudaScratch {
+    allocator: Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+    buffer: Option<DeviceBuffer>,
+    bytes: usize,
+    telemetry: Arc<CudaScratchJournalTelemetry>,
+}
+
+impl OwnedCudaScratch {
+    fn allocate(
+        binding: &DeviceIoBinding,
+        bytes: usize,
+        role: CudaScratchRole,
+        telemetry: &Arc<CudaScratchJournalTelemetry>,
+        context: impl FnOnce() -> String,
+    ) -> anyhow::Result<Self> {
+        const SCRATCH_ALIGN: usize = 256;
+        #[cfg(all(test, feature = "native-cuda"))]
+        {
+            let attempt = CUDA_SCRATCH_ALLOCATION_ATTEMPT.get();
+            CUDA_SCRATCH_ALLOCATION_ATTEMPT.set(attempt.saturating_add(1));
+            if CUDA_SCRATCH_ALLOCATION_FAILURE.get() == Some(attempt) {
+                bail!("injected CUDA scratch allocation failure at attempt {attempt}");
+            }
+        }
+        let allocator = Arc::clone(binding.allocator());
+        let buffer = allocator
+            .allocate(bytes.max(1), SCRATCH_ALIGN)
+            .with_context(context)?;
+        telemetry.allocated(role, bytes.max(1), &allocator);
+        Ok(Self {
+            allocator,
+            buffer: Some(buffer),
+            bytes: bytes.max(1),
+            telemetry: Arc::clone(telemetry),
+        })
+    }
+
+    fn buffer(&self) -> &DeviceBuffer {
+        self.buffer
+            .as_ref()
+            .expect("CUDA scratch buffer is taken only in Drop")
+    }
+
+    fn buffer_mut(&mut self) -> &mut DeviceBuffer {
+        self.buffer
+            .as_mut()
+            .expect("CUDA scratch buffer is taken only in Drop")
+    }
+}
+
+impl Drop for OwnedCudaScratch {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.telemetry.retirement_submitted(self.bytes);
+            if let Err(error) = self.allocator.deallocate(buffer) {
+                self.telemetry.retirement_quarantined(self.bytes);
+                eprintln!(
+                    "[onnx-genai-engine] CUDA rollback scratch could not enter deferred release: \
+                     {error}"
+                );
+            }
+        }
+    }
+}
+
+/// Device-resident recurrent-state snapshot owned by the snapshot handle.
+///
+/// The old implementation stored these buffers on `DecodeCudaState`, so
+/// dropping the logical snapshot did nothing and provider teardown quarantined
+/// the raw handles. Ownership now follows the snapshot and may safely outlive
+/// the decoder because every entry pins its exact provider.
+pub(crate) struct CudaFixedStateSnapshot {
+    identity: CudaStateIdentity,
+    pub(crate) buffers: Vec<(usize, OwnedCudaScratch)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CudaStateIdentity {
+    instance: u64,
+    physical_generation: u64,
+    logical: Option<NativeLogicalStateIdentity>,
+}
+
+#[derive(Clone, Debug)]
+struct CudaStateRestorePoison {
+    identity: CudaStateIdentity,
+    reason: String,
 }
 
 /// Resolve the physical KV-cache layout for the native CUDA binding layer.
@@ -741,22 +1017,12 @@ pub(crate) struct DecodeCudaState {
     /// from the declared `init: zeros` state (see `rewind`). Empty for pure-KV
     /// decoders.
     pub(crate) fixed_state_binding_range: std::ops::Range<usize>,
-    /// Device-resident scratch buffers for the speculative recurrent-state
-    /// snapshot, keyed by fixed-state binding index. Allocated lazily on the
-    /// first device snapshot and reused thereafter (state shapes are fixed), so
-    /// snapshotting the destructive GDN/conv state costs one device→device copy
-    /// per binding instead of a PCIe round-trip through host memory. Empty until
-    /// the CUDA device-snapshot path first runs; inert for greedy decode.
-    pub(crate) fixed_state_snapshot_scratch: Vec<(usize, DeviceBuffer)>,
-    /// Original live fixed state captured immediately before a restore attempt.
-    /// If any target copy or dense rewind step fails, this journal is copied
-    /// back before the error is returned.
-    fixed_state_restore_undo_scratch: Vec<(usize, DeviceBuffer)>,
-    /// Original attention-mask bytes for an atomic dense-KV/fixed-state rewind.
-    rewind_mask_undo_scratch: Option<DeviceBuffer>,
     /// Set only when restoring the undo journal itself fails. A possibly mixed
     /// session must never dispatch or replay again.
-    state_restore_poison: Option<String>,
+    state_restore_poison: Option<CudaStateRestorePoison>,
+    /// Exact physical decoder generation and optional logical owner.
+    state_identity: CudaStateIdentity,
+    scratch_journal_telemetry: Arc<CudaScratchJournalTelemetry>,
     pub(crate) auxiliary_binding_range: std::ops::Range<usize>,
     pub(crate) input_ids_binding: usize,
     pub(crate) position_ids_binding: Option<usize>,
@@ -5045,6 +5311,13 @@ impl DecodeCudaState {
                 "native CUDA device token loop configuration"
             );
         }
+        let state_instance = CUDA_STATE_INSTANCE_IDS
+            .fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |current| current.checked_add(1),
+            )
+            .map_err(|_| anyhow::anyhow!("native CUDA decoder instance identity exhausted"))?;
 
         Ok(Self {
             batch,
@@ -5056,10 +5329,13 @@ impl DecodeCudaState {
             base_binding_count,
             kv_binding_range: kv_start..kv_end,
             fixed_state_binding_range: kv_end..fixed_state_end,
-            fixed_state_snapshot_scratch: Vec::new(),
-            fixed_state_restore_undo_scratch: Vec::new(),
-            rewind_mask_undo_scratch: None,
             state_restore_poison: None,
+            state_identity: CudaStateIdentity {
+                instance: state_instance,
+                physical_generation: 1,
+                logical: None,
+            },
+            scratch_journal_telemetry: Arc::new(CudaScratchJournalTelemetry::default()),
             auxiliary_binding_range: auxiliary_start..auxiliary_end,
             input_ids_binding,
             position_ids_binding,
@@ -5640,22 +5916,15 @@ impl DecodeCudaState {
         self.set_logical_len(target_len)
     }
 
-    /// Ensure a device scratch buffer exists for every fixed-state binding,
-    /// sized to that binding's current byte length. Allocated once (state
-    /// shapes are fixed) via the binding's own execution provider, then reused.
-    /// Returns without allocating when there are no fixed-state bindings.
-    fn ensure_fixed_state_snapshot_scratch(&mut self) -> anyhow::Result<()> {
-        if self.fixed_state_snapshot_scratch.len() == self.fixed_state_binding_range.len() {
-            return Ok(());
-        }
-        // 256-byte alignment matches CUDA's native allocation granularity and is
-        // a power of two as `allocate` requires; the copy correctness does not
-        // depend on the base alignment, only on the byte length.
-        const SCRATCH_ALIGN: usize = 256;
+    fn allocate_fixed_state_scratch(
+        &self,
+        role: &str,
+        telemetry_role: CudaScratchRole,
+    ) -> anyhow::Result<Vec<(usize, OwnedCudaScratch)>> {
         let mut scratch = Vec::new();
         scratch
             .try_reserve_exact(self.fixed_state_binding_range.len())
-            .context("allocate fixed-state snapshot journal")?;
+            .with_context(|| format!("allocate fixed-state {role} journal"))?;
         for index in self.fixed_state_binding_range.clone() {
             let binding = &self.bindings[index];
             let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
@@ -5665,48 +5934,19 @@ impl DecodeCudaState {
                         binding.physical_shape()
                     )
                 })?;
-            let buffer = binding
-                .allocator()
-                .allocate(bytes.max(1), SCRATCH_ALIGN)
-                .with_context(|| format!("allocate device snapshot scratch for binding {index}"))?;
-            scratch.push((index, buffer));
-        }
-        self.fixed_state_snapshot_scratch = scratch;
-        Ok(())
-    }
-
-    fn ensure_fixed_state_restore_undo_scratch(&mut self) -> anyhow::Result<()> {
-        if self.fixed_state_restore_undo_scratch.len() == self.fixed_state_binding_range.len() {
-            return Ok(());
-        }
-        const SCRATCH_ALIGN: usize = 256;
-        let mut scratch = Vec::new();
-        scratch
-            .try_reserve_exact(self.fixed_state_binding_range.len())
-            .context("allocate fixed-state restore undo journal")?;
-        for index in self.fixed_state_binding_range.clone() {
-            let binding = &self.bindings[index];
-            let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype).with_context(
-                || {
-                    format!(
-                        "fixed CUDA decoder undo size overflow for binding {index} shape {:?}",
-                        binding.physical_shape()
-                    )
-                },
+            let buffer = OwnedCudaScratch::allocate(
+                binding,
+                bytes,
+                telemetry_role,
+                &self.scratch_journal_telemetry,
+                || format!("allocate device {role} scratch for binding {index}"),
             )?;
-            let buffer = binding
-                .allocator()
-                .allocate(bytes.max(1), SCRATCH_ALIGN)
-                .with_context(|| {
-                    format!("allocate device restore undo scratch for binding {index}")
-                })?;
             scratch.push((index, buffer));
         }
-        self.fixed_state_restore_undo_scratch = scratch;
-        Ok(())
+        Ok(scratch)
     }
 
-    fn ensure_rewind_mask_undo_scratch(&mut self) -> anyhow::Result<()> {
+    fn allocate_rewind_mask_undo_scratch(&self) -> anyhow::Result<OwnedCudaScratch> {
         let binding = &self.bindings[0];
         let bytes =
             checked_shape_bytes(binding.physical_shape(), binding.dtype).with_context(|| {
@@ -5715,30 +5955,140 @@ impl DecodeCudaState {
                     binding.physical_shape()
                 )
             })?;
-        if self
-            .rewind_mask_undo_scratch
-            .as_ref()
-            .is_some_and(|buffer| buffer.len() >= bytes.max(1))
-        {
-            return Ok(());
-        }
-        const SCRATCH_ALIGN: usize = 256;
-        self.rewind_mask_undo_scratch = Some(
-            binding
-                .allocator()
-                .allocate(bytes.max(1), SCRATCH_ALIGN)
-                .context("allocate CUDA attention-mask restore undo scratch")?,
-        );
-        Ok(())
+        OwnedCudaScratch::allocate(
+            binding,
+            bytes,
+            CudaScratchRole::MaskUndo,
+            &self.scratch_journal_telemetry,
+            || "allocate CUDA attention-mask restore undo scratch".to_string(),
+        )
     }
 
     pub(crate) fn ensure_state_restore_healthy(&self) -> anyhow::Result<()> {
-        if let Some(reason) = &self.state_restore_poison {
+        if let Some(poison) = &self.state_restore_poison {
+            let logical = poison.identity.logical.map_or_else(
+                || "standalone logical owner".to_string(),
+                |identity| {
+                    format!(
+                        "logical session {} generation {}",
+                        identity.session_id, identity.generation
+                    )
+                },
+            );
             bail!(
-                "native CUDA state restore transaction is poisoned after its undo failed: \
-                 {reason}; discard this session and construct a clean one"
+                "native CUDA state restore transaction is poisoned for {logical}, decoder \
+                 instance {} physical generation {}, after its undo failed: {}; reset that exact \
+                 logical generation or close it before dispatch",
+                poison.identity.instance,
+                poison.identity.physical_generation,
+                poison.reason
             );
         }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn scratch_journal_probe(&self) -> CudaScratchJournalProbe {
+        CudaScratchJournalProbe(Arc::clone(&self.scratch_journal_telemetry))
+    }
+
+    pub(crate) fn bind_logical_state(
+        &mut self,
+        identity: NativeLogicalStateIdentity,
+    ) -> anyhow::Result<()> {
+        self.ensure_state_restore_healthy()?;
+        match self.state_identity.logical {
+            Some(current) if current == identity => Ok(()),
+            Some(current) => bail!(
+                "native CUDA decoder instance {} physical generation {} is still bound to \
+                 logical session {} generation {}; reset it before binding logical session {} \
+                 generation {}",
+                self.state_identity.instance,
+                self.state_identity.physical_generation,
+                current.session_id,
+                current.generation,
+                identity.session_id,
+                identity.generation
+            ),
+            None => {
+                self.state_identity.logical = Some(identity);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn ensure_logical_state(
+        &self,
+        identity: NativeLogicalStateIdentity,
+    ) -> anyhow::Result<()> {
+        self.ensure_state_restore_healthy()?;
+        self.ensure_logical_state_owner(identity)
+    }
+
+    pub(crate) fn ensure_logical_state_owner(
+        &self,
+        identity: NativeLogicalStateIdentity,
+    ) -> anyhow::Result<()> {
+        if self.state_identity.logical != Some(identity) {
+            bail!(
+                "native CUDA decoder instance {} physical generation {} is not materializing \
+                 logical session {} generation {}; current owner is {:?}",
+                self.state_identity.instance,
+                self.state_identity.physical_generation,
+                identity.session_id,
+                identity.generation,
+                self.state_identity.logical
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn owns_logical_state(&self, identity: NativeLogicalStateIdentity) -> bool {
+        self.state_identity.logical == Some(identity)
+    }
+
+    fn poison_current_generation(&mut self, reason: impl Into<String>) {
+        self.state_restore_poison = Some(CudaStateRestorePoison {
+            identity: self.state_identity,
+            reason: reason.into(),
+        });
+    }
+
+    pub(crate) fn reset_generation(
+        &mut self,
+        session: &mut InferenceSession,
+    ) -> anyhow::Result<()> {
+        let next_generation = self
+            .state_identity
+            .physical_generation
+            .checked_add(1)
+            .context("native CUDA physical generation exhausted during reset")?;
+        if self.logical_len == 0
+            && self.state_identity.logical.is_none()
+            && self.state_restore_poison.is_none()
+        {
+            self.state_identity.physical_generation = next_generation;
+            return Ok(());
+        }
+        let reset = (|| {
+            self.invalidate_graph(session)
+                .context("invalidate CUDA graph before resetting decoder generation")?;
+            if self.verify_width.is_some() {
+                session
+                    .reset_verify_sibling_device_graph()
+                    .context("reset verify CUDA graph before resetting decoder generation")?;
+            }
+            self.reset_verify_graph_phase();
+            self.rewind(0)
+                .context("zero CUDA state for the next decoder generation")
+        })();
+        if let Err(error) = reset {
+            self.poison_current_generation(format!("{error:#}"));
+            return Err(error);
+        }
+        self.state_identity.physical_generation = next_generation;
+        self.state_identity.logical = None;
+        self.state_restore_poison = None;
         Ok(())
     }
 
@@ -5748,11 +6098,14 @@ impl DecodeCudaState {
     /// host memory. The snapshot is ordered on the EP stream ahead of the verify
     /// forward that overwrites the state, so no host synchronization is needed.
     /// Paired with [`Self::restore_fixed_states_device`].
-    pub(crate) fn snapshot_fixed_states_device(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn snapshot_fixed_states_device(
+        &mut self,
+    ) -> anyhow::Result<CudaFixedStateSnapshot> {
         self.ensure_state_restore_healthy()?;
-        self.ensure_fixed_state_snapshot_scratch()?;
-        for slot in 0..self.fixed_state_snapshot_scratch.len() {
-            let (index, ref mut scratch) = self.fixed_state_snapshot_scratch[slot];
+        let mut scratch =
+            self.allocate_fixed_state_scratch("snapshot", CudaScratchRole::Snapshot)?;
+        for (index, scratch) in &mut scratch {
+            let index = *index;
             let binding = &self.bindings[index];
             let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
                 .with_context(|| {
@@ -5762,42 +6115,68 @@ impl DecodeCudaState {
                     )
                 })?;
             binding
-                .snapshot_device_into(scratch, bytes)
+                .snapshot_device_into(scratch.buffer_mut(), bytes)
                 .with_context(|| {
                     format!("device snapshot of recurrent/conv state for binding {index}")
                 })?;
         }
-        Ok(())
+        Ok(CudaFixedStateSnapshot {
+            identity: self.state_identity,
+            buffers: scratch,
+        })
     }
 
     /// Restore a [`Self::snapshot_fixed_states_device`] capture back into the
     /// device recurrent/conv bindings with a stream-ordered device→device copy.
     /// Leaves every binding's shape unchanged, so it never invalidates a
     /// captured decode graph.
-    pub(crate) fn restore_fixed_states_device(&mut self) -> anyhow::Result<()> {
-        self.restore_fixed_states_transaction(None, None, false)
+    pub(crate) fn restore_fixed_states_device(
+        &mut self,
+        snapshot: &CudaFixedStateSnapshot,
+    ) -> anyhow::Result<()> {
+        self.restore_fixed_states_transaction(snapshot, None, None, false)
     }
 
     pub(crate) fn restore_fixed_states_and_rewind(
         &mut self,
+        snapshot: &CudaFixedStateSnapshot,
         target_len: usize,
         session: &mut InferenceSession,
         invalidate_graph: bool,
     ) -> anyhow::Result<()> {
-        self.restore_fixed_states_transaction(Some(target_len), Some(session), invalidate_graph)
+        self.restore_fixed_states_transaction(
+            snapshot,
+            Some(target_len),
+            Some(session),
+            invalidate_graph,
+        )
     }
 
     fn restore_fixed_states_transaction(
         &mut self,
+        snapshot: &CudaFixedStateSnapshot,
         target_len: Option<usize>,
         session: Option<&mut InferenceSession>,
         invalidate_graph: bool,
     ) -> anyhow::Result<()> {
         self.ensure_state_restore_healthy()?;
-        if self.fixed_state_snapshot_scratch.len() != self.fixed_state_binding_range.len() {
+        if snapshot.identity != self.state_identity {
+            bail!(
+                "CUDA recurrent snapshot belongs to decoder instance {} physical generation {} \
+                 owner {:?}, but restore targets decoder instance {} physical generation {} owner \
+                 {:?}; discard the stale or foreign snapshot",
+                snapshot.identity.instance,
+                snapshot.identity.physical_generation,
+                snapshot.identity.logical,
+                self.state_identity.instance,
+                self.state_identity.physical_generation,
+                self.state_identity.logical
+            );
+        }
+        if snapshot.buffers.len() != self.fixed_state_binding_range.len() {
             bail!(
                 "device recurrent restore requested before a matching device snapshot (have {} scratch buffers, need {})",
-                self.fixed_state_snapshot_scratch.len(),
+                snapshot.buffers.len(),
                 self.fixed_state_binding_range.len()
             );
         }
@@ -5809,10 +6188,12 @@ impl DecodeCudaState {
                 self.logical_len
             );
         }
-        self.ensure_fixed_state_restore_undo_scratch()?;
-        if target_len.is_some() {
-            self.ensure_rewind_mask_undo_scratch()?;
-        }
+        let mut undo_scratch =
+            self.allocate_fixed_state_scratch("restore undo", CudaScratchRole::RestoreUndo)?;
+        let mut mask_undo = target_len
+            .is_some()
+            .then(|| self.allocate_rewind_mask_undo_scratch())
+            .transpose()?;
 
         let old_logical_len = self.logical_len;
         let mut old_row_lens = Vec::new();
@@ -5825,15 +6206,16 @@ impl DecodeCudaState {
             let bytes = checked_shape_bytes(mask.physical_shape(), mask.dtype)
                 .context("CUDA attention-mask undo byte count")?;
             mask.snapshot_device_into(
-                self.rewind_mask_undo_scratch
+                mask_undo
                     .as_mut()
-                    .expect("mask undo scratch was prepared"),
+                    .expect("mask undo scratch was prepared")
+                    .buffer_mut(),
                 bytes,
             )
             .context("snapshot CUDA attention mask before state rollback")?;
         }
-        for slot in 0..self.fixed_state_restore_undo_scratch.len() {
-            let (index, ref mut undo) = self.fixed_state_restore_undo_scratch[slot];
+        for (index, undo) in &mut undo_scratch {
+            let index = *index;
             let binding = self.bindings.get(index).with_context(|| {
                 format!("fixed-state undo journal names out-of-range binding {index}")
             })?;
@@ -5844,9 +6226,11 @@ impl DecodeCudaState {
                         binding.physical_shape()
                     )
                 })?;
-            binding.snapshot_device_into(undo, bytes).with_context(|| {
-                format!("snapshot live recurrent/conv state for binding {index}")
-            })?;
+            binding
+                .snapshot_device_into(undo.buffer_mut(), bytes)
+                .with_context(|| {
+                    format!("snapshot live recurrent/conv state for binding {index}")
+                })?;
         }
         if invalidate_graph {
             self.invalidate_graph(
@@ -5859,8 +6243,8 @@ impl DecodeCudaState {
             if let Some(target_len) = target_len {
                 self.rewind_dense_state_only(target_len)?;
             }
-            for slot in 0..self.fixed_state_snapshot_scratch.len() {
-                let (index, ref scratch) = self.fixed_state_snapshot_scratch[slot];
+            for (slot, (index, scratch)) in snapshot.buffers.iter().enumerate() {
+                let index = *index;
                 check_cuda_fixed_restore_stage(slot, index)?;
                 let binding = self.bindings.get_mut(index).with_context(|| {
                     format!(
@@ -5876,7 +6260,7 @@ impl DecodeCudaState {
                         )
                     })?;
                 binding
-                    .restore_device_from(scratch, bytes)
+                    .restore_device_from(scratch.buffer(), bytes)
                     .with_context(|| {
                         format!("device restore of recurrent/conv state for binding {index}")
                     })?;
@@ -5895,9 +6279,10 @@ impl DecodeCudaState {
             match bytes {
                 Ok(bytes) => {
                     if let Err(error) = mask.restore_device_from(
-                        self.rewind_mask_undo_scratch
+                        mask_undo
                             .as_ref()
-                            .expect("mask undo scratch was prepared"),
+                            .expect("mask undo scratch was prepared")
+                            .buffer(),
                         bytes,
                     ) {
                         undo_errors.push(
@@ -5910,8 +6295,8 @@ impl DecodeCudaState {
                 Err(error) => undo_errors.push(error),
             }
         }
-        for slot in 0..self.fixed_state_restore_undo_scratch.len() {
-            let (index, ref undo) = self.fixed_state_restore_undo_scratch[slot];
+        for (slot, (index, undo)) in undo_scratch.iter().enumerate() {
+            let index = *index;
             if let Err(error) = check_cuda_fixed_undo_stage(slot, index) {
                 undo_errors.push(error);
                 continue;
@@ -5935,7 +6320,7 @@ impl DecodeCudaState {
                     continue;
                 }
             };
-            if let Err(error) = binding.restore_device_from(undo, bytes) {
+            if let Err(error) = binding.restore_device_from(undo.buffer(), bytes) {
                 undo_errors.push(
                     anyhow::Error::from(error)
                         .context(format!("undo recurrent/conv state for binding {index}")),
@@ -5958,7 +6343,7 @@ impl DecodeCudaState {
             }
         }
         if !undo_errors.is_empty() {
-            self.state_restore_poison = Some(
+            self.poison_current_generation(
                 undo_errors
                     .iter()
                     .map(|error| error.to_string())

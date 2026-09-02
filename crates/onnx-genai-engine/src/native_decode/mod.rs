@@ -1,6 +1,6 @@
 //! Native nxrt adapter for the engine's existing decode loop.
 
-use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback};
+use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback, SessionId};
 use crate::decode::DecodeBackend;
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState};
 use crate::logits::{ProcessorChain, TokenId};
@@ -179,6 +179,10 @@ pub struct NativeDecodeSession {
     /// axis internally, so its rows cannot be mapped back to input positions and
     /// padding would silently answer with a padded row.
     prefill_query_padding: bool,
+    #[cfg(test)]
+    fail_next_reset: bool,
+    #[cfg(test)]
+    fail_rewind_after: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,19 +301,29 @@ impl NativePastSnapshot {
 /// caching), this captures only destructive recurrent/conv bindings plus typed
 /// compressed-attention record/carry groups. Dense KV remains prefix-sliceable.
 /// Exactly one of `host` (host tensors keyed by past-input name) or
-/// `device_scratch` (device bindings staged into scratch) indicates where the
+/// `device_scratch` (owned device bindings staged into scratch) indicates where the
 /// captured state lives, depending on which decode backend produced it.
 /// `len` is the committed length the snapshot was taken at, asserted against the
 /// commit's `base_len`.
 pub(crate) struct RecurrentStateSnapshot {
     len: usize,
     host: Option<HashMap<String, Tensor>>,
-    /// True when the CUDA fixed-state bindings were staged into the session's
-    /// device scratch buffers (a stream-ordered device→device snapshot). The
-    /// bytes live in the CUDA decode state rather than in this handle, so a
-    /// restore copies them back from there. Only one such snapshot is live at a
-    /// time (per speculative step), matching the single scratch arena.
-    device_scratch: bool,
+    /// CUDA fixed-state bindings staged by device→device copies. The snapshot
+    /// owns the allocations and their exact providers, so dropping the handle
+    /// submits every allocation to provider-fenced deferred release.
+    device_scratch: Option<CudaFixedStateSnapshot>,
+}
+
+/// Exact logical owner of one materialized native decoder generation.
+///
+/// Session ids are never reused within an engine, while `generation` advances
+/// when reset keeps the same public id but starts a clean conversation. The
+/// pair prevents a stale snapshot or poison record from authorizing a later
+/// generation of the same logical session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeLogicalStateIdentity {
+    pub(crate) session_id: SessionId,
+    pub(crate) generation: u64,
 }
 
 impl RecurrentStateSnapshot {
@@ -446,6 +460,52 @@ impl NativeDecodeSession {
 impl NativeDecodeSession {
     pub(crate) fn inference_session(&self) -> &InferenceSession {
         &self.session
+    }
+
+    pub(crate) fn bind_logical_state(
+        &mut self,
+        identity: NativeLogicalStateIdentity,
+    ) -> anyhow::Result<()> {
+        if let Some(cuda) = &mut self.cuda {
+            cuda.bind_logical_state(identity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_logical_state(
+        &self,
+        identity: NativeLogicalStateIdentity,
+    ) -> anyhow::Result<()> {
+        if let Some(cuda) = &self.cuda {
+            cuda.ensure_logical_state(identity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_logical_state_owner(
+        &self,
+        identity: NativeLogicalStateIdentity,
+    ) -> anyhow::Result<()> {
+        if let Some(cuda) = &self.cuda {
+            cuda.ensure_logical_state_owner(identity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn owns_logical_state(&self, identity: NativeLogicalStateIdentity) -> bool {
+        self.cuda
+            .as_ref()
+            .is_some_and(|cuda| cuda.owns_logical_state(identity))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_reset_for_test(&mut self) {
+        self.fail_next_reset = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_rewind_after_for_test(&mut self, successful_rewinds: usize) {
+        self.fail_rewind_after = Some(successful_rewinds);
     }
 
     pub fn current_len(&self) -> usize {
@@ -791,11 +851,11 @@ impl NativeDecodeSession {
         }
         let len = self.current_len;
         if let Some(cuda) = self.cuda.as_mut() {
-            cuda.snapshot_fixed_states_device()?;
+            let device_scratch = cuda.snapshot_fixed_states_device()?;
             return Ok(RecurrentStateSnapshot {
                 len,
                 host: None,
-                device_scratch: true,
+                device_scratch: Some(device_scratch),
             });
         }
         if self.cpu_kv.is_some() {
@@ -821,7 +881,7 @@ impl NativeDecodeSession {
         Ok(RecurrentStateSnapshot {
             len,
             host: Some(host),
-            device_scratch: false,
+            device_scratch: None,
         })
     }
 
@@ -833,11 +893,11 @@ impl NativeDecodeSession {
         &mut self,
         snapshot: &RecurrentStateSnapshot,
     ) -> anyhow::Result<()> {
-        if snapshot.device_scratch {
+        if let Some(device_scratch) = &snapshot.device_scratch {
             let cuda = self.cuda.as_mut().context(
                 "recurrent snapshot targets the CUDA fixed-state bindings but this session has no CUDA state",
             )?;
-            cuda.restore_fixed_states_device()?;
+            cuda.restore_fixed_states_device(device_scratch)?;
             return Ok(());
         }
         if let Some(host) = &snapshot.host {
@@ -959,7 +1019,7 @@ impl NativeDecodeSession {
                 snapshot.len
             );
         }
-        if snapshot.device_scratch {
+        if let Some(device_scratch) = &snapshot.device_scratch {
             let state = self.cuda.as_mut().context(
                 "recurrent snapshot targets the CUDA fixed-state bindings but this session has no CUDA state",
             )?;
@@ -969,7 +1029,12 @@ impl NativeDecodeSession {
                 self.session.reset_verify_sibling_device_graph()?;
                 state.reset_verify_graph_phase();
             }
-            state.restore_fixed_states_and_rewind(target_len, &mut self.session, !retain)?;
+            state.restore_fixed_states_and_rewind(
+                device_scratch,
+                target_len,
+                &mut self.session,
+                !retain,
+            )?;
             self.current_len = target_len;
             return Ok(());
         }
@@ -1831,6 +1896,16 @@ impl NativeDecodeSession {
     }
 
     pub fn reset(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_reset) {
+            bail!("injected native decoder reset failure");
+        }
+        if let Some(state) = &mut self.cuda {
+            state.reset_generation(&mut self.session)?;
+            self.current_len = 0;
+            self.last_hidden = None;
+            return Ok(());
+        }
         self.rewind(0)
     }
 
