@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
@@ -205,10 +205,25 @@ fn host_ints(runtime: &CudaRuntime, view: &TensorView, op: &str) -> Result<Vec<i
 }
 
 #[derive(Debug)]
+struct PersistentMetadataAllocation {
+    runtime: Arc<CudaRuntime>,
+    ptr: CUdeviceptr,
+}
+
+impl Drop for PersistentMetadataAllocation {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct PersistentMetadata {
     runtime: Arc<CudaRuntime>,
     values: Option<Vec<u64>>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<PersistentMetadataAllocation>>,
 }
 
 impl PersistentMetadata {
@@ -216,13 +231,20 @@ impl PersistentMetadata {
         Self {
             runtime,
             values: None,
-            ptr: 0,
+            allocation: None,
         }
     }
 
     pub(super) fn prepare(&mut self, values: &[u64], op: &str) -> Result<CUdeviceptr> {
         if self.values.as_deref() == Some(values) {
-            return Ok(self.ptr);
+            return self.allocation.as_ref().map_or_else(
+                || {
+                    Err(EpError::KernelFailed(format!(
+                        "cuda_ep {op}: cached persistent metadata lost its device allocation"
+                    )))
+                },
+                |allocation| Ok(allocation.ptr),
+            );
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(format!(
@@ -240,21 +262,20 @@ impl PersistentMetadata {
             let _ = unsafe { self.runtime.free_raw(ptr) };
             return Err(error);
         }
-        if self.ptr != 0 {
-            unsafe { self.runtime.free_raw(self.ptr) }?;
-        }
         self.values = Some(values.to_vec());
-        self.ptr = ptr;
+        self.allocation = Some(Arc::new(PersistentMetadataAllocation {
+            runtime: Arc::clone(&self.runtime),
+            ptr,
+        }));
         Ok(ptr)
     }
-}
 
-impl Drop for PersistentMetadata {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
-        }
+    pub(super) fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        let allocation = self.allocation.as_ref()?;
+        Some(DeviceGraphResource::new(
+            Arc::as_ptr(allocation) as usize,
+            Arc::clone(allocation),
+        ))
     }
 }
 

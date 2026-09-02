@@ -13,7 +13,8 @@ use std::time::Instant;
 
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
-    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
+    CaptureSupport, DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut,
+    TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{
     DataType, EinsumClassification, EinsumContractionPlan, EinsumInput, EinsumOperandPlan,
@@ -515,19 +516,24 @@ impl CachedExecution {
 }
 
 struct CachedGemm {
-    runtime: Arc<CudaRuntime>,
     plan: CaptureStridedBatchedGemmPlan,
-    workspace: CUdeviceptr,
+    workspace: Option<Arc<GemmWorkspace>>,
 }
 
-impl Drop for CachedGemm {
+struct GemmWorkspace {
+    runtime: Arc<CudaRuntime>,
+    ptr: CUdeviceptr,
+}
+
+impl Drop for GemmWorkspace {
     fn drop(&mut self) {
-        if self.workspace != 0 {
+        if self.ptr != 0 {
             // SAFETY: allocated once when the immutable plan was built and
             // freed after the owning kernel/captured graph can no longer launch.
             unsafe {
-                let _ = self.runtime.free_raw(self.workspace);
+                let _ = self.runtime.free_raw(self.ptr);
             }
+            self.ptr = 0;
         }
     }
 }
@@ -563,7 +569,7 @@ impl CachedGemm {
                 runtime.blas(),
                 runtime.stream_ptr(),
                 &params,
-                self.workspace,
+                self.workspace.as_ref().map_or(0, |workspace| workspace.ptr),
             )
         }
     }
@@ -598,18 +604,100 @@ pub struct EinsumKernel {
     last_call_capture_safe: AtomicBool,
 }
 
-fn pointer_range(ptr: CUdeviceptr, bytes: usize) -> Result<Option<(u64, u64)>> {
-    if bytes == 0 {
-        return Ok(None);
-    }
-    let end = ptr.checked_add(bytes as u64).ok_or_else(|| {
-        EpError::KernelFailed("cuda_ep Einsum: device pointer range overflows u64".into())
-    })?;
-    Ok(Some((ptr, end)))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeviceByteRange {
+    start: u64,
+    end: u64,
 }
 
-fn overlaps(left: Option<(u64, u64)>, right: Option<(u64, u64)>) -> bool {
-    matches!((left, right), (Some((ls, le)), Some((rs, re))) if ls < re && rs < le)
+fn checked_nonnegative_strided_byte_range(
+    base: CUdeviceptr,
+    byte_offset: usize,
+    dtype: DataType,
+    shape: &[usize],
+    strides: &[i64],
+    context: &str,
+) -> Result<Option<DeviceByteRange>> {
+    if shape.len() != strides.len() {
+        return Err(EpError::KernelFailed(format!(
+            "{context}: shape rank {} does not match stride rank {}; provide a valid tensor view",
+            shape.len(),
+            strides.len()
+        )));
+    }
+    if let Some((axis, stride)) = strides
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, stride)| *stride < 0)
+    {
+        return Err(not_implemented(format!(
+            "{context} with negative stride {stride} on axis {axis}; execute through the zero-copy view path"
+        )));
+    }
+    if shape.contains(&0) {
+        return Ok(None);
+    }
+    let element_bytes = u64::try_from(dtype.byte_size()).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "{context}: element byte size does not fit u64 device addressing"
+        ))
+    })?;
+    if element_bytes == 0 {
+        return Err(EpError::KernelFailed(format!(
+            "{context}: dtype {dtype:?} has no fixed-width addressable element size"
+        )));
+    }
+    let offset = u64::try_from(byte_offset).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "{context}: byte_offset {byte_offset} does not fit u64 device addressing"
+        ))
+    })?;
+    let start = base.checked_add(offset).ok_or_else(|| {
+        EpError::KernelFailed(format!(
+            "{context}: address range overflows u64 while adding base {base:#x} and byte_offset {byte_offset}; use a view whose byte offset, shape, and strides fit device addressing"
+        ))
+    })?;
+    let max_element_offset = shape.iter().zip(strides).enumerate().try_fold(
+        0u64,
+        |offset, (axis, (&dim, &stride))| {
+            let dim_extent = u64::try_from(dim - 1).map_err(|_| {
+                EpError::KernelFailed(format!(
+                    "{context}: axis {axis} extent {} does not fit u64 device addressing",
+                    dim - 1
+                ))
+            })?;
+            let stride = u64::try_from(stride).expect("negative strides were rejected above");
+            let axis_extent = dim_extent.checked_mul(stride).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "{context}: address range overflows u64 for shape {shape:?}, strides {strides:?}, byte_offset {byte_offset} at axis {axis}; use a smaller validated view"
+                ))
+            })?;
+            offset.checked_add(axis_extent).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "{context}: address range overflows u64 while summing shape {shape:?}, strides {strides:?}, byte_offset {byte_offset}; use a smaller validated view"
+                ))
+            })
+        },
+    )?;
+    let span = max_element_offset
+        .checked_mul(element_bytes)
+        .and_then(|bytes| bytes.checked_add(element_bytes))
+        .ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "{context}: address range overflows u64 converting shape {shape:?} and strides {strides:?} to bytes for {dtype:?}; use a smaller validated view"
+            ))
+        })?;
+    let end = start.checked_add(span).ok_or_else(|| {
+        EpError::KernelFailed(format!(
+            "{context}: address range overflows u64 from start {start:#x} with byte span {span}; use a view whose byte offset, shape, and strides fit device addressing"
+        ))
+    })?;
+    Ok(Some(DeviceByteRange { start, end }))
+}
+
+fn overlaps(left: Option<DeviceByteRange>, right: Option<DeviceByteRange>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left.start < right.end && right.start < left.end)
 }
 
 impl EinsumKernel {
@@ -690,17 +778,19 @@ impl EinsumKernel {
                 )));
             }
             let workspace = if workspace_bytes == 0 {
-                0
+                None
             } else {
-                self.runtime.alloc_raw(workspace_bytes)?
+                Some(Arc::new(GemmWorkspace {
+                    runtime: Arc::clone(&self.runtime),
+                    ptr: self.runtime.alloc_raw(workspace_bytes)?,
+                }))
             };
             WORKSPACE_BYTES_LAST.store(workspace_bytes as u64, Ordering::Relaxed);
-            WORKSPACE_PTR_LAST.store(workspace, Ordering::Relaxed);
-            ExecutionKind::Gemm(CachedGemm {
-                runtime: self.runtime.clone(),
-                plan,
-                workspace,
-            })
+            WORKSPACE_PTR_LAST.store(
+                workspace.as_ref().map_or(0, |workspace| workspace.ptr),
+                Ordering::Relaxed,
+            );
+            ExecutionKind::Gemm(CachedGemm { plan, workspace })
         };
         SETUP_NS_LAST.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         PLAN_BUILDS.fetch_add(1, Ordering::Relaxed);
@@ -719,6 +809,38 @@ impl EinsumKernel {
                 "Einsum `{}` GEMM/BMM contraction with non-contiguous input/output",
                 self.plan.equation()
             )));
+        }
+        let output_context = format!(
+            "cuda_ep Einsum `{}` contraction output",
+            self.plan.equation()
+        );
+        let output_range = checked_nonnegative_strided_byte_range(
+            cuptr(outputs[0].data.0 as *const c_void),
+            outputs[0].byte_offset,
+            outputs[0].dtype,
+            outputs[0].shape,
+            outputs[0].strides,
+            &output_context,
+        )?;
+        for (index, input) in inputs.iter().enumerate() {
+            let input_context = format!(
+                "cuda_ep Einsum `{}` contraction input #{index}",
+                self.plan.equation()
+            );
+            let input_range = checked_nonnegative_strided_byte_range(
+                cuptr(input.data.0),
+                input.byte_offset,
+                input.dtype,
+                input.shape,
+                input.strides,
+                &input_context,
+            )?;
+            if overlaps(output_range, input_range) {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep Einsum `{}`: contraction output byte range {output_range:?} overlaps input #{index} byte range {input_range:?}; use non-overlapping storage",
+                    self.plan.equation()
+                )));
+            }
         }
         let capturing = self.runtime.is_capturing()?;
         let mut execution = self.execution.lock().map_err(|_| {
@@ -760,15 +882,6 @@ impl EinsumKernel {
         let a_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
         let c_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let output_range = pointer_range(c_ptr, outputs[0].byte_size())?;
-        if overlaps(output_range, pointer_range(a_ptr, inputs[0].byte_size())?)
-            || overlaps(output_range, pointer_range(b_ptr, inputs[1].byte_size())?)
-        {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep Einsum `{}`: output must not alias either contraction input",
-                self.plan.equation()
-            )));
-        }
 
         match &cached.kind {
             ExecutionKind::NoOp => {}
@@ -837,6 +950,56 @@ impl EinsumKernel {
             | EinsumClassification::DiagonalView(permutation) => permutation,
             _ => unreachable!("run_view is called only for view plans"),
         };
+        let view = self
+            .view_spec(&inputs[0], outputs[0].shape, permutation)
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep Einsum `{}`: output is not the canonical permutation/diagonal view",
+                    self.plan.equation()
+                ))
+            })?;
+        if view.strides.iter().any(|&stride| stride < 0) {
+            return Err(not_implemented(format!(
+                "Einsum `{}` fallback materialization with negative source strides; execute through the zero-copy view path",
+                self.plan.equation()
+            )));
+        }
+        if !outputs[0].is_contiguous() {
+            return Err(not_implemented(format!(
+                "Einsum `{}` view fallback with a non-contiguous destination",
+                self.plan.equation()
+            )));
+        }
+        let input_context = format!(
+            "cuda_ep Einsum `{}` materialized permutation/diagonal input",
+            self.plan.equation()
+        );
+        let output_context = format!(
+            "cuda_ep Einsum `{}` materialized permutation/diagonal output",
+            self.plan.equation()
+        );
+        let input_range = checked_nonnegative_strided_byte_range(
+            cuptr(inputs[0].data.0),
+            inputs[0].byte_offset,
+            inputs[0].dtype,
+            inputs[0].shape,
+            inputs[0].strides,
+            &input_context,
+        )?;
+        let output_range = checked_nonnegative_strided_byte_range(
+            cuptr(outputs[0].data.0 as *const c_void),
+            outputs[0].byte_offset,
+            outputs[0].dtype,
+            outputs[0].shape,
+            outputs[0].strides,
+            &output_context,
+        )?;
+        if overlaps(input_range, output_range) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Einsum `{}`: materialized permutation/diagonal output byte range {output_range:?} overlaps input byte range {input_range:?}; use non-overlapping storage or execute through the zero-copy view path",
+                self.plan.equation()
+            )));
+        }
         let capturing = self.runtime.is_capturing()?;
         let mut warmed = self.view_materialization.lock().map_err(|_| {
             EpError::KernelFailed(format!(
@@ -858,20 +1021,6 @@ impl EinsumKernel {
                 )));
             }
         } else {
-            let view = self
-                .view_spec(&inputs[0], outputs[0].shape, permutation)
-                .ok_or_else(|| {
-                    EpError::KernelFailed(format!(
-                        "cuda_ep Einsum `{}`: output is not the canonical permutation/diagonal view",
-                        self.plan.equation()
-                    ))
-                })?;
-            if view.strides.iter().any(|&stride| stride < 0) {
-                return Err(not_implemented(format!(
-                    "Einsum `{}` fallback materialization with negative source strides; execute through the zero-copy view path",
-                    self.plan.equation()
-                )));
-            }
             let mut metadata = outputs[0]
                 .shape
                 .iter()
@@ -889,20 +1038,6 @@ impl EinsumKernel {
         if outputs[0].numel() == 0 {
             self.last_call_capture_safe.store(true, Ordering::Relaxed);
             return Ok(());
-        }
-        if !outputs[0].is_contiguous() {
-            return Err(not_implemented(format!(
-                "Einsum `{}` view fallback with a non-contiguous destination",
-                self.plan.equation()
-            )));
-        }
-        let input_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
-        let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        if input_ptr == output_ptr {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep Einsum `{}`: materialized permutation/diagonal output aliases its input; execute through the zero-copy view path",
-                self.plan.equation()
-            )));
         }
         let metadata_ptr = self
             .view_metadata
@@ -989,33 +1124,74 @@ impl Kernel for EinsumKernel {
             )
     }
 
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        let mut resources = Vec::with_capacity(2);
+        if let Ok(execution) = self.execution.lock()
+            && let Some(CachedExecution {
+                kind: ExecutionKind::Gemm(gemm),
+                ..
+            }) = execution.as_ref()
+            && let Some(workspace) = gemm.workspace.as_ref()
+        {
+            resources.push(DeviceGraphResource::new(
+                Arc::as_ptr(workspace) as usize,
+                Arc::clone(workspace),
+            ));
+        }
+        if let Ok(metadata) = self.view_metadata.lock()
+            && let Some(resource) = metadata.device_graph_resource()
+        {
+            resources.push(resource);
+        }
+        resources
+    }
+
     fn capture_support(&self) -> CaptureSupport {
         match self.plan.classification() {
             EinsumClassification::ViewOnlyPermutation(_)
-            | EinsumClassification::DiagonalView(_) => {
-                let materialization_warmed = self
-                    .view_materialization
-                    .lock()
-                    .is_ok_and(|signature| signature.is_some());
-                if self.view_alias_warmed.load(Ordering::Relaxed) || materialization_warmed {
-                    CaptureSupport::Supported
-                } else {
-                    CaptureSupport::unsupported(format!(
-                        "Einsum `{}` must establish its zero-copy view or exact materialization signature before capture",
-                        self.plan.equation()
-                    ))
+            | EinsumClassification::DiagonalView(_) => match self.view_materialization.lock() {
+                Ok(signature) => {
+                    let materialization_warmed = signature.is_some();
+                    let metadata_required = signature
+                        .as_ref()
+                        .is_some_and(|signature| !signature.output_shape.contains(&0));
+                    let metadata_ready = !metadata_required
+                        || self
+                            .view_metadata
+                            .lock()
+                            .is_ok_and(|metadata| metadata.device_graph_resource().is_some());
+                    if (self.view_alias_warmed.load(Ordering::Relaxed) || materialization_warmed)
+                        && metadata_ready
+                    {
+                        CaptureSupport::Supported
+                    } else {
+                        CaptureSupport::unsupported(format!(
+                            "Einsum `{}` must establish its zero-copy view or exact materialization signature and persistent metadata before capture",
+                            self.plan.equation()
+                        ))
+                    }
                 }
-            }
-            EinsumClassification::Gemm(_) => {
-                if self.last_call_capture_safe.load(Ordering::Relaxed) {
+                Err(_) => CaptureSupport::unsupported(format!(
+                    "Einsum `{}` view-materialization lock was poisoned",
+                    self.plan.equation()
+                )),
+            },
+            EinsumClassification::Gemm(_) => match self.execution.lock() {
+                Ok(execution)
+                    if execution.is_some()
+                        && self.last_call_capture_safe.load(Ordering::Relaxed) =>
+                {
                     CaptureSupport::Supported
-                } else {
-                    CaptureSupport::unsupported(format!(
-                        "Einsum `{}` must warm its exact dtype/shape/layout and persistent cuBLASLt workspace before capture",
-                        self.plan.equation()
-                    ))
                 }
-            }
+                Ok(_) => CaptureSupport::unsupported(format!(
+                    "Einsum `{}` must warm its exact dtype/shape/layout and persistent cuBLASLt workspace before capture",
+                    self.plan.equation()
+                )),
+                Err(_) => CaptureSupport::unsupported(format!(
+                    "Einsum `{}` execution-plan lock was poisoned",
+                    self.plan.equation()
+                )),
+            },
             EinsumClassification::ReductionOrElementwise(_) => CaptureSupport::unsupported(
                 "CUDA Einsum reduction/elementwise lowering is not implemented",
             ),
@@ -1091,5 +1267,54 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("partial multi-axis batch"));
+    }
+
+    #[test]
+    fn addressed_byte_range_accounts_for_offsets_strides_and_empty_tensors() {
+        let range = checked_nonnegative_strided_byte_range(
+            0x1000,
+            8,
+            DataType::Float32,
+            &[2, 3],
+            &[5, 1],
+            "test input",
+        )
+        .unwrap();
+        assert_eq!(
+            range,
+            Some(DeviceByteRange {
+                start: 0x1008,
+                end: 0x1028
+            })
+        );
+        assert_eq!(
+            checked_nonnegative_strided_byte_range(
+                u64::MAX,
+                usize::MAX,
+                DataType::Float32,
+                &[0, usize::MAX],
+                &[i64::MAX, i64::MAX],
+                "empty test input",
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn addressed_byte_range_rejects_pointer_overflow_actionably() {
+        let error = checked_nonnegative_strided_byte_range(
+            u64::MAX - 1,
+            4,
+            DataType::Float32,
+            &[1],
+            &[1],
+            "test input",
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("test input"));
+        assert!(message.contains("address range overflows u64"));
+        assert!(message.contains("byte_offset 4"));
     }
 }

@@ -748,6 +748,185 @@ fn warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn captured_private_resources_outlive_dropped_einsum_kernels() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+
+    let gemm_shapes = [vec![32, 64], vec![4, 64, 48]];
+    let gemm_output_shape = [4, 32, 48];
+    let (gemm, gemm_inputs, gemm_buffers, mut gemm_output) =
+        make_direct_kernel(&ep, "mk,...kn->...mn", &gemm_shapes, &gemm_output_shape);
+    let gemm_input_strides = gemm_inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect::<Vec<_>>();
+    let gemm_output_strides = compute_contiguous_strides(&gemm_output_shape);
+    let gemm_views = gemm_inputs
+        .iter()
+        .zip(&gemm_buffers)
+        .zip(&gemm_input_strides)
+        .map(|((input, buffer), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                input.dtype,
+                &input.shape,
+                strides,
+                ep.device_id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let execute_gemm = |kernel: &dyn onnx_runtime_ep_api::Kernel,
+                        output: &mut onnx_runtime_ep_api::DeviceBuffer| {
+        kernel
+            .execute(
+                &gemm_views,
+                &mut [TensorMut::new(
+                    DevicePtrMut(output.as_mut_ptr()),
+                    DataType::Float32,
+                    &gemm_output_shape,
+                    &gemm_output_strides,
+                    ep.device_id(),
+                )],
+            )
+            .unwrap();
+    };
+
+    let view_shape = [2, 3];
+    let view_output_shape = [3, 2];
+    let (view, view_inputs, view_buffers, mut view_output) =
+        make_direct_kernel(&ep, "ij->ji", &[view_shape.to_vec()], &view_output_shape);
+    let view_input_strides = compute_contiguous_strides(&view_shape);
+    let view_output_strides = compute_contiguous_strides(&view_output_shape);
+    let view_input = TensorView::new(
+        DevicePtr(view_buffers[0].as_ptr()),
+        DataType::Float32,
+        &view_shape,
+        &view_input_strides,
+        ep.device_id(),
+    );
+    let execute_view = |kernel: &dyn onnx_runtime_ep_api::Kernel,
+                        output: &mut onnx_runtime_ep_api::DeviceBuffer| {
+        kernel
+            .execute(
+                std::slice::from_ref(&view_input),
+                &mut [TensorMut::new(
+                    DevicePtrMut(output.as_mut_ptr()),
+                    DataType::Float32,
+                    &view_output_shape,
+                    &view_output_strides,
+                    ep.device_id(),
+                )],
+            )
+            .unwrap();
+    };
+
+    reset_einsum_execution_stats();
+    execute_gemm(gemm.as_ref(), &mut gemm_output);
+    execute_view(view.as_ref(), &mut view_output);
+    let workspace_bytes = einsum_execution_stats().workspace_bytes;
+    assert_eq!(
+        gemm.device_graph_resources().len(),
+        usize::from(workspace_bytes != 0),
+        "only an allocated cuBLASLt workspace needs graph ownership"
+    );
+    assert_eq!(
+        view.device_graph_resources().len(),
+        1,
+        "materialized view metadata must expose one immutable graph owner"
+    );
+    assert!(gemm.capture_support().is_supported());
+    assert!(view.capture_support().is_supported());
+
+    runtime
+        .begin_graph_capture(&[gemm.as_ref(), view.as_ref()])
+        .unwrap();
+    execute_gemm(gemm.as_ref(), &mut gemm_output);
+    execute_view(view.as_ref(), &mut view_output);
+    runtime.end_graph_capture().unwrap();
+
+    let counts_before_drop = runtime.allocation_counts();
+    let pooled_before_drop = runtime.raw_pool_retained_bytes();
+    drop(gemm);
+    drop(view);
+    assert_eq!(
+        runtime.allocation_counts(),
+        counts_before_drop,
+        "dropping kernels must not free addresses embedded in a live graph"
+    );
+    assert_eq!(
+        runtime.raw_pool_retained_bytes(),
+        pooled_before_drop,
+        "dropping kernels must not return graph-owned addresses to the raw pool"
+    );
+
+    runtime.replay_graph().unwrap();
+    runtime.synchronize().unwrap();
+
+    let mut gemm_bytes = vec![0u8; gemm_output_shape.iter().product::<usize>() * 4];
+    unsafe {
+        runtime
+            .dtoh(&mut gemm_bytes, cuptr(gemm_output.as_ptr()))
+            .unwrap()
+    };
+    let gemm_actual = decode_floats(&gemm_bytes, DataType::Float32);
+    let gemm_a = quantize(
+        &decode_floats(&gemm_inputs[0].bytes, DataType::Float32),
+        DataType::Float32,
+    );
+    let gemm_b = quantize(
+        &decode_floats(&gemm_inputs[1].bytes, DataType::Float32),
+        DataType::Float32,
+    );
+    let gemm_expected =
+        f64_gemm_reference(&gemm_a, &gemm_b, 4, 32, 64, 48, false, false, 0, 64 * 48);
+    assert_close(
+        &gemm_actual,
+        &gemm_expected,
+        DataType::Float32,
+        "replay after GEMM kernel drop",
+    );
+
+    let mut view_bytes = vec![0u8; view_output_shape.iter().product::<usize>() * 4];
+    unsafe {
+        runtime
+            .dtoh(&mut view_bytes, cuptr(view_output.as_ptr()))
+            .unwrap()
+    };
+    let source = decode_floats(&view_inputs[0].bytes, DataType::Float32);
+    assert_eq!(
+        decode_floats(&view_bytes, DataType::Float32),
+        vec![
+            source[0], source[3], source[1], source[4], source[2], source[5]
+        ]
+    );
+
+    let counts_before_reset = runtime.allocation_counts();
+    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+    assert!(runtime.reset_graph().unwrap());
+    let counts_after_reset = runtime.allocation_counts();
+    let pooled_after_reset = runtime.raw_pool_retained_bytes();
+    assert!(
+        counts_after_reset.frees > counts_before_reset.frees
+            || pooled_after_reset > pooled_before_reset,
+        "destroying the graph must release its private workspace/metadata owners"
+    );
+
+    for buffer in gemm_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(gemm_output).unwrap();
+    for buffer in view_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(view_output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn contraction_rejects_output_alias_before_launch() {
     let _lock = suite_lock();
     let ep = require_cuda();
@@ -785,13 +964,178 @@ fn contraction_rejects_output_alias_before_launch() {
             )],
         )
         .unwrap_err();
-    assert!(error.to_string().contains("must not alias"));
+    assert!(error.to_string().contains("overlaps input #0"));
     assert_eq!(einsum_execution_stats().gemm_launches, before);
     runtime.synchronize().unwrap();
     for buffer in buffers {
         ep.deallocate(buffer).unwrap();
     }
     drop(inputs);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn materialized_view_rejects_partial_offset_overlap_before_mutation() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let input_shape = [2, 3];
+    let output_shape = [3, 2];
+    let (kernel, inputs, buffers, output) =
+        make_direct_kernel(&ep, "ij->ji", &[input_shape.to_vec()], &output_shape);
+    ep.deallocate(output).unwrap();
+    for buffer in buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+
+    let mut shared = ep.allocate(64, 256).unwrap();
+    let input_offset = 8u64;
+    unsafe {
+        runtime
+            .htod(
+                &inputs[0].bytes,
+                cuptr(shared.as_ptr()).checked_add(input_offset).unwrap(),
+            )
+            .unwrap()
+    };
+    let input_strides = compute_contiguous_strides(&input_shape);
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let input = TensorView::new(
+        DevicePtr(shared.as_ptr()),
+        DataType::Float32,
+        &input_shape,
+        &input_strides,
+        ep.device_id(),
+    )
+    .with_byte_offset(input_offset as usize);
+
+    reset_einsum_execution_stats();
+    let allocations_before = runtime.allocation_counts();
+    let error = kernel
+        .execute(
+            std::slice::from_ref(&input),
+            &mut [TensorMut::new(
+                DevicePtrMut(shared.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )
+            .with_byte_offset(12)],
+        )
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("materialized permutation/diagonal"));
+    assert!(message.contains("overlaps input byte range"));
+    assert_eq!(
+        runtime.allocation_counts(),
+        allocations_before,
+        "overlap rejection must happen before persistent metadata allocation"
+    );
+    assert_eq!(einsum_execution_stats().view_materializations, 0);
+    assert_eq!(einsum_execution_stats().materialization_bytes, 0);
+
+    for (label, output_offset) in [("adjacent", 32usize), ("gapped", 40usize)] {
+        kernel
+            .execute(
+                std::slice::from_ref(&input),
+                &mut [TensorMut::new(
+                    DevicePtrMut(shared.as_mut_ptr()),
+                    DataType::Float32,
+                    &output_shape,
+                    &output_strides,
+                    ep.device_id(),
+                )
+                .with_byte_offset(output_offset)],
+            )
+            .unwrap_or_else(|error| panic!("{label} output must be legal: {error}"));
+        runtime.synchronize().unwrap();
+        let mut bytes = vec![0u8; 24];
+        unsafe {
+            runtime
+                .dtoh(
+                    &mut bytes,
+                    cuptr(shared.as_ptr())
+                        .checked_add(output_offset as u64)
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            decode_floats(&bytes, DataType::Float32),
+            vec![
+                decode_floats(&inputs[0].bytes, DataType::Float32)[0],
+                decode_floats(&inputs[0].bytes, DataType::Float32)[3],
+                decode_floats(&inputs[0].bytes, DataType::Float32)[1],
+                decode_floats(&inputs[0].bytes, DataType::Float32)[4],
+                decode_floats(&inputs[0].bytes, DataType::Float32)[2],
+                decode_floats(&inputs[0].bytes, DataType::Float32)[5],
+            ],
+            "{label}"
+        );
+    }
+
+    ep.deallocate(shared).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn materialized_view_address_overflow_is_actionable_and_pre_mutation() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let input_shape = [2, 3];
+    let output_shape = [3, 2];
+    let (kernel, _inputs, buffers, mut output) =
+        make_direct_kernel(&ep, "ij->ji", &[input_shape.to_vec()], &output_shape);
+    let input_strides = compute_contiguous_strides(&input_shape);
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let invalid_offset = usize::MAX - (usize::MAX % DataType::Float32.byte_size());
+    let input = TensorView::new(
+        DevicePtr(buffers[0].as_ptr()),
+        DataType::Float32,
+        &input_shape,
+        &input_strides,
+        ep.device_id(),
+    )
+    .with_byte_offset(invalid_offset);
+
+    reset_einsum_execution_stats();
+    let allocations_before = runtime.allocation_counts();
+    let error = kernel
+        .execute(
+            std::slice::from_ref(&input),
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+        )
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("materialized permutation/diagonal input"));
+    assert!(message.contains("address range overflows u64"));
+    assert!(message.contains(&format!("byte_offset {invalid_offset}")));
+    assert!(message.contains("use a view"));
+    assert_eq!(
+        runtime.allocation_counts(),
+        allocations_before,
+        "overflow rejection must happen before persistent metadata allocation"
+    );
+    assert_eq!(einsum_execution_stats().view_materializations, 0);
+
+    for buffer in buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output).unwrap();
 }
 
 enum BenchMode {
