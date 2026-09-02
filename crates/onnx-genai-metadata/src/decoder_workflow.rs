@@ -40,12 +40,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::schema::{
-    BatchLayout, ComponentImplementation, ComponentPorts, DecoderAbi, PortRole, RuntimeInputRole,
-    SemanticInputRole, SequenceInputKind, ServingServiceContract, ShapeRecurrence, StateAliasing,
-    StateGroupContract, StateKind, StatePortAlias, StatePortRole, StateServiceContract,
-    StateUpdate, TensorContract, WorkflowComponent, WorkflowInput, WorkflowInputSource,
-    WorkflowManifest, WorkflowOutput, WorkflowOutputRole, WorkflowSpec, WorkflowStateCell,
-    WorkflowStateScope, WorkflowStep,
+    BatchLayout, ComponentImplementation, ComponentPorts, DecoderAbi, DecoderStateGroup, PortRole,
+    RuntimeInputRole, SemanticInputRole, SequenceInputKind, ServingServiceContract,
+    ShapeRecurrence, StateAliasing, StateGroupContract, StateKind, StatePortAlias, StatePortRole,
+    StateServiceContract, StateUpdate, TensorContract, WorkflowComponent, WorkflowInput,
+    WorkflowInputSource, WorkflowManifest, WorkflowOutput, WorkflowOutputRole, WorkflowSpec,
+    WorkflowStateCell, WorkflowStateScope, WorkflowStep,
 };
 
 /// Component name a converted single-decoder workflow binds its graph to.
@@ -305,21 +305,34 @@ pub fn decoder_workflow(
     // Each graph state pair becomes a state cell the loop carries and a group
     // alias binding the cell to the graph's ports. That is the same shape a
     // multi-component workflow uses; nothing about it is decoder-specific.
-    builder.state_group(KV_GROUP, StateKind::FullAttention, abi, &kv, true);
-    builder.state_group(
-        CROSS_KV_GROUP,
-        StateKind::CrossAttention,
-        abi,
-        &cross_kv,
-        true,
-    );
-    builder.state_group(
-        RECURRENT_GROUP,
-        StateKind::Recurrent,
-        abi,
-        &recurrent,
-        false,
-    );
+    if abi.state_groups.is_empty() {
+        builder.state_group(KV_GROUP, StateKind::FullAttention, abi, &kv, true, None);
+        builder.state_group(
+            CROSS_KV_GROUP,
+            StateKind::CrossAttention,
+            abi,
+            &cross_kv,
+            true,
+            None,
+        );
+        builder.state_group(
+            RECURRENT_GROUP,
+            StateKind::Recurrent,
+            abi,
+            &recurrent,
+            false,
+            None,
+        );
+    } else {
+        for group in &abi.state_groups {
+            let pairs = group
+                .ports
+                .iter()
+                .map(|port| (port.input.clone(), port.output.clone()))
+                .collect::<Vec<_>>();
+            builder.state_group(&group.name, group.kind, abi, &pairs, false, Some(group));
+        }
+    }
 
     if let Some(static_cache) = abi.static_cache.as_ref() {
         // A fixed-capacity buffer's valid prefix is not derivable from its
@@ -509,12 +522,15 @@ pub fn decoder_workflow(
     builder.invoke_inputs = BTreeMap::new();
 
     let groups = std::mem::take(&mut builder.groups);
+    let compressed_state = groups
+        .values()
+        .any(|group| group.kind == StateKind::CompressedAttention);
     let spec = WorkflowSpec {
         manifest: WorkflowManifest {
             adapter_abis: BTreeMap::new(),
         },
         publication_mode: crate::schema::WorkflowPublicationMode::CommitOnly,
-        publication_mode_authored: false,
+        publication_mode_authored: compressed_state,
         inputs: builder.inputs,
         outputs: BTreeMap::from([(
             TOKENS_OUTPUT.to_string(),
@@ -522,7 +538,7 @@ pub fn decoder_workflow(
                 contract: token_contract(),
                 role: WorkflowOutputRole::Tokens,
                 family: crate::schema::WorkflowOutputFamily::Materialized,
-                family_authored: false,
+                family_authored: compressed_state,
                 value_range: None,
                 stage: crate::schema::OutputStage::PreAdapter,
                 media: None,
@@ -1020,34 +1036,39 @@ impl Builder {
         abi: &DecoderAbi,
         pairs: &[(String, String)],
         keyed_by_role: bool,
+        declared: Option<&DecoderStateGroup>,
     ) {
         if pairs.is_empty() {
             return;
         }
         let mut aliases = BTreeMap::new();
         for (index, (input, output)) in pairs.iter().enumerate() {
-            let (role, layer) = if keyed_by_role {
-                // Self- and cross-attention pair as (key, value) per layer,
-                // which is the order every producer emits and the order the
-                // recognizer rebuilds pairs in.
-                let role = if index % 2 == 0 {
-                    StatePortRole::Key
+            let (role, layer) =
+                if let Some(port) = declared.and_then(|group| group.ports.get(index)) {
+                    (port.role, port.layer)
+                } else if keyed_by_role {
+                    // Self- and cross-attention pair as (key, value) per layer,
+                    // which is the order every producer emits and the order the
+                    // recognizer rebuilds pairs in.
+                    let role = if index % 2 == 0 {
+                        StatePortRole::Key
+                    } else {
+                        StatePortRole::Value
+                    };
+                    (Some(role), Some(index / 2))
                 } else {
-                    StatePortRole::Value
+                    (None, Some(index))
                 };
-                (Some(role), index / 2)
-            } else {
-                (None, index)
-            };
             let cell = format!("{group}.{index:04}");
             let cell_contract = self.state_port(&pairs[index].0);
+            let initializer = self.seed_state_input(cell_contract.clone());
             self.state.insert(
                 cell.clone(),
                 WorkflowStateCell {
                     contract: cell_contract,
                     class: crate::schema::WorkflowStateClass::Semantic,
                     scope: WorkflowStateScope::Invocation,
-                    initializer: STATE_SEED_INPUT.to_string(),
+                    initializer,
                     recurrence: ShapeRecurrence::Invariant,
                     // The runtime owns these buffers. That is what keeps paged,
                     // shared-buffer and CUDA-graph KV device-resident instead of
@@ -1065,7 +1086,7 @@ impl Builder {
                     output: Some(output.clone()),
                     access: crate::schema::StatePortAccess::ReadWrite,
                     role,
-                    layer: Some(layer),
+                    layer,
                 },
             );
             // The cell holds what the graph's port holds, so it takes the same
@@ -1083,38 +1104,49 @@ impl Builder {
                 next,
             });
         }
-        if let Some((first, _)) = pairs.first() {
-            self.seed_state_input(self.state_port(first));
-        }
-        let update = (kind == StateKind::FullAttention)
-            .then(|| static_update(abi))
-            .flatten();
-        let logical_lengths = update.is_some().then(|| LENGTHS_CELL.to_string());
+        let update = declared.and_then(|group| group.update.clone()).or_else(|| {
+            (kind == StateKind::FullAttention)
+                .then(|| static_update(abi))
+                .flatten()
+        });
+        let logical_lengths = matches!(update, Some(StateUpdate::IndexedScatter { .. }))
+            .then(|| LENGTHS_CELL.to_string());
         self.groups.insert(
             group.to_string(),
             StateGroupContract {
                 kind,
-                sequence_axis: (kind != StateKind::Recurrent).then_some(2),
-                layout: layout_name(abi),
+                properties: declared.and_then(|group| group.properties.clone()),
+                sequence_axis: declared
+                    .map(|group| group.sequence_axis)
+                    .unwrap_or_else(|| (kind != StateKind::Recurrent).then_some(2)),
+                layout: declared
+                    .map(|group| group.layout.clone())
+                    .unwrap_or_else(|| layout_name(abi)),
                 logical_lengths,
-                aliasing: if kind == StateKind::FullAttention {
-                    abi.aliasing.unwrap_or(StateAliasing::Forbidden)
-                } else {
-                    StateAliasing::Forbidden
-                },
+                aliasing: declared.map(|group| group.aliasing).unwrap_or_else(|| {
+                    if kind == StateKind::FullAttention {
+                        abi.aliasing.unwrap_or(StateAliasing::Forbidden)
+                    } else {
+                        StateAliasing::Forbidden
+                    }
+                }),
                 update,
                 ports: BTreeMap::from([(DECODER_COMPONENT.to_string(), aliases)]),
                 total_length: None,
-                reuse: crate::schema::StateReuse {
-                    prefix_reusable: true,
-                    evictable_prefix: true,
-                },
-                capabilities: crate::schema::StateGroupCapabilities {
-                    rollback_positions: None,
-                    snapshot: true,
-                    fork: true,
-                    cascade: BTreeSet::new(),
-                },
+                reuse: declared
+                    .map(|group| group.reuse)
+                    .unwrap_or(crate::schema::StateReuse {
+                        prefix_reusable: true,
+                        evictable_prefix: true,
+                    }),
+                capabilities: declared
+                    .map(|group| group.capabilities.clone())
+                    .unwrap_or_else(|| crate::schema::StateGroupCapabilities {
+                        rollback_positions: None,
+                        snapshot: true,
+                        fork: true,
+                        cascade: BTreeSet::new(),
+                    }),
                 checkpoint: None,
             },
         );
@@ -1131,20 +1163,44 @@ impl Builder {
             .unwrap_or_else(state_contract)
     }
 
-    fn seed_state_input(&mut self, contract: TensorContract) {
-        self.inputs
-            .entry(STATE_SEED_INPUT.to_string())
-            .or_insert(WorkflowInput {
+    fn seed_state_input(&mut self, contract: TensorContract) -> String {
+        if let Some((name, _)) = self
+            .inputs
+            .iter()
+            .find(|(name, input)| name.starts_with(STATE_SEED_INPUT) && input.contract == contract)
+        {
+            return name.clone();
+        }
+        let seed_count = self
+            .inputs
+            .keys()
+            .filter(|name| name.starts_with(STATE_SEED_INPUT))
+            .count();
+        let name = if seed_count == 0 {
+            STATE_SEED_INPUT.to_string()
+        } else {
+            format!("{STATE_SEED_INPUT}.{seed_count}")
+        };
+        let default = if contract.dtype == "bool" {
+            crate::schema::ScalarValue::Bool(false)
+        } else if contract.dtype.starts_with("int") || contract.dtype.starts_with("uint") {
+            crate::schema::ScalarValue::Integer(0)
+        } else {
+            crate::schema::ScalarValue::Float(0.0)
+        };
+        self.inputs.insert(
+            name.clone(),
+            WorkflowInput {
                 contract,
                 role: SemanticInputRole::Opaque,
                 source: WorkflowInputSource::Literal,
                 required: false,
-                default: Some(crate::schema::LiteralValue::Scalar(
-                    crate::schema::ScalarValue::Float(0.0),
-                )),
+                default: Some(crate::schema::LiteralValue::Scalar(default)),
                 present_as: None,
                 externally_suppliable: false,
-            });
+            },
+        );
+        name
     }
 }
 

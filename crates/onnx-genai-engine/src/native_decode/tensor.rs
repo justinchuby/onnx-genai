@@ -445,16 +445,21 @@ fn recurrent_state_tensor_bytes(name: &str, dtype: DataType, shape: &[Dim]) -> a
 pub(crate) fn kv_cache_bytes_per_sequence(
     session: &InferenceSession,
     present_to_past: &std::collections::HashMap<String, String>,
+    compressed_records: &super::csa::CompressedStatePlan,
     max_context: usize,
 ) -> anyhow::Result<u64> {
     let declared: std::collections::HashSet<&str> =
         present_to_past.values().map(String::as_str).collect();
+    let compressed_state_enabled = !compressed_records.is_empty();
     let mut tensors = Vec::new();
     for meta in session.inputs() {
         // Recurrent state is loop-carried too, and is charged separately at its
         // own fixed size. Sizing it by context would be wrong by orders of
         // magnitude -- its whole point is that it does not grow.
-        if !declared.contains(meta.name.as_str()) || is_recurrent_state_shape(&meta.shape) {
+        if !declared.contains(meta.name.as_str())
+            || is_recurrent_state_shape(&meta.shape)
+            || (compressed_state_enabled && compressed_records.contains_past(&meta.name))
+        {
             continue;
         }
         tensors.push(crate::kv_sizing::KvTensorSpec {
@@ -482,7 +487,55 @@ pub(crate) fn kv_cache_bytes_per_sequence(
                 .collect(),
         });
     }
-    crate::kv_sizing::kv_cache_bytes_for_tensors(&tensors, u64::try_from(max_context).unwrap_or(0))
+    let dense = crate::kv_sizing::kv_cache_bytes_for_tensors(
+        &tensors,
+        u64::try_from(max_context).unwrap_or(0),
+    )?;
+    let mut compressed = 0_u64;
+    for spec in compressed_records.records() {
+        let name = &spec.input;
+        let meta = session
+            .inputs()
+            .iter()
+            .find(|meta| meta.name == *name)
+            .with_context(|| format!("missing compressed state input metadata for '{name}'"))?;
+        if spec.sequence_axis >= meta.shape.len() {
+            bail!(
+                "compressed state input '{name}' sequence axis {} is outside rank {}",
+                spec.sequence_axis,
+                meta.shape.len()
+            );
+        }
+        let records = max_context / spec.ratio.tokens_per_record();
+        let mut elements = 1_usize;
+        for (axis, dim) in meta.shape.iter().copied().enumerate() {
+            let extent = if axis == 0 {
+                1
+            } else if axis == spec.sequence_axis {
+                records
+            } else if let Dim::Static(value) = dim {
+                value
+            } else {
+                bail!(
+                    "cannot size compressed state '{name}': dimension {axis} of {:?} is symbolic \
+                     and is neither batch nor the declared record axis",
+                    meta.shape
+                );
+            };
+            elements = elements.saturating_mul(extent);
+        }
+        let bytes = meta
+            .dtype
+            .checked_storage_bytes(elements)
+            .with_context(|| {
+                format!(
+                    "unsupported compressed-state dtype {:?} for '{name}'",
+                    meta.dtype
+                )
+            })?;
+        compressed = compressed.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+    Ok(dense.saturating_add(compressed))
 }
 
 pub(crate) fn make_empty_input_tensor(
@@ -594,6 +647,14 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 pub(crate) fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::Result<Tensor> {
+    if !tensor.layout.is_contiguous(&tensor.shape) {
+        bail!(
+            "native KV prefix slicing requires contiguous row-major storage, got layout {:?} for \
+             shape {:?}",
+            tensor.layout,
+            tensor.shape
+        );
+    }
     let axis_len = *tensor
         .shape
         .get(axis)
@@ -602,19 +663,48 @@ pub(crate) fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::
         bail!("native KV slice length {len} exceeds axis length {axis_len}");
     }
 
-    let inner = tensor.shape[axis + 1..].iter().product::<usize>();
-    let outer = tensor.shape[..axis].iter().product::<usize>();
+    let inner = tensor.shape[axis + 1..]
+        .iter()
+        .try_fold(1usize, |product, &extent| product.checked_mul(extent))
+        .context("native KV prefix inner extent overflow")?;
+    let outer = tensor.shape[..axis]
+        .iter()
+        .try_fold(1usize, |product, &extent| product.checked_mul(extent))
+        .context("native KV prefix outer extent overflow")?;
     let elem_bytes = tensor
         .dtype
         .checked_storage_bytes(1)
         .context("native KV dtype has no fixed storage size")?;
-    let source_stride = axis_len * inner * elem_bytes;
-    let kept_stride = len * inner * elem_bytes;
+    let source_stride = axis_len
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_bytes))
+        .context("native KV prefix source stride overflow")?;
+    let kept_stride = len
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_bytes))
+        .context("native KV prefix retained stride overflow")?;
+    let retained_bytes = outer
+        .checked_mul(kept_stride)
+        .context("native KV prefix retained byte count overflow")?;
     let source = tensor.as_bytes();
-    let mut bytes = Vec::with_capacity(outer * kept_stride);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(retained_bytes)
+        .context("allocate native KV prefix bytes")?;
     for index in 0..outer {
-        let start = index * source_stride;
-        bytes.extend_from_slice(&source[start..start + kept_stride]);
+        let start = index
+            .checked_mul(source_stride)
+            .context("native KV prefix source offset overflow")?;
+        let end = start
+            .checked_add(kept_stride)
+            .context("native KV prefix source end overflow")?;
+        let row = source.get(start..end).with_context(|| {
+            format!(
+                "native KV prefix source range {start}..{end} exceeds {} bytes",
+                source.len()
+            )
+        })?;
+        bytes.extend_from_slice(row);
     }
     let mut shape = tensor.shape.clone();
     shape[axis] = len;

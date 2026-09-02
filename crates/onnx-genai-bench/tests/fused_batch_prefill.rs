@@ -49,10 +49,11 @@ fn synthetic_io() -> DecoderAbi {
         audio_features_input: None,
         cross_kv_inputs: None,
         cross_kv_outputs: None,
-        kv_update: None,
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
         static_cache: None,
+        state_groups: Vec::new(),
+        aliasing: None,
     }
 }
 

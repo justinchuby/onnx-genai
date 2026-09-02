@@ -167,6 +167,15 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
         ));
         return;
     }
+    if let Some(path) = compressed_state_schema_feature(metadata)
+        && let Err(error) = crate::version::gate_feature_use(
+            declared,
+            crate::version::SchemaFeature::CompressedStateGroups,
+            &path,
+        )
+    {
+        errors.push(error);
+    }
     validate_output_protocol_version(metadata, declared, errors);
     let has_special_tokens = metadata
         .package
@@ -185,6 +194,40 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
             crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION,
             crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION
         ));
+    }
+
+    fn compressed_state_schema_feature(metadata: &InferenceMetadata) -> Option<String> {
+        let groups = &metadata
+            .pipeline
+            .as_ref()?
+            .workflow
+            .serving
+            .as_ref()?
+            .state_service
+            .groups;
+        groups.iter().find_map(|(name, group)| {
+            let compressed = group.kind == crate::schema::StateKind::CompressedAttention
+                || matches!(
+                    group.properties,
+                    Some(crate::schema::StateGroupProperties::CompressedAttention { .. })
+                )
+                || group
+                    .ports
+                    .values()
+                    .flat_map(|ports| ports.values())
+                    .any(|alias| {
+                        matches!(
+                            alias.role,
+                            Some(
+                                crate::schema::StatePortRole::CompressedKv
+                                    | crate::schema::StatePortRole::CompressionCarry
+                                    | crate::schema::StatePortRole::IndexKey
+                                    | crate::schema::StatePortRole::IndexCarry
+                            )
+                        )
+                    });
+            compressed.then(|| format!("pipeline.workflow.serving.state_service.groups.{name}"))
+        })
     }
     let has_tool_protocol = metadata
         .package
@@ -2606,6 +2649,7 @@ fn validate_workflow(
                 );
             }
             validate_state_update(group_name, group, workflow, errors);
+            validate_state_group_properties(group_name, group, workflow, errors);
             validate_state_port_layers(group_name, group, errors);
             validate_attention_component_declares_sequence_role(
                 group_name, group, workflow, errors,
@@ -2686,6 +2730,7 @@ fn validate_workflow(
                 }
             }
         }
+        validate_compressed_attention_layers(state_service, errors);
     }
 
     let mut values = workflow.inputs.keys().cloned().collect::<BTreeSet<_>>();
@@ -7566,6 +7611,208 @@ fn validate_scatter_control_ports(
                 "state service group '{group_name}' binds {role} to unknown component \
                  '{component_name}'"
             )),
+        }
+    }
+}
+
+fn validate_state_group_properties(
+    group_name: &str,
+    group: &crate::schema::StateGroupContract,
+    workflow: &crate::schema::WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    use crate::schema::{
+        CompressedRecordFormat, CompressionRecurrence, StateGroupProperties, StateKind,
+        StatePortRole, StateUpdate,
+    };
+
+    match (group.kind, group.properties.as_ref()) {
+        (
+            StateKind::CompressedAttention,
+            Some(StateGroupProperties::CompressedAttention {
+                record_format,
+                recurrence,
+                ..
+            }),
+        ) => {
+            if *record_format == CompressedRecordFormat::Fp4E2m1Block32 {
+                errors.push(format!(
+                    "state service group '{group_name}' declares fp4_e2m1_block32 as its \
+                     compressed-KV record format; FP4 is reserved for index_key records"
+                ));
+            }
+            if *recurrence == CompressionRecurrence::MultiTokenPrediction {
+                errors.push(format!(
+                    "state service group '{group_name}' declares multi_token_prediction \
+                     compression recurrence, which this contract does not define"
+                ));
+            }
+            let update = group.update.as_ref().unwrap_or(&StateUpdate::Append);
+            for (component, aliases) in &group.ports {
+                for (cell, alias) in aliases {
+                    let Some(role) = alias.role else {
+                        errors.push(format!(
+                            "compressed-attention state group '{group_name}' component \
+                             '{component}' cell '{cell}' must declare a typed state role"
+                        ));
+                        continue;
+                    };
+                    let role_matches_update = match update {
+                        StateUpdate::Append => {
+                            matches!(role, StatePortRole::CompressedKv | StatePortRole::IndexKey)
+                        }
+                        StateUpdate::Replace => matches!(
+                            role,
+                            StatePortRole::CompressionCarry | StatePortRole::IndexCarry
+                        ),
+                        StateUpdate::IndexedScatter { .. } => false,
+                    };
+                    if !role_matches_update {
+                        errors.push(format!(
+                            "compressed-attention state group '{group_name}' cell '{cell}' role \
+                             '{role:?}' is incompatible with update '{update:?}'; record roles \
+                             append and carry roles replace"
+                        ));
+                    }
+                    if alias.layer.is_none() {
+                        errors.push(format!(
+                            "compressed-attention state group '{group_name}' cell '{cell}' must \
+                             declare its layer index"
+                        ));
+                    }
+                    if let Some(state) = workflow.state.get(cell) {
+                        let rank = state.contract.rank();
+                        let batch_axis = state.contract.batch_layout.request_axis();
+                        if rank == 0 {
+                            errors.push(format!(
+                                "compressed-attention state group '{group_name}' cell '{cell}' is \
+                                 scalar rank 0 and cannot carry row-scoped state; declare a \
+                                 request-aligned rank-1-or-higher tensor, or keep the scalar \
+                                 outside state_service"
+                            ));
+                        }
+                        if batch_axis.is_some_and(|axis| axis >= rank) {
+                            errors.push(format!(
+                                "compressed-attention state group '{group_name}' cell '{cell}' \
+                                 declares batch axis {batch_axis:?} outside rank {rank}"
+                            ));
+                        }
+                        if matches!(update, StateUpdate::Append)
+                            && batch_axis == group.sequence_axis
+                        {
+                            errors.push(format!(
+                                "compressed-attention state group '{group_name}' cell '{cell}' \
+                                 uses axis {batch_axis:?} for both request batch and record \
+                                 sequence; the axes must be distinct"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        (StateKind::CompressedAttention, None) => errors.push(format!(
+            "state service group '{group_name}' has kind compressed_attention but declares no \
+             compressed_attention properties"
+        )),
+        (_, Some(_)) => errors.push(format!(
+            "state service group '{group_name}' declares compressed_attention properties but \
+             its kind is '{:?}'",
+            group.kind
+        )),
+        _ => {}
+    }
+}
+
+fn validate_compressed_attention_layers(
+    state_service: &crate::schema::StateServiceContract,
+    errors: &mut Vec<String>,
+) {
+    use crate::schema::{
+        CompressionRatio, StateGroupProperties, StateKind, StatePortAccess, StatePortRole,
+    };
+
+    type Properties = (
+        CompressionRatio,
+        crate::schema::CompressedRecordFormat,
+        crate::schema::CompressionRecurrence,
+    );
+    type LayerEntry = (Option<Properties>, BTreeMap<StatePortRole, String>);
+    let mut layers: BTreeMap<(String, usize), LayerEntry> = BTreeMap::new();
+
+    for (group_name, group) in &state_service.groups {
+        if group.kind != StateKind::CompressedAttention {
+            continue;
+        }
+        let properties = group.properties.as_ref().map(
+            |StateGroupProperties::CompressedAttention {
+                 ratio,
+                 record_format,
+                 recurrence,
+             }| (*ratio, *record_format, *recurrence),
+        );
+        for (component, aliases) in &group.ports {
+            let mut group_layers: BTreeMap<usize, Vec<(StatePortRole, String)>> = BTreeMap::new();
+            for (cell, alias) in aliases {
+                if alias.access != StatePortAccess::ReadWrite {
+                    continue;
+                }
+                let (Some(layer), Some(role)) = (alias.layer, alias.role) else {
+                    continue;
+                };
+                group_layers
+                    .entry(layer)
+                    .or_default()
+                    .push((role, cell.clone()));
+            }
+            for (layer, group_roles) in group_layers {
+                let entry = layers
+                    .entry((component.clone(), layer))
+                    .or_insert_with(|| (properties, BTreeMap::new()));
+                if entry.0 != properties {
+                    errors.push(format!(
+                        "compressed-attention layer {layer} for component '{component}' has \
+                         contradictory properties across state groups (including '{group_name}')"
+                    ));
+                }
+                for (role, cell) in group_roles {
+                    if let Some(previous) = entry.1.insert(role, cell.clone()) {
+                        errors.push(format!(
+                            "compressed-attention layer {layer} for component '{component}' \
+                             declares role '{role:?}' more than once ('{previous}' and '{cell}')"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for ((component, layer), (properties, roles)) in layers {
+        let Some((ratio, _, _)) = properties else {
+            continue;
+        };
+        let expected: &[StatePortRole] = if ratio == CompressionRatio::Ratio4 {
+            &[
+                StatePortRole::CompressedKv,
+                StatePortRole::CompressionCarry,
+                StatePortRole::IndexKey,
+                StatePortRole::IndexCarry,
+            ]
+        } else {
+            &[StatePortRole::CompressedKv, StatePortRole::CompressionCarry]
+        };
+        let missing = expected
+            .iter()
+            .filter(|role| !roles.contains_key(role))
+            .collect::<Vec<_>>();
+        let unexpected = roles
+            .keys()
+            .filter(|role| !expected.contains(role))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() || !unexpected.is_empty() {
+            errors.push(format!(
+                "compressed-attention layer {layer} for component '{component}' with ratio \
+                 '{ratio:?}' has incomplete roles; missing {missing:?}, unexpected {unexpected:?}"
+            ));
         }
     }
 }

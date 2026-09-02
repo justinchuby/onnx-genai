@@ -188,7 +188,8 @@ needs it flattened:
 | encoder-hidden / audio inputs | `components.<c>.ports.roles` |
 | KV input/output pairs, per layer | self-attention `state_service` groups |
 | cross-attention KV pairs | `cross_attention` groups |
-| fixed loop-carried state pairs | `recurrent` groups |
+| fixed loop-carried state pairs | `recurrent` or replace-updated groups |
+| compressed record/carry pairs and cadence | `compressed_attention` groups |
 | `aliasing`, KV layout | the owning group |
 | fixed-capacity scatter ABI | `StateUpdate::IndexedScatter` |
 | KV ownership | presence of an owning group |
@@ -209,8 +210,8 @@ describes the port and never the model family exposing it.
 
 State ports use the same separation of graph facts from semantic facts. The
 artifact owns every individual tensor's geometry. The state group supplies
-`role: key|value|combined` and numeric `layer`, because neither semantic half
-nor layer ordering is recoverable from shape or a producer-chosen label.
+typed roles and numeric `layer`, because neither semantic purpose nor layer
+ordering is recoverable from shape or a producer-chosen label.
 `layer` pairs and orders aliases; it never asserts equal geometry. Different
 layers may expose different KV head counts, and the key and value aliases of
 one layer may themselves have different head counts or head dimensions without
@@ -781,8 +782,9 @@ A state group declares **what the state means**, never where it lives:
 state_service:
   groups:
     decoder_cache:
-      kind: full_attention      # full_attention | sliding_attention | mla
-                                # | recurrent_ssm | cross_attention | encoder | ...
+      kind: full_attention      # full_attention | sliding_attention
+                                # | multi_latent_attention | compressed_attention
+                                # | recurrent | cross_attention | encoder
       sequence_axis: 2
       layout: bnsh
       logical_lengths: cache_lengths
@@ -1006,6 +1008,65 @@ type, and backend.
 A producer **MUST NOT** silently substitute another type when the requested
 graph ABI cannot represent the declared state. Runtime-private cache formats may
 be narrower than the portable contract, but that limits only those backends.
+
+### 12.2d Block-compressed attention records
+
+Schema v1.8 introduces the `compressed_attention` kind, its typed properties,
+and the `compressed_kv`, `compression_carry`, `index_key`, and `index_carry`
+roles. A document using any of that vocabulary **MUST** declare at least v1.8.
+Older declarations fail at the version boundary before typed parsing; unknown
+future versions fail closed. A package with no compressed state remains valid.
+
+Block-compressed attention has two distinct state disciplines. Record buffers
+append along an explicit per-layer record axis at a typed token-to-record ratio;
+compressor carries replace a fixed tensor after every step. They therefore
+**MUST** be separate `compressed_attention` groups:
+
+- `properties.ratio` is `ratio4` or `ratio128`;
+- `properties.record_format` is `fp8_e4m3_block64` or `f32`;
+- record groups use `update: append`, declare `sequence_axis`, and use
+  `compressed_kv` plus the ratio-4-only `index_key` role;
+- carry groups use `update: replace`, omit `sequence_axis`, and use
+  `compression_carry` plus the ratio-4-only `index_carry` role;
+- the paired groups repeat identical typed properties and cascade together.
+
+Every state cell declares its request batch axis through
+`contract.batch_layout`. Record groups additionally declare their record axis;
+the two axes must differ. Carry tensors have no token/record sequence axis and
+are atomic at rollback: rank-1 vectors and higher-rank carries are copied and
+restored wholesale, never prefix-sliced by a generic rank convention. A scalar
+rank-0 carry cannot be row-scoped and is rejected by schema validation.
+Non-contiguous carry storage is not supported by the root host snapshot ABI and
+is refused rather than copied with invented stride semantics.
+
+The record count at token length `L` is `floor(L / ratio)`. It is not a dense-KV
+token axis and must not be sized, rewound, or accounted as one. The runtime
+charges record storage through the same governed per-sequence reservation as
+dense KV, using the declared axis, ratio, graph dtype, and fixed remaining
+dimensions; fixed carries use recurrent-state accounting. There is no private
+compressed-state ceiling.
+
+Before a CPU session makes a present record visible as the next past, it checks
+the descriptor once as a complete transition: input/output pairing and layer,
+declared record axis, request batch, dtype, physical record layout/width, the
+previous `floor(past_len / ratio)` cursor, monotonicity, and the exact
+`floor(total_len / ratio)` cursor. A failure is a typed refusal and leaves the
+previous session state and logical token cursor unchanged.
+
+The DeepSeek-V4-Flash published schedule has 43 target layers and 44 ratio
+entries: two leading zero-ratio layers, alternating ratio-4 and ratio-128 state
+for target layers 2 through 42 (21 ratio-4 and 20 ratio-128), and one trailing
+zero-ratio MTP entry. The schedule is package data, not runtime model-family
+logic. The exact 21/20 fixture declares those layer indices and gives each layer
+its own symbolic record axis.
+
+Absent capability is a refusal, not emulation. The CPU native session supports
+present-to-past progression and full reset. It returns typed refusals for
+snapshot, rollback, fork, and non-zero rewind because the package declares none.
+Native CUDA likewise returns a public typed device refusal: persistent
+compressed record state, cursor/capture integration, device snapshotting, and
+its governor ownership belong to draft child #2339, so this CPU base neither
+copies records through host fallback nor pretends they are rank-4 dense KV.
 
 ### 12.3 Capabilities, cascade, fork, and reuse
 

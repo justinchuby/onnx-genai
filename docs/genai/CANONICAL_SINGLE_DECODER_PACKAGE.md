@@ -104,7 +104,9 @@ Do not hand-write this. See [Converting a package](#converting-a-package).
 
 2. **State lives in a `state_service` group, once.** The group's per-component
    aliases carry `input` (the `past` port), `output` (the `present` port),
-   `role: key|value` and `layer`. The `layer` index is what preserves the
+   a typed `role` and `layer`. Dense caches use `key|value|combined`;
+   compressed attention uses `compressed_kv|compression_carry|index_key|
+   index_carry`. The `layer` index is what preserves the
    graph's own layer order — port names live in a map whose key order is
    lexicographic, which would otherwise place layer 10 between layers 1 and 2.
 
@@ -125,6 +127,58 @@ Do not hand-write this. See [Converting a package](#converting-a-package).
    core workflow conformance. An optional semantic module names its exact
    identity and version at its typed declaration; there is no manifest
    capability list to keep in sync.
+
+## Compressed attention state
+
+Packages using the following vocabulary declare `schema_version: v1.8` or
+newer. This fail-closed floor is core conformance, not a model/vendor capability
+flag; packages without compressed state need not opt in.
+
+Compressed records and fixed compressor carries are separate groups because
+they have different update disciplines:
+
+```yaml
+compressed_records.2:
+  kind: compressed_attention
+  properties: {kind: compressed_attention, ratio: ratio4,
+               record_format: fp8_e4m3_block64, recurrence: standard}
+  sequence_axis: 1
+  layout: batch_record_feature
+  update: {kind: append}
+  ports:
+    decoder:
+      kv:    {input: past_compressed_kv.2, output: present_compressed_kv.2,
+              role: compressed_kv, layer: 2}
+      index: {input: past_index_key.2, output: present_index_key.2,
+              role: index_key, layer: 2}
+compressed_carries.2:
+  kind: compressed_attention
+  properties: {kind: compressed_attention, ratio: ratio4,
+               record_format: fp8_e4m3_block64, recurrence: standard}
+  layout: batch_carry_slot_stream_feature
+  update: {kind: replace}
+  ports:
+    decoder:
+      kv:    {input: past_compression_carry.2, output: present_compression_carry.2,
+              role: compression_carry, layer: 2}
+      index: {input: past_index_carry.2, output: present_index_carry.2,
+              role: index_carry, layer: 2}
+```
+
+Ratio-128 uses `record_format: f32` and omits both index roles. Record state is
+governed at `floor(max_context / ratio)` using the declared record axis; carries
+are charged at their fixed graph shape. Each state cell declares its request
+batch axis. Carries have no sequence axis and are copied/restored atomically:
+rank-1 and higher tensors are never prefix-sliced, rank-0 state is rejected as
+non-row-scoped, and unsupported strided storage fails closed. Snapshot,
+rollback, fork, and non-zero rewind are legal only when every involved group
+declares the capability.
+Native CPU validates each past→present record transition against that same
+descriptor before committing it: batch, dtype, record layout/width, layer axis,
+monotonic cursor, and exact `floor(token_length / ratio)` must all agree. A
+typed rejection preserves the prior session state. Native CUDA exposes the same
+refusal type publicly and declines before provider/VMM construction until the
+draft child loader implements the device-owned state lifecycle.
 
 ## Conversations
 

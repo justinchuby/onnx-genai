@@ -62,11 +62,20 @@ required-features = ["native-cuda"]
 name = "qwen3_0_6b_capture_step_inputs_decline"
 required-features = ["native-cuda"]
 
+[[test]]
+name = "native_cuda_default_off_state_capture_gpu"
+required-features = ["native-cuda"]
+
 [features]
 default = ["cuda-13000"]
 # Test-only fault injection for transaction publication regression tests in
 # dependent crates. It is deliberately off every production feature path.
 test-output-staging = ["native-backend"]
+gpu-tests = [
+    "native-cuda",
+    "onnx-runtime-ep-cuda/gpu-tests",
+    "onnx-runtime-session/gpu-tests",
+]
 native-backend = [
     "dep:onnx-runtime-ep-cpu",
     "onnx-runtime-ep-cpu/tracing",

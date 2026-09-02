@@ -1713,6 +1713,13 @@ pub struct StateServiceContract {
 pub struct StateGroupContract {
     /// Semantic kind of the state in this group.
     pub kind: StateKind,
+    /// Typed algorithmic properties carried by this state group.
+    ///
+    /// Most state kinds need no additional properties. Compressed-attention
+    /// state must declare its compression cadence and record representation
+    /// because neither is recoverable from tensor names or shapes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<StateGroupProperties>,
     /// Axis whose extent represents logical sequence positions.
     ///
     /// Required for sequence-growing and indexed-scatter state. Fixed-size
@@ -1796,12 +1803,73 @@ pub enum StateKind {
     SlidingAttention,
     /// Compressed latent attention state (MLA).
     MultiLatentAttention,
+    /// Block-compressed causal attention records and their fixed compressor
+    /// carries.
+    CompressedAttention,
     /// Fixed-size recurrent or state-space carry.
     Recurrent,
     /// Cross-attention state keyed by an encoder result.
     CrossAttention,
     /// Encoder output retained across decoder steps.
     Encoder,
+}
+
+/// Algorithmic properties of a semantic state group.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StateGroupProperties {
+    /// Properties shared by the record and carry groups of one compressed-
+    /// attention layer.
+    CompressedAttention {
+        /// Number of source tokens accumulated per emitted record.
+        ratio: CompressionRatio,
+        /// Storage representation of the compressed-KV record stream.
+        record_format: CompressedRecordFormat,
+        /// Recurrence discipline used by the compressor.
+        #[serde(default)]
+        recurrence: CompressionRecurrence,
+    },
+}
+
+/// Supported token-to-record cadences for compressed attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionRatio {
+    Ratio4,
+    Ratio128,
+}
+
+impl CompressionRatio {
+    pub fn tokens_per_record(self) -> usize {
+        match self {
+            Self::Ratio4 => 4,
+            Self::Ratio128 => 128,
+        }
+    }
+
+    pub fn has_index_state(self) -> bool {
+        matches!(self, Self::Ratio4)
+    }
+}
+
+/// Graph-visible storage format of compressed attention KV records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressedRecordFormat {
+    F32,
+    Fp8E4m3Block64,
+    /// The learned-index representation. It is expressible so a runtime can
+    /// issue a typed refusal when incorrectly declared for KV records.
+    Fp4E2m1Block32,
+}
+
+/// Recurrence discipline of a compressed-attention state group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionRecurrence {
+    #[default]
+    Standard,
+    MultiTokenPrediction,
 }
 
 /// How a state group's buffers absorb each step's new positions.
@@ -1991,4 +2059,12 @@ pub enum StatePortRole {
     Value,
     /// A single buffer holding keys and values together.
     Combined,
+    /// Compressed KV records emitted at the declared compression cadence.
+    CompressedKv,
+    /// Fixed-size compressor carry replaced after every step.
+    CompressionCarry,
+    /// Learned index-key records used by query-selective compressed attention.
+    IndexKey,
+    /// Fixed-size learned-index compressor carry.
+    IndexCarry,
 }

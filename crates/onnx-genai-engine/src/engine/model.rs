@@ -240,6 +240,10 @@ pub(crate) struct NativeSessionState {
     pub(crate) tokens: Vec<TokenId>,
     /// Monotonically increasing access stamp, used to pick an LRU victim.
     pub(crate) last_access: u64,
+    /// Reset advances this generation while retaining the public session id.
+    pub(crate) generation: u64,
+    /// A failed atomic rollback poisons only this exact logical generation.
+    pub(crate) poison: Option<String>,
 }
 
 pub(crate) struct MtpModel {

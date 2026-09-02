@@ -426,16 +426,20 @@ impl NativeDecodeSession {
             self.prepare_cpu_step_inputs(token_ids, past_len, total_len, supplied_inputs)?;
         owned.reserve(self.kv_inputs.len());
         for name in &self.kv_inputs {
-            let tensor = match self.past.remove(name) {
-                Some(tensor) => tensor,
-                None => self.make_empty_past(name)?,
-            };
-            owned.push((name.clone(), tensor));
+            if !self.past.contains_key(name) {
+                owned.push((name.clone(), self.make_empty_past(name)?));
+            }
         }
-        let bindings = owned
+        let mut bindings = owned
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
             .collect::<Vec<_>>();
+        bindings.reserve(self.past.len());
+        for name in &self.kv_inputs {
+            if let Some(tensor) = self.past.get(name) {
+                bindings.push((name.as_str(), tensor));
+            }
+        }
         drop(prepare_span);
 
         let run_result: anyhow::Result<_> = {
@@ -468,6 +472,7 @@ impl NativeDecodeSession {
         let mut logits = None;
         let mut hidden = None;
         let mut next_past = HashMap::with_capacity(self.kv_inputs.len());
+        let compressed_state_enabled = !self.compressed_state.is_empty();
         for (metadata, tensor) in self.session.outputs().iter().zip(outputs) {
             if metadata.name == self.logits {
                 logits = Some(tensor);
@@ -484,27 +489,105 @@ impl NativeDecodeSession {
                     .iter()
                     .find(|meta| &meta.name == past)
                     .is_some_and(|meta| is_recurrent_state_shape(&meta.shape));
-                if !recurrent {
-                    let seq_axis = tensor.shape.len().checked_sub(2).with_context(|| {
-                        format!("native present tensor '{}' rank is below 2", metadata.name)
-                    })?;
-                    if tensor.shape[seq_axis] != total_len {
-                        bail!(
-                            "native present tensor '{}' sequence length {} does not match {total_len}",
-                            metadata.name,
-                            tensor.shape[seq_axis]
-                        );
+                let compressed_transition = compressed_state_enabled
+                    .then(|| self.compressed_state.transition_for_present(&metadata.name))
+                    .flatten();
+                match compressed_transition {
+                    Some(csa::CompressedStateTransitionSpec::Record(spec)) => {
+                        let prior = bindings
+                            .iter()
+                            .find(|(name, _)| *name == spec.input)
+                            .map(|(_, tensor)| *tensor)
+                            .with_context(|| {
+                                format!(
+                                    "compressed-attention transition '{}' => '{}' has no bound \
+                                     past tensor",
+                                    spec.input, spec.output
+                                )
+                            })?;
+                        csa::validate_record_transition(
+                            spec,
+                            prior.into(),
+                            (&tensor).into(),
+                            past_len,
+                            total_len,
+                            1,
+                        )?;
+                        self.compressed_state_stats.transitions_validated = self
+                            .compressed_state_stats
+                            .transitions_validated
+                            .saturating_add(1);
+                        self.compressed_state_stats.host_output_allocations = self
+                            .compressed_state_stats
+                            .host_output_allocations
+                            .saturating_add(1);
+                        self.compressed_state_stats.host_output_bytes = self
+                            .compressed_state_stats
+                            .host_output_bytes
+                            .saturating_add(
+                                u64::try_from(tensor.as_bytes().len()).unwrap_or(u64::MAX),
+                            );
+                        self.compressed_state_stats.telemetry_updates = self
+                            .compressed_state_stats
+                            .telemetry_updates
+                            .saturating_add(1);
                     }
+                    Some(csa::CompressedStateTransitionSpec::Carry(spec)) => {
+                        let prior = bindings
+                            .iter()
+                            .find(|(name, _)| *name == spec.input)
+                            .map(|(_, tensor)| *tensor)
+                            .with_context(|| {
+                                format!(
+                                    "compressed-attention transition '{}' => '{}' has no bound \
+                                     past tensor",
+                                    spec.input, spec.output
+                                )
+                            })?;
+                        csa::validate_carry_transition(spec, prior.into(), (&tensor).into(), 1)?;
+                        self.compressed_state_stats.transitions_validated = self
+                            .compressed_state_stats
+                            .transitions_validated
+                            .saturating_add(1);
+                        self.compressed_state_stats.host_output_allocations = self
+                            .compressed_state_stats
+                            .host_output_allocations
+                            .saturating_add(1);
+                        self.compressed_state_stats.host_output_bytes = self
+                            .compressed_state_stats
+                            .host_output_bytes
+                            .saturating_add(
+                                u64::try_from(tensor.as_bytes().len()).unwrap_or(u64::MAX),
+                            );
+                        self.compressed_state_stats.telemetry_updates = self
+                            .compressed_state_stats
+                            .telemetry_updates
+                            .saturating_add(1);
+                    }
+                    None if !recurrent => {
+                        let seq_axis = tensor.shape.len().checked_sub(2).with_context(|| {
+                            format!("native present tensor '{}' rank is below 2", metadata.name)
+                        })?;
+                        if tensor.shape[seq_axis] != total_len {
+                            bail!(
+                                "native present tensor '{}' sequence length {} does not match \
+                                 {total_len}",
+                                metadata.name,
+                                tensor.shape[seq_axis]
+                            );
+                        }
+                    }
+                    None => {}
                 }
                 next_past.insert(past.clone(), tensor);
             }
         }
-        let result = self.finalize_cpu_logits_and_hidden(logits, hidden, greedy)?;
         for (present, past) in &self.present_to_past {
             if !next_past.contains_key(past) {
                 bail!("native decoder omitted present output '{present}'");
             }
         }
+        let result = self.finalize_cpu_logits_and_hidden(logits, hidden, greedy)?;
         drop(fetch_span);
 
         let _kv_span = onnx_genai_ort::prof_span!("native.kv_update");

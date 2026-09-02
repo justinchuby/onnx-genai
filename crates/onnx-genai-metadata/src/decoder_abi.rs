@@ -30,16 +30,18 @@
 use std::collections::BTreeMap;
 
 use crate::schema::{
-    DecoderAbi, KvCacheLayout, KvOwnership, LoopStatePair, PortRole, SequenceInputKind,
-    StateGroupContract, StateKind, StatePortRole, StateUpdate, StaticCacheIoSpec, WorkflowSpec,
+    DecoderAbi, DecoderStateGroup, DecoderStatePort, KvCacheLayout, KvOwnership, LoopStatePair,
+    PortRole, SequenceInputKind, StateGroupContract, StateKind, StatePortRole, StateUpdate,
+    StaticCacheIoSpec, WorkflowSpec,
 };
 
 /// Ordered per-layer view of one state group's port bindings for a component.
 struct GroupPorts<'a> {
-    /// `(layer, role, alias)` sorted into the graph's per-layer order.
+    /// `(layer, role, state cell, alias)` sorted into graph order.
     aliases: Vec<(
         usize,
         Option<StatePortRole>,
+        &'a str,
         &'a crate::schema::StatePortAlias,
     )>,
 }
@@ -53,22 +55,29 @@ impl<'a> GroupPorts<'a> {
     fn collect(group: &'a StateGroupContract, component: &str) -> Option<Self> {
         let bindings = group.ports.get(component)?;
         let mut aliases = bindings
-            .values()
+            .iter()
             .enumerate()
-            .map(|(position, alias)| (alias.layer.unwrap_or(position), alias.role, alias))
+            .map(|(position, (cell, alias))| {
+                (
+                    alias.layer.unwrap_or(position),
+                    alias.role,
+                    cell.as_str(),
+                    alias,
+                )
+            })
             .collect::<Vec<_>>();
         // Sort by layer first so a producer's label ordering never decides
         // which buffer belongs to which layer, then by role so that a split
         // cache yields a stable key-before-value order within each layer.
-        aliases.sort_by_key(|(layer, role, _)| (*layer, *role));
+        aliases.sort_by_key(|(layer, role, _, _)| (*layer, *role));
         Some(Self { aliases })
     }
 
     fn pairs(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
         self.aliases
             .iter()
-            .filter(|(_, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
-            .filter_map(|(_, _, alias)| {
+            .filter(|(_, _, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
+            .filter_map(|(_, _, _, alias)| {
                 // A read-write transition always names an output (validation
                 // enforces it); the filter_map keeps this total without an
                 // unwrap.
@@ -79,9 +88,9 @@ impl<'a> GroupPorts<'a> {
     fn with_role(&self, wanted: StatePortRole) -> Vec<&'a crate::schema::StatePortAlias> {
         self.aliases
             .iter()
-            .filter(|(_, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
-            .filter(|(_, role, _)| *role == Some(wanted))
-            .map(|(_, _, alias)| *alias)
+            .filter(|(_, _, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
+            .filter(|(_, role, _, _)| *role == Some(wanted))
+            .map(|(_, _, _, alias)| *alias)
             .collect()
     }
 }
@@ -89,7 +98,10 @@ impl<'a> GroupPorts<'a> {
 pub(crate) fn is_self_attention(kind: StateKind) -> bool {
     matches!(
         kind,
-        StateKind::FullAttention | StateKind::SlidingAttention | StateKind::MultiLatentAttention
+        StateKind::FullAttention
+            | StateKind::SlidingAttention
+            | StateKind::MultiLatentAttention
+            | StateKind::CompressedAttention
     )
 }
 
@@ -178,7 +190,27 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<DecoderAb
         let Some(ports) = GroupPorts::collect(group, component) else {
             continue;
         };
-        if is_self_attention(group.kind) {
+        if group.kind == StateKind::CompressedAttention {
+            let append = !matches!(group.update, Some(StateUpdate::Replace));
+            for (input, output) in ports.pairs() {
+                writes_attention_state = true;
+                if append {
+                    kv_inputs.push(input.to_string());
+                    kv_outputs.push(output.to_string());
+                } else {
+                    state_pairs.push(LoopStatePair {
+                        input: input.to_string(),
+                        output: output.to_string(),
+                        init: None,
+                        update: None,
+                    });
+                }
+            }
+            aliasing = Some(match (aliasing, group.aliasing) {
+                (None, declared) => declared,
+                (Some(current), declared) => strictest(current, declared),
+            });
+        } else if is_self_attention(group.kind) {
             // A group whose update is `indexed_scatter` is a fixed-capacity
             // cache. Its buffers are fully described by the static-cache ABI, so
             // they must not *also* appear as growing past/present pairs: a
@@ -251,6 +283,44 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<DecoderAb
     // rather than inventing a presence key that no caller supplies.
     let optional_inputs = BTreeMap::new();
 
+    let state_groups = groups
+        .iter()
+        .filter_map(|(name, group)| {
+            let ports = GroupPorts::collect(group, component)?;
+            let ports = ports
+                .aliases
+                .iter()
+                .filter(|(_, _, _, alias)| {
+                    alias.access == crate::schema::StatePortAccess::ReadWrite
+                })
+                .filter_map(|(_, _, cell, alias)| {
+                    Some(DecoderStatePort {
+                        role: alias.role,
+                        layer: alias.layer,
+                        batch_axis: workflow
+                            .state
+                            .get(*cell)
+                            .and_then(|state| state.contract.batch_layout.request_axis()),
+                        input: alias.input.clone(),
+                        output: alias.output.clone()?,
+                    })
+                })
+                .collect();
+            Some(DecoderStateGroup {
+                name: (*name).to_string(),
+                kind: group.kind,
+                properties: group.properties.clone(),
+                sequence_axis: group.sequence_axis,
+                layout: group.layout.clone(),
+                aliasing: group.aliasing,
+                update: group.update.clone(),
+                reuse: group.reuse,
+                capabilities: group.capabilities.clone(),
+                ports,
+            })
+        })
+        .collect();
+
     Some(DecoderAbi {
         sequence_source,
         kv_ownership,
@@ -275,6 +345,7 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<DecoderAb
         state_pairs: (!state_pairs.is_empty()).then_some(state_pairs),
         optional_inputs,
         static_cache,
+        state_groups,
     })
 }
 

@@ -7,9 +7,9 @@
 //! a package declares through a typed extension surface.
 
 use crate::version::{
-    CANONICAL_SPECULATION_SCHEMA_VERSION, DFLASH_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION,
-    PUBLICATION_MODE_SCHEMA_VERSION, SchemaVersion, TOKEN_CONTEXT_SCHEMA_VERSION,
-    TOOL_PROTOCOL_SCHEMA_VERSION,
+    CANONICAL_SPECULATION_SCHEMA_VERSION, COMPRESSED_STATE_SCHEMA_VERSION, DFLASH_SCHEMA_VERSION,
+    INITIAL_SCHEMA_VERSION, PUBLICATION_MODE_SCHEMA_VERSION, SchemaVersion,
+    TOKEN_CONTEXT_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
 };
 
 /// One immutable identifier/version pair.
@@ -468,6 +468,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
     (
         PUBLICATION_MODE_SCHEMA_VERSION,
         "the workflow declares `commit_only` or `provisional_revisions`, and the runtime reconciles revisions transactionally with one typed `commit` or `abort_to_baseline` outcome",
+    ),
+    (
+        COMPRESSED_STATE_SCHEMA_VERSION,
+        "typed compressed-attention record/carry groups with explicit cadence, format, roles, batch geometry, and fail-closed validation",
     ),
 ];
 

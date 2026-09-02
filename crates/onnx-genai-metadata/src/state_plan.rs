@@ -367,7 +367,8 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
                 Some(
                     StateKind::FullAttention
                     | StateKind::SlidingAttention
-                    | StateKind::MultiLatentAttention,
+                    | StateKind::MultiLatentAttention
+                    | StateKind::CompressedAttention,
                 ) => StateSemanticRole::AttentionKv,
                 Some(StateKind::Recurrent) => StateSemanticRole::RecurrentOrConvolution,
                 Some(StateKind::CrossAttention | StateKind::Encoder) | None => {
