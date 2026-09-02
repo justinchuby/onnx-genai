@@ -1992,6 +1992,63 @@ fn gpu_identity(ep: &CudaExecutionProvider) {
     );
 }
 
+#[test]
+#[ignore = "requires a pinned CUDA GPU; exact 256x512x384 f64 oracle is intentionally expensive"]
+fn einsum_benchmark_arms_match_exact_f64_oracle() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let logical_a = values(BENCH_M * BENCH_K, 13);
+    let b_values = values(BENCH_K * BENCH_N, 17);
+    for dtype in [DataType::Float16, DataType::Float32] {
+        let expected = f64_gemm_reference(
+            &quantize(&logical_a, dtype),
+            &quantize(&b_values, dtype),
+            1,
+            BENCH_M,
+            BENCH_K,
+            BENCH_N,
+            false,
+            false,
+            0,
+            0,
+        );
+        for arm in [
+            BenchArm::Descriptor,
+            BenchArm::Materialized,
+            BenchArm::Control,
+        ] {
+            reset_einsum_execution_stats();
+            onnx_runtime_ep_cuda::reset_movement_execution_stats();
+            let fixture = bench_fixture(&ep, arm, dtype, &logical_a, &b_values);
+            fixture.execute(&ep);
+            let allocations = ep.runtime().allocation_counts();
+            ep.runtime()
+                .begin_graph_capture(&fixture.kernel_refs())
+                .unwrap();
+            fixture.execute(&ep);
+            ep.runtime().end_graph_capture().unwrap();
+            ep.runtime().replay_graph().unwrap();
+            let bytes = fixture.output_bytes(&ep);
+            let output = decode_floats(&bytes, dtype);
+            oracle_metrics(&output, &expected, dtype);
+            assert_eq!(ep.runtime().allocation_counts(), allocations);
+            assert!(ep.runtime().reset_graph().unwrap());
+            fixture.finish(&ep);
+            let einsum = einsum_execution_stats();
+            let movement = onnx_runtime_ep_cuda::movement_execution_stats();
+            let route = if movement.capture_recordings != 0 {
+                "explicit-materialization"
+            } else if einsum.descriptor_transpose_gemm_launches != 0 {
+                "descriptor-transpose"
+            } else {
+                "canonical"
+            };
+            assert_eq!(route, arm.expected_route());
+            assert_eq!(einsum.claim_fallbacks, 0);
+        }
+    }
+}
+
 /// Host-locked, captured CUDA-event benchmark for the synthetic 256x512x384
 /// transpose contraction. `scripts/bench_cuda_einsum.sh` is the only supported
 /// entry point because it proves the lock, build, tree, and device mapping.
