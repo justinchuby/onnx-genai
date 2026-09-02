@@ -11,44 +11,65 @@ session/model-loading overhead. The standing quality bar for kernel rewrites is:
 
 From the repository root:
 
+### Focused kernel target (excludes governed Einsum)
+
+Name the bench target explicitly while iterating. A package-wide
+`cargo bench -p onnx-runtime-ep-cpu` also selects the governed Einsum target,
+so it is not a lightweight shortcut.
+
 ```bash
-scripts/hostlock.sh run --owner your_name --reason "CPU EP Criterion suite" -- \
+export ONNX_GENAI_CPU_DECODE_THREADS=16
+export CARGO_TARGET_DIR="$PWD/target-cpu-kernel-criterion"
+scripts/hostlock.sh run --owner cpu-bench \
+  --reason "CPU EP focused Criterion target" --wait --gate 3 --strict-reap -- \
+  cargo bench -p onnx-runtime-ep-cpu --bench kernels -- matmul/medium
+```
+
+Use a physical-core budget the host can realize as one logical CPU per core.
+The lock remains mandatory for focused timing because even one multithreaded
+kernel benchmark can contaminate another agent's measurement.
+
+### Full package sweep (includes governed Einsum)
+
+Use a fresh, absolute target directory. This one lock covers compilation,
+warmup, and every benchmark target in the package:
+
+```bash
+export ONNX_GENAI_CPU_DECODE_THREADS=16
+export CARGO_TARGET_DIR="$PWD/target-cpu-ep-suite-$(git rev-parse --short=12 HEAD)"
+scripts/hostlock.sh run --owner cpu-bench \
+  --reason "CPU EP full benchmark suite" --wait --gate 3 --strict-reap -- \
   cargo bench -p onnx-runtime-ep-cpu
 ```
 
-Use a filter while iterating, for example:
+Do not move the lock inside a per-target loop: the suite is one evidence sweep,
+and releasing between targets makes its rows incomparable.
+
+### Exact Einsum census and evidence run
+
+The checked-in runbook supplies the required lock, gate, physical-core budget,
+and absolute Cargo target directory. Use one fresh directory for the census and
+the subsequent run:
 
 ```bash
-cargo bench -p onnx-runtime-ep-cpu -- matmul/medium
+EINSUM_TARGET="$PWD/target-einsum-evidence-$(git rev-parse --short=12 HEAD)"
+crates/onnx-runtime-ep-cpu/benches/run_einsum.sh \
+  census cpu-bench 16 "$EINSUM_TARGET"
+crates/onnx-runtime-ep-cpu/benches/run_einsum.sh \
+  run cpu-bench 16 "$EINSUM_TARGET"
 ```
 
-Set the physical-core budget and fresh raw-evidence directory first:
-
-```console
-export ONNX_GENAI_CPU_DECODE_THREADS=16
-export CARGO_TARGET_DIR="$PWD/target-einsum-evidence"
-```
-
-The native Einsum target then has one exact governed invocation:
-
-```bash
-scripts/hostlock.sh run --owner your_name --reason "CPU Einsum evidence sweep" \
-  --wait --gate 3 --strict-reap -- \
-  cargo bench -p onnx-runtime-ep-cpu --bench einsum -- --noplot
-```
-
-Use a thread count the host can realize as one logical CPU per physical core.
-Use a fresh `CARGO_TARGET_DIR` for every evidence run. The benchmark refuses
+The census proves that the target lists exactly 12 Criterion selectors before
+the timed sweep. The benchmark refuses
 before measuring when the outer lock, gate, ownership, box scope, worktree
 provenance, physical-core affinity, CPU model/frequency, or raw Criterion
 destination cannot be verified. It also fails the run if any measurement window
 has foreign/sibling contention, more than 20% median-frequency drift, or an
 unstable MatMul control.
 
-The outer `hostlock.sh run` is mandatory because it covers Cargo compilation as
-well as warmup and timing. Reading the lock from the benchmark cannot substitute
-for custody. Replace `your_name` with a stable identifier containing only
-letters, digits, `_`, `.`, or `-`.
+The runbook holds one outer `hostlock.sh run` for each complete census or timed
+sweep, including Cargo compilation. Reading the lock from the benchmark cannot
+substitute for custody.
 
 The target emits:
 
@@ -72,12 +93,13 @@ kernel.
 
 Criterion reports the estimated time interval and change versus the prior local
 baseline. HTML reports are written under
-`target/criterion/report/index.html`. Compare the central time estimate, not a
-single sample, and keep CPU governor, build flags, and machine fixed. MatMul is
-run in dedicated Rayon pools pinned to 1 and 8 workers; its benchmark IDs report
-`threads=1` or `threads=8`. Add, ReduceMean, and Gather do not use Rayon
-internally and their IDs explicitly report `threads=1-internal`. Benchmark IDs
-also encode the operation, size class, dtype, and element or matrix dimensions.
+`"$CARGO_TARGET_DIR/criterion/report/index.html"`. Compare the central time
+estimate, not a single sample, and keep CPU governor, build flags, and machine
+fixed. MatMul is run in dedicated Rayon pools pinned to 1 and 8 workers; its
+benchmark IDs report `threads=1` or `threads=8`. Add, ReduceMean, and Gather do
+not use Rayon internally and their IDs explicitly report
+`threads=1-internal`. Benchmark IDs also encode the operation, size class,
+dtype, and element or matrix dimensions.
 
 Coverage:
 
@@ -99,26 +121,31 @@ environment:
 
 ```bash
 python -m pip install numpy onnx onnxruntime
-python crates/onnx-runtime-ep-cpu/benches/ort_baseline.py
+scripts/hostlock.sh run --owner cpu-bench \
+  --reason "ORT CPU kernel baseline" --wait --gate 3 --strict-reap -- \
+  python crates/onnx-runtime-ep-cpu/benches/ort_baseline.py --threads 1 8
 ```
 
 The script builds one-op ONNX models and times the same f32 operations and
 shapes after warmup, excluding session construction:
 
 ```bash
-python crates/onnx-runtime-ep-cpu/benches/ort_baseline.py \
-  --filter matmul/medium --threads 1 8 --warmup 20 \
-  --iterations 1000 --repetitions 9
+scripts/hostlock.sh run --owner cpu-bench \
+  --reason "ORT CPU MatMul baseline" --wait --gate 3 --strict-reap -- \
+  python crates/onnx-runtime-ep-cpu/benches/ort_baseline.py \
+    --filter matmul/medium --threads 1 8 --warmup 20 \
+    --iterations 1000 --repetitions 9
 ```
 
-Run it on the same otherwise-idle machine as Criterion. Compare matching f32
-rows and matching thread counts in microseconds. The script pins and prints
-`intra_op_num_threads` for every result and fixes `inter_op_num_threads=1`
-because each generated graph contains one node. ORT support and optimization
-behavior for f16/bf16 on CPU varies by release, so f32 is the required common
-baseline; the Rust-only f16/bf16 rows guard the broader dtype surface.
-`--repetitions` reports the median of independently timed iteration batches,
-which is preferable to a single elapsed-time sample for recorded comparisons.
+Run it under the same host-lock and admission-gate conditions as Criterion.
+Compare matching f32 rows and matching thread counts in microseconds. The
+script pins and prints `intra_op_num_threads` for every result and fixes
+`inter_op_num_threads=1` because each generated graph contains one node. ORT
+support and optimization behavior for f16/bf16 on CPU varies by release, so
+f32 is the required common baseline; the Rust-only f16/bf16 rows guard the
+broader dtype surface. `--repetitions` reports the median of independently
+timed iteration batches, which is preferable to a single elapsed-time sample
+for recorded comparisons.
 
 ## Thread-matched MatMul comparison
 
@@ -143,5 +170,6 @@ Fixed golden vectors for every benchmarked kernel/dtype live in
 `tests/kernel_numeric_regression.rs`:
 
 ```bash
+export CARGO_TARGET_DIR="$PWD/target-cpu-kernel-tests"
 cargo test -p onnx-runtime-ep-cpu --test kernel_numeric_regression
 ```

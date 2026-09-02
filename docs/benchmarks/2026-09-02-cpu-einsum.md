@@ -52,25 +52,25 @@ index and exact strides.
 
 ## Governed invocation
 
-Run the complete Criterion target from the repository root under the host lock:
-
-```console
-export ONNX_GENAI_CPU_DECODE_THREADS=16
-export CARGO_TARGET_DIR="$PWD/target-einsum-evidence"
-```
+Run the exact census and complete Criterion target from the repository root.
+The checked-in runbook owns the host lock for the whole Cargo child process,
+sets the admission gate and physical-core budget, and requires an absolute
+Cargo target directory:
 
 ```bash
-scripts/hostlock.sh run --owner your_name --reason "CPU Einsum evidence sweep" \
-  --wait --gate 3 --strict-reap -- \
-  cargo bench -p onnx-runtime-ep-cpu --bench einsum -- --noplot
+EINSUM_TARGET="$PWD/target-einsum-evidence-$(git rev-parse --short=12 HEAD)"
+crates/onnx-runtime-ep-cpu/benches/run_einsum.sh \
+  census cpu-bench 16 "$EINSUM_TARGET"
+crates/onnx-runtime-ep-cpu/benches/run_einsum.sh \
+  run cpu-bench 16 "$EINSUM_TARGET"
 ```
 
-The lock must wrap the actual `cargo bench --bench einsum` invocation so
+The census must report `selector census passed: 12/12` before the timed run.
+The runbook's lock wraps the actual `cargo bench --bench einsum` invocation so
 compilation, warmup, every case, and every control are covered by one custody
 interval. Merely reading the lock from inside the benchmark does not establish
-custody. Replace `your_name` with a stable identifier accepted by
-`hostlock.sh`, choose a physical-core budget valid for the machine, and use a
-fresh target directory.
+custody. Choose a physical-core budget valid for the machine and a fresh target
+directory; a completed prior run is rejected rather than overwritten.
 
 ## Fail-closed evidence contract
 
