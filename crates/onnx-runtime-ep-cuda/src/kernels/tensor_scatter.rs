@@ -20,7 +20,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::movement::PersistentMetadata;
@@ -336,7 +338,14 @@ impl Kernel for TensorScatterKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
+    }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,

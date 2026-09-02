@@ -22,12 +22,14 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
 use crate::optimizer::SILU_MUL_FUSION_ATTR;
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 /// Threads per block for the 1-D pointwise grids (a full warp-multiple block).
 const BLOCK: u32 = 256;
@@ -732,7 +734,7 @@ struct BinaryCaptureSignature {
 pub(crate) struct BroadcastMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<BroadcastMetadataKey>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
 }
 
 impl BroadcastMetadataCache {
@@ -740,7 +742,7 @@ impl BroadcastMetadataCache {
         Self {
             runtime,
             key: None,
-            ptr: 0,
+            allocation: None,
         }
     }
 
@@ -756,14 +758,22 @@ impl BroadcastMetadataCache {
             out_shape: out_shape.to_vec(),
         };
         if self.key.as_ref() == Some(&key) {
-            return Ok(self.ptr);
+            return self.allocation.as_ref().map_or_else(
+                || {
+                    Err(EpError::KernelFailed(
+                        "cuda_ep binary elementwise: cached broadcast metadata lost its device allocation"
+                            .into(),
+                    ))
+                },
+                |allocation| Ok(allocation.ptr()),
+            );
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
                 "cuda_ep binary elementwise: broadcast metadata shape changed during CUDA graph capture; warm the fixed decode shape before capture".into(),
             ));
         }
-        if self.ptr != 0 {
+        if self.allocation.is_some() {
             // Shape churn retires storage an earlier launch may still read.
             // Unlike trailing per-op eager synchronization, this lifetime
             // boundary cannot be deferred.
@@ -772,36 +782,19 @@ impl BroadcastMetadataCache {
 
         let metadata = broadcast_metadata(a_shape, b_shape, out_shape);
         let metadata_bytes = u64_bytes(&metadata);
-        let ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, metadata_bytes.len())?;
         // SAFETY: allocation exactly covers the metadata byte slice.
-        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, ptr) } {
-            // SAFETY: `ptr` is still owned by this cache and no launch used it.
-            let _ = unsafe { self.runtime.free_raw(ptr) };
-            return Err(error);
-        }
-        if self.ptr != 0 {
-            // SAFETY: synchronization completed all prior launches using the old
-            // pointer, which remains exclusively owned by this cache.
-            if let Err(error) = unsafe { self.runtime.free_raw(self.ptr) } {
-                // SAFETY: the replacement has not escaped or been launched.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(error);
-            }
-        }
+        unsafe { self.runtime.htod(metadata_bytes, allocation.ptr()) }?;
+        let ptr = allocation.ptr();
         self.key = Some(key);
-        self.ptr = ptr;
+        self.allocation = Some(allocation);
         Ok(ptr)
     }
-}
 
-impl Drop for BroadcastMetadataCache {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            // SAFETY: the live pointer was allocated by this runtime and remains
-            // exclusively owned by this cache.
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
-        }
+    pub(crate) fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        self.allocation
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -947,6 +940,15 @@ impl Kernel for BinaryKernel {
 
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {

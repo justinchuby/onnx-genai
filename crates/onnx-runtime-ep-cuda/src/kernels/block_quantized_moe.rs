@@ -1539,7 +1539,6 @@ struct BlockQuantizedMoeSharedState {
 
 struct OwnedBlockQuantizedMoeTelemetry {
     record: ArmedTelemetry,
-    runtime: Arc<CudaRuntime>,
 }
 
 impl OwnedBlockQuantizedMoeTelemetry {
@@ -1549,14 +1548,7 @@ impl OwnedBlockQuantizedMoeTelemetry {
     ) -> std::result::Result<Self, TelemetryUnsupported> {
         Ok(Self {
             record: ArmedTelemetry::arm(runtime, config)?,
-            runtime: Arc::clone(runtime),
         })
-    }
-}
-
-impl Drop for OwnedBlockQuantizedMoeTelemetry {
-    fn drop(&mut self) {
-        self.record.free(&self.runtime);
     }
 }
 

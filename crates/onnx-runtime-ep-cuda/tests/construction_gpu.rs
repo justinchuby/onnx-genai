@@ -1001,7 +1001,9 @@ fn build_movement_kernel(
         .map(|(index, shape)| {
             graph.create_named_value(
                 format!("input_{index}"),
-                if index == 1 && matches!(op, "Expand" | "Reshape" | "Tile") {
+                if (index == 1 && matches!(op, "Expand" | "Reshape" | "Tile"))
+                    || (op == "Slice" && index > 0)
+                {
                     DataType::Int64
                 } else {
                     DataType::Float32
@@ -1406,6 +1408,339 @@ fn transpose_warmed_metadata_captures_and_matches_eager() {
     assert!(runtime.reset_graph().unwrap());
     ep.deallocate(data_buffer).unwrap();
     ep.deallocate(output_buffer).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    let perm = [2_i64, 0, 1];
+    let a_input_shape = [2usize, 1, 3];
+    let a_output_shape = [3usize, 2, 1];
+    let kernel = build_movement_kernel(
+        &ep,
+        "Transpose",
+        &[a_input_shape.to_vec()],
+        &[a_output_shape.to_vec()],
+        &[("perm", Attribute::Ints(perm.to_vec()))],
+    );
+
+    let a_data = [1_f32, 2., 3., 4., 5., 6.];
+    let a_data_buffer = ep.allocate(std::mem::size_of_val(&a_data), 256).unwrap();
+    let mut a_output_buffer = ep.allocate(std::mem::size_of_val(&a_data), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&raw(&a_data), cuptr(a_data_buffer.as_ptr()))
+            .unwrap();
+    }
+    let a_input_strides = compute_contiguous_strides(&a_input_shape);
+    let a_output_strides = compute_contiguous_strides(&a_output_shape);
+    let a_inputs = [TensorView::new(
+        DevicePtr(a_data_buffer.as_ptr()),
+        DataType::Float32,
+        &a_input_shape,
+        &a_input_strides,
+        device,
+    )];
+    let mut run_a = || {
+        kernel.execute(
+            &a_inputs,
+            &mut [TensorMut::new(
+                DevicePtrMut(a_output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &a_output_shape,
+                &a_output_strides,
+                device,
+            )],
+        )
+    };
+
+    run_a().unwrap();
+    let a_resource = kernel.device_graph_resources();
+    assert_eq!(a_resource.len(), 1);
+    let a_resource_id = a_resource[0].identity();
+    drop(a_resource);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    run_a().unwrap();
+    runtime.end_graph_capture().unwrap();
+
+    let b_input_shape = [2usize, 2, 3];
+    let b_output_shape = [3usize, 2, 2];
+    let b_data = (0..12).map(|value| value as f32).collect::<Vec<_>>();
+    let b_data_buffer = ep.allocate(b_data.len() * 4, 256).unwrap();
+    let mut b_output_buffer = ep.allocate(b_data.len() * 4, 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&raw(&b_data), cuptr(b_data_buffer.as_ptr()))
+            .unwrap();
+    }
+    let b_input_strides = compute_contiguous_strides(&b_input_shape);
+    let b_output_strides = compute_contiguous_strides(&b_output_shape);
+    let b_inputs = [TensorView::new(
+        DevicePtr(b_data_buffer.as_ptr()),
+        DataType::Float32,
+        &b_input_shape,
+        &b_input_strides,
+        device,
+    )];
+    kernel
+        .execute(
+            &b_inputs,
+            &mut [TensorMut::new(
+                DevicePtrMut(b_output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &b_output_shape,
+                &b_output_strides,
+                device,
+            )],
+        )
+        .unwrap();
+    let b_resource = kernel.device_graph_resources();
+    assert_eq!(b_resource.len(), 1);
+    assert_ne!(
+        b_resource[0].identity(),
+        a_resource_id,
+        "rewarming must install a new eager metadata owner"
+    );
+    drop(b_resource);
+
+    let counts_before_drop = runtime.allocation_counts();
+    let pooled_before_drop = runtime.raw_pool_retained_bytes();
+    drop(kernel);
+    assert!(
+        runtime.allocation_counts().frees > counts_before_drop.frees
+            || runtime.raw_pool_retained_bytes() > pooled_before_drop,
+        "dropping the kernel must release only its newer eager metadata owner"
+    );
+
+    runtime.replay_graph().unwrap();
+    let mut actual = vec![0; std::mem::size_of_val(&a_data)];
+    unsafe {
+        runtime
+            .dtoh(&mut actual, cuptr(a_output_buffer.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(actual, raw(&[1_f32, 4., 2., 5., 3., 6.]));
+
+    let counts_before_reset = runtime.allocation_counts();
+    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+    assert!(runtime.reset_graph().unwrap());
+    assert!(
+        runtime.allocation_counts().frees > counts_before_reset.frees
+            || runtime.raw_pool_retained_bytes() > pooled_before_reset,
+        "reset must release the older metadata owner retained by the graph"
+    );
+
+    for buffer in [
+        a_data_buffer,
+        a_output_buffer,
+        b_data_buffer,
+        b_output_buffer,
+    ] {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn slice_captured_metadata_outlives_rewarm_and_kernel_drop() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    let a_data_shape = [3usize, 4];
+    let a_output_shape = [2usize, 2];
+    let bounds_shape = [2usize];
+    let kernel = build_movement_kernel(
+        &ep,
+        "Slice",
+        &[
+            a_data_shape.to_vec(),
+            bounds_shape.to_vec(),
+            bounds_shape.to_vec(),
+            bounds_shape.to_vec(),
+            bounds_shape.to_vec(),
+        ],
+        &[a_output_shape.to_vec()],
+        &[],
+    );
+
+    let a_data = (0..12).map(|value| value as f32).collect::<Vec<_>>();
+    let a_metadata = [
+        raw(&[0_i64, 3]),
+        raw(&[3_i64, -5]),
+        raw(&[0_i64, 1]),
+        raw(&[2_i64, -2]),
+    ];
+    let a_data_buffer = ep.allocate(a_data.len() * 4, 256).unwrap();
+    let a_metadata_buffers = a_metadata
+        .iter()
+        .map(|bytes| {
+            let buffer = ep.allocate(bytes.len(), 256).unwrap();
+            unsafe { runtime.htod(bytes, cuptr(buffer.as_ptr())).unwrap() };
+            buffer
+        })
+        .collect::<Vec<_>>();
+    let mut a_output_buffer = ep
+        .allocate(a_output_shape.iter().product::<usize>() * 4, 256)
+        .unwrap();
+    unsafe {
+        runtime
+            .htod(&raw(&a_data), cuptr(a_data_buffer.as_ptr()))
+            .unwrap();
+    }
+    let a_data_strides = compute_contiguous_strides(&a_data_shape);
+    let bounds_strides = compute_contiguous_strides(&bounds_shape);
+    let a_output_strides = compute_contiguous_strides(&a_output_shape);
+    let a_inputs = std::iter::once(TensorView::new(
+        DevicePtr(a_data_buffer.as_ptr()),
+        DataType::Float32,
+        &a_data_shape,
+        &a_data_strides,
+        device,
+    ))
+    .chain(a_metadata_buffers.iter().map(|buffer| {
+        TensorView::new(
+            DevicePtr(buffer.as_ptr()),
+            DataType::Int64,
+            &bounds_shape,
+            &bounds_strides,
+            device,
+        )
+    }))
+    .collect::<Vec<_>>();
+    let mut run_a = || {
+        kernel.execute(
+            &a_inputs,
+            &mut [TensorMut::new(
+                DevicePtrMut(a_output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &a_output_shape,
+                &a_output_strides,
+                device,
+            )],
+        )
+    };
+
+    run_a().unwrap();
+    let mut a_resource_ids = kernel
+        .device_graph_resources()
+        .into_iter()
+        .map(|resource| resource.identity())
+        .collect::<Vec<_>>();
+    a_resource_ids.sort_unstable();
+    assert_eq!(a_resource_ids.len(), 2);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    run_a().unwrap();
+    runtime.end_graph_capture().unwrap();
+
+    let b_data_shape = [2usize, 6];
+    let b_output_shape = [1usize, 3];
+    let b_data = (100..112).map(|value| value as f32).collect::<Vec<_>>();
+    let b_metadata = [
+        raw(&[1_i64, 0]),
+        raw(&[2_i64, 6]),
+        raw(&[0_i64, 1]),
+        raw(&[1_i64, 2]),
+    ];
+    let b_data_buffer = ep.allocate(b_data.len() * 4, 256).unwrap();
+    let b_metadata_buffers = b_metadata
+        .iter()
+        .map(|bytes| {
+            let buffer = ep.allocate(bytes.len(), 256).unwrap();
+            unsafe { runtime.htod(bytes, cuptr(buffer.as_ptr())).unwrap() };
+            buffer
+        })
+        .collect::<Vec<_>>();
+    let mut b_output_buffer = ep
+        .allocate(b_output_shape.iter().product::<usize>() * 4, 256)
+        .unwrap();
+    unsafe {
+        runtime
+            .htod(&raw(&b_data), cuptr(b_data_buffer.as_ptr()))
+            .unwrap();
+    }
+    let b_data_strides = compute_contiguous_strides(&b_data_shape);
+    let b_output_strides = compute_contiguous_strides(&b_output_shape);
+    let b_inputs = std::iter::once(TensorView::new(
+        DevicePtr(b_data_buffer.as_ptr()),
+        DataType::Float32,
+        &b_data_shape,
+        &b_data_strides,
+        device,
+    ))
+    .chain(b_metadata_buffers.iter().map(|buffer| {
+        TensorView::new(
+            DevicePtr(buffer.as_ptr()),
+            DataType::Int64,
+            &bounds_shape,
+            &bounds_strides,
+            device,
+        )
+    }))
+    .collect::<Vec<_>>();
+    kernel
+        .execute(
+            &b_inputs,
+            &mut [TensorMut::new(
+                DevicePtrMut(b_output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &b_output_shape,
+                &b_output_strides,
+                device,
+            )],
+        )
+        .unwrap();
+    let mut b_resource_ids = kernel
+        .device_graph_resources()
+        .into_iter()
+        .map(|resource| resource.identity())
+        .collect::<Vec<_>>();
+    b_resource_ids.sort_unstable();
+    assert_eq!(b_resource_ids.len(), 2);
+    assert!(
+        a_resource_ids
+            .iter()
+            .all(|identity| !b_resource_ids.contains(identity)),
+        "both Slice metadata allocations must be independently replaced"
+    );
+
+    drop(kernel);
+    runtime.replay_graph().unwrap();
+    let mut actual = vec![0; a_output_shape.iter().product::<usize>() * 4];
+    unsafe {
+        runtime
+            .dtoh(&mut actual, cuptr(a_output_buffer.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(actual, raw(&[3_f32, 1., 11., 9.]));
+
+    let counts_before_reset = runtime.allocation_counts();
+    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+    assert!(runtime.reset_graph().unwrap());
+    assert!(
+        runtime.allocation_counts().frees >= counts_before_reset.frees + 2
+            || runtime.raw_pool_retained_bytes() > pooled_before_reset,
+        "reset must release both Slice metadata owners retained by the graph"
+    );
+
+    ep.deallocate(a_data_buffer).unwrap();
+    ep.deallocate(a_output_buffer).unwrap();
+    for buffer in a_metadata_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(b_data_buffer).unwrap();
+    ep.deallocate(b_output_buffer).unwrap();
+    for buffer in b_metadata_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
 }
 
 #[cfg_attr(

@@ -19,17 +19,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::cublaslt::{result as cublaslt, sys as cublaslt_sys};
-use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceRequirement, WorkspaceView,
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::blas::{self, GemmDtype, GemmParams, WORKSPACE_BYTES};
 use crate::error::{cublas_err, driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 /// NVRTC module/entry for the dense decode GEMVs.
 const GEMV_F16_MODULE: &str = "matmul_dense_gemv_f16";
@@ -103,6 +102,7 @@ impl KernelFactory for MatMulFactory {
             runtime: self.runtime.clone(),
             f32_gemv: Mutex::new(None),
             dense_plans: Mutex::new(Vec::new()),
+            last_capture_resource: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
@@ -124,6 +124,8 @@ pub struct MatMulKernel {
     /// logits projection `lm_head`) CUDA-graph capturable across shape changes.
     /// MRU-ordered (front = most recent); bounded by [`DENSE_PLAN_CACHE_CAP`].
     dense_plans: Mutex<Vec<DenseGemmPlan>>,
+    /// Exact private workspace used by the most recent capture-safe call.
+    last_capture_resource: Mutex<Option<DeviceGraphResource>>,
     /// Set after every [`execute`](Kernel::execute) to record whether the call
     /// took the allocation- and sync-free GEMV fast path (capture-safe) or the
     /// cuBLASLt path (per-call workspace + heuristic, not capturable). Mirrors
@@ -141,7 +143,7 @@ struct F32GemvPlan {
     b_layout: cublaslt_sys::cublasLtMatrixLayout_t,
     c_layout: cublaslt_sys::cublasLtMatrixLayout_t,
     algo: cublaslt_sys::cublasLtMatmulAlgo_t,
-    workspace: CUdeviceptr,
+    workspace: Option<Arc<GraphDeviceAllocation>>,
     workspace_bytes: usize,
 }
 
@@ -154,9 +156,6 @@ impl Drop for F32GemvPlan {
         // SAFETY: every object was created once by `F32GemvPlan::new` and is
         // destroyed exactly once after the plan can no longer be launched.
         unsafe {
-            if self.workspace != 0 {
-                let _ = self.runtime.free_raw(self.workspace);
-            }
             if !self.c_layout.is_null() {
                 let _ = cublaslt::destroy_matrix_layout(self.c_layout);
             }
@@ -189,7 +188,7 @@ impl F32GemvPlan {
             c_layout: std::ptr::null_mut(),
             // SAFETY: the algorithm is not read until the heuristic initializes it.
             algo: unsafe { std::mem::zeroed() },
-            workspace: 0,
+            workspace: None,
             workspace_bytes: 0,
         };
         plan.handle = cublaslt::create_handle().map_err(|e| cublas_err("cublasLtCreate", e))?;
@@ -236,7 +235,10 @@ impl F32GemvPlan {
         plan.algo = heuristic.algo;
         plan.workspace_bytes = heuristic.workspaceSize;
         if plan.workspace_bytes > 0 {
-            plan.workspace = plan.runtime.alloc_raw(plan.workspace_bytes)?;
+            plan.workspace = Some(GraphDeviceAllocation::allocate(
+                &plan.runtime,
+                plan.workspace_bytes,
+            )?);
         }
         Ok(plan)
     }
@@ -259,12 +261,20 @@ impl F32GemvPlan {
                 c as *mut c_void,
                 self.c_layout,
                 (&self.algo) as *const cublaslt_sys::cublasLtMatmulAlgo_t,
-                self.workspace as *mut c_void,
+                self.workspace
+                    .as_ref()
+                    .map_or(0, |workspace| workspace.ptr()) as *mut c_void,
                 self.workspace_bytes,
                 stream as cublaslt_sys::cudaStream_t,
             )
         }
         .map_err(|e| cublas_err("cublasLtMatmul f32 M==1", e))
+    }
+
+    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        self.workspace
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -280,23 +290,12 @@ struct DenseGemmPlan {
     k: usize,
     n: usize,
     plan: blas::CaptureGemmPlan,
-    workspace: CUdeviceptr,
+    workspace: Option<Arc<GraphDeviceAllocation>>,
 }
 
 // SAFETY: the plan holds only context-independent cuBLASLt host handles and a
 // device workspace pointer; launches are serialized by `MatMulKernel::launch_dense_capturable`.
 unsafe impl Send for DenseGemmPlan {}
-
-impl Drop for DenseGemmPlan {
-    fn drop(&mut self) {
-        if self.workspace != 0 {
-            // SAFETY: allocated once in `new`, freed exactly once here.
-            unsafe {
-                let _ = self.runtime.free_raw(self.workspace);
-            }
-        }
-    }
-}
 
 impl DenseGemmPlan {
     fn matches(&self, dtype: GemmDtype, m: usize, k: usize, n: usize) -> bool {
@@ -314,9 +313,9 @@ impl DenseGemmPlan {
         let plan = blas::plan_capture_gemm(runtime.blas(), &params)?;
         let workspace_bytes = plan.workspace_bytes();
         let workspace = if workspace_bytes > 0 {
-            runtime.alloc_raw(workspace_bytes)?
+            Some(GraphDeviceAllocation::allocate(&runtime, workspace_bytes)?)
         } else {
-            0
+            None
         };
         Ok(Self {
             runtime,
@@ -339,9 +338,17 @@ impl DenseGemmPlan {
                 self.runtime.blas(),
                 self.runtime.stream_ptr(),
                 &params,
-                self.workspace,
+                self.workspace
+                    .as_ref()
+                    .map_or(0, |workspace| workspace.ptr()),
             )
         }
+    }
+
+    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        self.workspace
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -531,6 +538,9 @@ impl MatMulKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
+        if let Ok(mut resource) = self.last_capture_resource.lock() {
+            *resource = None;
+        }
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep MatMul: expected 2 inputs and 1 output, got {} and {}",
@@ -791,10 +801,17 @@ impl MatMulKernel {
             }
             *cached = Some(F32GemvPlan::new(self.runtime.clone(), k, n)?);
         }
-        cached
-            .as_ref()
-            .unwrap()
-            .launch(self.runtime.stream_ptr(), a_ptr, b_ptr, c_ptr)
+        let result =
+            cached
+                .as_ref()
+                .unwrap()
+                .launch(self.runtime.stream_ptr(), a_ptr, b_ptr, c_ptr);
+        if result.is_ok()
+            && let Ok(mut resource) = self.last_capture_resource.lock()
+        {
+            *resource = cached.as_ref().and_then(F32GemvPlan::device_graph_resource);
+        }
+        result
     }
 
     /// Launch a plain 2-D (`batch == 1`) dense M>1 GEMM through a cached
@@ -831,7 +848,13 @@ impl MatMulKernel {
                 let plan = cached.remove(idx);
                 cached.insert(0, plan);
             }
-            return cached[0].launch(a_ptr, b_ptr, c_ptr);
+            let result = cached[0].launch(a_ptr, b_ptr, c_ptr);
+            if result.is_ok()
+                && let Ok(mut resource) = self.last_capture_resource.lock()
+            {
+                *resource = cached[0].device_graph_resource();
+            }
+            return result;
         }
         // Cold miss. During capture we must not create a plan (the heuristic
         // query, allocation, and the cache mutation are all illegal inside a
@@ -852,7 +875,13 @@ impl MatMulKernel {
         if cached.len() > DENSE_PLAN_CACHE_CAP {
             cached.truncate(DENSE_PLAN_CACHE_CAP);
         }
-        cached[0].launch(a_ptr, b_ptr, c_ptr)
+        let result = cached[0].launch(a_ptr, b_ptr, c_ptr);
+        if result.is_ok()
+            && let Ok(mut resource) = self.last_capture_resource.lock()
+        {
+            *resource = cached[0].device_graph_resource();
+        }
+        result
     }
 }
 
@@ -877,6 +906,15 @@ impl Kernel for MatMulKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         // Dense inputs only (see `run`).
         false
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.last_capture_resource
+            .lock()
+            .ok()
+            .and_then(|resource| resource.clone())
+            .into_iter()
+            .collect()
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {

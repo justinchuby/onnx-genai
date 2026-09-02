@@ -26,7 +26,7 @@ use crate::blas::{
     self, CaptureStridedBatchedGemmPlan, GemmDtype, StridedBatchedGemmParams, WORKSPACE_BYTES,
 };
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 /// Counters proving which CUDA Einsum route executed and what persistent state
 /// it established. Values are process-global diagnostics, so GPU tests serialize
@@ -560,25 +560,7 @@ impl CachedExecution {
 
 struct CachedGemm {
     plan: CaptureStridedBatchedGemmPlan,
-    workspace: Option<Arc<GemmWorkspace>>,
-}
-
-struct GemmWorkspace {
-    runtime: Arc<CudaRuntime>,
-    ptr: CUdeviceptr,
-}
-
-impl Drop for GemmWorkspace {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            // SAFETY: allocated once when the immutable plan was built and
-            // freed after the owning kernel/captured graph can no longer launch.
-            unsafe {
-                let _ = self.runtime.free_raw(self.ptr);
-            }
-            self.ptr = 0;
-        }
-    }
+    workspace: Option<Arc<GraphDeviceAllocation>>,
 }
 
 impl CachedGemm {
@@ -612,7 +594,9 @@ impl CachedGemm {
                 runtime.blas(),
                 runtime.stream_ptr(),
                 &params,
-                self.workspace.as_ref().map_or(0, |workspace| workspace.ptr),
+                self.workspace
+                    .as_ref()
+                    .map_or(0, |workspace| workspace.ptr()),
             )
         }
     }
@@ -823,14 +807,14 @@ impl EinsumKernel {
             let workspace = if workspace_bytes == 0 {
                 None
             } else {
-                Some(Arc::new(GemmWorkspace {
-                    runtime: Arc::clone(&self.runtime),
-                    ptr: self.runtime.alloc_raw(workspace_bytes)?,
-                }))
+                Some(GraphDeviceAllocation::allocate(
+                    &self.runtime,
+                    workspace_bytes,
+                )?)
             };
             WORKSPACE_BYTES_LAST.store(workspace_bytes as u64, Ordering::Relaxed);
             WORKSPACE_PTR_LAST.store(
-                workspace.as_ref().map_or(0, |workspace| workspace.ptr),
+                workspace.as_ref().map_or(0, |workspace| workspace.ptr()),
                 Ordering::Relaxed,
             );
             ExecutionKind::Gemm(CachedGemm { plan, workspace })
@@ -1184,10 +1168,7 @@ impl Kernel for EinsumKernel {
             }) = execution.as_ref()
             && let Some(workspace) = gemm.workspace.as_ref()
         {
-            resources.push(DeviceGraphResource::new(
-                Arc::as_ptr(workspace) as usize,
-                Arc::clone(workspace),
-            ));
+            resources.push(GraphDeviceAllocation::device_graph_resource(workspace));
         }
         if let Ok(metadata) = self.view_metadata.lock()
             && let Some(resource) = metadata.device_graph_resource()

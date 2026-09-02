@@ -82,14 +82,14 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 const BLOCK: u32 = 256;
 /// Threads per block for `attention_row` (one block services one score row).
@@ -1429,9 +1429,9 @@ fn std_attention_workspace_requirement(
     })
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct StdWorkspaceSlot {
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
     bytes: usize,
 }
 
@@ -1439,14 +1439,20 @@ struct StdWorkspaceSlot {
 struct StdAttnWorkspace {
     runtime: Arc<CudaRuntime>,
     slots: [StdWorkspaceSlot; WS_COUNT],
+    used: [bool; WS_COUNT],
 }
 
 impl StdAttnWorkspace {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            slots: [StdWorkspaceSlot::default(); WS_COUNT],
+            slots: std::array::from_fn(|_| StdWorkspaceSlot::default()),
+            used: [false; WS_COUNT],
         }
+    }
+
+    fn begin_call(&mut self) {
+        self.used.fill(false);
     }
 
     /// Return a device pointer for slot `index` with at least `bytes` capacity.
@@ -1454,10 +1460,13 @@ impl StdAttnWorkspace {
     /// — but never during graph capture, where a grow would record an illegal
     /// allocation, so the caller must have warmed the exact decode shape first.
     fn reserve(&mut self, index: usize, bytes: usize) -> Result<CUdeviceptr> {
+        self.used[index] = true;
         let bytes = bytes.max(1);
-        let slot = self.slots[index];
-        if slot.bytes >= bytes {
-            return Ok(slot.ptr);
+        let slot = &self.slots[index];
+        if slot.bytes >= bytes
+            && let Some(allocation) = slot.allocation.as_ref()
+        {
+            return Ok(allocation.ptr());
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(format!(
@@ -1465,32 +1474,28 @@ impl StdAttnWorkspace {
                  capture; warm the fixed decode shape before capture"
             )));
         }
-        let ptr = self.runtime.alloc_raw(bytes)?;
-        if slot.ptr != 0 {
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes)?;
+        if slot.allocation.is_some() {
             // A growing (prefill/eager) shape may outgrow a slot warmed for a
             // smaller step. Wait for queued users of the old storage before
             // freeing; the fixed-capacity decode path never reaches here.
-            if let Err(error) = self.runtime.synchronize() {
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(error);
-            }
-            if let Err(error) = unsafe { self.runtime.free_raw(slot.ptr) } {
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(error);
-            }
+            self.runtime.synchronize()?;
         }
-        self.slots[index] = StdWorkspaceSlot { ptr, bytes };
+        let ptr = allocation.ptr();
+        self.slots[index] = StdWorkspaceSlot {
+            allocation: Some(allocation),
+            bytes,
+        };
         Ok(ptr)
     }
-}
 
-impl Drop for StdAttnWorkspace {
-    fn drop(&mut self) {
-        for slot in &self.slots {
-            if slot.ptr != 0 {
-                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
-            }
-        }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.slots
+            .iter()
+            .zip(self.used)
+            .filter_map(|(slot, used)| used.then_some(slot.allocation.as_ref()).flatten())
+            .map(GraphDeviceAllocation::device_graph_resource)
+            .collect()
     }
 }
 
@@ -1825,6 +1830,10 @@ impl StandardAttentionKernel {
         outputs: &mut [TensorMut],
         prepared: Option<WorkspaceView>,
     ) -> Result<()> {
+        self.workspace
+            .lock()
+            .map_err(|_| EpError::KernelFailed("Attention: workspace lock poisoned".into()))?
+            .begin_call();
         check_arity("Attention", inputs, outputs, 3, 7, 1)?;
         // Inputs may have been uploaded asynchronously on the EP stream. During
         // CUDA-graph capture the uploads are recorded into the graph, so no host
@@ -2806,6 +2815,13 @@ impl Kernel for StandardAttentionKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         false
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.workspace
+            .lock()
+            .map(|workspace| workspace.device_graph_resources())
+            .unwrap_or_default()
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {

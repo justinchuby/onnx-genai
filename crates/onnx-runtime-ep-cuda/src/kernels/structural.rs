@@ -5,7 +5,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::movement::PersistentMetadata;
@@ -344,6 +346,29 @@ impl Kernel for GatherNdKernel {
 
     fn supports_strided_input(&self, _: usize) -> bool {
         false
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.dimensions
+            .lock()
+            .ok()
+            .and_then(|dimensions| dimensions.device_graph_resource())
+            .into_iter()
+            .collect()
+    }
+
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        match self.dimensions.lock() {
+            Ok(dimensions) if dimensions.device_graph_resource().is_some() => {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            }
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "GatherND must warm its exact shape metadata before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "GatherND metadata lock was poisoned",
+            ),
+        }
     }
 }
 

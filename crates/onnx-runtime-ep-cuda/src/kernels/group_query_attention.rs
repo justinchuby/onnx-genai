@@ -14,15 +14,15 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::driver_err;
 use crate::kernels::kv_stride::{KvCachePath, KvCacheStrides};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 use super::attention::{AttentionDtype, run_attention_phase2a};
 use super::flash_attention;
@@ -1322,9 +1322,9 @@ struct GqaCaptureSignature {
     backend: GroupQueryAttentionBackend,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct WorkspaceSlot {
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
     bytes: usize,
 }
 
@@ -1332,60 +1332,58 @@ struct WorkspaceSlot {
 struct GqaWorkspace {
     runtime: Arc<CudaRuntime>,
     slots: [WorkspaceSlot; WS_COUNT],
+    used: [bool; WS_COUNT],
 }
 
 impl GqaWorkspace {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            slots: [WorkspaceSlot::default(); WS_COUNT],
+            slots: std::array::from_fn(|_| WorkspaceSlot::default()),
+            used: [false; WS_COUNT],
         }
     }
 
+    fn begin_call(&mut self) {
+        self.used.fill(false);
+    }
+
     fn reserve(&mut self, index: usize, bytes: usize) -> Result<CUdeviceptr> {
+        self.used[index] = true;
         let bytes = bytes.max(1);
-        let slot = self.slots[index];
-        if slot.bytes >= bytes {
-            return Ok(slot.ptr);
+        let slot = &self.slots[index];
+        if slot.bytes >= bytes
+            && let Some(allocation) = slot.allocation.as_ref()
+        {
+            return Ok(allocation.ptr());
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep GroupQueryAttention: workspace slot {index} requires {bytes} bytes during CUDA graph capture; warm the fixed decode shape before capture"
             )));
         }
-        let ptr = self.runtime.alloc_raw(bytes)?;
-        if slot.ptr != 0 {
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes)?;
+        if slot.allocation.is_some() {
             // Dynamic prefill/growing-cache shapes may outgrow a slot. Preserve
             // the fixed-capacity decode fast path (which never reaches here),
             // but wait before replacing storage that queued work may still use.
-            if let Err(error) = self.runtime.synchronize() {
-                // SAFETY: `ptr` was allocated above and has not escaped.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(error);
-            }
-            // SAFETY: synchronization completed all prior users of `slot.ptr`,
-            // which is still exclusively owned by this workspace.
-            if let Err(error) = unsafe { self.runtime.free_raw(slot.ptr) } {
-                // SAFETY: `ptr` was allocated above and has not escaped.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(error);
-            }
+            self.runtime.synchronize()?;
         }
-        self.slots[index] = WorkspaceSlot { ptr, bytes };
+        let ptr = allocation.ptr();
+        self.slots[index] = WorkspaceSlot {
+            allocation: Some(allocation),
+            bytes,
+        };
         Ok(ptr)
     }
-}
 
-impl Drop for GqaWorkspace {
-    fn drop(&mut self) {
-        for slot in self.slots.iter_mut().rev() {
-            if slot.ptr != 0 {
-                // SAFETY: every live slot pointer was allocated by this runtime
-                // and remains exclusively owned by this workspace.
-                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
-                slot.ptr = 0;
-            }
-        }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.slots
+            .iter()
+            .zip(self.used)
+            .filter_map(|(slot, used)| used.then_some(slot.allocation.as_ref()).flatten())
+            .map(GraphDeviceAllocation::device_graph_resource)
+            .collect()
     }
 }
 
@@ -1613,7 +1611,7 @@ impl GroupQueryAttentionKernel {
             EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
         })?;
         let read_slot = |index: usize| -> Result<Vec<i32>> {
-            let slot = workspace.slots[index];
+            let slot = &workspace.slots[index];
             let bytes_len = batch
                 .checked_mul(std::mem::size_of::<i32>())
                 .ok_or_else(|| {
@@ -1621,7 +1619,12 @@ impl GroupQueryAttentionKernel {
                         "cuda_ep GroupQueryAttention: test metadata size overflow".into(),
                     )
                 })?;
-            if slot.ptr == 0 || slot.bytes < bytes_len {
+            let Some(allocation) = slot.allocation.as_ref() else {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: test metadata workspace is unavailable".into(),
+                ));
+            };
+            if slot.bytes < bytes_len {
                 return Err(EpError::KernelFailed(
                     "cuda_ep GroupQueryAttention: test metadata workspace is unavailable".into(),
                 ));
@@ -1630,7 +1633,7 @@ impl GroupQueryAttentionKernel {
             // SAFETY: the workspace slot is live and was reserved for at least
             // `bytes_len` bytes by the most recent successful execution.
             unsafe {
-                self.runtime.dtoh(&mut bytes, slot.ptr)?;
+                self.runtime.dtoh(&mut bytes, allocation.ptr())?;
             }
             Ok(bytes
                 .chunks_exact(4)
@@ -1674,6 +1677,12 @@ impl GroupQueryAttentionKernel {
         outputs: &mut [TensorMut],
         prepared: Option<WorkspaceView>,
     ) -> Result<()> {
+        self.workspace
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
+            })?
+            .begin_call();
         let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
             EpError::KernelFailed(
                 "cuda_ep GroupQueryAttention: capture signature lock poisoned".into(),
@@ -3250,6 +3259,13 @@ impl Kernel for GroupQueryAttentionKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.workspace
+            .lock()
+            .map(|workspace| workspace.device_graph_resources())
+            .unwrap_or_default()
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {

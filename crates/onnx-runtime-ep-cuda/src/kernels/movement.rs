@@ -12,7 +12,7 @@ use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::elementwise::{broadcast_strides, u64_bytes};
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 const BLOCK: u32 = 256;
 
@@ -237,26 +237,10 @@ fn host_ints(runtime: &CudaRuntime, view: &TensorView, op: &str) -> Result<Vec<i
 }
 
 #[derive(Debug)]
-struct PersistentMetadataAllocation {
-    runtime: Arc<CudaRuntime>,
-    ptr: CUdeviceptr,
-    bytes: usize,
-}
-
-impl Drop for PersistentMetadataAllocation {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
-        }
-    }
-}
-
-#[derive(Debug)]
 pub(super) struct PersistentMetadata {
     runtime: Arc<CudaRuntime>,
     values: Option<Vec<u64>>,
-    allocation: Option<Arc<PersistentMetadataAllocation>>,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
 }
 
 impl PersistentMetadata {
@@ -276,7 +260,7 @@ impl PersistentMetadata {
                         "cuda_ep {op}: cached persistent metadata lost its device allocation"
                     )))
                 },
-                |allocation| Ok(allocation.ptr),
+                |allocation| Ok(allocation.ptr()),
             );
         }
         if self.runtime.is_capturing()? {
@@ -290,32 +274,23 @@ impl PersistentMetadata {
         } else {
             values
         });
-        let ptr = self.runtime.alloc_raw(bytes.len())?;
-        if let Err(error) = unsafe { self.runtime.htod(bytes, ptr) } {
-            let _ = unsafe { self.runtime.free_raw(ptr) };
-            return Err(error);
-        }
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes.len())?;
+        unsafe { self.runtime.htod(bytes, allocation.ptr()) }?;
         self.values = Some(values.to_vec());
-        self.allocation = Some(Arc::new(PersistentMetadataAllocation {
-            runtime: Arc::clone(&self.runtime),
-            ptr,
-            bytes: bytes.len(),
-        }));
+        let ptr = allocation.ptr();
+        self.allocation = Some(allocation);
         Ok(ptr)
     }
 
     pub(super) fn allocation_bytes(&self) -> usize {
         self.allocation
             .as_ref()
-            .map_or(0, |allocation| allocation.bytes)
+            .map_or(0, |allocation| allocation.bytes())
     }
 
     pub(super) fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
         let allocation = self.allocation.as_ref()?;
-        Some(DeviceGraphResource::new(
-            Arc::as_ptr(allocation) as usize,
-            Arc::clone(allocation),
-        ))
+        Some(GraphDeviceAllocation::device_graph_resource(allocation))
     }
 }
 
@@ -734,6 +709,14 @@ impl Kernel for ExpandKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
+    }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
@@ -867,6 +850,14 @@ impl Kernel for TransposeKernel {
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
+    }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
@@ -1125,6 +1116,20 @@ impl Kernel for SliceKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        let mut resources = Vec::with_capacity(2);
+        if let Ok(dims) = self.dims.lock()
+            && let Some(resource) = dims.device_graph_resource()
+        {
+            resources.push(resource);
+        }
+        if let Ok(strides) = self.strides.lock()
+            && let Some(resource) = strides.device_graph_resource()
+        {
+            resources.push(resource);
+        }
+        resources
+    }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
@@ -1241,6 +1246,14 @@ impl Kernel for TileKernel {
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
+    }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {

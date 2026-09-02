@@ -116,10 +116,10 @@ impl Drop for CapturedGraph {
             context.record_err(unsafe { result::graph::destroy(graph) });
         }
 
-        // Graph launches already queued on `stream` may still be in flight.
-        // Releasing a resource enqueues its final allocation release behind the
-        // stream tail, so keeping the owners through handle destruction is the
-        // required ordering boundary.
+        // A replay admitted before reset may already be queued even after its
+        // enqueue guard retired. Wait for that stream tail before a resource
+        // owner can return an embedded address to the raw allocation pool.
+        context.record_err(self.stream.synchronize());
         self.resources.clear();
     }
 }

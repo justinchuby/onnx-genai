@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -37,6 +37,64 @@ use onnx_runtime_cuda_memory::capture_gate;
 pub struct CudaAllocationCounts {
     pub allocations: u64,
     pub frees: u64,
+}
+
+/// Immutable owner for a kernel-private allocation whose address may be
+/// embedded in a CUDA graph.
+///
+/// The weak runtime reference avoids a `CudaRuntime -> graph -> resource ->
+/// CudaRuntime` cycle. While the runtime is alive, final release updates its
+/// allocation accounting. During runtime teardown the context fallback still
+/// frees the allocation after graph handles are destroyed.
+#[derive(Debug)]
+pub(crate) struct GraphDeviceAllocation {
+    runtime: Weak<CudaRuntime>,
+    context: Arc<CudaContext>,
+    ptr: CUdeviceptr,
+    bytes: usize,
+}
+
+impl GraphDeviceAllocation {
+    pub(crate) fn allocate(runtime: &Arc<CudaRuntime>, bytes: usize) -> Result<Arc<Self>> {
+        let ptr = runtime.alloc_raw(bytes)?;
+        Ok(Arc::new(Self {
+            runtime: Arc::downgrade(runtime),
+            context: Arc::clone(&runtime.context),
+            ptr,
+            bytes,
+        }))
+    }
+
+    pub(crate) fn ptr(&self) -> CUdeviceptr {
+        self.ptr
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn device_graph_resource(owner: &Arc<Self>) -> DeviceGraphResource {
+        DeviceGraphResource::new(Arc::as_ptr(owner) as usize, Arc::clone(owner))
+    }
+}
+
+impl Drop for GraphDeviceAllocation {
+    fn drop(&mut self) {
+        if self.ptr == 0 {
+            return;
+        }
+        if let Some(runtime) = self.runtime.upgrade() {
+            // SAFETY: this immutable owner is the final owner of the pointer.
+            let _ = unsafe { runtime.free_raw(self.ptr) };
+        } else {
+            let _ = self.context.bind_to_thread();
+            let _section = capture_gate::synchronizing_section();
+            // SAFETY: runtime teardown is dropping the graph before the context;
+            // this owner still exclusively owns the allocation.
+            let _ = unsafe { cudarc::driver::result::free_sync(self.ptr) };
+        }
+        self.ptr = 0;
+    }
 }
 
 /// Counts successful CUDA graph capture installations and executable launches.
@@ -3599,6 +3657,7 @@ impl Drop for CudaRuntime {
         // source weight's device address, and that address stops meaning
         // anything once this runtime's allocator is gone. Freeing here is what
         // bounds an entry's life by the life of the address that names it.
+        crate::kernels::marlin_gemm::release_scratch_for_runtime(self.runtime_id);
         self.interleave.release_all(&*self);
         if self.capture_error != 0 {
             // SAFETY: `capture_error` was allocated by this runtime's `alloc_raw`
@@ -4003,6 +4062,24 @@ mod tests {
         std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
             .ok()
             .flatten()
+    }
+
+    #[test]
+    fn graph_device_allocation_does_not_retain_runtime() {
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping graph allocation ownership test: CUDA runtime unavailable");
+            return;
+        };
+        let strong_before = Arc::strong_count(&runtime);
+        let allocation = GraphDeviceAllocation::allocate(&runtime, 8).unwrap();
+        let resource = GraphDeviceAllocation::device_graph_resource(&allocation);
+        assert_eq!(
+            Arc::strong_count(&runtime),
+            strong_before,
+            "allocation/resource ownership must be weak back to CudaRuntime"
+        );
+        drop(resource);
+        drop(allocation);
     }
 
     /// The on-disk kernel cache stores PTX *text* and restores it through a

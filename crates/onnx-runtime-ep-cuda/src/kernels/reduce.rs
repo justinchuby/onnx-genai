@@ -57,8 +57,8 @@ use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
 
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceRequirement, WorkspaceView,
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -67,7 +67,7 @@ use crate::cudnn::{
     governed_workspace_requirement,
 };
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 /// NVRTC source: one block per output element, reducing over its group of
 /// `reduce_count` elements addressed by `base_off[o] + delta_off[r]`.
@@ -732,9 +732,10 @@ struct ReductionMetadataKey {
 struct ReductionMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<ReductionMetadataKey>,
-    base: CUdeviceptr,
-    delta: CUdeviceptr,
-    axes: CUdeviceptr,
+    base: Option<Arc<GraphDeviceAllocation>>,
+    delta: Option<Arc<GraphDeviceAllocation>>,
+    axes: Option<Arc<GraphDeviceAllocation>>,
+    used: bool,
 }
 
 impl ReductionMetadataCache {
@@ -742,10 +743,15 @@ impl ReductionMetadataCache {
         Self {
             runtime,
             key: None,
-            base: 0,
-            delta: 0,
-            axes: 0,
+            base: None,
+            delta: None,
+            axes: None,
+            used: false,
         }
+    }
+
+    fn begin_call(&mut self) {
+        self.used = false;
     }
 
     fn prepare(
@@ -756,6 +762,7 @@ impl ReductionMetadataCache {
         axes: &[i64],
         plan: &ReductionPlan,
     ) -> Result<(CUdeviceptr, CUdeviceptr, CUdeviceptr)> {
+        self.used = true;
         let key = ReductionMetadataKey {
             input_shape: input_shape.to_vec(),
             reduce: reduce.to_vec(),
@@ -763,90 +770,53 @@ impl ReductionMetadataCache {
             axes: axes.to_vec(),
         };
         if self.key.as_ref() == Some(&key) {
-            return Ok((self.base, self.delta, self.axes));
+            return match (&self.base, &self.delta, &self.axes) {
+                (Some(base), Some(delta), Some(axes)) => Ok((base.ptr(), delta.ptr(), axes.ptr())),
+                _ => Err(EpError::KernelFailed(
+                    "cuda_ep ReduceSum: cached reduction metadata lost a device allocation".into(),
+                )),
+            };
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
                 "cuda_ep ReduceSum: int64 reduction metadata changed during CUDA graph capture; warm the fixed decode shape before capture".into(),
             ));
         }
-        if self.base != 0 || self.delta != 0 || self.axes != 0 {
+        if self.base.is_some() || self.delta.is_some() || self.axes.is_some() {
             self.runtime.synchronize()?;
         }
 
         let base_bytes = as_i64_bytes(&plan.base);
         let delta_bytes = as_i64_bytes(&plan.delta);
         let axes_bytes = as_i64_bytes(axes);
-        let base = self.runtime.alloc_raw(base_bytes.len().max(1))?;
-        let delta = match self.runtime.alloc_raw(delta_bytes.len().max(1)) {
-            Ok(delta) => delta,
-            Err(error) => {
-                // SAFETY: `base` is fresh and has not escaped this cache.
-                let _ = unsafe { self.runtime.free_raw(base) };
-                return Err(error);
-            }
-        };
-        let axes_ptr = match self.runtime.alloc_raw(axes_bytes.len().max(1)) {
-            Ok(axes_ptr) => axes_ptr,
-            Err(error) => {
-                // SAFETY: both pointers are fresh and have not escaped.
-                let _ = unsafe { self.runtime.free_raw(base) };
-                let _ = unsafe { self.runtime.free_raw(delta) };
-                return Err(error);
-            }
-        };
+        let base = GraphDeviceAllocation::allocate(&self.runtime, base_bytes.len().max(1))?;
+        let delta = GraphDeviceAllocation::allocate(&self.runtime, delta_bytes.len().max(1))?;
+        let axes = GraphDeviceAllocation::allocate(&self.runtime, axes_bytes.len().max(1))?;
         let upload = (|| {
             // SAFETY: all fresh allocations cover their corresponding slices.
-            unsafe { self.runtime.htod(&base_bytes, base) }?;
-            unsafe { self.runtime.htod(&delta_bytes, delta) }?;
-            unsafe { self.runtime.htod(&axes_bytes, axes_ptr) }
+            unsafe { self.runtime.htod(&base_bytes, base.ptr()) }?;
+            unsafe { self.runtime.htod(&delta_bytes, delta.ptr()) }?;
+            unsafe { self.runtime.htod(&axes_bytes, axes.ptr()) }
         })();
-        if let Err(error) = upload {
-            // SAFETY: none of the fresh pointers escaped or were launched.
-            let _ = unsafe { self.runtime.free_raw(base) };
-            let _ = unsafe { self.runtime.free_raw(delta) };
-            let _ = unsafe { self.runtime.free_raw(axes_ptr) };
-            return Err(error);
-        }
+        upload?;
 
-        if self.base != 0 {
-            // SAFETY: synchronization above completed every prior launch using
-            // these cache-owned pointers.
-            unsafe { self.runtime.free_raw(self.base) }?;
-        }
-        if self.delta != 0 {
-            // SAFETY: same ownership and synchronization invariant as `base`.
-            unsafe { self.runtime.free_raw(self.delta) }?;
-        }
-        if self.axes != 0 {
-            // SAFETY: same ownership and synchronization invariant as `base`.
-            unsafe { self.runtime.free_raw(self.axes) }?;
-        }
+        let pointers = (base.ptr(), delta.ptr(), axes.ptr());
         self.key = Some(key);
-        self.base = base;
-        self.delta = delta;
-        self.axes = axes_ptr;
-        Ok((base, delta, axes_ptr))
+        self.base = Some(base);
+        self.delta = Some(delta);
+        self.axes = Some(axes);
+        Ok(pointers)
     }
-}
 
-impl Drop for ReductionMetadataCache {
-    fn drop(&mut self) {
-        if self.base != 0 {
-            // SAFETY: this cache exclusively owns the live pointer.
-            let _ = unsafe { self.runtime.free_raw(self.base) };
-            self.base = 0;
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        if !self.used {
+            return Vec::new();
         }
-        if self.delta != 0 {
-            // SAFETY: this cache exclusively owns the live pointer.
-            let _ = unsafe { self.runtime.free_raw(self.delta) };
-            self.delta = 0;
+        let mut resources = Vec::with_capacity(3);
+        for allocation in [&self.base, &self.delta, &self.axes].into_iter().flatten() {
+            resources.push(GraphDeviceAllocation::device_graph_resource(allocation));
         }
-        if self.axes != 0 {
-            // SAFETY: this cache exclusively owns the live pointer.
-            let _ = unsafe { self.runtime.free_raw(self.axes) };
-            self.axes = 0;
-        }
+        resources
     }
 }
 
@@ -1073,6 +1043,14 @@ impl ReduceKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
+        self.reduce_metadata
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep ReduceSum: reduction metadata lock was poisoned".into(),
+                )
+            })?
+            .begin_call();
         let op = self.op.name();
         if !(1..=2).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -1505,6 +1483,13 @@ impl Kernel for ReduceKernel {
 
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.reduce_metadata
+            .lock()
+            .map(|metadata| metadata.device_graph_resources())
+            .unwrap_or_default()
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {

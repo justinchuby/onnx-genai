@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    EpError, ExecutorArtifactGeneration, ExecutorInstanceId, ExecutorRouteResidencyConfig, Kernel,
-    KernelFactory, Result, TensorMut, TensorView,
+    DeviceGraphResource, EpError, ExecutorArtifactGeneration, ExecutorInstanceId,
+    ExecutorRouteResidencyConfig, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
@@ -29,7 +29,7 @@ use crate::kernels::expert_route_telemetry::{
 };
 use crate::kernels::{qmoe_gemm, qmoe_grouping};
 use crate::route_residency::RouteTelemetrySource;
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 const MODULE: &str = "qmoe_affine_v1";
 const ROUTE_ENTRY: &str = "qmoe_route";
@@ -1468,6 +1468,10 @@ impl Kernel for SharedQMoEKernel {
         self.0.supports_strided_input(input_idx)
     }
 
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.0.device_graph_resources()
+    }
+
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         self.0.capture_support()
     }
@@ -1622,6 +1626,7 @@ pub struct QMoERouteTelemetry {
     runtime: Arc<CudaRuntime>,
     routes_per_row: usize,
     state: Mutex<Option<ArmedTelemetry>>,
+    last_call_used: AtomicBool,
 }
 
 impl QMoERouteTelemetry {
@@ -1630,6 +1635,7 @@ impl QMoERouteTelemetry {
             runtime,
             routes_per_row,
             state: Mutex::new(None),
+            last_call_used: AtomicBool::new(false),
         }
     }
 
@@ -1652,7 +1658,8 @@ impl QMoERouteTelemetry {
         let armed = ArmedTelemetry::arm(&self.runtime, config)?;
         let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         if let Some(previous) = telemetry.take() {
-            previous.free(&self.runtime);
+            let _ = self.runtime.drain_for_unmap();
+            drop(previous);
         }
         *telemetry = Some(armed);
         Ok(())
@@ -1662,7 +1669,8 @@ impl QMoERouteTelemetry {
     pub fn disarm_route_telemetry(&self) {
         let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         if let Some(previous) = telemetry.take() {
-            previous.free(&self.runtime);
+            let _ = self.runtime.drain_for_unmap();
+            drop(previous);
         }
     }
 
@@ -1672,7 +1680,7 @@ impl QMoERouteTelemetry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(previous) = telemetry.take() {
-            previous.free_after_stream_fences(&self.runtime);
+            drop(previous);
         }
     }
 
@@ -1716,10 +1724,29 @@ impl QMoERouteTelemetry {
         let telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         match telemetry.as_ref() {
             Some(armed) if armed.matches_experts(experts) => {
+                self.last_call_used.store(true, Ordering::Relaxed);
                 (armed.bitmap_ptr(), armed.header_ptr())
             }
-            _ => (0, 0),
+            _ => {
+                self.last_call_used.store(false, Ordering::Relaxed);
+                (0, 0)
+            }
         }
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        if !self.last_call_used.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        self.state
+            .lock()
+            .ok()
+            .and_then(|telemetry| {
+                telemetry
+                    .as_ref()
+                    .map(|armed| armed.device_graph_resources().into_iter().collect())
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -1728,7 +1755,8 @@ impl Drop for QMoERouteTelemetry {
         if let Ok(telemetry) = self.state.get_mut()
             && let Some(armed) = telemetry.take()
         {
-            armed.free(&self.runtime);
+            let _ = self.runtime.drain_for_unmap();
+            drop(armed);
         }
     }
 }
@@ -1951,9 +1979,8 @@ impl Kernel for QMoEKernel {
     ///   stream itself with `drain_for_unmap` (an unconditional barrier,
     ///   unlike `synchronize`), only when a slot actually grows (see its doc
     ///   comment) — the case this really guards against.
-    /// - teardown safety: `Drop for QMoEKernel` now performs its own
-    ///   best-effort `drain_for_unmap` before freeing scratch, since it can no
-    ///   longer assume a prior call already synced.
+    /// - teardown safety: graph-retained immutable scratch owners keep every
+    ///   captured address alive through graph reset/destruction.
     ///
     /// The trailing `synchronize()` call itself is kept, not removed: it
     /// establishes no correctness guarantee of its own in the default
@@ -1965,6 +1992,13 @@ impl Kernel for QMoEKernel {
     /// this call's kernels still surfaces synchronously from `execute` itself
     /// under that debug flag, matching prior behavior.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.scratch
+            .lock()
+            .map_err(|_| error("QMoE scratch pool mutex poisoned"))?
+            .begin_call();
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.last_call_used.store(false, Ordering::Relaxed);
+        }
         if !(7..=21).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
                 "expected 7 to 21 inputs and exactly 1 output, got {} inputs and {} outputs",
@@ -2506,6 +2540,18 @@ impl Kernel for QMoEKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         false
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        let mut resources = self
+            .scratch
+            .lock()
+            .map(|scratch| scratch.device_graph_resources())
+            .unwrap_or_default();
+        if let Some(telemetry) = &self.telemetry {
+            resources.extend(telemetry.device_graph_resources());
+        }
+        resources
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
@@ -3269,21 +3315,23 @@ fn float_widen_entry(name: &str, dtype: DataType) -> Result<Option<&'static str>
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ScratchSlot {
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
     capacity: usize,
 }
 
 #[derive(Debug)]
 struct ScratchPool {
     slots: [ScratchSlot; SCRATCH_SLOTS],
+    used: [bool; SCRATCH_SLOTS],
 }
 
 impl Default for ScratchPool {
     fn default() -> Self {
         Self {
-            slots: [ScratchSlot::default(); SCRATCH_SLOTS],
+            slots: std::array::from_fn(|_| ScratchSlot::default()),
+            used: [false; SCRATCH_SLOTS],
         }
     }
 }
@@ -3299,15 +3347,18 @@ impl ScratchPool {
     /// this call wants to free it.
     fn ensure(
         &mut self,
-        runtime: &CudaRuntime,
+        runtime: &Arc<CudaRuntime>,
         index: usize,
         bytes: usize,
         capturing: bool,
     ) -> Result<CUdeviceptr> {
         let slot = &mut self.slots[index];
         let bytes = bytes.max(1);
-        if slot.ptr != 0 && slot.capacity >= bytes {
-            return Ok(slot.ptr);
+        self.used[index] = true;
+        if slot.capacity >= bytes
+            && let Some(allocation) = slot.allocation.as_ref()
+        {
+            return Ok(allocation.ptr());
         }
         if capturing {
             return Err(error(format!(
@@ -3315,7 +3366,7 @@ impl ScratchPool {
                 slot.capacity
             )));
         }
-        if slot.ptr != 0 {
+        if slot.allocation.is_some() {
             // `free_raw` returns to a shared, size-classed pool rather than the
             // driver in the common case, so a stale pointer can be handed to an
             // unrelated caller almost immediately — there is no synchronization
@@ -3332,18 +3383,24 @@ impl ScratchPool {
             // this cost is not paid on the steady-state path.
             runtime.drain_for_unmap()?;
         }
-        let fresh = runtime.alloc_raw(bytes)?;
-        if slot.ptr != 0 {
-            // SAFETY: the previous pointer came from this runtime, every prior
-            // kernel that could read it has retired (drained above), and it is
-            // replaced only after the new allocation succeeds.
-            unsafe {
-                let _ = runtime.free_raw(slot.ptr);
-            }
-        }
-        slot.ptr = fresh;
+        let fresh = GraphDeviceAllocation::allocate(runtime, bytes)?;
+        let ptr = fresh.ptr();
+        slot.allocation = Some(fresh);
         slot.capacity = bytes;
-        Ok(fresh)
+        Ok(ptr)
+    }
+
+    fn begin_call(&mut self) {
+        self.used.fill(false);
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.slots
+            .iter()
+            .zip(self.used)
+            .filter_map(|(slot, used)| used.then_some(slot.allocation.as_ref()).flatten())
+            .map(GraphDeviceAllocation::device_graph_resource)
+            .collect()
     }
 }
 
@@ -3353,24 +3410,8 @@ impl Drop for QMoEKernel {
             .scratch
             .get_mut()
             .expect("cuda_ep QMoE scratch pool poisoned");
-        if scratch.slots.iter().any(|slot| slot.ptr != 0) {
-            // `execute()` no longer syncs after every call, so a launch from
-            // the last call may still be in flight and reading these scratch
-            // buffers. `Drop` can't propagate a `Result`, so this is a
-            // best-effort barrier: on error (e.g. a poisoned/lost device) we
-            // still proceed to free, matching the pre-existing "errors are
-            // swallowed at teardown" behavior of the `free_raw` calls below.
+        if scratch.slots.iter().any(|slot| slot.allocation.is_some()) {
             let _ = self.runtime.drain_for_unmap();
-        }
-        for slot in scratch.slots.iter_mut().rev() {
-            if slot.ptr != 0 {
-                // SAFETY: every non-zero pointer came from this runtime, the
-                // drain above (best-effort) has retired prior in-flight
-                // kernels, and each pointer is freed exactly once here.
-                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
-                slot.ptr = 0;
-                slot.capacity = 0;
-            }
         }
     }
 }
