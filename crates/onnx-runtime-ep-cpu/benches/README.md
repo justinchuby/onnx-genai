@@ -47,16 +47,27 @@ and releasing between targets makes its rows incomparable.
 
 ### Exact Einsum census and evidence run
 
-The checked-in runbook supplies the required lock, gate, physical-core budget,
-and absolute Cargo target directory. Use one fresh directory for the census and
-the subsequent run:
+Set the physical-core budget and a fresh absolute Cargo target directory from
+the repository root. The census helper uses the same values and must report
+12/12 before the evidence run:
 
-```bash
+```console
+export ONNX_GENAI_CPU_DECODE_THREADS=16
 EINSUM_TARGET="$PWD/target-einsum-evidence-$(git rev-parse --short=12 HEAD)"
+export CARGO_TARGET_DIR="$EINSUM_TARGET"
 crates/onnx-runtime-ep-cpu/benches/run_einsum.sh \
   census cpu-bench 16 "$EINSUM_TARGET"
-crates/onnx-runtime-ep-cpu/benches/run_einsum.sh \
-  run cpu-bench 16 "$EINSUM_TARGET"
+```
+
+The governed target has exactly one committed direct invocation. Keep the
+outer lock around the Cargo child so compilation, warmup, all 12 selectors,
+and both controls remain in one custody interval:
+
+```bash
+scripts/hostlock.sh run --owner cpu-bench \
+  --reason "CPU Einsum evidence sweep (12 selectors)" \
+  --wait --gate 3 --strict-reap -- \
+  cargo bench -p onnx-runtime-ep-cpu --bench einsum -- --noplot
 ```
 
 The census proves that the target lists exactly 12 Criterion selectors before
@@ -67,8 +78,10 @@ destination cannot be verified. It also fails the run if any measurement window
 has foreign/sibling contention, more than 20% median-frequency drift, or an
 unstable MatMul control.
 
-The runbook holds one outer `hostlock.sh run` for each complete census or timed
-sweep, including Cargo compilation. Reading the lock from the benchmark cannot
+The runbook's `run` mode remains an equivalent convenience for local use, but
+the direct command above is the governed invocation pinned by conformance.
+Both paths hold one outer `hostlock.sh run` for the complete timed sweep,
+including Cargo compilation. Reading the lock from the benchmark cannot
 substitute for custody.
 
 The target emits:
