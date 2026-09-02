@@ -2020,14 +2020,10 @@ fn binding_addresses(session: &NativeDecodeSession) -> Vec<usize> {
         .collect()
 }
 
-/// Build a synthetic single-layer CUDA decoder whose `logits` are a direct
-/// function of the *incoming* recurrent `conv_state`, and whose next state
-/// accumulates the decoded token id. Unlike `build_cuda_decoder_with_fixed_state`
-/// (where `conv_state` only passes through `Identity` and never reaches the
-/// logits, so a stale state is invisible), here a non-reset recurrent state
-/// changes the emitted logits on the next generation — the exact signature of
-/// the session-reuse corruption bug. Used by the regression test that a reused
-/// `NativeDecodeSession` re-zeros recurrent state on `reset()`.
+/// Build a synthetic CUDA decoder with three fixed recurrent states. The first
+/// state feeds `logits`, and every state accumulates the decoded token id, so
+/// stale or partially restored state is observable while first/middle/last
+/// restore failures can be injected independently.
 #[cfg(feature = "native-cuda")]
 fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeDecodeSession> {
     use prost::Message;
@@ -2056,20 +2052,26 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
         DataType::Float32,
         vec![1.into(), 1.into(), past.into(), 1.into()],
     );
-    let conv_state = graph.create_named_value(
-        "past_key_values.0.conv_state",
-        DataType::Float16,
-        vec![1.into(), 4.into(), 3.into()],
-    );
+    let conv_states = (0..3)
+        .map(|layer| {
+            graph.create_named_value(
+                format!("past_key_values.{layer}.conv_state"),
+                DataType::Float16,
+                vec![1.into(), 4.into(), 3.into()],
+            )
+        })
+        .collect::<Vec<_>>();
     for input in [
         input_ids,
         attention_mask,
         position_ids,
         past_key,
         past_value,
-        conv_state,
     ] {
         graph.add_input(input);
+    }
+    for &conv_state in &conv_states {
+        graph.add_input(conv_state);
     }
 
     // logits = ReduceSum(Cast(conv_state)) — depends on the INCOMING recurrent
@@ -2083,7 +2085,7 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
     insert_op(
         &mut graph,
         "Cast",
-        vec![conv_state],
+        vec![conv_states[0]],
         conv_f32,
         &[("to", Attribute::Int(DataType::Float32 as i64))],
     );
@@ -2111,18 +2113,16 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
         token_f16,
         &[("to", Attribute::Int(DataType::Float16 as i64))],
     );
-    let present_conv_state = graph.create_named_value(
-        "present.0.conv_state",
-        DataType::Float16,
-        vec![1.into(), 4.into(), 3.into()],
-    );
-    insert_op(
-        &mut graph,
-        "Add",
-        vec![conv_state, token_f16],
-        present_conv_state,
-        &[],
-    );
+    let mut present_conv_states = Vec::new();
+    for (layer, &conv_state) in conv_states.iter().enumerate() {
+        let present = graph.create_named_value(
+            format!("present.{layer}.conv_state"),
+            DataType::Float16,
+            vec![1.into(), 4.into(), 3.into()],
+        );
+        insert_op(&mut graph, "Add", vec![conv_state, token_f16], present, &[]);
+        present_conv_states.push(present);
+    }
 
     let present_key = graph.create_named_value(
         "present.0.key",
@@ -2149,8 +2149,11 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
         &[("to", Attribute::Int(DataType::Float32 as i64))],
     );
 
-    for output in [logits, present_key, present_value, present_conv_state] {
+    for output in [logits, present_key, present_value] {
         graph.add_output(output);
+    }
+    for present in present_conv_states {
+        graph.add_output(present);
     }
 
     let model = onnx_std::Model::new(graph).to_proto()?.encode_to_vec();
@@ -2160,12 +2163,16 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
         .build()
         .context("build recurrent-logits CUDA decoder")?;
     let mut io = tiny_decoder_io();
-    io.state_pairs = Some(vec![LoopStatePair {
-        input: "past_key_values.0.conv_state".into(),
-        output: "present.0.conv_state".into(),
-        init: Some("zeros".into()),
-        update: Some("replace".into()),
-    }]);
+    io.state_pairs = Some(
+        (0..3)
+            .map(|layer| LoopStatePair {
+                input: format!("past_key_values.{layer}.conv_state"),
+                output: format!("present.{layer}.conv_state"),
+                init: Some("zeros".into()),
+                update: Some("replace".into()),
+            })
+            .collect(),
+    );
     NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(session, Some(max_len), Some(&io))
 }
 
@@ -2215,6 +2222,145 @@ fn native_cuda_reused_session_rezeros_recurrent_state() -> anyhow::Result<()> {
     assert_eq!(
         first, second,
         "reused session must re-zero recurrent state on reset(): gen#1 {first:?} != gen#2 {second:?}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "native-cuda")]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires a CUDA device; enable gpu-tests to execute"
+)]
+#[test]
+fn native_cuda_fixed_state_restore_is_atomic_at_every_copy_stage() -> anyhow::Result<()> {
+    #[derive(Debug, PartialEq, Eq)]
+    struct DeviceIdentity {
+        logical_len: usize,
+        addresses: Vec<usize>,
+        physical_shapes: Vec<Vec<usize>>,
+        logical_shapes: Vec<Vec<usize>>,
+        mask: Vec<u8>,
+        fixed: Vec<Vec<u8>>,
+    }
+
+    fn identity(session: &mut NativeDecodeSession) -> anyhow::Result<DeviceIdentity> {
+        let stats = session
+            .cuda_kv_debug_stats()
+            .context("CUDA decoder exposes debug stats")?;
+        let state = session.cuda.as_mut().context("CUDA decoder state")?;
+        let addresses = state
+            .bindings
+            .iter()
+            .map(|binding| binding.device_ptr() as usize)
+            .collect();
+        let physical_shapes = state
+            .bindings
+            .iter()
+            .map(|binding| binding.physical_shape().to_vec())
+            .collect();
+        let logical_shapes = state
+            .bindings
+            .iter()
+            .map(|binding| binding.logical_shape().to_vec())
+            .collect();
+        let mask = state.bindings[0].read_bytes()?;
+        let mut fixed = Vec::new();
+        for index in state.fixed_state_binding_range.clone() {
+            fixed.push(state.bindings[index].read_bytes()?);
+        }
+        Ok(DeviceIdentity {
+            logical_len: stats.logical_len,
+            addresses,
+            physical_shapes,
+            logical_shapes,
+            mask,
+            fixed,
+        })
+    }
+
+    const PROMPT: [TokenId; 3] = [5, 7, 9];
+    let advance =
+        |session: &mut NativeDecodeSession, tokens: &[TokenId]| -> anyhow::Result<Vec<Vec<f32>>> {
+            let mut logits = Vec::new();
+            for &token in tokens {
+                logits = session.decode(&[token], session.current_len())?;
+            }
+            Ok(logits)
+        };
+    for failure in [0usize, 1, 2] {
+        let expected = {
+            let mut oracle = build_cuda_recurrent_logits_decoder(16)?;
+            advance(&mut oracle, &PROMPT)?;
+            advance(&mut oracle, &[17])?
+        };
+        let mut session = build_cuda_recurrent_logits_decoder(16)?;
+        advance(&mut session, &PROMPT)?;
+        let snapshot = session.snapshot_recurrent_state()?;
+        assert_eq!(
+            session
+                .cuda
+                .as_ref()
+                .expect("CUDA state")
+                .fixed_state_snapshot_scratch
+                .len(),
+            3,
+            "fixed-state fixture census drifted"
+        );
+        advance(&mut session, &[11, 13])?;
+        let before_len = session.current_len();
+        let before = identity(&mut session)?;
+
+        let error = {
+            let _failure = cuda::fail_cuda_fixed_restore_at(failure);
+            session
+                .restore_state_snapshot_at(&snapshot, PROMPT.len())
+                .expect_err("injected CUDA restore copy must abort")
+        };
+        assert!(
+            error.to_string().contains(&format!(
+                "injected CUDA fixed-state restore failure at slot {failure}"
+            )),
+            "initiating CUDA copy error must stay primary: {error:#}"
+        );
+        assert_eq!(session.current_len(), before_len);
+        assert_eq!(
+            identity(&mut session)?,
+            before,
+            "failure at CUDA fixed-state slot {failure} published a partial dense/fixed rollback"
+        );
+
+        session.restore_state_snapshot_at(&snapshot, PROMPT.len())?;
+        assert_eq!(
+            advance(&mut session, &[17])?,
+            expected,
+            "retry after CUDA fixed-state slot {failure} must match a clean session"
+        );
+    }
+
+    let mut poisoned = build_cuda_recurrent_logits_decoder(16)?;
+    advance(&mut poisoned, &PROMPT)?;
+    let snapshot = poisoned.snapshot_recurrent_state()?;
+    advance(&mut poisoned, &[11])?;
+    let error = {
+        let _failure = cuda::fail_cuda_fixed_restore_and_undo_at(1, 0);
+        poisoned
+            .restore_state_snapshot_at(&snapshot, PROMPT.len())
+            .expect_err("undo failure must be surfaced")
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("injected CUDA fixed-state restore failure at slot 1")
+            && message.contains("injected CUDA fixed-state undo failure at slot 0")
+            && message.contains("session is poisoned"),
+        "primary and undo failures must both remain actionable: {error:#}"
+    );
+    let retry = poisoned
+        .decode(&[17], poisoned.current_len())
+        .expect_err("a failed undo must permanently block dispatch");
+    assert!(
+        retry
+            .to_string()
+            .contains("state restore transaction is poisoned")
     );
     Ok(())
 }

@@ -7,6 +7,10 @@ static NATIVE_CUDA_PROVIDER_CONSTRUCTION_ATTEMPTS: AtomicU64 = AtomicU64::new(0)
 /// native decode cannot safely admit.
 #[derive(Debug)]
 pub enum NativeDecodeMetadataRefusal {
+    UnsupportedSchema {
+        path: PathBuf,
+        source: onnx_genai_metadata::UnsupportedSchemaVersion,
+    },
     InvalidDocument {
         path: PathBuf,
         source: onnx_genai_metadata::MetadataError,
@@ -24,6 +28,13 @@ pub enum NativeDecodeMetadataRefusal {
 impl std::fmt::Display for NativeDecodeMetadataRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnsupportedSchema { path, source } => write!(
+                formatter,
+                "native decode refused unsupported inference metadata '{}': {source}. Upgrade \
+                 the runtime or re-emit the package within the supported schema range before \
+                 selecting an execution provider",
+                path.display()
+            ),
             Self::InvalidDocument { path, source } => write!(
                 formatter,
                 "native decode refused inference metadata '{}': {source}. Fix or remove the \
@@ -51,6 +62,7 @@ impl std::fmt::Display for NativeDecodeMetadataRefusal {
 impl std::error::Error for NativeDecodeMetadataRefusal {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::UnsupportedSchema { source, .. } => Some(source),
             Self::InvalidDocument { source, .. } => Some(source),
             Self::InvalidCompatibilityMetadata { source, .. } => Some(source.as_ref()),
             Self::InvalidContract { .. } => None,
@@ -99,12 +111,17 @@ fn resolve_io_metadata_from_model_path(
     };
     let metadata_path = onnx_genai_metadata::find_metadata_path(root);
     let metadata = onnx_genai_metadata::load_metadata_from_dir(root).map_err(|source| {
-        anyhow::Error::new(NativeDecodeMetadataRefusal::InvalidDocument {
-            path: metadata_path
-                .clone()
-                .unwrap_or_else(|| root.join("inference_metadata.yaml")),
-            source,
-        })
+        let path = metadata_path
+            .clone()
+            .unwrap_or_else(|| root.join("inference_metadata.yaml"));
+        match source {
+            onnx_genai_metadata::MetadataError::UnsupportedSchema(source) => {
+                anyhow::Error::new(NativeDecodeMetadataRefusal::UnsupportedSchema { path, source })
+            }
+            source => {
+                anyhow::Error::new(NativeDecodeMetadataRefusal::InvalidDocument { path, source })
+            }
+        }
     })?;
     if let Some(metadata) = metadata {
         validate_resolved_metadata(
@@ -137,6 +154,26 @@ fn validate_resolved_metadata(
     metadata: &onnx_genai_metadata::InferenceMetadata,
     path: PathBuf,
 ) -> anyhow::Result<()> {
+    match onnx_genai_metadata::version::gate(metadata.schema_version.as_deref()) {
+        Ok(_) => {}
+        Err(onnx_genai_metadata::SchemaVersionError::Unsupported(source)) => {
+            let document = onnx_genai_metadata::SchemaDocumentContext::File(path.clone());
+            return Err(anyhow::Error::new(
+                NativeDecodeMetadataRefusal::UnsupportedSchema {
+                    path,
+                    source: source.with_document(document),
+                },
+            ));
+        }
+        Err(onnx_genai_metadata::SchemaVersionError::Invalid(reason)) => {
+            return Err(anyhow::Error::new(
+                NativeDecodeMetadataRefusal::InvalidContract {
+                    path,
+                    errors: vec![reason],
+                },
+            ));
+        }
+    }
     onnx_genai_metadata::validate_metadata(metadata).map_err(|errors| {
         anyhow::Error::new(NativeDecodeMetadataRefusal::InvalidContract {
             path: path.clone(),

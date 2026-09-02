@@ -19,9 +19,10 @@
 //! arbitrates.
 
 use onnx_genai_metadata::{
-    INITIAL_SCHEMA_VERSION, InferenceMetadata, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION,
-    WorkflowOutputFamily, WorkflowPublicationMode, parse_metadata, parse_metadata_json,
-    validate_metadata, version,
+    INITIAL_SCHEMA_VERSION, InferenceMetadata, MetadataError, SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, SchemaDocumentContext, SchemaFamily,
+    SchemaVersion, WorkflowOutputFamily, WorkflowPublicationMode, parse_metadata,
+    parse_metadata_json, validate_metadata, version,
 };
 
 /// The smallest document that says nothing new.
@@ -135,6 +136,14 @@ fn a_newer_document_is_refused_by_version_rather_than_by_the_first_field_it_uses
     let document =
         format!("schema_version: \"1.9\"\nfuture_section: {{ shape: circular }}\n{PLAIN}");
     let error = parse_metadata(&document, Some("yaml")).expect_err("1.9 is newer than this build");
+    let unsupported = match &error {
+        MetadataError::UnsupportedSchema(unsupported) => unsupported,
+        other => panic!("future schema must be typed unsupported, got {other:?}"),
+    };
+    assert_eq!(unsupported.family, SchemaFamily::InferenceMetadata);
+    assert_eq!(unsupported.observed, SchemaVersion::new(1, 9));
+    assert_eq!(unsupported.supported, SUPPORTED_SCHEMA_VERSIONS);
+    assert_eq!(unsupported.document, SchemaDocumentContext::InMemory);
     let error = error.to_string();
     assert!(
         error.contains("schema version v1.9") && error.contains("reads up to v1.8"),

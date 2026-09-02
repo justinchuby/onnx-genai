@@ -211,6 +211,7 @@ const METADATA_FILE_NAMES: [&str; 3] = [
 pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
     let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
     parse_metadata(&content, path.extension().and_then(|e| e.to_str()))
+        .map_err(|error| error.with_document_path(path))
 }
 
 /// The one way a document becomes an [`InferenceMetadata`].
@@ -280,7 +281,12 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     reject_retired_top_level_tokens(document)?;
     reject_invalid_tensor_contract_shapes(document, String::new())?;
     let declared = crate::version::declared_in(document).map_err(crate::MetadataError::Parse)?;
-    let version = crate::version::gate(declared).map_err(crate::MetadataError::Parse)?;
+    let version = crate::version::gate(declared).map_err(|error| match error {
+        crate::version::SchemaVersionError::Invalid(reason) => crate::MetadataError::Parse(reason),
+        crate::version::SchemaVersionError::Unsupported(error) => {
+            crate::MetadataError::UnsupportedSchema(error)
+        }
+    })?;
     gate_output_protocol_features(document, version)?;
     gate_compressed_state_features(document, version)?;
     reject_retired_streaming_emit(document)?;

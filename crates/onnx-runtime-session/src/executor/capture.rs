@@ -443,7 +443,10 @@ pub(super) struct DeviceBindingSignature {
     pub(super) output_name: Option<String>,
     pub(super) dtype: DataType,
     pub(super) physical_shape: Vec<usize>,
-    pub(super) logical_shape: Vec<usize>,
+    /// Shape kernels actually observe. A capacity-bound input sees its physical
+    /// shape, so dormant logical-length bookkeeping is not a graph dependency.
+    pub(super) kernel_input_shape: Vec<usize>,
+    pub(super) accepts_output_subshape: bool,
     pub(super) exposes_logical_input_shape: bool,
     pub(super) mask_decode_freeze_safe: bool,
     pub(super) device_ptr: usize,

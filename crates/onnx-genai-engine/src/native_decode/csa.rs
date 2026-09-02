@@ -1950,6 +1950,127 @@ mod tests {
     }
 
     #[test]
+    fn fixed_state_restore_failures_leave_dense_and_compressed_state_unchanged()
+    -> anyhow::Result<()> {
+        #[derive(Debug, PartialEq, Eq)]
+        struct StateIdentity {
+            shape: Vec<usize>,
+            layout: String,
+            address: usize,
+            bytes: Vec<u8>,
+        }
+
+        fn identity(session: &NativeDecodeSession) -> BTreeMap<String, StateIdentity> {
+            session
+                .past
+                .iter()
+                .map(|(name, tensor)| {
+                    (
+                        name.clone(),
+                        StateIdentity {
+                            shape: tensor.shape.clone(),
+                            layout: format!("{:?}", tensor.layout),
+                            address: tensor.device_ptr() as usize,
+                            bytes: tensor.as_bytes().to_vec(),
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        let model = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny-deepseek-v4-csa/model.onnx.textproto");
+        let prompt = [1, 2, 3, 4, 5, 6, 7, 8];
+        for failure in [0usize, 3, 5] {
+            let mut session =
+                NativeDecodeSession::load_with_resolved_io(&model, NativeDecodeDevice::Cpu)?;
+            let mut oracle =
+                NativeDecodeSession::load_with_resolved_io(&model, NativeDecodeDevice::Cpu)?;
+            let mut sibling =
+                NativeDecodeSession::load_with_resolved_io(&model, NativeDecodeDevice::Cpu)?;
+            session.decode(&prompt, 0)?;
+            oracle.decode(&prompt, 0)?;
+            sibling.decode(&prompt, 0)?;
+            let snapshot = session.snapshot_recurrent_state()?;
+            let fixed_count = snapshot.host.as_ref().expect("host snapshot").len();
+            assert_eq!(fixed_count, 6, "fixture fixed-state census drifted");
+
+            session.decode(&[9, 10, 11, 12], prompt.len())?;
+            let before = identity(&session);
+            let before_len = session.current_len();
+            let before_stats = session.compressed_state_path_stats();
+            let sibling_before = identity(&sibling);
+            let sibling_len = sibling.current_len();
+
+            let error = {
+                let _failure = fail_host_fixed_restore_at(failure);
+                session
+                    .restore_state_snapshot_at(&snapshot, prompt.len())
+                    .expect_err("injected fixed-state stage must abort the transaction")
+            };
+            assert!(
+                error.to_string().contains(&format!(
+                    "injected host fixed-state restore failure at slot {failure}"
+                )),
+                "the initiating restore error must remain primary: {error:#}"
+            );
+            assert_eq!(session.current_len(), before_len);
+            assert_eq!(session.compressed_state_path_stats(), before_stats);
+            assert_eq!(
+                identity(&session),
+                before,
+                "failure at fixed slot {failure} published a partial dense/fixed rollback"
+            );
+            assert_eq!(sibling.current_len(), sibling_len);
+            assert_eq!(
+                identity(&sibling),
+                sibling_before,
+                "failure at fixed slot {failure} crossed into a sibling session"
+            );
+
+            session.restore_state_snapshot_at(&snapshot, prompt.len())?;
+            assert_eq!(
+                session.decode(&[13], prompt.len())?,
+                oracle.decode(&[13], prompt.len())?,
+                "clean retry after fixed slot {failure} must match an untouched session"
+            );
+        }
+
+        let mut session =
+            NativeDecodeSession::load_with_resolved_io(&model, NativeDecodeDevice::Cpu)?;
+        session.decode(&prompt, 0)?;
+        let snapshot = session.snapshot_recurrent_state()?;
+        session.decode(&[9, 10], prompt.len())?;
+        let fixed = snapshot.host.as_ref().expect("host snapshot");
+        let dense_name = session
+            .past
+            .keys()
+            .find(|name| !fixed.contains_key(*name))
+            .cloned()
+            .expect("fixture carries dense KV");
+        let rank = session.past[&dense_name].shape.len();
+        session.past.get_mut(&dense_name).expect("dense KV").layout =
+            onnx_runtime_ir::TensorLayout::strided(vec![0; rank]);
+        let before = identity(&session);
+        let before_len = session.current_len();
+        let error = session
+            .restore_state_snapshot_at(&snapshot, prompt.len())
+            .expect_err("non-contiguous dense KV must fail before publication");
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("requires contiguous row-major storage"),
+            "{reported}"
+        );
+        assert_eq!(session.current_len(), before_len);
+        assert_eq!(
+            identity(&session),
+            before,
+            "non-contiguous input refusal must leave every dense/fixed binding untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn cuda_decline_is_typed() {
         let groups = vec![group(
             "records",

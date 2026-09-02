@@ -1359,7 +1359,9 @@ impl Executor {
                 output_name: binding.output_name().map(str::to_string),
                 dtype: binding.dtype,
                 physical_shape: binding.physical_shape().to_vec(),
-                logical_shape: binding.logical_shape().to_vec(),
+                kernel_input_shape: binding.kernel_input_shape().to_vec(),
+                accepts_output_subshape: binding.binds_input()
+                    && binding.logical_shape() != binding.physical_shape(),
                 exposes_logical_input_shape: binding.exposes_logical_input_shape(),
                 mask_decode_freeze_safe: binding.mask_decode_freeze_safe(),
                 device_ptr: binding.device_ptr() as usize,
@@ -1379,7 +1381,10 @@ impl Executor {
                             && expected.output_name.as_deref() == binding.output_name()
                             && expected.dtype == binding.dtype
                             && expected.physical_shape == binding.physical_shape()
-                            && expected.logical_shape == binding.logical_shape()
+                            && expected.kernel_input_shape == binding.kernel_input_shape()
+                            && expected.accepts_output_subshape
+                                == (binding.binds_input()
+                                    && binding.logical_shape() != binding.physical_shape())
                             && expected.exposes_logical_input_shape
                                 == binding.exposes_logical_input_shape()
                             && expected.mask_decode_freeze_safe == binding.mask_decode_freeze_safe()

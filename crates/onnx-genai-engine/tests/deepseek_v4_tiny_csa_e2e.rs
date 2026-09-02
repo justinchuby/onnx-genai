@@ -457,6 +457,11 @@ fn malformed_state_metadata_refuses_before_cuda_provider_and_vmm_construction() 
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let document = std::fs::read_to_string(fixture_dir().join("inference_metadata.yaml")).unwrap();
+    enum ExpectedRefusal {
+        InvalidDocument,
+        InvalidContract,
+        Unsupported,
+    }
     let cases = [
         (
             "unknown-field",
@@ -465,31 +470,31 @@ fn malformed_state_metadata_refuses_before_cuda_provider_and_vmm_construction() 
                 "            kind: compressed_attention\n            future_layout: tiled\n            properties:",
                 1,
             ),
-            false,
+            ExpectedRefusal::InvalidDocument,
         ),
         (
             "missing-record-format",
             document.replacen("          record_format: fp8_e4m3_block64\n", "", 1),
-            false,
+            ExpectedRefusal::InvalidDocument,
         ),
         (
             "inconsistent-roles",
             document.replacen("role: index_key", "role: compressed_kv", 1),
-            true,
+            ExpectedRefusal::InvalidContract,
         ),
         (
             "unsupported-version",
             document.replacen("schema_version: v1.8", "schema_version: v1.9", 1),
-            false,
+            ExpectedRefusal::Unsupported,
         ),
         (
             "under-versioned",
             document.replacen("schema_version: v1.8", "schema_version: v1.7", 1),
-            false,
+            ExpectedRefusal::InvalidDocument,
         ),
     ];
 
-    for (label, metadata, semantic) in cases {
+    for (label, metadata, expected) in cases {
         let scratch = scratch_fixture(label, Some(&metadata));
         for loader in ["resolved", "default", "kv-max", "cuda-options"] {
             onnx_runtime_ep_cuda::vmm_allocator::reset_global_vmm_stats();
@@ -524,11 +529,38 @@ fn malformed_state_metadata_refuses_before_cuda_provider_and_vmm_construction() 
                 .unwrap_or_else(|| {
                     panic!("{label}/{loader} must return typed metadata refusal: {error:#}")
                 });
-            assert_eq!(
-                matches!(refusal, NativeDecodeMetadataRefusal::InvalidContract { .. }),
-                semantic,
-                "{label}/{loader}: {refusal}"
-            );
+            match (&expected, refusal) {
+                (
+                    ExpectedRefusal::InvalidDocument,
+                    NativeDecodeMetadataRefusal::InvalidDocument { .. },
+                )
+                | (
+                    ExpectedRefusal::InvalidContract,
+                    NativeDecodeMetadataRefusal::InvalidContract { .. },
+                ) => {}
+                (
+                    ExpectedRefusal::Unsupported,
+                    NativeDecodeMetadataRefusal::UnsupportedSchema { source, .. },
+                ) => {
+                    assert_eq!(
+                        source.family,
+                        onnx_genai_metadata::SchemaFamily::InferenceMetadata
+                    );
+                    assert_eq!(
+                        source.observed,
+                        onnx_genai_metadata::SchemaVersion::new(1, 9)
+                    );
+                    assert_eq!(
+                        source.supported,
+                        onnx_genai_metadata::SUPPORTED_SCHEMA_VERSIONS
+                    );
+                    assert!(matches!(
+                        source.document,
+                        onnx_genai_metadata::SchemaDocumentContext::File(_)
+                    ));
+                }
+                _ => panic!("{label}/{loader}: unexpected typed refusal {refusal}"),
+            }
             assert_eq!(
                 native_cuda_provider_construction_attempts(),
                 constructions,

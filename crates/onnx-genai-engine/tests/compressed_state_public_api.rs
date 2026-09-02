@@ -4,6 +4,9 @@ use onnx_genai_engine::{
     CompressedStateLoadRefusal, CompressedStatePathStats, NativeDecodeDevice,
     NativeDecodeMetadataRefusal, NativeDecodeSession, compressed_state_map_lookups,
 };
+use onnx_genai_metadata::{
+    MetadataError, SUPPORTED_SCHEMA_VERSIONS, SchemaDocumentContext, SchemaFamily, SchemaVersion,
+};
 
 #[test]
 fn external_callers_can_match_typed_compressed_state_refusal() {
@@ -15,6 +18,22 @@ fn external_callers_can_match_typed_compressed_state_refusal() {
 
     fn accepts_metadata_refusal(_: &NativeDecodeMetadataRefusal) {}
     let _ = accepts_metadata_refusal;
+}
+
+#[test]
+fn external_callers_can_match_future_schema_without_string_parsing() {
+    let error = onnx_genai_metadata::parse_metadata(
+        "schema_version: \"v1.9\"\nfuture_section: {}\n",
+        Some("yaml"),
+    )
+    .expect_err("future schema must be refused");
+    let MetadataError::UnsupportedSchema(unsupported) = error else {
+        panic!("future schema was not preserved as a public typed refusal");
+    };
+    assert_eq!(unsupported.family, SchemaFamily::InferenceMetadata);
+    assert_eq!(unsupported.observed, SchemaVersion::new(1, 9));
+    assert_eq!(unsupported.supported, SUPPORTED_SCHEMA_VERSIONS);
+    assert_eq!(unsupported.document, SchemaDocumentContext::InMemory);
 }
 
 #[test]

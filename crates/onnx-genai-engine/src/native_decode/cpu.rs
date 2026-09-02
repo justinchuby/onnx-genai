@@ -527,6 +527,10 @@ impl NativeDecodeSession {
                             .saturating_add(
                                 u64::try_from(tensor.as_bytes().len()).unwrap_or(u64::MAX),
                             );
+                        self.compressed_state_stats.telemetry_updates = self
+                            .compressed_state_stats
+                            .telemetry_updates
+                            .saturating_add(1);
                     }
                     Some(csa::CompressedStateTransitionSpec::Carry(spec)) => {
                         let prior = bindings
@@ -555,6 +559,10 @@ impl NativeDecodeSession {
                             .saturating_add(
                                 u64::try_from(tensor.as_bytes().len()).unwrap_or(u64::MAX),
                             );
+                        self.compressed_state_stats.telemetry_updates = self
+                            .compressed_state_stats
+                            .telemetry_updates
+                            .saturating_add(1);
                     }
                     None if !recurrent => {
                         let seq_axis = tensor.shape.len().checked_sub(2).with_context(|| {

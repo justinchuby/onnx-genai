@@ -2,6 +2,59 @@ use super::*;
 
 use super::kv_commit::{self, KvBindingGeometry, KvCommitLayout};
 
+#[cfg(all(test, feature = "native-cuda"))]
+thread_local! {
+    static CUDA_FIXED_RESTORE_FAILURE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static CUDA_FIXED_UNDO_FAILURE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, feature = "native-cuda"))]
+pub(crate) struct CudaFixedRestoreFailureGuard;
+
+#[cfg(all(test, feature = "native-cuda"))]
+impl Drop for CudaFixedRestoreFailureGuard {
+    fn drop(&mut self) {
+        CUDA_FIXED_RESTORE_FAILURE.set(None);
+        CUDA_FIXED_UNDO_FAILURE.set(None);
+    }
+}
+
+#[cfg(all(test, feature = "native-cuda"))]
+pub(crate) fn fail_cuda_fixed_restore_at(slot: usize) -> CudaFixedRestoreFailureGuard {
+    CUDA_FIXED_RESTORE_FAILURE.set(Some(slot));
+    CudaFixedRestoreFailureGuard
+}
+
+#[cfg(all(test, feature = "native-cuda"))]
+pub(crate) fn fail_cuda_fixed_restore_and_undo_at(
+    restore_slot: usize,
+    undo_slot: usize,
+) -> CudaFixedRestoreFailureGuard {
+    CUDA_FIXED_RESTORE_FAILURE.set(Some(restore_slot));
+    CUDA_FIXED_UNDO_FAILURE.set(Some(undo_slot));
+    CudaFixedRestoreFailureGuard
+}
+
+fn check_cuda_fixed_restore_stage(slot: usize, binding: usize) -> anyhow::Result<()> {
+    #[cfg(all(test, feature = "native-cuda"))]
+    if CUDA_FIXED_RESTORE_FAILURE.get() == Some(slot) {
+        bail!("injected CUDA fixed-state restore failure at slot {slot} (binding {binding})");
+    }
+    let _ = (slot, binding);
+    Ok(())
+}
+
+fn check_cuda_fixed_undo_stage(slot: usize, binding: usize) -> anyhow::Result<()> {
+    #[cfg(all(test, feature = "native-cuda"))]
+    if CUDA_FIXED_UNDO_FAILURE.get() == Some(slot) {
+        bail!("injected CUDA fixed-state undo failure at slot {slot} (binding {binding})");
+    }
+    let _ = (slot, binding);
+    Ok(())
+}
+
 /// Resolve the physical KV-cache layout for the native CUDA binding layer.
 ///
 /// The authoritative source is the model's [`DecoderAbi::kv_layout`] descriptor
@@ -543,6 +596,9 @@ pub struct CudaKvDebugStats {
     pub kv_transfers: DeviceBindingTransferStats,
     pub kv_growth_events: u64,
     pub kv_growth_d2d_copy_bytes: u64,
+    /// Successful single-token CUDA decode submissions. This counts eager
+    /// warmup, capture execution, and graph replay exactly once each.
+    pub cuda_decode_submissions: u64,
     /// `true` when the KV bindings are stored seq-major (BSNH) and the binding
     /// layer accounts residency by the dense live-prefix rule; `false` for the
     /// default head-major (BNSH) flat-bucket accounting. Surfaced so the
@@ -691,7 +747,16 @@ pub(crate) struct DecodeCudaState {
     /// snapshotting the destructive GDN/conv state costs one device→device copy
     /// per binding instead of a PCIe round-trip through host memory. Empty until
     /// the CUDA device-snapshot path first runs; inert for greedy decode.
-    fixed_state_snapshot_scratch: Vec<(usize, DeviceBuffer)>,
+    pub(crate) fixed_state_snapshot_scratch: Vec<(usize, DeviceBuffer)>,
+    /// Original live fixed state captured immediately before a restore attempt.
+    /// If any target copy or dense rewind step fails, this journal is copied
+    /// back before the error is returned.
+    fixed_state_restore_undo_scratch: Vec<(usize, DeviceBuffer)>,
+    /// Original attention-mask bytes for an atomic dense-KV/fixed-state rewind.
+    rewind_mask_undo_scratch: Option<DeviceBuffer>,
+    /// Set only when restoring the undo journal itself fails. A possibly mixed
+    /// session must never dispatch or replay again.
+    state_restore_poison: Option<String>,
     pub(crate) auxiliary_binding_range: std::ops::Range<usize>,
     pub(crate) input_ids_binding: usize,
     pub(crate) position_ids_binding: Option<usize>,
@@ -745,6 +810,7 @@ pub(crate) struct DecodeCudaState {
     graph_replays: u64,
     graph_fallbacks: u64,
     graph_invalidations: u64,
+    cuda_decode_submissions: u64,
     kv_growth_events: u64,
     kv_growth_d2d_copy_bytes: u64,
     /// Count of KV-growth events that kept the captured graph (seq-major
@@ -4991,6 +5057,9 @@ impl DecodeCudaState {
             kv_binding_range: kv_start..kv_end,
             fixed_state_binding_range: kv_end..fixed_state_end,
             fixed_state_snapshot_scratch: Vec::new(),
+            fixed_state_restore_undo_scratch: Vec::new(),
+            rewind_mask_undo_scratch: None,
+            state_restore_poison: None,
             auxiliary_binding_range: auxiliary_start..auxiliary_end,
             input_ids_binding,
             position_ids_binding,
@@ -5010,6 +5079,7 @@ impl DecodeCudaState {
             graph_replays: 0,
             graph_fallbacks: 0,
             graph_invalidations: 0,
+            cuda_decode_submissions: 0,
             kv_growth_events: 0,
             kv_growth_d2d_copy_bytes: 0,
             graph_growth_keeps: 0,
@@ -5582,7 +5652,10 @@ impl DecodeCudaState {
         // a power of two as `allocate` requires; the copy correctness does not
         // depend on the base alignment, only on the byte length.
         const SCRATCH_ALIGN: usize = 256;
-        let mut scratch = Vec::with_capacity(self.fixed_state_binding_range.len());
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(self.fixed_state_binding_range.len())
+            .context("allocate fixed-state snapshot journal")?;
         for index in self.fixed_state_binding_range.clone() {
             let binding = &self.bindings[index];
             let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
@@ -5602,6 +5675,73 @@ impl DecodeCudaState {
         Ok(())
     }
 
+    fn ensure_fixed_state_restore_undo_scratch(&mut self) -> anyhow::Result<()> {
+        if self.fixed_state_restore_undo_scratch.len() == self.fixed_state_binding_range.len() {
+            return Ok(());
+        }
+        const SCRATCH_ALIGN: usize = 256;
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(self.fixed_state_binding_range.len())
+            .context("allocate fixed-state restore undo journal")?;
+        for index in self.fixed_state_binding_range.clone() {
+            let binding = &self.bindings[index];
+            let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype).with_context(
+                || {
+                    format!(
+                        "fixed CUDA decoder undo size overflow for binding {index} shape {:?}",
+                        binding.physical_shape()
+                    )
+                },
+            )?;
+            let buffer = binding
+                .allocator()
+                .allocate(bytes.max(1), SCRATCH_ALIGN)
+                .with_context(|| {
+                    format!("allocate device restore undo scratch for binding {index}")
+                })?;
+            scratch.push((index, buffer));
+        }
+        self.fixed_state_restore_undo_scratch = scratch;
+        Ok(())
+    }
+
+    fn ensure_rewind_mask_undo_scratch(&mut self) -> anyhow::Result<()> {
+        let binding = &self.bindings[0];
+        let bytes =
+            checked_shape_bytes(binding.physical_shape(), binding.dtype).with_context(|| {
+                format!(
+                    "CUDA attention-mask undo size overflow for shape {:?}",
+                    binding.physical_shape()
+                )
+            })?;
+        if self
+            .rewind_mask_undo_scratch
+            .as_ref()
+            .is_some_and(|buffer| buffer.len() >= bytes.max(1))
+        {
+            return Ok(());
+        }
+        const SCRATCH_ALIGN: usize = 256;
+        self.rewind_mask_undo_scratch = Some(
+            binding
+                .allocator()
+                .allocate(bytes.max(1), SCRATCH_ALIGN)
+                .context("allocate CUDA attention-mask restore undo scratch")?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn ensure_state_restore_healthy(&self) -> anyhow::Result<()> {
+        if let Some(reason) = &self.state_restore_poison {
+            bail!(
+                "native CUDA state restore transaction is poisoned after its undo failed: \
+                 {reason}; discard this session and construct a clean one"
+            );
+        }
+        Ok(())
+    }
+
     /// Device-resident analogue of [`Self::snapshot_fixed_states`]: stage every
     /// fixed recurrent/conv binding into its device scratch buffer with a
     /// stream-ordered device→device copy, avoiding the PCIe round-trip through
@@ -5609,6 +5749,7 @@ impl DecodeCudaState {
     /// forward that overwrites the state, so no host synchronization is needed.
     /// Paired with [`Self::restore_fixed_states_device`].
     pub(crate) fn snapshot_fixed_states_device(&mut self) -> anyhow::Result<()> {
+        self.ensure_state_restore_healthy()?;
         self.ensure_fixed_state_snapshot_scratch()?;
         for slot in 0..self.fixed_state_snapshot_scratch.len() {
             let (index, ref mut scratch) = self.fixed_state_snapshot_scratch[slot];
@@ -5634,6 +5775,25 @@ impl DecodeCudaState {
     /// Leaves every binding's shape unchanged, so it never invalidates a
     /// captured decode graph.
     pub(crate) fn restore_fixed_states_device(&mut self) -> anyhow::Result<()> {
+        self.restore_fixed_states_transaction(None, None, false)
+    }
+
+    pub(crate) fn restore_fixed_states_and_rewind(
+        &mut self,
+        target_len: usize,
+        session: &mut InferenceSession,
+        invalidate_graph: bool,
+    ) -> anyhow::Result<()> {
+        self.restore_fixed_states_transaction(Some(target_len), Some(session), invalidate_graph)
+    }
+
+    fn restore_fixed_states_transaction(
+        &mut self,
+        target_len: Option<usize>,
+        session: Option<&mut InferenceSession>,
+        invalidate_graph: bool,
+    ) -> anyhow::Result<()> {
+        self.ensure_state_restore_healthy()?;
         if self.fixed_state_snapshot_scratch.len() != self.fixed_state_binding_range.len() {
             bail!(
                 "device recurrent restore requested before a matching device snapshot (have {} scratch buffers, need {})",
@@ -5641,25 +5801,210 @@ impl DecodeCudaState {
                 self.fixed_state_binding_range.len()
             );
         }
-        for slot in 0..self.fixed_state_snapshot_scratch.len() {
-            let (index, ref scratch) = self.fixed_state_snapshot_scratch[slot];
-            let binding = self.bindings.get_mut(index).with_context(|| {
-                format!("recurrent device snapshot names out-of-range fixed-state binding {index}")
+        if let Some(target_len) = target_len
+            && target_len > self.logical_len
+        {
+            bail!(
+                "cannot restore native CUDA state forward from {} to {target_len}",
+                self.logical_len
+            );
+        }
+        self.ensure_fixed_state_restore_undo_scratch()?;
+        if target_len.is_some() {
+            self.ensure_rewind_mask_undo_scratch()?;
+        }
+
+        let old_logical_len = self.logical_len;
+        let mut old_row_lens = Vec::new();
+        old_row_lens
+            .try_reserve_exact(self.row_lens.len())
+            .context("allocate CUDA row-length restore journal")?;
+        old_row_lens.extend_from_slice(&self.row_lens);
+        if target_len.is_some() {
+            let mask = &self.bindings[0];
+            let bytes = checked_shape_bytes(mask.physical_shape(), mask.dtype)
+                .context("CUDA attention-mask undo byte count")?;
+            mask.snapshot_device_into(
+                self.rewind_mask_undo_scratch
+                    .as_mut()
+                    .expect("mask undo scratch was prepared"),
+                bytes,
+            )
+            .context("snapshot CUDA attention mask before state rollback")?;
+        }
+        for slot in 0..self.fixed_state_restore_undo_scratch.len() {
+            let (index, ref mut undo) = self.fixed_state_restore_undo_scratch[slot];
+            let binding = self.bindings.get(index).with_context(|| {
+                format!("fixed-state undo journal names out-of-range binding {index}")
             })?;
             let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
                 .with_context(|| {
                     format!(
-                        "fixed CUDA decoder state device restore size overflow for binding {index} shape {:?}",
+                        "fixed CUDA decoder undo snapshot size overflow for binding {index} shape {:?}",
                         binding.physical_shape()
                     )
                 })?;
-            binding
-                .restore_device_from(scratch, bytes)
-                .with_context(|| {
-                    format!("device restore of recurrent/conv state for binding {index}")
-                })?;
+            binding.snapshot_device_into(undo, bytes).with_context(|| {
+                format!("snapshot live recurrent/conv state for binding {index}")
+            })?;
         }
-        Ok(())
+        if invalidate_graph {
+            self.invalidate_graph(
+                session.context("CUDA state rollback graph invalidation requires its session")?,
+            )
+            .context("invalidate CUDA graph before committing state rollback")?;
+        }
+
+        let attempt = (|| {
+            if let Some(target_len) = target_len {
+                self.rewind_dense_state_only(target_len)?;
+            }
+            for slot in 0..self.fixed_state_snapshot_scratch.len() {
+                let (index, ref scratch) = self.fixed_state_snapshot_scratch[slot];
+                check_cuda_fixed_restore_stage(slot, index)?;
+                let binding = self.bindings.get_mut(index).with_context(|| {
+                    format!(
+                        "recurrent device snapshot names out-of-range fixed-state binding {index}"
+                    )
+                })?;
+                let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
+                    .with_context(|| {
+                        format!(
+                            "fixed CUDA decoder state device restore size overflow for binding \
+                             {index} shape {:?}",
+                            binding.physical_shape()
+                        )
+                    })?;
+                binding
+                    .restore_device_from(scratch, bytes)
+                    .with_context(|| {
+                        format!("device restore of recurrent/conv state for binding {index}")
+                    })?;
+            }
+            Ok(())
+        })();
+        let Err(primary) = attempt else {
+            return Ok(());
+        };
+
+        let mut undo_errors = Vec::new();
+        if target_len.is_some() {
+            let mask = &mut self.bindings[0];
+            let bytes = checked_shape_bytes(mask.physical_shape(), mask.dtype)
+                .context("CUDA attention-mask undo byte count");
+            match bytes {
+                Ok(bytes) => {
+                    if let Err(error) = mask.restore_device_from(
+                        self.rewind_mask_undo_scratch
+                            .as_ref()
+                            .expect("mask undo scratch was prepared"),
+                        bytes,
+                    ) {
+                        undo_errors.push(
+                            anyhow::Error::from(error).context(
+                                "restore CUDA attention mask after state rollback failure",
+                            ),
+                        );
+                    }
+                }
+                Err(error) => undo_errors.push(error),
+            }
+        }
+        for slot in 0..self.fixed_state_restore_undo_scratch.len() {
+            let (index, ref undo) = self.fixed_state_restore_undo_scratch[slot];
+            if let Err(error) = check_cuda_fixed_undo_stage(slot, index) {
+                undo_errors.push(error);
+                continue;
+            }
+            let Some(binding) = self.bindings.get_mut(index) else {
+                undo_errors.push(anyhow::anyhow!(
+                    "fixed-state undo journal names out-of-range binding {index}"
+                ));
+                continue;
+            };
+            let bytes = match checked_shape_bytes(binding.physical_shape(), binding.dtype)
+                .with_context(|| {
+                    format!(
+                        "fixed CUDA decoder undo restore size overflow for binding {index} shape {:?}",
+                        binding.physical_shape()
+                    )
+                }) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    undo_errors.push(error);
+                    continue;
+                }
+            };
+            if let Err(error) = binding.restore_device_from(undo, bytes) {
+                undo_errors.push(
+                    anyhow::Error::from(error)
+                        .context(format!("undo recurrent/conv state for binding {index}")),
+                );
+            }
+        }
+        if target_len.is_some() {
+            if let Err(error) = self.bindings[0]
+                .set_logical_shape(vec![self.batch, old_logical_len])
+                .context("restore CUDA attention-mask logical shape after rollback failure")
+            {
+                undo_errors.push(error);
+            }
+            self.row_lens = old_row_lens;
+            if let Err(error) = self
+                .set_logical_len(old_logical_len)
+                .context("restore CUDA KV logical length after rollback failure")
+            {
+                undo_errors.push(error);
+            }
+        }
+        if !undo_errors.is_empty() {
+            self.state_restore_poison = Some(
+                undo_errors
+                    .iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+            return Err(anyhow::Error::new(NativeStateRestoreTransactionError {
+                primary,
+                undo: undo_errors,
+            }));
+        }
+        Err(primary)
+    }
+
+    fn rewind_dense_state_only(&mut self, target_len: usize) -> anyhow::Result<()> {
+        if target_len < self.logical_len {
+            let bytes_per_word = std::mem::size_of::<i64>();
+            let tail_bytes = self
+                .logical_len
+                .checked_sub(target_len)
+                .and_then(|words| words.checked_mul(bytes_per_word))
+                .context("CUDA rewind mask tail byte count overflow")?;
+            let mut zeros = Vec::new();
+            zeros
+                .try_reserve_exact(tail_bytes)
+                .context("allocate CUDA rewind mask tail")?;
+            zeros.resize(tail_bytes, 0);
+            let row_stride = self
+                .max_len
+                .checked_mul(bytes_per_word)
+                .context("CUDA rewind mask row stride overflow")?;
+            for sequence in 0..self.batch {
+                let offset = sequence
+                    .checked_mul(row_stride)
+                    .and_then(|offset| {
+                        target_len
+                            .checked_mul(bytes_per_word)
+                            .and_then(|tail| offset.checked_add(tail))
+                    })
+                    .context("CUDA rewind mask offset overflow")?;
+                self.bindings[0].write_bytes(offset, &zeros)?;
+            }
+        }
+        self.bindings[0].set_logical_shape(vec![self.batch, target_len])?;
+        self.row_lens.fill(target_len);
+        self.set_logical_len(target_len)
     }
 
     fn write_decode_inputs(&mut self, token_id: TokenId, position: usize) -> anyhow::Result<()> {
@@ -5789,6 +6134,7 @@ impl DecodeCudaState {
         debug_assert!(self.auxiliary_binding_range.end <= self.base_binding_count);
         if !self.graph_enabled {
             session.run_with_device_bindings(&[], &mut self.bindings)?;
+            self.cuda_decode_submissions = self.cuda_decode_submissions.saturating_add(1);
             return Ok(());
         }
 
@@ -5841,6 +6187,7 @@ impl DecodeCudaState {
                 session.run_with_device_bindings(&[], &mut self.bindings)?;
             }
         }
+        self.cuda_decode_submissions = self.cuda_decode_submissions.saturating_add(1);
         Ok(())
     }
 
@@ -5868,6 +6215,7 @@ impl DecodeCudaState {
         debug_assert!(self.auxiliary_binding_range.end <= self.base_binding_count);
         if !self.graph_enabled {
             session.run_decode_inline_with_device_bindings(&[], &mut self.bindings)?;
+            self.cuda_decode_submissions = self.cuda_decode_submissions.saturating_add(1);
             return Ok(());
         }
 
@@ -5923,6 +6271,7 @@ impl DecodeCudaState {
                 session.run_decode_inline_with_device_bindings(&[], &mut self.bindings)?;
             }
         }
+        self.cuda_decode_submissions = self.cuda_decode_submissions.saturating_add(1);
         Ok(())
     }
 
@@ -6227,6 +6576,7 @@ impl DecodeCudaState {
             kv_transfers: transfers,
             kv_growth_events: self.kv_growth_events,
             kv_growth_d2d_copy_bytes: self.kv_growth_d2d_copy_bytes,
+            cuda_decode_submissions: self.cuda_decode_submissions,
             kv_layout_seq_major: self.kv_layout.is_seq_major(),
             graph: CudaGraphDebugStats {
                 enabled: self.graph_enabled,

@@ -34,6 +34,9 @@ impl DecodeBackend for NativeDecodeSession {
         token_ids: &[TokenId],
         past_len: usize,
     ) -> anyhow::Result<Option<u32>> {
+        if let Some(cuda) = &self.cuda {
+            cuda.ensure_state_restore_healthy()?;
+        }
         if token_ids.is_empty() {
             bail!("native decode requires at least one token");
         }
@@ -169,6 +172,9 @@ impl NativeDecodeSession {
     }
 
     pub(super) fn rewind_inner(&mut self, target_len: usize) -> anyhow::Result<()> {
+        if let Some(cuda) = &self.cuda {
+            cuda.ensure_state_restore_healthy()?;
+        }
         if target_len > self.current_len {
             bail!(
                 "cannot rewind native KV from {} forward to {target_len}",
