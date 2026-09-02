@@ -5052,7 +5052,7 @@ fn einsum_matmul_transpose_and_implicit() {
 }
 
 #[test]
-fn einsum_ellipsis_broadcasts_batch_dims() {
+fn einsum_ellipsis_broadcasts_and_right_aligns_batch_dims() {
     let out = run(
         &einsum_node("...ij,...jk->...ik", 2),
         vec![f32in(vec![c(5), c(2), c(3)]), f32in(vec![c(5), c(3), c(4)])],
@@ -5067,6 +5067,15 @@ fn einsum_ellipsis_broadcasts_batch_dims() {
         12,
     );
     assert_eq!(out_shape(&out), vec![c(6), c(2), c(4)]);
+
+    // Different ellipsis ranks right-align; the first operand has no batch
+    // dimensions and is broadcast across both dimensions from the second.
+    let out = run(
+        &einsum_node("...ij,...jk->...ik", 2),
+        vec![f32in(vec![c(2), c(3)]), f32in(vec![c(6), c(5), c(3), c(4)])],
+        12,
+    );
+    assert_eq!(out_shape(&out), vec![c(6), c(5), c(2), c(4)]);
 }
 
 #[test]
@@ -5087,16 +5096,127 @@ fn einsum_symbolic_dims_and_gating() {
             .is_none()
     );
 
-    // A rank that disagrees with the equation leaves the output unresolved.
-    assert!(
-        run(
+    // A provably invalid equation now fails explicitly instead of producing a
+    // plan that a native execution provider could misinterpret.
+    let error = try_run(
+        &einsum_node("ij->ji", 1),
+        vec![f32in(vec![c(2), c(3), c(4)])],
+        12,
+    )
+    .unwrap_err();
+    assert_invalid(error, "Einsum", "input #0 rank 3");
+}
+
+#[test]
+fn einsum_scalar_diagonal_reduction_zero_and_whitespace() {
+    let scalar = run(&einsum_node(" -> ", 1), vec![f32in(vec![])], 12);
+    assert_eq!(out_shape(&scalar), Vec::<DimExpr>::new());
+
+    let scalar_times_vector = run(
+        &einsum_node(" , i -> i ", 2),
+        vec![f32in(vec![]), f32in(vec![c(7)])],
+        12,
+    );
+    assert_eq!(out_shape(&scalar_times_vector), vec![c(7)]);
+
+    let diagonal = run(
+        &einsum_node("...ii -> ...i", 1),
+        vec![f32in(vec![c(0), c(5), c(5)])],
+        12,
+    );
+    assert_eq!(out_shape(&diagonal), vec![c(0), c(5)]);
+
+    let reduction = run(&einsum_node("ij->i", 1), vec![f32in(vec![c(2), c(3)])], 12);
+    assert_eq!(out_shape(&reduction), vec![c(2)]);
+}
+
+#[test]
+fn einsum_invalid_equations_dimensions_and_dtypes_are_actionable() {
+    let invalid_cases = [
+        (
             &einsum_node("ij->ji", 1),
             vec![f32in(vec![c(2), c(3), c(4)])],
-            12
-        )[0]
-        .type_info
-        .is_none()
+            "input #0 rank 3",
+        ),
+        (
+            &einsum_node("ij->ii", 1),
+            vec![f32in(vec![c(2), c(3)])],
+            "output label `i` appears more than once",
+        ),
+        (
+            &einsum_node("ij->ik", 1),
+            vec![f32in(vec![c(2), c(3)])],
+            "output label `k` does not appear",
+        ),
+        (
+            &einsum_node("i$,i->", 2),
+            vec![f32in(vec![c(2)]), f32in(vec![c(2)])],
+            "invalid character `$`",
+        ),
+        (
+            &einsum_node("ii->i", 1),
+            vec![f32in(vec![c(2), c(3)])],
+            "label `i` requires equal dimensions",
+        ),
+        (
+            &einsum_node("...i,...i->...i", 2),
+            vec![f32in(vec![c(2), c(3)]), f32in(vec![c(5), c(3)])],
+            "ellipsis axis #0 cannot broadcast",
+        ),
+    ];
+    for (node, inputs, detail) in invalid_cases {
+        let error = try_run(node, inputs, 12).unwrap_err();
+        assert_invalid(error, "Einsum", detail);
+    }
+
+    let mismatch = try_run(
+        &einsum_node("i,i->i", 2),
+        vec![f32in(vec![c(2)]), tin(DataType::Int32, vec![c(2)])],
+        12,
+    )
+    .unwrap_err();
+    assert_invalid(mismatch, "Einsum", "input #1 has dtype Int32");
+
+    let unsupported = try_run(
+        &einsum_node("i->i", 1),
+        vec![tin(DataType::Bool, vec![c(2)])],
+        12,
+    )
+    .unwrap_err();
+    assert_invalid(unsupported, "Einsum", "unsupported opset-12 dtype Bool");
+
+    // Missing type/shape metadata remains best-effort and leaves the output
+    // unresolved, preserving the crate-wide permissive inference contract.
+    assert!(
+        run(&einsum_node("i->i", 1), vec![NodeIo::default()], 12)[0]
+            .type_info
+            .is_none()
     );
+}
+
+#[test]
+fn einsum_ellipsis_uses_the_inference_context_lineage_chokepoint() {
+    let node = einsum_node("...i,...i->...i", 2);
+    let reg = InferenceRegistry::default_registry();
+    let mut imports = HashMap::new();
+    imports.insert(String::new(), 12);
+    let anonymous = SymbolId(0x8000_0001);
+    let named = SymbolId(7);
+    let mut interner = SymbolInterner::new(0x8000_0000);
+    let output = reg
+        .infer_node(
+            &node,
+            &imports,
+            vec![
+                f32in(vec![DimExpr::symbol(anonymous), c(3)]),
+                f32in(vec![DimExpr::symbol(named), c(3)]),
+            ],
+            MergePolicy::Permissive,
+            &mut interner,
+        )
+        .unwrap();
+    assert_eq!(out_shape(&output), vec![DimExpr::symbol(named), c(3)]);
+    assert_eq!(interner.unifications(), &[(anonymous, named)]);
 }
 
 #[test]
