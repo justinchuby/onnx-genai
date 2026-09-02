@@ -124,7 +124,7 @@ fn execute_decode(
     value_cache: &mut DeviceBuffer,
     y: &mut DeviceBuffer,
     past_seq: usize,
-) {
+) -> onnx_runtime_ep_api::Result<()> {
     let device = DeviceId::cuda(0);
     let q_shape = [1, HEADS, 1, HEAD_DIM];
     let past_shape = [1, HEADS, past_seq, HEAD_DIM];
@@ -193,9 +193,7 @@ fn execute_decode(
             device,
         ),
     ];
-    kernel
-        .execute(&inputs, &mut outputs)
-        .expect("default-domain Attention decode");
+    kernel.execute(&inputs, &mut outputs)
 }
 
 fn read(ep: &CudaExecutionProvider, buffer: &DeviceBuffer, bytes: usize) -> Vec<u8> {
@@ -218,7 +216,7 @@ fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager() {
     let ep = require_cuda();
     let runtime = ep.runtime();
     let kernel = standard_attention_kernel(&ep);
-    let max_seq = INITIAL_PAST + DECODE_STEPS;
+    let max_seq = INITIAL_PAST + DECODE_STEPS + 1;
     let cache_bytes = HEADS * max_seq * HEAD_DIM * std::mem::size_of::<f32>();
     let token_bytes = HEADS * HEAD_DIM * std::mem::size_of::<f32>();
 
@@ -299,7 +297,8 @@ fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager() {
             &mut eager_value,
             &mut eager_y,
             past_seq,
-        );
+        )
+        .unwrap();
         assert!(
             kernel.cuda_graph_compatible(),
             "eager staged decode must warm CUDA-graph capture support"
@@ -314,8 +313,25 @@ fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager() {
                 !warmed_resources.is_empty(),
                 "capture-eligible Attention must publish its private workspace owners"
             );
-            let failure = kernel.execute(&[], &mut []).unwrap_err().to_string();
-            assert!(failure.contains("expected 3..=7 inputs"), "{failure}");
+            let counts_before_failure = runtime.allocation_counts();
+            let pooled_before_failure = runtime.raw_pool_retained_bytes();
+            runtime.fail_warm_transaction_at_for_test(1);
+            let failure = execute_decode(
+                kernel.as_ref(),
+                &q,
+                &k,
+                &v,
+                &mut eager_key,
+                &mut eager_value,
+                &mut eager_y,
+                past_seq + 1,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                failure.contains("injected staged warm-cache failure after Attention workspace"),
+                "{failure}"
+            );
             assert!(
                 kernel.cuda_graph_compatible(),
                 "a failed replacement call must preserve the successful Attention warm"
@@ -328,6 +344,12 @@ fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager() {
                     .collect::<Vec<_>>(),
                 warmed_resources,
                 "Attention capture eligibility and resources must remain one successful snapshot"
+            );
+            let counts_after_failure = runtime.allocation_counts();
+            assert!(
+                counts_after_failure.frees > counts_before_failure.frees
+                    || runtime.raw_pool_retained_bytes() > pooled_before_failure,
+                "the rejected Attention workspace candidate must return each allocation exactly once"
             );
         }
 
@@ -344,28 +366,45 @@ fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager() {
             &mut captured_value,
             &mut captured_y,
             past_seq,
-        );
+        )
+        .unwrap();
         runtime
             .end_graph_capture()
             .expect("aliased default Attention staged copy-back must capture");
+        let present_bytes = HEADS * (past_seq + 1) * HEAD_DIM * std::mem::size_of::<f32>();
+        let eager_y_expected = read(&ep, &eager_y, token_bytes);
+        let eager_key_expected = read(&ep, &eager_key, present_bytes);
+        let eager_value_expected = read(&ep, &eager_value, present_bytes);
+        if step + 1 == DECODE_STEPS {
+            execute_decode(
+                kernel.as_ref(),
+                &q,
+                &k,
+                &v,
+                &mut eager_key,
+                &mut eager_value,
+                &mut eager_y,
+                past_seq + 1,
+            )
+            .unwrap();
+        }
         runtime
             .replay_graph()
             .expect("replay captured default Attention decode");
 
-        let present_bytes = HEADS * (past_seq + 1) * HEAD_DIM * std::mem::size_of::<f32>();
         assert_eq!(
             read(&ep, &captured_y, token_bytes),
-            read(&ep, &eager_y, token_bytes),
+            eager_y_expected,
             "captured Attention output diverged at decode step {step}"
         );
         assert_eq!(
             read(&ep, &captured_key, present_bytes),
-            read(&ep, &eager_key, present_bytes),
+            eager_key_expected,
             "captured aliased present key diverged at decode step {step}"
         );
         assert_eq!(
             read(&ep, &captured_value, present_bytes),
-            read(&ep, &eager_value, present_bytes),
+            eager_value_expected,
             "captured aliased present value diverged at decode step {step}"
         );
         assert_eq!(

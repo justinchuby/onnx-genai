@@ -286,11 +286,11 @@ impl Kernel for GatherNdKernel {
             .iter()
             .map(|&dimension| dimension as u64)
             .collect::<Vec<_>>();
-        let dimension_ptr = self
-            .dimensions
-            .lock()
-            .map_err(|_| EpError::KernelFailed("cuda_ep GatherND: metadata lock poisoned".into()))?
-            .prepare(&dimensions, "GatherND")?;
+        let mut dimensions_cache = self.dimensions.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep GatherND: metadata lock poisoned".into())
+        })?;
+        let dimensions_candidate = dimensions_cache.stage(&dimensions, "GatherND")?;
+        let dimension_ptr = dimensions_candidate.ptr("GatherND")?;
 
         let function = self
             .runtime
@@ -341,7 +341,11 @@ impl Kernel for GatherNdKernel {
         } else {
             self.runtime.synchronize()
         };
-        launch.and(sync)
+        launch.and(sync)?;
+        if !capturing {
+            *dimensions_cache = dimensions_candidate;
+        }
+        Ok(())
     }
 
     fn supports_strided_input(&self, _: usize) -> bool {

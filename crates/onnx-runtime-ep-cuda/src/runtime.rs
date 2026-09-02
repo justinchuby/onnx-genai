@@ -32,6 +32,12 @@ use crate::graph::CudaGraphLifecycle;
 use crate::kernel_cache;
 use onnx_runtime_cuda_memory::capture_gate;
 
+#[cfg(feature = "gpu-tests")]
+fn warm_transaction_faults() -> &'static Mutex<HashMap<u64, usize>> {
+    static FAULTS: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Counts explicit device allocation/free calls made through a runtime.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CudaAllocationCounts {
@@ -924,6 +930,44 @@ impl std::fmt::Debug for CudaRuntime {
 }
 
 impl CudaRuntime {
+    /// Fail the `checkpoint`th staged warm-cache mutation for this runtime.
+    ///
+    /// The seam is runtime-wide because all capture-capable kernels share the
+    /// same transaction contract. Tests choose a later checkpoint to prove that
+    /// a multi-slot candidate rolls back after real allocation/upload work.
+    #[cfg(feature = "gpu-tests")]
+    #[doc(hidden)]
+    pub fn fail_warm_transaction_at_for_test(&self, checkpoint: usize) {
+        assert!(checkpoint > 0, "warm transaction checkpoint is one-based");
+        warm_transaction_faults()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(self.runtime_id, checkpoint);
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub(crate) fn staged_warm_cache_mutation(&self, stage: &str) -> Result<()> {
+        let mut faults = warm_transaction_faults()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(remaining) = faults.get_mut(&self.runtime_id) else {
+            return Ok(());
+        };
+        *remaining -= 1;
+        if *remaining != 0 {
+            return Ok(());
+        }
+        faults.remove(&self.runtime_id);
+        Err(EpError::KernelFailed(format!(
+            "cuda_ep injected staged warm-cache failure after {stage}"
+        )))
+    }
+
+    #[cfg(not(feature = "gpu-tests"))]
+    pub(crate) fn staged_warm_cache_mutation(&self, _stage: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Initialise the primary context on CUDA device `ordinal`, its dedicated
     /// stream, and a cuBLASLt handle. Returns an error (never panics) when no
     /// such device exists or the CUDA driver / cuBLASLt cannot be loaded.

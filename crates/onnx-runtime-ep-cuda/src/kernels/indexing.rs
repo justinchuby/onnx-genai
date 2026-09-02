@@ -418,6 +418,7 @@ fn upload_meta(runtime: &Arc<CudaRuntime>, values: &[usize]) -> Result<Arc<Graph
     {
         return Err(error);
     }
+    runtime.staged_warm_cache_mutation("indexing metadata allocation/upload")?;
     Ok(allocation)
 }
 
@@ -427,7 +428,7 @@ struct ScatterMetadataKey {
     indices_shape: Vec<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ScatterMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<ScatterMetadataKey>,
@@ -449,7 +450,7 @@ impl ScatterMetadataCache {
             indices_shape: indices_shape.to_vec(),
         };
         if self.key.as_ref() == Some(&key) {
-            return self.allocation.as_ref().map_or_else(
+            let ptr = self.allocation.as_ref().map_or_else(
                 || {
                     Err(EpError::KernelFailed(
                         "cuda_ep ScatterElements: cached metadata lost its device allocation"
@@ -457,7 +458,16 @@ impl ScatterMetadataCache {
                     ))
                 },
                 |allocation| Ok(allocation.ptr()),
-            );
+            )?;
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    self.device_graph_resource()
+                        .expect("cached ScatterElements allocation is present")
+                        .identity(),
+                    "ScatterElements metadata",
+                )?;
+            }
+            return Ok(ptr);
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
@@ -465,7 +475,7 @@ impl ScatterMetadataCache {
             ));
         }
         if self.allocation.is_some() {
-            self.runtime.synchronize()?;
+            self.runtime.drain_for_unmap()?;
         }
 
         let mut meta = compute_contiguous_strides(indices_shape)
@@ -514,7 +524,7 @@ struct GatherElementsMetadataKey {
     indices_shape: Vec<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct GatherElementsMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<GatherElementsMetadataKey>,
@@ -536,14 +546,23 @@ impl GatherElementsMetadataCache {
             indices_shape: indices_shape.to_vec(),
         };
         if self.key.as_ref() == Some(&key) {
-            return self.allocation.as_ref().map_or_else(
+            let ptr = self.allocation.as_ref().map_or_else(
                 || {
                     Err(EpError::KernelFailed(
                         "cuda_ep GatherElements: cached metadata lost its device allocation".into(),
                     ))
                 },
                 |allocation| Ok(allocation.ptr()),
-            );
+            )?;
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    self.device_graph_resource()
+                        .expect("cached GatherElements allocation is present")
+                        .identity(),
+                    "GatherElements metadata",
+                )?;
+            }
+            return Ok(ptr);
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
@@ -551,7 +570,7 @@ impl GatherElementsMetadataCache {
             ));
         }
         if self.allocation.is_some() {
-            self.runtime.synchronize()?;
+            self.runtime.drain_for_unmap()?;
         }
 
         let mut meta = indices_shape.to_vec();
@@ -683,7 +702,8 @@ impl Kernel for GatherElementsKernel {
         let mut metadata = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep GatherElements: metadata lock was poisoned".into())
         })?;
-        let meta_ptr = metadata.prepare(data.shape, indices.shape)?;
+        let mut metadata_candidate = metadata.clone();
+        let meta_ptr = metadata_candidate.prepare(data.shape, indices.shape)?;
         let data_ptr = cuptr(data.data_ptr::<u8>() as *const c_void);
         let indices_ptr = cuptr(indices.data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
@@ -723,8 +743,9 @@ impl Kernel for GatherElementsKernel {
         }
         .map_err(|e| driver_err("launch gather_elements", e))?;
         if !capturing {
-            *warmed_signature = Some(signature);
             self.runtime.synchronize()?;
+            *metadata = metadata_candidate;
+            *warmed_signature = Some(signature);
         }
         Ok(())
     }
@@ -912,13 +933,11 @@ impl Kernel for ScatterNdKernel {
             .map(|value| value as u64)
             .collect::<Vec<_>>();
         metadata_values.extend(data.shape.iter().map(|&value| value as u64));
-        let metadata_ptr = self
-            .metadata
-            .lock()
-            .map_err(|_| {
-                EpError::KernelFailed("cuda_ep ScatterND: metadata lock was poisoned".into())
-            })?
-            .prepare(&metadata_values, "ScatterND")?;
+        let mut metadata_cache = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep ScatterND: metadata lock was poisoned".into())
+        })?;
+        let metadata_candidate = metadata_cache.stage(&metadata_values, "ScatterND")?;
+        let metadata_ptr = metadata_candidate.ptr("ScatterND")?;
         let entry = match data.dtype {
             DataType::Float16 => "scatter_nd_f16",
             DataType::Float32 => "scatter_nd_f32",
@@ -966,6 +985,7 @@ impl Kernel for ScatterNdKernel {
         }
         .map_err(|error| driver_err(&format!("launch {entry}"), error))?;
         if !capturing {
+            *metadata_cache = metadata_candidate;
             *warmed_signature = Some(signature);
         }
         Ok(())
@@ -1117,7 +1137,8 @@ impl Kernel for ScatterElementsKernel {
         let mut metadata = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep ScatterElements: metadata lock was poisoned".into())
         })?;
-        let meta_ptr = metadata.prepare(data.shape, indices.shape)?;
+        let mut metadata_candidate = metadata.clone();
+        let meta_ptr = metadata_candidate.prepare(data.shape, indices.shape)?;
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
         let indices_ptr = cuptr(indices.data_ptr::<u8>() as *const c_void);
         let updates_ptr = cuptr(updates.data_ptr::<u8>() as *const c_void);
@@ -1156,6 +1177,7 @@ impl Kernel for ScatterElementsKernel {
         }
         .map_err(|error| driver_err(&format!("launch {entry}"), error))?;
         if !capturing {
+            *metadata = metadata_candidate;
             *warmed_signature = Some(signature);
         }
         Ok(())

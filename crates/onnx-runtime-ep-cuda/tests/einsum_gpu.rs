@@ -989,6 +989,131 @@ fn captured_private_resources_outlive_dropped_einsum_kernels() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let shape = [2usize, 3];
+    let output_shape = [3usize, 2];
+    let (kernel, inputs, buffers, mut a_output) =
+        make_direct_kernel(&ep, "ij->ji", &[shape.to_vec()], &output_shape);
+    let a_strides = compute_contiguous_strides(&shape);
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let a_view = TensorView::new(
+        DevicePtr(buffers[0].as_ptr()),
+        DataType::Float32,
+        &shape,
+        &a_strides,
+        ep.device_id(),
+    );
+    let run_a = |output: &mut onnx_runtime_ep_api::DeviceBuffer| {
+        kernel.execute(
+            std::slice::from_ref(&a_view),
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+        )
+    };
+    run_a(&mut a_output).unwrap();
+    let a_resource_id = kernel.device_graph_resources()[0].identity();
+
+    let b_values = [10_f32, 11., 12., 0., 20., 21., 22., 0.];
+    let b_bytes = b_values
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect::<Vec<_>>();
+    let b_buffer = ep.allocate(b_bytes.len(), 256).unwrap();
+    let mut b_output = ep
+        .allocate(output_shape.iter().product::<usize>() * 4, 256)
+        .unwrap();
+    unsafe {
+        runtime.htod(&b_bytes, cuptr(b_buffer.as_ptr())).unwrap();
+    }
+    let b_strides = [4_i64, 1];
+    let b_view = TensorView::new(
+        DevicePtr(b_buffer.as_ptr()),
+        DataType::Float32,
+        &shape,
+        &b_strides,
+        ep.device_id(),
+    );
+    let run_b = |output: &mut onnx_runtime_ep_api::DeviceBuffer| {
+        kernel.execute(
+            std::slice::from_ref(&b_view),
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+        )
+    };
+
+    let counts_before_failure = runtime.allocation_counts();
+    let pooled_before_failure = runtime.raw_pool_retained_bytes();
+    runtime.fail_warm_transaction_at_for_test(1);
+    let failure = run_b(&mut b_output)
+        .expect_err("valid strided view B must fail after staging new metadata");
+    assert!(
+        failure
+            .to_string()
+            .contains("injected staged warm-cache failure after Einsum view metadata"),
+        "{failure}"
+    );
+    assert_eq!(
+        kernel.device_graph_resources()[0].identity(),
+        a_resource_id,
+        "failed Einsum view rewarm must retain A's metadata owner"
+    );
+    let counts_after_failure = runtime.allocation_counts();
+    assert!(
+        counts_after_failure.frees > counts_before_failure.frees
+            || runtime.raw_pool_retained_bytes() > pooled_before_failure,
+        "the rejected Einsum candidate must return its staged allocation exactly once"
+    );
+
+    run_a(&mut a_output).unwrap();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    run_a(&mut a_output).unwrap();
+    runtime.end_graph_capture().unwrap();
+
+    run_b(&mut b_output).unwrap();
+    assert_ne!(
+        kernel.device_graph_resources()[0].identity(),
+        a_resource_id,
+        "successful eager B must publish its own metadata owner"
+    );
+    runtime.replay_graph().unwrap();
+    runtime.synchronize().unwrap();
+    let mut replay = vec![0u8; inputs[0].bytes.len()];
+    unsafe {
+        runtime.dtoh(&mut replay, cuptr(a_output.as_ptr())).unwrap();
+    }
+    let source = decode_floats(&inputs[0].bytes, DataType::Float32);
+    assert_eq!(
+        decode_floats(&replay, DataType::Float32),
+        vec![
+            source[0], source[3], source[1], source[4], source[2], source[5]
+        ]
+    );
+    assert!(runtime.reset_graph().unwrap());
+
+    ep.deallocate(buffers.into_iter().next().unwrap()).unwrap();
+    ep.deallocate(a_output).unwrap();
+    ep.deallocate(b_buffer).unwrap();
+    ep.deallocate(b_output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn contraction_rejects_output_alias_before_launch() {
     let _lock = suite_lock();
     let ep = require_cuda();

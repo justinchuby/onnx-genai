@@ -543,7 +543,7 @@ pub fn dsa_plugin_capture_stats_for_test() -> (u64, u64, u64) {
     )
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DsaWorkspace {
     runtime: Arc<CudaRuntime>,
     allocation: Option<Arc<DsaWorkspaceAllocation>>,
@@ -587,13 +587,15 @@ impl DsaWorkspace {
             )));
         }
 
+        if self.allocation.is_some() {
+            self.runtime.drain_for_unmap()?;
+        }
         let allocation = Arc::new(DsaWorkspaceAllocation {
             allocation: GraphDeviceAllocation::allocate(&self.runtime, bytes)?,
             bytes,
         });
-        if self.allocation.is_some() {
-            self.runtime.drain_for_unmap()?;
-        }
+        self.runtime
+            .staged_warm_cache_mutation("DsaIndexSelect workspace allocation")?;
 
         let ptr = allocation.allocation.ptr();
         self.allocation = Some(allocation);
@@ -821,8 +823,9 @@ impl DsaIndexSelectKernel {
         let capturing = self.runtime.is_capturing()?;
 
         let layout = dsa_index_select_workspace_layout(dims)?;
-        let mut workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
-        let workspace_ptr = workspace.reserve(layout.bytes)?;
+        let mut published_workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        let mut workspace_candidate = published_workspace.clone();
+        let workspace_ptr = workspace_candidate.reserve(layout.bytes)?;
 
         let query_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let key_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
@@ -836,7 +839,7 @@ impl DsaIndexSelectKernel {
         {
             let test_replays = DSA_TEST_CAPTURE_REPLAYS.swap(0, Ordering::AcqRel);
             if test_replays != 0 {
-                return self.execute_capture_replay_test_seam(
+                let result = self.execute_capture_replay_test_seam(
                     query_ptr,
                     key_ptr,
                     weights_ptr,
@@ -848,6 +851,10 @@ impl DsaIndexSelectKernel {
                     dtype_code(dtype)?,
                     test_replays,
                 );
+                if result.is_ok() && !capturing {
+                    *published_workspace = workspace_candidate;
+                }
+                return result;
             }
         }
 
@@ -870,6 +877,7 @@ impl DsaIndexSelectKernel {
             // is guaranteed compiled and the workspace sized, so capture may now
             // record this kernel with stable device addresses.
             self.runtime.synchronize()?;
+            *published_workspace = workspace_candidate;
             self.warmed.store(true, Ordering::Relaxed);
             Ok(())
         }

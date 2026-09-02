@@ -2066,11 +2066,87 @@ pub struct SkipSimplifiedLayerNormKernel {
     last_call_used_bf16_scratch: AtomicBool,
 }
 
+struct SkipNormWarmRollback<'a> {
+    kernel: &'a SkipSimplifiedLayerNormKernel,
+    metadata: Option<SkipBroadcastMetadataCache>,
+    scratch: Option<NormBf16Scratch>,
+    capture_safe: bool,
+    used_bf16_scratch: bool,
+    committed: bool,
+}
+
+impl<'a> SkipNormWarmRollback<'a> {
+    fn new(kernel: &'a SkipSimplifiedLayerNormKernel) -> Result<Self> {
+        Ok(Self {
+            metadata: Some(
+                kernel
+                    .metadata
+                    .lock()
+                    .map_err(|_| {
+                        EpError::KernelFailed(
+                            "cuda_ep SkipSimplifiedLayerNormalization: metadata lock poisoned"
+                                .into(),
+                        )
+                    })?
+                    .clone(),
+            ),
+            scratch: Some(
+                kernel
+                    .bf16_scratch
+                    .lock()
+                    .map_err(|_| {
+                        EpError::KernelFailed(
+                            "cuda_ep SkipSimplifiedLayerNormalization: scratch lock poisoned"
+                                .into(),
+                        )
+                    })?
+                    .clone(),
+            ),
+            capture_safe: kernel.last_call_capture_safe.load(Ordering::Relaxed),
+            used_bf16_scratch: kernel.last_call_used_bf16_scratch.load(Ordering::Relaxed),
+            kernel,
+            committed: false,
+        })
+    }
+
+    fn finish(mut self, result: Result<()>) -> Result<()> {
+        self.committed = result.is_ok();
+        result
+    }
+}
+
+impl Drop for SkipNormWarmRollback<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if !self.kernel.runtime.is_capturing().unwrap_or(true) {
+            let _ = self.kernel.runtime.drain_for_unmap();
+        }
+        if let Some(metadata) = self.metadata.take()
+            && let Ok(mut current) = self.kernel.metadata.lock()
+        {
+            *current = metadata;
+        }
+        if let Some(scratch) = self.scratch.take()
+            && let Ok(mut current) = self.kernel.bf16_scratch.lock()
+        {
+            *current = scratch;
+        }
+        self.kernel
+            .last_call_capture_safe
+            .store(self.capture_safe, Ordering::Relaxed);
+        self.kernel
+            .last_call_used_bf16_scratch
+            .store(self.used_bf16_scratch, Ordering::Relaxed);
+    }
+}
+
 /// Persistent device arena that stages BFloat16 operands through Float32 without
 /// per-call allocation. Mirrors the `Bf16Scratch` pattern in `matmul_nbits`: a
 /// single grow-only buffer whose base address stays fixed across decode steps,
 /// so the casts recorded into a CUDA graph replay against a stable pointer.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct NormBf16Scratch {
     runtime: Arc<CudaRuntime>,
     allocation: Option<Arc<GraphDeviceAllocation>>,
@@ -2100,6 +2176,8 @@ impl NormBf16Scratch {
             self.runtime.drain_for_unmap()?;
         }
         let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes.max(1))?;
+        self.runtime
+            .staged_warm_cache_mutation("SkipSimplifiedLayerNorm bf16 scratch allocation")?;
         let ptr = allocation.ptr();
         self.allocation = Some(allocation);
         self.cap = bytes;
@@ -2113,7 +2191,7 @@ impl NormBf16Scratch {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SkipBroadcastMetadataCache {
     runtime: Arc<CudaRuntime>,
     allocation: Option<Arc<GraphDeviceAllocation>>,
@@ -2151,6 +2229,9 @@ impl SkipBroadcastMetadataCache {
         let allocation = GraphDeviceAllocation::allocate(&self.runtime, metadata_bytes.len())?;
         // SAFETY: `ptr` exactly covers the metadata byte slice.
         unsafe { self.runtime.htod(metadata_bytes, allocation.ptr()) }?;
+        self.runtime.staged_warm_cache_mutation(
+            "SkipSimplifiedLayerNorm broadcast metadata allocation/upload",
+        )?;
         if self.allocation.is_some() {
             // A dynamic shape change may replace metadata still referenced by
             // queued work. Fixed-shape decode always takes the cache-hit path.
@@ -2473,6 +2554,7 @@ impl SkipSimplifiedLayerNormKernel {
     }
 
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let rollback = SkipNormWarmRollback::new(self)?;
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
         self.last_call_used_bf16_scratch
             .store(false, Ordering::Relaxed);
@@ -2501,11 +2583,11 @@ impl SkipSimplifiedLayerNormKernel {
                 && skip.numel() == input.numel()
                 && bias.is_none()
             {
-                return self.run_bf16_native(inputs, outputs);
+                return rollback.finish(self.run_bf16_native(inputs, outputs));
             }
             self.last_call_used_bf16_scratch
                 .store(true, Ordering::Relaxed);
-            return self.run_bf16_via_f32(inputs, outputs);
+            return rollback.finish(self.run_bf16_via_f32(inputs, outputs));
         }
         require_f16_or_f32(op, "input", input.dtype)?;
         let is_half = input.dtype == DataType::Float16;
@@ -2752,7 +2834,7 @@ impl SkipSimplifiedLayerNormKernel {
         // additionally demotes when its arena grows during capture (see
         // `run_bf16_via_f32`).
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
-        Ok(())
+        rollback.finish(Ok(()))
     }
 }
 

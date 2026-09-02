@@ -1554,8 +1554,10 @@ impl QMoEFactory {
             attributes,
             bits: bits as usize,
             block_size: block_size as usize,
-            scratch: Mutex::new(ScratchPool::default()),
-            capture_ready: Mutex::new(None),
+            warm_state: Mutex::new(QMoEWarmState {
+                scratch: ScratchPool::default(),
+                capture_ready: None,
+            }),
             telemetry,
         })
     }
@@ -1796,9 +1798,13 @@ pub struct QMoEKernel {
     attributes: MoeAttributes,
     bits: usize,
     block_size: usize,
-    scratch: Mutex<ScratchPool>,
-    capture_ready: Mutex<Option<Arc<QMoECaptureReady>>>,
+    warm_state: Mutex<QMoEWarmState>,
     telemetry: Option<Arc<QMoERouteTelemetry>>,
+}
+
+struct QMoEWarmState {
+    scratch: ScratchPool,
+    capture_ready: Option<Arc<QMoECaptureReady>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1833,12 +1839,11 @@ impl QMoEKernel {
         }
     }
 
-    fn validate_capture_signature(&self, signature: &QMoECaptureSignature) -> Result<()> {
-        let ready = self
-            .capture_ready
-            .lock()
-            .map_err(|_| error("QMoE capture-ready state lock poisoned"))?;
-        let ready = ready.as_ref().ok_or_else(|| {
+    fn validate_capture_signature(
+        state: &QMoEWarmState,
+        signature: &QMoECaptureSignature,
+    ) -> Result<()> {
+        let ready = state.capture_ready.as_ref().ok_or_else(|| {
             error(
                 "QMoE capture began without a successful warmed call. HOW: run the exact \
                  fixed-shape QMoE call eagerly before capture.",
@@ -1855,27 +1860,18 @@ impl QMoEKernel {
     }
 
     fn publish_capture_ready(
-        &self,
+        state: &mut QMoEWarmState,
         signature: QMoECaptureSignature,
         resources: Vec<DeviceGraphResource>,
-    ) -> Result<()> {
-        *self
-            .capture_ready
-            .lock()
-            .map_err(|_| error("QMoE capture-ready state lock poisoned"))? =
-            Some(Arc::new(QMoECaptureReady {
-                signature,
-                resources,
-            }));
-        Ok(())
+    ) {
+        state.capture_ready = Some(Arc::new(QMoECaptureReady {
+            signature,
+            resources,
+        }));
     }
 
-    fn publish_capture_unsupported(&self) -> Result<()> {
-        *self
-            .capture_ready
-            .lock()
-            .map_err(|_| error("QMoE capture-ready state lock poisoned"))? = None;
-        Ok(())
+    fn publish_capture_unsupported(state: &mut QMoEWarmState) {
+        state.capture_ready = None;
     }
 
     #[doc(hidden)]
@@ -2098,10 +2094,6 @@ impl Kernel for QMoEKernel {
     /// this call's kernels still surfaces synchronously from `execute` itself
     /// under that debug flag, matching prior behavior.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.scratch
-            .lock()
-            .map_err(|_| error("QMoE scratch pool mutex poisoned"))?
-            .begin_call();
         if let Some(telemetry) = &self.telemetry {
             telemetry.last_call_used.store(false, Ordering::Relaxed);
         }
@@ -2285,8 +2277,12 @@ impl Kernel for QMoEKernel {
             telemetry.capture_resource_ids(experts)
         });
         let capture_signature = Self::capture_signature(inputs, outputs, telemetry_resource_ids);
+        let mut warm_state = self
+            .warm_state
+            .lock()
+            .map_err(|_| error("QMoE warm-state lock poisoned"))?;
         if capturing {
-            self.validate_capture_signature(&capture_signature)?;
+            Self::validate_capture_signature(&warm_state, &capture_signature)?;
         }
         if rows == 0 || hidden == 0 {
             if capturing {
@@ -2295,7 +2291,7 @@ impl Kernel for QMoEKernel {
                      signature eagerly.",
                 ));
             }
-            self.publish_capture_unsupported()?;
+            Self::publish_capture_unsupported(&mut warm_state);
             return Ok(());
         }
 
@@ -2346,10 +2342,8 @@ impl Kernel for QMoEKernel {
             })
             .transpose()?;
 
-        let mut scratch = self
-            .scratch
-            .lock()
-            .map_err(|_| error("QMoE scratch pool mutex poisoned"))?;
+        let mut scratch = warm_state.scratch.clone();
+        scratch.begin_call();
         let route_indices = scratch.ensure(&self.runtime, 0, route_index_bytes, capturing)?;
         let route_weights = scratch.ensure(&self.runtime, 1, route_weight_bytes, capturing)?;
         let fc1_output = (!fused_gate_up_decode)
@@ -2654,11 +2648,11 @@ impl Kernel for QMoEKernel {
         if !capturing {
             self.runtime.synchronize()?;
             let mut resources = scratch.device_graph_resources();
-            drop(scratch);
             if let Some(telemetry) = &self.telemetry {
                 resources.extend(telemetry.device_graph_resources());
             }
-            self.publish_capture_ready(capture_signature, resources)?;
+            warm_state.scratch = scratch;
+            Self::publish_capture_ready(&mut warm_state, capture_signature, resources);
         }
         Ok(())
     }
@@ -2668,16 +2662,23 @@ impl Kernel for QMoEKernel {
     }
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.capture_ready
+        self.warm_state
             .lock()
             .ok()
-            .and_then(|ready| ready.as_ref().map(|ready| ready.resources.clone()))
+            .and_then(|state| {
+                state
+                    .capture_ready
+                    .as_ref()
+                    .map(|ready| ready.resources.clone())
+            })
             .unwrap_or_default()
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        match self.capture_ready.lock() {
-            Ok(ready) if ready.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+        match self.warm_state.lock() {
+            Ok(state) if state.capture_ready.is_some() => {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            }
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "requires a warmed fixed-shape eager QMoE pass to size the pooled scratch and \
                  compile every routed expert kernel",
@@ -3444,7 +3445,7 @@ struct ScratchSlot {
     capacity: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ScratchPool {
     slots: [ScratchSlot; SCRATCH_SLOTS],
     used: [bool; SCRATCH_SLOTS],
@@ -3513,6 +3514,7 @@ impl ScratchPool {
             runtime.drain_for_unmap()?;
         }
         let fresh = GraphDeviceAllocation::allocate(runtime, bytes)?;
+        runtime.staged_warm_cache_mutation(&format!("QMoE scratch slot {index} allocation"))?;
         let ptr = fresh.ptr();
         slot.allocation = Some(fresh);
         slot.capacity = bytes;
@@ -3535,11 +3537,16 @@ impl ScratchPool {
 
 impl Drop for QMoEKernel {
     fn drop(&mut self) {
-        let scratch = self
-            .scratch
+        let state = self
+            .warm_state
             .get_mut()
-            .expect("cuda_ep QMoE scratch pool poisoned");
-        if scratch.slots.iter().any(|slot| slot.allocation.is_some()) {
+            .expect("cuda_ep QMoE warm state poisoned");
+        if state
+            .scratch
+            .slots
+            .iter()
+            .any(|slot| slot.allocation.is_some())
+        {
             let _ = self.runtime.drain_for_unmap();
         }
     }

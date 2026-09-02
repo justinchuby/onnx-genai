@@ -3261,13 +3261,6 @@ impl<'a> CaptureGuard<'a> {
         self.armed = false;
         self.runtime.end_graph_capture()
     }
-
-    /// Explicitly abort (the expected outcome for the rejection tests
-    /// below). Disarms the guard so `Drop` does not double-abort.
-    fn abort(mut self) -> onnx_runtime_ep_api::Result<()> {
-        self.armed = false;
-        self.runtime.abort_graph_capture()
-    }
 }
 
 impl Drop for CaptureGuard<'_> {
@@ -3432,48 +3425,132 @@ fn qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel() {
     let mut larger_output_buffer = ep.allocate(larger_output_bytes, 256).unwrap();
     let larger_output_strides = compute_contiguous_strides(&larger_output_shape);
 
-    let guard = CaptureGuard::begin(runtime, &[kernel.as_ref()]).unwrap();
-    let error = match kernel.execute(
-        &larger_views,
-        &mut [TensorMut::new(
-            DevicePtrMut(larger_output_buffer.as_mut_ptr()),
-            dtype,
-            &larger_output_shape,
-            &larger_output_strides,
-            ep.device_id(),
-        )],
-    ) {
-        Ok(()) => panic!(
-            "growing scratch capacity mid-capture must be rejected, not silently reallocated"
-        ),
-        Err(error) => error,
-    };
+    let counts_before_failure = runtime.allocation_counts();
+    let pooled_before_failure = runtime.raw_pool_retained_bytes();
+    runtime.fail_warm_transaction_at_for_test(3);
+    let error = kernel
+        .execute(
+            &larger_views,
+            &mut [TensorMut::new(
+                DevicePtrMut(larger_output_buffer.as_mut_ptr()),
+                dtype,
+                &larger_output_shape,
+                &larger_output_strides,
+                ep.device_id(),
+            )],
+        )
+        .expect_err("valid larger QMoE must fail after staging several replacement slots");
     assert!(
         error
             .to_string()
-            .contains("signature changed during CUDA graph capture"),
+            .contains("injected staged warm-cache failure after QMoE scratch slot 2"),
         "unexpected rejection message: {error}"
     );
-    assert!(error.to_string().contains("HOW:"), "{error}");
-    guard
-        .abort()
-        .expect("abort must succeed after a rejected in-capture growth attempt");
+    assert_eq!(
+        kernel
+            .device_graph_resources()
+            .iter()
+            .map(|resource| resource.identity())
+            .collect::<Vec<_>>(),
+        warmed_resources,
+        "failed multi-slot QMoE rewarm must preserve A's scratch snapshot"
+    );
+    let counts_after_failure = runtime.allocation_counts();
+    assert!(
+        counts_after_failure.frees > counts_before_failure.frees
+            || runtime.raw_pool_retained_bytes() > pooled_before_failure,
+        "every rejected QMoE candidate allocation must be returned exactly once"
+    );
 
+    let warm_strides: Vec<_> = warm_inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map(|input| compute_contiguous_strides(&input.shape))
+        })
+        .collect();
+    let warm_views: Vec<_> = warm_inputs
+        .iter()
+        .zip(&larger_buffers)
+        .zip(&warm_strides)
+        .enumerate()
+        .map(
+            |(index, ((input, buffer), strides))| match (input, buffer, strides) {
+                (Some(input), Some(buffer), Some(strides)) => TensorView::new(
+                    DevicePtr(buffer.as_ptr()),
+                    input.dtype,
+                    &input.shape,
+                    strides,
+                    ep.device_id(),
+                ),
+                _ => TensorView::absent(absent_dtype(index, dtype)),
+            },
+        )
+        .collect();
+    let warm_output_shape = [template.rows, template.hidden];
+    let warm_output_strides = compute_contiguous_strides(&warm_output_shape);
+    let mut execute_warm = || {
+        kernel.execute(
+            &warm_views,
+            &mut [TensorMut::new(
+                DevicePtrMut(larger_output_buffer.as_mut_ptr()),
+                dtype,
+                &warm_output_shape,
+                &warm_output_strides,
+                ep.device_id(),
+            )],
+        )
+    };
+
+    let guard = CaptureGuard::begin(runtime, &[kernel.as_ref()]).unwrap();
+    execute_warm().unwrap();
+    guard.end().unwrap();
+    drop(execute_warm);
+
+    kernel
+        .execute(
+            &larger_views,
+            &mut [TensorMut::new(
+                DevicePtrMut(larger_output_buffer.as_mut_ptr()),
+                dtype,
+                &larger_output_shape,
+                &larger_output_strides,
+                ep.device_id(),
+            )],
+        )
+        .unwrap();
+    assert_ne!(
+        kernel
+            .device_graph_resources()
+            .iter()
+            .map(|resource| resource.identity())
+            .collect::<Vec<_>>(),
+        warmed_resources,
+        "successful eager B must publish its new multi-slot scratch snapshot"
+    );
+    runtime.replay_graph().unwrap();
+    let warm_output_bytes = template.rows * template.hidden * dtype.byte_size();
+    let mut replay_bytes = vec![0u8; warm_output_bytes];
+    unsafe {
+        runtime
+            .dtoh(&mut replay_bytes, cuptr(larger_output_buffer.as_ptr()))
+            .unwrap();
+    }
+    assert_conforms(
+        &decode_output_bytes(&replay_bytes, dtype),
+        &warm_expected,
+        template,
+        dtype,
+    );
+    assert!(runtime.reset_graph().unwrap());
+
+    drop(warm_views);
     drop(larger_views);
     for buffer in larger_buffers.into_iter().flatten() {
         ep.deallocate(buffer).unwrap();
     }
     ep.deallocate(larger_output_buffer).unwrap();
-
-    // The kernel must still be correct afterward, at the ORIGINAL warmed
-    // shape, proving the rejected growth attempt left no partial state.
-    let post_inputs = case_inputs(template, dtype);
-    let post_expected = run_cpu(template, &rounded_cpu_inputs(&post_inputs, dtype));
-    let post = enqueue_with_existing_kernel(&ep, kernel.as_ref(), template, &post_inputs, dtype)
-        .unwrap()
-        .read_back_and_free(&ep)
-        .unwrap();
-    assert_conforms(&post, &post_expected, template, dtype);
 }
 
 #[cfg_attr(

@@ -85,7 +85,7 @@ struct WhereCaptureSignature {
 /// metadata for a three-input `Where`. Reused across decode steps whenever the
 /// operand shapes are unchanged, so a captured launch performs **no** per-step
 /// host allocation, upload, free, or synchronize.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct WhereMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<WhereMetadataKey>,
@@ -103,7 +103,7 @@ impl WhereMetadataCache {
 
     fn prepare(&mut self, key: &WhereMetadataKey) -> Result<CUdeviceptr> {
         if self.key.as_ref() == Some(key) {
-            return self.allocation.as_ref().map_or_else(
+            let ptr = self.allocation.as_ref().map_or_else(
                 || {
                     Err(EpError::KernelFailed(
                         "cuda_ep Where: cached broadcast metadata lost its device allocation"
@@ -111,7 +111,16 @@ impl WhereMetadataCache {
                     ))
                 },
                 |allocation| Ok(allocation.ptr()),
-            );
+            )?;
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    self.device_graph_resource()
+                        .expect("cached Where allocation is present")
+                        .identity(),
+                    "Where broadcast metadata",
+                )?;
+            }
+            return Ok(ptr);
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
@@ -133,6 +142,8 @@ impl WhereMetadataCache {
         let allocation = GraphDeviceAllocation::allocate(&self.runtime, metadata_bytes.len())?;
         // SAFETY: allocation exactly covers the metadata byte slice.
         unsafe { self.runtime.htod(metadata_bytes, allocation.ptr()) }?;
+        self.runtime
+            .staged_warm_cache_mutation("Where broadcast metadata allocation/upload")?;
         let ptr = allocation.ptr();
         self.key = Some(key.clone());
         self.allocation = Some(allocation);
@@ -158,7 +169,7 @@ impl Kernel for WhereKernel {
         let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep Where capture signature lock was poisoned".into())
         })?;
-        let warmed_signature = last_signature.take();
+        let warmed_signature = last_signature.clone();
 
         if inputs.len() != 3 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -227,12 +238,11 @@ impl Kernel for WhereKernel {
         let func = self
             .runtime
             .nvrtc_function("where_op", WHERE_SOURCE, "where_bytes")?;
-        let metadata_ptr = {
-            let mut metadata = self.metadata.lock().map_err(|_| {
-                EpError::KernelFailed("cuda_ep Where metadata lock was poisoned".into())
-            })?;
-            metadata.prepare(&key)?
-        };
+        let mut metadata = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Where metadata lock was poisoned".into())
+        })?;
+        let mut metadata_candidate = metadata.clone();
+        let metadata_ptr = metadata_candidate.prepare(&key)?;
         let condition_ptr = cuptr(condition.data_ptr::<u8>() as *const c_void);
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(y.data_ptr::<u8>() as *const c_void);
@@ -265,6 +275,9 @@ impl Kernel for WhereKernel {
             })
         }
         .map_err(|e| driver_err("launch where_bytes", e))?;
+        if !self.runtime.is_capturing()? {
+            *metadata = metadata_candidate;
+        }
         *last_signature = current_signature;
         Ok(())
     }

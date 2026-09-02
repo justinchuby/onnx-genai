@@ -545,7 +545,7 @@ impl UnaryKernel {
                 "cuda_ep unary elementwise capture signature lock was poisoned".into(),
             )
         })?;
-        let warmed_signature = last_signature.take();
+        let warmed_signature = last_signature.clone();
         let op = self.op.op_name();
         if inputs.len() != 1 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -730,7 +730,7 @@ struct BinaryCaptureSignature {
 /// shapes are unchanged, so a captured kernel launch performs **no** per-step
 /// host allocation, upload, free, or synchronize — the prerequisite for the op
 /// to advertise [`CaptureSupport::Supported`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct BroadcastMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<BroadcastMetadataKey>,
@@ -758,7 +758,7 @@ impl BroadcastMetadataCache {
             out_shape: out_shape.to_vec(),
         };
         if self.key.as_ref() == Some(&key) {
-            return self.allocation.as_ref().map_or_else(
+            let ptr = self.allocation.as_ref().map_or_else(
                 || {
                     Err(EpError::KernelFailed(
                         "cuda_ep binary elementwise: cached broadcast metadata lost its device allocation"
@@ -766,7 +766,16 @@ impl BroadcastMetadataCache {
                     ))
                 },
                 |allocation| Ok(allocation.ptr()),
-            );
+            )?;
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    self.device_graph_resource()
+                        .expect("cached broadcast allocation is present")
+                        .identity(),
+                    "binary broadcast metadata",
+                )?;
+            }
+            return Ok(ptr);
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
@@ -785,6 +794,8 @@ impl BroadcastMetadataCache {
         let allocation = GraphDeviceAllocation::allocate(&self.runtime, metadata_bytes.len())?;
         // SAFETY: allocation exactly covers the metadata byte slice.
         unsafe { self.runtime.htod(metadata_bytes, allocation.ptr()) }?;
+        self.runtime
+            .staged_warm_cache_mutation("binary broadcast metadata allocation/upload")?;
         let ptr = allocation.ptr();
         self.key = Some(key);
         self.allocation = Some(allocation);
@@ -805,7 +816,7 @@ impl BinaryKernel {
                 "cuda_ep binary elementwise capture signature lock was poisoned".into(),
             )
         })?;
-        let warmed_signature = last_signature.take();
+        let warmed_signature = last_signature.clone();
         let op = self.op.op_name();
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -899,7 +910,8 @@ impl BinaryKernel {
         let mut metadata = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep binary elementwise metadata lock was poisoned".into())
         })?;
-        let metadata_ptr = metadata.prepare(a.shape, b.shape, &out_shape)?;
+        let mut metadata_candidate = metadata.clone();
+        let metadata_ptr = metadata_candidate.prepare(a.shape, b.shape, &out_shape)?;
         let a_ptr = cuptr(a.data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
@@ -928,6 +940,9 @@ impl BinaryKernel {
         // SAFETY: pointer types match the dtype; metadata contains three
         // rank-length u64 arrays; broadcast strides keep all reads in bounds.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if !self.runtime.is_capturing()? {
+            *metadata = metadata_candidate;
+        }
         *last_signature = current_signature;
         Ok(())
     }
@@ -988,7 +1003,7 @@ impl SiluMulKernel {
                 "cuda_ep fused SiluMul capture signature lock was poisoned".into(),
             )
         })?;
-        let warmed_signature = last_signature.take();
+        let warmed_signature = last_signature.clone();
         const OP: &str = "SiluMul";
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(

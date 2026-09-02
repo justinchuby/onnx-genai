@@ -270,13 +270,11 @@ impl Kernel for TensorScatterKernel {
                 .into_iter()
                 .map(|value| value as u64),
         );
-        let metadata_ptr = self
-            .metadata
-            .lock()
-            .map_err(|_| {
-                EpError::KernelFailed("cuda_ep TensorScatter: metadata lock was poisoned".into())
-            })?
-            .prepare(&metadata_values, "TensorScatter")?;
+        let mut metadata_cache = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep TensorScatter: metadata lock was poisoned".into())
+        })?;
+        let metadata_candidate = metadata_cache.stage(&metadata_values, "TensorScatter")?;
+        let metadata_ptr = metadata_candidate.ptr("TensorScatter")?;
 
         let function =
             self.runtime
@@ -330,6 +328,7 @@ impl Kernel for TensorScatterKernel {
         }
         .map_err(|error| driver_err("launch tensor_scatter", error))?;
         if !capturing {
+            *metadata_cache = metadata_candidate;
             *warmed_signature = Some(signature);
         }
         Ok(())

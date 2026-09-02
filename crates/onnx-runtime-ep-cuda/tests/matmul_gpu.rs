@@ -420,12 +420,49 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup() {
         .iter()
         .map(|resource| resource.identity())
         .collect::<Vec<_>>();
-    // Some cuBLASLt algorithms require zero workspace on this GPU. The
-    // reduction regression supplies the non-empty resource falsifier; this
-    // MatMul cell pins the transactional eligibility/resource pairing for
-    // whichever exact set the selected algorithm owns.
-    let failure = kernel.execute(&[], &mut []).unwrap_err().to_string();
-    assert!(failure.contains("expected 2 inputs"), "{failure}");
+    let b_m = 2usize;
+    let b_a: Vec<f32> = (0..b_m * k)
+        .map(|i| (i.wrapping_mul(29) % 211) as f32 / 211.0 - 0.5)
+        .collect();
+    let b_a_buf = ep.allocate(std::mem::size_of_val(&b_a[..]), 256).unwrap();
+    let mut b_c_buf = ep
+        .allocate(b_m * n * std::mem::size_of::<f32>(), 256)
+        .unwrap();
+    unsafe {
+        rt.htod(f32_bytes(&b_a), cuptr(b_a_buf.as_ptr())).unwrap();
+    }
+    let b_a_shape = [b_m, k];
+    let b_c_shape = [b_m, n];
+    let b_a_strides = compute_contiguous_strides(&b_a_shape);
+    let b_c_strides = compute_contiguous_strides(&b_c_shape);
+    let b_a_view = TensorView::new(
+        DevicePtr(b_a_buf.as_ptr()),
+        DataType::Float32,
+        &b_a_shape,
+        &b_a_strides,
+        dev,
+    );
+    let execute_b = |b_c_buf: &mut onnx_runtime_ep_api::DeviceBuffer| {
+        kernel.execute(
+            &[b_a_view.clone(), b_view.clone()],
+            &mut [TensorMut::new(
+                DevicePtrMut(b_c_buf.as_mut_ptr()),
+                DataType::Float32,
+                &b_c_shape,
+                &b_c_strides,
+                dev,
+            )],
+        )
+    };
+
+    let counts_before_failure = rt.allocation_counts();
+    let pooled_before_failure = rt.raw_pool_retained_bytes();
+    rt.fail_warm_transaction_at_for_test(1);
+    let failure = execute_b(&mut b_c_buf).unwrap_err().to_string();
+    assert!(
+        failure.contains("injected staged warm-cache failure after MatMul dense plan"),
+        "{failure}"
+    );
     assert!(
         kernel.capture_support().is_supported(),
         "a failed replacement call must preserve the successful MatMul warm"
@@ -438,6 +475,13 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup() {
             .collect::<Vec<_>>(),
         warmed_resources,
         "MatMul capture eligibility and resources must remain one successful snapshot"
+    );
+    let counts_after_failure = rt.allocation_counts();
+    assert!(
+        counts_after_failure.allocations == counts_before_failure.allocations
+            || counts_after_failure.frees > counts_before_failure.frees
+            || rt.raw_pool_retained_bytes() > pooled_before_failure,
+        "the failed dense-plan candidate must return any workspace exactly once"
     );
     let allocations = rt.allocation_counts();
     rt.begin_graph_capture(&[kernel.as_ref()]).unwrap();
@@ -452,14 +496,27 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup() {
         "captured f32 GEMV must not allocate or free"
     );
     rt.end_graph_capture().unwrap();
+    assert_eq!(rt.allocation_counts(), allocations);
+    execute_b(&mut b_c_buf).unwrap();
     rt.replay_graph().unwrap();
     rt.synchronize().unwrap();
-    assert_eq!(rt.allocation_counts(), allocations);
+    let mut replay_bytes = vec![0u8; n * std::mem::size_of::<f32>()];
+    unsafe {
+        rt.dtoh(&mut replay_bytes, cuptr(c_buf.as_ptr())).unwrap();
+    }
+    let replay = replay_bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let expected = cpu_reference_nd(&a, &b, &a_shape, &b_shape);
+    assert!(approx_eq(&replay, &expected, 1e-4));
     assert!(rt.reset_graph().unwrap());
 
     ep.deallocate(a_buf).unwrap();
     ep.deallocate(b_buf).unwrap();
     ep.deallocate(c_buf).unwrap();
+    ep.deallocate(b_a_buf).unwrap();
+    ep.deallocate(b_c_buf).unwrap();
 }
 
 /// Run one dense fp16 MatMul on the GPU and return the host result as f32.

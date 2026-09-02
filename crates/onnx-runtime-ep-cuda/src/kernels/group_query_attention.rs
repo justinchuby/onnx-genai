@@ -1299,8 +1299,13 @@ pub struct GroupQueryAttentionKernel {
     /// generate their index arithmetic from this descriptor at NVRTC
     /// module-build time; every unconverted path rejects it.
     kv_strides: KvCacheStrides,
-    workspace: Mutex<GqaWorkspace>,
-    last_capture_safe_signature: Mutex<Option<GqaCaptureSignature>>,
+    warm_state: Mutex<GqaWarmState>,
+}
+
+#[derive(Debug)]
+struct GqaWarmState {
+    workspace: GqaWorkspace,
+    capture_signature: Option<GqaCaptureSignature>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1328,7 +1333,7 @@ struct WorkspaceSlot {
     bytes: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct GqaWorkspace {
     runtime: Arc<CudaRuntime>,
     slots: [WorkspaceSlot; WS_COUNT],
@@ -1355,6 +1360,12 @@ impl GqaWorkspace {
         if slot.bytes >= bytes
             && let Some(allocation) = slot.allocation.as_ref()
         {
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    GraphDeviceAllocation::device_graph_resource(allocation).identity(),
+                    "GroupQueryAttention workspace allocation",
+                )?;
+            }
             return Ok(allocation.ptr());
         }
         if self.runtime.is_capturing()? {
@@ -1362,13 +1373,16 @@ impl GqaWorkspace {
                 "cuda_ep GroupQueryAttention: workspace slot {index} requires {bytes} bytes during CUDA graph capture; warm the fixed decode shape before capture"
             )));
         }
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes)?;
         if slot.allocation.is_some() {
             // Dynamic prefill/growing-cache shapes may outgrow a slot. Preserve
             // the fixed-capacity decode fast path (which never reaches here),
             // but wait before replacing storage that queued work may still use.
-            self.runtime.synchronize()?;
+            self.runtime.drain_for_unmap()?;
         }
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes)?;
+        self.runtime.staged_warm_cache_mutation(&format!(
+            "GroupQueryAttention workspace slot {index} allocation"
+        ))?;
         let ptr = allocation.ptr();
         self.slots[index] = WorkspaceSlot {
             allocation: Some(allocation),
@@ -1380,8 +1394,7 @@ impl GqaWorkspace {
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
         self.slots
             .iter()
-            .zip(self.used)
-            .filter_map(|(slot, used)| used.then_some(slot.allocation.as_ref()).flatten())
+            .filter_map(|slot| slot.allocation.as_ref())
             .map(GraphDeviceAllocation::device_graph_resource)
             .collect()
     }
@@ -1554,7 +1567,10 @@ impl GroupQueryAttentionKernel {
             ));
         }
         Ok(Self {
-            workspace: Mutex::new(GqaWorkspace::new(runtime.clone())),
+            warm_state: Mutex::new(GqaWarmState {
+                workspace: GqaWorkspace::new(runtime.clone()),
+                capture_signature: None,
+            }),
             runtime,
             num_heads,
             kv_num_heads,
@@ -1566,7 +1582,6 @@ impl GroupQueryAttentionKernel {
             backend: GroupQueryAttentionBackend::Auto,
             prep_fusion_disabled: false,
             kv_strides: KvCacheStrides::head_major_bnsh(),
-            last_capture_safe_signature: Mutex::new(None),
         })
     }
 
@@ -1607,9 +1622,10 @@ impl GroupQueryAttentionKernel {
         &self,
         batch: usize,
     ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>)> {
-        let workspace = self.workspace.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
+        let state = self.warm_state.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep GroupQueryAttention: warm-state lock poisoned".into())
         })?;
+        let workspace = &state.workspace;
         let read_slot = |index: usize| -> Result<Vec<i32>> {
             let slot = &workspace.slots[index];
             let bytes_len = batch
@@ -1677,18 +1693,13 @@ impl GroupQueryAttentionKernel {
         outputs: &mut [TensorMut],
         prepared: Option<WorkspaceView>,
     ) -> Result<()> {
-        self.workspace
-            .lock()
-            .map_err(|_| {
-                EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
-            })?
-            .begin_call();
-        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
-            EpError::KernelFailed(
-                "cuda_ep GroupQueryAttention: capture signature lock poisoned".into(),
-            )
+        let mut warm_state = self.warm_state.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep GroupQueryAttention: warm-state lock poisoned".into())
         })?;
-        let warmed_signature = last_signature.take();
+        let warmed_signature = warm_state.capture_signature.clone();
+        let mut workspace_candidate = warm_state.workspace.clone();
+        workspace_candidate.begin_call();
+        let capturing = self.runtime.is_capturing()?;
         if !(7..=14).contains(&inputs.len()) || !(1..=3).contains(&outputs.len()) {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep GroupQueryAttention: expected 7..14 inputs and 1..3 outputs, got {} and {}",
@@ -2313,9 +2324,7 @@ impl GroupQueryAttentionKernel {
             want_scores,
         )?;
         let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
-        let mut workspace = self.workspace.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
-        })?;
+        let workspace = &mut workspace_candidate;
         let metadata_bytes = batch * std::mem::size_of::<i32>();
         let totals_gpu = workspace.reserve(WS_TOTALS, metadata_bytes)?;
         let past_lengths_gpu = workspace.reserve(WS_PAST_LENGTHS, metadata_bytes)?;
@@ -3104,7 +3113,10 @@ impl GroupQueryAttentionKernel {
                 }
             );
         }
-        *last_signature = capture_candidate;
+        if !capturing {
+            warm_state.workspace = workspace_candidate;
+            warm_state.capture_signature = capture_candidate;
+        }
         Ok(())
     }
 
@@ -3262,17 +3274,19 @@ impl Kernel for GroupQueryAttentionKernel {
     }
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.workspace
+        self.warm_state
             .lock()
-            .map(|workspace| workspace.device_graph_resources())
+            .map(|state| state.workspace.device_graph_resources())
             .unwrap_or_default()
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // Eligibility is tied to the exact one-token, fixed-capacity, in-place
         // device-KV decode signature warmed by the most recent successful call.
-        match self.last_capture_safe_signature.lock() {
-            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+        match self.warm_state.lock() {
+            Ok(state) if state.capture_signature.is_some() => {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            }
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "requires a warmed fixed-capacity aliased device-KV signature: either f32/fp16/bf16 q_seq==1 (Phase2a split-K decode) or fp16/bf16 q_seq>1 (fused flash verify/prefill); the current signature was not warmed as capture-safe",
             ),

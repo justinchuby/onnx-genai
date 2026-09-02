@@ -1465,9 +1465,6 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop() {
     assert_eq!(a_resource.len(), 1);
     let a_resource_id = a_resource[0].identity();
     drop(a_resource);
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
-    run_a().unwrap();
-    runtime.end_graph_capture().unwrap();
 
     let b_input_shape = [2usize, 2, 3];
     let b_output_shape = [3usize, 2, 2];
@@ -1488,6 +1485,44 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop() {
         &b_input_strides,
         device,
     )];
+    let counts_before_failure = runtime.allocation_counts();
+    let pooled_before_failure = runtime.raw_pool_retained_bytes();
+    runtime.fail_warm_transaction_at_for_test(1);
+    let failure = kernel
+        .execute(
+            &b_inputs,
+            &mut [TensorMut::new(
+                DevicePtrMut(b_output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &b_output_shape,
+                &b_output_strides,
+                device,
+            )],
+        )
+        .expect_err("valid shape-B metadata upload must hit the injected post-mutation failure");
+    assert!(
+        failure
+            .to_string()
+            .contains("injected staged warm-cache failure after Transpose metadata"),
+        "{failure}"
+    );
+    assert_eq!(
+        kernel.device_graph_resources()[0].identity(),
+        a_resource_id,
+        "failed Transpose rewarm must retain shape A's metadata owner"
+    );
+    let counts_after_failure = runtime.allocation_counts();
+    assert!(
+        counts_after_failure.frees > counts_before_failure.frees
+            || runtime.raw_pool_retained_bytes() > pooled_before_failure,
+        "the rejected Transpose candidate must return its staged allocation exactly once"
+    );
+
+    run_a().unwrap();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    run_a().unwrap();
+    runtime.end_graph_capture().unwrap();
+
     kernel
         .execute(
             &b_inputs,

@@ -412,7 +412,9 @@ fn fp16_zero_append_shared_cache_matches_cpu_and_replays() {
     ));
 
     let allocations_after_warmup = runtime.allocation_counts();
-    runtime.begin_graph_capture(&[]).unwrap();
+    runtime
+        .begin_graph_capture(&[&kernel as &dyn onnx_runtime_ep_api::Kernel])
+        .unwrap();
     execute(&mut key_buffer, &mut value_buffer, &mut output_buffer).unwrap();
     runtime.end_graph_capture().unwrap();
     assert_eq!(

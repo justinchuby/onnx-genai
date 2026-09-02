@@ -316,7 +316,7 @@ impl BinaryIntKernel {
         let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep bitwise capture signature lock was poisoned".into())
         })?;
-        let warmed_signature = last_signature.take();
+        let warmed_signature = last_signature.clone();
         let op = self.kind.op_name();
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -388,7 +388,8 @@ impl BinaryIntKernel {
         let mut metadata = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep bitwise metadata lock was poisoned".into())
         })?;
-        let metadata_ptr = metadata.prepare(a.shape, b.shape, &out_shape)?;
+        let mut metadata_candidate = metadata.clone();
+        let metadata_ptr = metadata_candidate.prepare(a.shape, b.shape, &out_shape)?;
         let rank = i32::try_from(out_shape.len())
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: rank exceeds i32")))?;
         let cfg = LaunchConfig {
@@ -411,6 +412,9 @@ impl BinaryIntKernel {
         // with matching rank/count/indexing; the metadata pointer is the
         // persistent cache buffer, valid across replays.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if !self.runtime.is_capturing()? {
+            *metadata = metadata_candidate;
+        }
         *last_signature = current_signature;
         Ok(())
     }

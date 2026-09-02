@@ -885,18 +885,22 @@ impl EinsumKernel {
                 self.plan.equation()
             )));
         }
-        if execution.is_none() {
+        let compiled = if execution.is_none() {
             if capturing {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep Einsum `{}`: exact dtype/shape/layout was not warmed before CUDA graph capture",
                     self.plan.equation()
                 )));
             }
-            *execution = Some(self.compile_contraction(dtype)?);
+            Some(self.compile_contraction(dtype)?)
         } else {
             PLAN_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-        }
-        let cached = execution.as_ref().unwrap();
+            None
+        };
+        let cached = execution
+            .as_ref()
+            .or(compiled.as_ref())
+            .expect("an existing or staged contraction plan is present");
         if cached.layout.output_shape.as_slice() != outputs[0].shape {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Einsum `{}`: output shape {:?}, expected {:?}",
@@ -941,6 +945,9 @@ impl EinsumKernel {
         }
         if capturing {
             CAPTURE_RECORDINGS.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(compiled) = compiled {
+            *execution = Some(compiled);
         }
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
         Ok(())
@@ -1041,7 +1048,7 @@ impl EinsumKernel {
                 self.plan.equation()
             ))
         })?;
-        if capturing {
+        let candidate = if capturing {
             let signature = warmed.as_ref().ok_or_else(|| {
                 EpError::KernelFailed(format!(
                     "cuda_ep Einsum `{}`: view materialization was not warmed before CUDA graph capture",
@@ -1054,6 +1061,7 @@ impl EinsumKernel {
                     self.plan.equation()
                 )));
             }
+            signature.clone()
         } else {
             let mut metadata = outputs[0]
                 .shape
@@ -1061,28 +1069,30 @@ impl EinsumKernel {
                 .map(|&dim| dim as u64)
                 .collect::<Vec<_>>();
             metadata.extend(view.strides.iter().map(|&stride| stride as u64));
-            *warmed = Some(ViewMaterialization {
+            ViewMaterialization {
                 dtype: inputs[0].dtype,
                 input_shape: inputs[0].shape.to_vec(),
                 input_strides: inputs[0].strides.to_vec(),
                 output_shape: outputs[0].shape.to_vec(),
                 metadata,
-            });
-        }
+            }
+        };
         if outputs[0].numel() == 0 {
+            if !capturing {
+                *warmed = Some(candidate);
+            }
             self.last_call_capture_safe.store(true, Ordering::Relaxed);
             return Ok(());
         }
-        let (metadata_ptr, metadata_bytes) = {
-            let mut metadata = self.view_metadata.lock().map_err(|_| {
-                EpError::KernelFailed(format!(
-                    "cuda_ep Einsum `{}`: view metadata lock was poisoned",
-                    self.plan.equation()
-                ))
-            })?;
-            let ptr = metadata.prepare(&warmed.as_ref().unwrap().metadata, "Einsum view")?;
-            (ptr, metadata.allocation_bytes())
-        };
+        let mut metadata = self.view_metadata.lock().map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep Einsum `{}`: view metadata lock was poisoned",
+                self.plan.equation()
+            ))
+        })?;
+        let metadata_candidate = metadata.stage(&candidate.metadata, "Einsum view")?;
+        let metadata_ptr = metadata_candidate.ptr("Einsum view")?;
+        let metadata_bytes = metadata_candidate.allocation_bytes();
         launch_persistent_metadata(
             &self.runtime,
             "transpose_bytes",
@@ -1095,6 +1105,9 @@ impl EinsumKernel {
         MATERIALIZATION_BYTES.fetch_add(outputs[0].byte_size() as u64, Ordering::Relaxed);
         if capturing {
             CAPTURE_RECORDINGS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            *metadata = metadata_candidate;
+            *warmed = Some(candidate);
         }
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
         Ok(())
