@@ -125,7 +125,6 @@ impl CsaBufferLayout {
 pub(crate) struct CsaDeviceBufferManager {
     runtime: Arc<CudaRuntime>,
     pub(crate) layout: CsaBufferLayout,
-    buffers: Vec<CUdeviceptr>,
     /// B6 pooled scratch (index transform / scores / selection / attention
     /// scores). Reserved once at runner init with stable addresses so the
     /// device-only capture path never allocates per call.
@@ -166,44 +165,21 @@ impl CsaDeviceBufferManager {
         let charge = ledger
             .try_charge(
                 charge_key,
-                CsaStateGroupBytes::from_layout(&layout, workspace_bytes),
+                CsaStateGroupBytes::workspace_only(workspace_bytes),
             )
             .map_err(EpError::from)?;
-        let sizes = [
-            layout.attention_r4_bytes,
-            layout.attention_r4_carry_bytes,
-            layout.attention_r128_bytes,
-            layout.attention_r128_carry_bytes,
-            layout.index_r4_bytes,
-            layout.index_r4_carry_bytes,
-            layout.dense_ring_bytes,
-        ];
-        let mut buffers = Vec::with_capacity(sizes.len());
         let mut workspaces = Vec::with_capacity(workspace_bytes.len());
-        let rollback = |buffers: &mut Vec<CUdeviceptr>, workspaces: &mut Vec<CUdeviceptr>| {
+        let rollback = |workspaces: &mut Vec<CUdeviceptr>| {
             for ptr in workspaces.drain(..).rev() {
                 // SAFETY: each pointer was allocated by this runtime and has not escaped.
                 let _ = unsafe { runtime.free_raw(ptr) };
             }
-            for ptr in buffers.drain(..).rev() {
-                // SAFETY: each pointer was allocated by this runtime and has not escaped.
-                let _ = unsafe { runtime.free_raw(ptr) };
-            }
         };
-        for size in sizes {
-            match runtime.alloc_raw(size) {
-                Ok(ptr) => buffers.push(ptr),
-                Err(error) => {
-                    rollback(&mut buffers, &mut workspaces);
-                    return Err(error);
-                }
-            }
-        }
         for &size in workspace_bytes {
             match runtime.alloc_raw(size.max(1)) {
                 Ok(ptr) => workspaces.push(ptr),
                 Err(error) => {
-                    rollback(&mut buffers, &mut workspaces);
+                    rollback(&mut workspaces);
                     return Err(error);
                 }
             }
@@ -211,7 +187,6 @@ impl CsaDeviceBufferManager {
         Ok(Self {
             runtime,
             layout,
-            buffers,
             workspaces,
             charge,
         })
@@ -234,10 +209,6 @@ impl CsaDeviceBufferManager {
 impl Drop for CsaDeviceBufferManager {
     fn drop(&mut self) {
         for ptr in self.workspaces.drain(..).rev() {
-            // SAFETY: this manager exclusively owns every pointer it reserved.
-            let _ = unsafe { self.runtime.free_raw(ptr) };
-        }
-        for ptr in self.buffers.drain(..).rev() {
             // SAFETY: this manager exclusively owns every pointer it reserved.
             let _ = unsafe { self.runtime.free_raw(ptr) };
         }
@@ -343,9 +314,9 @@ mod tests {
         .unwrap()
     }
 
-    /// The reservation charges the ledger with exactly the bytes it physically
-    /// reserves, and dropping the manager returns residency to baseline. This is
-    /// the core B6 property: the ledger is the sole accountant and never leaks.
+    /// The op-owned scratch reservation is charged exactly and returns to
+    /// baseline on drop. Record/carry state is owned and governed by the native
+    /// session bindings, so it is intentionally absent from this ledger.
     #[test]
     fn reserve_charges_ledger_and_releases_on_drop() {
         let Some(runtime) = crate::test_support::maybe_runtime() else {
@@ -354,7 +325,7 @@ mod tests {
         };
         let layout = sample_layout();
         let workspaces = [4096usize, 2048, 0];
-        let expected = CsaStateGroupBytes::from_layout(&layout, &workspaces).total();
+        let expected = CsaStateGroupBytes::workspace_only(&workspaces).total();
         assert!(expected > 0, "sample layout must reserve some bytes");
 
         let ledger = Arc::new(CsaStateGroupLedger::default());
@@ -400,7 +371,7 @@ mod tests {
         };
         let layout = sample_layout();
         let workspaces = [4096usize];
-        let needed = CsaStateGroupBytes::from_layout(&layout, &workspaces).total();
+        let needed = CsaStateGroupBytes::workspace_only(&workspaces).total();
 
         let ledger = Arc::new(CsaStateGroupLedger::with_device_limit(needed - 1));
         let result = CsaDeviceBufferManager::reserve(
@@ -435,7 +406,7 @@ mod tests {
             return;
         };
         let workspaces = [1024usize];
-        let per = CsaStateGroupBytes::from_layout(&sample_layout(), &workspaces).total();
+        let per = CsaStateGroupBytes::workspace_only(&workspaces).total();
         let ledger = Arc::new(CsaStateGroupLedger::default());
         let device = runtime.ordinal();
 
@@ -514,7 +485,7 @@ mod tests {
             return;
         };
         let workspaces = [1024usize];
-        let expected = CsaStateGroupBytes::from_layout(&sample_layout(), &workspaces).total();
+        let expected = CsaStateGroupBytes::workspace_only(&workspaces).total();
         let ledger = Arc::new(CsaStateGroupLedger::default());
         assert_eq!(
             ledger.device_available_bytes(),

@@ -609,8 +609,19 @@ impl Executor {
             // planning would key a different kernel than execution uses.
             let seq_independent =
                 node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
-            let graph_tokens =
-                std::array::from_fn(|index| self.slot_capture[index].device_graph_token);
+            let graph_tokens = std::array::from_fn(|index| {
+                let capture = &self.slot_capture[index];
+                capture
+                    .capture_schedule
+                    .as_ref()
+                    .is_some_and(|schedule| {
+                        schedule.segments.iter().any(|segment| {
+                            segment.captured && (segment.start..segment.end).contains(&pi)
+                        })
+                    })
+                    .then_some(capture.device_graph_token)
+                    .flatten()
+            });
             let (kernel, key) = self.cache.get_or_create(
                 node_id,
                 node,
@@ -1360,13 +1371,33 @@ impl Executor {
                 dtype: binding.dtype,
                 physical_shape: binding.physical_shape().to_vec(),
                 kernel_input_shape: binding.kernel_input_shape().to_vec(),
-                accepts_output_subshape: binding.binds_input()
+                accepts_output_subshape: binding.output_name().is_some()
                     && binding.logical_shape() != binding.physical_shape(),
                 exposes_logical_input_shape: binding.exposes_logical_input_shape(),
                 mask_decode_freeze_safe: binding.mask_decode_freeze_safe(),
+                fixed_physical_strides: binding.fixed_physical_strides(),
                 device_ptr: binding.device_ptr() as usize,
             })
             .collect()
+    }
+
+    pub(super) fn captured_graph_tokens_for_plan_index(
+        &self,
+        plan_index: usize,
+    ) -> [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT] {
+        std::array::from_fn(|index| {
+            let capture = &self.slot_capture[index];
+            capture
+                .capture_schedule
+                .as_ref()
+                .is_some_and(|schedule| {
+                    schedule.segments.iter().any(|segment| {
+                        segment.captured && (segment.start..segment.end).contains(&plan_index)
+                    })
+                })
+                .then_some(capture.device_graph_token)
+                .flatten()
+        })
     }
 
     fn bindings_match_graph_signature(&self, bindings: &[DeviceIoBinding]) -> bool {
@@ -1381,16 +1412,44 @@ impl Executor {
                             && expected.output_name.as_deref() == binding.output_name()
                             && expected.dtype == binding.dtype
                             && expected.physical_shape == binding.physical_shape()
-                            && expected.kernel_input_shape == binding.kernel_input_shape()
-                            && expected.accepts_output_subshape
-                                == (binding.binds_input()
-                                    && binding.logical_shape() != binding.physical_shape())
+                            && (expected.fixed_physical_strides
+                                || self.segmented_binding_keeps_dynamic_input_eager(binding)
+                                || (expected.kernel_input_shape == binding.kernel_input_shape()
+                                    && expected.accepts_output_subshape
+                                        == (binding.output_name().is_some()
+                                            && binding.logical_shape()
+                                                != binding.physical_shape())))
                             && expected.exposes_logical_input_shape
                                 == binding.exposes_logical_input_shape()
                             && expected.mask_decode_freeze_safe == binding.mask_decode_freeze_safe()
+                            && expected.fixed_physical_strides == binding.fixed_physical_strides()
                             && expected.device_ptr == binding.device_ptr() as usize
                     })
             })
+    }
+
+    fn segmented_binding_keeps_dynamic_input_eager(&self, binding: &DeviceIoBinding) -> bool {
+        if !binding.has_dynamic_logical_input_shape() || !binding.binds_input() {
+            return false;
+        }
+        let Some(schedule) = self.cap().capture_schedule.as_ref() else {
+            return false;
+        };
+        if schedule.is_single_graph() {
+            return false;
+        }
+        let Some(input) = self.input_index.get(binding.input_name()) else {
+            return false;
+        };
+        !schedule.segments.iter().any(|segment| {
+            segment.captured
+                && (segment.start..segment.end).any(|pi| {
+                    self.plan[pi]
+                        .inputs
+                        .iter()
+                        .any(|planned_input| planned_input.as_ref() == Some(input))
+                })
+        })
     }
 
     pub(super) fn prepare_external_bindings(
@@ -1482,6 +1541,7 @@ impl Executor {
                 )));
             }
             let physical_shape = binding.physical_shape();
+            let fixed_physical_strides = binding.fixed_physical_strides();
             let required = required_binding_bytes(dtype, physical_shape, input_name)?;
             if required > len {
                 return Err(SessionError::Internal(format!(
@@ -1501,6 +1561,8 @@ impl Executor {
                         dtype,
                         shape: Vec::new(),
                         accepts_subshape: false,
+                        strides: None,
+                        fixed_stride_shape: None,
                         ptr: ptr as usize,
                         len,
                         alignment,
@@ -1514,6 +1576,18 @@ impl Executor {
                     binding.kernel_input_shape()
                 });
                 value.accepts_subshape = false;
+                if fixed_physical_strides {
+                    dispatch::refill_contiguous_strides(
+                        value.strides.get_or_insert_default(),
+                        physical_shape,
+                    );
+                    let stable_shape = value.fixed_stride_shape.get_or_insert_default();
+                    stable_shape.clear();
+                    stable_shape.extend_from_slice(physical_shape);
+                } else {
+                    value.strides = None;
+                    value.fixed_stride_shape = None;
+                }
                 value.ptr = ptr as usize;
                 value.len = len;
                 value.alignment = alignment;
@@ -1553,6 +1627,8 @@ impl Executor {
                         dtype,
                         shape: Vec::new(),
                         accepts_subshape: false,
+                        strides: None,
+                        fixed_stride_shape: None,
                         ptr: ptr as usize,
                         len,
                         alignment,
@@ -1561,8 +1637,19 @@ impl Executor {
                 value.dtype = dtype;
                 value.shape.clear();
                 value.shape.extend_from_slice(binding.physical_shape());
-                value.accepts_subshape =
-                    bind_input && binding.logical_shape() != binding.physical_shape();
+                value.accepts_subshape = binding.logical_shape() != binding.physical_shape();
+                if fixed_physical_strides {
+                    dispatch::refill_contiguous_strides(
+                        value.strides.get_or_insert_default(),
+                        physical_shape,
+                    );
+                    let stable_shape = value.fixed_stride_shape.get_or_insert_default();
+                    stable_shape.clear();
+                    stable_shape.extend_from_slice(physical_shape);
+                } else {
+                    value.strides = None;
+                    value.fixed_stride_shape = None;
+                }
                 value.ptr = ptr as usize;
                 value.len = len;
                 value.alignment = alignment;

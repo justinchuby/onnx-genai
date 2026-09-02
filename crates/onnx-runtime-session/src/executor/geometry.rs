@@ -479,6 +479,32 @@ pub(super) fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize)
         && matches!(node.op_type.as_str(), "Shape" | "ReduceSum")
 }
 
+pub(super) fn binding_shape_result_is_observed(graph: &Graph, input: ValueId) -> bool {
+    let shape_outputs = graph
+        .nodes
+        .iter()
+        .filter(|(_, node)| {
+            node.is_default_domain()
+                && node.op_type == "Shape"
+                && node.inputs.first().copied().flatten() == Some(input)
+        })
+        .flat_map(|(_, node)| node.outputs.iter().copied())
+        .collect::<HashSet<_>>();
+    if shape_outputs.is_empty() {
+        return false;
+    }
+    graph
+        .outputs
+        .iter()
+        .any(|output| shape_outputs.contains(output))
+        || graph.nodes.iter().any(|(_, node)| {
+            node.inputs
+                .iter()
+                .flatten()
+                .any(|input| shape_outputs.contains(input))
+        })
+}
+
 /// Name a consumer that is *not* padded-capacity-safe, for attribution. Returns
 /// `None` for a capacity-safe consumer so callers can filter and format in one
 /// pass. Kept next to [`kernel_input_uses_padded_capacity`] so the allowlist and
@@ -1183,6 +1209,33 @@ fn describe_node(node: &Node) -> String {
 #[cfg(test)]
 mod gather_tests {
     use super::*;
+    use onnx_runtime_ir::static_shape;
+
+    #[test]
+    fn shape_capacity_is_not_assumed_when_the_result_is_observed() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let input = graph.create_named_value("mask", DataType::Int64, static_shape([1, 8]));
+        graph.add_input(input);
+        let shape = graph.create_named_value("shape", DataType::Int64, static_shape([2]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Shape",
+            vec![Some(input)],
+            vec![shape],
+        ));
+        assert!(!binding_shape_result_is_observed(&graph, input));
+
+        let observed = graph.create_named_value("observed", DataType::Int64, static_shape([2]));
+        graph.insert_node(Node::new(
+            NodeId(1),
+            "Identity",
+            vec![Some(shape)],
+            vec![observed],
+        ));
+        graph.add_output(observed);
+        assert!(binding_shape_result_is_observed(&graph, input));
+    }
 
     /// The element-at-a-time walk `gather_view` used to be, kept verbatim as the
     /// reference every fast path is checked against.

@@ -1106,6 +1106,10 @@ pub(super) struct ExternalValue {
     pub(super) dtype: DataType,
     pub(super) shape: Vec<usize>,
     pub(super) accepts_subshape: bool,
+    pub(super) strides: Option<Vec<i64>>,
+    /// Physical shape that remains capture-stable while `shape` exposes a
+    /// shorter logical prefix through fixed row strides.
+    pub(super) fixed_stride_shape: Option<Vec<usize>>,
     pub(super) ptr: usize,
     pub(super) len: usize,
     pub(super) alignment: usize,
@@ -1186,9 +1190,18 @@ pub(super) struct ExternalCaptureSig {
 }
 
 impl ExternalBindings {
+    fn capture_shape(value: &ExternalValue) -> &[usize] {
+        value.fixed_stride_shape.as_deref().unwrap_or(&value.shape)
+    }
+
     pub(super) fn seed_capture_shapes(&self, resolved: &mut HashMap<ValueId, Vec<usize>>) {
-        for (&vid, value) in self.inputs.iter().chain(&self.outputs) {
+        for (&vid, value) in &self.inputs {
             resolved.entry(vid).or_insert_with(|| value.shape.clone());
+        }
+        for (&vid, value) in &self.outputs {
+            if !value.accepts_subshape {
+                resolved.entry(vid).or_insert_with(|| value.shape.clone());
+            }
         }
     }
 
@@ -1206,7 +1219,7 @@ impl ExternalBindings {
                 vid,
                 is_input,
                 dtype: v.dtype,
-                shape: v.shape.clone(),
+                shape: Self::capture_shape(v).to_vec(),
                 ptr: v.ptr,
                 len: v.len,
             })
@@ -1235,7 +1248,7 @@ impl ExternalBindings {
             {
                 entry.dtype = value.dtype;
                 entry.shape.clear();
-                entry.shape.extend_from_slice(&value.shape);
+                entry.shape.extend_from_slice(Self::capture_shape(value));
                 entry.ptr = value.ptr;
                 entry.len = value.len;
             } else {
@@ -1243,7 +1256,7 @@ impl ExternalBindings {
                     vid,
                     is_input,
                     dtype: value.dtype,
-                    shape: value.shape.clone(),
+                    shape: Self::capture_shape(value).to_vec(),
                     ptr: value.ptr,
                     len: value.len,
                 });

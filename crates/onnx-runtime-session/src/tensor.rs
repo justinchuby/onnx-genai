@@ -245,6 +245,7 @@ pub(crate) struct DeviceBindingSpec {
     /// `q_seq == 1`, so a frozen mask is byte-identical and stays CUDA-graph
     /// capture-eligible). Only meaningful together with a mask input binding.
     pub(crate) decode_freeze_safe_mask: bool,
+    pub(crate) fixed_physical_strides: bool,
     /// Bytes reserved in the allocation. Defaults to the physical shape's byte
     /// size; larger values let a binding grow its exposed shape without moving.
     pub(crate) allocation_bytes: Option<usize>,
@@ -332,6 +333,10 @@ pub struct DeviceIoBinding {
     /// Whether a logical-exposing mask binding may be frozen to physical capacity
     /// for a single-token decode step (see [`DeviceBindingSpec::decode_freeze_safe_mask`]).
     decode_freeze_safe_mask: bool,
+    /// Keep the physical allocation's row strides while exposing a smaller
+    /// logical shape. Stateful record buffers use this to keep every batch row
+    /// at a fixed, capture-stable address as the record cursor grows.
+    fixed_physical_strides: bool,
     buffer: Option<DeviceBuffer>,
     allocator: Arc<dyn ExecutionProvider>,
     transfer_stats: DeviceBindingTransferStats,
@@ -359,6 +364,7 @@ impl DeviceIoBinding {
             logical_shape,
             expose_logical_input_shape,
             decode_freeze_safe_mask,
+            fixed_physical_strides,
             allocation_bytes,
             committed_ranges,
         } = spec;
@@ -408,6 +414,7 @@ impl DeviceIoBinding {
             logical_shape,
             expose_logical_input_shape,
             decode_freeze_safe_mask,
+            fixed_physical_strides,
             buffer: Some(buffer),
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
@@ -456,6 +463,7 @@ impl DeviceIoBinding {
             logical_shape,
             expose_logical_input_shape,
             decode_freeze_safe_mask,
+            fixed_physical_strides,
             allocation_bytes: _,
             committed_ranges: _,
         } = spec;
@@ -509,6 +517,7 @@ impl DeviceIoBinding {
             logical_shape,
             expose_logical_input_shape,
             decode_freeze_safe_mask,
+            fixed_physical_strides,
             buffer: Some(buffer),
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
@@ -550,6 +559,7 @@ impl DeviceIoBinding {
     pub fn has_dynamic_logical_input_shape(&self) -> bool {
         self.bind_input
             && self.expose_logical_input_shape
+            && !self.fixed_physical_strides
             && self.logical_shape != self.physical_shape
     }
 
@@ -577,6 +587,10 @@ impl DeviceIoBinding {
     /// [`exposes_logical_input_shape`]: Self::exposes_logical_input_shape
     pub fn mask_decode_freeze_safe(&self) -> bool {
         self.bind_input && self.decode_freeze_safe_mask
+    }
+
+    pub fn fixed_physical_strides(&self) -> bool {
+        self.fixed_physical_strides
     }
 
     pub(crate) fn set_device_graph_token(&mut self, token: DeviceGraphToken) {
@@ -1650,6 +1664,7 @@ mod tests {
                 logical_shape: vec![element_count],
                 expose_logical_input_shape: false,
                 decode_freeze_safe_mask: false,
+                fixed_physical_strides: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1732,6 +1747,7 @@ mod tests {
                 logical_shape: vec![1, 4096],
                 expose_logical_input_shape: true,
                 decode_freeze_safe_mask: false,
+                fixed_physical_strides: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1761,6 +1777,7 @@ mod tests {
                 logical_shape: vec![1, 5],
                 expose_logical_input_shape: false,
                 decode_freeze_safe_mask: false,
+                fixed_physical_strides: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1771,6 +1788,30 @@ mod tests {
         assert_eq!(physical_mask.kernel_input_shape(), &[1, 4096]);
         physical_mask.set_logical_shape(vec![1, 4096]).unwrap();
         assert!(!physical_mask.exposes_logical_input_shape());
+    }
+
+    #[test]
+    fn fixed_stride_binding_keeps_logical_shape_without_capture_decline() {
+        let binding = DeviceIoBinding::allocate(
+            shared_cpu_ep(),
+            DeviceBindingSpec {
+                input_name: "past_records".into(),
+                bind_input: true,
+                output_name: Some("present_records".into()),
+                dtype: DataType::Uint8,
+                physical_shape: vec![3, 65, 583],
+                logical_shape: vec![3, 2, 583],
+                expose_logical_input_shape: true,
+                decode_freeze_safe_mask: false,
+                fixed_physical_strides: true,
+                allocation_bytes: None,
+                committed_ranges: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(binding.kernel_input_shape(), &[3, 2, 583]);
+        assert!(binding.fixed_physical_strides());
+        assert!(!binding.has_dynamic_logical_input_shape());
     }
 
     /// A zeroed tensor is zero even when the allocation is not.

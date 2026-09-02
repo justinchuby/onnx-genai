@@ -44,6 +44,7 @@ def tiny_alternating_config(**overrides):
         model_type="deepseek_v4",
         hidden_size=32,
         num_hidden_layers=2,
+        max_position_embeddings=512,
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=512,

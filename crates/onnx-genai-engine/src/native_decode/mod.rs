@@ -250,6 +250,18 @@ pub struct CompressedRecordStateInfo {
 /// allocation/transfer/synchronization counters for its positive proof.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompressedStatePathStats {
+    /// Canonical compressed-state manifest plans admitted at setup. This is one
+    /// for an enabled plan and zero when compressed state is absent.
+    pub manifest_lookups: u64,
+    /// External state-source opens. The v1.8 native loader accepts no path/URI
+    /// source, so supported plans keep this at zero.
+    pub source_opens: u64,
+    /// External state-source read operations.
+    pub source_reads: u64,
+    /// External state-source bytes read.
+    pub source_bytes_read: u64,
+    /// External state-source memory mappings.
+    pub source_mmaps: u64,
     /// Hash-map probes made against the enabled compressed-state transition
     /// index. A disabled plan owns no index, so this remains exactly zero.
     pub state_map_lookups: u64,
@@ -261,6 +273,10 @@ pub struct CompressedStatePathStats {
     pub host_output_bytes: u64,
     /// Device allocations owned exclusively by compressed-state handling.
     pub device_allocations: u64,
+    /// One-time device zero-fill operations used to initialize governed state.
+    pub device_zero_fills: u64,
+    /// Bytes initialized by one-time governed-state device zero fills.
+    pub device_zero_fill_bytes: u64,
     /// Host-to-device copies requested by compressed-state handling.
     pub host_to_device_copies: u64,
     /// Device-to-host copies requested by compressed-state handling.
@@ -269,6 +285,8 @@ pub struct CompressedStatePathStats {
     pub device_to_device_copies: u64,
     /// Host-visible device synchronizations requested by compressed-state handling.
     pub synchronizations: u64,
+    /// Device events recorded solely for compressed-state setup or decode.
+    pub device_events: u64,
     /// Compressed-state telemetry updates.
     pub telemetry_updates: u64,
     /// Metadata clones performed solely to serve compressed-state handling.

@@ -178,6 +178,15 @@ fn malformed_and_unknown_compressed_fields_fail_closed() {
             ),
             "unknown field",
         ),
+        (
+            "arbitrary state source",
+            document.replacen(
+                "            kind: compressed_attention\n            properties:",
+                "            kind: compressed_attention\n            source:\n              path: ../../foreign-state.bin\n            properties:",
+                1,
+            ),
+            "unknown field",
+        ),
     ] {
         let error = match parse_metadata(&malformed, Some("yaml")) {
             Ok(_) => panic!("{label} must be rejected"),

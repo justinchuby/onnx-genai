@@ -2597,6 +2597,204 @@ fn native_cuda_fixed_state_restore_is_atomic_at_every_copy_stage() -> anyhow::Re
 }
 
 #[cfg(feature = "native-cuda")]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires a CUDA device; enable gpu-tests to execute"
+)]
+#[test]
+fn native_cuda_compressed_state_group_restore_is_atomic_first_middle_last() -> anyhow::Result<()> {
+    #[derive(Debug, PartialEq, Eq)]
+    struct StateIdentity {
+        logical_len: usize,
+        logical_shapes: Vec<Vec<usize>>,
+        bytes: Vec<Vec<u8>>,
+    }
+
+    fn build() -> anyhow::Result<NativeDecodeSession> {
+        let model = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny-deepseek-v4-csa/model.onnx.textproto");
+        NativeDecodeSession::load_with_cuda_options(
+            model,
+            NativeDecodeDevice::Cuda { index: Some(0) },
+            NativeDecodeCudaOptions {
+                decode_batch: None,
+                kv_max_len: Some(32),
+                metadata_max_len: None,
+                graph_capture: Some(false),
+                weight_offload_enabled: None,
+                weight_offload_stable_va: None,
+            },
+        )
+    }
+
+    fn advance(
+        session: &mut NativeDecodeSession,
+        tokens: &[TokenId],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let mut logits = Vec::new();
+        for &token in tokens {
+            logits = session.decode(&[token], session.current_len())?;
+        }
+        Ok(logits)
+    }
+
+    fn identity(session: &mut NativeDecodeSession) -> anyhow::Result<StateIdentity> {
+        let logical_len = session
+            .cuda_kv_debug_stats()
+            .context("CUDA debug stats")?
+            .logical_len;
+        let state = session.cuda.as_mut().context("CUDA decoder state")?;
+        let indices = state.snapshot_state_indices().collect::<Vec<_>>();
+        let logical_shapes = indices
+            .iter()
+            .map(|&index| state.bindings[index].logical_shape().to_vec())
+            .collect();
+        let mut bytes = Vec::with_capacity(indices.len());
+        for index in indices {
+            bytes.push(state.bindings[index].read_bytes()?);
+        }
+        Ok(StateIdentity {
+            logical_len,
+            logical_shapes,
+            bytes,
+        })
+    }
+
+    const PROMPT: [TokenId; 4] = [5, 7, 9, 11];
+    for failure_slot in [0usize, 3, 5] {
+        let expected = {
+            let mut oracle = build()?;
+            advance(&mut oracle, &PROMPT)?;
+            advance(&mut oracle, &[17])?
+        };
+        let mut session = build()?;
+        advance(&mut session, &PROMPT)?;
+        let scratch = session
+            .cuda
+            .as_ref()
+            .context("CUDA state")?
+            .scratch_journal_probe();
+        let snapshot = session.snapshot_recurrent_state()?;
+        assert_eq!(
+            snapshot
+                .device_scratch
+                .as_ref()
+                .context("CUDA snapshot")?
+                .buffers
+                .len(),
+            6,
+            "three records plus three carries must form one snapshot group"
+        );
+        advance(&mut session, &[13, 15])?;
+        let before = identity(&mut session)?;
+
+        let error = {
+            let _failure = cuda::fail_cuda_fixed_restore_at(failure_slot);
+            session
+                .restore_state_snapshot_at(&snapshot, PROMPT.len())
+                .expect_err("injected compressed-state member restore must abort")
+        };
+        assert!(
+            error.to_string().contains(&format!(
+                "injected CUDA fixed-state restore failure at slot {failure_slot}"
+            )),
+            "the exact failed group member must remain actionable: {error:#}"
+        );
+        assert_eq!(
+            identity(&mut session)?,
+            before,
+            "failure at compressed-state slot {failure_slot} published a partial group"
+        );
+        let failed = scratch.stats();
+        assert_eq!(failed.snapshot_allocations, 6);
+        assert_eq!(failed.restore_undo_allocations, 6);
+        assert_eq!(failed.mask_undo_allocations, 1);
+        assert_eq!(failed.live_allocations, 6);
+        assert_eq!(failed.pending_allocations, 7);
+        assert_eq!(failed.quarantined_allocations, 0);
+
+        session.restore_state_snapshot_at(&snapshot, PROMPT.len())?;
+        assert_eq!(
+            advance(&mut session, &[17])?,
+            expected,
+            "clean retry after compressed-state slot {failure_slot} must match a fresh generation"
+        );
+        drop(snapshot);
+        let retired = scratch.stats();
+        assert_eq!(retired.live_allocations, 0);
+        assert_eq!(retired.pending_allocations, 20);
+        scratch.settle()?;
+        let settled = scratch.stats();
+        assert_eq!(settled.pending_allocations, 0);
+        assert_eq!(settled.pending_bytes, 0);
+        assert_eq!(settled.settled_allocations, 20);
+        assert_eq!(settled.quarantined_allocations, 0);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-cuda")]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires a CUDA device; enable gpu-tests to execute"
+)]
+#[test]
+fn native_cuda_refuses_noncanonical_record_axes_before_vmm_allocation() -> anyhow::Result<()> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/tiny-deepseek-v4-csa");
+    let metadata = onnx_genai_metadata::load_metadata_from_dir(&dir)?
+        .context("CSA fixture metadata must be present")?;
+    let mut io = metadata
+        .decoder_io()
+        .context("canonical decoder ABI")?
+        .clone();
+    for group in &mut io.state_groups {
+        if group.kind == StateKind::CompressedAttention
+            && matches!(group.update, Some(StateUpdate::Append))
+        {
+            group.sequence_axis = Some(0);
+            for port in &mut group.ports {
+                port.batch_axis = Some(1);
+            }
+        }
+    }
+
+    onnx_runtime_ep_cuda::vmm_allocator::reset_global_vmm_stats();
+    let error = match NativeDecodeSession::load_with_cuda_options_and_io_spec(
+        dir.join("model.onnx.textproto"),
+        NativeDecodeDevice::Cuda { index: Some(0) },
+        NativeDecodeCudaOptions {
+            decode_batch: None,
+            kv_max_len: Some(32),
+            metadata_max_len: None,
+            graph_capture: Some(false),
+            weight_offload_enabled: None,
+            weight_offload_stable_va: None,
+        },
+        Some(&io),
+    ) {
+        Ok(_) => panic!("the CUDA CSA operator ABI must not guess swapped state axes"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .downcast_ref::<CompressedStateLoadRefusal>()
+            .is_some_and(|reason| matches!(
+                reason,
+                CompressedStateLoadRefusal::InvalidRecordLayout(message)
+                    if message.contains("sequence_axis 1")
+            )),
+        "axis refusal must remain typed and actionable: {error:#}"
+    );
+    assert_eq!(
+        onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats(),
+        Default::default(),
+        "invalid record axes must fail before any VMM state allocation"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "native-cuda")]
 fn input_update_stats(session: &NativeDecodeSession) -> [DeviceBindingTransferStats; 3] {
     let state = session.cuda.as_ref().expect("CUDA state");
     [
