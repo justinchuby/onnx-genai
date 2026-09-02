@@ -18,6 +18,7 @@
 //! | Element type | [`DataType`] |
 //! | Symbolic / static shapes | [`Shape`], [`Dim`], [`SymbolConstraints`] |
 //! | Physical strided layout | [`TensorLayout`], [`MemoryFormat`] |
+//! | Canonical Einsum planning | [`EinsumPlan`], [`EinsumClassification`] |
 //! | Device placement | [`DeviceType`], [`DeviceId`] |
 //! | Graph values (SSA edges) | [`Value`], [`ValueId`] |
 //! | Graph operations | [`Node`], [`NodeId`], [`Attribute`] |
@@ -35,12 +36,12 @@
 //!   producer/consumer edges consistent so optimization passes can rewrite it,
 //!   then it is shared immutably via `Arc` once frozen.
 //!
-//! Deep algorithms whose full implementation belongs to a later task (e.g.
-//! per-op shape inference) are represented here only by their data model; the
-//! `Graph` operations that are cheap and foundational (topological ordering,
-//! validation, edge rewiring, broadcasting, stride arithmetic) are fully
-//! implemented and unit-tested so downstream crates compile against a stable,
-//! working surface.
+//! Per-op graph shape inference remains in `onnx-runtime-shape-inference`.
+//! Shared semantic contracts needed by both inference and execution providers,
+//! such as [`EinsumPlan`], live here so every consumer validates and classifies
+//! an operator exactly once. The `Graph` operations that are cheap and
+//! foundational (topological ordering, validation, edge rewiring, broadcasting,
+//! stride arithmetic) are likewise fully implemented and unit-tested.
 
 #![forbid(unsafe_code)]
 
@@ -48,6 +49,7 @@ mod arena;
 mod device;
 mod domain;
 mod dtype;
+mod einsum;
 mod error;
 mod graph;
 mod graph_view;
@@ -62,6 +64,14 @@ pub use arena::{Arena, ArenaKey};
 pub use device::{DeviceId, DeviceType};
 pub use domain::{AI_ONNX_DOMAIN, is_default_domain, normalize_domain};
 pub use dtype::DataType;
+pub use einsum::{
+    EinsumAxis, EinsumAxisRef, EinsumClassification, EinsumConcreteGemmGeometry,
+    EinsumContractionPlan, EinsumDimension, EinsumDimensionRule, EinsumDimensionValue,
+    EinsumEquationSide, EinsumGemmGeometry, EinsumInput, EinsumLabel, EinsumLogicalAxis,
+    EinsumOperandAxis, EinsumOperandPlan, EinsumOverflowTarget, EinsumPermutationPlan, EinsumPlan,
+    EinsumPlanError, EinsumPlanErrorKind, EinsumReductionPlan, EinsumResolveError,
+    EinsumUnsupportedReason,
+};
 pub use error::{GraphError, IrError, Result};
 pub use graph::{Graph, ModelFunction, ModelFunctionKey};
 pub use graph_view::{ConsumerUse, FrozenGraph, GraphView, GraphViewCache, NodeIndex, ValueIndex};

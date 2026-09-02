@@ -297,6 +297,12 @@ impl From<onnx_runtime_ir::Dim> for DimExpr {
     }
 }
 
+impl onnx_runtime_ir::EinsumDimensionValue for DimExpr {
+    fn einsum_static_size(&self) -> Option<usize> {
+        usize::try_from(self.as_const()?).ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
