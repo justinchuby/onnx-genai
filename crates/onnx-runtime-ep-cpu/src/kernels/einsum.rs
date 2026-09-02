@@ -1,6 +1,6 @@
 //! Native CPU execution for ONNX `Einsum` (opset 12).
 //!
-//! The equation is parsed exactly once, by [`EinsumPlan`], when the
+//! The equation is parsed exactly once, by [`EinsumShapePlan`], when the
 //! shape-specialized kernel is built. Execution consumes only the plan's
 //! structural classification and axis maps.
 
@@ -12,8 +12,8 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{
     DataType, EinsumAxis, EinsumClassification, EinsumContractionPlan, EinsumInput,
-    EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumReductionPlan, Node, Shape,
-    compute_contiguous_strides,
+    EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumReductionPlan, EinsumShapePlan,
+    Node, Shape, compute_contiguous_strides,
 };
 use rayon::prelude::*;
 
@@ -63,7 +63,7 @@ struct EinsumScratch {
 
 /// Shape-specialized CPU Einsum kernel.
 pub struct EinsumKernel {
-    plan: EinsumPlan,
+    plan: EinsumShapePlan,
     matmul: MatMulKernel,
     scratch: RefCell<EinsumScratch>,
     mode: ExecutionMode,
@@ -87,7 +87,7 @@ impl KernelFactory for EinsumFactory {
             ));
         }
         let input_shape_refs: Vec<_> = input_shapes.iter().map(Vec::as_slice).collect();
-        let plan = EinsumPlan::build_for_shapes(equation, &input_shape_refs).map_err(|error| {
+        let plan = EinsumShapePlan::build(equation, &input_shape_refs).map_err(|error| {
             EpError::KernelFailed(format!(
                 "Einsum: canonical planning failed for `{equation}`: {error}"
             ))
@@ -943,7 +943,7 @@ fn collapse_group(shape: &[usize], strides: &[i64]) -> Option<(usize, i64)> {
 }
 
 fn collapsed_output_layout(
-    plan: &EinsumPlan,
+    plan: &EinsumShapePlan,
     gemm: &EinsumContractionPlan,
     output: &TensorMut,
 ) -> Option<Layout> {
@@ -960,7 +960,10 @@ fn collapsed_output_layout(
     )
 }
 
-fn canonical_output_shape(plan: &EinsumPlan, gemm: &EinsumContractionPlan) -> Result<Vec<usize>> {
+fn canonical_output_shape(
+    plan: &EinsumShapePlan,
+    gemm: &EinsumContractionPlan,
+) -> Result<Vec<usize>> {
     let mut axes = Vec::new();
     axes.extend_from_slice(gemm.batch_axes());
     axes.extend_from_slice(gemm.left_free_axes());
@@ -969,7 +972,7 @@ fn canonical_output_shape(plan: &EinsumPlan, gemm: &EinsumContractionPlan) -> Re
 }
 
 fn canonical_output_strides(
-    plan: &EinsumPlan,
+    plan: &EinsumShapePlan,
     gemm: &EinsumContractionPlan,
     output: &TensorMut,
 ) -> Result<Vec<i64>> {
@@ -1010,7 +1013,7 @@ fn canonical_output_strides(
 }
 
 fn write_canonical_output(
-    plan: &EinsumPlan,
+    plan: &EinsumShapePlan,
     gemm: &EinsumContractionPlan,
     data: &[f32],
     output: &mut TensorMut,
@@ -1028,7 +1031,7 @@ fn flattened_gemm_shape(batch_shape: &[usize], rows: usize, columns: usize) -> V
     shape
 }
 
-fn axes_shape(plan: &EinsumPlan, axes: &[EinsumAxis]) -> Result<Vec<usize>> {
+fn axes_shape(plan: &EinsumShapePlan, axes: &[EinsumAxis]) -> Result<Vec<usize>> {
     axes.iter()
         .map(|axis| {
             plan.logical_axes()
@@ -1189,7 +1192,7 @@ mod tests {
             Attribute::String(equation.as_bytes().to_vec()),
         );
         let input_shape_refs: Vec<_> = shapes.iter().map(Vec::as_slice).collect();
-        let plan = EinsumPlan::build_for_shapes(equation, &input_shape_refs).unwrap();
+        let plan = EinsumShapePlan::build(equation, &input_shape_refs).unwrap();
         Box::new(EinsumKernel {
             flops: None,
             plan,

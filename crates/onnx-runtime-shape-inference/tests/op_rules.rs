@@ -5101,6 +5101,20 @@ fn einsum_matmul_transpose_and_implicit() {
 }
 
 #[test]
+fn einsum_shape_inference_preserves_supported_float_dtype() {
+    for dtype in [DataType::Float16, DataType::Float32] {
+        let out = run(
+            &einsum_node("ij->ji", 1),
+            vec![tin(dtype, vec![c(2), c(3)])],
+            12,
+        );
+        let type_info = out[0].type_info.as_ref().unwrap();
+        assert_eq!(type_info.dtype, dtype);
+        assert_eq!(type_info.shape, vec![c(3), c(2)]);
+    }
+}
+
+#[test]
 fn einsum_ellipsis_broadcasts_fixed_rank_batch_dims() {
     let out = run(
         &einsum_node("...ij,...jk->...ik", 2),

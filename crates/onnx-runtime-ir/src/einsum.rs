@@ -1,11 +1,12 @@
 //! Canonical, execution-provider-neutral planning for ONNX `Einsum` (opset 12).
 //!
-//! [`EinsumPlan`] is the single parsed and validated representation shared by
-//! shape inference and native execution providers. It records logical axes,
-//! diagonal groups, equality/broadcast constraints, output order, reductions,
-//! and structural lowering data. CPU and CUDA consumers therefore never need to
-//! reparse an equation or infer contraction roles from concrete dimension
-//! values.
+//! [`EinsumPlan`] is the typed, parsed, and validated representation used by
+//! shape inference and typed execution-provider admission. [`EinsumShapePlan`]
+//! carries the same structural contract for factories that receive shapes but
+//! no dtype. Both record logical axes, diagonal groups, equality/broadcast
+//! constraints, output order, reductions, and structural lowering data, so
+//! consumers never need to reparse an equation or infer contraction roles from
+//! concrete dimension values.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -955,18 +956,11 @@ pub enum EinsumResolveError<E> {
     },
 }
 
-/// A normalized, validated, immutable einsum equation/shape plan.
+/// A normalized, validated, immutable typed Einsum plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EinsumPlan {
-    equation: String,
-    explicit_output: bool,
-    operands: Vec<EinsumOperandPlan>,
-    logical_axes: Vec<EinsumLogicalAxis>,
-    output_axes: Vec<EinsumAxis>,
-    output_shape: Vec<EinsumDimension>,
-    reduction_axes: Vec<EinsumAxis>,
-    classification: EinsumClassification,
-    static_output_numel: Option<usize>,
+    dtype: DataType,
+    shape: EinsumShapePlan,
 }
 
 impl EinsumPlan {
@@ -978,10 +972,114 @@ impl EinsumPlan {
     ) -> Result<Self, EinsumPlanError> {
         let normalized = normalize_equation(equation);
         let parsed = ParsedEquation::parse(&normalized, inputs.len())?;
-        let input_meta = validate_inputs(&normalized, inputs)?;
-        build_plan(normalized, parsed, input_meta)
+        let (dtype, input_meta) = validate_inputs(&normalized, inputs)?;
+        let shape = build_shape_plan(normalized, parsed, input_meta)?;
+        Ok(Self { dtype, shape })
     }
 
+    /// Shared input/output dtype.
+    pub const fn dtype(&self) -> DataType {
+        self.dtype
+    }
+
+    /// The structural plan, which carries no dtype claim.
+    pub const fn shape_plan(&self) -> &EinsumShapePlan {
+        &self.shape
+    }
+
+    /// Whitespace-free canonical equation.
+    pub fn equation(&self) -> &str {
+        self.shape.equation()
+    }
+
+    /// Whether the source equation supplied an explicit `->` output.
+    pub const fn has_explicit_output(&self) -> bool {
+        self.shape.has_explicit_output()
+    }
+
+    /// Canonical operand mappings.
+    pub fn operands(&self) -> &[EinsumOperandPlan] {
+        self.shape.operands()
+    }
+
+    /// Canonical logical axes, in ellipsis-then-ASCII-label order.
+    pub fn logical_axes(&self) -> &[EinsumLogicalAxis] {
+        self.shape.logical_axes()
+    }
+
+    /// Requested output axes in exact output order.
+    pub fn output_axes(&self) -> &[EinsumAxis] {
+        self.shape.output_axes()
+    }
+
+    /// Statically known output extents.
+    pub fn output_shape(&self) -> &[EinsumDimension] {
+        self.shape.output_shape()
+    }
+
+    /// Logical axes summed out by the equation.
+    pub fn reduction_axes(&self) -> &[EinsumAxis] {
+        self.shape.reduction_axes()
+    }
+
+    /// Structural lowering class and its complete axis mappings.
+    pub const fn classification(&self) -> &EinsumClassification {
+        self.shape.classification()
+    }
+
+    /// Static output element count when every output dimension is known.
+    pub const fn static_output_numel(&self) -> Option<usize> {
+        self.shape.static_output_numel()
+    }
+
+    /// Resolve the output using the exact symbolic dimensions from which this
+    /// plan was built.
+    pub fn resolve_output_shape<D: Clone, E>(
+        &self,
+        input_shapes: &[&[D]],
+        broadcast: impl FnMut(&D, &D) -> Result<D, E>,
+    ) -> Result<Vec<D>, EinsumResolveError<E>> {
+        self.shape.resolve_output_shape(input_shapes, broadcast)
+    }
+
+    /// Validate concrete runtime shapes against this already-parsed plan and
+    /// return the exact output shape without reparsing the equation.
+    pub fn resolve_concrete_output_shape(
+        &self,
+        input_shapes: &[&[usize]],
+    ) -> Result<Vec<usize>, EinsumPlanError> {
+        self.shape.resolve_concrete_output_shape(input_shapes)
+    }
+
+    /// Resolve checked concrete B/M/K/N geometry for a GEMM/BMM-classified
+    /// plan. Returns `Ok(None)` for every other classification.
+    pub fn resolve_concrete_gemm_geometry(
+        &self,
+        input_shapes: &[&[usize]],
+    ) -> Result<Option<EinsumConcreteGemmGeometry>, EinsumPlanError> {
+        self.shape.resolve_concrete_gemm_geometry(input_shapes)
+    }
+}
+
+/// A normalized, validated, immutable Einsum equation/shape plan with no dtype.
+///
+/// This representation is for consumers whose construction API receives
+/// shapes but not tensor dtypes. It cannot be mistaken for a typed
+/// [`EinsumPlan`] and therefore cannot claim a fabricated runtime dtype.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EinsumShapePlan {
+    equation: String,
+    explicit_output: bool,
+    operands: Vec<EinsumOperandPlan>,
+    logical_axes: Vec<EinsumLogicalAxis>,
+    output_axes: Vec<EinsumAxis>,
+    output_shape: Vec<EinsumDimension>,
+    reduction_axes: Vec<EinsumAxis>,
+    classification: EinsumClassification,
+    static_output_numel: Option<usize>,
+}
+
+impl EinsumShapePlan {
     /// Parse and validate an opset-12 equation against input shapes, then
     /// classify its lowering structurally.
     ///
@@ -990,7 +1088,7 @@ impl EinsumPlan {
     /// dtypes; their provider capability gate and runtime kernel must validate
     /// the real dtype separately. Using a fabricated dtype here would let a
     /// direct factory call bypass the canonical ONNX type contract.
-    pub fn build_for_shapes<D: EinsumDimensionValue>(
+    pub fn build<D: EinsumDimensionValue>(
         equation: &str,
         input_shapes: &[&[D]],
     ) -> Result<Self, EinsumPlanError> {
@@ -1009,7 +1107,7 @@ impl EinsumPlan {
                     .collect(),
             })
             .collect();
-        build_plan(normalized, parsed, input_meta)
+        build_shape_plan(normalized, parsed, input_meta)
     }
 
     /// Whitespace-free canonical equation.
@@ -1457,7 +1555,7 @@ struct InputMeta {
 fn validate_inputs<D: EinsumDimensionValue>(
     equation: &str,
     inputs: &[EinsumInput<'_, D>],
-) -> Result<Vec<InputMeta>, EinsumPlanError> {
+) -> Result<(DataType, Vec<InputMeta>), EinsumPlanError> {
     let mut result = Vec::with_capacity(inputs.len());
     let mut expected_dtype = None;
     for (input, metadata) in inputs.iter().enumerate() {
@@ -1498,7 +1596,9 @@ fn validate_inputs<D: EinsumDimensionValue>(
                 .collect(),
         });
     }
-    Ok(result)
+    let dtype = expected_dtype
+        .ok_or_else(|| EinsumPlanError::new(equation, EinsumPlanErrorKind::NoInputs))?;
+    Ok((dtype, result))
 }
 
 fn normalize_equation(equation: &str) -> String {
@@ -1525,11 +1625,11 @@ fn is_opset12_dtype(dtype: DataType) -> bool {
     )
 }
 
-fn build_plan(
+fn build_shape_plan(
     equation: String,
     parsed: ParsedEquation,
     input_meta: Vec<InputMeta>,
-) -> Result<EinsumPlan, EinsumPlanError> {
+) -> Result<EinsumShapePlan, EinsumPlanError> {
     let mut ellipsis_ranks = Vec::with_capacity(input_meta.len());
     let mut explicit_ellipsis = None;
     for (input, (term, metadata)) in parsed.inputs.iter().zip(&input_meta).enumerate() {
@@ -1764,7 +1864,7 @@ fn build_plan(
         &reduction_axes,
     )?;
 
-    Ok(EinsumPlan {
+    Ok(EinsumShapePlan {
         equation,
         explicit_output,
         operands: operand_axes,
@@ -2799,7 +2899,7 @@ mod tests {
     fn shape_only_planning_does_not_fabricate_a_dtype() {
         let left = [2usize, 3];
         let right = [3usize, 4];
-        let plan = EinsumPlan::build_for_shapes("ik,kj->ij", &[&left, &right]).unwrap();
+        let plan = EinsumShapePlan::build("ik,kj->ij", &[&left, &right]).unwrap();
         assert!(matches!(
             plan.classification(),
             EinsumClassification::Gemm(_)

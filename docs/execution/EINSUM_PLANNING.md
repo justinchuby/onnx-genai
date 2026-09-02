@@ -1,8 +1,11 @@
 # Native Einsum planning contract
 
-`onnx-runtime-ir::EinsumPlan` is the execution-provider-neutral contract for
-ONNX `Einsum` opset 12. Shape inference and every native EP consume this plan;
-they must not reparse `equation` or classify an equation by matching its string.
+`onnx-runtime-ir::EinsumPlan` is the typed execution-provider-neutral contract
+for ONNX `Einsum` opset 12 and preserves the exact validated input/output dtype.
+`EinsumShapePlan` carries the same structural contract for kernel factories
+that receive shapes but no dtype; it cannot claim a fabricated dtype. Shape
+inference and native EPs consume the appropriate representation and must not
+reparse `equation` or classify an equation by matching its string.
 
 ## Guarantees
 
