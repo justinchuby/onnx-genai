@@ -2005,7 +2005,7 @@ fn einsum_captured_descriptor_benchmark() {
     let expect_runnable = std::env::var("EINSUM_BENCH_EXPECT_RUNNABLE")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(3);
+        .unwrap_or(4);
     let max_drift_percent = std::env::var("EINSUM_BENCH_MAX_DRIFT_PERCENT")
         .ok()
         .and_then(|value| value.parse().ok())

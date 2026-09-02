@@ -28,7 +28,10 @@ if [[ "$ONNX_GENAI_CUDA_PHYSICAL_DEVICE" != "$CUDA_VISIBLE_DEVICES" ]]; then
     exit 2
 fi
 
-PROVENANCE=$(scripts/hostlock.sh provenance --oneline --expect-runnable "${EINSUM_BENCH_EXPECT_RUNNABLE:-3}")
+# The outer `--gate 3` is evaluated before launching the command. This
+# in-command provenance probe adds its own runnable process, so its equivalent
+# after-the-fact threshold is four.
+PROVENANCE=$(scripts/hostlock.sh provenance --oneline --expect-runnable "${EINSUM_BENCH_EXPECT_RUNNABLE:-4}")
 printf 'HOSTLOCK_SCRIPT,%s\n' "$PROVENANCE"
 for required in \
     hostlock_state=HELD declared=yes held_owner_source=flag \
