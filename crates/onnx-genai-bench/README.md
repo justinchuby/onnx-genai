@@ -1,6 +1,7 @@
 # onnx-genai benchmarks
 
-The deterministic FreeToken byte-accounting harness is documented in
+The deterministic FreeToken estimate model and observed production-receipt
+harness are documented in
 [`../../docs/benchmarks/FREETOKEN_BYTE_AB.md`](../../docs/benchmarks/FREETOKEN_BYTE_AB.md).
 
 This crate keeps a fixed Criterion scenario suite for comparing runtime performance across

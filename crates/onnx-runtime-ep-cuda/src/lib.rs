@@ -84,6 +84,7 @@ compile_error!(
 
 pub mod arch;
 pub mod blas;
+pub mod byte_telemetry;
 pub mod capture;
 pub mod cudnn;
 pub mod cufft;

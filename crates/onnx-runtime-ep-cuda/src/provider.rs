@@ -1271,6 +1271,55 @@ impl std::fmt::Debug for CudaExecutionProvider {
 }
 
 impl CudaExecutionProvider {
+    /// Open one bounded observed-byte session for an exact executor generation.
+    ///
+    /// Provider and device identity are derived here rather than accepted from
+    /// public labels. The returned ledger is read/reset/close authority only;
+    /// its recorder stays private inside this provider runtime.
+    pub fn open_observed_byte_session(
+        &self,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        logical_session: u64,
+        event_capacity: usize,
+    ) -> Result<crate::byte_telemetry::ObservedByteLedger> {
+        if executor == ExecutorInstanceId::UNSCOPED {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: observed-byte session requires a nonzero executor identity for provider \
+                 {} on CUDA:{}",
+                self.artifact_provider_id.get(),
+                self.runtime.ordinal()
+            )));
+        }
+        if generation.get() == 0 || logical_session == 0 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: observed-byte session for executor {} requires nonzero generation and \
+                 logical-session identities, got generation={} logical_session={logical_session}",
+                executor.get(),
+                generation.get()
+            )));
+        }
+        let ledger = crate::byte_telemetry::ObservedByteLedger::new(
+            crate::byte_telemetry::ObservedScope {
+                provider: self.artifact_provider_id.get(),
+                device: self.runtime.ordinal(),
+                executor: executor.get(),
+                generation: generation.get(),
+                logical_session,
+            },
+            event_capacity,
+        )
+        .map_err(|error| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: create observed-byte session for executor {} generation {}: {error}",
+                executor.get(),
+                generation.get()
+            ))
+        })?;
+        self.runtime.install_observed_byte_ledger(&ledger)?;
+        Ok(ledger)
+    }
+
     fn artifact_policy(&self) -> ExecutorArtifactPolicy {
         ExecutorArtifactPolicy::new(
             self.artifact_provider_id,

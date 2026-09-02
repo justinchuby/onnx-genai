@@ -51,6 +51,7 @@ onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-quantization = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 half = { workspace = true }
 libloading = { workspace = true }
 arc-swap = { workspace = true }

@@ -34,6 +34,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, NodeId, ValueId};
 use onnx_runtime_memory_governor::{AllocationReleaseState, Tier, VirtualBacking};
 
+use crate::byte_telemetry::{EventSpec, ObservedBoundary, ObservedCategory, ObservedStatus};
 use crate::deferred_release::{
     CudaDeferredReleaseQueue, DeferredActionOutcome, DeferredReleaseAction, RetainedOwnership,
 };
@@ -1652,6 +1653,7 @@ enum WeightReleaseAction {
     VmmSpan {
         allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
         allowance: onnx_runtime_memory_governor::MappedAllowance,
+        recorder: Option<crate::byte_telemetry::ProductionByteRecorder>,
         ptr: CUdeviceptr,
         len: usize,
     },
@@ -1660,6 +1662,7 @@ enum WeightReleaseAction {
     VmmSlot {
         allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
         allowance: onnx_runtime_memory_governor::MappedAllowance,
+        recorder: Option<crate::byte_telemetry::ProductionByteRecorder>,
         ptr: CUdeviceptr,
         len: usize,
         slot_state: Option<Arc<SlotOperationState>>,
@@ -1669,6 +1672,7 @@ enum WeightReleaseAction {
     RetainedVmmSlot {
         allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
         allowance: onnx_runtime_memory_governor::MappedAllowance,
+        recorder: Option<crate::byte_telemetry::ProductionByteRecorder>,
         ptr: CUdeviceptr,
         len: usize,
         slot_state: Option<Arc<SlotOperationState>>,
@@ -1747,6 +1751,7 @@ impl WeightReleaseAction {
             Self::VmmSpan {
                 allocator,
                 allowance,
+                recorder,
                 ptr,
                 len,
             } => {
@@ -1768,6 +1773,14 @@ impl WeightReleaseAction {
                         accounting,
                     } => {
                         Self::refund(&allowance, accounting.unmapped_bytes);
+                        if let Some(recorder) = recorder {
+                            let _ = recorder.record(EventSpec::new(
+                                ObservedCategory::VmmUnmap,
+                                ObservedBoundary::WeightVmmUnmap,
+                                ObservedStatus::Reclaimed,
+                                accounting.unmapped_bytes,
+                            ));
+                        }
                         DeferredActionOutcome::released(accounting.unmapped_bytes)
                     }
                     onnx_runtime_memory_governor::AllocationReleaseOutcome::Quarantined {
@@ -1777,6 +1790,22 @@ impl WeightReleaseAction {
                         // Refund only what really became unmapped; the residual
                         // stays charged and its allocator stays pinned.
                         Self::refund(&allowance, accounting.unmapped_bytes);
+                        if let Some(recorder) = recorder {
+                            let _ = recorder.record_pair(
+                                EventSpec::new(
+                                    ObservedCategory::VmmUnmap,
+                                    ObservedBoundary::WeightVmmUnmap,
+                                    ObservedStatus::Reclaimed,
+                                    accounting.unmapped_bytes,
+                                ),
+                                EventSpec::new(
+                                    ObservedCategory::VmmUnmap,
+                                    ObservedBoundary::WeightVmmUnmap,
+                                    ObservedStatus::Quarantined,
+                                    residual.retained_bytes,
+                                ),
+                            );
+                        }
                         DeferredActionOutcome::quarantined(
                             residual.state,
                             accounting.unmapped_bytes,
@@ -1792,6 +1821,14 @@ impl WeightReleaseAction {
                         )
                     }
                     onnx_runtime_memory_governor::AllocationReleaseOutcome::Failed { failure } => {
+                        if let Some(recorder) = recorder {
+                            let _ = recorder.record(EventSpec::new(
+                                ObservedCategory::VmmUnmap,
+                                ObservedBoundary::WeightVmmUnmap,
+                                ObservedStatus::Quarantined,
+                                len as u64,
+                            ));
+                        }
                         DeferredActionOutcome::quarantined(
                             AllocationReleaseState::Quarantined,
                             0,
@@ -1808,6 +1845,7 @@ impl WeightReleaseAction {
             Self::VmmSlot {
                 allocator,
                 allowance,
+                recorder,
                 ptr,
                 len,
                 slot_state,
@@ -1822,6 +1860,26 @@ impl WeightReleaseAction {
                 match outcome {
                     Ok(crate::vmm_allocator::DecommitOutcome::Complete { accounting }) => {
                         Self::refund(&allowance, accounting.unmapped_bytes);
+                        if let Some(recorder) = recorder {
+                            let _ = recorder.record_pair(
+                                EventSpec::new(
+                                    ObservedCategory::VmmUnmap,
+                                    ObservedBoundary::WeightVmmUnmap,
+                                    ObservedStatus::Reclaimed,
+                                    accounting.unmapped_bytes,
+                                ),
+                                EventSpec::new(
+                                    ObservedCategory::DeviceRelease,
+                                    ObservedBoundary::WeightVmmUnmap,
+                                    if accounting.quarantined_owned_bytes == 0 {
+                                        ObservedStatus::Reclaimed
+                                    } else {
+                                        ObservedStatus::Quarantined
+                                    },
+                                    accounting.quarantined_owned_bytes,
+                                ),
+                            );
+                        }
                         // Only a terminally complete decommit reopens the slot.
                         if let Some(state) = slot_state.as_ref() {
                             state.finish_release();
@@ -1854,6 +1912,14 @@ impl WeightReleaseAction {
                         if let Some(state) = slot_state.as_ref() {
                             state.poison();
                         }
+                        if let Some(recorder) = recorder {
+                            let _ = recorder.record(EventSpec::new(
+                                ObservedCategory::VmmUnmap,
+                                ObservedBoundary::WeightVmmUnmap,
+                                ObservedStatus::RolledBack,
+                                len as u64,
+                            ));
+                        }
                         DeferredActionOutcome::quarantined(
                             AllocationReleaseState::Quarantined,
                             0,
@@ -1871,6 +1937,22 @@ impl WeightReleaseAction {
                         reason,
                     }) => {
                         Self::refund(&allowance, accounting.unmapped_bytes);
+                        if let Some(recorder) = recorder {
+                            let _ = recorder.record_pair(
+                                EventSpec::new(
+                                    ObservedCategory::VmmUnmap,
+                                    ObservedBoundary::WeightVmmUnmap,
+                                    ObservedStatus::Reclaimed,
+                                    accounting.unmapped_bytes,
+                                ),
+                                EventSpec::new(
+                                    ObservedCategory::DeviceRelease,
+                                    ObservedBoundary::WeightVmmUnmap,
+                                    ObservedStatus::Quarantined,
+                                    residual.retained_bytes,
+                                ),
+                            );
+                        }
                         if let Some(state) = slot_state.as_ref() {
                             state.poison();
                         }
@@ -1893,6 +1975,14 @@ impl WeightReleaseAction {
                         if let Some(state) = slot_state.as_ref() {
                             state.poison();
                         }
+                        if let Some(recorder) = recorder {
+                            let _ = recorder.record(EventSpec::new(
+                                ObservedCategory::VmmUnmap,
+                                ObservedBoundary::WeightVmmUnmap,
+                                ObservedStatus::Quarantined,
+                                len as u64,
+                            ));
+                        }
                         DeferredActionOutcome::quarantined(
                             AllocationReleaseState::Quarantined,
                             0,
@@ -1909,19 +1999,32 @@ impl WeightReleaseAction {
             Self::RetainedVmmSlot {
                 allocator,
                 allowance,
+                recorder,
                 ptr,
                 len,
                 slot_state,
-            } => DeferredActionOutcome::quarantined(
-                AllocationReleaseState::Quarantined,
-                0,
-                format!("stable weight slot at {ptr:#x} already had a pending or poisoned release"),
-                Some(RetainedOwnership {
-                    bytes: len as u64,
-                    detail: String::from("duplicate stable-VA weight-slot release"),
-                    keep_alive: Box::new((allocator, allowance, slot_state)),
-                }),
-            ),
+            } => {
+                if let Some(recorder) = recorder {
+                    let _ = recorder.record(EventSpec::new(
+                        ObservedCategory::VmmUnmap,
+                        ObservedBoundary::WeightVmmUnmap,
+                        ObservedStatus::Quarantined,
+                        len as u64,
+                    ));
+                }
+                DeferredActionOutcome::quarantined(
+                    AllocationReleaseState::Quarantined,
+                    0,
+                    format!(
+                        "stable weight slot at {ptr:#x} already had a pending or poisoned release"
+                    ),
+                    Some(RetainedOwnership {
+                        bytes: len as u64,
+                        detail: String::from("duplicate stable-VA weight-slot release"),
+                        keep_alive: Box::new((allocator, allowance, slot_state)),
+                    }),
+                )
+            }
         }
     }
 }
@@ -2020,6 +2123,7 @@ impl CudaWeightPage {
                         return Some(WeightReleaseAction::RetainedVmmSlot {
                             allocator,
                             allowance,
+                            recorder: self.runtime.observed_byte_recorder(),
                             ptr: self.ptr,
                             len: self.len,
                             slot_state,
@@ -2028,6 +2132,7 @@ impl CudaWeightPage {
                     Some(WeightReleaseAction::VmmSlot {
                         allocator,
                         allowance,
+                        recorder: self.runtime.observed_byte_recorder(),
                         ptr: self.ptr,
                         len: self.len,
                         slot_state,
@@ -2036,6 +2141,7 @@ impl CudaWeightPage {
                     Some(WeightReleaseAction::VmmSpan {
                         allocator,
                         allowance,
+                        recorder: self.runtime.observed_byte_recorder(),
                         ptr: self.ptr,
                         len: self.len,
                     })
@@ -2326,6 +2432,7 @@ impl CudaWeightPage {
 }
 
 pub(crate) fn fill_staging_from_regions(
+    runtime: &CudaRuntime,
     weight: &LazyWeight,
     source: &dyn MmapRegionSource,
     staging: &mut PinnedStaging,
@@ -2360,6 +2467,26 @@ pub(crate) fn fill_staging_from_regions(
     GLOBAL_STAGING_FILL_CALLS.fetch_add(1, Ordering::Relaxed);
     GLOBAL_STAGING_FILL_REGIONS.fetch_add(weight.regions.len() as u64, Ordering::Relaxed);
     GLOBAL_STAGING_FILL_BYTES.fetch_add(total as u64, Ordering::Relaxed);
+    runtime.observe_byte_pair(
+        EventSpec::new(
+            ObservedCategory::SourceRead,
+            ObservedBoundary::MmapMaterialize,
+            ObservedStatus::Unsupported,
+            0,
+        ),
+        EventSpec::new(
+            ObservedCategory::MmapPageIn,
+            ObservedBoundary::MmapMaterialize,
+            ObservedStatus::Unsupported,
+            0,
+        ),
+    );
+    runtime.observe_bytes(EventSpec::new(
+        ObservedCategory::HostWrite,
+        ObservedBoundary::MmapMaterialize,
+        ObservedStatus::Completed,
+        total as u64,
+    ));
     Ok(())
 }
 
@@ -4573,6 +4700,34 @@ impl CudaWeightResidency {
                         reason: "resolved bytes differ from finalized dtype/shape/catalog".into(),
                     });
                 }
+                self.runtime.observe_byte_pair(
+                    EventSpec::new(
+                        ObservedCategory::SourceRead,
+                        ObservedBoundary::MmapMaterialize,
+                        ObservedStatus::Unsupported,
+                        0,
+                    ),
+                    EventSpec::new(
+                        ObservedCategory::MmapPageIn,
+                        ObservedBoundary::MmapMaterialize,
+                        ObservedStatus::Unsupported,
+                        0,
+                    ),
+                );
+                self.runtime.observe_byte_pair(
+                    EventSpec::new(
+                        ObservedCategory::HostAllocation,
+                        ObservedBoundary::MmapMaterialize,
+                        ObservedStatus::Committed,
+                        resident.bytes().len() as u64,
+                    ),
+                    EventSpec::new(
+                        ObservedCategory::HostWrite,
+                        ObservedBoundary::MmapMaterialize,
+                        ObservedStatus::Completed,
+                        resident.bytes().len() as u64,
+                    ),
+                );
                 Ok((member.clone(), resident))
             })
             .collect::<Result<Vec<_>, RouteBankReservationReject>>()?;
@@ -4645,21 +4800,39 @@ impl CudaWeightResidency {
                     std::slice::from_ref(&full_range),
                 )
                 .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
+            let (committed, reserved) = allocator.committed_and_reserved();
+            self.runtime.observe_byte_pair(
+                EventSpec::new(
+                    ObservedCategory::VmmReserve,
+                    ObservedBoundary::WeightVmmReserve,
+                    ObservedStatus::Committed,
+                    reserved as u64,
+                ),
+                EventSpec::new(
+                    ObservedCategory::VmmMap,
+                    ObservedBoundary::WeightVmmMap,
+                    ObservedStatus::Committed,
+                    committed as u64,
+                ),
+            );
             let mut staging = self
                 .runtime
                 .alloc_pinned(member.catalog.tensor_len())
                 .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
             staging.as_mut_slice().copy_from_slice(resident.bytes());
+            self.runtime.observe_bytes(EventSpec::new(
+                ObservedCategory::HostWrite,
+                ObservedBoundary::MmapMaterialize,
+                ObservedStatus::Completed,
+                staging.as_slice().len() as u64,
+            ));
             // SAFETY: `ptr` is the exact committed tensor reservation and the
-            // pinned source remains live until the copy stream is synchronized.
-            unsafe {
+            // measured primitive establishes completion before returning.
+            let (_copy_ms, _completed) = unsafe {
                 self.runtime
-                    .htod_async(staging.as_slice(), ptr.as_ptr() as CUdeviceptr)
+                    .htod_async_elapsed_ms(staging.as_slice(), ptr.as_ptr() as CUdeviceptr)
             }
             .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
-            self.runtime
-                .sync_copy_stream()
-                .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
             let reservation = Arc::new(RouteWeightReservation {
                 identity: member.clone(),
                 allocator: Arc::clone(&allocator),
@@ -4670,6 +4843,12 @@ impl CudaWeightResidency {
             catalogs.insert(member.value, member.catalog.clone());
             allocators.insert(member.value, allocator);
             by_key.insert(member.value.0 as u64, reservation);
+            self.runtime.observe_bytes(EventSpec::new(
+                ObservedCategory::ExpertPublication,
+                ObservedBoundary::WeightExpertPublish,
+                ObservedStatus::Published,
+                member.catalog.tensor_len() as u64,
+            ));
         }
 
         let set = Arc::new(RouteReservationSet {
@@ -5444,7 +5623,7 @@ impl CudaWeightResidency {
             .staging_pool
             .acquire(bytes as usize)
             .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
-        fill_staging_from_regions(weight, source, staging.staging_mut())?;
+        fill_staging_from_regions(&self.runtime, weight, source, staging.staging_mut())?;
         let ptr = self
             .runtime
             .alloc_raw(bytes as usize)
@@ -5734,7 +5913,7 @@ impl CudaWeightResidency {
             .acquire(len)
             .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
         let materialize_start = std::time::Instant::now();
-        fill_staging_from_regions(weight, source, staging.staging_mut())?;
+        fill_staging_from_regions(&self.runtime, weight, source, staging.staging_mut())?;
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
         if self.physical.get().is_some() {
             return self.resident_vmm_with(
@@ -6389,6 +6568,20 @@ impl CudaWeightResidency {
         } else {
             inner.insert_page(key, Arc::clone(&page), len as u64);
         }
+        self.runtime.observe_byte_pair(
+            EventSpec::new(
+                ObservedCategory::PageIn,
+                ObservedBoundary::WeightPageIn,
+                ObservedStatus::Published,
+                len as u64,
+            ),
+            EventSpec::new(
+                ObservedCategory::ExpertPublication,
+                ObservedBoundary::WeightExpertPublish,
+                ObservedStatus::Published,
+                len as u64,
+            ),
+        );
         // #945 experiment 2/3: snapshot the pinned probe key's device copy right
         // after its (one and only) admission fill, so every later hit can be
         // compared against the bytes that were actually written here.
@@ -6604,6 +6797,12 @@ impl CudaWeightResidency {
                                 failure,
                             ));
                         }
+                        self.runtime.observe_bytes(EventSpec::new(
+                            ObservedCategory::VmmMap,
+                            ObservedBoundary::WeightVmmMap,
+                            ObservedStatus::Committed,
+                            commit.newly_mapped_bytes,
+                        ));
                         // The span is filled and (if not a bypass) about to join
                         // the resident set. Pin it now so no later admission can
                         // ever select it as an eviction victim — the whole point
@@ -6773,6 +6972,20 @@ impl CudaWeightResidency {
             if let Some(state) = slot_state.as_ref() {
                 state.poison();
             }
+            self.runtime.observe_byte_pair(
+                EventSpec::new(
+                    ObservedCategory::VmmMap,
+                    ObservedBoundary::WeightVmmMap,
+                    ObservedStatus::Quarantined,
+                    len as u64,
+                ),
+                EventSpec::new(
+                    ObservedCategory::PageIn,
+                    ObservedBoundary::WeightPageIn,
+                    ObservedStatus::Quarantined,
+                    len as u64,
+                ),
+            );
             quarantine_in_flight_fill(Box::new((
                 Arc::clone(&physical.allocator),
                 allowance.clone(),
@@ -6797,6 +7010,24 @@ impl CudaWeightResidency {
             {
                 Ok(crate::vmm_allocator::DecommitOutcome::Complete { accounting }) => {
                     WeightReleaseAction::refund(allowance, accounting.unmapped_bytes);
+                    self.runtime.observe_byte_pair(
+                        EventSpec::new(
+                            ObservedCategory::VmmUnmap,
+                            ObservedBoundary::WeightVmmUnmap,
+                            ObservedStatus::Reclaimed,
+                            accounting.unmapped_bytes,
+                        ),
+                        EventSpec::new(
+                            ObservedCategory::PageIn,
+                            ObservedBoundary::WeightPageIn,
+                            if accounting.quarantined_owned_bytes == 0 {
+                                ObservedStatus::RolledBack
+                            } else {
+                                ObservedStatus::Quarantined
+                            },
+                            len as u64,
+                        ),
+                    );
                     if accounting.quarantined_owned_bytes == 0 {
                         format!("rolled back {} mapped byte(s)", accounting.unmapped_bytes)
                     } else {
@@ -6811,6 +7042,20 @@ impl CudaWeightResidency {
                     if let Some(state) = slot_state.as_ref() {
                         state.poison();
                     }
+                    self.runtime.observe_byte_pair(
+                        EventSpec::new(
+                            ObservedCategory::VmmUnmap,
+                            ObservedBoundary::WeightVmmUnmap,
+                            ObservedStatus::RolledBack,
+                            len as u64,
+                        ),
+                        EventSpec::new(
+                            ObservedCategory::PageIn,
+                            ObservedBoundary::WeightPageIn,
+                            ObservedStatus::Quarantined,
+                            len as u64,
+                        ),
+                    );
                     format!(
                         "cleanup rolled back to the partially filled mapping ({reason}); the \
                          stable slot was poisoned and remains charged"
@@ -6825,6 +7070,20 @@ impl CudaWeightResidency {
                     if let Some(state) = slot_state.as_ref() {
                         state.poison();
                     }
+                    self.runtime.observe_byte_pair(
+                        EventSpec::new(
+                            ObservedCategory::VmmUnmap,
+                            ObservedBoundary::WeightVmmUnmap,
+                            ObservedStatus::Reclaimed,
+                            accounting.unmapped_bytes,
+                        ),
+                        EventSpec::new(
+                            ObservedCategory::PageIn,
+                            ObservedBoundary::WeightPageIn,
+                            ObservedStatus::Quarantined,
+                            residual.retained_bytes,
+                        ),
+                    );
                     format!(
                         "cleanup quarantined the stable slot ({reason}); refunded {} unmapped \
                          byte(s) and retained {} byte(s) at {:#x}",
@@ -6835,6 +7094,12 @@ impl CudaWeightResidency {
                     if let Some(state) = slot_state.as_ref() {
                         state.poison();
                     }
+                    self.runtime.observe_bytes(EventSpec::new(
+                        ObservedCategory::PageIn,
+                        ObservedBoundary::WeightPageIn,
+                        ObservedStatus::Quarantined,
+                        len as u64,
+                    ));
                     format!(
                         "cleanup was refused ({cleanup_error}); the stable slot was poisoned and \
                          remains charged"
@@ -6845,6 +7110,20 @@ impl CudaWeightResidency {
             match physical.allocator.deallocate_span_outcome(ptr) {
                 onnx_runtime_memory_governor::AllocationReleaseOutcome::Complete { accounting } => {
                     WeightReleaseAction::refund(allowance, accounting.unmapped_bytes);
+                    self.runtime.observe_byte_pair(
+                        EventSpec::new(
+                            ObservedCategory::VmmUnmap,
+                            ObservedBoundary::WeightVmmUnmap,
+                            ObservedStatus::Reclaimed,
+                            accounting.unmapped_bytes,
+                        ),
+                        EventSpec::new(
+                            ObservedCategory::PageIn,
+                            ObservedBoundary::WeightPageIn,
+                            ObservedStatus::RolledBack,
+                            len as u64,
+                        ),
+                    );
                     format!(
                         "released the fresh span and refunded {} mapped byte(s)",
                         accounting.unmapped_bytes
@@ -6855,6 +7134,20 @@ impl CudaWeightResidency {
                     residual,
                 } => {
                     WeightReleaseAction::refund(allowance, accounting.unmapped_bytes);
+                    self.runtime.observe_byte_pair(
+                        EventSpec::new(
+                            ObservedCategory::VmmUnmap,
+                            ObservedBoundary::WeightVmmUnmap,
+                            ObservedStatus::Reclaimed,
+                            accounting.unmapped_bytes,
+                        ),
+                        EventSpec::new(
+                            ObservedCategory::PageIn,
+                            ObservedBoundary::WeightPageIn,
+                            ObservedStatus::Quarantined,
+                            residual.retained_bytes,
+                        ),
+                    );
                     format!(
                         "quarantined the fresh span; refunded {} unmapped byte(s) and retained {} \
                          byte(s) at {:#x}: {}",
@@ -6865,6 +7158,12 @@ impl CudaWeightResidency {
                     )
                 }
                 onnx_runtime_memory_governor::AllocationReleaseOutcome::Failed { failure } => {
+                    self.runtime.observe_bytes(EventSpec::new(
+                        ObservedCategory::PageIn,
+                        ObservedBoundary::WeightPageIn,
+                        ObservedStatus::Quarantined,
+                        len as u64,
+                    ));
                     format!(
                         "cleanup failed before a release outcome was established ({failure}); the \
                          allocator retains the span and its charge"
@@ -8658,6 +8957,9 @@ mod tests {
     )]
     #[test]
     fn possible_in_flight_vmm_fills_quarantine_fresh_and_reused_destinations() {
+        use crate::byte_telemetry::{
+            ObservedByteLedger, ObservedCategory, ObservedPhase, ObservedScope, ObservedStatus,
+        };
         use onnx_runtime_memory_governor::{
             DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
         };
@@ -8677,6 +8979,23 @@ mod tests {
             eprintln!("SKIPPED (CUDA runtime dependencies unavailable): in-flight fill test");
             return;
         };
+        let mut observed = ObservedByteLedger::new(
+            ObservedScope {
+                provider: 740,
+                device: 0,
+                executor: 740,
+                generation: 1,
+                logical_session: 740,
+            },
+            128,
+        )
+        .expect("observed rollback ledger");
+        observed
+            .set_phase(ObservedPhase::Failure)
+            .expect("set rollback phase");
+        runtime
+            .install_observed_byte_ledger(&observed)
+            .expect("attach rollback ledger");
         let granule = 2usize << 20;
         let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(
             (granule * 2) as u64,
@@ -8809,6 +9128,34 @@ mod tests {
         assert_eq!(
             GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
             global_before + (granule * 2) as u64
+        );
+        let snapshot = observed.snapshot().expect("rollback snapshot");
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed),
+            granule as u64,
+            "only the successful intermediate page-in may publish useful H2D"
+        );
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::PageIn, ObservedStatus::Published),
+            granule as u64
+        );
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::PageIn, ObservedStatus::Quarantined),
+            (granule * 2) as u64,
+            "fresh and reused unresolved fills must remain non-useful"
+        );
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::VmmUnmap, ObservedStatus::Reclaimed),
+            granule as u64,
+            "the successful page's deferred decommit must report actual reclaimed bytes"
+        );
+        eprintln!(
+            "freetoken_vmm_failure_control: useful_h2d={} useful_page_in={} \
+             quarantined_page_in={} reclaimed_vmm_unmap={}",
+            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed),
+            snapshot.bytes(ObservedCategory::PageIn, ObservedStatus::Published),
+            snapshot.bytes(ObservedCategory::PageIn, ObservedStatus::Quarantined),
+            snapshot.bytes(ObservedCategory::VmmUnmap, ObservedStatus::Reclaimed),
         );
     }
 

@@ -1,12 +1,10 @@
-//! Deterministic, byte-level FreeToken A/B accounting.
+//! Deterministic FreeToken workload and byte-estimate model.
 //!
-//! The harness is deliberately model-package independent. Synthetic expert
-//! banks expose exact byte extents through a chunked source, so large MoE
-//! layouts can be represented without allocating a checkpoint-sized buffer.
-//! Every byte event names one authoritative boundary and is committed only
-//! after that operation completes. Logical work, transport traffic, mapping
-//! topology, and persistent residency are separate dimensions and are never
-//! summed into a misleading universal "total bytes" number.
+//! This host-only harness does not execute loader, allocator, CUDA, VMM, or
+//! publication boundaries. Its declared extents therefore live only under
+//! explicitly named `estimated_*` report fields and must never be cited as
+//! observed production bytes. Real receipts are collected independently by
+//! `onnx_runtime_ep_cuda::byte_telemetry` at the operations that perform them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,10 +12,10 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const WORKLOAD_SCHEMA: &str = "onnx-genai.freetoken-byte-ab.workload.v2";
-pub const RUN_SCHEMA: &str = "onnx-genai.freetoken-byte-ab.run.v2";
-pub const COMPARISON_SCHEMA: &str = "onnx-genai.freetoken-byte-ab.comparison.v2";
-pub const TAXONOMY_SCHEMA: &str = "onnx-genai.freetoken-byte-taxonomy.v1";
+pub const WORKLOAD_SCHEMA: &str = "onnx-genai.freetoken-byte-ab.workload.v3";
+pub const RUN_SCHEMA: &str = "onnx-genai.freetoken-byte-ab.estimate-run.v3";
+pub const COMPARISON_SCHEMA: &str = "onnx-genai.freetoken-byte-ab.estimate-comparison.v3";
+pub const TAXONOMY_SCHEMA: &str = "onnx-genai.freetoken-byte-estimate-taxonomy.v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,34 +46,31 @@ pub enum Phase {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ByteClass {
-    /// Bytes returned by the synthetic source's `read_exact` boundary.
+    /// Modeled bytes a source read would return.
     SourceRead,
-    /// Requested payload capacity of a successful host allocation.
+    /// Modeled requested host payload capacity.
     HostAllocation,
-    /// Non-zero payload bytes written into host storage.
+    /// Modeled non-zero host payload writes.
     HostWrite,
-    /// Zero-initialized host bytes. Disjoint from `host_write`.
+    /// Modeled zero initialization. Disjoint from `host_write`.
     ZeroFill,
-    /// H2D payload bytes counted only after completion.
+    /// Modeled H2D payload.
     H2d,
-    /// D2H payload bytes counted only after completion.
+    /// Modeled D2H payload.
     D2h,
-    /// D2D payload bytes counted only after completion.
+    /// Modeled D2D payload.
     D2d,
-    /// OS page-in bytes. Synthetic runs report zero unless an authoritative
-    /// page-fault receipt is supplied.
+    /// Never inferred by the synthetic estimate harness.
     MmapPageIn,
-    /// Bytes whose virtual range gained a physical mapping. This is topology,
-    /// not transport, and is never added to H2D/D2H/D2D traffic.
+    /// Modeled virtual range that would gain a physical mapping.
     VmmMap,
-    /// Bytes whose virtual range lost a physical mapping.
+    /// Modeled virtual range that would lose a physical mapping.
     VmmUnmap,
-    /// Logical expert payload consumed by routed computation. This is useful
-    /// work, not traffic.
+    /// Modeled logical expert payload selected by the route.
     ExpertMaterialization,
-    /// Logical recurrent/attention state payload advanced by the workload.
+    /// Modeled logical recurrent/attention state payload.
     StateMaterialization,
-    /// Scratch or rollback-journal bytes touched.
+    /// Modeled scratch or rollback-journal payload.
     ScratchJournal,
 }
 
@@ -127,68 +122,68 @@ pub fn byte_taxonomy() -> BTreeMap<ByteClass, TaxonomyEntry> {
     [
         (
             SourceRead,
-            "bytes returned by the exact source read boundary",
-            "traffic",
+            "modeled source payload bytes; no source operation is performed",
+            "modeled_traffic",
         ),
         (
             HostAllocation,
-            "requested payload capacity after host allocation succeeds",
-            "allocation",
+            "modeled host payload capacity; no allocation is performed",
+            "modeled_allocation",
         ),
         (
             HostWrite,
-            "non-zero payload copied into host storage",
-            "traffic",
+            "modeled host payload write; no write is performed",
+            "modeled_traffic",
         ),
         (
             ZeroFill,
-            "bytes explicitly initialized to zero; excluded from host_write",
-            "traffic",
+            "modeled zero initialization; no memset is performed",
+            "modeled_traffic",
         ),
         (
             H2d,
-            "payload covered by a completed H2D receipt",
-            "transport",
+            "modeled H2D payload; not a CUDA completion receipt",
+            "modeled_transport",
         ),
         (
             D2h,
-            "payload covered by a completed D2H receipt",
-            "transport",
+            "modeled D2H payload; not a CUDA completion receipt",
+            "modeled_transport",
         ),
         (
             D2d,
-            "payload covered by a completed D2D receipt",
-            "transport",
+            "modeled D2D payload; not a CUDA completion receipt",
+            "modeled_transport",
         ),
         (
             MmapPageIn,
-            "bytes confirmed faulted into memory by an external page-fault receipt",
-            "os_traffic",
+            "not modeled without an external page-fault receipt",
+            "modeled_os_traffic",
         ),
         (
             VmmMap,
-            "virtual bytes mapped to physical backing",
-            "mapping_topology",
+            "modeled virtual mapping extent; no VMM call is performed",
+            "modeled_mapping_topology",
         ),
         (
             VmmUnmap,
-            "virtual bytes unmapped from physical backing",
-            "mapping_topology",
+            "modeled virtual unmapping extent; no VMM call is performed",
+            "modeled_mapping_topology",
         ),
         (
             ExpertMaterialization,
-            "logical selected-expert payload consumed by computation",
-            "logical_work",
+            "modeled selected-expert logical payload",
+            "modeled_logical_work",
         ),
         (
             StateMaterialization,
-            "logical state payload advanced by computation",
-            "logical_work",
+            "modeled logical state payload",
+            "modeled_logical_work",
         ),
         (
             ScratchJournal,
-            "scratch/checkpoint/journal payload touched",
-            "logical_work",
+            "modeled scratch/checkpoint/journal payload",
+            "modeled_logical_work",
         ),
     ]
     .into_iter()
@@ -317,44 +312,59 @@ struct PendingSubmission {
     counters: Vec<(CounterClass, u64)>,
 }
 
-/// Unforgeable-by-safe-code handle for one ledger instance. It is benchmark
-/// authority only and is never consumed by production placement or execution.
+#[derive(Debug)]
+struct LedgerInstance;
+
+/// Non-cloneable handle bound to one exact ledger allocation.
+///
+/// Public scope labels are diagnostics, never authority. The private `Arc`
+/// identity remains stable if the ledger value moves and cannot be shared by a
+/// sibling ledger constructed with identical labels.
 #[derive(Debug)]
 pub struct LedgerAuthority {
     identity: ScopeIdentity,
-    nonce: u64,
+    instance: std::sync::Arc<LedgerInstance>,
+    epoch: u64,
 }
 
 /// Session-owned deterministic ledger. There is no process-global state.
 #[derive(Debug)]
 pub struct ScopedLedger {
     identity: ScopeIdentity,
-    nonce: u64,
+    instance: std::sync::Arc<LedgerInstance>,
     epoch: u64,
     next_submission: u64,
     pending: BTreeMap<u64, PendingSubmission>,
+    aborted: BTreeSet<u64>,
     phases: BTreeMap<Phase, PhaseAccounting>,
 }
 
 impl ScopedLedger {
     pub fn new(identity: ScopeIdentity) -> (Self, LedgerAuthority) {
-        let nonce = scope_nonce(&identity);
+        let instance = std::sync::Arc::new(LedgerInstance);
         (
             Self {
                 identity: identity.clone(),
-                nonce,
+                instance: std::sync::Arc::clone(&instance),
                 epoch: 0,
                 next_submission: 1,
                 pending: BTreeMap::new(),
+                aborted: BTreeSet::new(),
                 phases: BTreeMap::new(),
             },
-            LedgerAuthority { identity, nonce },
+            LedgerAuthority {
+                identity,
+                instance,
+                epoch: 0,
+            },
         )
     }
 
     fn authorize(&self, authority: &LedgerAuthority) -> Result<()> {
         ensure!(
-            authority.identity == self.identity && authority.nonce == self.nonce,
+            authority.identity == self.identity
+                && std::sync::Arc::ptr_eq(&authority.instance, &self.instance)
+                && authority.epoch == self.epoch,
             "measurement authority is foreign to provider={}, device={}, executor={}, \
              generation={}, logical_session={}",
             self.identity.provider,
@@ -440,6 +450,24 @@ impl ScopedLedger {
         self.finish_submission(authority, submission, Some(disposition))
     }
 
+    /// Discard one still-pending modeled submission without publishing any
+    /// byte or counter. Repeated abort is idempotent; aborting a committed or
+    /// failed submission remains an actionable error.
+    pub fn abort_submission(&mut self, authority: &LedgerAuthority, submission: u64) -> Result<()> {
+        self.authorize(authority)?;
+        if self.aborted.contains(&submission) {
+            return Ok(());
+        }
+        self.pending.remove(&submission).with_context(|| {
+            format!(
+                "submission {submission} is not pending and cannot be aborted; it was committed, \
+                 failed, or belongs to another ledger"
+            )
+        })?;
+        self.aborted.insert(submission);
+        Ok(())
+    }
+
     fn finish_submission(
         &mut self,
         authority: &LedgerAuthority,
@@ -447,32 +475,42 @@ impl ScopedLedger {
         disposition: Option<FailureDisposition>,
     ) -> Result<()> {
         self.authorize(authority)?;
-        let pending = self.pending.remove(&submission).with_context(|| {
+        let pending = self.pending.get(&submission).cloned().with_context(|| {
             format!("submission {submission} is not active; completion cannot be counted twice")
         })?;
-        let phase = self.phases.entry(pending.phase).or_default();
+        let pending_phase = pending.phase;
+        // Prepare the complete phase record off-ledger. Every checked add,
+        // including the first/middle/last event and terminal counters, succeeds
+        // before pending state or any snapshot-visible byte is changed.
+        let mut prepared = self.phases.get(&pending_phase).cloned().unwrap_or_default();
         for event in pending.bytes {
-            phase
+            prepared
                 .bytes
                 .checked_add(event.class, event.bytes, disposition)?;
             if event.feature_specific {
-                phase
+                prepared
                     .feature_bytes
                     .checked_add(event.class, event.bytes, disposition)?;
             }
         }
         for (class, amount) in pending.counters {
-            phase.checked_add_counter(class, amount)?;
+            prepared.checked_add_counter(class, amount)?;
         }
         match disposition {
             Some(FailureDisposition::RolledBack) => {
-                phase.checked_add_counter(CounterClass::Rollbacks, 1)?;
+                prepared.checked_add_counter(CounterClass::Rollbacks, 1)?;
             }
             Some(FailureDisposition::Quarantined) => {
-                phase.checked_add_counter(CounterClass::Quarantines, 1)?;
+                prepared.checked_add_counter(CounterClass::Quarantines, 1)?;
             }
             _ => {}
         }
+        // One &mut authority is the linearization point: readers can observe
+        // only the old record or this fully prepared replacement.
+        self.pending
+            .remove(&submission)
+            .expect("submission remained present during preparation");
+        self.phases.insert(pending_phase, prepared);
         Ok(())
     }
 
@@ -493,31 +531,23 @@ impl ScopedLedger {
             .collect())
     }
 
-    pub fn reset(&mut self, authority: &LedgerAuthority) -> Result<()> {
+    pub fn reset(&mut self, authority: &mut LedgerAuthority) -> Result<()> {
         self.authorize(authority)?;
         ensure!(
             self.pending.is_empty(),
             "reset refused with {} in-flight submission(s); this prevents reset/completion TOCTOU",
             self.pending.len()
         );
-        self.epoch = self
+        let epoch = self
             .epoch
             .checked_add(1)
             .context("measurement epoch exhausted; refusing to wrap")?;
+        self.epoch = epoch;
+        authority.epoch = epoch;
         self.phases.clear();
+        self.aborted.clear();
         Ok(())
     }
-}
-
-fn scope_nonce(identity: &ScopeIdentity) -> u64 {
-    let mut hasher = Sha256::new();
-    hasher.update(identity.provider.to_le_bytes());
-    hasher.update(identity.device.to_le_bytes());
-    hasher.update(identity.executor.to_le_bytes());
-    hasher.update(identity.generation.to_le_bytes());
-    hasher.update(identity.logical_session.to_le_bytes());
-    let digest = hasher.finalize();
-    u64::from_le_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes"))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -781,7 +811,7 @@ pub fn synthetic_workload(fixture: SyntheticFixture) -> WorkloadSpec {
         schema: WORKLOAD_SCHEMA.to_string(),
         label: label.to_string(),
         fixture_limit:
-            "Synthetic structural fixture only: exact declared byte extents and routes; \
+            "Synthetic structural estimate only: declared byte extents and exact routes; \
                         not an exported checkpoint, model-quality run, or full-model E2E claim."
                 .to_string(),
         batch,
@@ -914,18 +944,32 @@ pub struct FailureProof {
     pub residency_after: ResidencySummary,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimateProvenance {
+    DeclaredSyntheticModel,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationAvailability {
+    NotObservedSyntheticEstimateOnly,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunReport {
     pub schema: String,
-    pub taxonomy_schema: String,
+    pub estimate_taxonomy_schema: String,
     pub arm: Arm,
     pub identity: ScopeIdentity,
     pub workload_label: String,
-    pub phases: Vec<PhaseRecord>,
-    pub totals: PhaseAccounting,
-    pub residency: ResidencySummary,
+    pub estimate_provenance: EstimateProvenance,
+    pub observed_production_events: ObservationAvailability,
+    pub estimated_phases: Vec<PhaseRecord>,
+    pub estimated_totals: PhaseAccounting,
+    pub estimated_residency: ResidencySummary,
     pub semantics: SemanticProof,
-    pub failure: Option<FailureProof>,
+    pub estimated_failure: Option<FailureProof>,
     pub contract: ContractStatus,
 }
 
@@ -944,7 +988,11 @@ struct SimulationState {
     output_tokens: Vec<u32>,
 }
 
-pub fn run_arm(workload: &WorkloadSpec, arm: Arm, identity: ScopeIdentity) -> Result<RunReport> {
+pub fn run_estimate_arm(
+    workload: &WorkloadSpec,
+    arm: Arm,
+    identity: ScopeIdentity,
+) -> Result<RunReport> {
     workload.validate()?;
     let (mut ledger, authority) = ScopedLedger::new(identity.clone());
     let mut state = SimulationState {
@@ -968,16 +1016,16 @@ pub fn run_arm(workload: &WorkloadSpec, arm: Arm, identity: ScopeIdentity) -> Re
             .context("scratch/journal census overflowed")
     })?;
 
-    record_setup(workload, arm, &mut ledger, &authority)?;
+    estimate_setup(workload, arm, &mut ledger, &authority)?;
     let mut tick = 0u64;
     let mut capture_setup_recorded = false;
     for step in &workload.routes {
         if step.phase == Phase::Replay && !capture_setup_recorded {
-            record_capture_setup(workload, arm, &mut ledger, &authority)?;
+            estimate_capture_setup(workload, arm, &mut ledger, &authority)?;
             capture_setup_recorded = true;
         }
         tick = tick.checked_add(1).context("route clock exhausted")?;
-        record_step(
+        estimate_step(
             workload,
             arm,
             step,
@@ -1030,15 +1078,17 @@ pub fn run_arm(workload: &WorkloadSpec, arm: Arm, identity: ScopeIdentity) -> Re
     let totals = aggregate_phases(&phases)?;
     let mut report = RunReport {
         schema: RUN_SCHEMA.to_string(),
-        taxonomy_schema: TAXONOMY_SCHEMA.to_string(),
+        estimate_taxonomy_schema: TAXONOMY_SCHEMA.to_string(),
         arm,
         identity,
         workload_label: workload.label.clone(),
-        phases,
-        totals,
-        residency: successful_residency,
+        estimate_provenance: EstimateProvenance::DeclaredSyntheticModel,
+        observed_production_events: ObservationAvailability::NotObservedSyntheticEstimateOnly,
+        estimated_phases: phases,
+        estimated_totals: totals,
+        estimated_residency: successful_residency,
         semantics: successful_semantics,
-        failure,
+        estimated_failure: failure,
         contract: ContractStatus::default(),
     };
     report.contract.diagnostics = validate_run(&report);
@@ -1046,7 +1096,7 @@ pub fn run_arm(workload: &WorkloadSpec, arm: Arm, identity: ScopeIdentity) -> Re
     Ok(report)
 }
 
-fn record_setup(
+fn estimate_setup(
     workload: &WorkloadSpec,
     arm: Arm,
     ledger: &mut ScopedLedger,
@@ -1100,7 +1150,7 @@ fn record_setup(
     Ok(())
 }
 
-fn record_capture_setup(
+fn estimate_capture_setup(
     workload: &WorkloadSpec,
     arm: Arm,
     ledger: &mut ScopedLedger,
@@ -1126,7 +1176,7 @@ fn record_capture_setup(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_step(
+fn estimate_step(
     workload: &WorkloadSpec,
     arm: Arm,
     step: &RouteStep,
@@ -1186,7 +1236,13 @@ fn record_step(
         match arm {
             Arm::BaselineAbsent | Arm::BaselineFailureControl => {
                 for _expert in unique {
-                    stage_expert_load(ledger, authority, submission, bank.bytes_per_expert, false)?;
+                    estimate_expert_load(
+                        ledger,
+                        authority,
+                        submission,
+                        bank.bytes_per_expert,
+                        false,
+                    )?;
                     ledger.stage_bytes(
                         authority,
                         submission,
@@ -1238,7 +1294,7 @@ fn record_step(
                                 true,
                             )?;
                         }
-                        stage_expert_load(
+                        estimate_expert_load(
                             ledger,
                             authority,
                             submission,
@@ -1323,7 +1379,7 @@ fn record_step(
     ledger.commit_submission(authority, submission)
 }
 
-fn stage_expert_load(
+fn estimate_expert_load(
     ledger: &mut ScopedLedger,
     authority: &LedgerAuthority,
     submission: u64,
@@ -1356,7 +1412,7 @@ fn run_failure_probe(
         .first()
         .context("failure probe requires an expert bank")?;
     let rolled_back = ledger.begin_submission(authority, Phase::Failure)?;
-    stage_expert_load(
+    estimate_expert_load(
         ledger,
         authority,
         rolled_back,
@@ -1447,16 +1503,20 @@ pub fn validate_run(report: &RunReport) -> Vec<String> {
             report.schema
         ));
     }
-    if report.taxonomy_schema != TAXONOMY_SCHEMA {
+    if report.estimate_taxonomy_schema != TAXONOMY_SCHEMA {
         errors.push(format!(
             "taxonomy schema must be {TAXONOMY_SCHEMA}, got {}",
-            report.taxonomy_schema
+            report.estimate_taxonomy_schema
         ));
     }
-    if report.totals.counter(CounterClass::Tokens) == 0 {
+    if report.estimated_totals.counter(CounterClass::Tokens) == 0 {
         errors.push("token census is empty".to_string());
     }
-    if report.totals.counter(CounterClass::ExpertSelections) == 0 {
+    if report
+        .estimated_totals
+        .counter(CounterClass::ExpertSelections)
+        == 0
+    {
         errors.push("expert-selection census is empty".to_string());
     }
     if report.semantics.generated_token_ids.is_empty() {
@@ -1470,24 +1530,36 @@ pub fn validate_run(report: &RunReport) -> Vec<String> {
         Phase::Replay,
         Phase::DecodeSteady,
     ] {
-        if !report.phases.iter().any(|phase| phase.phase == required) {
+        if !report
+            .estimated_phases
+            .iter()
+            .any(|phase| phase.phase == required)
+        {
             errors.push(format!("required phase {required:?} is absent"));
         }
     }
     match report.arm {
         Arm::BaselineAbsent | Arm::BaselineFailureControl => {
-            if report.totals.counter(CounterClass::FeatureLookups) != 0 {
+            if report
+                .estimated_totals
+                .counter(CounterClass::FeatureLookups)
+                != 0
+            {
                 errors.push("absent arm performed FreeToken feature lookups".to_string());
             }
-            if report.totals.feature_bytes != ByteBuckets::default() {
+            if report.estimated_totals.feature_bytes != ByteBuckets::default() {
                 errors.push("absent arm recorded feature-specific bytes".to_string());
             }
         }
         Arm::Optimized | Arm::OptimizedFailureControl => {
-            if report.totals.counter(CounterClass::FeatureLookups) == 0 {
+            if report
+                .estimated_totals
+                .counter(CounterClass::FeatureLookups)
+                == 0
+            {
                 errors.push("optimized arm performed zero FreeToken lookups".to_string());
             }
-            if report.totals.feature_bytes.value(ByteClass::H2d) == 0 {
+            if report.estimated_totals.feature_bytes.value(ByteClass::H2d) == 0 {
                 errors.push("optimized positive control committed zero H2D bytes".to_string());
             }
         }
@@ -1496,7 +1568,7 @@ pub fn validate_run(report: &RunReport) -> Vec<String> {
         report.arm,
         Arm::BaselineFailureControl | Arm::OptimizedFailureControl
     ) {
-        let Some(failure) = &report.failure else {
+        let Some(failure) = &report.estimated_failure else {
             errors.push("failure-control arm omitted its rollback proof".to_string());
             return errors;
         };
@@ -1507,7 +1579,7 @@ pub fn validate_run(report: &RunReport) -> Vec<String> {
             errors.push("failed work changed useful residency".to_string());
         }
         let failure_phase = report
-            .phases
+            .estimated_phases
             .iter()
             .find(|phase| phase.phase == Phase::Failure);
         match failure_phase {
@@ -1545,20 +1617,20 @@ pub struct ByteDelta {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ComparisonReport {
     pub schema: String,
-    pub taxonomy_schema: String,
-    pub taxonomy: BTreeMap<ByteClass, TaxonomyEntry>,
+    pub estimate_taxonomy_schema: String,
+    pub estimate_taxonomy: BTreeMap<ByteClass, TaxonomyEntry>,
     pub workload: WorkloadSpec,
     pub baseline: RunReport,
     pub optimized: RunReport,
     pub baseline_failure_control: RunReport,
     pub optimized_failure_control: RunReport,
-    pub deterministic_deltas: Vec<ByteDelta>,
+    pub estimated_deltas: Vec<ByteDelta>,
     pub contract: ContractStatus,
 }
 
-pub fn run_comparison(workload: WorkloadSpec) -> Result<ComparisonReport> {
+pub fn run_estimate_comparison(workload: WorkloadSpec) -> Result<ComparisonReport> {
     workload.validate()?;
-    let baseline = run_arm(
+    let baseline = run_estimate_arm(
         &workload,
         Arm::BaselineAbsent,
         ScopeIdentity {
@@ -1569,7 +1641,7 @@ pub fn run_comparison(workload: WorkloadSpec) -> Result<ComparisonReport> {
             logical_session: 1,
         },
     )?;
-    let optimized = run_arm(
+    let optimized = run_estimate_arm(
         &workload,
         Arm::Optimized,
         ScopeIdentity {
@@ -1580,7 +1652,7 @@ pub fn run_comparison(workload: WorkloadSpec) -> Result<ComparisonReport> {
             logical_session: 2,
         },
     )?;
-    let baseline_failure_control = run_arm(
+    let baseline_failure_control = run_estimate_arm(
         &workload,
         Arm::BaselineFailureControl,
         ScopeIdentity {
@@ -1591,7 +1663,7 @@ pub fn run_comparison(workload: WorkloadSpec) -> Result<ComparisonReport> {
             logical_session: 3,
         },
     )?;
-    let optimized_failure_control = run_arm(
+    let optimized_failure_control = run_estimate_arm(
         &workload,
         Arm::OptimizedFailureControl,
         ScopeIdentity {
@@ -1602,17 +1674,17 @@ pub fn run_comparison(workload: WorkloadSpec) -> Result<ComparisonReport> {
             logical_session: 4,
         },
     )?;
-    let deterministic_deltas = deltas(&baseline, &optimized);
+    let estimated_deltas = deltas(&baseline, &optimized);
     let mut report = ComparisonReport {
         schema: COMPARISON_SCHEMA.to_string(),
-        taxonomy_schema: TAXONOMY_SCHEMA.to_string(),
-        taxonomy: byte_taxonomy(),
+        estimate_taxonomy_schema: TAXONOMY_SCHEMA.to_string(),
+        estimate_taxonomy: byte_taxonomy(),
         workload,
         baseline,
         optimized,
         baseline_failure_control,
         optimized_failure_control,
-        deterministic_deltas,
+        estimated_deltas,
         contract: ContractStatus::default(),
     };
     report.contract.diagnostics = validate_comparison(&report);
@@ -1622,12 +1694,12 @@ pub fn run_comparison(workload: WorkloadSpec) -> Result<ComparisonReport> {
 
 fn deltas(baseline: &RunReport, optimized: &RunReport) -> Vec<ByteDelta> {
     let baseline_phases: BTreeMap<_, _> = baseline
-        .phases
+        .estimated_phases
         .iter()
         .map(|phase| (phase.phase, &phase.accounting))
         .collect();
     let optimized_phases: BTreeMap<_, _> = optimized
-        .phases
+        .estimated_phases
         .iter()
         .map(|phase| (phase.phase, &phase.accounting))
         .collect();
@@ -1729,11 +1801,24 @@ pub fn validate_comparison(report: &ComparisonReport) -> Vec<String> {
     {
         errors.push("steady decode phase is unavailable".to_string());
     }
-    if report.baseline.totals.counter(CounterClass::FeatureLookups) != 0 {
+    if report
+        .baseline
+        .estimated_totals
+        .counter(CounterClass::FeatureLookups)
+        != 0
+    {
         errors.push("default-off baseline feature lookup census is nonzero".to_string());
     }
-    if report.optimized.totals.counter(CounterClass::CacheHits) == 0
-        || report.optimized.totals.counter(CounterClass::CacheMisses) == 0
+    if report
+        .optimized
+        .estimated_totals
+        .counter(CounterClass::CacheHits)
+        == 0
+        || report
+            .optimized
+            .estimated_totals
+            .counter(CounterClass::CacheMisses)
+            == 0
     {
         errors.push("optimized workload did not prove both hot and cold experts".to_string());
     }
@@ -1753,7 +1838,10 @@ pub fn validate_comparison(report: &ComparisonReport) -> Vec<String> {
 }
 
 fn phase_record(report: &RunReport, phase: Phase) -> Option<&PhaseRecord> {
-    report.phases.iter().find(|record| record.phase == phase)
+    report
+        .estimated_phases
+        .iter()
+        .find(|record| record.phase == phase)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1770,7 +1858,7 @@ pub fn aggregate_reports(reports: &[RunReport]) -> Result<AggregateReport> {
     ordered.sort_by_key(|report| report.identity.clone());
     let mut totals = PhaseAccounting::default();
     for report in &ordered {
-        totals.checked_merge(&report.totals)?;
+        totals.checked_merge(&report.estimated_totals)?;
     }
     Ok(AggregateReport {
         schema: "onnx-genai.freetoken-byte-ab.aggregate.v1".to_string(),
@@ -1791,7 +1879,7 @@ pub fn read_workload(path: &std::path::Path) -> Result<WorkloadSpec> {
     Ok(workload)
 }
 
-pub fn write_report(path: &std::path::Path, report: &ComparisonReport) -> Result<()> {
+pub fn write_estimate_report(path: &std::path::Path, report: &ComparisonReport) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1857,20 +1945,27 @@ mod tests {
     }
 
     #[test]
-    fn known_transfer_bytes_are_exact_and_setup_is_separate() {
-        let report = run_comparison(tiny_workload()).expect("tiny comparison");
+    fn known_modeled_bytes_are_deterministic_and_setup_is_separate() {
+        let report = run_estimate_comparison(tiny_workload()).expect("tiny comparison");
         assert!(report.contract.passed, "{:?}", report.contract.diagnostics);
         // Baseline streams one 10-byte expert in each of four phases.
         assert_eq!(
-            report.baseline.totals.bytes.value(ByteClass::SourceRead),
+            report
+                .baseline
+                .estimated_totals
+                .bytes
+                .value(ByteClass::SourceRead),
             40
         );
-        assert_eq!(report.baseline.totals.bytes.value(ByteClass::H2d), 56);
+        assert_eq!(
+            report.baseline.estimated_totals.bytes.value(ByteClass::H2d),
+            56
+        );
         // State setup is 4 bytes; decode-state H2D is counted in execution
         // phases, never averaged into setup.
         let setup = report
             .optimized
-            .phases
+            .estimated_phases
             .iter()
             .find(|phase| phase.phase == Phase::Setup)
             .expect("setup");
@@ -1924,15 +2019,15 @@ mod tests {
             generation: 9,
             logical_session: 10,
         };
-        let (mut ledger, authority) = ScopedLedger::new(identity);
+        let (mut ledger, mut authority) = ScopedLedger::new(identity);
         let submission = ledger
             .begin_submission(&authority, Phase::DecodeSteady)
             .unwrap();
-        assert!(ledger.reset(&authority).is_err());
+        assert!(ledger.reset(&mut authority).is_err());
         ledger
             .fail_submission(&authority, submission, FailureDisposition::Failed)
             .unwrap();
-        ledger.reset(&authority).unwrap();
+        ledger.reset(&mut authority).unwrap();
         assert!(ledger.snapshot(&authority).unwrap().is_empty());
     }
 
@@ -1945,7 +2040,7 @@ mod tests {
             generation: 1,
             logical_session: 1,
         });
-        let (_second, second_authority) = ScopedLedger::new(ScopeIdentity {
+        let (_second, mut second_authority) = ScopedLedger::new(ScopeIdentity {
             provider: 1,
             device: 0,
             executor: 2,
@@ -1959,18 +2054,79 @@ mod tests {
                 .to_string()
                 .contains("foreign")
         );
-        assert!(first.reset(&second_authority).is_err());
+        assert!(first.reset(&mut second_authority).is_err());
         assert!(first.snapshot(&first_authority).unwrap().is_empty());
     }
 
     #[test]
+    fn same_public_scope_siblings_reject_cross_ledger_authority() {
+        let identity = ScopeIdentity {
+            provider: 4,
+            device: 0,
+            executor: 8,
+            generation: 15,
+            logical_session: 16,
+        };
+        let (mut first, first_authority) = ScopedLedger::new(identity.clone());
+        let (_second, second_authority) = ScopedLedger::new(identity);
+        assert!(
+            first
+                .begin_submission(&second_authority, Phase::Setup)
+                .is_err()
+        );
+        let submission = first
+            .begin_submission(&first_authority, Phase::Setup)
+            .unwrap();
+        first
+            .abort_submission(&first_authority, submission)
+            .unwrap();
+        first
+            .abort_submission(&first_authority, submission)
+            .unwrap();
+        assert!(first.snapshot(&first_authority).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_luv_overflow_probe_publishes_nothing_and_remains_abortable() {
+        let (mut ledger, authority) = ScopedLedger::new(ScopeIdentity {
+            provider: 1,
+            device: 0,
+            executor: 1,
+            generation: 1,
+            logical_session: 1,
+        });
+        let submission = ledger
+            .begin_submission(&authority, Phase::DecodeSteady)
+            .unwrap();
+        ledger
+            .stage_bytes(&authority, submission, ByteClass::H2d, u64::MAX, true)
+            .unwrap();
+        ledger
+            .stage_bytes(&authority, submission, ByteClass::H2d, 1, true)
+            .unwrap();
+        assert!(ledger.commit_submission(&authority, submission).is_err());
+        assert!(
+            ledger.snapshot(&authority).is_err(),
+            "overflowed submission must remain pending and block success snapshots"
+        );
+        ledger.abort_submission(&authority, submission).unwrap();
+        assert!(ledger.snapshot(&authority).unwrap().is_empty());
+    }
+
+    #[test]
     fn absent_path_has_zero_feature_bytes_and_lookups() {
-        let report = run_comparison(tiny_workload()).unwrap();
+        let report = run_estimate_comparison(tiny_workload()).unwrap();
         assert_eq!(
-            report.baseline.totals.counter(CounterClass::FeatureLookups),
+            report
+                .baseline
+                .estimated_totals
+                .counter(CounterClass::FeatureLookups),
             0
         );
-        assert_eq!(report.baseline.totals.feature_bytes, ByteBuckets::default());
+        assert_eq!(
+            report.baseline.estimated_totals.feature_bytes,
+            ByteBuckets::default()
+        );
     }
 
     #[test]
@@ -1979,7 +2135,7 @@ mod tests {
         empty.routes.clear();
         assert!(empty.validate().unwrap_err().to_string().contains("empty"));
 
-        let mut report = run_comparison(tiny_workload()).unwrap();
+        let mut report = run_estimate_comparison(tiny_workload()).unwrap();
         report.optimized.semantics.generated_token_ids[0] ^= 1;
         let errors = validate_comparison(&report).join("\n");
         assert!(errors.contains("generated token IDs differ"), "{errors}");
@@ -1987,15 +2143,15 @@ mod tests {
 
     #[test]
     fn failure_controls_preserve_state_and_separate_quarantine() {
-        let report = run_comparison(tiny_workload()).unwrap();
+        let report = run_estimate_comparison(tiny_workload()).unwrap();
         for failure_run in [
             &report.baseline_failure_control,
             &report.optimized_failure_control,
         ] {
-            let failure = failure_run.failure.as_ref().expect("proof");
+            let failure = failure_run.estimated_failure.as_ref().expect("proof");
             assert_eq!(failure.state_before, failure.state_after);
             let phase = failure_run
-                .phases
+                .estimated_phases
                 .iter()
                 .find(|phase| phase.phase == Phase::Failure)
                 .expect("failure phase");
@@ -2004,15 +2160,18 @@ mod tests {
             assert!(phase.accounting.bytes.quarantined[&ByteClass::VmmMap] > 0);
         }
         assert_eq!(
-            report.baseline_failure_control.totals.feature_bytes,
+            report
+                .baseline_failure_control
+                .estimated_totals
+                .feature_bytes,
             ByteBuckets::default()
         );
     }
 
     #[test]
     fn phase_and_json_order_are_stable() {
-        let first = run_comparison(tiny_workload()).unwrap();
-        let second = run_comparison(tiny_workload()).unwrap();
+        let first = run_estimate_comparison(tiny_workload()).unwrap();
+        let second = run_estimate_comparison(tiny_workload()).unwrap();
         assert_eq!(
             serde_json::to_vec(&first).unwrap(),
             serde_json::to_vec(&second).unwrap()
@@ -2026,7 +2185,7 @@ mod tests {
             .map(|session| {
                 let workload = workload.clone();
                 std::thread::spawn(move || {
-                    run_arm(
+                    run_estimate_arm(
                         &workload,
                         Arm::Optimized,
                         ScopeIdentity {
@@ -2053,7 +2212,7 @@ mod tests {
         assert_eq!(reverse.sessions.len(), 4);
         assert_eq!(
             reverse.totals.counter(CounterClass::Tokens),
-            reports[0].totals.counter(CounterClass::Tokens) * 4
+            reports[0].estimated_totals.counter(CounterClass::Tokens) * 4
         );
     }
 
@@ -2089,7 +2248,7 @@ mod tests {
                         _ => step as u32 % experts,
                     };
                 }
-                let report = run_comparison(workload).expect("property matrix comparison");
+                let report = run_estimate_comparison(workload).expect("property matrix comparison");
                 assert!(report.contract.passed, "{:?}", report.contract.diagnostics);
                 assert_eq!(
                     report.baseline.semantics.generated_token_ids,

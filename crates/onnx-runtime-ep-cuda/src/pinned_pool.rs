@@ -42,6 +42,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::byte_telemetry::{EventSpec, ObservedBoundary, ObservedCategory, ObservedStatus};
 use crate::runtime::{CopyCompleted, CudaRuntime, PinnedStaging};
 
 /// Number of times the pool actually called `cuMemHostAlloc` (a pinned-buffer
@@ -145,6 +146,12 @@ impl PinnedStagingPool {
             Some(staging) => {
                 self.reuses.fetch_add(1, Ordering::Relaxed);
                 GLOBAL_PINNED_REUSES.fetch_add(1, Ordering::Relaxed);
+                self.runtime.observe_bytes(EventSpec::new(
+                    ObservedCategory::HostAllocation,
+                    ObservedBoundary::PinnedHostReuse,
+                    ObservedStatus::Reclaimed,
+                    staging.len() as u64,
+                ));
                 staging
             }
             None => {

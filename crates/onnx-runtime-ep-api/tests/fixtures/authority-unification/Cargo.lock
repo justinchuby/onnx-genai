@@ -597,6 +597,7 @@ dependencies = [
  "onnx-runtime-optimizer",
  "onnx-runtime-quantization",
  "onnx-runtime-virtual-memory",
+ "serde",
  "thiserror 2.0.20",
 ]
 
