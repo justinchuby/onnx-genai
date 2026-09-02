@@ -1787,6 +1787,10 @@ fn measure_bench_arm(
     let (ramp_ms, ramp_replays) = ramp_graph(runtime, &label, ramp_seconds);
     let clock_pre = gpu_state(&label, "timed-pre");
     assert!(
+        clock_pre.foreign_processes.is_empty(),
+        "{label}: foreign GPU process appeared before the timed region: {clock_pre:?}"
+    );
+    assert!(
         clock_pre.clock_mhz as f64 >= f64::from(clock_pre.max_clock_mhz) * 0.90,
         "{label}: timed region started below 90% of maximum SM clock: {clock_pre:?}"
     );
@@ -1817,6 +1821,11 @@ fn measure_bench_arm(
         "{label}: replay allocated after warmup"
     );
     let clock_post = gpu_state(&label, "timed-post");
+    assert!(
+        clock_post.foreign_processes.is_empty(),
+        "{label}: foreign GPU process appeared during the timed region: {clock_post:?}"
+    );
+    hostlock_provenance(&format!("{label}-timed-post"), expect_runnable);
     assert!(
         clock_post.clock_mhz as f64 >= f64::from(clock_post.max_clock_mhz) * 0.90,
         "{label}: timed region ended below 90% of maximum SM clock: {clock_post:?}"
