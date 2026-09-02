@@ -77,7 +77,7 @@ plugin EPs (via C ABI bridge) handle them.
 | DequantizeLinear | 10 | INT4/INT8 weight dequantization. |
 | QuantizeLinear | 10 | Activation quantization. |
 | QLinearMatMul | 10 | Quantized matmul. |
-| Einsum | 12 | Shared validated planning contract; native kernels pending. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md). |
+| Einsum | 12 | Shared validated planning contract; native CUDA lowers capture-safe f32/f16 GEMM/BMM plans and zero-copy permutation/diagonal views. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md) and [CUDA_COVERAGE.md](CUDA_COVERAGE.md). |
 | Tile | 6 | Repeat for broadcasting. |
 | Range | 11 | Position IDs generation. |
 | CumSum | 11 | Position computation. |

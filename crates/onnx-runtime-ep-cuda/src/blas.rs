@@ -267,6 +267,30 @@ pub struct GemmParams {
     pub epilogue: Option<GemmEpilogue>,
 }
 
+/// A fixed-shape row-major strided-batched GEMM request used by canonical
+/// `Einsum` contractions.
+///
+/// Logical execution is `C[batch,M,N] = A[batch,M,K] · B[batch,K,N]`. When a
+/// transpose flag is set, the corresponding storage matrix has the reversed
+/// shape (`A` is `[K,M]`, or `B` is `[N,K]`) and cuBLASLt applies the transpose
+/// through its descriptor without materializing bytes.
+pub struct StridedBatchedGemmParams {
+    pub dtype: GemmDtype,
+    pub a: CUdeviceptr,
+    pub b: CUdeviceptr,
+    pub c: CUdeviceptr,
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    pub batch: usize,
+    pub transpose_a: bool,
+    pub transpose_b: bool,
+    /// Element stride between stored A matrices. Zero broadcasts one matrix.
+    pub a_batch_stride: usize,
+    /// Element stride between stored B matrices. Zero broadcasts one matrix.
+    pub b_batch_stride: usize,
+}
+
 /// cuBLASLt fused epilogue kind. All variants add a per-output-channel bias;
 /// activation, when present, is evaluated by cuBLASLt before the result is
 /// written to global memory.
@@ -559,6 +583,201 @@ impl CaptureGemmPlan {
 /// heuristic [`governed_gemm`] uses per call.
 pub fn plan_capture_gemm(handle: &CublasLt, p: &GemmParams) -> Result<CaptureGemmPlan> {
     Ok(CaptureGemmPlan(plan_gemm(handle, p)?))
+}
+
+fn checked_layout_dim(value: usize, name: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "cuda_ep Einsum: cuBLASLt {name}={value} exceeds u64"
+        ))
+    })
+}
+
+fn checked_layout_stride(value: usize, name: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "cuda_ep Einsum: cuBLASLt {name}={value} exceeds i64"
+        ))
+    })
+}
+
+fn plan_strided_batched_gemm(
+    handle: &CublasLt,
+    p: &StridedBatchedGemmParams,
+) -> Result<PlannedMatmul> {
+    if p.m == 0 || p.n == 0 || p.k == 0 || p.batch == 0 {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep Einsum: degenerate cuBLASLt contraction M={} K={} N={} batch={}",
+            p.m, p.k, p.n, p.batch
+        )));
+    }
+
+    let dt = p.dtype.data_type();
+    // Row-major C[M,N] is column-major C^T[N,M]. Therefore cuBLASLt computes
+    // B^T · A^T with the operand order swapped. A row-major transposed storage
+    // view is represented by toggling the matching descriptor operation.
+    let (b_rows, b_cols, b_ld) = if p.transpose_b {
+        (p.k, p.n, p.k)
+    } else {
+        (p.n, p.k, p.n)
+    };
+    let (a_rows, a_cols, a_ld) = if p.transpose_a {
+        (p.m, p.k, p.m)
+    } else {
+        (p.k, p.m, p.k)
+    };
+    let b_layout = MatrixLayout::new(
+        dt,
+        checked_layout_dim(b_rows, "B rows")?,
+        checked_layout_dim(b_cols, "B columns")?,
+        checked_layout_stride(b_ld, "B leading dimension")?,
+    )?;
+    let a_layout = MatrixLayout::new(
+        dt,
+        checked_layout_dim(a_rows, "A rows")?,
+        checked_layout_dim(a_cols, "A columns")?,
+        checked_layout_stride(a_ld, "A leading dimension")?,
+    )?;
+    let c_layout = MatrixLayout::new(
+        dt,
+        checked_layout_dim(p.n, "C rows")?,
+        checked_layout_dim(p.m, "C columns")?,
+        checked_layout_stride(p.n, "C leading dimension")?,
+    )?;
+
+    if p.batch > 1 {
+        let count = i32::try_from(p.batch).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep Einsum: cuBLASLt batch {} exceeds i32",
+                p.batch
+            ))
+        })?;
+        b_layout.set_batch(
+            count,
+            checked_layout_stride(p.b_batch_stride, "B batch stride")?,
+        )?;
+        a_layout.set_batch(
+            count,
+            checked_layout_stride(p.a_batch_stride, "A batch stride")?,
+        )?;
+        let c_stride = p.m.checked_mul(p.n).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep Einsum: output matrix stride overflows for M={} N={}",
+                p.m, p.n
+            ))
+        })?;
+        c_layout.set_batch(count, checked_layout_stride(c_stride, "C batch stride")?)?;
+    }
+
+    let desc = MatmulDesc::new(p.dtype.compute_type(), sys::cudaDataType_t::CUDA_R_32F)?;
+    // `transa` belongs to the first cuBLAS operand (row-major B), and `transb`
+    // to the second (row-major A), because the row-major mapping swaps them.
+    desc.set_transpose(
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+        p.transpose_b,
+    )?;
+    desc.set_transpose(
+        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+        p.transpose_a,
+    )?;
+    let pref = MatmulPref::new(WORKSPACE_BYTES)?;
+    // SAFETY: all descriptor/layout handles are live for the query.
+    let heuristic = unsafe {
+        result::get_matmul_algo_heuristic(
+            handle.handle,
+            desc.0,
+            b_layout.0,
+            a_layout.0,
+            c_layout.0,
+            c_layout.0,
+            pref.0,
+        )
+    }
+    .map_err(|e| {
+        cublas_err(
+            &format!(
+                "no cuBLASLt algorithm for Einsum M={} K={} N={} batch={} \
+                 transpose_a={} transpose_b={} dtype={:?}",
+                p.m, p.k, p.n, p.batch, p.transpose_a, p.transpose_b, p.dtype
+            ),
+            e,
+        )
+    })?;
+    Ok(PlannedMatmul {
+        a_layout: b_layout,
+        b_layout: a_layout,
+        c_layout,
+        _desc: desc,
+        algo: heuristic.algo,
+        workspace_bytes: heuristic.workspaceSize,
+    })
+}
+
+/// Immutable cuBLASLt algorithm/layout selection for one canonical `Einsum`
+/// contraction. Planning happens during warmup; later launches only update
+/// tensor pointers and are legal during CUDA graph capture.
+pub struct CaptureStridedBatchedGemmPlan(PlannedMatmul);
+
+// SAFETY: identical to `CaptureGemmPlan`; the descriptor/layout handles are
+// context-independent host objects and the owning kernel serializes launches.
+unsafe impl Send for CaptureStridedBatchedGemmPlan {}
+
+impl CaptureStridedBatchedGemmPlan {
+    #[must_use]
+    pub fn workspace_bytes(&self) -> usize {
+        self.0.workspace_bytes
+    }
+
+    /// Launch the warmed contraction. Only A/B/C addresses may differ from the
+    /// request used to create this plan.
+    ///
+    /// # Safety
+    ///
+    /// A/B/C and workspace must be live device allocations covering the fixed
+    /// shape and strides represented by this plan, and C must not overlap A/B.
+    pub unsafe fn launch(
+        &self,
+        handle: &CublasLt,
+        stream: cudarc::driver::sys::CUstream,
+        p: &StridedBatchedGemmParams,
+        workspace: CUdeviceptr,
+    ) -> Result<()> {
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        // SAFETY: forwarded from the caller; all plan objects remain live.
+        unsafe {
+            let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
+            result::matmul(
+                handle.handle,
+                self.0._desc.0,
+                (&alpha) as *const f32 as *const c_void,
+                (&beta) as *const f32 as *const c_void,
+                p.b as *const c_void,
+                self.0.a_layout.0,
+                p.a as *const c_void,
+                self.0.b_layout.0,
+                p.c as *const c_void,
+                self.0.c_layout.0,
+                p.c as *mut c_void,
+                self.0.c_layout.0,
+                (&self.0.algo) as *const sys::cublasLtMatmulAlgo_t,
+                workspace as *mut c_void,
+                self.0.workspace_bytes,
+                stream as sys::cudaStream_t,
+            )
+        }
+        .map_err(|e| cublas_err("cublasLtMatmul Einsum", e))
+    }
+}
+
+/// Select one reusable cuBLASLt plan for a canonical `Einsum` contraction.
+pub fn plan_capture_strided_batched_gemm(
+    handle: &CublasLt,
+    p: &StridedBatchedGemmParams,
+) -> Result<CaptureStridedBatchedGemmPlan> {
+    Ok(CaptureStridedBatchedGemmPlan(plan_strided_batched_gemm(
+        handle, p,
+    )?))
 }
 
 /// A single (non-batched) **column-major, native cuBLAS** GEMM request:

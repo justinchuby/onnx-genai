@@ -258,7 +258,7 @@ impl Drop for PersistentMetadata {
     }
 }
 
-fn launch_persistent_metadata(
+pub(super) fn launch_persistent_metadata(
     runtime: &CudaRuntime,
     entry: &'static str,
     input: &TensorView,

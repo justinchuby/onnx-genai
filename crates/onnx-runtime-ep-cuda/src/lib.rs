@@ -132,6 +132,9 @@ pub use kernels::dsa_index_select::{
 pub use kernels::dsa_index_select::{
     dsa_plugin_capture_stats_for_test, set_dsa_plugin_capture_replays_for_test,
 };
+pub use kernels::einsum::{
+    EinsumExecutionStats, einsum_execution_stats, reset_einsum_execution_stats,
+};
 pub use kernels::gather::GATHER_CAPTURE_ERROR_INDEX;
 pub use kernels::gather_block_quantized::GATHER_BLOCK_QUANTIZED_CAPTURE_ERROR_INDEX;
 pub use kernels::group_query_attention::{

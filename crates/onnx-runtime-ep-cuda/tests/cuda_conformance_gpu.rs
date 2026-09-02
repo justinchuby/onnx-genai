@@ -2409,6 +2409,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "cuBLASLt dense/batched GEMM",
     ));
     p.push(dedicated(
+        "Einsum",
+        "einsum_gpu.rs",
+        "canonical-plan cuBLASLt contractions and zero-copy views",
+    ));
+    p.push(dedicated(
         "MatMulNBits",
         "matmul_nbits_gpu.rs",
         "packed INT4 block dequant + GEMM",
