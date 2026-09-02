@@ -27,6 +27,12 @@ mlas = [
 ]
 gqa_phase_profile = ["onnx-runtime-ep-cpu/gqa_phase_profile"]
 native-cuda = ["bench-native", "onnx-genai-engine/native-cuda", "onnx-runtime-session/cuda"]
+gpu-tests = [
+    "native-cuda",
+    "dep:cudarc",
+    "onnx-runtime-ep-cuda/gpu-tests",
+    "onnx-runtime-session/gpu-tests",
+]
 # Host<->device bandwidth probe (`roofline_transfer` bin). Pulls in `cudarc`
 # directly so the probe measures the raw link the runtime uses, independent of
 # any EP. The CUDA API version tracks the crate's `cuda-*` feature (default
@@ -111,12 +117,18 @@ onnx-runtime-loader = { workspace = true }
 prost = { workspace = true }
 onnx-runtime-session = { path = "../onnx-runtime-session", version = "=0.1.0-dev.5", optional = true, default-features = false }
 onnx-runtime-tracer = { workspace = true, optional = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokenizers = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"
+
+[[test]]
+name = "freetoken_byte_accounting_gpu"
+required-features = ["gpu-tests"]
 
 [[bench]]
 name = "no_model"
@@ -180,6 +192,9 @@ required-features = ["bench-native"]
 [[bin]]
 name = "marlin_bench"
 required-features = ["native-cuda"]
+
+[[bin]]
+name = "freetoken_byte_ab"
 
 [[bin]]
 name = "roofline_transfer"

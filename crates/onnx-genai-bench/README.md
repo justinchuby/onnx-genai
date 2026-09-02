@@ -1,5 +1,8 @@
 # onnx-genai benchmarks
 
+The deterministic FreeToken byte-accounting harness is documented in
+[`../../docs/benchmarks/FREETOKEN_BYTE_AB.md`](../../docs/benchmarks/FREETOKEN_BYTE_AB.md).
+
 This crate keeps a fixed Criterion scenario suite for comparing runtime performance across
 devices. The no-model suite needs no ONNX Runtime model or GPU:
 
