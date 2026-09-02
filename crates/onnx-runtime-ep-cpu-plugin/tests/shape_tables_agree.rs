@@ -242,7 +242,7 @@ fn dft_opset17_default_axis_agrees() {
 }
 
 fn einsum_agrees_on_canonical_gemm_shape() {
-    let mut einsum = node("Einsum", 2, &[], 12);
+    let mut einsum = node("Einsum", 2, &[], 24);
     einsum
         .attributes
         .insert("equation".into(), Attribute::String(b"ik,kj->ij".to_vec()));
@@ -255,7 +255,7 @@ fn einsum_agrees_on_canonical_gemm_shape() {
     assert_agree(
         "Einsum canonical GEMM",
         &einsum,
-        12,
+        24,
         plugin_rule,
         &[left_view, right_view],
         vec![

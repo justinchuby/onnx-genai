@@ -12,7 +12,8 @@ session/model-loading overhead. The standing quality bar for kernel rewrites is:
 From the repository root:
 
 ```bash
-cargo bench -p onnx-runtime-ep-cpu
+scripts/hostlock.sh run --owner your_name --reason "CPU EP Criterion suite" -- \
+  cargo bench -p onnx-runtime-ep-cpu
 ```
 
 Use a filter while iterating, for example:
@@ -20,6 +21,19 @@ Use a filter while iterating, for example:
 ```bash
 cargo bench -p onnx-runtime-ep-cpu -- matmul/medium
 ```
+
+The native Einsum target has its own exact governed invocation:
+
+```bash
+scripts/hostlock.sh run --owner your_name --reason "CPU Einsum synthetic Criterion sweep" -- \
+  cargo bench -p onnx-runtime-ep-cpu --bench einsum -- --noplot
+```
+
+The outer `hostlock.sh run` is mandatory for publishable benchmark results. The
+benchmark also records lock provenance, but observing a lock from inside the
+binary does not protect Cargo compilation, warmup, or the interval before the
+binary starts. Replace `your_name` with a stable identifier containing only
+letters, digits, `_`, `.`, or `-`.
 
 Criterion reports the estimated time interval and change versus the prior local
 baseline. HTML reports are written under

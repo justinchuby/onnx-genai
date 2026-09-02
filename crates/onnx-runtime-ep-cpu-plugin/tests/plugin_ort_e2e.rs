@@ -1653,84 +1653,120 @@ fn conformance_matmul_2d() {
 
 // ─── Conformance: Einsum ─────────────────────────────────────────────────────
 
-/// The canonical `ik,kj->ij` class must travel through real ORT loading,
-/// plugin capability, assignment, compile, and compute. CPU fallback is
-/// disabled, and the exported callback counters prove the selector is neither
-/// empty nor satisfied by ORT's built-in CPU kernel.
+/// Canonical Float32 and Float16 `ik,kj->ij` must travel through real ORT
+/// loading, plugin capability, assignment, compile, and compute. CPU fallback
+/// is disabled, and the exported callback counters prove each selector is
+/// neither empty nor satisfied by ORT's built-in CPU kernel.
 #[test]
-fn conformance_einsum_gemm_2d_reaches_native_cpu_kernel() {
+fn conformance_einsum_f32_f16_reach_native_cpu_kernel() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
+    let f32_model =
         PathBuf::from(manifest_dir).join("tests/fixtures/einsum_gemm_2d/model.onnx.textproto");
+    let f16_text = include_str!("fixtures/einsum_gemm_2d/model.onnx.textproto")
+        .replace("elem_type: 1", "elem_type: 10");
+    let f16_model = write_generated_model("einsum_gemm_2d_f16", &f16_text);
     let ep_path = skip_if_missing!(
         find_ep_cdylib(),
-        "conformance_einsum_gemm_2d_reaches_native_cpu_kernel: EP cdylib not found"
+        "conformance_einsum_f32_f16_reach_native_cpu_kernel: EP cdylib not found"
     );
     let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
-    unsafe {
-        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_get_capability_call_count");
-        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_compiled_node_count");
-        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_executed_node_count");
-    }
+    for (label, model_path, dtype) in [("f32", f32_model, ELEM_F32), ("f16", f16_model, ELEM_F16)] {
+        unsafe {
+            reset_ep_counter(&ep_lib, b"nxrt_ep_reset_get_capability_call_count");
+            reset_ep_counter(&ep_lib, b"nxrt_ep_reset_compiled_node_count");
+            reset_ep_counter(&ep_lib, b"nxrt_ep_reset_executed_node_count");
+        }
 
-    let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_einsum", &model_path, true) })
-    else {
-        eprintln!(
-            "*** SKIPPED: conformance_einsum_gemm_2d_reaches_native_cpu_kernel — \
-             ORT or EP cdylib not found ***"
-        );
-        return;
-    };
+        let registration = format!("cpu_ep_einsum_{label}");
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(&registration, &model_path, true) })
+        else {
+            eprintln!(
+                "*** SKIPPED: conformance_einsum_f32_f16_reach_native_cpu_kernel — \
+                 ORT or EP cdylib not found ***"
+            );
+            return;
+        };
 
-    unsafe {
-        assert!(
-            read_ep_counter(&ep_lib, b"nxrt_ep_get_capability_call_count") > 0,
-            "real ORT session creation must enter the plugin GetCapability callback"
-        );
-        assert_ops_assigned_to_our_ep(api, session, &["Einsum"], "einsum_gemm_2d");
-        assert_eq!(
-            read_ep_counter(&ep_lib, b"nxrt_ep_compiled_node_count"),
-            1,
-            "ORT must compile exactly the assigned Einsum node"
-        );
+        unsafe {
+            assert!(
+                read_ep_counter(&ep_lib, b"nxrt_ep_get_capability_call_count") > 0,
+                "{label}: real ORT session creation must enter GetCapability"
+            );
+            assert_ops_assigned_to_our_ep(api, session, &["Einsum"], &registration);
+            assert_eq!(
+                read_ep_counter(&ep_lib, b"nxrt_ep_compiled_node_count"),
+                1,
+                "{label}: ORT must compile exactly the assigned Einsum node"
+            );
 
-        let mut a_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let mut b_data = [1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0];
-        let a_val = make_float_tensor(api, &mut a_data, &[2, 3]);
-        let b_val = make_float_tensor(api, &mut b_data, &[3, 2]);
-        let inputs: [*const ort::OrtValue; 2] = [a_val, b_val];
-        let input_names = [c"A".as_ptr(), c"B".as_ptr()];
-        let output_names = [c"C".as_ptr()];
-        let mut output: *mut ort::OrtValue = ptr::null_mut();
-        let status = ((*api).Run.unwrap())(
-            session,
-            ptr::null(),
-            input_names.as_ptr(),
-            inputs.as_ptr(),
-            inputs.len(),
-            output_names.as_ptr(),
-            1,
-            &mut output,
-        );
-        check_status(api, status, "Run(Einsum)");
-        assert!(!output.is_null());
-        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
-        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
-        check_status(api, status, "GetTensorMutableData(Einsum)");
-        let result = std::slice::from_raw_parts(data_ptr.cast::<f32>(), 4);
-        assert_eq!(result, [4.0, 2.0, 10.0, 5.0]);
-        assert_eq!(
-            read_ep_counter(&ep_lib, b"nxrt_ep_executed_node_count"),
-            1,
-            "the assigned Einsum kernel must execute exactly once"
-        );
+            let (a_val, b_val) = if dtype == ELEM_F32 {
+                let a = Box::leak(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0].into_boxed_slice());
+                let b = Box::leak(vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0].into_boxed_slice());
+                (
+                    make_float_tensor(api, a, &[2, 3]),
+                    make_float_tensor(api, b, &[3, 2]),
+                )
+            } else {
+                let a = Box::leak(
+                    [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+                        .map(f32_to_f16_bits)
+                        .to_vec()
+                        .into_boxed_slice(),
+                );
+                let b = Box::leak(
+                    [1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0]
+                        .map(f32_to_f16_bits)
+                        .to_vec()
+                        .into_boxed_slice(),
+                );
+                (
+                    make_float16_tensor(api, a, &[2, 3]),
+                    make_float16_tensor(api, b, &[3, 2]),
+                )
+            };
+            let inputs: [*const ort::OrtValue; 2] = [a_val, b_val];
+            let input_names = [c"A".as_ptr(), c"B".as_ptr()];
+            let output_names = [c"C".as_ptr()];
+            let mut output: *mut ort::OrtValue = ptr::null_mut();
+            let status = ((*api).Run.unwrap())(
+                session,
+                ptr::null(),
+                input_names.as_ptr(),
+                inputs.as_ptr(),
+                inputs.len(),
+                output_names.as_ptr(),
+                1,
+                &mut output,
+            );
+            check_status(api, status, "Run(Einsum)");
+            assert!(!output.is_null());
+            let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+            let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+            check_status(api, status, "GetTensorMutableData(Einsum)");
+            if dtype == ELEM_F32 {
+                assert_eq!(
+                    std::slice::from_raw_parts(data_ptr.cast::<f32>(), 4),
+                    [4.0, 2.0, 10.0, 5.0]
+                );
+            } else {
+                assert_eq!(
+                    std::slice::from_raw_parts(data_ptr.cast::<u16>(), 4),
+                    [4.0f32, 2.0, 10.0, 5.0].map(f32_to_f16_bits)
+                );
+            }
+            assert_eq!(
+                read_ep_counter(&ep_lib, b"nxrt_ep_executed_node_count"),
+                1,
+                "{label}: the assigned Einsum kernel must execute exactly once"
+            );
 
-        ((*api).ReleaseValue.unwrap())(output);
-        ((*api).ReleaseValue.unwrap())(a_val);
-        ((*api).ReleaseValue.unwrap())(b_val);
-        conformance_teardown(api, env, opts, session, "cpu_ep_einsum");
+            ((*api).ReleaseValue.unwrap())(output);
+            ((*api).ReleaseValue.unwrap())(a_val);
+            ((*api).ReleaseValue.unwrap())(b_val);
+            conformance_teardown(api, env, opts, session, &registration);
+        }
     }
 }
 

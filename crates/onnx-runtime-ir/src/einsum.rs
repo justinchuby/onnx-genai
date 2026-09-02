@@ -823,7 +823,11 @@ impl fmt::Display for EinsumPlanError {
             }
             EinsumPlanErrorKind::UnsupportedInputDtype { input, dtype } => write!(
                 f,
-                "input #{input} has unsupported opset-12 dtype {dtype:?}; expected an 8/16/32/64-bit integer or float tensor"
+                "input #{input} has unsupported opset-12 dtype {dtype:?}; expected Uint8, Uint16, \
+                 Uint32, Uint64, Int8, Int16, Int32, Int64, Float16, Float32, or Float64. \
+                 BFloat16 is not part of the canonical Einsum contract. HOW: cast the operands \
+                 to a schema-supported dtype or use an operator/schema version that explicitly \
+                 permits their dtype"
             ),
             EinsumPlanErrorKind::InputDtypeMismatch {
                 input,
@@ -956,7 +960,6 @@ pub enum EinsumResolveError<E> {
 pub struct EinsumPlan {
     equation: String,
     explicit_output: bool,
-    dtype: DataType,
     operands: Vec<EinsumOperandPlan>,
     logical_axes: Vec<EinsumLogicalAxis>,
     output_axes: Vec<EinsumAxis>,
@@ -973,12 +976,39 @@ impl EinsumPlan {
         equation: &str,
         inputs: &[EinsumInput<'_, D>],
     ) -> Result<Self, EinsumPlanError> {
-        let normalized: String = equation
-            .chars()
-            .filter(|&character| character != ' ')
-            .collect();
+        let normalized = normalize_equation(equation);
         let parsed = ParsedEquation::parse(&normalized, inputs.len())?;
         let input_meta = validate_inputs(&normalized, inputs)?;
+        build_plan(normalized, parsed, input_meta)
+    }
+
+    /// Parse and validate an opset-12 equation against input shapes, then
+    /// classify its lowering structurally.
+    ///
+    /// This entry point intentionally performs no dtype validation. It is for
+    /// kernel factories whose API receives concrete shapes but not tensor
+    /// dtypes; their provider capability gate and runtime kernel must validate
+    /// the real dtype separately. Using a fabricated dtype here would let a
+    /// direct factory call bypass the canonical ONNX type contract.
+    pub fn build_for_shapes<D: EinsumDimensionValue>(
+        equation: &str,
+        input_shapes: &[&[D]],
+    ) -> Result<Self, EinsumPlanError> {
+        let normalized = normalize_equation(equation);
+        let parsed = ParsedEquation::parse(&normalized, input_shapes.len())?;
+        let input_meta = input_shapes
+            .iter()
+            .map(|shape| InputMeta {
+                shape: shape
+                    .iter()
+                    .map(|dimension| {
+                        dimension
+                            .einsum_static_size()
+                            .map_or(EinsumDimension::Dynamic, EinsumDimension::Static)
+                    })
+                    .collect(),
+            })
+            .collect();
         build_plan(normalized, parsed, input_meta)
     }
 
@@ -990,11 +1020,6 @@ impl EinsumPlan {
     /// Whether the source equation supplied an explicit `->` output.
     pub const fn has_explicit_output(&self) -> bool {
         self.explicit_output
-    }
-
-    /// Shared input/output dtype.
-    pub const fn dtype(&self) -> DataType {
-        self.dtype
     }
 
     /// Canonical operand mappings.
@@ -1426,7 +1451,6 @@ impl ParsedEquation {
 
 #[derive(Clone, Debug)]
 struct InputMeta {
-    dtype: DataType,
     shape: Vec<EinsumDimension>,
 }
 
@@ -1464,7 +1488,6 @@ fn validate_inputs<D: EinsumDimensionValue>(
             EinsumPlanError::new(equation, EinsumPlanErrorKind::MissingInputShape { input })
         })?;
         result.push(InputMeta {
-            dtype,
             shape: shape
                 .iter()
                 .map(|dimension| {
@@ -1476,6 +1499,13 @@ fn validate_inputs<D: EinsumDimensionValue>(
         });
     }
     Ok(result)
+}
+
+fn normalize_equation(equation: &str) -> String {
+    equation
+        .chars()
+        .filter(|&character| character != ' ')
+        .collect()
 }
 
 fn is_opset12_dtype(dtype: DataType) -> bool {
@@ -1737,7 +1767,6 @@ fn build_plan(
     Ok(EinsumPlan {
         equation,
         explicit_output,
-        dtype: input_meta[0].dtype,
         operands: operand_axes,
         logical_axes,
         output_axes,
@@ -2736,6 +2765,21 @@ mod tests {
             }
         ));
 
+        let bfloat16 = [EinsumInput::new(DataType::BFloat16, &shape)];
+        let error = EinsumPlan::build("i->i", &bfloat16).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            EinsumPlanErrorKind::UnsupportedInputDtype {
+                input: 0,
+                dtype: DataType::BFloat16
+            }
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("BFloat16 is not part of the canonical Einsum contract")
+        );
+
         let integer = [3usize];
         let mismatch = [
             EinsumInput::new(DataType::Float32, &shape),
@@ -2749,6 +2793,24 @@ mod tests {
                 actual: DataType::Int32
             }
         ));
+    }
+
+    #[test]
+    fn shape_only_planning_does_not_fabricate_a_dtype() {
+        let left = [2usize, 3];
+        let right = [3usize, 4];
+        let plan = EinsumPlan::build_for_shapes("ik,kj->ij", &[&left, &right]).unwrap();
+        assert!(matches!(
+            plan.classification(),
+            EinsumClassification::Gemm(_)
+        ));
+        assert_eq!(
+            plan.output_shape()
+                .iter()
+                .map(|dimension| dimension.as_static())
+                .collect::<Vec<_>>(),
+            [Some(2), Some(4)]
+        );
     }
 
     #[test]

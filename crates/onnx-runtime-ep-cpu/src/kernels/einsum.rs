@@ -21,17 +21,18 @@ use super::{check_arity, matmul::MatMulKernel, to_dense_bytes, write_dense_bytes
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::next_index;
 
-/// Diagnostic A/B switch used by `benches/einsum.rs`.
+/// Diagnostic execution switch used by `benches/einsum.rs`.
 ///
-/// `reference` routes arithmetic through the canonical plan's generic
-/// high-precision evaluator instead of the GEMM lowering. The default is
+/// `oracle` routes arithmetic through the canonical plan's generic
+/// high-precision evaluator instead of the native lowering. It is a
+/// correctness diagnostic, not a replaceable performance baseline. The default is
 /// `optimized`. It is read only when a kernel is constructed.
 pub const EINSUM_MODE_ENV: &str = "NXRT_CPU_EINSUM_MODE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecutionMode {
     Optimized,
-    Reference,
+    Oracle,
 }
 
 #[derive(Default)]
@@ -64,11 +65,8 @@ impl KernelFactory for EinsumFactory {
                     .into(),
             ));
         }
-        let planned_inputs: Vec<_> = input_shapes
-            .iter()
-            .map(|shape| EinsumInput::new(DataType::Float32, shape))
-            .collect();
-        let plan = EinsumPlan::build(equation, &planned_inputs).map_err(|error| {
+        let input_shape_refs: Vec<_> = input_shapes.iter().map(Vec::as_slice).collect();
+        let plan = EinsumPlan::build_for_shapes(equation, &input_shape_refs).map_err(|error| {
             EpError::KernelFailed(format!(
                 "Einsum: canonical planning failed for `{equation}`: {error}"
             ))
@@ -117,18 +115,18 @@ fn equation(node: &Node) -> Result<&str> {
 
 fn execution_mode() -> Result<ExecutionMode> {
     match std::env::var(EINSUM_MODE_ENV) {
-        Ok(value) if value.eq_ignore_ascii_case("reference") => Ok(ExecutionMode::Reference),
+        Ok(value) if value.eq_ignore_ascii_case("oracle") => Ok(ExecutionMode::Oracle),
         Ok(value) if value.eq_ignore_ascii_case("optimized") || value.trim().is_empty() => {
             Ok(ExecutionMode::Optimized)
         }
         Ok(value) => Err(EpError::KernelFailed(format!(
             "Einsum: {EINSUM_MODE_ENV}={value:?} is invalid. HOW: use `optimized` (default) or \
-             `reference` for benchmark A/B."
+             `oracle` for a high-precision correctness diagnostic."
         ))),
         Err(std::env::VarError::NotPresent) => Ok(ExecutionMode::Optimized),
         Err(std::env::VarError::NotUnicode(_)) => Err(EpError::KernelFailed(format!(
             "Einsum: {EINSUM_MODE_ENV} is not valid UTF-8. HOW: unset it or use `optimized` or \
-             `reference`."
+             `oracle`."
         ))),
     }
 }
@@ -160,33 +158,35 @@ pub fn unsupported_reason(
             "Einsum `{equation}` has no inputs; ONNX Einsum requires at least one operand"
         ));
     }
-    if let Some((index, dtype)) = input_dtypes.iter().copied().enumerate().find(|(_, dtype)| {
-        !matches!(
-            dtype,
-            DataType::Float32 | DataType::Float16 | DataType::BFloat16
-        )
-    }) {
-        return Some(format!(
-            "Einsum `{equation}` input #{index} has dtype {dtype:?}; the native CPU kernel \
-             supports Float32, Float16, and BFloat16. HOW: cast the operands to a supported \
-             compute dtype or use another execution provider."
-        ));
-    }
     let inputs: Vec<_> = shapes
         .iter()
         .zip(input_dtypes)
         .map(|(shape, &dtype)| EinsumInput::new(dtype, shape))
         .collect();
     match EinsumPlan::build(equation, &inputs) {
-        Ok(plan) => match plan.classification() {
-            EinsumClassification::Unsupported(reason) => Some(format!(
-                "Einsum `{}` is valid but not a native CPU lowering: {reason}. Supported native \
-                 classes are view/diagonal, reduction or elementwise product, and binary \
-                 GEMM/BMM-compatible contractions.",
-                plan.equation()
-            )),
-            _ => None,
-        },
+        Ok(plan) => {
+            if let Some((index, dtype)) = input_dtypes
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, dtype)| !matches!(dtype, DataType::Float32 | DataType::Float16))
+            {
+                return Some(format!(
+                    "Einsum `{equation}` input #{index} has canonical dtype {dtype:?}, but the \
+                     native CPU kernel supports only Float32 and Float16. HOW: cast every operand \
+                     to Float32 or Float16, or use another execution provider."
+                ));
+            }
+            match plan.classification() {
+                EinsumClassification::Unsupported(reason) => Some(format!(
+                    "Einsum `{}` is valid but not a native CPU lowering: {reason}. Supported \
+                     native classes are view/diagonal, reduction or elementwise product, and \
+                     binary GEMM/BMM-compatible contractions.",
+                    plan.equation()
+                )),
+                _ => None,
+            }
+        }
         Err(error) => Some(format!(
             "Einsum canonical planning rejected `{equation}`: {error}"
         )),
@@ -207,7 +207,7 @@ impl Kernel for EinsumKernel {
                 self.execute_view_copy(inputs, outputs, permutation)
             }
             EinsumClassification::ReductionOrElementwise(reduction) => {
-                self.record_route(if self.mode == ExecutionMode::Reference {
+                self.record_route(if self.mode == ExecutionMode::Oracle {
                     4
                 } else {
                     2
@@ -219,7 +219,7 @@ impl Kernel for EinsumKernel {
             }
             EinsumClassification::Gemm(_) => {
                 self.record_route(4);
-                self.execute_reference(inputs, outputs)
+                self.execute_oracle(inputs, outputs)
             }
             EinsumClassification::Unsupported(reason) => Err(EpError::KernelFailed(format!(
                 "Einsum equation `{}` reached execution with an unsupported canonical plan: \
@@ -247,6 +247,12 @@ impl Kernel for EinsumKernel {
         num_outputs: usize,
     ) -> Option<Vec<ViewOutput>> {
         if num_outputs != 1 || output_shapes.len() != 1 {
+            return None;
+        }
+        let dtype = inputs.first()?.dtype;
+        if !matches!(dtype, DataType::Float32 | DataType::Float16)
+            || inputs.iter().any(|input| input.dtype != dtype)
+        {
             return None;
         }
         let permutation = match self.plan.classification() {
@@ -302,13 +308,11 @@ impl EinsumKernel {
                     input.device
                 )));
             }
-            if !matches!(
-                input.dtype,
-                DataType::Float32 | DataType::Float16 | DataType::BFloat16
-            ) {
+            if !matches!(input.dtype, DataType::Float32 | DataType::Float16) {
                 return Err(EpError::KernelFailed(format!(
-                    "Einsum `{}` input #{index} has unsupported dtype {:?}; expected Float32, \
-                     Float16, or BFloat16",
+                    "Einsum `{}` input #{index} has unsupported dtype {:?}; expected Float32 or \
+                     Float16. BFloat16 is not in the canonical ONNX opset-12 Einsum contract. \
+                     HOW: cast every operand to Float32 or Float16 before this node.",
                     self.plan.equation(),
                     input.dtype
                 )));
@@ -397,11 +401,11 @@ impl EinsumKernel {
             reduction.iteration_axes(),
             reduction.output_rank(),
             reduction.operand_axis_mappings(),
-            self.mode == ExecutionMode::Reference,
+            self.mode == ExecutionMode::Oracle,
         )
     }
 
-    fn execute_reference(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn execute_oracle(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         let mut iteration_axes = self.plan.output_axes().to_vec();
         iteration_axes.extend_from_slice(self.plan.reduction_axes());
         let output_rank = self.plan.output_axes().len();
@@ -1119,8 +1123,9 @@ pub fn benchmark_scratch_capacity_bytes(kernel: &dyn Kernel) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ep_api::abi::OrtGraphView;
     use onnx_runtime_ep_api::{DevicePtrMut, ExecutionProvider};
-    use onnx_runtime_ir::{Attribute, DeviceId, Dim, NodeId, static_shape};
+    use onnx_runtime_ir::{Attribute, DeviceId, Dim, FrozenGraph, Graph, NodeId, static_shape};
 
     fn kernel(equation: &str, shapes: &[Vec<usize>], mode: ExecutionMode) -> Box<dyn Kernel> {
         let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
@@ -1128,11 +1133,8 @@ mod tests {
             "equation".into(),
             Attribute::String(equation.as_bytes().to_vec()),
         );
-        let planned_inputs: Vec<_> = shapes
-            .iter()
-            .map(|shape| EinsumInput::new(DataType::Float32, shape))
-            .collect();
-        let plan = EinsumPlan::build(equation, &planned_inputs).unwrap();
+        let input_shape_refs: Vec<_> = shapes.iter().map(Vec::as_slice).collect();
+        let plan = EinsumPlan::build_for_shapes(equation, &input_shape_refs).unwrap();
         Box::new(EinsumKernel {
             flops: None,
             plan,
@@ -1335,7 +1337,7 @@ mod tests {
         let equation = "abxy,...xycd->d...cab";
         let shapes = [vec![2, 1, 2, 2], vec![3, 2, 2, 2, 2]];
         let broadcasted = kernel(equation, &shapes, ExecutionMode::Optimized);
-        let reference = kernel(equation, &shapes, ExecutionMode::Reference);
+        let oracle = kernel(equation, &shapes, ExecutionMode::Oracle);
         let left = Owned::f32(&shapes[0], &[1., 2., 3., 4., 5., 6., 7., 8.]);
         let right = Owned::f32(
             &shapes[1],
@@ -1346,7 +1348,7 @@ mod tests {
         broadcasted
             .execute(&[left.view(), right.view()], &mut [actual.view_mut()])
             .unwrap();
-        reference
+        oracle
             .execute(&[left.view(), right.view()], &mut [expected.view_mut()])
             .unwrap();
         assert_close(&actual.to_f32(), &expected.to_f32(), 1e-5);
@@ -1354,63 +1356,43 @@ mod tests {
     }
 
     #[test]
-    fn half_dtypes_and_noncontiguous_inputs_match_f32_reference() {
-        for dtype in [DataType::Float16, DataType::BFloat16] {
-            let gemm = kernel(
-                "ik,kj->ij",
-                &[vec![2, 3], vec![3, 2]],
-                ExecutionMode::Optimized,
-            );
-            let a = match dtype {
-                DataType::Float16 => Owned::f16(&[2, 3], &[1., 2., 3., 4., 5., 6.]),
-                DataType::BFloat16 => Owned::bf16(&[2, 3], &[1., 2., 3., 4., 5., 6.]),
-                _ => unreachable!(),
-            };
-            let b = match dtype {
-                DataType::Float16 => Owned::f16(&[3, 2], &[1., 0., 0., 1., 1., 0.]),
-                DataType::BFloat16 => Owned::bf16(&[3, 2], &[1., 0., 0., 1., 1., 0.]),
-                _ => unreachable!(),
-            };
-            let mut out = Owned::zeros(dtype, &[2, 2]);
-            gemm.execute(&[a.view(), b.view()], &mut [out.view_mut()])
-                .unwrap();
-            let actual = if dtype == DataType::Float16 {
-                out.to_f16_as_f32()
-            } else {
-                out.to_bf16_as_f32()
-            };
-            assert_close(&actual, &[4., 2., 10., 5.], 0.05);
+    fn float16_and_noncontiguous_inputs_match_expected_values() {
+        let gemm = kernel(
+            "ik,kj->ij",
+            &[vec![2, 3], vec![3, 2]],
+            ExecutionMode::Optimized,
+        );
+        let a = Owned::f16(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f16(&[3, 2], &[1., 0., 0., 1., 1., 0.]);
+        let mut out = Owned::zeros(DataType::Float16, &[2, 2]);
+        gemm.execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_close(&out.to_f16_as_f32(), &[4., 2., 10., 5.], 0.05);
 
-            let reduce = kernel("ij->i", &[vec![2, 3]], ExecutionMode::Optimized);
-            let mut reduced = Owned::zeros(dtype, &[2]);
-            reduce
-                .execute(&[a.view()], &mut [reduced.view_mut()])
-                .unwrap();
-            let actual = if dtype == DataType::Float16 {
-                reduced.to_f16_as_f32()
-            } else {
-                reduced.to_bf16_as_f32()
-            };
-            assert_close(&actual, &[6., 15.], 0.05);
+        let reduce = kernel("ij->i", &[vec![2, 3]], ExecutionMode::Optimized);
+        let mut reduced = Owned::zeros(DataType::Float16, &[2]);
+        reduce
+            .execute(&[a.view()], &mut [reduced.view_mut()])
+            .unwrap();
+        assert_close(&reduced.to_f16_as_f32(), &[6., 15.], 0.05);
 
-            let transpose = kernel("ij->ji", &[vec![2, 3]], ExecutionMode::Optimized);
-            let mut transposed = Owned::zeros(dtype, &[3, 2]);
-            transpose
-                .execute(&[a.view()], &mut [transposed.view_mut()])
-                .unwrap();
-            assert_eq!(
-                transposed.to_u16_bits(),
-                [
-                    a.to_u16_bits()[0],
-                    a.to_u16_bits()[3],
-                    a.to_u16_bits()[1],
-                    a.to_u16_bits()[4],
-                    a.to_u16_bits()[2],
-                    a.to_u16_bits()[5],
-                ],
-                "view/copy semantics must preserve half payload bits exactly"
-            );
-        }
+        let transpose = kernel("ij->ji", &[vec![2, 3]], ExecutionMode::Optimized);
+        let mut transposed = Owned::zeros(DataType::Float16, &[3, 2]);
+        transpose
+            .execute(&[a.view()], &mut [transposed.view_mut()])
+            .unwrap();
+        assert_eq!(
+            transposed.to_u16_bits(),
+            [
+                a.to_u16_bits()[0],
+                a.to_u16_bits()[3],
+                a.to_u16_bits()[1],
+                a.to_u16_bits()[4],
+                a.to_u16_bits()[2],
+                a.to_u16_bits()[5],
+            ],
+            "view/copy semantics must preserve Float16 payload bits exactly"
+        );
 
         let noncontiguous = kernel(
             "ik,kj->ij",
@@ -1490,16 +1472,16 @@ mod tests {
     }
 
     #[test]
-    fn reference_mode_is_high_precision_and_non_vacuously_selected() {
+    fn oracle_mode_is_high_precision_and_non_vacuously_selected() {
         let optimized = kernel(
             "ik,kj->ij",
             &[vec![2, 3], vec![3, 2]],
             ExecutionMode::Optimized,
         );
-        let reference = kernel(
+        let oracle_kernel = kernel(
             "ik,kj->ij",
             &[vec![2, 3], vec![3, 2]],
-            ExecutionMode::Reference,
+            ExecutionMode::Oracle,
         );
         let a = Owned::f32(&[2, 3], &[1e10, 1., -1e10, 3., 4., 5.]);
         let b = Owned::f32(&[3, 2], &[1., 2., 1., 1., 1., 0.]);
@@ -1508,13 +1490,102 @@ mod tests {
         optimized
             .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
             .unwrap();
-        reference
+        oracle_kernel
             .execute(&[a.view(), b.view()], &mut [oracle.view_mut()])
             .unwrap();
         assert_eq!(route(&*optimized), 3);
-        assert_eq!(route(&*reference), 4);
+        assert_eq!(route(&*oracle_kernel), 4);
         assert_eq!(oracle.to_f32(), [1., 2e10, 12., 10.]);
         assert_close(&fast.to_f32(), &oracle.to_f32(), 1024.0);
+    }
+
+    fn einsum_graph(dtype: DataType) -> FrozenGraph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 24);
+        let left = graph.create_named_value("A", dtype, static_shape([2, 3]));
+        let right = graph.create_named_value("B", dtype, static_shape([3, 2]));
+        let output = graph.create_named_value("C", dtype, static_shape([2, 2]));
+        graph.add_input(left);
+        graph.add_input(right);
+        let mut node = Node::new(
+            NodeId(0),
+            "Einsum",
+            vec![Some(left), Some(right)],
+            vec![output],
+        );
+        node.attributes
+            .insert("equation".into(), Attribute::String(b"ik,kj->ij".to_vec()));
+        graph.insert_node(node);
+        graph.add_output(output);
+        FrozenGraph::build(graph).unwrap()
+    }
+
+    #[test]
+    fn provider_placement_declines_bfloat16_and_reaches_float16_float32() {
+        let provider = crate::CpuExecutionProvider::new();
+
+        for dtype in [DataType::Float32, DataType::Float16] {
+            let frozen = einsum_graph(dtype);
+            let view = frozen.view();
+            let node_index = view.nodes().next().expect("one Einsum node");
+            let support = provider.supports_node(&view, node_index, 24);
+            assert!(
+                support.is_supported(),
+                "{dtype:?} Einsum must be reachable through normal provider placement: {support:?}"
+            );
+            let claims = OrtGraphView::new(&view).query_capabilities(&provider);
+            assert_eq!(
+                claims.len(),
+                1,
+                "{dtype:?} Einsum must produce one non-vacuous provider capability"
+            );
+            let kernel = provider
+                .get_kernel(view.node(node_index), &[vec![2, 3], vec![3, 2]], 24)
+                .unwrap();
+            let (left, right) = match dtype {
+                DataType::Float32 => (
+                    Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]),
+                    Owned::f32(&[3, 2], &[1., 0., 0., 1., 1., 0.]),
+                ),
+                DataType::Float16 => (
+                    Owned::f16(&[2, 3], &[1., 2., 3., 4., 5., 6.]),
+                    Owned::f16(&[3, 2], &[1., 0., 0., 1., 1., 0.]),
+                ),
+                _ => unreachable!(),
+            };
+            let mut output = Owned::zeros(dtype, &[2, 2]);
+            kernel
+                .execute(&[left.view(), right.view()], &mut [output.view_mut()])
+                .unwrap();
+            let actual = match dtype {
+                DataType::Float32 => output.to_f32(),
+                DataType::Float16 => output.to_f16_as_f32(),
+                _ => unreachable!(),
+            };
+            assert_close(&actual, &[4., 2., 10., 5.], 0.05);
+        }
+
+        let frozen = einsum_graph(DataType::BFloat16);
+        let view = frozen.view();
+        let node_index = view.nodes().next().expect("one Einsum node");
+        let support = provider.supports_node(&view, node_index, 24);
+        assert!(!support.is_supported());
+        let reason = support.reason().expect("BFloat16 decline must explain why");
+        assert!(
+            reason.contains("unsupported opset-12 dtype BFloat16"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("not part of the canonical Einsum contract"),
+            "{reason}"
+        );
+        assert!(reason.contains("HOW:"), "{reason}");
+        assert!(
+            OrtGraphView::new(&view)
+                .query_capabilities(&provider)
+                .is_empty(),
+            "BFloat16 Einsum must not reach compilation through provider placement"
+        );
     }
 
     #[test]
@@ -1551,7 +1622,7 @@ mod tests {
 
     #[test]
     fn runtime_shape_and_dtype_errors_are_actionable() {
-        let kernel = kernel(
+        let shape_kernel = kernel(
             "ik,kj->ij",
             &[vec![2, 3], vec![3, 2]],
             ExecutionMode::Optimized,
@@ -1559,7 +1630,7 @@ mod tests {
         let a = Owned::f32(&[2, 3], &[1.; 6]);
         let b = Owned::f32(&[4, 2], &[1.; 8]);
         let mut out = Owned::zeros_f32(&[2, 2]);
-        let error = kernel
+        let error = shape_kernel
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap_err()
             .to_string();
@@ -1578,6 +1649,25 @@ mod tests {
             .insert("equation".into(), Attribute::String(b"i->i".to_vec()));
         let reason =
             unsupported_reason(&node, &[int_shape], &[DataType::Int32]).expect("must decline");
-        assert!(reason.contains("supports Float32, Float16, and BFloat16"));
+        assert!(reason.contains("supports only Float32 and Float16"));
+
+        let direct = kernel("i->i", &[vec![2]], ExecutionMode::Optimized);
+        let input = Owned::bf16(&[2], &[1.0, 2.0]);
+        assert!(
+            direct
+                .view_outputs(&[input.view()], &[vec![2]], 1)
+                .is_none(),
+            "BFloat16 must not bypass kernel dtype validation through a view output"
+        );
+        let mut output = Owned::zeros(DataType::BFloat16, &[2]);
+        let error = direct
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("BFloat16 is not in the canonical ONNX opset-12 Einsum contract"),
+            "{error}"
+        );
+        assert!(error.contains("HOW:"), "{error}");
     }
 }

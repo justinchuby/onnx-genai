@@ -62,8 +62,10 @@ reparsing, and `resolve_concrete_gemm_geometry` returns overflow-checked concret
 batch/M/K/N geometry for `Gemm` plans.
 
 The native CPU EP implements the four executable classes for
-`Float32`/`Float16`/`BFloat16`: zero-copy view/diagonal outputs where the
-executor permits aliases, canonical reduction/elementwise loops, and binary
-GEMM/BMM lowering through the existing MatMul kernel. `Unsupported` remains a
-claim-time refusal with the plan's structured reason. Other EPs may implement
-different subsets without changing this shared contract.
+`Float32`/`Float16`: zero-copy view/diagonal outputs where the executor permits
+aliases, canonical reduction/elementwise loops, and binary GEMM/BMM lowering
+through the existing MatMul kernel. BFloat16 is not in the canonical ONNX
+Einsum opset-12 type constraint and is declined before kernel creation; this
+implementation does not expand the schema. `Unsupported` remains a claim-time
+refusal with the plan's structured reason. Other EPs may implement different
+schema-valid subsets without changing this shared contract.

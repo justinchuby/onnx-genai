@@ -106,18 +106,23 @@ fn inputs(case: &Case) -> Vec<Tensor> {
         .collect()
 }
 
-fn validate_case(case: &Case, optimized: &dyn Kernel, reference: &dyn Kernel, inputs: &[Tensor]) {
+fn validate_case(
+    case: &Case,
+    optimized: &dyn Kernel,
+    oracle_kernel: &dyn Kernel,
+    inputs: &[Tensor],
+) {
     let views = inputs.iter().map(Tensor::view).collect::<Vec<_>>();
     let mut fast = Tensor::zeros(case.dtype, &case.output_shape);
-    let mut oracle = Tensor::zeros(case.dtype, &case.output_shape);
+    let mut oracle_output = Tensor::zeros(case.dtype, &case.output_shape);
     optimized
         .execute(&views, &mut [fast.view_mut()])
         .expect("optimized Einsum must execute");
-    reference
-        .execute(&views, &mut [oracle.view_mut()])
-        .expect("reference Einsum must execute");
+    oracle_kernel
+        .execute(&views, &mut [oracle_output.view_mut()])
+        .expect("Einsum correctness oracle must execute");
     let fast = fast.to_f32();
-    let oracle = oracle.to_f32();
+    let oracle = oracle_output.to_f32();
     assert!(
         oracle.iter().any(|value| *value != 0.0),
         "{} oracle is all-zero; the benchmark correctness check would be vacuous",
@@ -178,14 +183,6 @@ fn bench_einsum(c: &mut Criterion) {
             tolerance: 0.25,
         },
         Case {
-            name: "gemm_bf16",
-            equation: "ik,kj->ij",
-            input_shapes: vec![vec![32, 256], vec![256, 128]],
-            output_shape: vec![32, 128],
-            dtype: FloatDType::Bf16,
-            tolerance: 1.0,
-        },
-        Case {
             name: "reduction",
             equation: "ij->i",
             input_shapes: vec![vec![512, 512]],
@@ -227,8 +224,8 @@ fn bench_einsum(c: &mut Criterion) {
         let tensors = inputs(&case);
         let views = tensors.iter().map(Tensor::view).collect::<Vec<_>>();
         let (optimized, optimized_setup) = kernel_with_mode(&case, "optimized");
-        let (reference, reference_setup) = kernel_with_mode(&case, "reference");
-        validate_case(&case, &*optimized, &*reference, &tensors);
+        let (oracle, _) = kernel_with_mode(&case, "oracle");
+        validate_case(&case, &*optimized, &*oracle, &tensors);
         let workspace = benchmark_scratch_capacity_bytes(&*optimized).unwrap_or(0);
         let mut allocation_probe_output = Tensor::zeros(case.dtype, &case.output_shape);
         reset_allocations();
@@ -237,48 +234,27 @@ fn bench_einsum(c: &mut Criterion) {
             .expect("allocation probe must execute");
         let (allocation_calls, allocated_bytes) = allocations();
         eprintln!(
-            "EINSUM_SETUP case={} optimized_us={:.3} reference_us={:.3} \
+            "EINSUM_SETUP case={} native_us={:.3} \
              reusable_workspace_bytes={workspace} steady_allocations={allocation_calls} \
              steady_allocated_bytes={allocated_bytes}",
             case.name,
             optimized_setup.as_secs_f64() * 1e6,
-            reference_setup.as_secs_f64() * 1e6,
         );
         group.throughput(Throughput::Elements(
             case.output_shape.iter().product::<usize>() as u64,
         ));
 
         let mut optimized_output = Tensor::zeros(case.dtype, &case.output_shape);
-        group.bench_with_input(
-            BenchmarkId::new(case.name, "optimized"),
-            &(),
-            |bencher, _| {
-                bencher.iter(|| {
-                    optimized
-                        .execute(
-                            black_box(&views),
-                            black_box(&mut [optimized_output.view_mut()]),
-                        )
-                        .unwrap()
-                });
-            },
-        );
-
-        let mut reference_output = Tensor::zeros(case.dtype, &case.output_shape);
-        group.bench_with_input(
-            BenchmarkId::new(case.name, "reference_f64"),
-            &(),
-            |bencher, _| {
-                bencher.iter(|| {
-                    reference
-                        .execute(
-                            black_box(&views),
-                            black_box(&mut [reference_output.view_mut()]),
-                        )
-                        .unwrap()
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new(case.name, "native"), &(), |bencher, _| {
+            bencher.iter(|| {
+                optimized
+                    .execute(
+                        black_box(&views),
+                        black_box(&mut [optimized_output.view_mut()]),
+                    )
+                    .unwrap()
+            });
+        });
     }
     group.finish();
 
@@ -312,7 +288,7 @@ fn bench_einsum(c: &mut Criterion) {
     black_box(&allocation_probe);
     let (view_allocations, view_allocated_bytes) = allocations();
     eprintln!(
-        "EINSUM_SETUP case=view_permutation optimized_us={:.3} reference_us=n/a \
+        "EINSUM_SETUP case=view_permutation native_us={:.3} \
          reusable_workspace_bytes=0 steady_allocations={view_allocations} \
          steady_allocated_bytes={view_allocated_bytes}",
         view_setup.as_secs_f64() * 1e6,
