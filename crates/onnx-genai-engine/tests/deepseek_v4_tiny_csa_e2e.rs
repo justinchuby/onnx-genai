@@ -659,14 +659,31 @@ fn native_cuda_loader_materializes_all_governed_state_once() {
         warmed.csa_record_device_ptrs,
         initial.csa_record_device_ptrs
     );
-    assert!(warmed.graph.captures > 0);
-    assert!(warmed.graph.replays > 0);
+    assert_eq!(warmed.graph.captures, 1);
+    assert_eq!(warmed.graph.replays, 7);
     assert_eq!(warmed.graph.fallbacks, 0);
-    assert!(warmed.cuda_decode_submissions > 0);
+    assert_eq!(warmed.graph.invalidations, 0);
+    assert_eq!(warmed.cuda_decode_submissions, 9);
+    assert_eq!(warmed.csa_record_growth_events, 2);
 
     let vmm = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
     assert!(vmm.reserved_bytes > 0);
     assert!(vmm.allocations > 0);
+    eprintln!(
+        "loaded-state CUDA proof: device_allocations={} telemetry_updates={} host_allocations={} \
+         h2d={} d2h={} d2d={} sync={} submissions={} captures={} replays={} record_growths={}",
+        loader.device_allocations,
+        loader.telemetry_updates,
+        loader.host_output_allocations,
+        loader.host_to_device_copies,
+        loader.device_to_host_copies,
+        loader.device_to_device_copies,
+        loader.synchronizations,
+        warmed.cuda_decode_submissions,
+        warmed.graph.captures,
+        warmed.graph.replays,
+        warmed.csa_record_growth_events
+    );
 }
 
 #[cfg(feature = "native-cuda")]
