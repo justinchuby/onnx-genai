@@ -6,9 +6,12 @@ they must not reparse `equation` or classify an equation by matching its string.
 
 ## Guarantees
 
-- The equation is whitespace-normalized, parsed once, and validated against
-  every input dtype, rank, and dimension.
-- Input axes map to canonical named or right-aligned ellipsis axes. Repeated
+- Only U+0020 ASCII spaces are stripped from the equation; every other
+  whitespace or non-syntax character is rejected. The normalized equation is
+  parsed once and validated against every input dtype, rank, and dimension.
+- Every explicit ellipsis expands to the same fixed number of dimensions, as
+  required by opset 12. Terms without ellipsis do not acquire synthetic axes.
+  Input axes map to canonical named or ellipsis axes. Repeated
   labels are represented as one operand axis with all contributing physical
   axes, so a diagonal view uses the sum of their strides.
 - Each logical axis records all physical occurrences, its equality or broadcast
@@ -42,8 +45,9 @@ A `Gemm` plan exposes canonical groups and mappings:
 - result: `[batch..., M..., N...]`
 
 Each operand order entry indexes its post-diagonal `unique_axes`; `None` inserts
-a singleton for an absent, right-aligned ellipsis batch axis. Named batch labels
-require equality, while ellipsis batch axes use broadcast constraints.
+a singleton for an ellipsis batch axis absent from a term that did not contain
+ellipsis. Named batch labels require equality, while ellipsis batch axes use
+broadcast constraints.
 `output_permutation` maps the requested output to the canonical result.
 `EinsumGemmGeometry` carries the full batch shape and checked flattened
 `batch/M/K/N` products when static; dynamic values remain explicit.

@@ -88,12 +88,12 @@ impl fmt::Display for EinsumLabel {
 
 /// A canonical logical axis in an einsum expression.
 ///
-/// Ellipsis axes are numbered left-to-right after expanding every input to the
-/// maximum ellipsis rank. Shorter ellipses are right-aligned, so their leading
-/// canonical axes are implicit singleton dimensions.
+/// Ellipsis axes are numbered left-to-right after expanding every explicit
+/// ellipsis to the common rank required by ONNX opset 12. Operands without an
+/// ellipsis simply do not contain those axes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EinsumAxis {
-    /// A right-aligned broadcast axis expanded from `...`.
+    /// A broadcast axis expanded from `...`.
     Ellipsis(usize),
     /// A named equation label.
     Label(EinsumLabel),
@@ -667,6 +667,17 @@ pub enum EinsumPlanErrorKind {
         /// Whether the term contains an ellipsis.
         has_ellipsis: bool,
     },
+    /// Two explicit ellipses expand to different numbers of dimensions.
+    EllipsisRankMismatch {
+        /// First input term containing an ellipsis.
+        first_input: usize,
+        /// Expansion rank established by the first ellipsis.
+        first_rank: usize,
+        /// Later input term containing an incompatible ellipsis.
+        input: usize,
+        /// Expansion rank of the incompatible ellipsis.
+        rank: usize,
+    },
     /// Concrete shapes supplied to an existing plan have the wrong count.
     ResolvedInputCountMismatch {
         /// Count used to build the plan.
@@ -840,6 +851,15 @@ impl fmt::Display for EinsumPlanError {
                     )
                 }
             }
+            EinsumPlanErrorKind::EllipsisRankMismatch {
+                first_input,
+                first_rank,
+                input,
+                rank,
+            } => write!(
+                f,
+                "input term #{input} explicit ellipsis has expansion rank {rank}, but input term #{first_input} explicit ellipsis has expansion rank {first_rank}; ONNX opset 12 requires every explicit ellipsis to represent the same number of dimensions"
+            ),
             EinsumPlanErrorKind::ResolvedInputCountMismatch { expected, found } => write!(
                 f,
                 "plan was built for {expected} inputs, but execution supplied {found}"
@@ -955,7 +975,7 @@ impl EinsumPlan {
     ) -> Result<Self, EinsumPlanError> {
         let normalized: String = equation
             .chars()
-            .filter(|character| !character.is_whitespace())
+            .filter(|&character| character != ' ')
             .collect();
         let parsed = ParsedEquation::parse(&normalized, inputs.len())?;
         let input_meta = validate_inputs(&normalized, inputs)?;
@@ -1062,30 +1082,21 @@ impl EinsumPlan {
             resolved_ellipsis = Some(match resolved_ellipsis {
                 None => current,
                 Some(existing) => {
-                    let rank = existing.len().max(current.len());
-                    let existing_offset = rank - existing.len();
-                    let current_offset = rank - current.len();
-                    let mut result = Vec::with_capacity(rank);
-                    for axis in 0..rank {
-                        match (
-                            axis.checked_sub(existing_offset)
-                                .and_then(|index| existing.get(index)),
-                            axis.checked_sub(current_offset)
-                                .and_then(|index| current.get(index)),
-                        ) {
-                            (Some(left), Some(right)) => {
-                                result.push(broadcast(left, right).map_err(|source| {
-                                    EinsumResolveError::Broadcast {
-                                        axis: EinsumAxis::Ellipsis(axis),
-                                        source,
-                                    }
-                                })?);
+                    debug_assert_eq!(
+                        existing.len(),
+                        current.len(),
+                        "validated explicit ellipses have one common expansion rank"
+                    );
+                    let mut result = Vec::with_capacity(existing.len());
+                    for (axis, (left, right)) in
+                        existing.into_iter().zip(current.iter()).enumerate()
+                    {
+                        result.push(broadcast(&left, right).map_err(|source| {
+                            EinsumResolveError::Broadcast {
+                                axis: EinsumAxis::Ellipsis(axis),
+                                source,
                             }
-                            (Some(dimension), None) | (None, Some(dimension)) => {
-                                result.push(dimension.clone());
-                            }
-                            (None, None) => unreachable!("axis belongs to at least one shape"),
-                        }
+                        })?);
                     }
                     result
                 }
@@ -1490,6 +1501,7 @@ fn build_plan(
     input_meta: Vec<InputMeta>,
 ) -> Result<EinsumPlan, EinsumPlanError> {
     let mut ellipsis_ranks = Vec::with_capacity(input_meta.len());
+    let mut explicit_ellipsis = None;
     for (input, (term, metadata)) in parsed.inputs.iter().zip(&input_meta).enumerate() {
         let named_labels = term.named_count().ok_or_else(|| {
             EinsumPlanError::new(
@@ -1518,9 +1530,26 @@ fn build_plan(
                 },
             )
         })?;
+        if term.has_ellipsis {
+            if let Some((first_input, first_rank)) = explicit_ellipsis {
+                if ellipsis_rank != first_rank {
+                    return Err(EinsumPlanError::new(
+                        &equation,
+                        EinsumPlanErrorKind::EllipsisRankMismatch {
+                            first_input,
+                            first_rank,
+                            input,
+                            rank: ellipsis_rank,
+                        },
+                    ));
+                }
+            } else {
+                explicit_ellipsis = Some((input, ellipsis_rank));
+            }
+        }
         ellipsis_ranks.push(ellipsis_rank);
     }
-    let ellipsis_rank = ellipsis_ranks.iter().copied().max().unwrap_or(0);
+    let ellipsis_rank = explicit_ellipsis.map_or(0, |(_, rank)| rank);
 
     let mut occurrences: BTreeMap<EinsumAxis, Vec<EinsumAxisRef>> = BTreeMap::new();
     let mut operand_axes = Vec::with_capacity(input_meta.len());
@@ -2196,6 +2225,34 @@ mod tests {
         EinsumPlan::build(equation, inputs).unwrap_err().kind
     }
 
+    fn assert_ellipsis_rank_mismatch(
+        equation: &str,
+        left: &[usize],
+        right: &[usize],
+        first_rank: usize,
+        rank: usize,
+    ) {
+        let inputs = [
+            EinsumInput::new(DataType::Float32, left),
+            EinsumInput::new(DataType::Float32, right),
+        ];
+        let error = EinsumPlan::build(equation, &inputs).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            EinsumPlanErrorKind::EllipsisRankMismatch {
+                first_input: 0,
+                first_rank: actual_first_rank,
+                input: 1,
+                rank: actual_rank,
+            } if *actual_first_rank == first_rank && *actual_rank == rank
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("ONNX opset 12 requires every explicit ellipsis")
+        );
+    }
+
     #[test]
     fn explicit_and_implicit_equations_normalize_and_order_output() {
         let explicit = plan("  i k , k j  ->  j i ", &[&[2, 3], &[3, 4]]);
@@ -2211,8 +2268,30 @@ mod tests {
     }
 
     #[test]
+    fn only_ascii_space_is_ignored() {
+        let spaced = plan(" i k , k j -> j i ", &[&[2, 3], &[3, 4]]);
+        assert_eq!(spaced.equation(), "ik,kj->ji");
+
+        for invalid in ['\t', '\n', '\u{00a0}', '\u{2003}', '\u{2028}'] {
+            let equation = format!("i{invalid}->i");
+            let shape = [7usize];
+            let inputs = [EinsumInput::new(DataType::Float32, &shape)];
+            let error = EinsumPlan::build(&equation, &inputs).unwrap_err();
+            assert_eq!(error.equation(), equation);
+            assert!(matches!(
+                error.kind(),
+                EinsumPlanErrorKind::InvalidCharacter {
+                    side: EinsumEquationSide::Input(0),
+                    offset: 1,
+                    found,
+                } if *found == invalid
+            ));
+        }
+    }
+
+    #[test]
     fn scalar_rank_one_and_zero_dimensions_are_preserved() {
-        for equation in ["", "->", " \t -> \n"] {
+        for equation in ["", "->", "   ->   "] {
             let scalar = plan(equation, &[&[]]);
             assert!(scalar.output_axes().is_empty());
             assert_eq!(scalar.static_output_numel(), Some(1));
@@ -2230,8 +2309,8 @@ mod tests {
     }
 
     #[test]
-    fn ellipses_expand_to_max_rank_and_right_align() {
-        let plan = plan("...ij,j...k->...ik", &[&[5, 2, 3], &[3, 6, 5, 4]]);
+    fn explicit_ellipses_expand_to_one_fixed_rank() {
+        let plan = plan("...ij,j...k->...ik", &[&[6, 5, 2, 3], &[3, 6, 5, 4]]);
         assert_eq!(
             static_shape(&plan),
             vec![Some(6), Some(5), Some(2), Some(4)]
@@ -2248,6 +2327,7 @@ mod tests {
         assert_eq!(
             plan.operands()[0].axes(),
             &[
+                EinsumAxis::Ellipsis(0),
                 EinsumAxis::Ellipsis(1),
                 EinsumAxis::Label(EinsumLabel(b'i')),
                 EinsumAxis::Label(EinsumLabel(b'j')),
@@ -2261,6 +2341,51 @@ mod tests {
                 EinsumAxis::Ellipsis(1),
                 EinsumAxis::Label(EinsumLabel(b'k')),
             ]
+        );
+    }
+
+    #[test]
+    fn unequal_explicit_ellipsis_ranks_are_rejected() {
+        assert_ellipsis_rank_mismatch("...ij,j...k->...ik", &[5, 2, 3], &[3, 6, 5, 4], 1, 2);
+        assert_ellipsis_rank_mismatch("...ij,...jk->...ik", &[2, 3], &[6, 5, 3, 4], 0, 2);
+    }
+
+    #[test]
+    fn terms_without_ellipsis_do_not_acquire_broadcast_axes() {
+        let explicit = plan("ij,...jk->...ik", &[&[2, 3], &[6, 5, 3, 4]]);
+        assert_eq!(
+            static_shape(&explicit),
+            vec![Some(6), Some(5), Some(2), Some(4)]
+        );
+        assert!(!explicit.operands()[0].has_ellipsis());
+        assert_eq!(explicit.operands()[0].ellipsis_rank(), 0);
+        assert_eq!(explicit.operands()[0].axes().len(), 2);
+
+        let implicit = plan("ij,...jk", &[&[2, 3], &[6, 5, 3, 4]]);
+        assert_eq!(
+            static_shape(&implicit),
+            vec![Some(6), Some(5), Some(2), Some(4)]
+        );
+
+        let zero_rank = plan("...ij,...jk->...ik", &[&[2, 3], &[3, 4]]);
+        assert_eq!(static_shape(&zero_rank), vec![Some(2), Some(4)]);
+        assert!(
+            zero_rank
+                .operands()
+                .iter()
+                .all(EinsumOperandPlan::has_ellipsis)
+        );
+        assert!(
+            zero_rank
+                .operands()
+                .iter()
+                .all(|operand| operand.ellipsis_rank() == 0)
+        );
+        assert!(
+            zero_rank
+                .output_axes()
+                .iter()
+                .all(|axis| !matches!(axis, EinsumAxis::Ellipsis(_)))
         );
     }
 
@@ -2380,7 +2505,7 @@ mod tests {
 
     #[test]
     fn bmm_layout_inserts_missing_batch_axes_and_records_output_permutation() {
-        let plan = plan("...mk,...kn->n...m", &[&[2, 3], &[6, 5, 3, 4]]);
+        let plan = plan("mk,...kn->n...m", &[&[2, 3], &[6, 5, 3, 4]]);
         let EinsumClassification::Gemm(gemm) = plan.classification() else {
             panic!("expected BMM");
         };

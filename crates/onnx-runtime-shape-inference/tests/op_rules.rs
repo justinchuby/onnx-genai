@@ -5052,7 +5052,7 @@ fn einsum_matmul_transpose_and_implicit() {
 }
 
 #[test]
-fn einsum_ellipsis_broadcasts_and_right_aligns_batch_dims() {
+fn einsum_ellipsis_broadcasts_fixed_rank_batch_dims() {
     let out = run(
         &einsum_node("...ij,...jk->...ik", 2),
         vec![f32in(vec![c(5), c(2), c(3)]), f32in(vec![c(5), c(3), c(4)])],
@@ -5068,10 +5068,19 @@ fn einsum_ellipsis_broadcasts_and_right_aligns_batch_dims() {
     );
     assert_eq!(out_shape(&out), vec![c(6), c(2), c(4)]);
 
-    // Different ellipsis ranks right-align; the first operand has no batch
-    // dimensions and is broadcast across both dimensions from the second.
+    // A term without ellipsis contributes no batch dimensions and broadcasts
+    // across the fixed-rank ellipsis from the other term.
     let out = run(
-        &einsum_node("...ij,...jk->...ik", 2),
+        &einsum_node("ij,...jk->...ik", 2),
+        vec![f32in(vec![c(2), c(3)]), f32in(vec![c(6), c(5), c(3), c(4)])],
+        12,
+    );
+    assert_eq!(out_shape(&out), vec![c(6), c(5), c(2), c(4)]);
+
+    // Implicit output retains the ellipsis first and once-only labels in ASCII
+    // order, even when another term has no ellipsis.
+    let out = run(
+        &einsum_node("ij,...jk", 2),
         vec![f32in(vec![c(2), c(3)]), f32in(vec![c(6), c(5), c(3), c(4)])],
         12,
     );
@@ -5128,6 +5137,40 @@ fn einsum_scalar_diagonal_reduction_zero_and_whitespace() {
 
     let reduction = run(&einsum_node("ij->i", 1), vec![f32in(vec![c(2), c(3)])], 12);
     assert_eq!(out_shape(&reduction), vec![c(2)]);
+}
+
+#[test]
+fn einsum_rejects_unequal_explicit_ellipsis_ranks_and_non_space_whitespace() {
+    // ONNX opset 12 requires every explicit ellipsis to cover one fixed number
+    // of dimensions. NumPy accepts these by right-aligning unequal ranks.
+    for (equation, inputs, detail) in [
+        (
+            "...ij,j...k->...ik",
+            vec![
+                f32in(vec![c(5), c(2), c(3)]),
+                f32in(vec![c(3), c(6), c(5), c(4)]),
+            ],
+            "input term #1 explicit ellipsis has expansion rank 2, but input term #0 explicit ellipsis has expansion rank 1",
+        ),
+        (
+            "...ij,...jk->...ik",
+            vec![f32in(vec![c(2), c(3)]), f32in(vec![c(6), c(5), c(3), c(4)])],
+            "input term #1 explicit ellipsis has expansion rank 2, but input term #0 explicit ellipsis has expansion rank 0",
+        ),
+    ] {
+        let error = try_run(&einsum_node(equation, 2), inputs, 12).unwrap_err();
+        assert_invalid(error, "Einsum", detail);
+    }
+
+    for invalid in ['\t', '\n', '\u{00a0}', '\u{2003}', '\u{2028}'] {
+        let equation = format!("i{invalid}->i");
+        let error = try_run(&einsum_node(&equation, 1), vec![f32in(vec![c(7)])], 12).unwrap_err();
+        assert_invalid(
+            error,
+            "Einsum",
+            &format!("invalid character `{invalid}` at normalized byte offset 1"),
+        );
+    }
 }
 
 #[test]
