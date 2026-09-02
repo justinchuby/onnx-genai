@@ -1,5 +1,58 @@
 use super::*;
 
+#[derive(Clone)]
+pub(super) struct ProviderArtifactRequirement {
+    config: ExecutorArtifactConfig,
+    state: Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>,
+}
+
+impl std::fmt::Debug for ProviderArtifactRequirement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderArtifactRequirement")
+            .field("provider", &self.config.provider().get())
+            .field("executor", &self.config.executor().get())
+            .field("generation", &self.config.generation().get())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderArtifactRequirement {
+    pub(super) fn new(
+        config: ExecutorArtifactConfig,
+        state: Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>,
+    ) -> Self {
+        Self { config, state }
+    }
+
+    pub(super) fn acquire_use(
+        &self,
+        config: ExecutorArtifactConfig,
+    ) -> Result<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>> {
+        if self.config != config {
+            return Err(SessionError::Internal(format!(
+                "baked provider-artifact requirement names provider {} executor {} generation {}, \
+                 but the active private session scope is provider {} executor {} generation {}",
+                self.config.provider().get(),
+                self.config.executor().get(),
+                self.config.generation().get(),
+                config.provider().get(),
+                config.executor().get(),
+                config.generation().get(),
+            )));
+        }
+        self.state.acquire_use().map_err(Into::into)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) enum CapturedProviderArtifactRequirement {
+    #[default]
+    Uncaptured,
+    NeverInstalled,
+    Required(ProviderArtifactRequirement),
+}
+
 /// Host-side captured-graph bookkeeping for ONE [`DeviceGraphSlot`]. The
 /// executor holds one of these per slot (see [`Executor::slot_capture`]) so the
 /// M=1 `Primary` decode graph and the M=k+1 `Verify` speculative-verify graph
@@ -14,6 +67,8 @@ use super::*;
 pub(crate) struct SlotCaptureState {
     /// Exact provider installation token for this executor/slot.
     pub(super) device_graph_token: Option<DeviceGraphToken>,
+    /// Exact provider-artifact requirement captured with this graph.
+    pub(super) provider_artifact_requirement: CapturedProviderArtifactRequirement,
     /// Binding signature (I/O name + dtype + physical shape + device ptr) the
     /// installed graph for this slot was captured under; a replay whose bindings
     /// differ retires the graph. `None` when no device graph is installed.
@@ -62,9 +117,297 @@ pub(crate) struct SlotCaptureState {
     pub(super) capture_quarantine_ops: HashSet<(String, String)>,
 }
 
+#[derive(Clone, Debug)]
+enum ProviderArtifactOutcome {
+    Unfinalized,
+    Pending(ExecutorArtifactPending),
+    Failed(String),
+    Complete {
+        route_residency: ExecutorRouteResidency,
+        requirement: Option<ProviderArtifactRequirement>,
+    },
+}
+
+/// Session-owned resolved route behavior. No provider or external crate can
+/// construct this value or publish a `Complete` lifecycle state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ExecutorRouteResidency {
+    #[default]
+    Disabled,
+    Declined,
+    Required {
+        owner: ExecutorInstanceId,
+    },
+}
+
+impl ExecutorRouteResidency {
+    pub(super) fn owner(self) -> Option<ExecutorInstanceId> {
+        match self {
+            Self::Required { owner } => Some(owner),
+            Self::Disabled | Self::Declined => None,
+        }
+    }
+
+    pub(super) fn is_required(self) -> bool {
+        self.owner().is_some()
+    }
+}
+
+/// The executor's sole authority for whether provider-owned artifacts may be
+/// used by eager execution, capture, or replay.
+#[derive(Clone, Debug)]
+pub(super) struct ProviderArtifactReadiness {
+    epoch: ExecutorArtifactReadinessEpoch,
+    outcome: ProviderArtifactOutcome,
+}
+
+impl Default for ProviderArtifactReadiness {
+    fn default() -> Self {
+        Self {
+            epoch: ExecutorArtifactReadinessEpoch::INITIAL,
+            outcome: ProviderArtifactOutcome::Unfinalized,
+        }
+    }
+}
+
+impl ProviderArtifactReadiness {
+    pub(super) fn checked_next_epoch(&self) -> Result<ExecutorArtifactReadinessEpoch> {
+        self.epoch
+            .get()
+            .checked_add(1)
+            .map(ExecutorArtifactReadinessEpoch::new)
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "executor artifact readiness epoch space exhausted; refusing to wrap and \
+                     authorize an ABA-stale provider artifact"
+                        .to_string(),
+                )
+                .into()
+            })
+    }
+
+    pub(super) fn advance_to(&mut self, epoch: ExecutorArtifactReadinessEpoch) {
+        if epoch > self.epoch {
+            self.epoch = epoch;
+            self.outcome = ProviderArtifactOutcome::Unfinalized;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn at_epoch_for_test(epoch: u64) -> Self {
+        Self {
+            epoch: ExecutorArtifactReadinessEpoch::new(epoch),
+            outcome: ProviderArtifactOutcome::Unfinalized,
+        }
+    }
+
+    pub(super) fn needs_finalization(&self) -> bool {
+        matches!(self.outcome, ProviderArtifactOutcome::Unfinalized)
+    }
+
+    /// Finalize the current specialization exactly once, then require its
+    /// outcome before any eager execution, capture, or replay.
+    pub(super) fn finalize_if_needed(
+        &mut self,
+        ep: &dyn ExecutionProvider,
+        config: ExecutorArtifactConfig,
+        graph: &Graph,
+        finalized_banks: &[FinalizedExpertBank],
+    ) -> Result<()> {
+        let executor = config.executor();
+        if self.needs_finalization() {
+            match ep.inspect_executor_artifacts(
+                config.provider(),
+                config.executor(),
+                config.generation(),
+                self.epoch,
+                graph,
+                finalized_banks,
+            ) {
+                Ok(report) => {
+                    if report.provider() != config.provider()
+                        || report.executor() != config.executor()
+                        || report.generation() != config.generation()
+                        || report.readiness() != self.epoch
+                    {
+                        self.outcome = ProviderArtifactOutcome::Failed(format!(
+                            "provider artifact report mismatch: returned provider {} executor {} \
+                             generation {} epoch {}, expected provider {} executor {} generation {} \
+                             epoch {}",
+                            report.provider().get(),
+                            report.executor().get(),
+                            report.generation().get(),
+                            report.readiness().get(),
+                            config.provider().get(),
+                            config.executor().get(),
+                            config.generation().get(),
+                            self.epoch.get(),
+                        ));
+                    } else {
+                        self.outcome = match (config.route_residency(), report.into_state()) {
+                            (
+                                ExecutorRouteResidencyConfig::Disabled,
+                                ExecutorArtifactState::Disabled,
+                            ) => ProviderArtifactOutcome::Complete {
+                                route_residency: ExecutorRouteResidency::Disabled,
+                                requirement: None,
+                            },
+                            (
+                                ExecutorRouteResidencyConfig::Enabled,
+                                ExecutorArtifactState::Declined,
+                            ) => ProviderArtifactOutcome::Complete {
+                                route_residency: ExecutorRouteResidency::Declined,
+                                requirement: None,
+                            },
+                            (
+                                ExecutorRouteResidencyConfig::Enabled,
+                                ExecutorArtifactState::Required,
+                            ) => match ep.executor_artifact_requirement(
+                                config.provider(),
+                                config.executor(),
+                                config.generation(),
+                            ) {
+                                Ok(Some(state)) => ProviderArtifactOutcome::Complete {
+                                    route_residency: ExecutorRouteResidency::Required {
+                                        owner: executor,
+                                    },
+                                    requirement: Some(ProviderArtifactRequirement::new(
+                                        config, state,
+                                    )),
+                                },
+                                Ok(None) => ProviderArtifactOutcome::Failed(format!(
+                                    "{} reported required artifacts for executor {} generation {}, \
+                                     but retained no exact use requirement",
+                                    ep.name(),
+                                    config.executor().get(),
+                                    config.generation().get(),
+                                )),
+                                Err(error) => ProviderArtifactOutcome::Failed(error.to_string()),
+                            },
+                            (
+                                ExecutorRouteResidencyConfig::Enabled,
+                                ExecutorArtifactState::Pending(pending),
+                            ) => ProviderArtifactOutcome::Pending(pending),
+                            (policy, state) => ProviderArtifactOutcome::Failed(format!(
+                                "provider artifact state {state:?} is incompatible with immutable \
+                                 route-residency policy {policy:?}",
+                            )),
+                        };
+                    }
+                }
+                Err(error) => {
+                    self.outcome = ProviderArtifactOutcome::Failed(error.to_string());
+                }
+            }
+        }
+        self.require_complete(ep.name(), executor)
+    }
+
+    /// Acquire the exact provider-owned use lease selected by private session
+    /// finalization or baked into a captured graph.
+    pub(super) fn acquire_use(
+        &self,
+        ep: &dyn ExecutionProvider,
+        config: ExecutorArtifactConfig,
+        exact_requirement: Option<&CapturedProviderArtifactRequirement>,
+    ) -> Result<Option<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>>> {
+        self.require_complete(ep.name(), config.executor())?;
+        let current = match &self.outcome {
+            ProviderArtifactOutcome::Complete { requirement, .. } => requirement.as_ref(),
+            _ => None,
+        };
+        let requirement = match exact_requirement {
+            None => current,
+            Some(CapturedProviderArtifactRequirement::NeverInstalled) => None,
+            Some(CapturedProviderArtifactRequirement::Required(requirement)) => Some(requirement),
+            Some(CapturedProviderArtifactRequirement::Uncaptured) => {
+                return Err(SessionError::Internal(
+                    "device graph has no captured provider-artifact requirement".into(),
+                ));
+            }
+        };
+        requirement
+            .map(|requirement| requirement.acquire_use(config))
+            .transpose()
+    }
+
+    fn requirement(&self) -> Option<&ProviderArtifactRequirement> {
+        match &self.outcome {
+            ProviderArtifactOutcome::Complete { requirement, .. } => requirement.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(super) fn captured_requirement(&self) -> CapturedProviderArtifactRequirement {
+        match self.requirement() {
+            Some(requirement) => CapturedProviderArtifactRequirement::Required(requirement.clone()),
+            None => CapturedProviderArtifactRequirement::NeverInstalled,
+        }
+    }
+
+    pub(super) fn require_complete(
+        &self,
+        provider: &str,
+        executor: ExecutorInstanceId,
+    ) -> Result<()> {
+        match &self.outcome {
+            ProviderArtifactOutcome::Complete { .. } => Ok(()),
+            ProviderArtifactOutcome::Unfinalized => {
+                Err(SessionError::ExecutionProviderArtifactsPending {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: "provider artifact finalization has not reached a terminal outcome"
+                        .to_string(),
+                })
+            }
+            ProviderArtifactOutcome::Pending(pending) => {
+                Err(SessionError::ExecutionProviderArtifactsPending {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: pending.reason(),
+                })
+            }
+            ProviderArtifactOutcome::Failed(reason) => {
+                Err(SessionError::ExecutionProviderArtifactFinalizationFailed {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: reason.clone(),
+                })
+            }
+        }
+    }
+
+    pub(super) fn route_residency(
+        &self,
+        provider: &str,
+        executor: ExecutorInstanceId,
+    ) -> Result<ExecutorRouteResidency> {
+        self.require_complete(provider, executor)?;
+        match self.outcome {
+            ProviderArtifactOutcome::Complete {
+                route_residency, ..
+            } => Ok(route_residency),
+            _ => unreachable!("require_complete accepted only a complete outcome"),
+        }
+    }
+}
+
 /// The compiled, runnable graph: buffers + plan + kernel cache. Owned by the
 /// public [`InferenceSession`](crate::InferenceSession).
 pub(crate) struct Executor {
+    /// Process-unique ownership scope for provider artifacts published while
+    /// this executor compiles kernels.
+    pub(super) instance_id: ExecutorInstanceId,
+    /// Immutable session-issued configuration bound once to this provider,
+    /// device, executor, and generation and required by every artifact
+    /// publication/finalization call.
+    pub(super) artifact_config: ExecutorArtifactConfig,
+    /// False while `ExecutorArtifactBuildTransaction` still owns rollback.
+    /// Armed only after the complete executor has been constructed.
+    pub(super) artifact_teardown_armed: bool,
     pub(super) graph: Graph,
     /// Kept alive so external-weight memory maps outlive buffer population —
     /// **and**, since the weight-streaming change, so borrowed initializer
@@ -120,6 +463,10 @@ pub(crate) struct Executor {
     /// today; production consumers land in a follow-up slice per issue #82.
     #[allow(dead_code)]
     pub(super) expert_region_candidates: HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+    /// Exact loader-finalized routed banks supplied to the provider only by
+    /// the authoritative post-kernel finalization transition. Empty unless the
+    /// provider opted in during build.
+    pub(super) finalized_expert_banks: Vec<FinalizedExpertBank>,
     /// The validated [`onnx_runtime_ep_api::ResidencyPlan`] derived from
     /// `expert_region_candidates` using [`onnx_runtime_ep_api::WholeBankResidentPolicy`]
     /// (the only shipped policy today). Pure bookkeeping: it does not own
@@ -402,6 +749,10 @@ pub(crate) struct Executor {
     /// Control-flow and sequence nodes always have `None` (they don't use the
     /// kernel cache).
     pub(super) kernel_bindings: Vec<Option<KernelKey>>,
+    /// Single readiness authority for this executor's provider-owned artifacts.
+    /// Its epoch advances with concrete kernel specializations; every execute,
+    /// capture, and replay path must observe `Complete` before enqueuing work.
+    pub(super) provider_artifact_readiness: ProviderArtifactReadiness,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
     /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped

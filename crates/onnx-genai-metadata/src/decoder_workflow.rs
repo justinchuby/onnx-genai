@@ -522,12 +522,15 @@ pub fn decoder_workflow(
     builder.invoke_inputs = BTreeMap::new();
 
     let groups = std::mem::take(&mut builder.groups);
+    let compressed_state = groups
+        .values()
+        .any(|group| group.kind == StateKind::CompressedAttention);
     let spec = WorkflowSpec {
         manifest: WorkflowManifest {
             adapter_abis: BTreeMap::new(),
         },
         publication_mode: crate::schema::WorkflowPublicationMode::CommitOnly,
-        publication_mode_authored: false,
+        publication_mode_authored: compressed_state,
         inputs: builder.inputs,
         outputs: BTreeMap::from([(
             TOKENS_OUTPUT.to_string(),
@@ -535,7 +538,7 @@ pub fn decoder_workflow(
                 contract: token_contract(),
                 role: WorkflowOutputRole::Tokens,
                 family: crate::schema::WorkflowOutputFamily::Materialized,
-                family_authored: false,
+                family_authored: compressed_state,
                 value_range: None,
                 stage: crate::schema::OutputStage::PreAdapter,
                 media: None,
@@ -1120,11 +1123,13 @@ impl Builder {
                     .map(|group| group.layout.clone())
                     .unwrap_or_else(|| layout_name(abi)),
                 logical_lengths,
-                aliasing: if kind == StateKind::FullAttention {
-                    abi.aliasing.unwrap_or(StateAliasing::Forbidden)
-                } else {
-                    StateAliasing::Forbidden
-                },
+                aliasing: declared.map(|group| group.aliasing).unwrap_or_else(|| {
+                    if kind == StateKind::FullAttention {
+                        abi.aliasing.unwrap_or(StateAliasing::Forbidden)
+                    } else {
+                        StateAliasing::Forbidden
+                    }
+                }),
                 update,
                 ports: BTreeMap::from([(DECODER_COMPONENT.to_string(), aliases)]),
                 total_length: None,

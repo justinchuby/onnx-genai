@@ -2,8 +2,12 @@ use super::kv_commit::KvCommitLayout;
 use super::*;
 #[cfg(feature = "native-cuda")]
 use onnx_genai_metadata::LoopStatePair;
-use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
-use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData};
+use onnx_genai_metadata::{
+    CompressedRecordFormat, CompressionRatio, CompressionRecurrence, DecoderAbi, DecoderStateGroup,
+    DecoderStatePort, KvOwnership, SequenceInputKind, StateAliasing, StateGroupCapabilities,
+    StateGroupProperties, StateKind, StatePortRole, StateUpdate,
+};
+use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData, static_shape};
 use prost::Message;
 use std::collections::BTreeMap;
 
@@ -2016,14 +2020,10 @@ fn binding_addresses(session: &NativeDecodeSession) -> Vec<usize> {
         .collect()
 }
 
-/// Build a synthetic single-layer CUDA decoder whose `logits` are a direct
-/// function of the *incoming* recurrent `conv_state`, and whose next state
-/// accumulates the decoded token id. Unlike `build_cuda_decoder_with_fixed_state`
-/// (where `conv_state` only passes through `Identity` and never reaches the
-/// logits, so a stale state is invisible), here a non-reset recurrent state
-/// changes the emitted logits on the next generation — the exact signature of
-/// the session-reuse corruption bug. Used by the regression test that a reused
-/// `NativeDecodeSession` re-zeros recurrent state on `reset()`.
+/// Build a synthetic CUDA decoder with three fixed recurrent states. The first
+/// state feeds `logits`, and every state accumulates the decoded token id, so
+/// stale or partially restored state is observable while first/middle/last
+/// restore failures can be injected independently.
 #[cfg(feature = "native-cuda")]
 fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeDecodeSession> {
     use prost::Message;
@@ -2052,20 +2052,26 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
         DataType::Float32,
         vec![1.into(), 1.into(), past.into(), 1.into()],
     );
-    let conv_state = graph.create_named_value(
-        "past_key_values.0.conv_state",
-        DataType::Float16,
-        vec![1.into(), 4.into(), 3.into()],
-    );
+    let conv_states = (0..3)
+        .map(|layer| {
+            graph.create_named_value(
+                format!("past_key_values.{layer}.conv_state"),
+                DataType::Float16,
+                vec![1.into(), 4.into(), 3.into()],
+            )
+        })
+        .collect::<Vec<_>>();
     for input in [
         input_ids,
         attention_mask,
         position_ids,
         past_key,
         past_value,
-        conv_state,
     ] {
         graph.add_input(input);
+    }
+    for &conv_state in &conv_states {
+        graph.add_input(conv_state);
     }
 
     // logits = ReduceSum(Cast(conv_state)) — depends on the INCOMING recurrent
@@ -2079,7 +2085,7 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
     insert_op(
         &mut graph,
         "Cast",
-        vec![conv_state],
+        vec![conv_states[0]],
         conv_f32,
         &[("to", Attribute::Int(DataType::Float32 as i64))],
     );
@@ -2107,18 +2113,16 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
         token_f16,
         &[("to", Attribute::Int(DataType::Float16 as i64))],
     );
-    let present_conv_state = graph.create_named_value(
-        "present.0.conv_state",
-        DataType::Float16,
-        vec![1.into(), 4.into(), 3.into()],
-    );
-    insert_op(
-        &mut graph,
-        "Add",
-        vec![conv_state, token_f16],
-        present_conv_state,
-        &[],
-    );
+    let mut present_conv_states = Vec::new();
+    for (layer, &conv_state) in conv_states.iter().enumerate() {
+        let present = graph.create_named_value(
+            format!("present.{layer}.conv_state"),
+            DataType::Float16,
+            vec![1.into(), 4.into(), 3.into()],
+        );
+        insert_op(&mut graph, "Add", vec![conv_state, token_f16], present, &[]);
+        present_conv_states.push(present);
+    }
 
     let present_key = graph.create_named_value(
         "present.0.key",
@@ -2145,8 +2149,11 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
         &[("to", Attribute::Int(DataType::Float32 as i64))],
     );
 
-    for output in [logits, present_key, present_value, present_conv_state] {
+    for output in [logits, present_key, present_value] {
         graph.add_output(output);
+    }
+    for present in present_conv_states {
+        graph.add_output(present);
     }
 
     let model = onnx_std::Model::new(graph).to_proto()?.encode_to_vec();
@@ -2156,12 +2163,16 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
         .build()
         .context("build recurrent-logits CUDA decoder")?;
     let mut io = tiny_decoder_io();
-    io.state_pairs = Some(vec![LoopStatePair {
-        input: "past_key_values.0.conv_state".into(),
-        output: "present.0.conv_state".into(),
-        init: Some("zeros".into()),
-        update: Some("replace".into()),
-    }]);
+    io.state_pairs = Some(
+        (0..3)
+            .map(|layer| LoopStatePair {
+                input: format!("past_key_values.{layer}.conv_state"),
+                output: format!("present.{layer}.conv_state"),
+                init: Some("zeros".into()),
+                update: Some("replace".into()),
+            })
+            .collect(),
+    );
     NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(session, Some(max_len), Some(&io))
 }
 
@@ -2212,6 +2223,513 @@ fn native_cuda_reused_session_rezeros_recurrent_state() -> anyhow::Result<()> {
         first, second,
         "reused session must re-zero recurrent state on reset(): gen#1 {first:?} != gen#2 {second:?}"
     );
+    Ok(())
+}
+
+#[cfg(feature = "native-cuda")]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires a CUDA device; enable gpu-tests to execute"
+)]
+#[test]
+fn native_cuda_fixed_state_restore_is_atomic_at_every_copy_stage() -> anyhow::Result<()> {
+    #[derive(Debug, PartialEq, Eq)]
+    struct DeviceIdentity {
+        logical_len: usize,
+        addresses: Vec<usize>,
+        physical_shapes: Vec<Vec<usize>>,
+        logical_shapes: Vec<Vec<usize>>,
+        mask: Vec<u8>,
+        fixed: Vec<Vec<u8>>,
+    }
+
+    fn identity(session: &mut NativeDecodeSession) -> anyhow::Result<DeviceIdentity> {
+        let stats = session
+            .cuda_kv_debug_stats()
+            .context("CUDA decoder exposes debug stats")?;
+        let state = session.cuda.as_mut().context("CUDA decoder state")?;
+        let addresses = state
+            .bindings
+            .iter()
+            .map(|binding| binding.device_ptr() as usize)
+            .collect();
+        let physical_shapes = state
+            .bindings
+            .iter()
+            .map(|binding| binding.physical_shape().to_vec())
+            .collect();
+        let logical_shapes = state
+            .bindings
+            .iter()
+            .map(|binding| binding.logical_shape().to_vec())
+            .collect();
+        let mask = state.bindings[0].read_bytes()?;
+        let mut fixed = Vec::new();
+        for index in state.fixed_state_binding_range.clone() {
+            fixed.push(state.bindings[index].read_bytes()?);
+        }
+        Ok(DeviceIdentity {
+            logical_len: stats.logical_len,
+            addresses,
+            physical_shapes,
+            logical_shapes,
+            mask,
+            fixed,
+        })
+    }
+
+    const PROMPT: [TokenId; 3] = [5, 7, 9];
+    let advance =
+        |session: &mut NativeDecodeSession, tokens: &[TokenId]| -> anyhow::Result<Vec<Vec<f32>>> {
+            let mut logits = Vec::new();
+            for &token in tokens {
+                logits = session.decode(&[token], session.current_len())?;
+            }
+            Ok(logits)
+        };
+
+    let mut partial_snapshot = build_cuda_recurrent_logits_decoder(16)?;
+    let partial_snapshot_probe = partial_snapshot
+        .cuda
+        .as_ref()
+        .expect("CUDA state")
+        .scratch_journal_probe();
+    advance(&mut partial_snapshot, &PROMPT)?;
+    let allocation_failure = cuda::fail_cuda_scratch_allocation_at(1);
+    let failure = match partial_snapshot.snapshot_recurrent_state() {
+        Ok(_) => panic!("partial snapshot allocation must fail"),
+        Err(error) => error,
+    };
+    drop(allocation_failure);
+    assert!(
+        failure
+            .to_string()
+            .contains("injected CUDA scratch allocation failure at attempt 1")
+    );
+    let partial = partial_snapshot_probe.stats();
+    assert_eq!(partial.snapshot_allocations, 1);
+    assert_eq!(partial.live_allocations, 0);
+    assert_eq!(partial.pending_allocations, 1);
+    assert_eq!(partial.quarantined_allocations, 0);
+    partial_snapshot_probe.settle()?;
+    assert_eq!(partial_snapshot_probe.stats().pending_allocations, 0);
+
+    for (failure_attempt, expected_undo) in [(1usize, 1u64), (3usize, 3u64)] {
+        let mut partial_restore = build_cuda_recurrent_logits_decoder(16)?;
+        let partial_restore_probe = partial_restore
+            .cuda
+            .as_ref()
+            .expect("CUDA state")
+            .scratch_journal_probe();
+        advance(&mut partial_restore, &PROMPT)?;
+        let snapshot = partial_restore.snapshot_recurrent_state()?;
+        advance(&mut partial_restore, &[11])?;
+        let allocation_failure = cuda::fail_cuda_scratch_allocation_at(failure_attempt);
+        let failure = partial_restore
+            .restore_state_snapshot_at(&snapshot, PROMPT.len())
+            .expect_err("partial undo allocation must fail before mutation");
+        drop(allocation_failure);
+        assert!(
+            failure.to_string().contains(&format!(
+                "injected CUDA scratch allocation failure at attempt {failure_attempt}"
+            )),
+            "allocation refusal must name its exact attempt: {failure:#}"
+        );
+        let partial = partial_restore_probe.stats();
+        assert_eq!(partial.snapshot_allocations, 3);
+        assert_eq!(partial.restore_undo_allocations, expected_undo);
+        assert_eq!(partial.mask_undo_allocations, 0);
+        assert_eq!(partial.live_allocations, 3);
+        assert_eq!(partial.pending_allocations, expected_undo);
+        drop(snapshot);
+        let retired = partial_restore_probe.stats();
+        assert_eq!(retired.live_allocations, 0);
+        assert_eq!(retired.pending_allocations, expected_undo + 3);
+        partial_restore_probe.settle()?;
+        let settled = partial_restore_probe.stats();
+        assert_eq!(settled.pending_allocations, 0);
+        assert_eq!(settled.quarantined_allocations, 0);
+    }
+
+    for failure in [0usize, 1, 2] {
+        let expected = {
+            let mut oracle = build_cuda_recurrent_logits_decoder(16)?;
+            advance(&mut oracle, &PROMPT)?;
+            advance(&mut oracle, &[17])?
+        };
+        let mut session = build_cuda_recurrent_logits_decoder(16)?;
+        let scratch = session
+            .cuda
+            .as_ref()
+            .expect("CUDA state")
+            .scratch_journal_probe();
+        advance(&mut session, &PROMPT)?;
+        let snapshot = session.snapshot_recurrent_state()?;
+        assert_eq!(
+            snapshot
+                .device_scratch
+                .as_ref()
+                .expect("CUDA snapshot")
+                .buffers
+                .len(),
+            3,
+            "fixed-state fixture census drifted"
+        );
+        let after_snapshot = scratch.stats();
+        assert_eq!(after_snapshot.snapshot_allocations, 3);
+        assert_eq!(after_snapshot.restore_undo_allocations, 0);
+        assert_eq!(after_snapshot.mask_undo_allocations, 0);
+        assert_eq!(after_snapshot.live_allocations, 3);
+        assert!(after_snapshot.live_bytes > 0);
+        assert_eq!(after_snapshot.pending_allocations, 0);
+        advance(&mut session, &[11, 13])?;
+        let before_len = session.current_len();
+        let before = identity(&mut session)?;
+
+        let error = {
+            let _failure = cuda::fail_cuda_fixed_restore_at(failure);
+            session
+                .restore_state_snapshot_at(&snapshot, PROMPT.len())
+                .expect_err("injected CUDA restore copy must abort")
+        };
+        assert!(
+            error.to_string().contains(&format!(
+                "injected CUDA fixed-state restore failure at slot {failure}"
+            )),
+            "initiating CUDA copy error must stay primary: {error:#}"
+        );
+        assert_eq!(session.current_len(), before_len);
+        assert_eq!(
+            identity(&mut session)?,
+            before,
+            "failure at CUDA fixed-state slot {failure} published a partial dense/fixed rollback"
+        );
+        let after_undo = scratch.stats();
+        assert_eq!(after_undo.snapshot_allocations, 3);
+        assert_eq!(after_undo.restore_undo_allocations, 3);
+        assert_eq!(after_undo.mask_undo_allocations, 1);
+        assert_eq!(after_undo.live_allocations, 3);
+        assert_eq!(after_undo.pending_allocations, 4);
+        assert_eq!(after_undo.quarantined_allocations, 0);
+
+        session.restore_state_snapshot_at(&snapshot, PROMPT.len())?;
+        let after_retry = scratch.stats();
+        assert_eq!(after_retry.restore_undo_allocations, 6);
+        assert_eq!(after_retry.mask_undo_allocations, 2);
+        assert_eq!(after_retry.live_allocations, 3);
+        assert_eq!(after_retry.pending_allocations, 8);
+        assert_eq!(
+            advance(&mut session, &[17])?,
+            expected,
+            "retry after CUDA fixed-state slot {failure} must match a clean session"
+        );
+        drop(snapshot);
+        let retired = scratch.stats();
+        assert_eq!(retired.live_allocations, 0);
+        assert_eq!(retired.retirement_submissions, 11);
+        assert_eq!(retired.pending_allocations, 11);
+        assert_eq!(retired.allocated_bytes, retired.retirement_bytes);
+        assert_eq!(retired.pending_bytes, retired.retirement_bytes);
+        scratch.settle()?;
+        let settled = scratch.stats();
+        assert_eq!(settled.pending_allocations, 0);
+        assert_eq!(settled.pending_bytes, 0);
+        assert_eq!(settled.settled_allocations, 11);
+        assert_eq!(settled.settled_bytes, settled.retirement_bytes);
+        assert_eq!(settled.quarantined_allocations, 0);
+        assert_eq!(settled.quarantined_bytes, 0);
+    }
+
+    let mut poisoned = build_cuda_recurrent_logits_decoder(16)?;
+    let poisoned_identity = NativeLogicalStateIdentity {
+        session_id: SessionId::from(41_u64),
+        generation: 7,
+    };
+    let sibling_identity = NativeLogicalStateIdentity {
+        session_id: SessionId::from(42_u64),
+        generation: 3,
+    };
+    poisoned.bind_logical_state(poisoned_identity)?;
+    let poisoned_scratch = poisoned
+        .cuda
+        .as_ref()
+        .expect("CUDA state")
+        .scratch_journal_probe();
+    advance(&mut poisoned, &PROMPT)?;
+    let snapshot = poisoned.snapshot_recurrent_state()?;
+    advance(&mut poisoned, &[11])?;
+    let error = {
+        let _failure = cuda::fail_cuda_fixed_restore_and_undo_at(1, 0);
+        poisoned
+            .restore_state_snapshot_at(&snapshot, PROMPT.len())
+            .expect_err("undo failure must be surfaced")
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("injected CUDA fixed-state restore failure at slot 1")
+            && message.contains("injected CUDA fixed-state undo failure at slot 0")
+            && message.contains("session is poisoned"),
+        "primary and undo failures must both remain actionable: {error:#}"
+    );
+    let retry = poisoned
+        .decode(&[17], poisoned.current_len())
+        .expect_err("a failed undo must block the poisoned physical generation");
+    assert!(
+        retry
+            .to_string()
+            .contains("state restore transaction is poisoned")
+    );
+    assert!(
+        format!("{retry:#}").contains("logical session 41 generation 7"),
+        "physical poison must retain its exact logical owner: {retry:#}"
+    );
+    let poisoned_census = poisoned_scratch.stats();
+    assert_eq!(poisoned_census.snapshot_allocations, 3);
+    assert_eq!(poisoned_census.restore_undo_allocations, 3);
+    assert_eq!(poisoned_census.mask_undo_allocations, 1);
+    assert_eq!(poisoned_census.live_allocations, 3);
+    assert_eq!(poisoned_census.pending_allocations, 4);
+    assert_eq!(poisoned_census.quarantined_allocations, 0);
+    let mut foreign = build_cuda_recurrent_logits_decoder(16)?;
+    foreign.bind_logical_state(poisoned_identity)?;
+    let foreign_error = foreign
+        .restore_state_snapshot_at(&snapshot, PROMPT.len())
+        .expect_err("a foreign decoder instance must reject the snapshot");
+    assert!(
+        foreign_error
+            .to_string()
+            .contains("stale or foreign snapshot"),
+        "foreign identity refusal must be actionable: {foreign_error:#}"
+    );
+    poisoned.reset()?;
+    poisoned.bind_logical_state(sibling_identity)?;
+    let stale = poisoned
+        .restore_state_snapshot_at(&snapshot, PROMPT.len())
+        .expect_err("a reset must reject the prior physical generation's snapshot");
+    assert!(
+        stale.to_string().contains("stale or foreign snapshot"),
+        "stale generation refusal must be actionable: {stale:#}"
+    );
+    drop(snapshot);
+    let retired = poisoned_scratch.stats();
+    assert_eq!(retired.live_allocations, 0);
+    assert_eq!(retired.retirement_submissions, 7);
+    assert_eq!(retired.pending_allocations, 7);
+    assert_eq!(retired.pending_bytes, retired.retirement_bytes);
+    eprintln!(
+        "CUDA_ROLLBACK_FAILED_SESSION_CENSUS allocations={} bytes={} pending={} \
+         pending_bytes={} quarantined={}",
+        retired.retirement_submissions,
+        retired.retirement_bytes,
+        retired.pending_allocations,
+        retired.pending_bytes,
+        retired.quarantined_allocations
+    );
+    poisoned_scratch.settle()?;
+    let settled = poisoned_scratch.stats();
+    assert_eq!(settled.pending_allocations, 0);
+    assert_eq!(settled.pending_bytes, 0);
+    assert_eq!(settled.settled_allocations, 7);
+    assert_eq!(settled.quarantined_allocations, 0);
+    let mut clean = build_cuda_recurrent_logits_decoder(16)?;
+    assert_eq!(
+        poisoned.decode(&[17], 0)?,
+        clean.decode(&[17], 0)?,
+        "physical recovery must start a byte-clean generation"
+    );
+
+    let mut repeated = build_cuda_recurrent_logits_decoder(16)?;
+    let repeated_scratch = repeated
+        .cuda
+        .as_ref()
+        .expect("CUDA state")
+        .scratch_journal_probe();
+    for iteration in 0..64usize {
+        repeated.reset()?;
+        advance(&mut repeated, &PROMPT)?;
+        let snapshot = repeated.snapshot_recurrent_state()?;
+        advance(&mut repeated, &[11])?;
+        let _failure = cuda::fail_cuda_fixed_restore_at(iteration % 3);
+        repeated
+            .restore_state_snapshot_at(&snapshot, PROMPT.len())
+            .expect_err("every injected restore must fail");
+        drop(_failure);
+        drop(snapshot);
+        let census = repeated_scratch.stats();
+        let transactions = u64::try_from(iteration + 1)?;
+        assert_eq!(census.snapshot_allocations, transactions * 3);
+        assert_eq!(census.restore_undo_allocations, transactions * 3);
+        assert_eq!(census.mask_undo_allocations, transactions);
+        assert_eq!(census.live_allocations, 0);
+        assert_eq!(census.retirement_submissions, transactions * 7);
+        assert_eq!(census.pending_allocations, transactions * 7);
+        assert_eq!(census.quarantined_allocations, 0);
+    }
+    let repeated_pending = repeated_scratch.stats();
+    assert_eq!(
+        repeated_pending.pending_bytes,
+        repeated_pending.retirement_bytes
+    );
+    repeated_scratch.settle()?;
+    let repeated_settled = repeated_scratch.stats();
+    assert_eq!(repeated_settled.pending_allocations, 0);
+    assert_eq!(repeated_settled.pending_bytes, 0);
+    assert_eq!(repeated_settled.settled_allocations, 64 * 7);
+    assert_eq!(
+        repeated_settled.settled_bytes,
+        repeated_settled.retirement_bytes
+    );
+    assert_eq!(repeated_settled.quarantined_allocations, 0);
+    eprintln!(
+        "CUDA_ROLLBACK_SCRATCH_CENSUS iterations=64 allocations={} bytes={} \
+         retirement_submissions={} settled={} pending={} pending_bytes={} quarantined={}",
+        repeated_settled.snapshot_allocations
+            + repeated_settled.restore_undo_allocations
+            + repeated_settled.mask_undo_allocations,
+        repeated_settled.allocated_bytes,
+        repeated_settled.retirement_submissions,
+        repeated_settled.settled_allocations,
+        repeated_settled.pending_allocations,
+        repeated_settled.pending_bytes,
+        repeated_settled.quarantined_allocations
+    );
+    Ok(())
+}
+
+#[cfg(feature = "native-cuda")]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires a CUDA device; enable gpu-tests to execute"
+)]
+#[test]
+fn native_cuda_compressed_state_group_restore_is_atomic_first_middle_last() -> anyhow::Result<()> {
+    #[derive(Debug, PartialEq, Eq)]
+    struct StateIdentity {
+        logical_len: usize,
+        logical_shapes: Vec<Vec<usize>>,
+        bytes: Vec<Vec<u8>>,
+    }
+
+    fn build() -> anyhow::Result<NativeDecodeSession> {
+        let model = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny-deepseek-v4-csa/model.onnx.textproto");
+        NativeDecodeSession::load_with_cuda_options(
+            model,
+            NativeDecodeDevice::Cuda { index: Some(0) },
+            NativeDecodeCudaOptions {
+                decode_batch: None,
+                kv_max_len: Some(32),
+                metadata_max_len: None,
+                graph_capture: Some(false),
+                weight_offload_enabled: None,
+                weight_offload_stable_va: None,
+            },
+        )
+    }
+
+    fn advance(
+        session: &mut NativeDecodeSession,
+        tokens: &[TokenId],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let mut logits = Vec::new();
+        for &token in tokens {
+            logits = session.decode(&[token], session.current_len())?;
+        }
+        Ok(logits)
+    }
+
+    fn identity(session: &mut NativeDecodeSession) -> anyhow::Result<StateIdentity> {
+        let logical_len = session
+            .cuda_kv_debug_stats()
+            .context("CUDA debug stats")?
+            .logical_len;
+        let state = session.cuda.as_mut().context("CUDA decoder state")?;
+        let indices = state.snapshot_state_indices().collect::<Vec<_>>();
+        let logical_shapes = indices
+            .iter()
+            .map(|&index| state.bindings[index].logical_shape().to_vec())
+            .collect();
+        let mut bytes = Vec::with_capacity(indices.len());
+        for index in indices {
+            bytes.push(state.bindings[index].read_bytes()?);
+        }
+        Ok(StateIdentity {
+            logical_len,
+            logical_shapes,
+            bytes,
+        })
+    }
+
+    const PROMPT: [TokenId; 4] = [5, 7, 9, 11];
+    for failure_slot in [0usize, 3, 5] {
+        let expected = {
+            let mut oracle = build()?;
+            advance(&mut oracle, &PROMPT)?;
+            advance(&mut oracle, &[17])?
+        };
+        let mut session = build()?;
+        advance(&mut session, &PROMPT)?;
+        let scratch = session
+            .cuda
+            .as_ref()
+            .context("CUDA state")?
+            .scratch_journal_probe();
+        let snapshot = session.snapshot_recurrent_state()?;
+        assert_eq!(
+            snapshot
+                .device_scratch
+                .as_ref()
+                .context("CUDA snapshot")?
+                .buffers
+                .len(),
+            6,
+            "three records plus three carries must form one snapshot group"
+        );
+        advance(&mut session, &[13, 15])?;
+        let before = identity(&mut session)?;
+
+        let error = {
+            let _failure = cuda::fail_cuda_fixed_restore_at(failure_slot);
+            session
+                .restore_state_snapshot_at(&snapshot, PROMPT.len())
+                .expect_err("injected compressed-state member restore must abort")
+        };
+        assert!(
+            error.to_string().contains(&format!(
+                "injected CUDA fixed-state restore failure at slot {failure_slot}"
+            )),
+            "the exact failed group member must remain actionable: {error:#}"
+        );
+        assert_eq!(
+            identity(&mut session)?,
+            before,
+            "failure at compressed-state slot {failure_slot} published a partial group"
+        );
+        let failed = scratch.stats();
+        assert_eq!(failed.snapshot_allocations, 6);
+        assert_eq!(failed.restore_undo_allocations, 6);
+        assert_eq!(failed.mask_undo_allocations, 1);
+        assert_eq!(failed.live_allocations, 6);
+        assert_eq!(failed.pending_allocations, 7);
+        assert_eq!(failed.quarantined_allocations, 0);
+
+        session.restore_state_snapshot_at(&snapshot, PROMPT.len())?;
+        assert_eq!(
+            advance(&mut session, &[17])?,
+            expected,
+            "clean retry after compressed-state slot {failure_slot} must match a fresh generation"
+        );
+        drop(snapshot);
+        let retired = scratch.stats();
+        assert_eq!(retired.live_allocations, 0);
+        assert_eq!(retired.pending_allocations, 20);
+        scratch.settle()?;
+        let settled = scratch.stats();
+        assert_eq!(settled.pending_allocations, 0);
+        assert_eq!(settled.pending_bytes, 0);
+        assert_eq!(settled.settled_allocations, 20);
+        assert_eq!(settled.quarantined_allocations, 0);
+    }
     Ok(())
 }
 
@@ -3158,6 +3676,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
     let Some(model_dir) = qwen_cuda_smoke_model_dir() else {
         return Ok(());
     };
+    let compressed_lookups = compressed_state_map_lookups();
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))?;
     let prompt = tokenizer.encode("Hello")?;
     const HORIZON: usize = 64;
@@ -3191,7 +3710,12 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
 
     let mut cpu = NativeDecodeSession::load(model_dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
     let (cpu_tokens, _) = generate(&mut cpu)?;
+    assert_eq!(
+        cpu.compressed_state_path_stats(),
+        CompressedStatePathStats::default()
+    );
     drop(cpu);
+    assert_eq!(compressed_state_map_lookups(), compressed_lookups);
 
     let mut eager = NativeDecodeSession::load_with_cuda_options(
         model_dir.join("model.onnx"),
@@ -3213,7 +3737,12 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
     assert!(!eager_after.graph.enabled);
     assert_eq!(eager_after.graph.captures, 0);
     assert_eq!(eager_after.graph.replays, 0);
+    assert_eq!(
+        eager.compressed_state_path_stats(),
+        CompressedStatePathStats::default()
+    );
     drop(eager);
+    assert_eq!(compressed_state_map_lookups(), compressed_lookups);
 
     let mut captured = NativeDecodeSession::load_with_cuda_options(
         model_dir.join("model.onnx"),
@@ -3249,6 +3778,12 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
     assert_eq!(captured_after.graph.replays, HORIZON as u64 - 2);
     assert_eq!(captured_after.graph.fallbacks, 0);
     assert!(captured.cuda_graph_fallback_reason().is_none());
+    assert_eq!(
+        captured.compressed_state_path_stats(),
+        CompressedStatePathStats::default(),
+        "default-off first capture and warmed replay must perform zero compressed-state lookups \
+         or telemetry updates"
+    );
 
     let eager_us = eager_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;
     let captured_us = captured_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;
@@ -3272,6 +3807,12 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
         .decode(&vec![0; 129], 0)
         .expect_err("decode beyond configured KV capacity must fail");
     assert!(error.to_string().contains("CUDA KV capacity exceeded"));
+    drop(captured);
+    assert_eq!(
+        compressed_state_map_lookups(),
+        compressed_lookups,
+        "default-off capture/replay/rewind/teardown must perform zero compressed-state map lookups"
+    );
     Ok(())
 }
 
@@ -3898,6 +4439,152 @@ fn a_decoder_without_recurrent_layers_needs_no_recurrent_state() {
         crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session, &declared)
             .expect("a dense decoder is sizeable");
     assert_eq!(bytes, 0);
+}
+
+#[test]
+fn a_decoder_without_compressed_state_records_zero_state_path_work() -> anyhow::Result<()> {
+    let mut session =
+        NativeDecodeSession::from_session_with_io(tiny_decoder(false), &tiny_decoder_io())?;
+    session.decode(&[1, 2, 3], 0)?;
+    for token in [4, 5, 6] {
+        let past = session.current_len();
+        session.decode(&[token], past)?;
+    }
+    session.rewind(4)?;
+    session.reset()?;
+    assert_eq!(
+        session.compressed_state_path_stats(),
+        CompressedStatePathStats::default(),
+        "absent-state prefill, warmed decode, rewind, and reset must perform no state lookup, \
+         validation, allocation, copy, synchronization, or telemetry update"
+    );
+    Ok(())
+}
+
+fn low_rank_carry_plan(carry_shape: &[usize], aliasing: StateAliasing) -> csa::CompressedStatePlan {
+    let port = |role, input: &str, output: &str| DecoderStatePort {
+        role: Some(role),
+        layer: Some(0),
+        batch_axis: Some(0),
+        input: input.to_string(),
+        output: output.to_string(),
+    };
+    let properties = Some(StateGroupProperties::CompressedAttention {
+        ratio: CompressionRatio::Ratio128,
+        record_format: CompressedRecordFormat::F32,
+        recurrence: CompressionRecurrence::Standard,
+    });
+    let groups = [
+        DecoderStateGroup {
+            name: "records".to_string(),
+            kind: StateKind::CompressedAttention,
+            properties: properties.clone(),
+            sequence_axis: Some(2),
+            layout: "batch_feature_record".to_string(),
+            aliasing,
+            update: Some(StateUpdate::Append),
+            reuse: Default::default(),
+            capabilities: StateGroupCapabilities::default(),
+            ports: vec![port(
+                StatePortRole::CompressedKv,
+                "past_record",
+                "present_record",
+            )],
+        },
+        DecoderStateGroup {
+            name: "carries".to_string(),
+            kind: StateKind::CompressedAttention,
+            properties,
+            sequence_axis: None,
+            layout: "batch_carry".to_string(),
+            aliasing,
+            update: Some(StateUpdate::Replace),
+            reuse: Default::default(),
+            capabilities: StateGroupCapabilities::default(),
+            ports: vec![port(
+                StatePortRole::CompressionCarry,
+                "past_carry",
+                "present_carry",
+            )],
+        },
+    ];
+    let meta = |name: &str, shape: &[usize]| onnx_runtime_session::IoMeta {
+        name: name.to_string(),
+        dtype: DataType::Float32,
+        shape: static_shape(shape.iter().copied()),
+    };
+    csa::resolve_compressed_state(
+        &[
+            meta("past_record", &[1, 1, 0]),
+            meta("past_carry", carry_shape),
+        ],
+        &[
+            meta("present_record", &[1, 1, 0]),
+            meta("present_carry", carry_shape),
+        ],
+        &groups,
+    )
+    .expect("low-rank carry plan")
+}
+
+#[test]
+fn low_rank_carries_never_enter_token_prefix_slicing() -> anyhow::Result<()> {
+    for aliasing in [StateAliasing::Forbidden, StateAliasing::Permitted] {
+        for carry_shape in [vec![1], vec![1, 0], vec![1, 4], vec![1, 2, 1, 2]] {
+            let plan = low_rank_carry_plan(&carry_shape, aliasing);
+            let skip_names = plan.state_past_names().cloned().collect::<HashSet<_>>();
+            assert!(skip_names.contains("past_carry"));
+
+            let carry_values = (0..carry_shape.iter().product::<usize>())
+                .map(|index| 100.0 + index as f32)
+                .collect::<Vec<_>>();
+            let carry = Tensor::from_f32(&carry_shape, &carry_values)?;
+            let carry_bytes = carry.as_bytes().to_vec();
+            let carry_layout = carry.layout.clone();
+            let mut past = HashMap::from([
+                (
+                    "dense_kv".to_string(),
+                    Tensor::from_f32(&[1, 1, 4, 1], &[10.0, 20.0, 30.0, 40.0])?,
+                ),
+                ("past_carry".to_string(), carry),
+            ]);
+
+            for target in [1usize, 2, 3] {
+                let staged = backend::stage_host_prefix_rewind(&past, &skip_names, target)?;
+                assert_eq!(staged.len(), 1, "rank {carry_shape:?}, target {target}");
+                assert_eq!(staged[0].0, "dense_kv");
+                assert_eq!(staged[0].1.shape, vec![1, 1, target, 1]);
+                assert_eq!(
+                    staged[0].1.to_vec_f32(),
+                    [10.0, 20.0, 30.0][..target],
+                    "dense sequence prefix at target {target}"
+                );
+                let untouched = &past["past_carry"];
+                assert_eq!(untouched.shape, carry_shape);
+                assert_eq!(untouched.layout, carry_layout);
+                assert_eq!(untouched.as_bytes(), carry_bytes);
+            }
+
+            let snapshot = past["past_carry"].try_clone()?;
+            past.insert(
+                "past_carry".to_string(),
+                Tensor::from_f32(&carry_shape, &vec![999.0; carry_values.len()])?,
+            );
+            let staged = backend::stage_host_prefix_rewind(&past, &skip_names, 2)?;
+            for (name, tensor) in staged {
+                past.insert(name, tensor);
+            }
+            past.insert("past_carry".to_string(), snapshot);
+            assert_eq!(past["past_carry"].shape, carry_shape);
+            assert_eq!(past["past_carry"].layout, carry_layout);
+            assert_eq!(
+                past["past_carry"].as_bytes(),
+                carry_bytes,
+                "rollback/retry must restore the complete carry, never a prefix"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// KV is sized at full context, per sequence, from the declared pairs.

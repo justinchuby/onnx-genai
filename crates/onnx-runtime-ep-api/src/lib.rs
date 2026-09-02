@@ -59,9 +59,12 @@ pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{
     ArgmaxTieBreak, BoundBufferOwnership, CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner,
     DeviceGraphSlot, DeviceGraphToken, DeviceValidationOwner, DeviceValidationRegistration,
-    DeviceValidationToken, EpConfig, EpId, ExecutionProvider, Fence, HostToDeviceCopier,
-    RawDeviceAllocationSiteStats, SealedDeviceAllocation, StructuralCaptureDecline,
-    WorkspaceAllocation,
+    DeviceValidationToken, EpConfig, EpId, ExecutionProvider, ExecutorArtifactGeneration,
+    ExecutorArtifactPending, ExecutorArtifactPolicy, ExecutorArtifactProviderId,
+    ExecutorArtifactReadinessEpoch, ExecutorArtifactReport, ExecutorArtifactRequirementState,
+    ExecutorArtifactState, ExecutorArtifactUseGuard, ExecutorInstanceId, ExecutorKernelScope,
+    ExecutorRouteResidencyConfig, Fence, HostToDeviceCopier, RawDeviceAllocationSiteStats,
+    SealedDeviceAllocation, StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{
@@ -69,11 +72,12 @@ pub use tensor::{
 };
 pub use weight::{
     AdmissionPolicyInput, EvictionClass, ExecutionProviderCapabilities, ExpertWeightGroup,
-    LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary, LazyWeightCandidate, MmapRegionSource,
-    NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight, PagedWeight, Phase3aHostOnlyBinder,
-    ResidencyDecision, ResidencyDegradationReason, ResidencyPlan, ResidencyPolicy,
-    ResidencyPolicyInput, ResidencyResizeOutcome, ResidencyResizePlan, ResidencyResizeRequest,
-    ResidentWeight, ResidentWeightMaterializer, ResizeDirection, ResizeRejection, ResizeSafePoint,
+    FinalizedExpertBank, FinalizedExpertWeight, LazyDeviceWeightBinder, LazyWeight,
+    LazyWeightBoundary, LazyWeightCandidate, MmapRegionSource, NXRT_WEIGHT_PAGING_CAPABILITY,
+    NegotiatedWeight, PagedWeight, Phase3aHostOnlyBinder, ResidencyDecision,
+    ResidencyDegradationReason, ResidencyPlan, ResidencyPolicy, ResidencyPolicyInput,
+    ResidencyResizeOutcome, ResidencyResizePlan, ResidencyResizeRequest, ResidentWeight,
+    ResidentWeightMaterializer, ResizeDirection, ResizeRejection, ResizeSafePoint,
     RoutedResidencyCoverage, RoutedResidencyGuardHandle, RoutedResidencyProof,
     RoutedResidencyRequirement, StaticProfileResidencyPolicy, WeightHandle, WeightHandleError,
     WholeBankReason, WholeBankResidentPolicy, expert_weight_groups, lazy_weight_candidates,

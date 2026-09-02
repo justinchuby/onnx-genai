@@ -1,6 +1,6 @@
 //! Native nxrt adapter for the engine's existing decode loop.
 
-use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback};
+use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback, SessionId};
 use crate::decode::DecodeBackend;
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState};
 use crate::logits::{ProcessorChain, TokenId};
@@ -30,7 +30,10 @@ mod kv_commit;
 mod load;
 mod paged_gqa;
 mod tensor;
-pub use csa::{CompressedStateTensorPhase, CompressedStateTransitionRefusal};
+pub use csa::{
+    CompressedStateLoadRefusal, CompressedStateTensorPhase, CompressedStateTransitionRefusal,
+    compressed_state_map_lookups,
+};
 #[cfg(feature = "native-cuda")]
 pub(crate) use tensor::recurrent_state_bytes_from_graph;
 #[cfg(test)]
@@ -52,6 +55,7 @@ pub(crate) fn configured_cuda_kv_max_len() -> anyhow::Result<Option<usize>> {
 }
 use io::*;
 pub(crate) use load::NativeDecodeLoadOptions;
+pub use load::{NativeDecodeMetadataRefusal, native_cuda_provider_construction_attempts};
 pub use paged_gqa::{
     GQA_PRESENT_ALLOCATIONS, PagedGqaConfig, flat_gqa_decode_step, gqa_present_allocations,
     paged_gqa_decode_step,
@@ -131,6 +135,7 @@ pub struct NativeDecodeSession {
     /// plus name indexes. Runtime validation, accounting, state reporting, and
     /// operation refusals all consume this same authority.
     compressed_state: csa::CompressedStatePlan,
+    compressed_state_stats: CompressedStatePathStats,
     past: HashMap<String, Tensor>,
     cuda: Option<DecodeCudaState>,
     cpu_kv: Option<DecodeCpuKvState>,
@@ -174,6 +179,10 @@ pub struct NativeDecodeSession {
     /// axis internally, so its rows cannot be mapped back to input positions and
     /// padding would silently answer with a padded row.
     prefill_query_padding: bool,
+    #[cfg(test)]
+    fail_next_reset: bool,
+    #[cfg(test)]
+    fail_rewind_after: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +241,42 @@ pub struct CompressedRecordStateInfo {
     pub record_width_bytes: usize,
 }
 
+/// Deterministic process-local accounting for the host compressed-state path.
+///
+/// Each committed record output is one executor-allocated host tensor replacing
+/// the corresponding past binding. The root PR deliberately exposes these
+/// counts rather than implying device residency: a future device loader must
+/// drive both fields to zero during warmed decode and use the session's device
+/// allocation/transfer/synchronization counters for its positive proof.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompressedStatePathStats {
+    /// Hash-map probes made against the enabled compressed-state transition
+    /// index. A disabled plan owns no index, so this remains exactly zero.
+    pub state_map_lookups: u64,
+    /// Successful typed record/carry contract validations.
+    pub transitions_validated: u64,
+    /// Host tensors allocated for compressed-state outputs.
+    pub host_output_allocations: u64,
+    /// Logical compressed-state output bytes materialized on the host.
+    pub host_output_bytes: u64,
+    /// Device allocations owned exclusively by compressed-state handling.
+    pub device_allocations: u64,
+    /// Host-to-device copies requested by compressed-state handling.
+    pub host_to_device_copies: u64,
+    /// Device-to-host copies requested by compressed-state handling.
+    pub device_to_host_copies: u64,
+    /// Device-to-device copies requested by compressed-state handling.
+    pub device_to_device_copies: u64,
+    /// Host-visible device synchronizations requested by compressed-state handling.
+    pub synchronizations: u64,
+    /// Compressed-state telemetry updates.
+    pub telemetry_updates: u64,
+    /// Metadata clones performed solely to serve compressed-state handling.
+    pub metadata_clones: u64,
+    /// Environment-variable reads performed solely to configure compressed state.
+    pub environment_reads: u64,
+}
+
 /// Deep-copy of the native loop-carried tensors at a semantic prefix boundary.
 ///
 /// Host-native decoding keeps dense KV and recurrent state in the same `past`
@@ -250,26 +295,35 @@ impl NativePastSnapshot {
     }
 }
 
-/// Pre-draft snapshot of the destructive recurrent/conv state used to commit a
-/// speculative verify window to the accepted-prefix length.
+/// Pre-draft snapshot of native state that cannot be prefix-sliced.
 ///
 /// Unlike [`NativePastSnapshot`] (which clones the whole host past for prefix
-/// caching), this captures *only* the recurrent/conv bindings and works on both
-/// the host past path and the CUDA fixed-state bindings. Exactly one of `host`
-/// (rank-carrying host tensors keyed by past-input name) or `device_scratch`
-/// (the CUDA fixed-state bindings staged into device scratch) indicates where
-/// the captured state lives, depending on which decode backend produced it.
+/// caching), this captures only destructive recurrent/conv bindings plus typed
+/// compressed-attention record/carry groups. Dense KV remains prefix-sliceable.
+/// Exactly one of `host` (host tensors keyed by past-input name) or
+/// `device_scratch` (owned device bindings staged into scratch) indicates where the
+/// captured state lives, depending on which decode backend produced it.
 /// `len` is the committed length the snapshot was taken at, asserted against the
 /// commit's `base_len`.
 pub(crate) struct RecurrentStateSnapshot {
     len: usize,
     host: Option<HashMap<String, Tensor>>,
-    /// True when the CUDA fixed-state bindings were staged into the session's
-    /// device scratch buffers (a stream-ordered device→device snapshot). The
-    /// bytes live in the CUDA decode state rather than in this handle, so a
-    /// restore copies them back from there. Only one such snapshot is live at a
-    /// time (per speculative step), matching the single scratch arena.
-    device_scratch: bool,
+    /// CUDA fixed-state bindings staged by device→device copies. The snapshot
+    /// owns the allocations and their exact providers, so dropping the handle
+    /// submits every allocation to provider-fenced deferred release.
+    device_scratch: Option<CudaFixedStateSnapshot>,
+}
+
+/// Exact logical owner of one materialized native decoder generation.
+///
+/// Session ids are never reused within an engine, while `generation` advances
+/// when reset keeps the same public id but starts a clean conversation. The
+/// pair prevents a stale snapshot or poison record from authorizing a later
+/// generation of the same logical session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeLogicalStateIdentity {
+    pub(crate) session_id: SessionId,
+    pub(crate) generation: u64,
 }
 
 impl RecurrentStateSnapshot {
@@ -284,6 +338,66 @@ impl RecurrentStateSnapshot {
 /// diagnostics can restore recurrent/conv state around an eager verify forward
 /// without exposing the snapshot internals.
 pub struct NativeRecurrentSnapshot(RecurrentStateSnapshot);
+
+#[derive(Debug)]
+struct NativeStateRestoreTransactionError {
+    primary: anyhow::Error,
+    undo: Vec<anyhow::Error>,
+}
+
+impl std::fmt::Display for NativeStateRestoreTransactionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "native state rollback failed: {}", self.primary)?;
+        if !self.undo.is_empty() {
+            write!(formatter, "; restoring the pre-attempt state also failed")?;
+            for (index, error) in self.undo.iter().enumerate() {
+                write!(formatter, " [undo {index}: {error}]")?;
+            }
+            write!(
+                formatter,
+                "; the session is poisoned and refuses further dispatch"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for NativeStateRestoreTransactionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static HOST_FIXED_RESTORE_FAILURE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct HostFixedRestoreFailureGuard;
+
+#[cfg(test)]
+impl Drop for HostFixedRestoreFailureGuard {
+    fn drop(&mut self) {
+        HOST_FIXED_RESTORE_FAILURE.set(None);
+    }
+}
+
+#[cfg(test)]
+fn fail_host_fixed_restore_at(index: usize) -> HostFixedRestoreFailureGuard {
+    HOST_FIXED_RESTORE_FAILURE.set(Some(index));
+    HostFixedRestoreFailureGuard
+}
+
+fn check_host_fixed_restore_stage(index: usize, name: &str) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if HOST_FIXED_RESTORE_FAILURE.get() == Some(index) {
+        bail!("injected host fixed-state restore failure at slot {index} ('{name}')");
+    }
+    let _ = (index, name);
+    Ok(())
+}
 
 /// State of the Inc-1b PR-2 decode-specialized inlined-body plan for a session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,6 +462,52 @@ impl NativeDecodeSession {
         &self.session
     }
 
+    pub(crate) fn bind_logical_state(
+        &mut self,
+        identity: NativeLogicalStateIdentity,
+    ) -> anyhow::Result<()> {
+        if let Some(cuda) = &mut self.cuda {
+            cuda.bind_logical_state(identity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_logical_state(
+        &self,
+        identity: NativeLogicalStateIdentity,
+    ) -> anyhow::Result<()> {
+        if let Some(cuda) = &self.cuda {
+            cuda.ensure_logical_state(identity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_logical_state_owner(
+        &self,
+        identity: NativeLogicalStateIdentity,
+    ) -> anyhow::Result<()> {
+        if let Some(cuda) = &self.cuda {
+            cuda.ensure_logical_state_owner(identity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn owns_logical_state(&self, identity: NativeLogicalStateIdentity) -> bool {
+        self.cuda
+            .as_ref()
+            .is_some_and(|cuda| cuda.owns_logical_state(identity))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_reset_for_test(&mut self) {
+        self.fail_next_reset = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_rewind_after_for_test(&mut self, successful_rewinds: usize) {
+        self.fail_rewind_after = Some(successful_rewinds);
+    }
+
     pub fn current_len(&self) -> usize {
         self.current_len
     }
@@ -383,10 +543,18 @@ impl NativeDecodeSession {
         Ok(state)
     }
 
+    pub fn compressed_state_path_stats(&self) -> CompressedStatePathStats {
+        CompressedStatePathStats {
+            state_map_lookups: self.compressed_state.map_lookups(),
+            ..self.compressed_state_stats
+        }
+    }
+
     pub fn kv_layer_count(&self) -> usize {
+        let compressed_state_enabled = !self.compressed_state.is_empty();
         self.kv_inputs
             .iter()
-            .filter(|name| !self.compressed_state.contains_past(name))
+            .filter(|name| !compressed_state_enabled || !self.compressed_state.contains_past(name))
             .filter(|name| {
                 self.session
                     .inputs()
@@ -510,11 +678,14 @@ impl NativeDecodeSession {
         // Length-`past_len` batched past for every KV / recurrent-state input,
         // batch axis = N.
         for name in &self.kv_inputs {
-            let logical_len = self
-                .compressed_state
-                .record_for_past(name)
-                .map(|spec| past_len / spec.ratio.tokens_per_record())
-                .unwrap_or(past_len);
+            let logical_len = if self.compressed_state.is_empty() {
+                past_len
+            } else {
+                self.compressed_state
+                    .record_for_past(name)
+                    .map(|spec| past_len / spec.ratio.tokens_per_record())
+                    .unwrap_or(past_len)
+            };
             let tensor = make_past_input_tensor_batched(&self.session, name, batch, logical_len)?;
             owned.push((name.clone(), tensor));
         }
@@ -567,21 +738,6 @@ impl NativeDecodeSession {
             .collect()
     }
 
-    /// Past-input names of the CSA/HCA compressed-record buffers
-    /// (`past_compressed_kv.*`, `past_index_key.*`).
-    ///
-    /// Classified from typed canonical state roles and properties at load time,
-    /// not from tensor
-    /// shape: their growth axis is the backend-owned compressed-record cursor
-    /// (~tokens/ratio), so they are append-only but cannot be token-prefix-sliced
-    /// like a dense KV cache.
-    /// The fixed-size carries are excluded (they thread as recurrent
-    /// wholesale-swap state via [`Self::recurrent_past_names`]). Empty for a
-    /// graph with no CSA record state.
-    fn csa_record_past_names(&self) -> HashSet<String> {
-        self.compressed_state.past_names().cloned().collect()
-    }
-
     fn compressed_state_refusal(
         &self,
         operation: NativeStateOperation,
@@ -592,7 +748,7 @@ impl NativeDecodeSession {
         }
         let mut state_inputs = self
             .compressed_state
-            .past_names()
+            .state_past_names()
             .cloned()
             .collect::<Vec<_>>();
         state_inputs.sort();
@@ -621,7 +777,7 @@ impl NativeDecodeSession {
     }
 
     pub(crate) fn has_recurrent_state(&self) -> bool {
-        !self.recurrent_past_names().is_empty()
+        !self.recurrent_past_names().is_empty() || !self.compressed_state.is_empty()
     }
 
     pub(crate) fn snapshot_past(&self) -> anyhow::Result<NativePastSnapshot> {
@@ -677,10 +833,10 @@ impl NativeDecodeSession {
         Ok(())
     }
 
-    /// Snapshot the destructive recurrent/conv state as of the last committed
-    /// token, so a speculative verify window can advance it and later be
-    /// committed to exactly the accepted-prefix length (vLLM's no-rollback rule
-    /// for Gated-DeltaNet SSM + conv1d state). See
+    /// Snapshot native state that cannot be token-prefix-sliced as of the last
+    /// committed token, so a speculative verify window or atomic turn can
+    /// advance it and later restore the exact committed boundary. This includes
+    /// recurrent/conv state and typed compressed-attention records/carries. See
     /// [`Self::commit_recurrent_state_to_accepted`].
     ///
     /// The recurrent/conv bindings are identified through the existing structural
@@ -690,19 +846,16 @@ impl NativeDecodeSession {
     /// it is a prefix-sliceable append-only cache the ordinary rewind already
     /// handles.
     pub(crate) fn snapshot_recurrent_state(&mut self) -> anyhow::Result<RecurrentStateSnapshot> {
-        if let Some(error) = self.compressed_state_refusal(NativeStateOperation::Snapshot, None) {
-            return Err(error);
-        }
         if !self.has_recurrent_state() {
             bail!("snapshot_recurrent_state requires a decoder that carries recurrent state");
         }
         let len = self.current_len;
         if let Some(cuda) = self.cuda.as_mut() {
-            cuda.snapshot_fixed_states_device()?;
+            let device_scratch = cuda.snapshot_fixed_states_device()?;
             return Ok(RecurrentStateSnapshot {
                 len,
                 host: None,
-                device_scratch: true,
+                device_scratch: Some(device_scratch),
             });
         }
         if self.cpu_kv.is_some() {
@@ -711,7 +864,10 @@ impl NativeDecodeSession {
                  recurrent decoders keep their loop-carried state in the host past map"
             );
         }
-        let snapshot_names = self.recurrent_past_names();
+        let mut snapshot_names = self.recurrent_past_names();
+        if !self.compressed_state.is_empty() {
+            snapshot_names.extend(self.compressed_state.state_past_names().cloned());
+        }
         let mut host = HashMap::with_capacity(snapshot_names.len());
         for name in &snapshot_names {
             let tensor = self.past.get(name).with_context(|| {
@@ -725,7 +881,7 @@ impl NativeDecodeSession {
         Ok(RecurrentStateSnapshot {
             len,
             host: Some(host),
-            device_scratch: false,
+            device_scratch: None,
         })
     }
 
@@ -737,23 +893,158 @@ impl NativeDecodeSession {
         &mut self,
         snapshot: &RecurrentStateSnapshot,
     ) -> anyhow::Result<()> {
-        if snapshot.device_scratch {
+        if let Some(device_scratch) = &snapshot.device_scratch {
             let cuda = self.cuda.as_mut().context(
                 "recurrent snapshot targets the CUDA fixed-state bindings but this session has no CUDA state",
             )?;
-            cuda.restore_fixed_states_device()?;
+            cuda.restore_fixed_states_device(device_scratch)?;
             return Ok(());
         }
         if let Some(host) = &snapshot.host {
+            let mut restored = HashMap::with_capacity(host.len());
             for (name, tensor) in host {
-                let slot = self.past.get_mut(name).with_context(|| {
+                if !self.past.contains_key(name) {
+                    bail!("native state '{name}' is not materialized; cannot restore snapshot");
+                }
+                restored.insert(
+                    name.clone(),
+                    tensor.try_clone().map_err(anyhow::Error::from)?,
+                );
+            }
+            for (name, tensor) in restored {
+                let slot = self.past.get_mut(&name).with_context(|| {
                     format!("recurrent state '{name}' is not materialized; cannot restore snapshot")
                 })?;
-                *slot = tensor.try_clone().map_err(anyhow::Error::from)?;
+                *slot = tensor;
             }
             return Ok(());
         }
         bail!("recurrent snapshot carried neither host nor device state");
+    }
+
+    fn stage_host_state_restore(
+        &self,
+        snapshot: &RecurrentStateSnapshot,
+        target_len: usize,
+    ) -> anyhow::Result<HashMap<String, Tensor>> {
+        let host = snapshot
+            .host
+            .as_ref()
+            .context("host state restore requires a host recurrent snapshot")?;
+        if target_len > self.current_len {
+            bail!(
+                "cannot restore native state forward from {} to {target_len}",
+                self.current_len
+            );
+        }
+        let mut state_names = self.recurrent_past_names();
+        if !self.compressed_state.is_empty() {
+            state_names.extend(self.compressed_state.state_past_names().cloned());
+        }
+        let snapshot_names = host.keys().cloned().collect::<HashSet<_>>();
+        if snapshot_names != state_names {
+            let mut missing = state_names
+                .difference(&snapshot_names)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut extra = snapshot_names
+                .difference(&state_names)
+                .cloned()
+                .collect::<Vec<_>>();
+            missing.sort();
+            extra.sort();
+            bail!(
+                "native state snapshot does not match the session's fixed-state bindings: \
+                 missing {missing:?}, extra {extra:?}"
+            );
+        }
+
+        let mut next = HashMap::new();
+        next.try_reserve(self.past.len())
+            .context("allocate native state restore transaction")?;
+
+        if target_len > 0 {
+            let mut dense_names = self
+                .past
+                .keys()
+                .filter(|name| !state_names.contains(*name))
+                .cloned()
+                .collect::<Vec<_>>();
+            dense_names.sort();
+            for name in dense_names {
+                let tensor = &self.past[&name];
+                let axis = tensor
+                    .shape
+                    .len()
+                    .checked_sub(2)
+                    .with_context(|| format!("native KV tensor '{name}' rank is below 2"))?;
+                let tensor = prefix_slice(tensor, axis, target_len)
+                    .with_context(|| format!("stage native KV tensor '{name}' for rollback"))?;
+                next.insert(name, tensor);
+            }
+        }
+
+        let mut fixed_names = state_names.into_iter().collect::<Vec<_>>();
+        fixed_names.sort();
+        for (index, name) in fixed_names.into_iter().enumerate() {
+            check_host_fixed_restore_stage(index, &name)?;
+            if !self.past.contains_key(&name) {
+                bail!("native state '{name}' is not materialized; cannot restore snapshot");
+            }
+            let tensor = host[&name]
+                .try_clone()
+                .map_err(anyhow::Error::from)
+                .with_context(|| {
+                    format!("stage fixed native state '{name}' for atomic rollback")
+                })?;
+            next.insert(name, tensor);
+        }
+        Ok(next)
+    }
+
+    /// Restore an exact transaction boundary while bypassing the public bare
+    /// rewind refusal for non-prefix-sliceable state. The caller must hold the
+    /// snapshot taken at `target_len`. Host dense KV and fixed state are built
+    /// into one replacement map before publication. CUDA journals the current
+    /// mask, lengths, and fixed bindings, then restores that journal on any
+    /// failed device operation before returning the initiating error.
+    pub(crate) fn restore_state_snapshot_at(
+        &mut self,
+        snapshot: &RecurrentStateSnapshot,
+        target_len: usize,
+    ) -> anyhow::Result<()> {
+        if snapshot.len != target_len {
+            bail!(
+                "native state snapshot length {} does not match restore target {target_len}",
+                snapshot.len
+            );
+        }
+        if let Some(device_scratch) = &snapshot.device_scratch {
+            let state = self.cuda.as_mut().context(
+                "recurrent snapshot targets the CUDA fixed-state bindings but this session has no CUDA state",
+            )?;
+            let retain = state.retain_graph_on_rewind
+                || (state.retain_decode_graph_across_spec && target_len != 0);
+            if target_len == 0 {
+                self.session.reset_verify_sibling_device_graph()?;
+                state.reset_verify_graph_phase();
+            }
+            state.restore_fixed_states_and_rewind(
+                device_scratch,
+                target_len,
+                &mut self.session,
+                !retain,
+            )?;
+            self.current_len = target_len;
+            return Ok(());
+        }
+        let restored = self.stage_host_state_restore(snapshot, target_len)?;
+        self.past = restored;
+        self.current_len = target_len;
+        if target_len == 0 {
+            self.last_hidden = None;
+        }
+        Ok(())
     }
 
     /// Commit the recurrent/conv state to exactly `accepted_tokens.len()` tokens
@@ -774,11 +1065,6 @@ impl NativeDecodeSession {
         base_len: usize,
         accepted_tokens: &[TokenId],
     ) -> anyhow::Result<()> {
-        if let Some(error) =
-            self.compressed_state_refusal(NativeStateOperation::Rollback, Some(base_len))
-        {
-            return Err(error);
-        }
         if snapshot.len != base_len {
             bail!(
                 "recurrent snapshot length {} does not match commit base length {base_len}",
@@ -793,10 +1079,7 @@ impl NativeDecodeSession {
         }
         // Attention KV keeps the ordinary prefix-slice rewind (this skips the
         // recurrent/conv states, which have no sliceable history).
-        self.rewind_inner(base_len)?;
-        // Restore the destructive recurrent/conv states to the pre-draft snapshot,
-        // then deterministically re-advance them by exactly the accepted tokens.
-        self.restore_recurrent_state(snapshot)?;
+        self.restore_state_snapshot_at(snapshot, base_len)?;
         // Re-advance ONE token at a time (M=1) rather than a single M=num_accepted
         // batch. The recurrent/conv state advance is inherently sequential, so a
         // per-token replay is state-equivalent to a batched forward, but it keeps
@@ -1275,6 +1558,7 @@ impl NativeDecodeSession {
     /// length. See [`Self::snapshot_recurrent_state`]. Public, opaque handle for
     /// diagnostics that must restore recurrent state around an eager verify.
     pub fn snapshot_recurrent_state_public(&mut self) -> anyhow::Result<NativeRecurrentSnapshot> {
+        self.ensure_state_operation_supported(NativeStateOperation::Snapshot, None)?;
         Ok(NativeRecurrentSnapshot(self.snapshot_recurrent_state()?))
     }
 
@@ -1285,6 +1569,7 @@ impl NativeDecodeSession {
         &mut self,
         snapshot: &NativeRecurrentSnapshot,
     ) -> anyhow::Result<()> {
+        self.ensure_state_operation_supported(NativeStateOperation::Restore, Some(snapshot.0.len))?;
         self.restore_recurrent_state(&snapshot.0)
     }
 
@@ -1298,6 +1583,7 @@ impl NativeDecodeSession {
         base_len: usize,
         accepted_tokens: &[TokenId],
     ) -> anyhow::Result<()> {
+        self.ensure_state_operation_supported(NativeStateOperation::Rollback, Some(base_len))?;
         self.commit_recurrent_state_to_accepted(&snapshot.0, base_len, accepted_tokens)
     }
 
@@ -1459,6 +1745,9 @@ impl NativeDecodeSession {
         past_len: usize,
         step_inputs: &[(String, Tensor)],
     ) -> anyhow::Result<Vec<Vec<f32>>> {
+        if let Some(cuda) = &self.cuda {
+            cuda.ensure_state_restore_healthy()?;
+        }
         if token_ids.is_empty() {
             bail!("native decode requires at least one token");
         }
@@ -1607,6 +1896,16 @@ impl NativeDecodeSession {
     }
 
     pub fn reset(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_reset) {
+            bail!("injected native decoder reset failure");
+        }
+        if let Some(state) = &mut self.cuda {
+            state.reset_generation(&mut self.session)?;
+            self.current_len = 0;
+            self.last_hidden = None;
+            return Ok(());
+        }
         self.rewind(0)
     }
 

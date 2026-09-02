@@ -13,6 +13,7 @@
 //! which is the difference between an upgrade and a bug hunt.
 
 use std::fmt;
+use std::path::PathBuf;
 
 /// A `<major>.<minor>` inference-metadata schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -35,11 +36,128 @@ impl fmt::Display for SchemaVersion {
     }
 }
 
+/// Public identity of a versioned document family.
+///
+/// This is intentionally independent of models, vendors, and execution
+/// providers so callers can handle an unsupported document before selecting
+/// any runtime backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaFamily {
+    InferenceMetadata,
+}
+
+impl fmt::Display for SchemaFamily {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InferenceMetadata => formatter.write_str("inference-metadata"),
+        }
+    }
+}
+
+/// Inclusive version interval understood by this build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupportedSchemaVersions {
+    pub minimum: SchemaVersion,
+    pub maximum: SchemaVersion,
+}
+
+/// Payload-free context identifying where an unsupported document came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaDocumentContext {
+    InMemory,
+    File(PathBuf),
+}
+
+/// Stable typed refusal for a well-formed document from an unsupported schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedSchemaVersion {
+    pub family: SchemaFamily,
+    pub observed: SchemaVersion,
+    pub supported: SupportedSchemaVersions,
+    pub document: SchemaDocumentContext,
+}
+
+impl fmt::Display for UnsupportedSchemaVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.observed.major != self.supported.maximum.major {
+            write!(
+                formatter,
+                "{} document from {} declares unsupported schema version {}, and this build reads \
+                 major version {} ({} through {}). A major version is a different contract, not \
+                 a longer one. The document is not malformed: use a runtime that declares {}.x \
+                 support",
+                self.family,
+                self.document,
+                self.observed,
+                self.supported.maximum.major,
+                self.supported.minimum,
+                self.supported.maximum,
+                self.observed.major
+            )
+        } else {
+            write!(
+                formatter,
+                "{} document from {} declares unsupported schema version {}, and this build reads \
+                 up to {}. The document is not malformed: upgrade the runtime, or re-emit the \
+                 package within {} through {} without newer fields",
+                self.family,
+                self.document,
+                self.observed,
+                self.supported.maximum,
+                self.supported.minimum,
+                self.supported.maximum
+            )
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedSchemaVersion {}
+
+impl UnsupportedSchemaVersion {
+    pub fn with_document(mut self, document: SchemaDocumentContext) -> Self {
+        self.document = document;
+        self
+    }
+
+    fn inference_metadata(observed: SchemaVersion) -> Self {
+        Self {
+            family: SchemaFamily::InferenceMetadata,
+            observed,
+            supported: SUPPORTED_SCHEMA_VERSIONS,
+            document: SchemaDocumentContext::InMemory,
+        }
+    }
+}
+
+impl fmt::Display for SchemaDocumentContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InMemory => formatter.write_str("an in-memory source"),
+            Self::File(path) => write!(formatter, "file '{}'", path.display()),
+        }
+    }
+}
+
+/// Version-gate error before typed document parsing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SchemaVersionError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error(transparent)]
+    Unsupported(UnsupportedSchemaVersion),
+}
+
 /// The version an absent, `v1`, `1`, or `1.0` document means.
 pub const INITIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
 
 /// The newest version this build can read.
-pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 7);
+pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 8);
+
+/// Every inference-metadata schema version this build reads.
+pub const SUPPORTED_SCHEMA_VERSIONS: SupportedSchemaVersions = SupportedSchemaVersions {
+    minimum: INITIAL_SCHEMA_VERSION,
+    maximum: SUPPORTED_SCHEMA_VERSION,
+};
 
 /// The version that first carried encoder batching, padding, ownership levels,
 /// and the video preprocessing program.
@@ -67,11 +185,15 @@ pub const OUTPUT_PROTOCOL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 
 /// The version that made transaction-scoped publication visibility explicit.
 pub const PUBLICATION_MODE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 7);
 
+/// The version that introduced typed compressed-attention record/carry groups.
+pub const COMPRESSED_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 8);
+
 /// A serialized feature whose presence is bounded by one schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaFeature {
     OutputProtocols,
     PublicationMode,
+    CompressedStateGroups,
 }
 
 impl SchemaFeature {
@@ -79,6 +201,7 @@ impl SchemaFeature {
         match self {
             Self::OutputProtocols => OUTPUT_PROTOCOL_SCHEMA_VERSION,
             Self::PublicationMode => PUBLICATION_MODE_SCHEMA_VERSION,
+            Self::CompressedStateGroups => COMPRESSED_STATE_SCHEMA_VERSION,
         }
     }
 
@@ -89,6 +212,9 @@ impl SchemaFeature {
             }
             Self::PublicationMode => {
                 "workflow transaction publication mode and typed commit/abort reconciliation"
+            }
+            Self::CompressedStateGroups => {
+                "typed compressed-attention record/carry groups, roles, cadence, and formats"
             }
         }
     }
@@ -102,6 +228,10 @@ impl SchemaFeature {
             Self::PublicationMode => {
                 "Declare `publication_mode: commit_only` or \
                  `publication_mode: provisional_revisions`"
+            }
+            Self::CompressedStateGroups => {
+                "Declare compressed records and fixed carries as complete paired \
+                 `compressed_attention` groups"
             }
         }
     }
@@ -134,6 +264,13 @@ pub fn gate_feature_use(
              {required}. Remove `pipeline.workflow.publication_mode` to keep a pre-{required} \
              document, or upgrade `schema_version` to \"{required}\" and author a valid mode \
              (`commit_only` or `provisional_revisions`)"
+        )),
+        SchemaFeature::CompressedStateGroups => Err(format!(
+            "{path} is not legal in authored schema version {version}; {} require minimum schema \
+             version {required}. Remove the compressed-attention state declaration to retain \
+             legacy state semantics, or migrate/re-emit the package with `schema_version: \
+             \"{required}\"` and complete typed record/carry groups",
+            feature.description()
         )),
     }
 }
@@ -189,24 +326,16 @@ pub fn normalize(spelling: Option<&str>) -> Result<SchemaVersion, String> {
 }
 
 /// Refuse a document this build is too old to read, before `serde` sees it.
-pub fn gate(spelling: Option<&str>) -> Result<SchemaVersion, String> {
-    let version = normalize(spelling)?;
+pub fn gate(spelling: Option<&str>) -> Result<SchemaVersion, SchemaVersionError> {
+    let version = normalize(spelling).map_err(SchemaVersionError::Invalid)?;
     if version.major != SUPPORTED_SCHEMA_VERSION.major {
-        return Err(format!(
-            "this package declares inference-metadata schema version {version}, and this build \
-             reads major version {}. A major version is a different contract, not a longer one, \
-             so there is nothing here to read partially: use a runtime that declares \
-             {}.x support",
-            SUPPORTED_SCHEMA_VERSION.major, version.major
+        return Err(SchemaVersionError::Unsupported(
+            UnsupportedSchemaVersion::inference_metadata(version),
         ));
     }
     if version.minor > SUPPORTED_SCHEMA_VERSION.minor {
-        return Err(format!(
-            "this package declares inference-metadata schema version {version}, and this build \
-             reads up to {SUPPORTED_SCHEMA_VERSION}. The document is not malformed — it uses \
-             fields added after this runtime was built, and every structure in this schema \
-             refuses fields it does not know rather than ignoring them. Upgrade the runtime, or \
-             re-emit the package at {SUPPORTED_SCHEMA_VERSION} without the newer fields"
+        return Err(SchemaVersionError::Unsupported(
+            UnsupportedSchemaVersion::inference_metadata(version),
         ));
     }
     Ok(version)
@@ -253,7 +382,7 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.7");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.8");
         assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
@@ -292,22 +421,28 @@ mod tests {
 
     #[test]
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
-        let error = gate(Some("1.8")).expect_err("1.8 is newer than this build");
+        let error = gate(Some("1.9")).expect_err("1.9 is newer than this build");
+        let error = error.to_string();
         assert!(
-            error.contains("declares inference-metadata schema version v1.8"),
+            error.contains("declares unsupported schema version v1.9"),
             "{error}"
         );
         assert!(
             error.contains(&format!("reads up to {SUPPORTED_SCHEMA_VERSION}")),
             "{error}"
         );
-        assert!(error.contains("refuses fields it does not know"), "{error}");
     }
 
     #[test]
     fn a_different_major_is_a_different_contract() {
         let error = gate(Some("2.0")).expect_err("2.0 is a different contract");
-        assert!(error.contains("major version"), "{error}");
+        assert!(matches!(
+            error,
+            SchemaVersionError::Unsupported(UnsupportedSchemaVersion {
+                observed: SchemaVersion { major: 2, minor: 0 },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -331,7 +466,11 @@ mod tests {
             gate(Some("1.6")).expect("1.6"),
             CANONICAL_SPECULATION_SCHEMA_VERSION
         );
-        assert_eq!(gate(Some("1.7")).expect("1.7"), SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(
+            gate(Some("1.7")).expect("1.7"),
+            PUBLICATION_MODE_SCHEMA_VERSION
+        );
+        assert_eq!(gate(Some("1.8")).expect("1.8"), SUPPORTED_SCHEMA_VERSION);
     }
 
     #[test]

@@ -313,7 +313,8 @@ impl Executor {
                 .weight_handles
                 .get(vid)
                 .and_then(|handle| handle.as_lazy())
-                && self.ep.prefetch_lazy_weight(
+                && self.ep.prefetch_lazy_weight_for_executor(
+                    self.instance_id,
                     vid.0 as u64,
                     lazy,
                     &WeightStoreRegionSource(self.weights.as_ref()),
@@ -563,21 +564,10 @@ impl Executor {
         let has_lazy_inputs = in_infos.iter().any(|info| info.lazy_unresolved);
 
         let ep = self.ep.clone();
+        let artifact_config = self.artifact_config;
         // Eager seam variants are not baked into the installed executable, so
         // evicting one must not reset an otherwise valid segmented graph.
-        let graph_tokens = std::array::from_fn(|index| {
-            let capture = &self.slot_capture[index];
-            capture
-                .capture_schedule
-                .as_ref()
-                .is_some_and(|schedule| {
-                    schedule.segments.iter().any(|segment| {
-                        segment.captured && (segment.start..segment.end).contains(&pi)
-                    })
-                })
-                .then_some(capture.device_graph_token)
-                .flatten()
-        });
+        let graph_tokens = self.captured_graph_tokens_for_plan_index(pi);
 
         // Bind the mutated fields as disjoint borrows so `self` is never borrowed
         // whole while the kernel (from `cache`) and the buffers/views are held.
@@ -585,9 +575,12 @@ impl Executor {
         // resolved kernel reference borrows `cache` for the rest of the dispatch.
         let cache = &mut self.cache;
         let kernel_bindings = &mut self.kernel_bindings;
+        let provider_artifact_readiness = &mut self.provider_artifact_readiness;
+        let finalized_expert_banks = &self.finalized_expert_banks;
         let capture_growing = &self.capture_growing_symbols;
         let weights = &self.weights;
         let mut ctx = KernelDispatchContext {
+            executor: self.instance_id,
             ep: &ep,
             graph: &self.graph,
             external,
@@ -666,6 +659,8 @@ impl Executor {
                     &constant_values,
                     opset,
                     node_capture_seq_independent(ctx.graph, node, capture_growing),
+                    artifact_config,
+                    provider_artifact_readiness,
                     ep.as_ref(),
                     graph_tokens,
                 )?;
@@ -680,6 +675,16 @@ impl Executor {
                 )
                 .expect("kernel binding resolved immediately before lookup")
         };
+        // Preflight cannot compile a node whose inputs become concrete only
+        // during runtime shape resolution. If lookup above created that
+        // specialization, the cache publication chokepoint invalidated the
+        // authority. Finalize it now, while no kernel work has been enqueued.
+        provider_artifact_readiness.finalize_if_needed(
+            ep.as_ref(),
+            artifact_config,
+            ctx.graph,
+            finalized_expert_banks,
+        )?;
         for (index, (view, info)) in views.iter_mut().zip(&in_infos).enumerate() {
             if let Some(sealed) = kernel.constant_input_override(index) {
                 *view = sealed;
@@ -1228,7 +1233,8 @@ impl Executor {
                 // lifetime via `paged`. On `None` (EP can't page) the input stays
                 // absent and is routed to the kernel as a lazy `KernelInput::Weight`.
                 let issued_at = self.prefetch_issue_nodes.lock().unwrap().remove(&vid);
-                let paged = self.ep.page_lazy_weight(
+                let paged = self.ep.page_lazy_weight_for_executor(
+                    self.instance_id,
                     vid.0 as u64,
                     lazy,
                     &WeightStoreRegionSource(self.weights.as_ref()),
@@ -1550,6 +1556,7 @@ fn materialize_strided_inputs(
 /// order without ever borrowing `self` whole (which would collide with the
 /// resolved kernel's borrow of `self.cache`). No field is cloned.
 struct KernelDispatchContext<'a> {
+    executor: ExecutorInstanceId,
     ep: &'a Arc<dyn ExecutionProvider>,
     graph: &'a Graph,
     external: &'a ExternalBindings,
@@ -1880,18 +1887,22 @@ impl KernelDispatchContext<'_> {
             .matches(&node.domain, &node.op_type)
             || LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type)
         {
-            inputs.iter().find_map(|value| {
-                let value = (*value)?;
-                let catalog = self.expert_region_candidates.get(&value)?;
-                self.ep
-                    .acquire_routed_residency(
-                        value.0 as u64,
-                        onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
-                        catalog,
-                    )
-                    .ok()
-                    .flatten()
-            })
+            let mut guard = None;
+            for value in inputs.iter().flatten() {
+                let Some(catalog) = self.expert_region_candidates.get(value) else {
+                    continue;
+                };
+                guard = self.ep.acquire_routed_residency_for_executor(
+                    self.executor,
+                    value.0 as u64,
+                    onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+                    catalog,
+                )?;
+                if guard.is_some() {
+                    break;
+                }
+            }
+            guard
         } else {
             None
         };

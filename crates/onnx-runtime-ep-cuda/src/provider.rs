@@ -43,9 +43,12 @@ use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{
     BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
-    DevicePtr, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities, Fence,
-    HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result,
-    SealedDeviceAllocation, WorkspaceAllocation, deny, structural_input_bytes,
+    DevicePtr, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities,
+    ExecutorArtifactGeneration, ExecutorArtifactPending, ExecutorArtifactPolicy,
+    ExecutorArtifactProviderId, ExecutorArtifactReadinessEpoch, ExecutorArtifactReport,
+    ExecutorArtifactState, ExecutorInstanceId, ExecutorKernelScope, ExecutorRouteResidencyConfig,
+    ExpertWeightGroup, Fence, HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry,
+    PagedWeight, Result, SealedDeviceAllocation, WorkspaceAllocation, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
@@ -60,17 +63,273 @@ use onnx_runtime_memory_governor::{
 };
 
 use crate::deferred_release::{
-    CudaDeferredReleaseQueue, CudaStreamFences, DEFAULT_DEFERRED_RELEASE_CAPACITY, ReleaseObserver,
+    CudaDeferredReleaseQueue, CudaStreamFences, DEFAULT_DEFERRED_RELEASE_CAPACITY,
+    DeferredActionOutcome, DeferredReleaseAction, ReleaseObserver,
 };
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
 use crate::route_residency::{
-    RouteResidencyBoundary, RouteResidencyDiagnostics, RouteResidencyInstallOutcome,
-    build_route_residency_boundary,
+    RouteResidencyBindingReject, RouteResidencyBoundary, RouteResidencyDiagnostics,
+    RouteResidencyInstallOutcome, build_route_residency_boundaries,
 };
 use crate::runtime::{CudaRuntime, cuptr};
-use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy, PrefillRoute};
+use crate::weight_paging::{
+    CudaWeightResidency, DeviceOffloadPolicy, PrefillRoute, RouteReservationRetirementCleanup,
+    RouteReservationRetirementStart, RouteReservationRetirementStats,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteResidencyExecutorStatus {
+    pub finalization_attempts: u64,
+    pub readiness_epoch: Option<ExecutorArtifactReadinessEpoch>,
+    pub pending: Option<ExecutorArtifactPending>,
+    pub drain_calls: u64,
+    pub drained: bool,
+    pub outcome: Option<RouteResidencyInstallOutcome>,
+    pub producer_nodes: usize,
+    pub retained_banks: usize,
+    pub reservation_generation: Option<u64>,
+    pub reservation_removals: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteResidencyRetirementCensus {
+    pub active_registry_entries: usize,
+    pub retirement_registry_entries: usize,
+    pub live_retirement_records: usize,
+    pub reservation_registry_entries: usize,
+    pub retirements_started: u64,
+    pub deferred_cleanups: u64,
+    pub cleanups_scheduled: u64,
+    pub cleanups_executed: u64,
+    pub prepared_rollbacks: u64,
+}
+
+#[doc(hidden)]
+pub struct RoutePrepareCommitInterlock {
+    admitted: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+impl RoutePrepareCommitInterlock {
+    pub fn new() -> Self {
+        Self {
+            admitted: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        }
+    }
+
+    pub fn wait_until_prepared(&self) {
+        self.admitted.wait();
+    }
+
+    pub fn resume_commit(&self) {
+        self.resume.wait();
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    fn pause_before_commit(&self) {
+        self.admitted.wait();
+        self.resume.wait();
+    }
+}
+
+impl Default for RoutePrepareCommitInterlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Default)]
+struct ExecutorRouteResidencyState {
+    finalization_attempts: u64,
+    readiness_epoch: Option<ExecutorArtifactReadinessEpoch>,
+    pending: Option<ExecutorArtifactPending>,
+    drain_calls: u64,
+    drained: bool,
+    outcome: Option<RouteResidencyInstallOutcome>,
+    boundaries: Vec<Arc<RouteResidencyBoundary>>,
+    armed_sources: Vec<Arc<crate::kernels::qmoe::QMoERouteTelemetry>>,
+    retained_artifacts: Option<Arc<Vec<ExpertWeightGroup>>>,
+    reservation_health: Option<Arc<crate::weight_paging::RouteReservationHealth>>,
+    reservation_generation: Option<u64>,
+    reservation_removals: u64,
+    finalization_admission: Option<RouteFinalizationAdmission>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RouteFinalizationAdmission {
+    token: u64,
+    readiness: ExecutorArtifactReadinessEpoch,
+}
+
+fn route_finalization_commit_is_live(
+    state: Option<&ExecutorRouteResidencyState>,
+    admission: RouteFinalizationAdmission,
+    retired_requirement_is_live: bool,
+) -> bool {
+    state.is_some_and(|state| {
+        !state.drained
+            && state.finalization_admission == Some(admission)
+            && !retired_requirement_is_live
+    })
+}
+
+enum PreparedRouteFinalization {
+    Complete(RouteResidencyInstallOutcome),
+    Pending(ExecutorArtifactPending),
+    Installed(PreparedRouteResidencyInstallation),
+}
+
+struct PreparedRouteResidencyInstallation {
+    executor: ExecutorInstanceId,
+    residency: Arc<CudaWeightResidency>,
+    groups: Vec<ExpertWeightGroup>,
+    boundaries: Vec<RouteResidencyBoundary>,
+    armed_sources: Vec<Arc<crate::kernels::qmoe::QMoERouteTelemetry>>,
+    health: Option<Arc<crate::weight_paging::RouteReservationHealth>>,
+    rollback_counter: Arc<AtomicU64>,
+    banks: usize,
+    committed: bool,
+}
+
+impl PreparedRouteResidencyInstallation {
+    fn commit(mut self, state: &mut ExecutorRouteResidencyState) -> usize {
+        state.retained_artifacts = Some(Arc::new(std::mem::take(&mut self.groups)));
+        state.boundaries = std::mem::take(&mut self.boundaries)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        state.armed_sources = std::mem::take(&mut self.armed_sources);
+        state.reservation_health = self.health.take();
+        state.reservation_generation = state
+            .reservation_health
+            .as_ref()
+            .and_then(|health| health.generation());
+        state.outcome = Some(RouteResidencyInstallOutcome::Installed { banks: self.banks });
+        self.committed = true;
+        self.banks
+    }
+}
+
+impl Drop for PreparedRouteResidencyInstallation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for source in &self.armed_sources {
+            source.disarm_route_telemetry();
+        }
+        if self.residency.remove_route_bank_reservations(self.executor) {
+            self.rollback_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct RouteReservationRetirementAction {
+    executor: ExecutorInstanceId,
+    generation: Option<u64>,
+    boundaries: Vec<Arc<RouteResidencyBoundary>>,
+    armed_sources: Vec<Arc<crate::kernels::qmoe::QMoERouteTelemetry>>,
+    residency: Arc<CudaWeightResidency>,
+    reservation_count: usize,
+    bytes: u64,
+    health: Weak<crate::weight_paging::RouteReservationHealth>,
+}
+
+impl std::fmt::Debug for RouteReservationRetirementAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteReservationRetirementAction")
+            .field("executor", &self.executor)
+            .field("generation", &self.generation)
+            .field("boundaries", &self.boundaries.len())
+            .field("armed_sources", &self.armed_sources.len())
+            .field("reservations", &self.reservation_count)
+            .finish()
+    }
+}
+
+impl DeferredReleaseAction for RouteReservationRetirementAction {
+    fn execute(self: Box<Self>) -> DeferredActionOutcome {
+        let mut action = *self;
+        let health = action.health.upgrade();
+        for source in action.armed_sources.drain(..) {
+            source.disarm_route_telemetry_after_stream_fences();
+        }
+        action.boundaries.clear();
+        drop(
+            action
+                .residency
+                .take_route_bank_reservations(action.executor),
+        );
+        if let Some(health) = health {
+            health.complete_retirement();
+        }
+        DeferredActionOutcome::released(0)
+    }
+
+    fn label(&self) -> &'static str {
+        "route-reservation-retirement"
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+struct RouteReservationRetirementSubmission {
+    queue: Arc<CudaDeferredReleaseQueue>,
+    action: RouteReservationRetirementAction,
+}
+
+impl std::fmt::Debug for RouteReservationRetirementSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteReservationRetirementSubmission")
+            .field("action", &self.action)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RouteReservationRetirementCleanup for RouteReservationRetirementSubmission {
+    fn schedule(self: Box<Self>) {
+        let Self { queue, action } = *self;
+        if let Err(refused) = queue.enqueue(action) {
+            let detail = format!(
+                "route-reservation retirement enqueue was refused as {}; exact mapping ownership \
+                 remains quarantined",
+                refused.rejection.name()
+            );
+            queue.retain_refused(refused, detail);
+        }
+    }
+}
+
+pub(crate) enum RouteArtifactFinalization {
+    Disabled,
+    Declined,
+    Required,
+    Pending(ExecutorArtifactPending),
+}
+
+static NEXT_ARTIFACT_PROVIDER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn issue_artifact_provider_id() -> Result<ExecutorArtifactProviderId> {
+    NEXT_ARTIFACT_PROVIDER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map(ExecutorArtifactProviderId::from_raw)
+        .map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep: executor artifact provider identity space exhausted; refusing to wrap \
+                 and create an ABA collision"
+                    .to_string(),
+            )
+        })
+}
 
 /// The provider-owned mapped-attribution zone.
 ///
@@ -953,14 +1212,52 @@ pub struct CudaExecutionProvider {
     /// The context-owned queue that performs every final device release after
     /// both stream tails.
     release_queue: Arc<CudaDeferredReleaseQueue>,
-    /// Slice-7C boundary consumer wiring. `route_boundary` binds one expert
-    /// bank's producer window source + residency authorities for the coarse
-    /// safe-boundary consumer; it is `None` in production today (the reachable
-    /// seam has no live per-session registration yet, exactly like the 7A/7B
-    /// producer/consumer shipped) and is installed only by the Slice-7C tests.
-    /// `route_diag` carries the typed outcome of every boundary.
-    route_boundary: Mutex<Option<Arc<RouteResidencyBoundary>>>,
+    /// Executor-scoped route-residency lifecycle state. Sibling/base/MTP
+    /// executors may share this EP, but each owns an independent finalization
+    /// outcome, boundary, and retained bank artifacts.
+    route_residency_config: ExecutorRouteResidencyConfig,
+    artifact_provider_id: ExecutorArtifactProviderId,
+    route_executors: Mutex<HashMap<ExecutorInstanceId, ExecutorRouteResidencyState>>,
+    /// Weak retirement records outlive the live registry only while a baked
+    /// requirement or active lease still retains the exact reservation health.
+    route_retirements:
+        Mutex<HashMap<ExecutorInstanceId, Weak<crate::weight_paging::RouteReservationHealth>>>,
+    next_route_finalization_admission: AtomicU64,
+    route_finalization_rollbacks: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "gpu-tests"))]
+    route_state_lock_acquisitions: AtomicU64,
+    #[cfg(any(test, feature = "gpu-tests"))]
+    route_request_boundary_calls: AtomicU64,
+    #[cfg(any(test, feature = "gpu-tests"))]
+    fail_allocation_after_required_report: AtomicBool,
+    #[cfg(any(test, feature = "gpu-tests"))]
+    fail_next_allocation: AtomicBool,
+    #[cfg(feature = "gpu-tests")]
+    route_prepare_commit_interlock: Mutex<Option<Arc<RoutePrepareCommitInterlock>>>,
     route_diag: Arc<RouteResidencyDiagnostics>,
+    /// EP-owned registry of live `QMoE` route-telemetry producer sources,
+    /// keyed by call-site `NodeId` (issue #1810 Slice 7E). Shared with the
+    /// `QMoEFactory` this EP built: every executing `QMoEKernel` registers here,
+    /// so [`Self::try_install_route_residency_binding`] can bind the real
+    /// producer instances instead of a controllable test double. Empty until a
+    /// model with `QMoE` nodes is compiled; drained at teardown.
+    route_telemetry_registry: Arc<crate::kernels::qmoe::RouteTelemetrySourceRegistry>,
+}
+
+struct RouteFinalizationAdmissionGuard<'a> {
+    provider: &'a CudaExecutionProvider,
+    executor: ExecutorInstanceId,
+    admission: RouteFinalizationAdmission,
+    committed: bool,
+}
+
+impl Drop for RouteFinalizationAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.provider
+                .cancel_route_finalization_admission(self.executor, self.admission);
+        }
+    }
 }
 
 impl std::fmt::Debug for CudaExecutionProvider {
@@ -974,6 +1271,119 @@ impl std::fmt::Debug for CudaExecutionProvider {
 }
 
 impl CudaExecutionProvider {
+    fn artifact_policy(&self) -> ExecutorArtifactPolicy {
+        ExecutorArtifactPolicy::new(
+            self.artifact_provider_id,
+            self.device,
+            self.route_residency_config,
+        )
+    }
+
+    fn validate_artifact_provider(
+        &self,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+    ) -> Result<()> {
+        if provider != self.artifact_provider_id {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: executor {} artifact provider {} is foreign; expected provider {} for \
+                 device {:?}; rebuild the executor from this provider's immutable policy",
+                executor.get(),
+                provider.get(),
+                self.artifact_provider_id.get(),
+                self.device,
+            )));
+        }
+        Ok(())
+    }
+
+    fn resolved_route_residency(
+        executor: ExecutorInstanceId,
+        state: &ExecutorRouteResidencyState,
+    ) -> Result<RouteArtifactFinalization> {
+        if !state.drained && !state.boundaries.is_empty() {
+            return Ok(RouteArtifactFinalization::Required);
+        }
+        match state.outcome.as_ref() {
+            Some(RouteResidencyInstallOutcome::GateDisabled) => {
+                Ok(RouteArtifactFinalization::Disabled)
+            }
+            Some(
+                RouteResidencyInstallOutcome::OffloadDisabled
+                | RouteResidencyInstallOutcome::Rejected(_),
+            ) => Ok(RouteArtifactFinalization::Declined),
+            Some(RouteResidencyInstallOutcome::Installed { .. }) => {
+                Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} reports installed route residency without a live \
+                     owner-scoped request boundary; rebuild the executor",
+                    executor.get()
+                )))
+            }
+            None => Err(EpError::KernelFailed(format!(
+                "cuda_ep: executor {} completed route-residency finalization without a terminal \
+                 disabled, declined, or required outcome",
+                executor.get()
+            ))),
+        }
+    }
+
+    fn lock_route_executors(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<ExecutorInstanceId, ExecutorRouteResidencyState>> {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        self.route_state_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        self.route_executors
+            .lock()
+            .expect("cuda_ep route-residency executors poisoned")
+    }
+
+    #[cfg(any(test, feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub fn route_state_lock_acquisition_count(&self) -> u64 {
+        self.route_state_lock_acquisitions.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub fn route_request_boundary_call_count(&self) -> u64 {
+        self.route_request_boundary_calls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub fn fail_next_allocation_after_required_artifact_report_for_test(&self) {
+        self.fail_allocation_after_required_report
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    #[doc(hidden)]
+    pub fn install_route_prepare_commit_interlock_for_test(
+        &self,
+        interlock: Arc<RoutePrepareCommitInterlock>,
+    ) {
+        *self
+            .route_prepare_commit_interlock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(interlock);
+    }
+
+    #[cfg(not(feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub fn install_route_prepare_commit_interlock_for_test(
+        &self,
+        interlock: Arc<RoutePrepareCommitInterlock>,
+    ) {
+        let _ = interlock;
+    }
+
+    #[cfg(any(test, feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub fn test_acquire_route_state_lock(&self) {
+        drop(self.lock_route_executors());
+    }
+
     /// Construct a CUDA EP bound to `CUDA:ordinal` with the Phase-2a kernels
     /// registered. Fails if the device or CUDA libraries are unavailable.
     pub fn new(ordinal: u32) -> Result<Self> {
@@ -990,7 +1400,13 @@ impl CudaExecutionProvider {
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
     ) -> Result<Self> {
-        Self::new_with_policy_governor_and_manager(ordinal, offload_policy, None, None)
+        Self::new_with_policy_governor_manager_and_route_config(
+            ordinal,
+            offload_policy,
+            None,
+            None,
+            Self::route_residency_config_from_env(),
+        )
     }
 
     /// Construct a CUDA EP with the device authority available before the
@@ -1000,7 +1416,13 @@ impl CudaExecutionProvider {
         offload_policy: DeviceOffloadPolicy,
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
     ) -> Result<Self> {
-        Self::new_with_policy_governor_and_manager(ordinal, offload_policy, Some(governor), None)
+        Self::new_with_policy_governor_manager_and_route_config(
+            ordinal,
+            offload_policy,
+            Some(governor),
+            None,
+            Self::route_residency_config_from_env(),
+        )
     }
 
     /// Construct with a caller-owned process manager shared by sessions/devices.
@@ -1010,19 +1432,49 @@ impl CudaExecutionProvider {
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
         manager: ProcessMemoryManager,
     ) -> Result<Self> {
-        Self::new_with_policy_governor_and_manager(
+        Self::new_with_policy_governor_manager_and_route_config(
             ordinal,
             offload_policy,
             Some(governor),
             Some(manager),
+            Self::route_residency_config_from_env(),
         )
     }
 
-    fn new_with_policy_governor_and_manager(
+    /// Construct with an explicit immutable route-residency configuration.
+    ///
+    /// This is the non-environment construction path for embedding hosts and
+    /// tests that create sibling provider/executor generations with distinct
+    /// configurations.
+    pub fn new_with_offload_policy_governor_and_route_config(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+        route_residency_config: ExecutorRouteResidencyConfig,
+    ) -> Result<Self> {
+        Self::new_with_policy_governor_manager_and_route_config(
+            ordinal,
+            offload_policy,
+            Some(governor),
+            None,
+            route_residency_config,
+        )
+    }
+
+    fn route_residency_config_from_env() -> ExecutorRouteResidencyConfig {
+        if crate::coarse_residency::coarse_residency_profile_enabled() {
+            ExecutorRouteResidencyConfig::Enabled
+        } else {
+            ExecutorRouteResidencyConfig::Disabled
+        }
+    }
+
+    fn new_with_policy_governor_manager_and_route_config(
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
         governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
         manager: Option<ProcessMemoryManager>,
+        route_residency_config: ExecutorRouteResidencyConfig,
     ) -> Result<Self> {
         validate_offload_policy(&offload_policy)?;
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
@@ -1035,7 +1487,15 @@ impl CudaExecutionProvider {
             Some(governor) => CsaMetrics::with_governor(Arc::clone(governor)),
             None => CsaMetrics::default(),
         });
-        let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
+        let artifact_provider_id = issue_artifact_provider_id()?;
+        let route_telemetry_registry = Arc::new(
+            crate::kernels::qmoe::RouteTelemetrySourceRegistry::new(route_residency_config),
+        );
+        let registry = build_cuda_registry_with_metrics(
+            runtime.clone(),
+            csa_metrics.clone(),
+            Arc::clone(&route_telemetry_registry),
+        );
         let auto_dynamic_lending = auto_dynamic_lending_for(
             governor.is_some(),
             &offload_policy,
@@ -1209,8 +1669,24 @@ impl CudaExecutionProvider {
             retired_memory_mechanisms: Vec::new(),
             retired_allocator_teardown: Vec::new(),
             release_queue,
-            route_boundary: Mutex::new(None),
+            route_residency_config,
+            artifact_provider_id,
+            route_executors: Mutex::new(HashMap::new()),
+            route_retirements: Mutex::new(HashMap::new()),
+            next_route_finalization_admission: AtomicU64::new(1),
+            route_finalization_rollbacks: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "gpu-tests"))]
+            route_state_lock_acquisitions: AtomicU64::new(0),
+            #[cfg(any(test, feature = "gpu-tests"))]
+            route_request_boundary_calls: AtomicU64::new(0),
+            #[cfg(any(test, feature = "gpu-tests"))]
+            fail_allocation_after_required_report: AtomicBool::new(false),
+            #[cfg(any(test, feature = "gpu-tests"))]
+            fail_next_allocation: AtomicBool::new(false),
+            #[cfg(feature = "gpu-tests")]
+            route_prepare_commit_interlock: Mutex::new(None),
             route_diag: Arc::new(RouteResidencyDiagnostics::default()),
+            route_telemetry_registry,
         };
         if let Some(residency) = provider.residency.as_ref() {
             residency
@@ -1740,6 +2216,22 @@ impl CudaExecutionProvider {
         Ok(provider)
     }
 
+    pub fn initialized_with_offload_policy_governor_and_route_config(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+        route_residency_config: ExecutorRouteResidencyConfig,
+    ) -> Result<Self> {
+        let mut provider = Self::new_with_offload_policy_governor_and_route_config(
+            ordinal,
+            offload_policy,
+            governor,
+            route_residency_config,
+        )?;
+        <Self as ExecutionProvider>::initialize(&mut provider, &EpConfig::default())?;
+        Ok(provider)
+    }
+
     pub fn initialized_with_offload_policy_governor_and_manager(
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
@@ -1778,6 +2270,31 @@ impl CudaExecutionProvider {
         &self.runtime
     }
 
+    fn create_registered_kernel(
+        &self,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> Result<Box<dyn Kernel>> {
+        let factory = self
+            .registry
+            .lookup(&op.op_type, &op.domain, opset)
+            .ok_or_else(|| EpError::NoEpForOp {
+                domain: if op.domain.is_empty() {
+                    "ai.onnx".to_string()
+                } else {
+                    op.domain.clone()
+                },
+                op_type: op.op_type.clone(),
+                opset,
+            })?;
+        let mut versioned = op.clone();
+        if versioned.version.is_none() {
+            versioned.version = i64::try_from(opset).ok();
+        }
+        factory.create(&versioned, shapes)
+    }
+
     /// Borrow the shared CSA observability surface (§8). Every CSA kernel this
     /// EP builds records per-layer attention mode, bytes avoided, cursor
     /// lengths, sink mass, and host/device byte counts here; speculative
@@ -1786,20 +2303,34 @@ impl CudaExecutionProvider {
         &self.csa_metrics
     }
 
-    /// Install the Slice-7C route-residency boundary binding for this EP.
+    /// Install an unscoped Slice-7C route-residency test binding.
     ///
     /// Once installed, the coarse safe-boundary consumer (driven from
-    /// [`ExecutionProvider::consume_route_residency_at_boundary`] at
+    /// [`ExecutionProvider::consume_route_residency_at_boundary_for_executor`] at
     /// `Executor::finish_device_validation`) will, *when the default-off gate is
     /// enabled*, snapshot → consume → reset this bank's window exactly once per
-    /// request boundary. Production has no live per-session registration yet, so
-    /// this is `#[doc(hidden)]` and used only by the Slice-7C wiring tests.
+    /// request boundary. Production uses executor-scoped finalization instead;
+    /// this is `#[doc(hidden)]` and retained only for Slice-7C wiring tests.
+    #[cfg(any(test, feature = "gpu-tests"))]
     #[doc(hidden)]
     pub fn install_route_residency_boundary(&self, boundary: Arc<RouteResidencyBoundary>) {
-        *self
-            .route_boundary
+        self.install_route_residency_boundaries_for_executor(
+            ExecutorInstanceId::UNSCOPED,
+            vec![boundary],
+        );
+    }
+
+    fn install_route_residency_boundaries_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        boundaries: Vec<Arc<RouteResidencyBoundary>>,
+    ) {
+        self.route_executors
             .lock()
-            .expect("cuda_ep route-residency boundary poisoned") = Some(boundary);
+            .expect("cuda_ep route-residency executors poisoned")
+            .entry(executor)
+            .or_default()
+            .boundaries = boundaries;
     }
 
     /// The typed reason/outcome surface for every route-residency boundary this
@@ -1809,9 +2340,551 @@ impl CudaExecutionProvider {
         &self.route_diag
     }
 
+    /// The EP-owned live route-telemetry producer sources for one executor,
+    /// keyed by call-site `NodeId` (issue #1810 Slice 7E).
+    ///
+    /// These are the *actual executing* [`QMoEKernel`](crate::kernels::qmoe::QMoEKernel)
+    /// instances the session's `KernelCache` runs — populated as those kernels
+    /// are created (the eager `compile_all` pre-warm registers them before decode
+    /// capture) — exposed as [`RouteTelemetrySource`] trait objects. This is the
+    /// real producer half the route-residency binding builder needs: it removes
+    /// the Slice-7D limitation that route telemetry sources were session/cache
+    /// owned rather than EP owned. Empty for a model with no `QMoE` nodes and on
+    /// the default-off path (nothing is armed until a binding installs).
+    ///
+    /// [`RouteTelemetrySource`]: crate::route_residency::RouteTelemetrySource
+    pub fn route_telemetry_sources(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> std::collections::HashMap<NodeId, Arc<dyn crate::route_residency::RouteTelemetrySource>>
+    {
+        self.route_telemetry_registry.sources(executor)
+    }
+
+    /// The concrete registered `QMoE` producer for `node_id`, if any. Test and
+    /// arming access: the coarse install seam arms these before the first
+    /// boundary so the real producer accumulates the routes the consumer reads.
+    pub fn route_telemetry_producer(
+        &self,
+        executor: ExecutorInstanceId,
+        node_id: NodeId,
+    ) -> Option<Arc<crate::kernels::qmoe::QMoERouteTelemetry>> {
+        self.route_telemetry_registry.source(executor, node_id)
+    }
+
+    pub fn retained_route_residency_artifacts(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Option<Arc<Vec<ExpertWeightGroup>>> {
+        self.lock_route_executors()
+            .get(&executor)
+            .and_then(|state| state.retained_artifacts.clone())
+    }
+
+    pub fn route_residency_executor_status(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> RouteResidencyExecutorStatus {
+        let states = self
+            .route_executors
+            .lock()
+            .expect("cuda_ep route-residency executors poisoned");
+        if let Some(state) = states.get(&executor) {
+            return RouteResidencyExecutorStatus {
+                finalization_attempts: state.finalization_attempts,
+                readiness_epoch: state.readiness_epoch,
+                pending: state.pending.clone(),
+                drain_calls: state.drain_calls,
+                drained: state.drained,
+                outcome: state.outcome.clone(),
+                producer_nodes: self.route_telemetry_registry.len(executor),
+                retained_banks: state
+                    .retained_artifacts
+                    .as_ref()
+                    .map_or(0, |artifacts| artifacts.len()),
+                reservation_generation: state.reservation_generation,
+                reservation_removals: state.reservation_removals,
+            };
+        }
+        drop(states);
+        let retired = self.retired_route_reservation(executor);
+        let (retiring, fully_retired) = retired
+            .as_ref()
+            .map_or((false, false), |health| health.retirement_status());
+        RouteResidencyExecutorStatus {
+            finalization_attempts: 0,
+            readiness_epoch: None,
+            pending: None,
+            drain_calls: u64::from(retiring || fully_retired),
+            drained: retiring || fully_retired,
+            outcome: None,
+            producer_nodes: 0,
+            retained_banks: 0,
+            reservation_generation: retired.as_ref().and_then(|health| health.generation()),
+            reservation_removals: u64::from(fully_retired),
+        }
+    }
+
+    #[cfg(any(test, feature = "gpu-tests"))]
+    pub fn executor_artifact_generation_claims(
+        &self,
+    ) -> Vec<(ExecutorInstanceId, ExecutorArtifactGeneration)> {
+        self.route_telemetry_registry.claimed_generations()
+    }
+
+    #[cfg(any(test, feature = "gpu-tests"))]
+    pub fn retired_executor_artifact_generations(
+        &self,
+    ) -> Vec<(ExecutorInstanceId, ExecutorArtifactGeneration)> {
+        self.route_telemetry_registry.retired_generations()
+    }
+
+    fn retired_route_reservation(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Option<Arc<crate::weight_paging::RouteReservationHealth>> {
+        let mut retirements = self
+            .route_retirements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retirements.retain(|_, health| health.strong_count() != 0);
+        retirements.get(&executor).and_then(Weak::upgrade)
+    }
+
+    pub fn route_residency_retirement_census(&self) -> RouteResidencyRetirementCensus {
+        let active_registry_entries = self
+            .route_executors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        let (retirement_registry_entries, live_retirement_records) = {
+            let mut retirements = self
+                .route_retirements
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            retirements.retain(|_, health| health.strong_count() != 0);
+            let live = retirements
+                .values()
+                .filter(|health| health.upgrade().is_some())
+                .count();
+            (retirements.len(), live)
+        };
+        let (reservation_registry_entries, stats) = self.residency.as_ref().map_or(
+            (0, RouteReservationRetirementStats::default()),
+            |residency| {
+                (
+                    residency.route_reservation_count(),
+                    residency.route_reservation_retirement_stats(),
+                )
+            },
+        );
+        RouteResidencyRetirementCensus {
+            active_registry_entries,
+            retirement_registry_entries,
+            live_retirement_records,
+            reservation_registry_entries,
+            retirements_started: stats.retirements_started,
+            deferred_cleanups: stats.deferred_cleanups,
+            cleanups_scheduled: stats.cleanups_scheduled,
+            cleanups_executed: stats.cleanups_executed,
+            prepared_rollbacks: self.route_finalization_rollbacks.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn route_residency_scopes(&self) -> Vec<ExecutorInstanceId> {
+        let mut scopes: Vec<_> = self
+            .route_executors
+            .lock()
+            .expect("cuda_ep route-residency executors poisoned")
+            .iter()
+            .filter_map(|(executor, state)| {
+                (!state.drained
+                    && matches!(
+                        state.outcome,
+                        Some(RouteResidencyInstallOutcome::Installed { .. })
+                    ))
+                .then_some(*executor)
+            })
+            .collect();
+        scopes.sort_unstable_by_key(|scope| scope.get());
+        scopes
+    }
+
+    fn next_route_finalization_admission(&self) -> Result<u64> {
+        self.next_route_finalization_admission
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: route-residency finalization admission identity exhausted"
+                        .to_string(),
+                )
+            })
+    }
+
+    fn cancel_route_finalization_admission(
+        &self,
+        executor: ExecutorInstanceId,
+        admission: RouteFinalizationAdmission,
+    ) {
+        let _retirements = self
+            .route_retirements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut states = self
+            .route_executors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove = states.get_mut(&executor).is_some_and(|state| {
+            if state.finalization_admission != Some(admission) {
+                return false;
+            }
+            state.finalization_admission = None;
+            state.drained
+        });
+        if remove {
+            states.remove(&executor);
+        }
+    }
+
+    fn prepare_route_residency_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        artifact_generation: ExecutorArtifactGeneration,
+        graph: &Graph,
+        finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
+    ) -> PreparedRouteFinalization {
+        let Some(residency) = self.residency.as_ref() else {
+            return PreparedRouteFinalization::Complete(
+                RouteResidencyInstallOutcome::OffloadDisabled,
+            );
+        };
+
+        let discovered = onnx_runtime_ep_api::expert_weight_groups(graph);
+        if discovered.is_empty() {
+            return PreparedRouteFinalization::Complete(RouteResidencyInstallOutcome::Rejected(
+                RouteResidencyBindingReject::NoExpertGroups,
+            ));
+        }
+        if let Some(group) = discovered
+            .iter()
+            .find(|group| group.boundary != onnx_runtime_ep_api::LazyWeightBoundary::QMoe)
+        {
+            return PreparedRouteFinalization::Complete(RouteResidencyInstallOutcome::Rejected(
+                RouteResidencyBindingReject::UnsupportedBoundary {
+                    node: group.node,
+                    boundary: group.boundary,
+                },
+            ));
+        }
+
+        let sources = self.route_telemetry_sources(executor);
+        let groups = match crate::route_residency::validate_route_residency_bindings(
+            graph,
+            |node| sources.contains_key(&node),
+            |_value| true,
+            |_value| true,
+        ) {
+            Ok(groups) => groups,
+            Err(RouteResidencyBindingReject::NoTelemetrySource { node }) => {
+                return PreparedRouteFinalization::Pending(
+                    ExecutorArtifactPending::ProducerUnavailable { node },
+                );
+            }
+            Err(reject) => {
+                return PreparedRouteFinalization::Complete(
+                    RouteResidencyInstallOutcome::Rejected(reject),
+                );
+            }
+        };
+
+        let expected_request = match u32::try_from(executor.get()) {
+            Ok(request) => request,
+            Err(_) => {
+                return PreparedRouteFinalization::Complete(
+                    RouteResidencyInstallOutcome::Rejected(
+                        RouteResidencyBindingReject::RequestIdentityOutOfRange {
+                            executor: executor.get(),
+                        },
+                    ),
+                );
+            }
+        };
+        let banks = groups.iter().map(|group| group.members.len()).sum();
+        let authorities = match residency.install_route_bank_reservations(
+            self.artifact_provider_id,
+            executor,
+            artifact_generation,
+            finalized_banks,
+            self.device.index as i32,
+        ) {
+            Ok(authorities) => authorities,
+            Err(error) => {
+                return PreparedRouteFinalization::Complete(
+                    RouteResidencyInstallOutcome::Rejected(
+                        RouteResidencyBindingReject::Reservation(error),
+                    ),
+                );
+            }
+        };
+
+        let mut prepared = PreparedRouteResidencyInstallation {
+            executor,
+            residency: Arc::clone(residency),
+            groups,
+            boundaries: Vec::new(),
+            armed_sources: Vec::new(),
+            health: Some(Arc::clone(&authorities.health)),
+            rollback_counter: Arc::clone(&self.route_finalization_rollbacks),
+            banks,
+            committed: false,
+        };
+        for group in &prepared.groups {
+            let Some(source) = self.route_telemetry_registry.source(executor, group.node) else {
+                return PreparedRouteFinalization::Pending(
+                    ExecutorArtifactPending::ProducerUnavailable { node: group.node },
+                );
+            };
+            let experts = group
+                .members
+                .first()
+                .and_then(|value| authorities.catalogs.get(value))
+                .map_or(0, |catalog| catalog.layout().experts);
+            let config = crate::kernels::expert_route_telemetry::RouteTelemetryConfig {
+                request_id: expected_request,
+                device_id: self.device.index,
+                num_experts: experts,
+                routes_per_row: source.routes_per_row(),
+            };
+            if let Err(error) = source.arm_route_telemetry(config) {
+                return PreparedRouteFinalization::Complete(
+                    RouteResidencyInstallOutcome::Rejected(
+                        RouteResidencyBindingReject::TelemetryUnsupported {
+                            node: group.node,
+                            reason: error.to_string(),
+                        },
+                    ),
+                );
+            }
+            prepared.armed_sources.push(source);
+        }
+
+        prepared.boundaries = match build_route_residency_boundaries(
+            graph,
+            Arc::clone(residency),
+            &sources,
+            &authorities.catalogs,
+            &authorities.allocators,
+            Arc::clone(&authorities.health),
+            authorities.device_pool,
+            authorities.host_pool,
+            1,
+            self.device.index as i32,
+            expected_request,
+            self.device.index,
+            1,
+        ) {
+            Ok(boundaries) => boundaries,
+            Err(reject) => {
+                return PreparedRouteFinalization::Complete(
+                    RouteResidencyInstallOutcome::Rejected(reject),
+                );
+            }
+        };
+        PreparedRouteFinalization::Installed(prepared)
+    }
+
+    /// Finalize one executor's real QMoE route-residency artifacts.
+    ///
+    /// `NoTelemetrySource` is readiness-dependent and returns `Pending` without
+    /// recording or latching a decline only for boundary kinds whose producer
+    /// can be published by a later resolved compilation. Unsupported producer
+    /// kinds are structural, terminal declines. Every structural outcome is
+    /// idempotent. The shipped default-off path returns before touching the
+    /// executor-state map.
+    pub(crate) fn finalize_route_residency_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        artifact_generation: ExecutorArtifactGeneration,
+        graph: &Graph,
+        readiness: ExecutorArtifactReadinessEpoch,
+        finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
+    ) -> Result<RouteArtifactFinalization> {
+        self.finalize_route_residency_for_executor_impl(
+            executor,
+            artifact_generation,
+            graph,
+            readiness,
+            finalized_banks,
+        )
+    }
+
+    fn finalize_route_residency_for_executor_impl(
+        &self,
+        executor: ExecutorInstanceId,
+        artifact_generation: ExecutorArtifactGeneration,
+        graph: &Graph,
+        readiness: ExecutorArtifactReadinessEpoch,
+        finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
+    ) -> Result<RouteArtifactFinalization> {
+        if self.route_residency_config == ExecutorRouteResidencyConfig::Disabled {
+            return Ok(RouteArtifactFinalization::Disabled);
+        }
+
+        let admission = {
+            let mut retirements = self
+                .route_retirements
+                .lock()
+                .expect("cuda_ep route-residency retirements poisoned");
+            retirements.retain(|_, health| health.strong_count() != 0);
+            if let Some(health) = retirements.get(&executor).and_then(Weak::upgrade) {
+                let generation = health.generation();
+                let (retiring, retired) = health.retirement_status();
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} route-bank artifact generation {:?} is {}; executor \
+                     identities cannot be reused while a baked requirement or lease still references \
+                     the retired generation",
+                    executor.get(),
+                    generation,
+                    if retired {
+                        "retired"
+                    } else if retiring {
+                        "retiring"
+                    } else {
+                        "not live"
+                    }
+                )));
+            }
+
+            let mut states = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            let state = states.entry(executor).or_default();
+            if state.drained {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} route-bank artifact authority was retired before \
+                     reservation installation completed; rebuild the executor",
+                    executor.get()
+                )));
+            }
+            if state.outcome.is_some() {
+                state.readiness_epoch = Some(readiness);
+                return Self::resolved_route_residency(executor, state);
+            }
+            if state
+                .readiness_epoch
+                .is_some_and(|attempted| attempted >= readiness)
+                && let Some(pending) = &state.pending
+            {
+                return Ok(RouteArtifactFinalization::Pending(pending.clone()));
+            }
+            if let Some(active) = state.finalization_admission {
+                return Ok(RouteArtifactFinalization::Pending(
+                    ExecutorArtifactPending::ProviderReadiness {
+                        reason: format!(
+                            "route-residency finalization admission {} is still preparing",
+                            active.token
+                        ),
+                    },
+                ));
+            }
+            let admission = RouteFinalizationAdmission {
+                token: self.next_route_finalization_admission()?,
+                readiness,
+            };
+            state.readiness_epoch = Some(readiness);
+            state.pending = None;
+            state.finalization_attempts += 1;
+            state.finalization_admission = Some(admission);
+            admission
+        };
+
+        let mut admission_guard = RouteFinalizationAdmissionGuard {
+            provider: self,
+            executor,
+            admission,
+            committed: false,
+        };
+        let prepared = self.prepare_route_residency_for_executor(
+            executor,
+            artifact_generation,
+            graph,
+            finalized_banks,
+        );
+        #[cfg(feature = "gpu-tests")]
+        if let Some(interlock) = self
+            .route_prepare_commit_interlock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            interlock.pause_before_commit();
+        }
+
+        let commit_result = {
+            let mut retirements = self
+                .route_retirements
+                .lock()
+                .expect("cuda_ep route-residency retirements poisoned");
+            retirements.retain(|_, health| health.strong_count() != 0);
+            let retired_health = retirements.get(&executor).and_then(Weak::upgrade);
+            let mut states = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            let can_commit = route_finalization_commit_is_live(
+                states.get(&executor),
+                admission,
+                retired_health.is_some(),
+            );
+            match states.get_mut(&executor) {
+                Some(state) if can_commit => {
+                    let result = match prepared {
+                        PreparedRouteFinalization::Complete(outcome) => {
+                            if let RouteResidencyInstallOutcome::Rejected(reject) = &outcome {
+                                self.route_diag.record_decline(&reject.reason());
+                            } else if matches!(
+                                outcome,
+                                RouteResidencyInstallOutcome::OffloadDisabled
+                            ) {
+                                self.route_diag
+                                    .record_decline("weight offload/coarse residency disabled");
+                            }
+                            state.outcome = Some(outcome);
+                            Self::resolved_route_residency(executor, state)?
+                        }
+                        PreparedRouteFinalization::Pending(pending) => {
+                            state.pending = Some(pending.clone());
+                            RouteArtifactFinalization::Pending(pending)
+                        }
+                        PreparedRouteFinalization::Installed(installation) => {
+                            let banks = installation.commit(state);
+                            self.route_diag.record_install(banks);
+                            RouteArtifactFinalization::Required
+                        }
+                    };
+                    state.finalization_admission = None;
+                    Ok(result)
+                }
+                _ => Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} route-residency finalization admission {} for readiness \
+                     epoch {} was invalidated before commit; prepared resources were rolled back",
+                    executor.get(),
+                    admission.token,
+                    admission.readiness.get()
+                ))),
+            }
+        };
+        if commit_result.is_ok() {
+            admission_guard.committed = true;
+        }
+        commit_result
+    }
+
     /// Construct and install a production [`RouteResidencyBoundary`] from a
-    /// loaded model graph's expert banks, if — and only if — this EP is a valid
-    /// single binding authority for one.
+    /// loaded model graph's expert banks.
     ///
     /// This is the production seam Slice 7C's caller was waiting for: it runs
     /// once, after the model's weights/catalog are fully loaded and *before*
@@ -1834,8 +2907,8 @@ impl CudaExecutionProvider {
     /// The bank identity/membership and boundary kind come entirely from
     /// property-based discovery over `graph`; `sources`/`catalogs`/`allocators`/
     /// pools are this EP's existing authorities, keyed by the discovered
-    /// node/values. The binding is single-authority per EP/request/device: a
-    /// second successful install replaces the first.
+    /// node/values. Every discovered group is validated before the unscoped
+    /// test binding is published.
     #[allow(clippy::too_many_arguments)]
     pub fn try_install_route_residency_binding(
         &self,
@@ -1868,12 +2941,13 @@ impl CudaExecutionProvider {
         };
         let device_ordinal = self.device.index as i32;
         let expected_device = self.device.index;
-        match build_route_residency_boundary(
+        match build_route_residency_boundaries(
             graph,
             Arc::clone(residency),
             sources,
-            catalogs,
-            allocators,
+            &catalogs,
+            &allocators,
+            crate::weight_paging::RouteReservationHealth::new(),
             device_pool,
             host_pool,
             1,
@@ -1882,9 +2956,15 @@ impl CudaExecutionProvider {
             expected_device,
             initial_epoch,
         ) {
-            Ok(boundary) => {
-                let banks = boundary.bank_value_count();
-                self.install_route_residency_boundary(Arc::new(boundary));
+            Ok(boundaries) => {
+                let banks = boundaries
+                    .iter()
+                    .map(RouteResidencyBoundary::bank_value_count)
+                    .sum();
+                self.install_route_residency_boundaries_for_executor(
+                    ExecutorInstanceId::UNSCOPED,
+                    boundaries.into_iter().map(Arc::new).collect(),
+                );
                 self.route_diag.record_install(banks);
                 RouteResidencyInstallOutcome::Installed { banks }
             }
@@ -1895,19 +2975,157 @@ impl CudaExecutionProvider {
         }
     }
 
-    /// Remove any installed route-residency binding, releasing the producer
-    /// source/residency/pool handles it held. Called at request/model teardown
-    /// ([`ExecutionProvider::shutdown`]); idempotent and safe when nothing is
-    /// installed (the default). After draining, the boundary consumer is inert
-    /// again until a new binding is installed.
+    /// Drain the legacy unscoped test binding.
     pub fn drain_route_residency_boundary(&self) {
-        *self
-            .route_boundary
-            .lock()
-            .expect("cuda_ep route-residency boundary poisoned") = None;
+        self.drain_route_residency_for_executor(ExecutorInstanceId::UNSCOPED);
     }
 
-    /// Test-only sibling of [`ExecutionProvider::consume_route_residency_at_boundary`]
+    #[cfg(any(test, feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub fn consume_route_residency_at_boundary(&self) -> Result<()> {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            return Ok(());
+        }
+        self.consume_route_residency_boundaries(ExecutorInstanceId::UNSCOPED)
+    }
+
+    pub fn drain_route_residency_for_executor(&self, executor: ExecutorInstanceId) {
+        enum Drain {
+            Nothing,
+            Preparing,
+            Installed {
+                health: Arc<crate::weight_paging::RouteReservationHealth>,
+                state: Box<ExecutorRouteResidencyState>,
+            },
+        }
+
+        let drain = {
+            // This mutex is the lifecycle linearization authority. Admission,
+            // commit, and retirement all take it before the live-state mutex;
+            // expensive CUDA/resource work happens only after both are released.
+            let mut retirements = self
+                .route_retirements
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            retirements.retain(|_, health| health.strong_count() != 0);
+            let mut states = self
+                .route_executors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(state) = states.get_mut(&executor) else {
+                return;
+            };
+            state.pending = None;
+            state.drained = true;
+            if let Some(health) = state.reservation_health.clone() {
+                if health.begin_retirement() != RouteReservationRetirementStart::Started {
+                    return;
+                }
+                retirements.insert(executor, Arc::downgrade(&health));
+                let state = states
+                    .remove(&executor)
+                    .expect("live route-residency state disappeared under lifecycle authority");
+                Drain::Installed {
+                    health,
+                    state: Box::new(state),
+                }
+            } else {
+                if state.finalization_admission.is_some() {
+                    Drain::Preparing
+                } else {
+                    states.remove(&executor);
+                    Drain::Nothing
+                }
+            }
+        };
+        self.route_telemetry_registry.remove(executor);
+        let Drain::Installed { health, mut state } = drain else {
+            return;
+        };
+
+        let Some(residency) = self.residency.as_ref().map(Arc::clone) else {
+            health.mark_unusable(
+                "installed route-bank reservation lost its residency owner during retirement"
+                    .to_string(),
+            );
+            return;
+        };
+        let (reservation_count, bytes) = residency
+            .route_reservation_resource_stats(executor)
+            .unwrap_or_default();
+        if reservation_count == 0 {
+            health.mark_unusable(
+                "installed route-bank reservation lost its mapped ownership during retirement"
+                    .to_string(),
+            );
+        }
+        let cleanup = RouteReservationRetirementSubmission {
+            queue: Arc::clone(&self.release_queue),
+            action: RouteReservationRetirementAction {
+                executor,
+                generation: health.generation(),
+                boundaries: std::mem::take(&mut state.boundaries),
+                armed_sources: std::mem::take(&mut state.armed_sources),
+                residency,
+                reservation_count,
+                bytes,
+                health: Arc::downgrade(&health),
+            },
+        };
+        health.install_retirement_cleanup(Box::new(cleanup));
+    }
+
+    fn drain_all_route_residency(&self) {
+        let executors: Vec<_> = self
+            .route_executors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        for executor in executors {
+            self.drain_route_residency_for_executor(executor);
+        }
+        self.route_telemetry_registry.clear();
+    }
+
+    fn consume_route_residency_for_executor(&self, executor: ExecutorInstanceId) -> Result<()> {
+        if self.route_residency_config == ExecutorRouteResidencyConfig::Disabled {
+            return Ok(());
+        }
+        self.consume_route_residency_boundaries(executor)
+    }
+
+    fn consume_route_residency_boundaries(&self, executor: ExecutorInstanceId) -> Result<()> {
+        let boundaries = {
+            let states = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            let Some(state) = states.get(&executor) else {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} has a resolved route-residency requirement but no live \
+                     owner-scoped boundary; rebuild the executor",
+                    executor.get()
+                )));
+            };
+            if state.drained || state.boundaries.is_empty() {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} has a resolved route-residency requirement but no live \
+                     owner-scoped boundary; rebuild the executor",
+                    executor.get()
+                )));
+            }
+            state.boundaries.clone()
+        };
+        for boundary in boundaries {
+            crate::route_residency::run_route_residency_boundary(&boundary, &self.route_diag)?;
+        }
+        Ok(())
+    }
+
+    /// Test-only sibling of
+    /// [`ExecutionProvider::consume_route_residency_at_boundary_for_executor`]
     /// that drives the installed boundary through the phase-8 driver-fault
     /// consumer, so a deterministic unmap/map fault proves the *caller-driven*
     /// transition rolls back range-precisely and quarantines like a real driver
@@ -1926,11 +3144,11 @@ impl CudaExecutionProvider {
             return Ok(());
         }
         let boundary = {
-            let guard = self
-                .route_boundary
-                .lock()
-                .expect("cuda_ep route-residency boundary poisoned");
-            match guard.as_ref() {
+            let guard = self.lock_route_executors();
+            match guard
+                .get(&ExecutorInstanceId::UNSCOPED)
+                .and_then(|state| state.boundaries.first())
+            {
                 Some(boundary) => Arc::clone(boundary),
                 None => return Ok(()),
             }
@@ -1940,6 +3158,76 @@ impl CudaExecutionProvider {
             &boundary,
             &self.route_diag,
             phase8_faults,
+        )
+    }
+
+    #[cfg(any(test, feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub fn consume_route_residency_at_boundary_with_phase8_faults_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        phase8_faults: std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>,
+        >,
+    ) -> Result<()> {
+        if self.route_residency_config == ExecutorRouteResidencyConfig::Disabled {
+            return Ok(());
+        }
+        let boundary = {
+            let guard = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            match guard
+                .get(&executor)
+                .and_then(|state| state.boundaries.first())
+            {
+                Some(boundary) => Arc::clone(boundary),
+                None => return Ok(()),
+            }
+        };
+        crate::route_residency::run_route_residency_boundary_with_phase8_faults(
+            &self.runtime,
+            &boundary,
+            &self.route_diag,
+            phase8_faults,
+        )
+    }
+
+    #[cfg(any(test, feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub fn consume_route_residency_with_rollback_interlock_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        phase8_faults: std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>,
+        >,
+        rollback_interlock: Arc<crate::coarse_residency::RollbackSafePointInterlock>,
+    ) -> Result<()> {
+        if self.route_residency_config == ExecutorRouteResidencyConfig::Disabled {
+            return Ok(());
+        }
+        let boundary = {
+            let guard = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            match guard
+                .get(&executor)
+                .and_then(|state| state.boundaries.first())
+            {
+                Some(boundary) => Arc::clone(boundary),
+                None => return Ok(()),
+            }
+        };
+        crate::route_residency::run_route_residency_boundary_with_rollback_interlock(
+            &self.runtime,
+            &boundary,
+            &self.route_diag,
+            phase8_faults,
+            rollback_interlock,
         )
     }
 
@@ -2570,6 +3858,25 @@ impl ExecutionProvider for CudaExecutionProvider {
         )))
     }
 
+    fn page_lazy_weight_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn onnx_runtime_ep_api::MmapRegionSource,
+    ) -> Result<Option<PagedWeight>> {
+        if let Some(residency) = self.residency.as_ref()
+            && let Some(page) = residency
+                .route_weight_page(executor, key, weight, self.device)
+                .map_err(|error| {
+                    EpError::KernelFailed(format!("routed bank page binding: {error}"))
+                })?
+        {
+            return Ok(Some(page));
+        }
+        self.page_lazy_weight(key, weight, source)
+    }
+
     /// Mint a routed-residency guard for a QMoE-family dispatch. Returns
     /// `Ok(None)` when offload is disabled (nothing pages lazily, so nothing
     /// needs a guard against a resize the executor's default path never
@@ -2589,6 +3896,46 @@ impl ExecutionProvider for CudaExecutionProvider {
             return Ok(None);
         };
         let guard = residency.acquire_routed_residency(requirement, catalog);
+        Ok(Some(Box::new(guard)
+            as Box<
+                dyn onnx_runtime_ep_api::RoutedResidencyGuardHandle,
+            >))
+    }
+
+    fn acquire_routed_residency_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        key: u64,
+        requirement: onnx_runtime_ep_api::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    ) -> Result<Option<Box<dyn onnx_runtime_ep_api::RoutedResidencyGuardHandle>>> {
+        let Some(residency) = self.residency.as_ref() else {
+            return Ok(None);
+        };
+        let Ok(value) = u32::try_from(key) else {
+            return Err(EpError::KernelFailed(format!(
+                "routed residency key {key} does not fit ValueId"
+            )));
+        };
+        let Some(health) = residency.route_reservation_health(executor, ValueId(value)) else {
+            return self.acquire_routed_residency(key, requirement, catalog);
+        };
+        let guard = residency
+            .acquire_route_reservation_use(
+                executor,
+                self.device.index,
+                requirement,
+                catalog,
+                health,
+            )
+            .map_err(|reason| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} CUDA:{} cannot acquire route-bank dispatch lease for \
+                     value {value}: {reason}",
+                    executor.get(),
+                    self.device.index
+                ))
+            })?;
         Ok(Some(Box::new(guard)
             as Box<
                 dyn onnx_runtime_ep_api::RoutedResidencyGuardHandle,
@@ -2626,6 +3973,24 @@ impl ExecutionProvider for CudaExecutionProvider {
             .map_err(|error| EpError::KernelFailed(format!("weight prefetch: {error}")))
     }
 
+    fn prefetch_lazy_weight_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn onnx_runtime_ep_api::MmapRegionSource,
+    ) -> Result<bool> {
+        if let Some(residency) = self.residency.as_ref()
+            && let Ok(value) = u32::try_from(key)
+            && residency
+                .coarse_route_bank_reservation(executor, ValueId(value))
+                .is_some()
+        {
+            return Ok(false);
+        }
+        self.prefetch_lazy_weight(key, weight, source)
+    }
+
     fn initialize(&mut self, _config: &EpConfig) -> Result<()> {
         // The context, stream, and cuBLASLt handle are created eagerly in
         // `new`; binding here confirms the device is reachable on this thread.
@@ -2657,7 +4022,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         // Drain any installed route-residency binding first, so the boundary
         // consumer is inert during teardown and the producer source/residency
         // handles it held are released before residency retirement.
-        self.drain_route_residency_boundary();
+        self.drain_all_route_residency();
         // Retire residency so every page it holds enqueues its release behind
         // the stream fences recorded at this moment. Releases already accepted
         // finish afterwards, because the queue's worker, the binding's
@@ -2942,23 +4307,48 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>> {
-        let factory = self
-            .registry
-            .lookup(&op.op_type, &op.domain, opset)
-            .ok_or_else(|| EpError::NoEpForOp {
-                domain: if op.domain.is_empty() {
-                    "ai.onnx".to_string()
+        if self.executor_kernel_scope(op) == ExecutorKernelScope::Required {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: {}::{} requires a session-owned executor lifecycle because route \
+                 residency is enabled; compile it through an onnx-runtime-session executor so all \
+                 kernels use the same provider generation",
+                if op.domain.is_empty() {
+                    "ai.onnx"
                 } else {
-                    op.domain.clone()
+                    &op.domain
                 },
-                op_type: op.op_type.clone(),
-                opset,
-            })?;
-        let mut versioned = op.clone();
-        if versioned.version.is_none() {
-            versioned.version = i64::try_from(opset).ok();
+                op.op_type,
+            )));
         }
-        factory.create(&versioned, shapes)
+        self.create_registered_kernel(op, shapes, opset)
+    }
+
+    fn get_kernel_for_executor(
+        &self,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> Result<Box<dyn Kernel>> {
+        self.validate_artifact_provider(provider, executor)?;
+        self.route_telemetry_registry
+            .with_executor_scope(executor, generation, || {
+                self.create_registered_kernel(op, shapes, opset)
+            })?
+    }
+
+    fn executor_kernel_scope(&self, op: &Node) -> ExecutorKernelScope {
+        if self.route_residency_config == ExecutorRouteResidencyConfig::Enabled
+            && onnx_runtime_ep_api::LazyWeightBoundary::for_op(&op.domain, &op.op_type).is_some_and(
+                |boundary| boundary.route_telemetry_producer_may_appear_after_compilation(),
+            )
+        {
+            ExecutorKernelScope::Required
+        } else {
+            ExecutorKernelScope::Unscoped
+        }
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
@@ -2966,6 +4356,13 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        if self.fail_next_allocation.swap(false, Ordering::AcqRel) {
+            return Err(EpError::OutOfMemory {
+                requested: size,
+                available: 0,
+            });
+        }
         if dynamic_lending_enabled()
             && let Some(arena) = self.managed_vmm()
             && let Some(governor) = self.governor.as_deref()
@@ -3932,28 +5329,126 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     /// Slice-7C: the coarse safe-boundary route-telemetry consumer, called once
     /// per top-level request from `Executor::finish_device_validation` (after
-    /// `sync()`, past capture/replay). Default-off and byte-identical: when the
-    /// gate is disabled — the shipped default — this is a single env read with
-    /// no lock, no snapshot, no allocation, no launch, and no telemetry reset.
-    /// When enabled but no boundary binding is installed (production today) it
-    /// is a lock + `None` check. Only when a binding is installed (the Slice-7C
-    /// tests) does it drive snapshot → consume → reset exactly once, recording
-    /// the typed outcome in [`route_residency_diagnostics`](Self::route_residency_diagnostics).
-    fn consume_route_residency_at_boundary(&self) -> Result<()> {
-        if !crate::coarse_residency::coarse_residency_profile_enabled() {
-            return Ok(());
+    /// `sync()`, past capture/replay). Artifact finalization resolves whether
+    /// this exact executor owns a boundary; disabled and declined executors
+    /// never call this method. A required call must find the owner-scoped
+    /// boundary and drives snapshot → consume → reset exactly once, recording
+    /// the typed outcome in
+    /// [`route_residency_diagnostics`](Self::route_residency_diagnostics).
+    fn consume_route_residency_at_boundary_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Result<()> {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        self.route_request_boundary_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.consume_route_residency_for_executor(executor)
+    }
+
+    fn executor_artifact_policy(&self) -> Result<ExecutorArtifactPolicy> {
+        Ok(self.artifact_policy())
+    }
+
+    fn inspect_executor_artifacts(
+        &self,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        readiness: ExecutorArtifactReadinessEpoch,
+        graph: &Graph,
+        banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
+    ) -> Result<ExecutorArtifactReport> {
+        self.validate_artifact_provider(provider, executor)?;
+        let outcome =
+            self.route_telemetry_registry
+                .with_executor_scope(executor, generation, || {
+                    self.finalize_route_residency_for_executor(
+                        executor, generation, graph, readiness, banks,
+                    )
+                })??;
+        #[cfg(any(test, feature = "gpu-tests"))]
+        if matches!(outcome, RouteArtifactFinalization::Required)
+            && self
+                .fail_allocation_after_required_report
+                .swap(false, Ordering::AcqRel)
+        {
+            self.fail_next_allocation.store(true, Ordering::Release);
         }
-        let boundary = {
-            let guard = self
-                .route_boundary
+        Ok(ExecutorArtifactReport::observed(
+            provider,
+            executor,
+            generation,
+            readiness,
+            match outcome {
+                RouteArtifactFinalization::Disabled => ExecutorArtifactState::Disabled,
+                RouteArtifactFinalization::Declined => ExecutorArtifactState::Declined,
+                RouteArtifactFinalization::Required => ExecutorArtifactState::Required,
+                RouteArtifactFinalization::Pending(pending) => {
+                    ExecutorArtifactState::Pending(pending)
+                }
+            },
+        ))
+    }
+
+    fn executor_artifact_requirement(
+        &self,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+    ) -> Result<Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>> {
+        self.validate_artifact_provider(provider, executor)?;
+        let active = {
+            let states = self
+                .route_executors
                 .lock()
-                .expect("cuda_ep route-residency boundary poisoned");
-            match guard.as_ref() {
-                Some(boundary) => Arc::clone(boundary),
-                None => return Ok(()),
-            }
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            states.get(&executor).and_then(|state| {
+                matches!(
+                    state.outcome,
+                    Some(RouteResidencyInstallOutcome::Installed { .. })
+                )
+                .then(|| state.reservation_health.clone())
+                .flatten()
+            })
         };
-        crate::route_residency::run_route_residency_boundary(&boundary, &self.route_diag)
+        let health = match active {
+            Some(health) => health,
+            None => match self.retired_route_reservation(executor) {
+                Some(health) => health,
+                None => return Ok(None),
+            },
+        };
+        health
+            .validate_artifact_scope(provider, executor, generation, self.device.index)
+            .map_err(|reason| EpError::KernelFailed(format!(
+                "cuda_ep: executor {} generation {} route-bank requirement is foreign or stale: \
+                 {reason}",
+                executor.get(),
+                generation.get(),
+            )))?;
+        health.requirement_state().map(Some).map_err(|reason| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: executor {} generation {} route-bank requirement is invalid: {reason}",
+                executor.get(),
+                generation.get(),
+            ))
+        })
+    }
+
+    fn drain_executor_artifacts(
+        &self,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+    ) -> Result<()> {
+        self.validate_artifact_provider(provider, executor)?;
+        self.route_telemetry_registry
+            .retire_scope(executor, generation, |newly_retired| {
+                if newly_retired {
+                    self.drain_route_residency_for_executor(executor);
+                }
+            })?;
+        Ok(())
     }
 
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
@@ -4177,6 +5672,7 @@ impl Drop for CudaExecutionProvider {
         // releases before provider teardown retires the allocator.
         let _ = self.runtime.reset_graph();
         let _ = self.runtime.reset_graph_in(DeviceGraphSlot::Verify);
+        self.drain_all_route_residency();
         // Residency is retired first so its pages can still enqueue, then the
         // queue is closed: nothing else can reach this provider afterwards.
         self.retire_residency();
@@ -4200,6 +5696,47 @@ mod tests {
 
     use crate::error::driver_err;
     use crate::test_support::EnvVarGuard;
+
+    #[test]
+    fn paused_finalizer_cannot_publish_after_retirement_or_admission_replacement() {
+        let admission = RouteFinalizationAdmission {
+            token: 7,
+            readiness: ExecutorArtifactReadinessEpoch::new(3),
+        };
+        let mut state = ExecutorRouteResidencyState {
+            finalization_admission: Some(admission),
+            ..Default::default()
+        };
+        assert!(route_finalization_commit_is_live(
+            Some(&state),
+            admission,
+            false
+        ));
+
+        state.drained = true;
+        assert!(!route_finalization_commit_is_live(
+            Some(&state),
+            admission,
+            false
+        ));
+        state.drained = false;
+        state.finalization_admission = Some(RouteFinalizationAdmission {
+            token: 8,
+            readiness: admission.readiness,
+        });
+        assert!(!route_finalization_commit_is_live(
+            Some(&state),
+            admission,
+            false
+        ));
+        state.finalization_admission = Some(admission);
+        assert!(!route_finalization_commit_is_live(
+            Some(&state),
+            admission,
+            true
+        ));
+        assert!(!route_finalization_commit_is_live(None, admission, false));
+    }
 
     #[test]
     fn known_unsafe_byte_aware_residency_is_rejected_before_cuda_initialization() {

@@ -631,6 +631,8 @@ impl Executor {
                 &constant_values,
                 opset,
                 seq_independent,
+                self.artifact_config,
+                &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
                 graph_tokens,
             )?;
@@ -757,9 +759,14 @@ impl Executor {
                 }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let mut kernel =
-                self.ep
-                    .get_kernel(node, &input_shapes, effective_opset(&self.graph, node))?;
+            let mut kernel = self.ep.get_kernel_for_executor(
+                self.artifact_config.provider(),
+                self.artifact_config.executor(),
+                self.artifact_config.generation(),
+                node,
+                &input_shapes,
+                effective_opset(&self.graph, node),
+            )?;
             let constant_inputs = node
                 .inputs
                 .iter()
@@ -981,6 +988,7 @@ impl Executor {
             &external,
             RunMode::Eager,
             Some(validation_submission),
+            None,
         );
         self.scratch_external_bindings = external;
         self.release_step_workspace()?;
@@ -1044,8 +1052,14 @@ impl Executor {
             self.reset_device_graph()?;
         }
         let external = self.prepare_external_bindings(bindings)?;
-        let result =
-            self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture, None);
+        let result = self.run_scoped_mode(
+            inputs,
+            &HashMap::new(),
+            &external,
+            RunMode::Capture,
+            None,
+            None,
+        );
         self.scratch_external_bindings = external;
         self.release_step_workspace()?;
         match result? {
@@ -1073,6 +1087,8 @@ impl Executor {
                 for binding in bindings.iter_mut() {
                     binding.set_device_graph_token(token);
                 }
+                let requirement = self.provider_artifact_readiness.captured_requirement();
+                self.cap_mut().provider_artifact_requirement = requirement;
                 self.cap_mut().device_graph_signature = Some(Self::binding_signature(bindings));
                 Ok(DeviceGraphCaptureResult::Captured(tensors))
             }
@@ -1092,6 +1108,20 @@ impl Executor {
                 "mixed-provider device-graph replay",
             ));
         }
+        // Fast replay bypasses the scoped runner, so it must drive the same
+        // executor-local authority that gates eager execution and capture.
+        // Complete any transition published by binding preparation before
+        // relaunching the installed graph. Pending or failed outcomes remain
+        // latched until a later cache miss advances the epoch.
+        self.provider_artifact_readiness.finalize_if_needed(
+            self.ep.as_ref(),
+            self.artifact_config,
+            &self.graph,
+            &self.finalized_expert_banks,
+        )?;
+        let route_residency = self
+            .provider_artifact_readiness
+            .route_residency(self.ep.name(), self.instance_id)?;
         if !self.bindings_match_graph_signature(bindings) {
             self.reset_device_graph()?;
             return Err(SessionError::Internal(
@@ -1128,10 +1158,21 @@ impl Executor {
             .as_ref()
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
+            let exact_requirement = &self.cap().provider_artifact_requirement;
+            let artifact_use = self.provider_artifact_readiness.acquire_use(
+                self.ep.as_ref(),
+                self.artifact_config,
+                Some(exact_requirement),
+            )?;
             let mut validation_submission =
                 self.begin_device_validation_submission_for_bindings(bindings)?;
             if let Err(replay_error) = self.ep.replay_owned_device_graph(token) {
-                let validation = self.finish_device_validation_boundary();
+                let sync = self.ep.sync();
+                drop(artifact_use);
+                let validation = match sync {
+                    Ok(()) => self.finish_device_validation_boundary_after_sync(route_residency),
+                    Err(error) => Err(error.into()),
+                };
                 validation_submission.disarm();
                 return match validation {
                     Ok(()) => Err(replay_error.into()),
@@ -1141,11 +1182,19 @@ impl Executor {
                     ))),
                 };
             }
+            let sync = self.ep.sync();
+            drop(artifact_use);
+            let validation = match sync {
+                Ok(()) => self.finish_device_validation_boundary_after_sync(route_residency),
+                Err(error) => Err(error.into()),
+            };
             validation_submission.disarm();
+            validation?;
             return Ok(true);
         }
         let validation_submission =
             self.begin_device_validation_submission_for_bindings(bindings)?;
+        let artifact_requirement = self.cap().provider_artifact_requirement.clone();
         let external = self.prepare_external_bindings(bindings)?;
         let result = self.run_scoped_mode(
             &[],
@@ -1153,6 +1202,7 @@ impl Executor {
             &external,
             RunMode::Replay,
             Some(validation_submission),
+            Some(artifact_requirement),
         );
         self.scratch_external_bindings = external;
         self.release_step_workspace()?;
@@ -1182,6 +1232,7 @@ impl Executor {
         if token.is_some() {
             let cap = self.cap_mut();
             cap.device_graph_token = None;
+            cap.provider_artifact_requirement = CapturedProviderArtifactRequirement::Uncaptured;
             cap.device_graph_signature = None;
             cap.capture_schedule = None;
             cap.capture_cf_shapes.clear();
@@ -1319,13 +1370,34 @@ impl Executor {
                 output_name: binding.output_name().map(str::to_string),
                 dtype: binding.dtype,
                 physical_shape: binding.physical_shape().to_vec(),
-                logical_shape: binding.logical_shape().to_vec(),
+                kernel_input_shape: binding.kernel_input_shape().to_vec(),
+                accepts_output_subshape: binding.output_name().is_some()
+                    && binding.logical_shape() != binding.physical_shape(),
                 exposes_logical_input_shape: binding.exposes_logical_input_shape(),
                 mask_decode_freeze_safe: binding.mask_decode_freeze_safe(),
                 fixed_physical_strides: binding.fixed_physical_strides(),
                 device_ptr: binding.device_ptr() as usize,
             })
             .collect()
+    }
+
+    pub(super) fn captured_graph_tokens_for_plan_index(
+        &self,
+        plan_index: usize,
+    ) -> [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT] {
+        std::array::from_fn(|index| {
+            let capture = &self.slot_capture[index];
+            capture
+                .capture_schedule
+                .as_ref()
+                .is_some_and(|schedule| {
+                    schedule.segments.iter().any(|segment| {
+                        segment.captured && (segment.start..segment.end).contains(&plan_index)
+                    })
+                })
+                .then_some(capture.device_graph_token)
+                .flatten()
+        })
     }
 
     fn bindings_match_graph_signature(&self, bindings: &[DeviceIoBinding]) -> bool {
@@ -1342,7 +1414,11 @@ impl Executor {
                             && expected.physical_shape == binding.physical_shape()
                             && (expected.fixed_physical_strides
                                 || self.segmented_binding_keeps_dynamic_input_eager(binding)
-                                || expected.logical_shape == binding.logical_shape())
+                                || (expected.kernel_input_shape == binding.kernel_input_shape()
+                                    && expected.accepts_output_subshape
+                                        == (binding.output_name().is_some()
+                                            && binding.logical_shape()
+                                                != binding.physical_shape())))
                             && expected.exposes_logical_input_shape
                                 == binding.exposes_logical_input_shape()
                             && expected.mask_decode_freeze_safe == binding.mask_decode_freeze_safe()
@@ -1561,8 +1637,7 @@ impl Executor {
                 value.dtype = dtype;
                 value.shape.clear();
                 value.shape.extend_from_slice(binding.physical_shape());
-                value.accepts_subshape =
-                    bind_input && binding.logical_shape() != binding.physical_shape();
+                value.accepts_subshape = binding.logical_shape() != binding.physical_shape();
                 if fixed_physical_strides {
                     dispatch::refill_contiguous_strides(
                         value.strides.get_or_insert_default(),

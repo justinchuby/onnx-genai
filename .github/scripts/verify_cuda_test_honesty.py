@@ -132,6 +132,11 @@ SESSION_HETERO_TARGET = "hetero_cuda_gpu"
 SESSION_BASE_FEATURES = "cuda,cuda-13000"
 SESSION_GPU_FEATURES = "gpu-tests,cuda-13000"
 SESSION_HETERO_MIN_TESTS = 1
+ENGINE_PACKAGE = "onnx-genai-engine"
+ENGINE_DEFAULT_OFF_TARGET = "native_cuda_default_off_state_capture_gpu"
+ENGINE_BASE_FEATURES = "native-cuda,cuda-13000"
+ENGINE_GPU_FEATURES = "gpu-tests,cuda-13000"
+ENGINE_DEFAULT_OFF_MIN_TESTS = 1
 
 
 def run(command: list[str | Path]) -> subprocess.CompletedProcess[str]:
@@ -1093,12 +1098,60 @@ def verify_production_feature_targets() -> tuple[list[str], list[str]]:
         )
     )
 
+    engine_base_binary = build_named_test_binary(
+        ENGINE_PACKAGE, ENGINE_DEFAULT_OFF_TARGET, ENGINE_BASE_FEATURES
+    )
+    engine_base_inventory = list_inventory(engine_base_binary)
+    errors.extend(
+        feature_target_inventory_errors(
+            f"{ENGINE_PACKAGE}/{ENGINE_DEFAULT_OFF_TARGET} without gpu-tests",
+            engine_base_binary,
+            engine_base_inventory,
+            ENGINE_DEFAULT_OFF_MIN_TESTS,
+        )
+    )
+    _, passed, failed, ignored, names = run_libtest(engine_base_binary)
+    errors.extend(
+        validate_ignored_result(
+            IgnoredResult(
+                ENGINE_DEFAULT_OFF_TARGET,
+                len(engine_base_inventory),
+                passed,
+                failed,
+                ignored,
+                known_names(names, engine_base_inventory),
+            )
+        )
+    )
+
+    engine_gpu_binary = build_named_test_binary(
+        ENGINE_PACKAGE, ENGINE_DEFAULT_OFF_TARGET, ENGINE_GPU_FEATURES
+    )
+    engine_gpu_inventory = list_inventory(engine_gpu_binary)
+    errors.extend(
+        feature_target_inventory_errors(
+            f"{ENGINE_PACKAGE}/{ENGINE_DEFAULT_OFF_TARGET} with gpu-tests",
+            engine_gpu_binary,
+            engine_gpu_inventory,
+            ENGINE_DEFAULT_OFF_MIN_TESTS,
+        )
+    )
+    errors.extend(
+        compare_inventories(
+            {ENGINE_DEFAULT_OFF_TARGET: engine_base_inventory},
+            {ENGINE_DEFAULT_OFF_TARGET: engine_gpu_inventory},
+        )
+    )
+
     summaries = [
         f"{CUDA_PLUGIN_PACKAGE}/{CUDA_PLUGIN_TARGET}: "
         f"{len(plugin_inventory)} test(s) compiled with {CUDA_PLUGIN_FEATURES}",
         f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET}: "
         f"{len(session_base_inventory)} test(s) present without gpu-tests and ignored; "
         f"{len(session_gpu_inventory)} present with gpu-tests and compiled only",
+        f"{ENGINE_PACKAGE}/{ENGINE_DEFAULT_OFF_TARGET}: "
+        f"{len(engine_base_inventory)} test(s) present without gpu-tests and ignored; "
+        f"{len(engine_gpu_inventory)} present with gpu-tests and compiled only",
     ]
     return summaries, errors
 

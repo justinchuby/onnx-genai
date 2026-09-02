@@ -450,6 +450,7 @@ pub(crate) fn kv_cache_bytes_per_sequence(
 ) -> anyhow::Result<u64> {
     let declared: std::collections::HashSet<&str> =
         present_to_past.values().map(String::as_str).collect();
+    let compressed_state_enabled = !compressed_records.is_empty();
     let mut tensors = Vec::new();
     for meta in session.inputs() {
         // Recurrent state is loop-carried too, and is charged separately at its
@@ -457,7 +458,7 @@ pub(crate) fn kv_cache_bytes_per_sequence(
         // magnitude -- its whole point is that it does not grow.
         if !declared.contains(meta.name.as_str())
             || is_recurrent_state_shape(&meta.shape)
-            || compressed_records.contains_past(&meta.name)
+            || (compressed_state_enabled && compressed_records.contains_past(&meta.name))
         {
             continue;
         }
@@ -646,6 +647,14 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 pub(crate) fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::Result<Tensor> {
+    if !tensor.layout.is_contiguous(&tensor.shape) {
+        bail!(
+            "native KV prefix slicing requires contiguous row-major storage, got layout {:?} for \
+             shape {:?}",
+            tensor.layout,
+            tensor.shape
+        );
+    }
     let axis_len = *tensor
         .shape
         .get(axis)
@@ -654,19 +663,48 @@ pub(crate) fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::
         bail!("native KV slice length {len} exceeds axis length {axis_len}");
     }
 
-    let inner = tensor.shape[axis + 1..].iter().product::<usize>();
-    let outer = tensor.shape[..axis].iter().product::<usize>();
+    let inner = tensor.shape[axis + 1..]
+        .iter()
+        .try_fold(1usize, |product, &extent| product.checked_mul(extent))
+        .context("native KV prefix inner extent overflow")?;
+    let outer = tensor.shape[..axis]
+        .iter()
+        .try_fold(1usize, |product, &extent| product.checked_mul(extent))
+        .context("native KV prefix outer extent overflow")?;
     let elem_bytes = tensor
         .dtype
         .checked_storage_bytes(1)
         .context("native KV dtype has no fixed storage size")?;
-    let source_stride = axis_len * inner * elem_bytes;
-    let kept_stride = len * inner * elem_bytes;
+    let source_stride = axis_len
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_bytes))
+        .context("native KV prefix source stride overflow")?;
+    let kept_stride = len
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_bytes))
+        .context("native KV prefix retained stride overflow")?;
+    let retained_bytes = outer
+        .checked_mul(kept_stride)
+        .context("native KV prefix retained byte count overflow")?;
     let source = tensor.as_bytes();
-    let mut bytes = Vec::with_capacity(outer * kept_stride);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(retained_bytes)
+        .context("allocate native KV prefix bytes")?;
     for index in 0..outer {
-        let start = index * source_stride;
-        bytes.extend_from_slice(&source[start..start + kept_stride]);
+        let start = index
+            .checked_mul(source_stride)
+            .context("native KV prefix source offset overflow")?;
+        let end = start
+            .checked_add(kept_stride)
+            .context("native KV prefix source end overflow")?;
+        let row = source.get(start..end).with_context(|| {
+            format!(
+                "native KV prefix source range {start}..{end} exceeds {} bytes",
+                source.len()
+            )
+        })?;
+        bytes.extend_from_slice(row);
     }
     let mut shape = tensor.shape.clone();
     shape[axis] = len;

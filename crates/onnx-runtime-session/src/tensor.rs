@@ -1073,14 +1073,14 @@ impl Drop for DeviceIoBinding {
                     }
                 }
             }
-            if let Some(token) = self.device_graph_token.take()
-                && let Err(error) = self.allocator.reset_owned_device_graph(token)
-            {
-                safe_to_release = false;
-                eprintln!(
-                    "[onnx-runtime-session] device binding drop could not retire its captured \
-                     graph generation: {error}"
-                );
+            if let Some(token) = self.device_graph_token.take() {
+                if let Err(error) = self.allocator.reset_owned_device_graph(token) {
+                    safe_to_release = false;
+                    eprintln!(
+                        "[onnx-runtime-session] device binding drop could not retire its captured \
+                          graph generation: {error}"
+                    );
+                }
             }
             if safe_to_release {
                 let _ = self.allocator.deallocate(buffer);

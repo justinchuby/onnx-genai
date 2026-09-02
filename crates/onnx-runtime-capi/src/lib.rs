@@ -134,7 +134,11 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::ExternalBuffer { .. } => OrtErrorCode::InvalidArgument,
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
-        E::Ep(_) | E::ExecutionProviderUnavailable(_) => OrtErrorCode::EpFail,
+        E::Ep(_)
+        | E::ExecutionProviderUnavailable(_)
+        | E::ExecutionProviderArtifactsPending { .. }
+        | E::ExecutionProviderArtifactFinalizationFailed { .. }
+        | E::ExecutionProviderArtifactRollbackFailed { .. } => OrtErrorCode::EpFail,
         // The graph carries a per-node opset the ONNX format cannot represent,
         // so it cannot be written out. That is a property of the graph, like
         // the other members of this arm, rather than a runtime failure.
@@ -957,6 +961,27 @@ mod tests {
                 got: 2,
             }),
             OrtErrorCode::Fail
+        );
+
+        // Readiness blocks are execution-provider failures, not malformed
+        // caller arguments or invalid model graphs.
+        assert_eq!(
+            map_session_error(&E::ExecutionProviderArtifactsPending {
+                provider: "cuda".into(),
+                executor: 7,
+                readiness_epoch: 2,
+                reason: "producer unavailable".into(),
+            }),
+            OrtErrorCode::EpFail
+        );
+        assert_eq!(
+            map_session_error(&E::ExecutionProviderArtifactFinalizationFailed {
+                provider: "cuda".into(),
+                executor: 7,
+                readiness_epoch: 2,
+                reason: "injected failure".into(),
+            }),
+            OrtErrorCode::EpFail
         );
     }
 }

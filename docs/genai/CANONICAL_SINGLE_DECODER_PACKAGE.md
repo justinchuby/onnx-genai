@@ -130,6 +130,10 @@ Do not hand-write this. See [Converting a package](#converting-a-package).
 
 ## Compressed attention state
 
+Packages using the following vocabulary declare `schema_version: v1.8` or
+newer. This fail-closed floor is core conformance, not a model/vendor capability
+flag; packages without compressed state need not opt in.
+
 Compressed records and fixed compressor carries are separate groups because
 they have different update disciplines:
 
@@ -163,12 +167,18 @@ compressed_carries.2:
 
 Ratio-128 uses `record_format: f32` and omits both index roles. Record state is
 governed at `floor(max_context / ratio)` using the declared record axis; carries
-are charged at their fixed graph shape. Snapshot, rollback, fork, and non-zero
-rewind are legal only when every involved group declares the capability.
+are charged at their fixed graph shape. Each state cell declares its request
+batch axis. Carries have no sequence axis and are copied/restored atomically:
+rank-1 and higher tensors are never prefix-sliced, rank-0 state is rejected as
+non-row-scoped, and unsupported strided storage fails closed. Snapshot,
+rollback, fork, and non-zero rewind are legal only when every involved group
+declares the capability.
 Native CPU validates each past→present record transition against that same
 descriptor before committing it: batch, dtype, record layout/width, layer axis,
 monotonic cursor, and exact `floor(token_length / ratio)` must all agree. A
-typed rejection preserves the prior session state.
+typed rejection preserves the prior session state. Native CUDA exposes the same
+refusal type publicly and declines before provider/VMM construction until the
+draft child loader implements the device-owned state lifecycle.
 
 ## Conversations
 

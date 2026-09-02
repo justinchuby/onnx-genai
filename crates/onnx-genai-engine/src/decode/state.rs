@@ -674,17 +674,27 @@ impl DecodeState {
         target_len: usize,
         baseline: &DecodeTurnBaseline,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "native-backend")]
+        if let Some(snapshot) = &baseline.recurrent {
+            let current = std::mem::take(&mut self.loop_state);
+            let restored = self
+                .native_recurrent_runner_mut()
+                .context(
+                    "cannot abort atomic turn: the native state snapshot participant disappeared",
+                )
+                .and_then(|runner| runner.restore_state_snapshot_at(snapshot, target_len));
+            if let Err(error) = restored {
+                self.loop_state = current;
+                return Err(error);
+            }
+            self.restore_fixed_loop_state(&baseline.fixed_loop_state)?;
+            self.next_positions = baseline.next_positions.clone();
+            return Ok(());
+        }
         if self.has_runner() {
             self.rewind_runner_to_fixed_baseline(target_len, &baseline.fixed_loop_state)?;
         } else {
             self.restore_fixed_loop_state(&baseline.fixed_loop_state)?;
-        }
-        #[cfg(feature = "native-backend")]
-        if let Some(snapshot) = &baseline.recurrent {
-            let runner = self.native_recurrent_runner_mut().context(
-                "cannot abort atomic turn: the native recurrent decoder participant disappeared",
-            )?;
-            runner.restore_recurrent_state(snapshot)?;
         }
         self.next_positions = baseline.next_positions.clone();
         Ok(())

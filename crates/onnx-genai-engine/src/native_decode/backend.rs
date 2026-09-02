@@ -1,5 +1,29 @@
 use super::*;
 
+pub(super) fn stage_host_prefix_rewind(
+    past: &HashMap<String, Tensor>,
+    skip_names: &HashSet<String>,
+    target_len: usize,
+) -> anyhow::Result<Vec<(String, Tensor)>> {
+    let mut rewound = Vec::new();
+    for (name, tensor) in past {
+        if skip_names.contains(name) {
+            continue;
+        }
+        let axis = tensor
+            .shape
+            .len()
+            .checked_sub(2)
+            .with_context(|| format!("native KV tensor '{name}' rank is below 2"))?;
+        rewound.push((
+            name.clone(),
+            prefix_slice(tensor, axis, target_len)
+                .with_context(|| format!("rewind native KV tensor '{name}'"))?,
+        ));
+    }
+    Ok(rewound)
+}
+
 impl DecodeBackend for NativeDecodeSession {
     fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
         self.decode_with_step_inputs(token_ids, past_len, &[])
@@ -10,6 +34,9 @@ impl DecodeBackend for NativeDecodeSession {
         token_ids: &[TokenId],
         past_len: usize,
     ) -> anyhow::Result<Option<u32>> {
+        if let Some(cuda) = &self.cuda {
+            cuda.ensure_state_restore_healthy()?;
+        }
         if token_ids.is_empty() {
             bail!("native decode requires at least one token");
         }
@@ -145,6 +172,17 @@ impl NativeDecodeSession {
     }
 
     pub(super) fn rewind_inner(&mut self, target_len: usize) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(remaining) = self.fail_rewind_after.as_mut() {
+            if *remaining == 0 {
+                self.fail_rewind_after = None;
+                bail!("injected native decoder rewind failure");
+            }
+            *remaining -= 1;
+        }
+        if let Some(cuda) = &self.cuda {
+            cuda.ensure_state_restore_healthy()?;
+        }
         if target_len > self.current_len {
             bail!(
                 "cannot rewind native KV from {} forward to {target_len}",
@@ -217,29 +255,20 @@ impl NativeDecodeSession {
             .filter(|meta| is_recurrent_state_shape(&meta.shape))
             .map(|meta| meta.name.clone())
             .collect();
-        // CSA/HCA compressed-record buffers advance on the compression cursor,
-        // not the token count, so they cannot be token-prefix-sliced. Like the
-        // conv/SSM carries they are restored wholesale from a snapshot by the
-        // speculative-rollback commit path; a bare non-zero rewind of them is
-        // refused earlier in the public `rewind`.
-        skip_names.extend(self.csa_record_past_names());
-        for (name, tensor) in &mut self.past {
-            // Recurrent states are destructive rolling caches with no per-step
-            // history to slice; leave them intact here. Greedy decode never
-            // rewinds, and a speculative rewind commits them out-of-band via
-            // `snapshot_recurrent_state` + `commit_recurrent_state_to_accepted`
-            // (snapshot the pre-draft state, then re-advance by the accepted
-            // tokens) rather than prefix-slicing them.
-            if skip_names.contains(name) {
-                continue;
-            }
-            let axis = tensor
-                .shape
-                .len()
-                .checked_sub(2)
-                .with_context(|| format!("native KV tensor '{name}' rank is below 2"))?;
-            *tensor = prefix_slice(tensor, axis, target_len)
-                .with_context(|| format!("rewind native KV tensor '{name}'"))?;
+        // Every typed CSA/HCA state tensor is restored atomically. Record
+        // buffers advance on a compression cursor rather than token count, and
+        // fixed carries have no sequence axis at all; neither may enter generic
+        // penultimate-axis prefix slicing.
+        if !self.compressed_state.is_empty() {
+            skip_names.extend(self.compressed_state.state_past_names().cloned());
+        }
+        let rewound = stage_host_prefix_rewind(&self.past, &skip_names, target_len)?;
+        for (name, tensor) in rewound {
+            let slot = self
+                .past
+                .get_mut(&name)
+                .with_context(|| format!("native KV tensor '{name}' disappeared during rewind"))?;
+            *slot = tensor;
         }
         self.current_len = target_len;
         Ok(())

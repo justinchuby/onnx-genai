@@ -272,7 +272,7 @@ impl DecoderTurnParticipant {
 struct NativeDecoderTurnParticipant {
     turn: crate::pipeline::TurnTransaction,
     session_id: SessionId,
-    active_before: Option<SessionId>,
+    identity: crate::native_decode::NativeLogicalStateIdentity,
     materialized_len: Option<usize>,
     recurrent: Option<crate::native_decode::RecurrentStateSnapshot>,
     speculative_stats: SpeculativeStats,
@@ -282,17 +282,21 @@ struct NativeDecoderTurnParticipant {
 #[cfg(feature = "native-backend")]
 impl NativeDecoderTurnParticipant {
     fn admit(engine: &mut Engine, session_id: SessionId) -> anyhow::Result<Self> {
+        let identity = engine.native_turn_identity(session_id)?;
         let active_before = engine.native_active_session;
         let native = engine.native_session.as_mut().context(
             "cannot admit atomic native decoder turn: native decoder session is unavailable",
         )?;
+        if active_before == Some(session_id) {
+            native.ensure_logical_state(identity)?;
+        }
         let materialized_len = (active_before == Some(session_id)).then(|| native.current_len());
         let recurrent = materialized_len
             .filter(|length| *length > 0 && native.has_recurrent_state())
             .map(|_| {
                 native.snapshot_recurrent_state().with_context(|| {
-                    "cannot admit atomic native decoder turn: recurrent state has no \
-                     snapshot/restore support; implement that participant before mutation"
+                    "cannot admit atomic native decoder turn: non-prefix-sliceable state could \
+                     not be snapshotted before mutation"
                 })
             })
             .transpose()?;
@@ -301,7 +305,7 @@ impl NativeDecoderTurnParticipant {
                 engine.workflow.next_turn_transaction_id(),
             ),
             session_id,
-            active_before,
+            identity,
             materialized_len,
             recurrent,
             speculative_stats: engine.last_speculative_stats,
@@ -325,27 +329,61 @@ impl NativeDecoderTurnParticipant {
     ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
         engine.last_speculative_stats = self.speculative_stats;
         engine.connector.restore_stats(self.connector_stats);
-        let native = engine.native_session.as_mut().context(
-            "cannot abort atomic native decoder turn: native decoder session is unavailable",
-        )?;
-        match self.materialized_len {
-            Some(length) => {
-                native.rewind(length)?;
-                if let Some(snapshot) = &self.recurrent {
-                    native.restore_recurrent_state(snapshot)?;
+        let restored = {
+            let native = engine.native_session.as_mut().context(
+                "cannot abort atomic native decoder turn: native decoder session is unavailable",
+            )?;
+            match self.materialized_len {
+                Some(length) => {
+                    native.ensure_logical_state(self.identity)?;
+                    if let Some(snapshot) = &self.recurrent {
+                        native.restore_state_snapshot_at(snapshot, length)
+                    } else {
+                        native.rewind(length)
+                    }
                 }
-                engine.native_active_session = Some(self.session_id);
+                None => native.reset(),
             }
-            None => {
-                // This turn had to evict another session's materialized native
-                // cache. Its logical history remains in `native_sessions`; make
-                // the cache explicitly cold rather than leaving a provisional
-                // target prefix observable as an active session.
-                native.reset()?;
-                engine.native_active_session = None;
+        };
+        if let Err(rollback) = restored {
+            engine.native_active_session = None;
+            let logical_baseline_lost = self.materialized_len.is_some();
+            if logical_baseline_lost {
+                poison_native_generation(
+                    &mut engine.native_sessions,
+                    self.identity,
+                    format!("{rollback:#}"),
+                );
             }
+            let recovery = engine
+                .native_session
+                .as_mut()
+                .context(
+                    "cannot recover failed atomic native decoder turn: native decoder session is unavailable",
+                )?
+                .reset();
+            return match recovery {
+                Ok(()) if logical_baseline_lost => Err(rollback.context(format!(
+                    "logical session {} generation {} was poisoned and detached; the shared \
+                     physical decoder was reset for sibling sessions",
+                    self.session_id, self.identity.generation
+                ))),
+                Ok(()) => Err(rollback.context(
+                    "the target logical session was not mutated; the prior physical decoder \
+                     generation was reset and detached",
+                )),
+                Err(recovery) if logical_baseline_lost => Err(rollback.context(format!(
+                    "logical session {} generation {} was poisoned and detached; shared physical \
+                     decoder recovery also failed: {recovery:#}",
+                    self.session_id, self.identity.generation
+                ))),
+                Err(recovery) => Err(rollback.context(format!(
+                    "the target logical session was not mutated, but prior physical decoder \
+                     generation recovery also failed: {recovery:#}"
+                ))),
+            };
         }
-        let _ = self.active_before;
+        engine.native_active_session = self.materialized_len.map(|_| self.session_id);
         Ok(self.turn.abort(reason)?)
     }
 }
@@ -517,6 +555,40 @@ fn apply_native_rewind<T>(
 }
 
 #[cfg(feature = "native-backend")]
+fn poison_native_generation(
+    sessions: &mut HashMap<SessionId, NativeSessionState>,
+    identity: crate::native_decode::NativeLogicalStateIdentity,
+    reason: String,
+) -> bool {
+    let Some(state) = sessions.get_mut(&identity.session_id) else {
+        return false;
+    };
+    if state.generation != identity.generation {
+        return false;
+    }
+    state.poison = Some(reason);
+    true
+}
+
+#[cfg(feature = "native-backend")]
+fn healthy_native_identity(
+    id: SessionId,
+    state: &NativeSessionState,
+) -> anyhow::Result<crate::native_decode::NativeLogicalStateIdentity> {
+    if let Some(reason) = &state.poison {
+        anyhow::bail!(
+            "native logical session {id} generation {} is poisoned after an atomic rollback \
+             failed: {reason}; reset the session to start a clean generation or close it",
+            state.generation
+        );
+    }
+    Ok(crate::native_decode::NativeLogicalStateIdentity {
+        session_id: id,
+        generation: state.generation,
+    })
+}
+
+#[cfg(feature = "native-backend")]
 impl SessionLen for NativeSessions<'_> {
     fn logical_len(&self, id: SessionId) -> Option<usize> {
         native_logical_len(self.0, id)
@@ -532,7 +604,8 @@ impl SessionLen for NativeSessionsRef<'_> {
 
 #[cfg(feature = "native-backend")]
 impl SessionStore for NativeSessions<'_> {
-    fn validate_rewind(&self, _id: SessionId, _target: CheckedPosition) -> anyhow::Result<()> {
+    fn validate_rewind(&self, id: SessionId, _target: CheckedPosition) -> anyhow::Result<()> {
+        self.0.ensure_native_session_dispatchable(id)?;
         // The native decoder validates any required physical move before the
         // logical tail is committed in `rewind`.
         Ok(())
@@ -540,8 +613,14 @@ impl SessionStore for NativeSessions<'_> {
 
     fn rewind(&mut self, id: SessionId, target: CheckedPosition) -> anyhow::Result<()> {
         let engine = &mut *self.0;
+        let identity = engine.ensure_native_session_dispatchable(id)?;
         let position = target.get();
         let materialized_len = if engine.native_active_session == Some(id) {
+            engine
+                .native_session
+                .as_ref()
+                .context("native decoder session is unavailable")?
+                .ensure_logical_state(identity)?;
             Some(
                 engine
                     .native_session
@@ -577,17 +656,48 @@ impl SessionStore for NativeSessions<'_> {
 
     fn reset(&mut self, id: SessionId) -> anyhow::Result<()> {
         let engine = &mut *self.0;
-        let last_access = engine.touch_native_session();
-        if let Some(state) = engine.native_sessions.get_mut(&id) {
-            state.tokens.clear();
-            state.last_access = last_access;
-        }
-        if engine.native_active_session == Some(id) {
+        let (identity, next_generation) = {
+            let state = engine
+                .native_sessions
+                .get(&id)
+                .with_context(|| format!("session {id} not found"))?;
+            (
+                crate::native_decode::NativeLogicalStateIdentity {
+                    session_id: id,
+                    generation: state.generation,
+                },
+                state
+                    .generation
+                    .checked_add(1)
+                    .with_context(|| format!("native session {id} generation exhausted"))?,
+            )
+        };
+        let was_active = engine.native_active_session == Some(id);
+        let owns_physical = engine
+            .native_session
+            .as_ref()
+            .is_some_and(|native| native.owns_logical_state(identity));
+        if was_active || owns_physical {
             let native = engine
                 .native_session
                 .as_mut()
                 .context("native decoder session is unavailable")?;
-            native.reset()?;
+            native.ensure_logical_state_owner(identity)?;
+            native
+                .reset()
+                .with_context(|| format!("reset physical state for native session {id}"))?;
+        }
+        let last_access = engine.native_access_counter.saturating_add(1);
+        engine.native_access_counter = last_access;
+        let state = engine
+            .native_sessions
+            .get_mut(&id)
+            .expect("native session was preflighted before physical reset");
+        state.tokens.clear();
+        state.last_access = last_access;
+        state.generation = next_generation;
+        state.poison = None;
+        if was_active || owns_physical {
             engine.native_active_session = None;
         }
         Ok(())
@@ -595,13 +705,31 @@ impl SessionStore for NativeSessions<'_> {
 
     fn close(&mut self, id: SessionId) -> anyhow::Result<()> {
         let engine = &mut *self.0;
-        engine.native_sessions.remove(&id);
-        if engine.native_active_session == Some(id) {
+        let identity = engine
+            .native_sessions
+            .get(&id)
+            .map(|state| crate::native_decode::NativeLogicalStateIdentity {
+                session_id: id,
+                generation: state.generation,
+            })
+            .with_context(|| format!("session {id} not found"))?;
+        let was_active = engine.native_active_session == Some(id);
+        let owns_physical = engine
+            .native_session
+            .as_ref()
+            .is_some_and(|native| native.owns_logical_state(identity));
+        if was_active || owns_physical {
             let native = engine
                 .native_session
                 .as_mut()
                 .context("native decoder session is unavailable")?;
-            native.reset()?;
+            native.ensure_logical_state_owner(identity)?;
+            native.reset().with_context(|| {
+                format!("retire physical state for closing native session {id}")
+            })?;
+        }
+        engine.native_sessions.remove(&id);
+        if was_active || owns_physical {
             engine.native_active_session = None;
         }
         if engine.native_default_session == Some(id) {
@@ -835,6 +963,25 @@ impl Engine {
                 return Err(error);
             }
         };
+        let begin_generation = {
+            let native = self
+                .native_session
+                .as_mut()
+                .context("native decoder session is unavailable")?;
+            native
+                .reset()
+                .and_then(|()| native.bind_logical_state(turn.identity))
+        };
+        if let Err(error) = begin_generation {
+            self.scheduler.complete(scheduler_session_id);
+            return match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                Ok(_) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "atomic native cold turn could not start a clean physical generation and its \
+                     baseline restoration also failed: {rollback:#}"
+                ))),
+            };
+        }
         self.last_speculative_stats = SpeculativeStats::default();
         let workspace_query_rows = native_workspace_query_rows(
             prompt_tokens.len(),
@@ -1020,6 +1167,33 @@ impl Engine {
     }
 
     #[cfg(feature = "native-backend")]
+    fn native_turn_identity(
+        &self,
+        id: SessionId,
+    ) -> anyhow::Result<crate::native_decode::NativeLogicalStateIdentity> {
+        match self.native_sessions.get(&id) {
+            Some(state) => healthy_native_identity(id, state),
+            // Cold generation requests use a freshly minted, non-retained id.
+            None => Ok(crate::native_decode::NativeLogicalStateIdentity {
+                session_id: id,
+                generation: 1,
+            }),
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn ensure_native_session_dispatchable(
+        &self,
+        id: SessionId,
+    ) -> anyhow::Result<crate::native_decode::NativeLogicalStateIdentity> {
+        let state = self
+            .native_sessions
+            .get(&id)
+            .with_context(|| format!("session {id} not found"))?;
+        healthy_native_identity(id, state)
+    }
+
+    #[cfg(feature = "native-backend")]
     fn create_native_session_state(&mut self) -> anyhow::Result<SessionId> {
         if self.decode_backend != EngineDecodeBackend::Native {
             anyhow::bail!("native session state requires the native decode backend");
@@ -1031,6 +1205,8 @@ impl Engine {
             NativeSessionState {
                 tokens: Vec::new(),
                 last_access,
+                generation: 1,
+                poison: None,
             },
         );
         self.evict_native_sessions(id);
@@ -3459,6 +3635,7 @@ impl Engine {
         if !self.native_sessions.contains_key(&session_id) {
             anyhow::bail!("session {session_id} not found");
         }
+        let identity = self.ensure_native_session_dispatchable(session_id)?;
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
             prompt_tokens.len(),
@@ -3507,7 +3684,13 @@ impl Engine {
                     .as_mut()
                     .context("native decoder session is unavailable")?;
                 native.reset()?;
+                native.bind_logical_state(identity)?;
                 self.native_active_session = Some(session_id);
+            } else {
+                self.native_session
+                    .as_ref()
+                    .context("native decoder session is unavailable")?
+                    .ensure_logical_state(identity)?;
             }
 
             let prefix_len = {
@@ -3896,6 +4079,237 @@ mod tests {
                 "{route} retry must publish only its committed stream"
             );
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_poison_is_generation_scoped_and_siblings_keep_dispatching() -> anyhow::Result<()> {
+        let mut engine = tiny_native_cold_engine()?;
+        let poisoned = engine.create_session()?;
+        let sibling = engine.create_session()?;
+        let poisoned_identity = engine.ensure_native_session_dispatchable(poisoned)?;
+        assert!(poison_native_generation(
+            &mut engine.native_sessions,
+            poisoned_identity,
+            "synthetic rollback failure".to_string(),
+        ));
+
+        let request = tiny_native_cold_request(false);
+        let sibling_result = engine.generate_in_session(sibling, request.clone())?;
+        assert!(!sibling_result.token_ids.is_empty());
+        assert_eq!(engine.native_active_session, Some(sibling));
+        let sibling_tokens = engine.native_sessions[&sibling].tokens.clone();
+        let sibling_access = engine.native_sessions[&sibling].last_access;
+        let access_counter = engine.native_access_counter;
+        let speculative_stats = engine.last_speculative_stats;
+        let connector_stats = engine.connector.stats().clone();
+
+        let refusal = engine
+            .generate_in_session(poisoned, request.clone())
+            .expect_err("the poisoned logical generation must fail closed");
+        let refusal = format!("{refusal:#}");
+        assert!(
+            refusal.contains(&format!(
+                "native logical session {poisoned} generation 1 is poisoned"
+            )) && refusal.contains("reset the session"),
+            "poison refusal must name the exact repair: {refusal}"
+        );
+        assert_eq!(engine.native_active_session, Some(sibling));
+        assert_eq!(engine.native_sessions[&sibling].tokens, sibling_tokens);
+        assert_eq!(engine.native_sessions[&sibling].last_access, sibling_access);
+        assert_eq!(engine.native_access_counter, access_counter);
+        assert_eq!(engine.last_speculative_stats, speculative_stats);
+        assert_eq!(engine.connector.stats(), &connector_stats);
+
+        engine.reset_session(poisoned)?;
+        let reset = &engine.native_sessions[&poisoned];
+        assert_eq!(reset.generation, 2);
+        assert!(reset.poison.is_none());
+        assert!(reset.tokens.is_empty());
+        assert_eq!(engine.native_sessions[&sibling].tokens, sibling_tokens);
+        let recovered = engine.generate_in_session(poisoned, request)?;
+        assert!(!recovered.token_ids.is_empty());
+        assert_eq!(engine.native_active_session, Some(poisoned));
+
+        assert!(
+            !poison_native_generation(
+                &mut engine.native_sessions,
+                poisoned_identity,
+                "stale generation".to_string(),
+            ),
+            "a stale generation must not poison the reset session"
+        );
+        assert!(engine.native_sessions[&poisoned].poison.is_none());
+
+        engine.close_session(poisoned)?;
+        assert!(!engine.native_sessions.contains_key(&poisoned));
+        assert!(engine.native_sessions.contains_key(&sibling));
+        assert!(engine.close_session(poisoned).is_err());
+
+        for cycle in 0..64 {
+            let id = engine.create_session()?;
+            let identity = engine.ensure_native_session_dispatchable(id)?;
+            assert!(poison_native_generation(
+                &mut engine.native_sessions,
+                identity,
+                format!("cycle {cycle}"),
+            ));
+            engine.close_session(id)?;
+            assert_eq!(
+                engine.native_sessions.len(),
+                1,
+                "poison tombstones must leave with their logical session"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn failed_active_turn_poisons_only_its_logical_generation() -> anyhow::Result<()> {
+        let mut engine = tiny_native_cold_engine()?;
+        let failed = engine.create_session()?;
+        let sibling = engine.create_session()?;
+        engine.generate_in_session(failed, tiny_native_cold_request(false))?;
+        assert_eq!(engine.native_active_session, Some(failed));
+
+        engine
+            .native_session
+            .as_mut()
+            .context("native decoder")?
+            .fail_rewind_after_for_test(1);
+        let failure = with_native_output_stage_limit_for_test(1, || {
+            engine.generate_in_session(failed, tiny_native_cold_request(false))
+        })
+        .expect_err("the active turn's rollback must hit the injected rewind failure");
+        let failure = format!("{failure:#}");
+        assert!(
+            failure.contains("injected native decoder rewind failure")
+                && failure.contains(&format!(
+                    "logical session {failed} generation 1 was poisoned and detached"
+                )),
+            "failed rollback must identify the exact logical generation: {failure}"
+        );
+        assert_eq!(engine.native_active_session, None);
+        assert!(
+            engine.native_sessions[&failed]
+                .poison
+                .as_deref()
+                .is_some_and(|reason| reason.contains("injected native decoder rewind failure"))
+        );
+
+        let sibling_result =
+            engine.generate_in_session(sibling, tiny_native_cold_request(false))?;
+        assert!(!sibling_result.token_ids.is_empty());
+        assert_eq!(engine.native_active_session, Some(sibling));
+        let sibling_tokens = engine.native_sessions[&sibling].tokens.clone();
+        let sibling_access = engine.native_sessions[&sibling].last_access;
+        let access_counter = engine.native_access_counter;
+        let refusal = engine
+            .generate_in_session(failed, tiny_native_cold_request(false))
+            .expect_err("the poisoned generation must refuse a retry before mutation");
+        assert!(format!("{refusal:#}").contains(&format!(
+            "native logical session {failed} generation 1 is poisoned"
+        )));
+        assert_eq!(engine.native_active_session, Some(sibling));
+        assert_eq!(engine.native_sessions[&sibling].tokens, sibling_tokens);
+        assert_eq!(engine.native_sessions[&sibling].last_access, sibling_access);
+        assert_eq!(engine.native_access_counter, access_counter);
+
+        engine.reset_session(failed)?;
+        assert_eq!(engine.native_sessions[&failed].generation, 2);
+        assert!(engine.native_sessions[&failed].poison.is_none());
+        let retry = engine.generate_in_session(failed, tiny_native_cold_request(false))?;
+        assert!(!retry.token_ids.is_empty());
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_reset_and_close_publish_only_after_physical_retirement() -> anyhow::Result<()> {
+        let mut engine = tiny_native_cold_engine()?;
+        let session = engine.create_session()?;
+        engine.native_default_session = Some(session);
+        engine.generate_in_session(session, tiny_native_cold_request(false))?;
+        assert_eq!(engine.native_active_session, Some(session));
+
+        let before_tokens = engine.native_sessions[&session].tokens.clone();
+        let before_generation = engine.native_sessions[&session].generation;
+        let before_access = engine.native_sessions[&session].last_access;
+        let before_counter = engine.native_access_counter;
+        engine
+            .native_session
+            .as_mut()
+            .context("native decoder")?
+            .fail_next_reset_for_test();
+        let reset = engine
+            .reset_session(session)
+            .expect_err("injected physical reset must abort logical reset");
+        assert!(
+            format!("{reset:#}").contains("injected native decoder reset failure"),
+            "reset error must retain its physical cause: {reset:#}"
+        );
+        assert_eq!(engine.native_sessions[&session].tokens, before_tokens);
+        assert_eq!(
+            engine.native_sessions[&session].generation,
+            before_generation
+        );
+        assert_eq!(engine.native_sessions[&session].last_access, before_access);
+        assert_eq!(engine.native_access_counter, before_counter);
+        assert_eq!(engine.native_active_session, Some(session));
+        assert_eq!(engine.native_default_session, Some(session));
+
+        engine.reset_session(session)?;
+        assert!(engine.native_sessions[&session].tokens.is_empty());
+        assert_eq!(
+            engine.native_sessions[&session].generation,
+            before_generation + 1
+        );
+        assert_eq!(engine.native_active_session, None);
+        assert_eq!(engine.native_default_session, Some(session));
+        engine.reset_session(session)?;
+        assert_eq!(
+            engine.native_sessions[&session].generation,
+            before_generation + 2,
+            "repeated reset starts another clean, defined generation"
+        );
+
+        engine.generate_in_session(session, tiny_native_cold_request(false))?;
+        let before_close_tokens = engine.native_sessions[&session].tokens.clone();
+        let before_close_generation = engine.native_sessions[&session].generation;
+        let before_close_access = engine.native_sessions[&session].last_access;
+        let before_close_counter = engine.native_access_counter;
+        engine
+            .native_session
+            .as_mut()
+            .context("native decoder")?
+            .fail_next_reset_for_test();
+        let close = engine
+            .close_session(session)
+            .expect_err("injected physical retirement must abort logical close");
+        assert!(
+            format!("{close:#}").contains("injected native decoder reset failure"),
+            "close error must retain its physical cause: {close:#}"
+        );
+        assert_eq!(engine.native_sessions[&session].tokens, before_close_tokens);
+        assert_eq!(
+            engine.native_sessions[&session].generation,
+            before_close_generation
+        );
+        assert_eq!(
+            engine.native_sessions[&session].last_access,
+            before_close_access
+        );
+        assert_eq!(engine.native_access_counter, before_close_counter);
+        assert_eq!(engine.native_active_session, Some(session));
+        assert_eq!(engine.native_default_session, Some(session));
+
+        engine.close_session(session)?;
+        assert!(!engine.native_sessions.contains_key(&session));
+        assert_eq!(engine.native_active_session, None);
+        assert_eq!(engine.native_default_session, None);
+        assert!(engine.close_session(session).is_err());
         Ok(())
     }
 

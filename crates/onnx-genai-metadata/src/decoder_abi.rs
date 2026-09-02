@@ -37,10 +37,11 @@ use crate::schema::{
 
 /// Ordered per-layer view of one state group's port bindings for a component.
 struct GroupPorts<'a> {
-    /// `(layer, role, alias)` sorted into the graph's per-layer order.
+    /// `(layer, role, state cell, alias)` sorted into graph order.
     aliases: Vec<(
         usize,
         Option<StatePortRole>,
+        &'a str,
         &'a crate::schema::StatePortAlias,
     )>,
 }
@@ -54,22 +55,29 @@ impl<'a> GroupPorts<'a> {
     fn collect(group: &'a StateGroupContract, component: &str) -> Option<Self> {
         let bindings = group.ports.get(component)?;
         let mut aliases = bindings
-            .values()
+            .iter()
             .enumerate()
-            .map(|(position, alias)| (alias.layer.unwrap_or(position), alias.role, alias))
+            .map(|(position, (cell, alias))| {
+                (
+                    alias.layer.unwrap_or(position),
+                    alias.role,
+                    cell.as_str(),
+                    alias,
+                )
+            })
             .collect::<Vec<_>>();
         // Sort by layer first so a producer's label ordering never decides
         // which buffer belongs to which layer, then by role so that a split
         // cache yields a stable key-before-value order within each layer.
-        aliases.sort_by_key(|(layer, role, _)| (*layer, *role));
+        aliases.sort_by_key(|(layer, role, _, _)| (*layer, *role));
         Some(Self { aliases })
     }
 
     fn pairs(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
         self.aliases
             .iter()
-            .filter(|(_, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
-            .filter_map(|(_, _, alias)| {
+            .filter(|(_, _, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
+            .filter_map(|(_, _, _, alias)| {
                 // A read-write transition always names an output (validation
                 // enforces it); the filter_map keeps this total without an
                 // unwrap.
@@ -80,9 +88,9 @@ impl<'a> GroupPorts<'a> {
     fn with_role(&self, wanted: StatePortRole) -> Vec<&'a crate::schema::StatePortAlias> {
         self.aliases
             .iter()
-            .filter(|(_, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
-            .filter(|(_, role, _)| *role == Some(wanted))
-            .map(|(_, _, alias)| *alias)
+            .filter(|(_, _, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
+            .filter(|(_, role, _, _)| *role == Some(wanted))
+            .map(|(_, _, _, alias)| *alias)
             .collect()
     }
 }
@@ -282,11 +290,17 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<DecoderAb
             let ports = ports
                 .aliases
                 .iter()
-                .filter(|(_, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
-                .filter_map(|(_, _, alias)| {
+                .filter(|(_, _, _, alias)| {
+                    alias.access == crate::schema::StatePortAccess::ReadWrite
+                })
+                .filter_map(|(_, _, cell, alias)| {
                     Some(DecoderStatePort {
                         role: alias.role,
                         layer: alias.layer,
+                        batch_axis: workflow
+                            .state
+                            .get(*cell)
+                            .and_then(|state| state.contract.batch_layout.request_axis()),
                         input: alias.input.clone(),
                         output: alias.output.clone()?,
                     })
@@ -298,6 +312,7 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<DecoderAb
                 properties: group.properties.clone(),
                 sequence_axis: group.sequence_axis,
                 layout: group.layout.clone(),
+                aliasing: group.aliasing,
                 update: group.update.clone(),
                 reuse: group.reuse,
                 capabilities: group.capabilities.clone(),

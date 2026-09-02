@@ -1,4 +1,80 @@
 use super::*;
+use std::path::PathBuf;
+
+static NATIVE_CUDA_PROVIDER_CONSTRUCTION_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Typed refusal returned when an adjacent model package declares metadata that
+/// native decode cannot safely admit.
+#[derive(Debug)]
+pub enum NativeDecodeMetadataRefusal {
+    UnsupportedSchema {
+        path: PathBuf,
+        source: onnx_genai_metadata::UnsupportedSchemaVersion,
+    },
+    InvalidDocument {
+        path: PathBuf,
+        source: onnx_genai_metadata::MetadataError,
+    },
+    InvalidContract {
+        path: PathBuf,
+        errors: Vec<String>,
+    },
+    InvalidCompatibilityMetadata {
+        path: PathBuf,
+        source: anyhow::Error,
+    },
+}
+
+impl std::fmt::Display for NativeDecodeMetadataRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSchema { path, source } => write!(
+                formatter,
+                "native decode refused unsupported inference metadata '{}': {source}. Upgrade \
+                 the runtime or re-emit the package within the supported schema range before \
+                 selecting an execution provider",
+                path.display()
+            ),
+            Self::InvalidDocument { path, source } => write!(
+                formatter,
+                "native decode refused inference metadata '{}': {source}. Fix or remove the \
+                 malformed sidecar; an existing sidecar is never treated as absent",
+                path.display()
+            ),
+            Self::InvalidContract { path, errors } => write!(
+                formatter,
+                "native decode refused inference metadata '{}': {}. Re-emit a complete supported \
+                 contract before selecting an execution provider",
+                path.display(),
+                errors.join("; ")
+            ),
+            Self::InvalidCompatibilityMetadata { path, source } => write!(
+                formatter,
+                "native decode could not derive inference metadata from compatibility package \
+                 '{}': {source:#}. Fix genai_config.json or provide canonical \
+                 inference_metadata.yaml",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeDecodeMetadataRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnsupportedSchema { source, .. } => Some(source),
+            Self::InvalidDocument { source, .. } => Some(source),
+            Self::InvalidCompatibilityMetadata { source, .. } => Some(source.as_ref()),
+            Self::InvalidContract { .. } => None,
+        }
+    }
+}
+
+/// Number of native CUDA provider-construction attempts that crossed metadata
+/// and typed state admission.
+pub fn native_cuda_provider_construction_attempts() -> u64 {
+    NATIVE_CUDA_PROVIDER_CONSTRUCTION_ATTEMPTS.load(AtomicOrdering::Relaxed)
+}
 
 pub(crate) struct NativeDecodeLoadOptions<'a> {
     pub(crate) host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
@@ -18,39 +94,130 @@ pub(crate) struct NativeDecodeLoadOptions<'a> {
     pub(crate) decode_batch: Option<usize>,
 }
 
-fn native_metadata_max_len_from_model_path(path: &Path) -> Option<usize> {
-    let root = if path.is_dir() { path } else { path.parent()? };
-    onnx_genai_metadata::load_metadata_from_dir(root)
-        .ok()
-        .flatten()
-        .and_then(|metadata| metadata.model.and_then(|model| model.max_sequence_length))
-}
-
 /// Resolve a model directory's [`InferenceMetadata`] using the same precedence
 /// as the engine's directory loader: a native `inference_metadata.{yaml,yml,json}`
 /// sidecar first, then onnxruntime-genai `genai_config.json` compatibility
-/// synthesis. Returns `None` when neither is present so callers fall back to
-/// shape-based I/O inference exactly as before.
+/// synthesis. `Ok(None)` means neither is present. An existing declaration that
+/// cannot be parsed, version-gated, normalized, or validated is a typed refusal.
 fn resolve_io_metadata_from_model_path(
     path: &Path,
-) -> Option<onnx_genai_metadata::InferenceMetadata> {
-    let root = if path.is_dir() { path } else { path.parent()? };
-    if let Some(metadata) = onnx_genai_metadata::load_metadata_from_dir(root)
-        .ok()
-        .flatten()
-    {
-        return Some(metadata);
+) -> anyhow::Result<Option<onnx_genai_metadata::InferenceMetadata>> {
+    let Some(root) = (if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    }) else {
+        return Ok(None);
+    };
+    let metadata_path = onnx_genai_metadata::find_metadata_path(root);
+    let metadata = onnx_genai_metadata::load_metadata_from_dir(root).map_err(|source| {
+        let path = metadata_path
+            .clone()
+            .unwrap_or_else(|| root.join("inference_metadata.yaml"));
+        match source {
+            onnx_genai_metadata::MetadataError::UnsupportedSchema(source) => {
+                anyhow::Error::new(NativeDecodeMetadataRefusal::UnsupportedSchema { path, source })
+            }
+            source => {
+                anyhow::Error::new(NativeDecodeMetadataRefusal::InvalidDocument { path, source })
+            }
+        }
+    })?;
+    if let Some(metadata) = metadata {
+        validate_resolved_metadata(
+            &metadata,
+            metadata_path.unwrap_or_else(|| root.join("inference_metadata.yaml")),
+        )?;
+        return Ok(Some(metadata));
     }
     let genai_config = root.join("genai_config.json");
     if genai_config.is_file() {
-        return crate::engine::genai_config_compat_metadata_from_model_path(
+        let metadata = crate::engine::genai_config_compat_metadata_from_model_path(
             Some(genai_config.as_path()),
             path,
         )
-        .ok()
-        .flatten();
+        .map_err(|error| {
+            anyhow::Error::new(NativeDecodeMetadataRefusal::InvalidCompatibilityMetadata {
+                path: genai_config.clone(),
+                source: error,
+            })
+        })?;
+        if let Some(metadata) = metadata {
+            validate_resolved_metadata(&metadata, genai_config)?;
+            return Ok(Some(metadata));
+        }
     }
-    None
+    Ok(None)
+}
+
+fn validate_resolved_metadata(
+    metadata: &onnx_genai_metadata::InferenceMetadata,
+    path: PathBuf,
+) -> anyhow::Result<()> {
+    match onnx_genai_metadata::version::gate(metadata.schema_version.as_deref()) {
+        Ok(_) => {}
+        Err(onnx_genai_metadata::SchemaVersionError::Unsupported(source)) => {
+            let document = onnx_genai_metadata::SchemaDocumentContext::File(path.clone());
+            return Err(anyhow::Error::new(
+                NativeDecodeMetadataRefusal::UnsupportedSchema {
+                    path,
+                    source: source.with_document(document),
+                },
+            ));
+        }
+        Err(onnx_genai_metadata::SchemaVersionError::Invalid(reason)) => {
+            return Err(anyhow::Error::new(
+                NativeDecodeMetadataRefusal::InvalidContract {
+                    path,
+                    errors: vec![reason],
+                },
+            ));
+        }
+    }
+    onnx_genai_metadata::validate_metadata(metadata).map_err(|errors| {
+        anyhow::Error::new(NativeDecodeMetadataRefusal::InvalidContract {
+            path: path.clone(),
+            errors,
+        })
+    })?;
+    let compressed_groups = metadata
+        .pipeline
+        .as_ref()
+        .and_then(|pipeline| pipeline.workflow.serving.as_ref())
+        .into_iter()
+        .flat_map(|serving| &serving.state_service.groups)
+        .filter(|(_, group)| group.kind == onnx_genai_metadata::StateKind::CompressedAttention)
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    if !compressed_groups.is_empty() {
+        let resolved = metadata.decoder_io().ok_or_else(|| {
+            anyhow::Error::new(NativeDecodeMetadataRefusal::InvalidContract {
+                path: path.clone(),
+                errors: vec![format!(
+                    "compressed-attention state groups {compressed_groups:?} do not resolve to \
+                     one canonical decoder ABI; use the workflow engine for a multi-component \
+                     package instead of silently loading one artifact without its state contract"
+                )],
+            })
+        })?;
+        if !resolved
+            .state_groups
+            .iter()
+            .any(|group| group.kind == onnx_genai_metadata::StateKind::CompressedAttention)
+        {
+            return Err(anyhow::Error::new(
+                NativeDecodeMetadataRefusal::InvalidContract {
+                    path,
+                    errors: vec![format!(
+                        "compressed-attention state groups {compressed_groups:?} were present but \
+                         absent from the resolved decoder ABI; native decode refuses rather than \
+                         disabling declared state"
+                    )],
+                },
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl NativeDecodeSession {
@@ -70,7 +237,7 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
     ) -> anyhow::Result<Self> {
         let path = path.as_ref();
-        let metadata = resolve_io_metadata_from_model_path(path);
+        let metadata = resolve_io_metadata_from_model_path(path)?;
         let io = metadata.as_ref().and_then(|metadata| metadata.decoder_io());
         Self::load_with_cuda_options_and_io(
             path,
@@ -93,8 +260,11 @@ impl NativeDecodeSession {
                 .io
                 .map(|io| io.state_groups.as_slice())
                 .unwrap_or_default(),
-            matches!(&device, NativeDecodeDevice::Cuda { .. }),
+            matches!(&device, NativeDecodeDevice::Cuda { .. }) && !cfg!(feature = "native-cuda"),
         )?;
+        if matches!(&device, NativeDecodeDevice::Cuda { .. }) {
+            NATIVE_CUDA_PROVIDER_CONSTRUCTION_ATTEMPTS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
@@ -236,8 +406,14 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         cuda_kv_max_len: Option<usize>,
     ) -> anyhow::Result<Self> {
-        let metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
-        Self::load_with_cuda_options(
+        let path = path.as_ref();
+        let metadata = resolve_io_metadata_from_model_path(path)?;
+        let metadata_max_len = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.model.as_ref())
+            .and_then(|model| model.max_sequence_length);
+        let io = metadata.as_ref().and_then(|metadata| metadata.decoder_io());
+        Self::load_with_cuda_options_and_io(
             path,
             device,
             NativeDecodeCudaOptions {
@@ -248,6 +424,10 @@ impl NativeDecodeSession {
                 weight_offload_enabled: None,
                 weight_offload_stable_va: None,
             },
+            io,
+            None,
+            None,
+            None,
         )
     }
 
@@ -263,7 +443,17 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         options: NativeDecodeCudaOptions,
     ) -> anyhow::Result<Self> {
-        Self::load_with_cuda_options_and_io(path, device, options, None, None, None, None)
+        let path = path.as_ref();
+        let metadata = resolve_io_metadata_from_model_path(path)?;
+        let mut options = options;
+        if options.metadata_max_len.is_none() {
+            options.metadata_max_len = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.model.as_ref())
+                .and_then(|model| model.max_sequence_length);
+        }
+        let io = metadata.as_ref().and_then(|metadata| metadata.decoder_io());
+        Self::load_with_cuda_options_and_io(path, device, options, io, None, None, None)
     }
 
     /// Load a decoder-with-past model, threading the pipeline-declared
@@ -311,7 +501,7 @@ impl NativeDecodeSession {
     fn load_with_cuda_options_and_io(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
-        mut options: NativeDecodeCudaOptions,
+        options: NativeDecodeCudaOptions,
         io: Option<&DecoderAbi>,
         #[cfg(feature = "native-cuda")] cuda_governor: Option<
             Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
@@ -328,11 +518,10 @@ impl NativeDecodeSession {
     ) -> anyhow::Result<Self> {
         csa::refuse_compressed_records_on_cuda(
             io.map(|io| io.state_groups.as_slice()).unwrap_or_default(),
-            matches!(&device, NativeDecodeDevice::Cuda { .. }),
+            matches!(&device, NativeDecodeDevice::Cuda { .. }) && !cfg!(feature = "native-cuda"),
         )?;
-        if options.metadata_max_len.is_none() {
-            options.metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
-        }
+        #[cfg(feature = "native-cuda")]
+        let mut options = options;
         // Issue #716: the managed no-spill authority path installs the VMM arena
         // and physical granule pool, so weight page-ins run on reserved-once
         // stable virtual addresses. Record that here — where the effective
@@ -343,6 +532,9 @@ impl NativeDecodeSession {
             options.weight_offload_stable_va = Some(policy.enabled && policy.managed_no_spill);
         }
         let requested_cuda = matches!(&device, NativeDecodeDevice::Cuda { .. });
+        if requested_cuda {
+            NATIVE_CUDA_PROVIDER_CONSTRUCTION_ATTEMPTS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
@@ -655,6 +847,16 @@ impl NativeDecodeSession {
             session.outputs(),
             io.map(|io| io.state_groups.as_slice()).unwrap_or_default(),
         )?;
+        if session.device_id().is_host_accessible()
+            && !compressed_state.required_aliasing_groups().is_empty()
+        {
+            bail!(
+                "native host decode cannot honor required present/past aliasing for \
+                 compressed-attention state groups {:?}; use a device state loader that \
+                 explicitly binds those groups in place",
+                compressed_state.required_aliasing_groups()
+            );
+        }
         csa::refuse_compressed_records_on_cuda(
             io.map(|io| io.state_groups.as_slice()).unwrap_or_default(),
             session.device_id().device_type == DeviceType::Cuda && !cfg!(feature = "native-cuda"),
@@ -943,6 +1145,17 @@ impl NativeDecodeSession {
 
         let has_plugin_fused = graph_has_plugin_fused(session.graph());
         let uses_decode_pool = graph_uses_decode_pool(session.graph());
+        let compressed_state_stats = if cuda.is_some() {
+            let device_allocations =
+                u64::try_from(compressed_state.device_binding_count()).unwrap_or(u64::MAX);
+            CompressedStatePathStats {
+                device_allocations,
+                telemetry_updates: u64::from(device_allocations > 0),
+                ..CompressedStatePathStats::default()
+            }
+        } else {
+            CompressedStatePathStats::default()
+        };
         Ok(Self {
             session,
             step_inputs,
@@ -951,6 +1164,7 @@ impl NativeDecodeSession {
             kv_inputs,
             present_to_past,
             compressed_state,
+            compressed_state_stats,
             past: HashMap::new(),
             cuda,
             cpu_kv,
@@ -963,6 +1177,10 @@ impl NativeDecodeSession {
             decode_inline: DecodeInlineState::Untried,
             prefill_chunk_size: None,
             prefill_query_padding: true,
+            #[cfg(test)]
+            fail_next_reset: false,
+            #[cfg(test)]
+            fail_rewind_after: None,
         })
     }
 }

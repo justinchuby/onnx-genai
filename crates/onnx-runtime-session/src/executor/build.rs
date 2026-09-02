@@ -356,13 +356,14 @@ pub(super) fn reject_unsupported_operators(
 pub(super) fn cuda_fallback_report(
     graph: &Graph,
     ep: &dyn ExecutionProvider,
+    artifact_config: ExecutorArtifactConfig,
 ) -> Option<ExecutionProviderFallbackReport> {
     if ep.device_type() != DeviceType::Cuda {
         return None;
     }
 
     let mut issues = Vec::new();
-    collect_cuda_coverage_issues(graph, graph, ep, "graph", &mut issues);
+    collect_cuda_coverage_issues(graph, graph, ep, artifact_config, "graph", &mut issues);
     if issues.is_empty() {
         return None;
     }
@@ -426,6 +427,7 @@ pub(super) fn collect_cuda_coverage_issues(
     graph: &Graph,
     opset_graph: &Graph,
     ep: &dyn ExecutionProvider,
+    artifact_config: ExecutorArtifactConfig,
     scope: &str,
     issues: &mut Vec<ExecutionProviderDecline>,
 ) {
@@ -485,7 +487,14 @@ pub(super) fn collect_cuda_coverage_issues(
         else {
             continue;
         };
-        if let Err(error) = ep.get_kernel(node, &concrete_shapes, opset) {
+        if let Err(error) = ep.get_kernel_for_executor(
+            artifact_config.provider(),
+            artifact_config.executor(),
+            artifact_config.generation(),
+            node,
+            &concrete_shapes,
+            opset,
+        ) {
             issues.push(ExecutionProviderDecline {
                 node: format_node_identity(scope, node_id, node),
                 domain: canonical_domain(node),
@@ -497,7 +506,14 @@ pub(super) fn collect_cuda_coverage_issues(
 
     for ((node_id, attribute), subgraph) in &graph.subgraphs {
         let sub_scope = format!("{scope}/node#{}/{}", node_id.0, attribute);
-        collect_cuda_coverage_issues(subgraph, opset_graph, ep, &sub_scope, issues);
+        collect_cuda_coverage_issues(
+            subgraph,
+            opset_graph,
+            ep,
+            artifact_config,
+            &sub_scope,
+            issues,
+        );
     }
 }
 
@@ -604,6 +620,40 @@ pub(super) fn plan_default_residency(
         candidates,
         &onnx_runtime_ep_api::WholeBankResidentPolicy,
     )
+}
+
+fn finalized_expert_banks(
+    graph: &Graph,
+    handles: &HashMap<ValueId, WeightHandle>,
+    catalogs: &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+) -> Vec<FinalizedExpertBank> {
+    expert_weight_groups(graph)
+        .into_iter()
+        .map(|group| {
+            let members = group
+                .members
+                .iter()
+                .filter_map(|value| {
+                    let WeightHandle::Lazy(weight) = handles.get(value)? else {
+                        return None;
+                    };
+                    let catalog = catalogs.get(value)?;
+                    let onnx_runtime_ir::WeightRef::External { path, .. } =
+                        graph.initializers.get(value)?
+                    else {
+                        return None;
+                    };
+                    Some(FinalizedExpertWeight {
+                        value: *value,
+                        external_path: path.clone(),
+                        weight: weight.clone(),
+                        catalog: catalog.clone(),
+                    })
+                })
+                .collect();
+            FinalizedExpertBank { group, members }
+        })
+        .collect()
 }
 
 /// Test/measurement seam: build a plan with an arbitrary
@@ -833,9 +883,9 @@ impl Executor {
     }
 
     fn build_with_mode(
-        mut graph: Graph,
+        graph: Graph,
         weights: Arc<WeightStore>,
-        mut ep: Arc<dyn ExecutionProvider>,
+        ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
         hetero_enabled: bool,
     ) -> Result<Self> {
@@ -877,8 +927,50 @@ impl Executor {
             }
         }
 
-        let execution_provider_fallback_report =
-            Self::place_graph(&mut graph, &weights, &mut ep, require_cuda)?;
+        let instance_id = issue_executor_instance_id()?;
+        let artifact_config = Self::resolve_artifact_config(ep.as_ref(), instance_id)?;
+        let mut artifact_transaction =
+            ExecutorArtifactBuildTransaction::new(Arc::clone(&ep), artifact_config);
+        let build = Self::build_with_artifact_transaction(
+            graph,
+            weights,
+            ep,
+            instance_id,
+            &mut artifact_transaction,
+            require_cuda,
+        );
+        match build {
+            Ok(mut exec) => {
+                artifact_transaction.commit();
+                exec.artifact_teardown_armed = true;
+                Ok(exec)
+            }
+            Err(build) => match artifact_transaction.abort() {
+                Ok(()) => Err(build),
+                Err(rollback) => Err(SessionError::ExecutionProviderArtifactRollbackFailed {
+                    build: Box::new(build),
+                    rollback,
+                }),
+            },
+        }
+    }
+
+    fn build_with_artifact_transaction(
+        mut graph: Graph,
+        weights: Arc<WeightStore>,
+        mut ep: Arc<dyn ExecutionProvider>,
+        instance_id: ExecutorInstanceId,
+        artifact_transaction: &mut ExecutorArtifactBuildTransaction,
+        require_cuda: bool,
+    ) -> Result<Self> {
+        let execution_provider_fallback_report = Self::place_graph(
+            &mut graph,
+            &weights,
+            &mut ep,
+            instance_id,
+            artifact_transaction,
+            require_cuda,
+        )?;
         // Topological order up front: also validates the selected graph is a DAG.
         let order = graph.topological_order()?;
         let (weight_handles, expert_region_candidates) = {
@@ -909,6 +1001,13 @@ impl Executor {
                 );
             }
             plan
+        };
+        let finalized_expert_banks = if artifact_transaction.config().route_residency()
+            == ExecutorRouteResidencyConfig::Enabled
+        {
+            finalized_expert_banks(&graph, &weight_handles, &expert_region_candidates)
+        } else {
+            Vec::new()
         };
 
         let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
@@ -941,6 +1040,9 @@ impl Executor {
         let plan_len = plan.len();
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
         let mut exec = Self {
+            instance_id,
+            artifact_config: artifact_transaction.config(),
+            artifact_teardown_armed: false,
             graph,
             weights,
             ep,
@@ -951,6 +1053,7 @@ impl Executor {
             pending_device_validation: None,
             weight_handles,
             expert_region_candidates,
+            finalized_expert_banks,
             residency_plan,
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
@@ -1012,6 +1115,7 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
+            provider_artifact_readiness: ProviderArtifactReadiness::default(),
             persistent_workspace: None,
             step_workspace: None,
             pin_step_workspace: false,
@@ -1027,7 +1131,7 @@ impl Executor {
             let mut span = trace_span("session.static_materialize", "session");
             let empty = HashMap::new();
             let resolved = exec.resolve_all(&empty)?;
-            exec.compile_all(&resolved)?;
+            exec.ensure_provider_artifacts_ready(&resolved)?;
             exec.size_buffers(&resolved)?;
             if let Some(span) = span.as_mut() {
                 span.set_args(
@@ -1249,10 +1353,30 @@ impl Executor {
     /// CUDA-only fusion that could otherwise touch a KV-growth `Concat` has
     /// already run), and its own output must be accounted for by the coverage
     /// check that follows.
+    fn resolve_artifact_config(
+        ep: &dyn ExecutionProvider,
+        instance_id: ExecutorInstanceId,
+    ) -> Result<ExecutorArtifactConfig> {
+        let artifact_policy = ep.executor_artifact_policy()?;
+        if artifact_policy.device() != ep.device_id() {
+            return Err(EpError::KernelFailed(format!(
+                "{} returned executor artifact configuration for device {:?}, but the provider \
+                 is bound to device {:?}; rebuild the provider with one authoritative device",
+                ep.name(),
+                artifact_policy.device(),
+                ep.device_id(),
+            ))
+            .into());
+        }
+        ExecutorArtifactConfig::issue(artifact_policy, instance_id)
+    }
+
     fn place_graph(
         graph: &mut Graph,
         weights: &Arc<WeightStore>,
         ep: &mut Arc<dyn ExecutionProvider>,
+        instance_id: ExecutorInstanceId,
+        artifact_transaction: &mut ExecutorArtifactBuildTransaction,
         require_cuda: bool,
     ) -> Result<Option<ExecutionProviderFallbackReport>> {
         let mut placement_span = trace_span("session.node_placement", "session");
@@ -1279,7 +1403,8 @@ impl Executor {
         run_ep_scoped_passes(graph, weights, ep.as_ref())?;
         let ep_pass_nodes_after = graph.num_nodes();
         rewrite_kv_capacity_appends(graph, ep.as_ref());
-        let mut execution_provider_fallback_report = cuda_fallback_report(graph, ep.as_ref());
+        let mut execution_provider_fallback_report =
+            cuda_fallback_report(graph, ep.as_ref(), artifact_transaction.config());
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
             .map_or(0, |report| report.declines.len());
@@ -1309,8 +1434,11 @@ impl Executor {
                 &hetero_providers,
                 hetero_placement_env_enabled(),
             )?;
+            let cpu = auto_detect_cpu_ep()?;
+            let cpu_artifact_config = Self::resolve_artifact_config(cpu.as_ref(), instance_id)?;
+            artifact_transaction.rebind(Arc::clone(&cpu), cpu_artifact_config)?;
             *graph = graph_before_ep_passes;
-            *ep = auto_detect_cpu_ep()?;
+            *ep = cpu;
             run_ep_scoped_passes(graph, weights, ep.as_ref())?;
             let mut assigned_ops = BTreeSet::new();
             report.assigned_node_count = collect_executable_ops(graph, &mut assigned_ops);
@@ -2259,13 +2387,42 @@ impl Executor {
             .collect()
     }
 
-    /// Populate the kernel cache for the compiled plan against `resolved` shapes.
-    pub(super) fn compile_all(&mut self, resolved: &HashMap<ValueId, Vec<usize>>) -> Result<()> {
+    /// Advance the executor's pre-execution provider-artifact state machine.
+    ///
+    /// Every currently-resolved leaf kernel is compiled first, publishing any
+    /// executor-scoped producer handles. The provider then receives the
+    /// resulting readiness epoch and must report either an honest terminal
+    /// outcome or a typed pending state. Pending and failed epochs are cached:
+    /// another run with no newly compiled specialization returns the same typed
+    /// error without calling the provider again. No caller may execute or enter
+    /// capture until this method succeeds.
+    pub(super) fn ensure_provider_artifacts_ready(
+        &mut self,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) -> Result<()> {
+        self.compile_ready_kernels(resolved)?;
+        self.provider_artifact_readiness.finalize_if_needed(
+            self.ep.as_ref(),
+            self.artifact_config,
+            &self.graph,
+            &self.finalized_expert_banks,
+        )
+    }
+
+    /// Compile every leaf kernel whose inputs are currently resolved.
+    ///
+    /// Unresolved leaves are deliberately skipped rather than guessed. A
+    /// provider that needs one of them observes its missing producer and
+    /// returns typed `Pending`, which blocks the plan until a later input
+    /// specialization creates a concrete kernel and advances the readiness
+    /// epoch.
+    fn compile_ready_kernels(&mut self, resolved: &HashMap<ValueId, Vec<usize>>) -> Result<()> {
         let mut span = trace_span("session.kernel_compile_plan", "session");
         let cache_entries_before = self.cache.stats().entries;
         let mut compiled_nodes = 0_u64;
         let mut skipped_control_flow = 0_u64;
         let mut skipped_sequence = 0_u64;
+        let mut skipped_unresolved = 0_u64;
         for i in 0..self.plan.len() {
             let node_id = self.plan[i].node_id;
             let node = self.graph.node(node_id);
@@ -2285,6 +2442,30 @@ impl Executor {
                 if span.is_some() {
                     skipped_sequence += 1;
                 }
+                continue;
+            }
+            if !self.plan[i]
+                .inputs
+                .iter()
+                .all(|input| input.is_none_or(|value| resolved.contains_key(&value)))
+            {
+                if span.is_some() {
+                    skipped_unresolved += 1;
+                }
+                continue;
+            }
+            if self.kernel_bindings[i].as_ref().is_some_and(|binding| {
+                self.cache.contains(binding)
+                    && binding.shapes.len() == self.plan[i].inputs.len()
+                    && binding.shapes.iter().zip(&self.plan[i].inputs).all(
+                        |(bound_shape, input)| match input {
+                            Some(value) => resolved
+                                .get(value)
+                                .is_some_and(|shape| shape == bound_shape),
+                            None => bound_shape.is_empty(),
+                        },
+                    )
+            }) {
                 continue;
             }
             if span.is_some() {
@@ -2307,8 +2488,7 @@ impl Executor {
             let opset = effective_opset(&self.graph, node);
             let seq_independent =
                 node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
-            let graph_tokens =
-                std::array::from_fn(|index| self.slot_capture[index].device_graph_token);
+            let graph_tokens = self.captured_graph_tokens_for_plan_index(i);
             let (_, key) = self.cache.get_or_create(
                 node_id,
                 node,
@@ -2318,6 +2498,8 @@ impl Executor {
                 &constant_values,
                 opset,
                 seq_independent,
+                self.artifact_config,
+                &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
                 graph_tokens,
             )?;
@@ -2332,6 +2514,7 @@ impl Executor {
                     .with("compiled_nodes", compiled_nodes)
                     .with("skipped_control_flow", skipped_control_flow)
                     .with("skipped_sequence", skipped_sequence)
+                    .with("skipped_unresolved", skipped_unresolved)
                     .with("cache_entries_before", cache_entries_before as u64)
                     .with("cache_entries_after", self.cache.stats().entries as u64),
             );
@@ -2404,16 +2587,17 @@ impl Executor {
         physical_shape: Vec<usize>,
         logical_shape: Vec<usize>,
     ) -> Result<DeviceIoBinding> {
+        let bind_input = !input_name.is_empty();
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
                 input_name,
-                bind_input: true,
+                bind_input,
                 output_name: Some(output_name),
                 dtype,
                 physical_shape,
                 logical_shape,
-                expose_logical_input_shape: true,
+                expose_logical_input_shape: bind_input,
                 decode_freeze_safe_mask: false,
                 fixed_physical_strides: true,
                 allocation_bytes: None,
@@ -2739,6 +2923,10 @@ impl Executor {
         &self.weights
     }
 
+    pub(crate) fn instance_id(&self) -> ExecutorInstanceId {
+        self.instance_id
+    }
+
     /// Warmup: re-touch the shape-keyed cache for the compiled plan so the first
     /// real `run` sees only cache hits (§11.3). Only meaningful for fully-static
     /// graphs, whose plan shapes are known at build; symbolic graphs cannot be
@@ -2749,6 +2937,6 @@ impl Executor {
         }
         let empty = HashMap::new();
         let resolved = self.resolve_all(&empty)?;
-        self.compile_all(&resolved)
+        self.ensure_provider_artifacts_ready(&resolved)
     }
 }

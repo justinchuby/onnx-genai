@@ -1,0 +1,30 @@
+[package]
+name = "authority-unification-hostile-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+session = ["onnx-runtime-session/cuda-13000"]
+cuda = [
+    "session",
+    "onnx-runtime-session/cuda",
+    "onnx-runtime-ep-cuda/cuda",
+]
+gpu-tests = [
+    "cuda",
+    "onnx-runtime-session/gpu-tests",
+    "onnx-runtime-ep-cuda/gpu-tests",
+]
+workspace-unified = [
+    "gpu-tests",
+]
+
+[dependencies]
+onnx-runtime-ep-api = { path = "../../.." }
+onnx-runtime-ep-cuda = { path = "../../../../onnx-runtime-ep-cuda", default-features = false, features = ["cuda-13000"] }
+onnx-runtime-session = { path = "../../../../onnx-runtime-session", default-features = false }
+onnx-runtime-ir = { path = "../../../../onnx-runtime-ir" }

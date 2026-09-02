@@ -211,6 +211,7 @@ const METADATA_FILE_NAMES: [&str; 3] = [
 pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
     let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
     parse_metadata(&content, path.extension().and_then(|e| e.to_str()))
+        .map_err(|error| error.with_document_path(path))
 }
 
 /// The one way a document becomes an [`InferenceMetadata`].
@@ -280,8 +281,14 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     reject_retired_top_level_tokens(document)?;
     reject_invalid_tensor_contract_shapes(document, String::new())?;
     let declared = crate::version::declared_in(document).map_err(crate::MetadataError::Parse)?;
-    let version = crate::version::gate(declared).map_err(crate::MetadataError::Parse)?;
+    let version = crate::version::gate(declared).map_err(|error| match error {
+        crate::version::SchemaVersionError::Invalid(reason) => crate::MetadataError::Parse(reason),
+        crate::version::SchemaVersionError::Unsupported(error) => {
+            crate::MetadataError::UnsupportedSchema(error)
+        }
+    })?;
     gate_output_protocol_features(document, version)?;
+    gate_compressed_state_features(document, version)?;
     reject_retired_streaming_emit(document)?;
     // After the version, deliberately. The flat packed spelling is a reshape
     // within the v1 line, so refusing it presumes the document belongs to that
@@ -297,6 +304,76 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     reject_flat_token_packed(document, String::new())
         .and_then(|_| reject_retired_batching_hints(document))
         .and_then(|_| reject_retired_capability_declarations(document))
+}
+
+/// Apply the compressed-state schema floor before typed parsing.
+///
+/// The gate recognizes every new vocabulary entry, not just a perfectly formed
+/// `kind: compressed_attention`. A partially authored group that already uses a
+/// compressed record/carry role or property must still make an older reader
+/// refuse by version rather than report whichever later field serde sees first.
+fn gate_compressed_state_features(
+    document: &serde_yaml::Value,
+    version: crate::version::SchemaVersion,
+) -> Result<(), crate::MetadataError> {
+    let Some(groups) = document
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("workflow"))
+        .and_then(|workflow| workflow.get("serving"))
+        .and_then(|serving| serving.get("state_service"))
+        .and_then(|service| service.get("groups"))
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
+        return Ok(());
+    };
+
+    for (name, group) in groups {
+        let name = name.as_str().unwrap_or("?");
+        if untyped_group_uses_compressed_state(group) {
+            crate::version::gate_feature_use(
+                version,
+                crate::version::SchemaFeature::CompressedStateGroups,
+                &format!("pipeline.workflow.serving.state_service.groups.{name}"),
+            )
+            .map_err(crate::MetadataError::Parse)?;
+        }
+    }
+    Ok(())
+}
+
+fn untyped_group_uses_compressed_state(group: &serde_yaml::Value) -> bool {
+    const ROLES: [&str; 4] = [
+        "compressed_kv",
+        "compression_carry",
+        "index_key",
+        "index_carry",
+    ];
+    if group.get("kind").and_then(serde_yaml::Value::as_str) == Some("compressed_attention") {
+        return true;
+    }
+    if let Some(properties) = group
+        .get("properties")
+        .and_then(serde_yaml::Value::as_mapping)
+        && (properties
+            .get(serde_yaml::Value::from("kind"))
+            .and_then(serde_yaml::Value::as_str)
+            == Some("compressed_attention")
+            || ["ratio", "record_format", "recurrence"]
+                .iter()
+                .any(|key| properties.contains_key(serde_yaml::Value::from(*key))))
+    {
+        return true;
+    }
+    group
+        .get("ports")
+        .and_then(serde_yaml::Value::as_mapping)
+        .into_iter()
+        .flat_map(|components| components.values())
+        .filter_map(serde_yaml::Value::as_mapping)
+        .flat_map(|aliases| aliases.values())
+        .filter_map(|alias| alias.get("role"))
+        .filter_map(serde_yaml::Value::as_str)
+        .any(|role| ROLES.contains(&role))
 }
 
 /// Refuse the retired capability lists with their true migration path.

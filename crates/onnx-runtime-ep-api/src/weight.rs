@@ -140,6 +140,16 @@ impl LazyWeightBoundary {
     pub fn matches_any(domain: &str, op_type: &str) -> bool {
         Self::for_op(domain, op_type).is_some()
     }
+
+    /// Whether this boundary's route-telemetry producer is published by
+    /// resolved kernel compilation and can therefore be absent temporarily.
+    ///
+    /// A missing producer is readiness-dependent only for these boundaries.
+    /// For every other boundary, absence is a terminal unsupported capability,
+    /// not permission to remain pending forever.
+    pub const fn route_telemetry_producer_may_appear_after_compilation(self) -> bool {
+        matches!(self, Self::QMoe)
+    }
 }
 
 /// An initializer the executor may expose as a lazy weight handle.
@@ -216,6 +226,25 @@ impl ExpertWeightGroup {
     pub fn contains(&self, value: ValueId) -> bool {
         self.members.contains(&value)
     }
+}
+
+/// One externally backed expert tensor whose lazy identity and expert-region
+/// catalog were both finalized by the session loader.
+#[derive(Clone, Debug)]
+pub struct FinalizedExpertWeight {
+    pub value: ValueId,
+    /// Exact external-data property that produced the live mmap identity.
+    pub external_path: std::path::PathBuf,
+    pub weight: LazyWeight,
+    pub catalog: onnx_runtime_loader::WeightRegionCatalog,
+}
+
+/// One graph-structural routed expert bank and the exact finalized tensors that
+/// may back it.
+#[derive(Clone, Debug)]
+pub struct FinalizedExpertBank {
+    pub group: ExpertWeightGroup,
+    pub members: Vec<FinalizedExpertWeight>,
 }
 
 /// Derive every [`ExpertWeightGroup`] in `graph`: one group per node whose
@@ -1343,6 +1372,21 @@ mod tests {
             None
         );
         assert!(!LazyWeightBoundary::matches_any("ai.onnx", "MatMul"));
+    }
+
+    #[test]
+    fn only_qmoe_has_a_deferred_route_telemetry_producer() {
+        assert!(LazyWeightBoundary::QMoe.route_telemetry_producer_may_appear_after_compilation());
+        for boundary in [
+            LazyWeightBoundary::MatMul,
+            LazyWeightBoundary::BlockQuantizedMoe,
+            LazyWeightBoundary::MatMulNBits,
+        ] {
+            assert!(
+                !boundary.route_telemetry_producer_may_appear_after_compilation(),
+                "{boundary:?} has no producer publication path"
+            );
+        }
     }
 
     fn shape1(n: usize) -> onnx_runtime_ir::Shape {

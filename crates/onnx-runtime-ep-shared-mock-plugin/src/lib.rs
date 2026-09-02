@@ -281,10 +281,6 @@ const SUPPORTED_OPS: &[&str] = &["Add", "Mul"];
 const SUPPORTED_DTYPES: &[DataType] = &[DataType::Float32];
 
 impl ExecutionProvider for SharedMockEp {
-    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
-        Ok(())
-    }
-
     fn name(&self) -> &str {
         "nxrt_shared_mock_ep"
     }
