@@ -304,6 +304,32 @@ fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager() {
             kernel.cuda_graph_compatible(),
             "eager staged decode must warm CUDA-graph capture support"
         );
+        if step == 0 {
+            let warmed_resources = kernel
+                .device_graph_resources()
+                .iter()
+                .map(|resource| resource.identity())
+                .collect::<Vec<_>>();
+            assert!(
+                !warmed_resources.is_empty(),
+                "capture-eligible Attention must publish its private workspace owners"
+            );
+            let failure = kernel.execute(&[], &mut []).unwrap_err().to_string();
+            assert!(failure.contains("expected 3..=7 inputs"), "{failure}");
+            assert!(
+                kernel.cuda_graph_compatible(),
+                "a failed replacement call must preserve the successful Attention warm"
+            );
+            assert_eq!(
+                kernel
+                    .device_graph_resources()
+                    .iter()
+                    .map(|resource| resource.identity())
+                    .collect::<Vec<_>>(),
+                warmed_resources,
+                "Attention capture eligibility and resources must remain one successful snapshot"
+            );
+        }
 
         let kernels: [&dyn Kernel; 1] = [kernel.as_ref()];
         runtime

@@ -415,6 +415,30 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup() {
         kernel.capture_support().is_supported(),
         "warmed f32 M==1 signature must advertise capture support"
     );
+    let warmed_resources = kernel
+        .device_graph_resources()
+        .iter()
+        .map(|resource| resource.identity())
+        .collect::<Vec<_>>();
+    // Some cuBLASLt algorithms require zero workspace on this GPU. The
+    // reduction regression supplies the non-empty resource falsifier; this
+    // MatMul cell pins the transactional eligibility/resource pairing for
+    // whichever exact set the selected algorithm owns.
+    let failure = kernel.execute(&[], &mut []).unwrap_err().to_string();
+    assert!(failure.contains("expected 2 inputs"), "{failure}");
+    assert!(
+        kernel.capture_support().is_supported(),
+        "a failed replacement call must preserve the successful MatMul warm"
+    );
+    assert_eq!(
+        kernel
+            .device_graph_resources()
+            .iter()
+            .map(|resource| resource.identity())
+            .collect::<Vec<_>>(),
+        warmed_resources,
+        "MatMul capture eligibility and resources must remain one successful snapshot"
+    );
     let allocations = rt.allocation_counts();
     rt.begin_graph_capture(&[kernel.as_ref()]).unwrap();
     execute(&mut c_buf);

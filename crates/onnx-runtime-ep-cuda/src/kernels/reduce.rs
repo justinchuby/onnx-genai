@@ -50,7 +50,6 @@
 //! * an axis out of `[-rank, rank)` → rejected, naming the axis.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::PushKernelArg;
@@ -670,7 +669,7 @@ macro_rules! reduce_factory {
                     cudnn_reduce: Mutex::new(CudnnReduceCache::new()),
                     warmed_axes: Mutex::new(None),
                     prepared_axes: Mutex::new(None),
-                    last_call_capture_safe: AtomicBool::new(false),
+                    capture_ready: Mutex::new(None),
                 }))
             }
         }
@@ -717,7 +716,10 @@ pub struct ReduceKernel {
     /// `execute_with_workspace`; stash the exact axes here so the launch path
     /// can reuse them without a second device→host read.
     prepared_axes: Mutex<Option<Vec<i64>>>,
-    last_call_capture_safe: AtomicBool,
+    /// Immutable signature and complete private-resource set from the most
+    /// recent successful capture-safe call. Failed replacement calls leave it
+    /// untouched; a successful replacement publishes the new state atomically.
+    capture_ready: Mutex<Option<Arc<ReductionCaptureReady>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -731,27 +733,71 @@ struct ReductionMetadataKey {
 #[derive(Debug)]
 struct ReductionMetadataCache {
     runtime: Arc<CudaRuntime>,
-    key: Option<ReductionMetadataKey>,
-    base: Option<Arc<GraphDeviceAllocation>>,
-    delta: Option<Arc<GraphDeviceAllocation>>,
-    axes: Option<Arc<GraphDeviceAllocation>>,
-    used: bool,
+    current: Option<PreparedReductionMetadata>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedReductionMetadata {
+    key: ReductionMetadataKey,
+    base: Arc<GraphDeviceAllocation>,
+    delta: Arc<GraphDeviceAllocation>,
+    axes: Arc<GraphDeviceAllocation>,
+}
+
+impl PreparedReductionMetadata {
+    fn pointers(&self) -> (CUdeviceptr, CUdeviceptr, CUdeviceptr) {
+        (self.base.ptr(), self.delta.ptr(), self.axes.ptr())
+    }
+
+    fn resources(&self) -> Vec<DeviceGraphResource> {
+        [&self.base, &self.delta, &self.axes]
+            .into_iter()
+            .map(GraphDeviceAllocation::device_graph_resource)
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReductionCaptureRoute {
+    Cudnn,
+    Nvrtc,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReductionCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+    reduce: Vec<bool>,
+    axes: Vec<i64>,
+    keepdims: bool,
+    route: ReductionCaptureRoute,
+}
+
+#[derive(Clone)]
+struct ReductionCaptureReady {
+    signature: ReductionCaptureSignature,
+    resources: Vec<DeviceGraphResource>,
+}
+
+impl std::fmt::Debug for ReductionCaptureReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReductionCaptureReady")
+            .field("signature", &self.signature)
+            .field(
+                "resource_ids",
+                &ReduceKernel::capture_resource_ids(&self.resources),
+            )
+            .finish()
+    }
 }
 
 impl ReductionMetadataCache {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            key: None,
-            base: None,
-            delta: None,
-            axes: None,
-            used: false,
+            current: None,
         }
-    }
-
-    fn begin_call(&mut self) {
-        self.used = false;
     }
 
     fn prepare(
@@ -761,28 +807,24 @@ impl ReductionMetadataCache {
         keepdims: bool,
         axes: &[i64],
         plan: &ReductionPlan,
-    ) -> Result<(CUdeviceptr, CUdeviceptr, CUdeviceptr)> {
-        self.used = true;
+    ) -> Result<PreparedReductionMetadata> {
         let key = ReductionMetadataKey {
             input_shape: input_shape.to_vec(),
             reduce: reduce.to_vec(),
             keepdims,
             axes: axes.to_vec(),
         };
-        if self.key.as_ref() == Some(&key) {
-            return match (&self.base, &self.delta, &self.axes) {
-                (Some(base), Some(delta), Some(axes)) => Ok((base.ptr(), delta.ptr(), axes.ptr())),
-                _ => Err(EpError::KernelFailed(
-                    "cuda_ep ReduceSum: cached reduction metadata lost a device allocation".into(),
-                )),
-            };
+        if let Some(current) = &self.current
+            && current.key == key
+        {
+            return Ok(current.clone());
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
                 "cuda_ep ReduceSum: int64 reduction metadata changed during CUDA graph capture; warm the fixed decode shape before capture".into(),
             ));
         }
-        if self.base.is_some() || self.delta.is_some() || self.axes.is_some() {
+        if self.current.is_some() {
             self.runtime.synchronize()?;
         }
 
@@ -800,23 +842,17 @@ impl ReductionMetadataCache {
         })();
         upload?;
 
-        let pointers = (base.ptr(), delta.ptr(), axes.ptr());
-        self.key = Some(key);
-        self.base = Some(base);
-        self.delta = Some(delta);
-        self.axes = Some(axes);
-        Ok(pointers)
+        let prepared = PreparedReductionMetadata {
+            key,
+            base,
+            delta,
+            axes,
+        };
+        Ok(prepared)
     }
 
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        if !self.used {
-            return Vec::new();
-        }
-        let mut resources = Vec::with_capacity(3);
-        for allocation in [&self.base, &self.delta, &self.axes].into_iter().flatten() {
-            resources.push(GraphDeviceAllocation::device_graph_resource(allocation));
-        }
-        resources
+    fn commit(&mut self, prepared: PreparedReductionMetadata) {
+        self.current = Some(prepared);
     }
 }
 
@@ -857,6 +893,114 @@ pub(crate) fn resolve_reduce_mask(
 }
 
 impl ReduceKernel {
+    fn capture_signature(
+        &self,
+        x: &TensorView,
+        output: &TensorMut,
+        reduce: &[bool],
+        axes: &[i64],
+        route: ReductionCaptureRoute,
+    ) -> ReductionCaptureSignature {
+        ReductionCaptureSignature {
+            dtype: x.dtype,
+            input_shape: x.shape.to_vec(),
+            output_shape: output.shape.to_vec(),
+            reduce: reduce.to_vec(),
+            axes: axes.to_vec(),
+            keepdims: self.keepdims,
+            route,
+        }
+    }
+
+    fn capture_resource_ids(resources: &[DeviceGraphResource]) -> Vec<usize> {
+        resources
+            .iter()
+            .map(DeviceGraphResource::identity)
+            .collect()
+    }
+
+    fn validate_captured_signature(&self, signature: &ReductionCaptureSignature) -> Result<()> {
+        let ready = self.capture_ready.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
+            )
+        })?;
+        let ready = ready.as_ref().ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep ReduceSum: capture began without a successful warmed reduction \
+                 signature. HOW: execute the exact fixed-shape reduction successfully before \
+                 beginning CUDA graph capture."
+                    .into(),
+            )
+        })?;
+        if ready.signature != *signature {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep ReduceSum: reduction signature changed during CUDA graph capture: \
+                 warmed={:?}, current={signature:?}. HOW: end or abort capture, then warm the \
+                 exact replacement signature before capturing it.",
+                ready.signature
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_captured_resources(&self, resources: &[DeviceGraphResource]) -> Result<()> {
+        let ready = self.capture_ready.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
+            )
+        })?;
+        let ready = ready.as_ref().ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep ReduceSum: capture began without a successful warmed reduction \
+                 signature/resources. HOW: abort capture and successfully warm the exact \
+                 fixed-shape reduction before retrying."
+                    .into(),
+            )
+        })?;
+        let warmed_ids = Self::capture_resource_ids(&ready.resources);
+        let current_ids = Self::capture_resource_ids(resources);
+        if warmed_ids != current_ids {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep ReduceSum: private reduction resources changed during CUDA graph \
+                 capture: warmed={warmed_ids:?}, current={current_ids:?}. HOW: abort capture and \
+                 successfully warm the exact signature/resources before retrying."
+            )));
+        }
+        for resource in resources {
+            self.runtime.require_registered_address_capture(
+                resource.identity(),
+                "Reduce metadata allocation",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn publish_capture_ready(
+        &self,
+        signature: ReductionCaptureSignature,
+        resources: Vec<DeviceGraphResource>,
+    ) -> Result<()> {
+        *self.capture_ready.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
+            )
+        })? = Some(Arc::new(ReductionCaptureReady {
+            signature,
+            resources,
+        }));
+        Ok(())
+    }
+
+    fn publish_capture_unsupported(&self) -> Result<()> {
+        *self.capture_ready.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
+            )
+        })? = None;
+        Ok(())
+    }
+
     /// Read the optional axes **input** (opset 13/18+) off the device as `i64`.
     fn read_axes_input(&self, op: &str, axes: &TensorView) -> Result<Vec<i64>> {
         if !axes.is_contiguous() {
@@ -905,33 +1049,24 @@ impl ReduceKernel {
                 ));
             }
             let cached_axes = self
-                .reduce_metadata
+                .capture_ready
                 .lock()
                 .map_err(|_| {
                     EpError::KernelFailed(
-                        "cuda_ep ReduceSum: metadata cache lock was poisoned".into(),
+                        "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
                     )
                 })?
-                .key
                 .as_ref()
-                .map(|key| key.axes.clone());
+                .map(|ready| ready.signature.axes.clone());
             let axes = match cached_axes {
                 Some(axes) => axes,
-                None => self
-                    .warmed_axes
-                    .lock()
-                    .map_err(|_| {
-                        EpError::KernelFailed(
-                            "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
-                        )
-                    })?
-                    .clone()
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep ReduceSum: axes were not warmed before CUDA graph capture"
-                                .into(),
-                        )
-                    })?,
+                None => {
+                    return Err(EpError::KernelFailed(
+                        "cuda_ep ReduceSum: axes were not part of a successful warmed capture \
+                         signature before CUDA graph capture"
+                            .into(),
+                    ));
+                }
             };
             Ok(Some(axes))
         } else if inputs.len() == 2 {
@@ -1043,14 +1178,6 @@ impl ReduceKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
-        self.reduce_metadata
-            .lock()
-            .map_err(|_| {
-                EpError::KernelFailed(
-                    "cuda_ep ReduceSum: reduction metadata lock was poisoned".into(),
-                )
-            })?
-            .begin_call();
         let op = self.op.name();
         if !(1..=2).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -1126,16 +1253,32 @@ impl ReduceKernel {
         }
 
         if x.numel() == 0 || outputs[0].numel() == 0 {
+            if capturing {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: an empty reduction cannot replace the successful warmed \
+                     signature during CUDA graph capture. HOW: abort capture and warm this exact \
+                     empty signature outside capture."
+                )));
+            }
+            self.publish_capture_unsupported()?;
             return Ok(());
         }
 
         if (!reduce.iter().any(|&axis| axis) || rank == 0) && self.op.ext_tags().is_none() {
+            if capturing {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: an identity reduction cannot replace the successful warmed \
+                     signature during CUDA graph capture. HOW: abort capture and run this \
+                     signature eagerly."
+                )));
+            }
             let src = cuptr(x.data_ptr::<u8>() as *const c_void);
             let dst = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
             if src != dst {
                 // SAFETY: identity reduction has equal input/output storage size.
                 unsafe { self.runtime.dtod(src, dst, x.byte_size()) }?;
             }
+            self.publish_capture_unsupported()?;
             return Ok(());
         }
 
@@ -1194,6 +1337,17 @@ impl ReduceKernel {
             && let Some(cudnn_op) = cudnn_op
             && self.runtime.cudnn().is_available()
         {
+            let signature = self.capture_signature(
+                x,
+                &outputs[0],
+                &reduce,
+                axes_raw.as_deref().unwrap_or(&[]),
+                ReductionCaptureRoute::Cudnn,
+            );
+            if capturing {
+                self.validate_captured_signature(&signature)?;
+                self.validate_captured_resources(&[])?;
+            }
             let (input_spec, output_spec) = cudnn_reduce_specs(x.dtype, x.shape, &reduce)?;
             let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
             let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
@@ -1225,8 +1379,8 @@ impl ReduceKernel {
             // the float reduce fold into the captured segment.
             if !capturing {
                 self.runtime.synchronize()?;
+                self.publish_capture_ready(signature, Vec::new())?;
             }
-            self.last_call_capture_safe.store(true, Ordering::Relaxed);
             return Ok(());
         }
 
@@ -1251,11 +1405,21 @@ impl ReduceKernel {
         // graph. A signature change mid-capture is rejected by `prepare` rather
         // than reallocating device memory inside the capture.
         let axes = axes_raw.as_deref().unwrap_or(&[]);
+        let signature =
+            self.capture_signature(x, &outputs[0], &reduce, axes, ReductionCaptureRoute::Nvrtc);
+        if capturing {
+            self.validate_captured_signature(&signature)?;
+        }
         let mut metadata = self.reduce_metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep ReduceSum: metadata cache lock was poisoned".into())
         })?;
-        let (base_buf, delta_buf, expected_axes) =
-            metadata.prepare(x.shape, &reduce, self.keepdims, axes, &plan)?;
+        let prepared = metadata.prepare(x.shape, &reduce, self.keepdims, axes, &plan)?;
+        drop(metadata);
+        let (base_buf, delta_buf, expected_axes) = prepared.pointers();
+        let resources = prepared.resources();
+        if capturing {
+            self.validate_captured_resources(&resources)?;
+        }
         // Only the Int64 DATA reduce reads the axes device buffer, so it alone
         // validates the captured axes against the warmed metadata. The float/
         // bf16 block reduce bakes the reduce mask into base/delta and never reads
@@ -1273,7 +1437,17 @@ impl ReduceKernel {
             reduce_count,
             capturing,
         )?;
-        self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        if !capturing {
+            self.reduce_metadata
+                .lock()
+                .map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep ReduceSum: metadata cache lock was poisoned".into(),
+                    )
+                })?
+                .commit(prepared);
+            self.publish_capture_ready(signature, resources)?;
+        }
         Ok(())
     }
 
@@ -1486,19 +1660,22 @@ impl Kernel for ReduceKernel {
     }
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.reduce_metadata
+        self.capture_ready
             .lock()
-            .map(|metadata| metadata.device_graph_resources())
+            .ok()
+            .and_then(|ready| ready.as_ref().map(|ready| ready.resources.clone()))
             .unwrap_or_default()
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        if self.last_call_capture_safe.load(Ordering::Relaxed) {
-            onnx_runtime_ep_api::CaptureSupport::Supported
-        } else {
-            onnx_runtime_ep_api::CaptureSupport::unsupported(
+        match self.capture_ready.lock() {
+            Ok(ready) if ready.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "requires a warmed fixed-shape ReduceSum path with warmed axes metadata and prepared persistent cuDNN workspace",
-            )
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "reduction capture readiness is unavailable because its state lock was poisoned",
+            ),
         }
     }
 }
@@ -1650,7 +1827,6 @@ mod tests {
 #[cfg(test)]
 mod claim_probes {
     use std::ffi::c_void;
-    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, Kernel, TensorMut, TensorView};
@@ -1674,7 +1850,7 @@ mod claim_probes {
             cudnn_reduce: Mutex::new(CudnnReduceCache::new()),
             warmed_axes: Mutex::new(None),
             prepared_axes: Mutex::new(None),
-            last_call_capture_safe: AtomicBool::new(false),
+            capture_ready: Mutex::new(None),
         }
     }
 

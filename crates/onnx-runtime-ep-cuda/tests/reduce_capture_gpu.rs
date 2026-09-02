@@ -587,6 +587,203 @@ fn f32_low_parallelism_reduce_prepared_workspace_uses_the_injected_allocator() {
     );
 }
 
+/// A failed replacement call must not split capture eligibility from the
+/// private resources belonging to the last successful warm.
+///
+/// Sequence:
+/// 1. warm signature A and record its exact three metadata owners;
+/// 2. fail before arity/shape validation can establish a replacement;
+/// 3. capture A, proving the same owners were retained at begin-capture;
+/// 4. drop A's kernel, warm a different signature B, then replay A;
+/// 5. observe B's resources release on kernel drop and A's on graph reset.
+///
+/// Without the immutable successful-warm snapshot, step 2 clears the resource
+/// list while leaving capture eligibility true. Step 3 then begins with no
+/// retained owners, and step 4 can recycle/overwrite the pointers embedded in
+/// A's graph.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn failed_reduce_call_preserves_capture_signature_resources_through_drop_rewarm_replay() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let dtype = DataType::Float16;
+    let axes_values = [1i64];
+    let axes = ep
+        .allocate(std::mem::size_of_val(&axes_values), 256)
+        .expect("allocate axes");
+    unsafe {
+        runtime
+            .htod(&bytes(&axes_values), cuptr(axes.as_ptr()))
+            .unwrap();
+    }
+
+    let a_in = [4usize, 8];
+    let a_out = [4usize, 1];
+    let a_values = varied(32, 0.25);
+    let a_data = ep.allocate(32 * 2, 256).expect("allocate A data");
+    let mut a_eager = ep.allocate(4 * 2, 256).expect("allocate A eager");
+    let mut a_captured = ep.allocate(4 * 2, 256).expect("allocate A captured");
+    unsafe {
+        runtime
+            .htod(&encode(&a_values, dtype), cuptr(a_data.as_ptr()))
+            .unwrap();
+    }
+    let kernel_a = reduce_kernel(&ep, "ReduceSum", dtype, &a_in, 1, true, &a_out);
+    let mut workspace_a = None;
+    execute_reduce(
+        &ep,
+        kernel_a.as_ref(),
+        dtype,
+        &a_data,
+        &a_in,
+        &axes,
+        1,
+        &mut a_eager,
+        &a_out,
+        &mut workspace_a,
+    );
+    assert!(kernel_a.cuda_graph_compatible());
+    let warmed_ids = {
+        let resources = kernel_a.device_graph_resources();
+        assert_eq!(
+            resources.len(),
+            3,
+            "NVRTC reduction warm must publish base, delta, and axes owners"
+        );
+        resources
+            .iter()
+            .map(|resource| resource.identity())
+            .collect::<Vec<_>>()
+    };
+
+    let failure = kernel_a.execute(&[], &mut []).unwrap_err().to_string();
+    assert!(failure.contains("expected 1-2 inputs"), "{failure}");
+    assert!(
+        kernel_a.cuda_graph_compatible(),
+        "a failed replacement must not erase the last successful warm"
+    );
+    let after_failure_ids = kernel_a
+        .device_graph_resources()
+        .iter()
+        .map(|resource| resource.identity())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after_failure_ids, warmed_ids,
+        "capture eligibility and retained resources must come from one immutable successful warm"
+    );
+
+    runtime
+        .begin_graph_capture(&[kernel_a.as_ref()])
+        .expect("the preserved A signature must still admit capture");
+    execute_reduce(
+        &ep,
+        kernel_a.as_ref(),
+        dtype,
+        &a_data,
+        &a_in,
+        &axes,
+        1,
+        &mut a_captured,
+        &a_out,
+        &mut workspace_a,
+    );
+    runtime.end_graph_capture().expect("end A capture");
+    assert_eq!(
+        runtime.graph_segment_count().unwrap(),
+        1,
+        "the valid A call must record one non-vacuous reduction segment"
+    );
+
+    let frees_before_a_drop = runtime.allocation_counts().frees;
+    let pooled_before_a_drop = runtime.raw_pool_retained_bytes();
+    drop(kernel_a);
+    assert_eq!(
+        runtime.allocation_counts().frees,
+        frees_before_a_drop,
+        "dropping A's kernel must not free metadata retained by its graph"
+    );
+    assert_eq!(
+        runtime.raw_pool_retained_bytes(),
+        pooled_before_a_drop,
+        "dropping A's kernel must not return graph-retained metadata to the pool"
+    );
+
+    let b_in = [2usize, 16];
+    let b_out = [2usize, 1];
+    let b_values = varied(32, 1.75);
+    let b_data = ep.allocate(32 * 2, 256).expect("allocate B data");
+    let mut b_output = ep.allocate(2 * 2, 256).expect("allocate B output");
+    unsafe {
+        runtime
+            .htod(&encode(&b_values, dtype), cuptr(b_data.as_ptr()))
+            .unwrap();
+    }
+    let kernel_b = reduce_kernel(&ep, "ReduceSum", dtype, &b_in, 1, true, &b_out);
+    let mut workspace_b = None;
+    execute_reduce(
+        &ep,
+        kernel_b.as_ref(),
+        dtype,
+        &b_data,
+        &b_in,
+        &axes,
+        1,
+        &mut b_output,
+        &b_out,
+        &mut workspace_b,
+    );
+    let b_ids = kernel_b
+        .device_graph_resources()
+        .iter()
+        .map(|resource| resource.identity())
+        .collect::<Vec<_>>();
+    assert_eq!(b_ids.len(), 3);
+    assert!(
+        b_ids.iter().all(|identity| !warmed_ids.contains(identity)),
+        "rewarming B must publish owners distinct from graph-retained A"
+    );
+
+    let counts_before_b_drop = runtime.allocation_counts();
+    let pooled_before_b_drop = runtime.raw_pool_retained_bytes();
+    drop(kernel_b);
+    assert!(
+        runtime.allocation_counts().frees > counts_before_b_drop.frees
+            || runtime.raw_pool_retained_bytes() > pooled_before_b_drop,
+        "dropping B must release its unretained replacement metadata"
+    );
+
+    runtime.replay_graph().expect("replay A after B rewarm");
+    assert_eq!(
+        read(&ep, &a_captured, 4 * 2),
+        read(&ep, &a_eager, 4 * 2),
+        "A replay must survive kernel drop and a different reduction rewarm"
+    );
+    assert_eq!(runtime.check_capture_error().unwrap(), 0);
+
+    let counts_before_reset = runtime.allocation_counts();
+    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+    assert!(runtime.reset_graph().unwrap());
+    assert!(
+        runtime.allocation_counts().frees > counts_before_reset.frees
+            || runtime.raw_pool_retained_bytes() > pooled_before_reset,
+        "graph reset must release A's retained base/delta/axes owners"
+    );
+
+    if let Some(workspace) = workspace_a.take() {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
+    if let Some(workspace) = workspace_b.take() {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
+    for buffer in [a_captured, a_eager, a_data, b_output, b_data, axes] {
+        ep.deallocate(buffer).unwrap();
+    }
+    common::drain_releases(&ep, "Reduce capture snapshot teardown");
+}
+
 /// A single kernel driven across two shapes to prove the cache key includes the
 /// shape: warm shape A, then run shape B, then shape A again — each must be
 /// numerically correct (a shape-blind cache would reuse A's workspace/descriptor
@@ -743,6 +940,11 @@ fn float_reduce_shape_change_under_capture_is_rejected() {
     assert!(
         result.is_err(),
         "a reduce signature change during capture must be rejected, not silently reuse the stale workspace"
+    );
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("signature changed during CUDA graph capture"),
+        "mismatch refusal must identify the rejected warmed/current signature: {message}"
     );
     runtime
         .abort_graph_capture()

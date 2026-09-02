@@ -1000,10 +1000,9 @@ pub struct StandardAttentionKernel {
     /// during the eager warmup step and reused (never grown) during CUDA-graph
     /// capture/replay.
     workspace: Mutex<StdAttnWorkspace>,
-    /// Set to the single-token decode signature after a successful
-    /// capture-eligible call; gates [`Self::capture_support`] to Supported only
-    /// once such a step has been warmed (mirrors GroupQueryAttention).
-    last_capture_safe_signature: Mutex<Option<StdAttnCaptureSignature>>,
+    /// Immutable signature and complete private workspace owners from the most
+    /// recent successful capture-eligible call.
+    capture_ready: Mutex<Option<Arc<StdAttnCaptureReady>>>,
 }
 
 /// Decode signature warmed as capture-safe. A subsequent capture pass reuses
@@ -1011,6 +1010,8 @@ pub struct StandardAttentionKernel {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StdAttnCaptureSignature {
     dtype: DataType,
+    inputs: Vec<(DataType, Vec<usize>, bool)>,
+    outputs: Vec<(DataType, Vec<usize>)>,
     batch: usize,
     q_heads: usize,
     kv_heads: usize,
@@ -1018,6 +1019,12 @@ struct StdAttnCaptureSignature {
     key_cap: usize,
     head_size: usize,
     v_head_size: usize,
+}
+
+#[derive(Clone)]
+struct StdAttnCaptureReady {
+    signature: StdAttnCaptureSignature,
+    resources: Vec<DeviceGraphResource>,
 }
 
 const WS_SCORES: usize = 0;
@@ -1466,6 +1473,12 @@ impl StdAttnWorkspace {
         if slot.bytes >= bytes
             && let Some(allocation) = slot.allocation.as_ref()
         {
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    GraphDeviceAllocation::device_graph_resource(allocation).identity(),
+                    "Attention workspace allocation",
+                )?;
+            }
             return Ok(allocation.ptr());
         }
         if self.runtime.is_capturing()? {
@@ -1543,7 +1556,7 @@ impl KernelFactory for StandardAttentionFactory {
             output_count: node.outputs.len(),
             since_version: self.since_version,
             workspace: Mutex::new(StdAttnWorkspace::new(self.runtime.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            capture_ready: Mutex::new(None),
         }))
     }
 }
@@ -1824,6 +1837,49 @@ impl StandardAttentionKernel {
 }
 
 impl StandardAttentionKernel {
+    fn validate_capture_signature(&self, signature: &StdAttnCaptureSignature) -> Result<()> {
+        let ready = self.capture_ready.lock().map_err(|_| {
+            EpError::KernelFailed("Attention: capture-ready state lock poisoned".into())
+        })?;
+        let ready = ready.as_ref().ok_or_else(|| {
+            EpError::KernelFailed(
+                "Attention: CUDA graph capture began without a successful warmed decode \
+                 signature. HOW: run the exact fixed-capacity decode call eagerly before \
+                 capture."
+                    .into(),
+            )
+        })?;
+        if ready.signature != *signature {
+            return Err(EpError::KernelFailed(format!(
+                "Attention: signature changed during CUDA graph capture: warmed={:?}, \
+                 current={signature:?}. HOW: abort capture and warm the exact replacement.",
+                ready.signature
+            )));
+        }
+        Ok(())
+    }
+
+    fn publish_capture_ready(
+        &self,
+        signature: StdAttnCaptureSignature,
+        resources: Vec<DeviceGraphResource>,
+    ) -> Result<()> {
+        *self.capture_ready.lock().map_err(|_| {
+            EpError::KernelFailed("Attention: capture-ready state lock poisoned".into())
+        })? = Some(Arc::new(StdAttnCaptureReady {
+            signature,
+            resources,
+        }));
+        Ok(())
+    }
+
+    fn publish_capture_unsupported(&self) -> Result<()> {
+        *self.capture_ready.lock().map_err(|_| {
+            EpError::KernelFailed("Attention: capture-ready state lock poisoned".into())
+        })? = None;
+        Ok(())
+    }
+
     fn run(
         &self,
         inputs: &[TensorView],
@@ -2238,6 +2294,34 @@ impl StandardAttentionKernel {
             let capturing = self.runtime.is_capturing()?;
             let staged_decode_eligible = (stage_key || stage_value) && batch == 1 && q_seq == 1;
             let capture_workspace_eligible = dev_length_eligible || staged_decode_eligible;
+            let capture_signature = capture_workspace_eligible.then(|| StdAttnCaptureSignature {
+                dtype,
+                inputs: inputs
+                    .iter()
+                    .map(|input| (input.dtype, input.shape.to_vec(), input.is_absent()))
+                    .collect(),
+                outputs: outputs
+                    .iter()
+                    .map(|output| (output.dtype, output.shape.to_vec()))
+                    .collect(),
+                batch,
+                q_heads,
+                kv_heads,
+                q_seq,
+                key_cap,
+                head_size,
+                v_head_size,
+            });
+            if capturing {
+                let signature = capture_signature.as_ref().ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "Attention: the current call is not a capture-eligible fixed-capacity \
+                         decode signature. HOW: abort capture and warm this exact route eagerly."
+                            .into(),
+                    )
+                })?;
+                self.validate_capture_signature(signature)?;
+            }
             // FlashDecoding split-KV: engage on the capture-safe fixed-capacity
             // decode route. `num_splits`/`chunk` derive only from the fixed cap
             // and row count, so the choice is identical under eager and capture.
@@ -2747,19 +2831,18 @@ impl StandardAttentionKernel {
             // single-token step has run through the device-length workspace path
             // with no per-op allocation or synchronize. `capture_support` gates
             // on this so the session only captures a warmed decode shape.
-            if capture_workspace_eligible {
-                let signature = StdAttnCaptureSignature {
-                    dtype,
-                    batch,
-                    q_heads,
-                    kv_heads,
-                    q_seq,
-                    key_cap,
-                    head_size,
-                    v_head_size,
-                };
-                if let Ok(mut slot) = self.last_capture_safe_signature.lock() {
-                    *slot = Some(signature);
+            if !capturing {
+                if let Some(signature) = capture_signature {
+                    let resources = self
+                        .workspace
+                        .lock()
+                        .map_err(|_| {
+                            EpError::KernelFailed("Attention: workspace lock poisoned".into())
+                        })?
+                        .device_graph_resources();
+                    self.publish_capture_ready(signature, resources)?;
+                } else {
+                    self.publish_capture_unsupported()?;
                 }
             }
             Ok(())
@@ -2818,9 +2901,10 @@ impl Kernel for StandardAttentionKernel {
     }
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.workspace
+        self.capture_ready
             .lock()
-            .map(|workspace| workspace.device_graph_resources())
+            .ok()
+            .and_then(|ready| ready.as_ref().map(|ready| ready.resources.clone()))
             .unwrap_or_default()
     }
 
@@ -2828,8 +2912,8 @@ impl Kernel for StandardAttentionKernel {
         // Eligible once a single-token decode step has been warmed with all
         // scratch reserved in the persistent workspace and its control uploads
         // done outside capture.
-        match self.last_capture_safe_signature.lock() {
-            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+        match self.capture_ready.lock() {
+            Ok(ready) if ready.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "requires a warmed capture-eligible single-token decode step",
             ),
@@ -2941,7 +3025,7 @@ mod alias_tests {
             output_count: 3,
             since_version: 24,
             workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            capture_ready: Mutex::new(None),
         };
 
         // Runs one decode step; when `alias` the present KV outputs share the
@@ -3145,7 +3229,7 @@ mod alias_tests {
             output_count: 3,
             since_version: 24,
             workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            capture_ready: Mutex::new(None),
         };
 
         // Lay a `[heads, valid, dim]` contiguous tensor into a `[heads, cap, dim]`
@@ -3315,7 +3399,7 @@ mod alias_tests {
             output_count: 1,
             since_version: 24,
             workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            capture_ready: Mutex::new(None),
         };
         const NEG: f32 = -65504.0;
         let mask_kind = 1i32; // f32 additive bias
@@ -3414,7 +3498,7 @@ mod alias_tests {
             output_count: 1,
             since_version: 24,
             workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            capture_ready: Mutex::new(None),
         };
         // No warmed decode step yet -> capture declined.
         assert!(
@@ -3425,16 +3509,21 @@ mod alias_tests {
             "fresh kernel must decline capture until a fixed-capacity device-valid-length decode step is warmed"
         );
         // Simulate a warmed single-token decode step recording its signature.
-        *kernel.last_capture_safe_signature.lock().unwrap() = Some(StdAttnCaptureSignature {
-            dtype: DataType::Float16,
-            batch: 1,
-            q_heads: 1,
-            kv_heads: 1,
-            q_seq: 1,
-            key_cap: 4096,
-            head_size: 192,
-            v_head_size: 128,
-        });
+        *kernel.capture_ready.lock().unwrap() = Some(Arc::new(StdAttnCaptureReady {
+            signature: StdAttnCaptureSignature {
+                dtype: DataType::Float16,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                batch: 1,
+                q_heads: 1,
+                kv_heads: 1,
+                q_seq: 1,
+                key_cap: 4096,
+                head_size: 192,
+                v_head_size: 128,
+            },
+            resources: Vec::new(),
+        }));
         assert!(
             matches!(
                 kernel.capture_support(),

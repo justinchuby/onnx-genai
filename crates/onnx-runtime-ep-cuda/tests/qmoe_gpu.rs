@@ -3348,6 +3348,33 @@ fn qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel() {
         kernel.capture_support().is_supported(),
         "kernel must claim capture support once warmed"
     );
+    let warmed_resources = kernel
+        .device_graph_resources()
+        .iter()
+        .map(|resource| resource.identity())
+        .collect::<Vec<_>>();
+    assert!(
+        !warmed_resources.is_empty(),
+        "warmed QMoE must publish its exact private scratch owners"
+    );
+    let failed_replacement = kernel.execute(&[], &mut []).unwrap_err().to_string();
+    assert!(
+        failed_replacement.contains("expected 7 to 21 inputs"),
+        "{failed_replacement}"
+    );
+    assert!(
+        kernel.capture_support().is_supported(),
+        "a failed replacement call must preserve the successful QMoE warm"
+    );
+    assert_eq!(
+        kernel
+            .device_graph_resources()
+            .iter()
+            .map(|resource| resource.identity())
+            .collect::<Vec<_>>(),
+        warmed_resources,
+        "QMoE capture eligibility and resources must remain one successful snapshot"
+    );
 
     let runtime = ep.runtime();
 
@@ -3422,9 +3449,12 @@ fn qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel() {
         Err(error) => error,
     };
     assert!(
-        error.to_string().contains("warmed capacity"),
+        error
+            .to_string()
+            .contains("signature changed during CUDA graph capture"),
         "unexpected rejection message: {error}"
     );
+    assert!(error.to_string().contains("HOW:"), "{error}");
     guard
         .abort()
         .expect("abort must succeed after a rejected in-capture growth attempt");
