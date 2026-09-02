@@ -49,6 +49,28 @@ impl ExecutorInstanceId {
     }
 }
 
+/// Process-unique identity of one logical inference session.
+///
+/// A logical session may own several executor instances (base decode,
+/// decode-inline, and verify). Providers receive this only as routing data and
+/// must validate it against exact provider-owned executor-generation state
+/// before using it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ExecutorLogicalSessionId(u64);
+
+impl ExecutorLogicalSessionId {
+    /// Stable numeric representation for provider-owned maps and diagnostics.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Reconstitute an identity stored in session-private lifecycle state.
+    #[doc(hidden)]
+    pub const fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 /// Exact provider-instance label echoed through session artifact calls.
 ///
 /// This is intentionally non-secret routing data, not a capability. The
@@ -447,12 +469,33 @@ pub struct DeviceValidationRegistration {
 /// transitions. Providers without mutable artifact state return `None`.
 pub trait ExecutorArtifactUseGuard: Send + Sync {}
 
+/// Transactional receipt for one state tensor publication.
+///
+/// The session prepares this while the exact executor artifact-use guard is
+/// active, before submitting kernels that produce the state. It publishes only
+/// after successful execution, or rolls back the attempted publication when
+/// execution fails.
+pub trait StatePublicationReceipt: Send {
+    fn publish(&mut self) -> Result<()>;
+    fn roll_back(&mut self) -> Result<()>;
+}
+
 /// Provider-owned state retained by the session after it privately validates a
 /// `Required` artifact report. The session stores the returned `Arc` in its
 /// private executor state and in every baked graph requirement; there is no
 /// public constructor, issuer, binder, proof resolver, or finalization path.
 pub trait ExecutorArtifactRequirementState: Send + Sync {
     fn acquire_use(&self) -> Result<Box<dyn ExecutorArtifactUseGuard>>;
+
+    /// Provider-specific observation control retained by the exact session
+    /// lifecycle owner.
+    ///
+    /// The session exposes only the observation belonging to its privately
+    /// validated requirement state; no provider/executor/generation labels are
+    /// accepted at that access boundary.
+    fn observation(&self) -> Option<&(dyn Any + Send + Sync)> {
+        None
+    }
 }
 
 impl DeviceValidationRegistration {
@@ -2094,11 +2137,13 @@ pub trait ExecutionProvider: Send + Sync {
     /// This method supplies data only. It cannot finalize a session: the
     /// session validates the report against its private immutable policy and
     /// readiness epoch before publishing a runnable state.
+    #[allow(clippy::too_many_arguments)]
     fn inspect_executor_artifacts(
         &self,
         _provider: ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        _logical_session: ExecutorLogicalSessionId,
         readiness: ExecutorArtifactReadinessEpoch,
         _graph: &Graph,
         _banks: &[crate::FinalizedExpertBank],
@@ -2126,6 +2171,7 @@ pub trait ExecutionProvider: Send + Sync {
         _provider: ExecutorArtifactProviderId,
         _executor: ExecutorInstanceId,
         _generation: ExecutorArtifactGeneration,
+        _logical_session: ExecutorLogicalSessionId,
     ) -> Result<()> {
         Ok(())
     }
@@ -2145,7 +2191,21 @@ pub trait ExecutionProvider: Send + Sync {
         _provider: ExecutorArtifactProviderId,
         _executor: ExecutorInstanceId,
         _generation: ExecutorArtifactGeneration,
+        _logical_session: ExecutorLogicalSessionId,
     ) -> Result<Option<Arc<dyn ExecutorArtifactRequirementState>>> {
+        Ok(None)
+    }
+
+    /// Reserve telemetry for state outputs that this session explicitly marks
+    /// as authoritative state publications.
+    ///
+    /// Non-participating providers return `None`. Participating providers must
+    /// reserve before execution so a capacity/overflow failure prevents the
+    /// state-producing operation from being submitted.
+    fn prepare_state_publication(
+        &self,
+        _bytes: u64,
+    ) -> Result<Option<Box<dyn StatePublicationReceipt>>> {
         Ok(None)
     }
 

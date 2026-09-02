@@ -348,9 +348,27 @@ pub struct DeviceIoBinding {
     /// Exact deferred-validation generation whose output was submitted into
     /// this binding. Foreign bindings never receive this token.
     device_validation: Option<DeviceValidationToken>,
+    state_publication: bool,
 }
 
 impl DeviceIoBinding {
+    /// Mark this output as authoritative session state.
+    ///
+    /// The executor reserves a provider state-publication receipt before
+    /// submitting the operation and publishes it only after successful
+    /// execution.
+    pub fn mark_state_publication(&mut self) {
+        self.state_publication = true;
+    }
+
+    pub(crate) fn state_publication_bytes(&self) -> u64 {
+        if self.state_publication && self.output_name.is_some() {
+            self.buffer().len() as u64
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn allocate(
         allocator: Arc<dyn ExecutionProvider>,
         spec: DeviceBindingSpec,
@@ -421,6 +439,7 @@ impl DeviceIoBinding {
             device_graph_token: None,
             validation_registration: Some(validation_registration),
             device_validation: None,
+            state_publication: false,
         })
     }
 
@@ -524,6 +543,7 @@ impl DeviceIoBinding {
             device_graph_token: None,
             validation_registration: Some(validation_registration),
             device_validation: None,
+            state_publication: false,
         })
     }
 

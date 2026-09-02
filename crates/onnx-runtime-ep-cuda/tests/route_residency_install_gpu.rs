@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use onnx_runtime_ep_api::{
     ExecutionProvider, ExecutorArtifactGeneration, ExecutorArtifactPending,
     ExecutorArtifactProviderId, ExecutorArtifactReadinessEpoch, ExecutorArtifactState,
-    ExecutorInstanceId, ExecutorRouteResidencyConfig,
+    ExecutorInstanceId, ExecutorLogicalSessionId, ExecutorRouteResidencyConfig,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
@@ -63,6 +63,7 @@ struct TestArtifactScope {
     provider: ExecutorArtifactProviderId,
     executor: ExecutorInstanceId,
     generation: ExecutorArtifactGeneration,
+    logical_session: ExecutorLogicalSessionId,
     route_residency: ExecutorRouteResidencyConfig,
 }
 
@@ -90,6 +91,7 @@ fn artifact_config(
         provider: policy.provider(),
         executor,
         generation: ExecutorArtifactGeneration::from_raw(NEXT.fetch_add(1, Ordering::Relaxed)),
+        logical_session: ExecutorLogicalSessionId::from_raw(executor.get()),
         route_residency: policy.route_residency(),
     }
 }
@@ -104,6 +106,7 @@ fn finalize_artifacts(
         config.provider,
         config.executor,
         config.generation,
+        config.logical_session,
         readiness,
         graph,
         &[],
@@ -604,6 +607,7 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
             foreign_drain.provider,
             foreign_drain.executor,
             foreign_drain.generation,
+            foreign_drain.logical_session,
         )
         .expect_err("a stale sibling generation must fail closed");
     assert!(
@@ -619,10 +623,20 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
         "draining a sibling executor cannot tear down the owner's producer"
     );
     provider
-        .drain_executor_artifacts(config.provider, config.executor, config.generation)
+        .drain_executor_artifacts(
+            config.provider,
+            config.executor,
+            config.generation,
+            config.logical_session,
+        )
         .expect("drain exact owner");
     provider
-        .drain_executor_artifacts(config.provider, config.executor, config.generation)
+        .drain_executor_artifacts(
+            config.provider,
+            config.executor,
+            config.generation,
+            config.logical_session,
+        )
         .expect("repeat exact drain is idempotent");
     assert!(
         provider.route_telemetry_sources(executor).is_empty(),
@@ -881,7 +895,12 @@ fn disabled_build_installs_and_retains_nothing() {
 
     // Draining the never-installed boundary is a safe no-op.
     provider
-        .drain_executor_artifacts(config.provider, config.executor, config.generation)
+        .drain_executor_artifacts(
+            config.provider,
+            config.executor,
+            config.generation,
+            config.logical_session,
+        )
         .expect("drain disabled exact scope");
     assert!(
         provider.route_telemetry_sources(executor).is_empty(),
@@ -945,6 +964,7 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
             stale_enabled_config.provider,
             stale_enabled_config.executor,
             stale_enabled_config.generation,
+            stale_enabled_config.logical_session,
             ExecutorArtifactReadinessEpoch::new(1),
             &graph,
             &[],
@@ -1008,6 +1028,7 @@ fn explicit_sibling_configs_are_isolated_and_mismatched_tokens_fail_closed() {
                         enabled_config.provider,
                         enabled_config.executor,
                         enabled_config.generation,
+                        enabled_config.logical_session,
                         ExecutorArtifactReadinessEpoch::new(2),
                         &graph,
                         &[],

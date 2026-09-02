@@ -1166,7 +1166,25 @@ impl Executor {
             )?;
             let mut validation_submission =
                 self.begin_device_validation_submission_for_bindings(bindings)?;
+            let state_publication_bytes = bindings.iter().try_fold(0_u64, |total, binding| {
+                total
+                    .checked_add(binding.state_publication_bytes())
+                    .ok_or_else(|| {
+                        SessionError::Internal(
+                            "captured state-publication output byte total overflowed u64".into(),
+                        )
+                    })
+            })?;
+            let mut state_publication = if state_publication_bytes == 0 {
+                None
+            } else {
+                self.ep.prepare_state_publication(state_publication_bytes)?
+            };
             if let Err(replay_error) = self.ep.replay_owned_device_graph(token) {
+                let publication = state_publication
+                    .as_mut()
+                    .map(|receipt| receipt.roll_back())
+                    .transpose();
                 let sync = self.ep.sync();
                 drop(artifact_use);
                 let validation = match sync {
@@ -1174,6 +1192,12 @@ impl Executor {
                     Err(error) => Err(error.into()),
                 };
                 validation_submission.disarm();
+                if let Err(publication_error) = publication {
+                    return Err(SessionError::Internal(format!(
+                        "device graph replay failed: {replay_error}; state-publication rollback \
+                         also failed: {publication_error}"
+                    )));
+                }
                 return match validation {
                     Ok(()) => Err(replay_error.into()),
                     Err(validation_error) => Err(SessionError::Internal(format!(
@@ -1183,12 +1207,23 @@ impl Executor {
                 };
             }
             let sync = self.ep.sync();
+            let publication = match sync.as_ref() {
+                Ok(()) => state_publication
+                    .as_mut()
+                    .map(|receipt| receipt.publish())
+                    .transpose(),
+                Err(_) => state_publication
+                    .as_mut()
+                    .map(|receipt| receipt.roll_back())
+                    .transpose(),
+            };
             drop(artifact_use);
             let validation = match sync {
                 Ok(()) => self.finish_device_validation_boundary_after_sync(route_residency),
                 Err(error) => Err(error.into()),
             };
             validation_submission.disarm();
+            publication?;
             validation?;
             return Ok(true);
         }
@@ -1567,6 +1602,7 @@ impl Executor {
                         len,
                         alignment,
                         device,
+                        state_publication: false,
                     });
                 value.dtype = dtype;
                 value.shape.clear();
@@ -1633,11 +1669,13 @@ impl Executor {
                         len,
                         alignment,
                         device,
+                        state_publication: binding.state_publication_bytes() != 0,
                     });
                 value.dtype = dtype;
                 value.shape.clear();
                 value.shape.extend_from_slice(binding.physical_shape());
                 value.accepts_subshape = binding.logical_shape() != binding.physical_shape();
+                value.state_publication = binding.state_publication_bytes() != 0;
                 if fixed_physical_strides {
                     dispatch::refill_contiguous_strides(
                         value.strides.get_or_insert_default(),

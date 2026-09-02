@@ -2000,6 +2000,18 @@ impl InferenceSession {
         self.exec.instance_id()
     }
 
+    /// Borrow provider-specific observation control owned by this exact
+    /// session executor.
+    ///
+    /// The value is available only after provider-artifact finalization and is
+    /// reached through the session's private provider/executor/generation
+    /// lifecycle state. No labels are accepted here, so one session cannot
+    /// select a sibling executor's observation state.
+    #[doc(hidden)]
+    pub fn provider_artifact_observation<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
+        self.exec.provider_artifact_observation::<T>()
+    }
+
     /// Export a `com.microsoft::EPContext` context-cache model for this session
     /// (§55.4 dump path), driven by the `ep.context_*` session options
     /// ([`Self::ep_context_config`]).

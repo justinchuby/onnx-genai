@@ -53,11 +53,11 @@ use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
     ExecutionProvider, ExecutorArtifactGeneration, ExecutorArtifactPending, ExecutorArtifactPolicy,
     ExecutorArtifactReadinessEpoch, ExecutorArtifactState, ExecutorInstanceId,
-    ExecutorRouteResidencyConfig, ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight,
-    Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
-    expert_weight_groups, lazy_weight_candidates,
+    ExecutorLogicalSessionId, ExecutorRouteResidencyConfig, ExternalMmapRegion,
+    FinalizedExpertBank, FinalizedExpertWeight, Kernel, KernelConstantInput, KernelInput,
+    KernelMatch, LazyWeight, LazyWeightBoundary, StructuralCaptureDecline, TensorBacking,
+    TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
+    WorkspaceRequirement, WorkspaceView, expert_weight_groups, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -88,6 +88,7 @@ use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tens
 
 static NEXT_EXECUTOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_ARTIFACT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_LOGICAL_SESSION: AtomicU64 = AtomicU64::new(1);
 
 fn allocate_non_reusable_identity(counter: &AtomicU64, exhausted: &'static str) -> Result<u64> {
     counter
@@ -113,6 +114,14 @@ fn issue_artifact_generation() -> Result<ExecutorArtifactGeneration> {
     .map(ExecutorArtifactGeneration::from_raw)
 }
 
+fn issue_logical_session_id() -> Result<ExecutorLogicalSessionId> {
+    allocate_non_reusable_identity(
+        &NEXT_LOGICAL_SESSION,
+        "logical session id space exhausted; refusing to wrap and create an ABA collision",
+    )
+    .map(ExecutorLogicalSessionId::from_raw)
+}
+
 /// The session-private lifecycle value. Public EP crates see only its routing
 /// labels and can return reports; they cannot construct, clone, or finalize
 /// this authority.
@@ -121,14 +130,25 @@ struct ExecutorArtifactConfig {
     policy: ExecutorArtifactPolicy,
     executor: ExecutorInstanceId,
     generation: ExecutorArtifactGeneration,
+    logical_session: ExecutorLogicalSessionId,
 }
 
 impl ExecutorArtifactConfig {
+    #[cfg(test)]
     fn issue(policy: ExecutorArtifactPolicy, executor: ExecutorInstanceId) -> Result<Self> {
+        Self::issue_for_logical_session(policy, executor, issue_logical_session_id()?)
+    }
+
+    fn issue_for_logical_session(
+        policy: ExecutorArtifactPolicy,
+        executor: ExecutorInstanceId,
+        logical_session: ExecutorLogicalSessionId,
+    ) -> Result<Self> {
         Ok(Self {
             policy,
             executor,
             generation: issue_artifact_generation()?,
+            logical_session,
         })
     }
 
@@ -144,6 +164,10 @@ impl ExecutorArtifactConfig {
         self.generation
     }
 
+    fn logical_session(self) -> ExecutorLogicalSessionId {
+        self.logical_session
+    }
+
     fn route_residency(self) -> ExecutorRouteResidencyConfig {
         self.policy.route_residency()
     }
@@ -154,7 +178,12 @@ fn drain_executor_artifacts_panic_safe(
     config: ExecutorArtifactConfig,
 ) -> onnx_runtime_ep_api::Result<()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ep.drain_executor_artifacts(config.provider(), config.executor(), config.generation())
+        ep.drain_executor_artifacts(
+            config.provider(),
+            config.executor(),
+            config.generation(),
+            config.logical_session(),
+        )
     }))
     .unwrap_or_else(|_| {
         Err(EpError::KernelFailed(format!(

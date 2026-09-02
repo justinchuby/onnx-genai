@@ -48,8 +48,23 @@
 //!     runtime.install_observed_byte_ledger(ledger).unwrap();
 //! }
 //! ```
+//!
+//! ```compile_fail,E0599
+//! use onnx_runtime_ep_api::{ExecutorArtifactGeneration, ExecutorInstanceId};
+//! use onnx_runtime_ep_cuda::CudaExecutionProvider;
+//!
+//! fn forge_labels(provider: &CudaExecutionProvider) {
+//!     let _ = provider.open_observed_byte_session(
+//!         ExecutorInstanceId::from_raw(0xfeed),
+//!         ExecutorArtifactGeneration::from_raw(0xbeef),
+//!         0xcafe,
+//!         16,
+//!     );
+//! }
+//! ```
 
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +95,17 @@ pub enum ObservedPhase {
     Teardown,
 }
 
+#[derive(Clone)]
+pub struct ObservedByteReadHandle {
+    inner: Arc<LedgerInner>,
+}
+
+impl ObservedByteReadHandle {
+    pub fn snapshot(&self) -> Result<ObservedSnapshot, LedgerError> {
+        snapshot_inner(&self.inner)
+    }
+}
+
 impl ObservedPhase {
     pub const ALL: [Self; PHASE_COUNT] = [
         Self::Setup,
@@ -96,6 +122,26 @@ impl ObservedPhase {
     const fn index(self) -> usize {
         self as usize
     }
+}
+
+fn snapshot_inner(inner: &Arc<LedgerInner>) -> Result<ObservedSnapshot, LedgerError> {
+    let guard = inner.lock();
+    let state = guard.state();
+    ensure_unfaulted(state)?;
+    if state.pending != 0 {
+        return Err(LedgerError::PendingSubmissions {
+            count: state.pending,
+        });
+    }
+    Ok(ObservedSnapshot {
+        schema: OBSERVED_BYTE_SCHEMA,
+        scope: inner.scope,
+        epoch: state.epoch,
+        phase: state.phase,
+        events: state.events[..state.event_len].to_vec(),
+        totals: state.totals,
+        phase_totals: state.phase_totals,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -223,6 +269,7 @@ pub enum ObservedBoundary {
     PinnedHostAllocate,
     PinnedHostReuse,
     MmapMaterialize,
+    ResidentMaterialize,
     WeightVmmReserve,
     WeightVmmMap,
     WeightVmmUnmap,
@@ -295,12 +342,13 @@ impl ObservedSnapshot {
 pub enum LedgerFault {
     SubmissionAbandoned,
     StaleRecorderUse,
+    UnreportedOperation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LedgerError {
     ZeroCapacity,
-    AlreadyAttached,
+    Retiring,
     Closed,
     StaleEpoch {
         expected: u64,
@@ -344,9 +392,8 @@ impl fmt::Display for LedgerError {
             Self::ZeroCapacity => {
                 formatter.write_str("observed-byte event capacity must be greater than zero")
             }
-            Self::AlreadyAttached => formatter.write_str(
-                "observed-byte ledger is already attached to a production runtime; create a \
-                 separate ledger for a sibling provider",
+            Self::Retiring => formatter.write_str(
+                "observed-byte ledger is retiring; no new production operation may attach",
             ),
             Self::Closed => formatter.write_str(
                 "observed-byte ledger is closed; create a new ledger for further production work",
@@ -443,15 +490,20 @@ struct LedgerState {
     event_len: usize,
     totals: [u64; TOTAL_COUNT],
     phase_totals: [u64; PHASE_TOTAL_COUNT],
+    reserved_events: usize,
+    reserved_totals: [u64; TOTAL_COUNT],
+    reserved_phase_totals: [u64; PHASE_TOTAL_COUNT],
     pending: usize,
+    active_recorders: usize,
+    retiring: bool,
     closed: bool,
     fault: Option<LedgerFault>,
 }
 
 struct LedgerInner {
     scope: ObservedScope,
+    runtime_id: u64,
     gate: AtomicBool,
-    attached: AtomicBool,
     state: UnsafeCell<LedgerState>,
 }
 
@@ -519,7 +571,16 @@ impl fmt::Debug for ObservedByteLedger {
 }
 
 impl ObservedByteLedger {
+    #[cfg(test)]
     pub(crate) fn new(scope: ObservedScope, event_capacity: usize) -> Result<Self, LedgerError> {
+        Self::new_for_runtime(scope, 0, event_capacity)
+    }
+
+    pub(crate) fn new_for_runtime(
+        scope: ObservedScope,
+        runtime_id: u64,
+        event_capacity: usize,
+    ) -> Result<Self, LedgerError> {
         if event_capacity == 0 {
             return Err(LedgerError::ZeroCapacity);
         }
@@ -537,8 +598,8 @@ impl ObservedByteLedger {
         Ok(Self {
             inner: Arc::new(LedgerInner {
                 scope,
+                runtime_id,
                 gate: AtomicBool::new(false),
-                attached: AtomicBool::new(false),
                 state: UnsafeCell::new(LedgerState {
                     epoch: 1,
                     next_submission: 1,
@@ -548,7 +609,12 @@ impl ObservedByteLedger {
                     event_len: 0,
                     totals: [0; TOTAL_COUNT],
                     phase_totals: [0; PHASE_TOTAL_COUNT],
+                    reserved_events: 0,
+                    reserved_totals: [0; TOTAL_COUNT],
+                    reserved_phase_totals: [0; PHASE_TOTAL_COUNT],
                     pending: 0,
+                    active_recorders: 0,
+                    retiring: false,
                     closed: false,
                     fault: None,
                 }),
@@ -560,7 +626,7 @@ impl ObservedByteLedger {
         self.inner.scope
     }
 
-    pub fn set_phase(&mut self, phase: ObservedPhase) -> Result<(), LedgerError> {
+    pub fn set_phase(&self, phase: ObservedPhase) -> Result<(), LedgerError> {
         let mut guard = self.inner.lock();
         let state = guard.state_mut();
         ensure_available(state)?;
@@ -574,26 +640,16 @@ impl ObservedByteLedger {
     }
 
     pub fn snapshot(&self) -> Result<ObservedSnapshot, LedgerError> {
-        let guard = self.inner.lock();
-        let state = guard.state();
-        ensure_available(state)?;
-        if state.pending != 0 {
-            return Err(LedgerError::PendingSubmissions {
-                count: state.pending,
-            });
-        }
-        Ok(ObservedSnapshot {
-            schema: OBSERVED_BYTE_SCHEMA,
-            scope: self.inner.scope,
-            epoch: state.epoch,
-            phase: state.phase,
-            events: state.events[..state.event_len].to_vec(),
-            totals: state.totals,
-            phase_totals: state.phase_totals,
-        })
+        snapshot_inner(&self.inner)
     }
 
-    pub fn reset(&mut self) -> Result<(), LedgerError> {
+    pub fn read_handle(&self) -> ObservedByteReadHandle {
+        ObservedByteReadHandle {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    pub fn reset(&self) -> Result<(), LedgerError> {
         let mut guard = self.inner.lock();
         let state = guard.state_mut();
         if state.closed {
@@ -613,11 +669,14 @@ impl ObservedByteLedger {
         state.event_len = 0;
         state.totals.fill(0);
         state.phase_totals.fill(0);
+        state.reserved_events = 0;
+        state.reserved_totals.fill(0);
+        state.reserved_phase_totals.fill(0);
         state.fault = None;
         Ok(())
     }
 
-    pub fn close(&mut self) -> Result<(), LedgerError> {
+    pub fn close(&self) -> Result<(), LedgerError> {
         let mut guard = self.inner.lock();
         let state = guard.state_mut();
         if state.closed {
@@ -629,32 +688,53 @@ impl ObservedByteLedger {
             });
         }
         state.closed = true;
+        state.retiring = false;
         Ok(())
     }
 
-    pub(crate) fn attach(&self) -> Result<ProductionByteRecorder, LedgerError> {
-        if self
-            .inner
-            .attached
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(LedgerError::AlreadyAttached);
-        }
-        let guard = self.inner.lock();
-        let state = guard.state();
+    pub(crate) fn recorder(&self) -> Result<ProductionByteRecorder, LedgerError> {
+        let mut guard = self.inner.lock();
+        let state = guard.state_mut();
         ensure_available(state)?;
+        state.active_recorders = state
+            .active_recorders
+            .checked_add(1)
+            .ok_or(LedgerError::SubmissionExhausted)?;
         Ok(ProductionByteRecorder {
             inner: Arc::clone(&self.inner),
             epoch: state.epoch,
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn attach(&self) -> Result<ProductionByteRecorder, LedgerError> {
+        self.recorder()
+    }
+
+    pub(crate) fn retire(&self) {
+        let mut guard = self.inner.lock();
+        let state = guard.state_mut();
+        state.retiring = true;
+        if state.active_recorders == 0 {
+            state.closed = true;
+        }
+    }
 }
 
-#[derive(Clone)]
 pub(crate) struct ProductionByteRecorder {
     inner: Arc<LedgerInner>,
     epoch: u64,
+}
+
+impl Drop for ProductionByteRecorder {
+    fn drop(&mut self) {
+        let mut guard = self.inner.lock();
+        let state = guard.state_mut();
+        state.active_recorders = state.active_recorders.saturating_sub(1);
+        if state.active_recorders == 0 && state.retiring {
+            state.closed = true;
+        }
+    }
 }
 
 impl fmt::Debug for ProductionByteRecorder {
@@ -668,6 +748,25 @@ impl fmt::Debug for ProductionByteRecorder {
 }
 
 impl ProductionByteRecorder {
+    pub(crate) fn taint_unreported_operation(&self) {
+        let mut guard = self.inner.lock();
+        guard.state_mut().fault = Some(LedgerFault::UnreportedOperation);
+    }
+
+    pub(crate) fn duplicate(&self) -> Result<Self, LedgerError> {
+        let mut guard = self.inner.lock();
+        let state = guard.state_mut();
+        ensure_recorder(state, self.epoch)?;
+        state.active_recorders = state
+            .active_recorders
+            .checked_add(1)
+            .ok_or(LedgerError::SubmissionExhausted)?;
+        Ok(Self {
+            inner: Arc::clone(&self.inner),
+            epoch: self.epoch,
+        })
+    }
+
     pub(crate) fn begin(&self) -> Result<PendingObservedBatch, LedgerError> {
         let mut guard = self.inner.lock();
         let state = guard.state_mut();
@@ -680,8 +779,15 @@ impl ProductionByteRecorder {
             .pending
             .checked_add(1)
             .ok_or(LedgerError::SubmissionExhausted)?;
+        state.active_recorders = state
+            .active_recorders
+            .checked_add(1)
+            .ok_or(LedgerError::SubmissionExhausted)?;
         Ok(PendingObservedBatch {
-            recorder: self.clone(),
+            recorder: ProductionByteRecorder {
+                inner: Arc::clone(&self.inner),
+                epoch: self.epoch,
+            },
             epoch: self.epoch,
             submission,
             phase: state.phase,
@@ -691,11 +797,143 @@ impl ProductionByteRecorder {
                 ObservedStatus::Unsupported,
                 0,
             ); MAX_BATCH_EVENTS],
+            reserved_specs: [EventSpec::new(
+                ObservedCategory::SourceRead,
+                ObservedBoundary::AsyncCompletionUnsupported,
+                ObservedStatus::Unsupported,
+                0,
+            ); MAX_BATCH_EVENTS],
             len: 0,
+            reserved: false,
             terminal: false,
         })
     }
 
+    pub(crate) fn prepare(&self, specs: &[EventSpec]) -> Result<PendingObservedBatch, LedgerError> {
+        if specs.len() > MAX_BATCH_EVENTS {
+            return Err(LedgerError::BatchCapacityExceeded {
+                capacity: MAX_BATCH_EVENTS,
+            });
+        }
+        let mut guard = self.inner.lock();
+        let state = guard.state_mut();
+        ensure_recorder(state, self.epoch)?;
+        reserve_specs(state, specs, state.phase)?;
+        let submission = state.next_submission;
+        state.next_submission = submission
+            .checked_add(1)
+            .ok_or(LedgerError::SubmissionExhausted)?;
+        state.pending = state
+            .pending
+            .checked_add(1)
+            .ok_or(LedgerError::SubmissionExhausted)?;
+        state.active_recorders = state
+            .active_recorders
+            .checked_add(1)
+            .ok_or(LedgerError::SubmissionExhausted)?;
+        let mut batch = PendingObservedBatch {
+            recorder: ProductionByteRecorder {
+                inner: Arc::clone(&self.inner),
+                epoch: self.epoch,
+            },
+            epoch: self.epoch,
+            submission,
+            phase: state.phase,
+            specs: [EventSpec::new(
+                ObservedCategory::SourceRead,
+                ObservedBoundary::AsyncCompletionUnsupported,
+                ObservedStatus::Unsupported,
+                0,
+            ); MAX_BATCH_EVENTS],
+            reserved_specs: [EventSpec::new(
+                ObservedCategory::SourceRead,
+                ObservedBoundary::AsyncCompletionUnsupported,
+                ObservedStatus::Unsupported,
+                0,
+            ); MAX_BATCH_EVENTS],
+            len: specs.len(),
+            reserved: true,
+            terminal: false,
+        };
+        batch.specs[..specs.len()].copy_from_slice(specs);
+        batch.reserved_specs[..specs.len()].copy_from_slice(specs);
+        Ok(batch)
+    }
+}
+
+pub(crate) struct ExecutionRecorderRegistry {
+    active: std::sync::Mutex<HashMap<std::thread::ThreadId, Vec<ProductionByteRecorder>>>,
+}
+
+impl Default for ExecutionRecorderRegistry {
+    fn default() -> Self {
+        Self {
+            active: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl ExecutionRecorderRegistry {
+    pub(crate) fn enter(
+        self: &Arc<Self>,
+        recorder: ProductionByteRecorder,
+    ) -> RecorderContextGuard {
+        let thread = std::thread::current().id();
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(thread)
+            .or_default()
+            .push(recorder);
+        RecorderContextGuard {
+            registry: Arc::clone(self),
+            thread,
+        }
+    }
+
+    pub(crate) fn current(
+        &self,
+        runtime_id: u64,
+    ) -> Result<Option<ProductionByteRecorder>, LedgerError> {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active
+            .get(&std::thread::current().id())
+            .and_then(|stack| {
+                stack
+                    .iter()
+                    .rev()
+                    .find(|recorder| recorder.inner.runtime_id == runtime_id)
+            })
+            .map(ProductionByteRecorder::duplicate)
+            .transpose()
+    }
+}
+
+pub(crate) struct RecorderContextGuard {
+    registry: Arc<ExecutionRecorderRegistry>,
+    thread: std::thread::ThreadId,
+}
+
+impl Drop for RecorderContextGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .registry
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(stack) = active.get_mut(&self.thread) {
+            stack.pop();
+            if stack.is_empty() {
+                active.remove(&self.thread);
+            }
+        }
+    }
+}
+
+impl ProductionByteRecorder {
     pub(crate) fn record(&self, spec: EventSpec) -> Result<(), LedgerError> {
         let mut batch = self.begin()?;
         batch.push(spec)?;
@@ -720,11 +958,30 @@ pub(crate) struct PendingObservedBatch {
     submission: u64,
     phase: ObservedPhase,
     specs: [EventSpec; MAX_BATCH_EVENTS],
+    reserved_specs: [EventSpec; MAX_BATCH_EVENTS],
     len: usize,
+    reserved: bool,
     terminal: bool,
 }
 
 impl PendingObservedBatch {
+    pub(crate) fn set_boundary(&mut self, index: usize, boundary: ObservedBoundary) {
+        if !self.terminal && index < self.len {
+            self.specs[index].boundary = boundary;
+        }
+    }
+
+    pub(crate) fn set_bytes(&mut self, index: usize, bytes: u64) -> Result<(), LedgerError> {
+        if self.terminal {
+            return Err(LedgerError::SubmissionTerminal);
+        }
+        if index >= self.len || bytes > self.reserved_specs[index].bytes {
+            return Err(LedgerError::BatchCapacityExceeded { capacity: self.len });
+        }
+        self.specs[index].bytes = bytes;
+        Ok(())
+    }
+
     pub(crate) fn push(&mut self, spec: EventSpec) -> Result<(), LedgerError> {
         if self.terminal {
             return Err(LedgerError::SubmissionTerminal);
@@ -746,6 +1003,10 @@ impl PendingObservedBatch {
         let mut guard = self.recorder.inner.lock();
         let state = guard.state_mut();
         ensure_recorder(state, self.epoch)?;
+        if self.reserved {
+            release_reserved_specs(state, &self.reserved_specs[..self.len], self.phase);
+            self.reserved = false;
+        }
         let new_len =
             state
                 .event_len
@@ -844,10 +1105,124 @@ impl PendingObservedBatch {
         let mut guard = self.recorder.inner.lock();
         let state = guard.state_mut();
         if state.epoch == self.epoch && state.pending > 0 {
+            if self.reserved {
+                release_reserved_specs(state, &self.reserved_specs[..self.len], self.phase);
+                self.reserved = false;
+            }
             state.pending -= 1;
             state.fault = Some(LedgerFault::SubmissionAbandoned);
         }
+
         self.terminal = true;
+    }
+}
+
+fn reserve_specs(
+    state: &mut LedgerState,
+    specs: &[EventSpec],
+    phase: ObservedPhase,
+) -> Result<(), LedgerError> {
+    let requested = state.reserved_events.checked_add(specs.len()).ok_or(
+        LedgerError::EventCapacityExceeded {
+            capacity: state.events.len(),
+            committed: state.event_len,
+            requested: specs.len(),
+        },
+    )?;
+    let occupied =
+        state
+            .event_len
+            .checked_add(requested)
+            .ok_or(LedgerError::EventCapacityExceeded {
+                capacity: state.events.len(),
+                committed: state.event_len,
+                requested: specs.len(),
+            })?;
+    if occupied > state.events.len() {
+        return Err(LedgerError::EventCapacityExceeded {
+            capacity: state.events.len(),
+            committed: state.event_len + state.reserved_events,
+            requested: specs.len(),
+        });
+    }
+    state
+        .next_sequence
+        .checked_add(requested as u64)
+        .ok_or(LedgerError::SequenceExhausted)?;
+    let mut reserved_totals = state.reserved_totals;
+    let mut reserved_phase_totals = state.reserved_phase_totals;
+    for spec in specs {
+        let total = total_index(spec.category, spec.status);
+        let current = state.totals[total]
+            .checked_add(reserved_totals[total])
+            .ok_or(LedgerError::ByteTotalOverflow {
+                phase,
+                category: spec.category,
+                status: spec.status,
+                current: state.totals[total],
+                added: reserved_totals[total],
+            })?;
+        reserved_totals[total] = reserved_totals[total].checked_add(spec.bytes).ok_or(
+            LedgerError::ByteTotalOverflow {
+                phase,
+                category: spec.category,
+                status: spec.status,
+                current,
+                added: spec.bytes,
+            },
+        )?;
+        state.totals[total]
+            .checked_add(reserved_totals[total])
+            .ok_or(LedgerError::ByteTotalOverflow {
+                phase,
+                category: spec.category,
+                status: spec.status,
+                current,
+                added: spec.bytes,
+            })?;
+        let phase_total = phase_total_index(phase, spec.category, spec.status);
+        let current_phase = state.phase_totals[phase_total]
+            .checked_add(reserved_phase_totals[phase_total])
+            .ok_or(LedgerError::ByteTotalOverflow {
+                phase,
+                category: spec.category,
+                status: spec.status,
+                current: state.phase_totals[phase_total],
+                added: reserved_phase_totals[phase_total],
+            })?;
+        reserved_phase_totals[phase_total] = reserved_phase_totals[phase_total]
+            .checked_add(spec.bytes)
+            .ok_or(LedgerError::ByteTotalOverflow {
+                phase,
+                category: spec.category,
+                status: spec.status,
+                current: current_phase,
+                added: spec.bytes,
+            })?;
+        state.phase_totals[phase_total]
+            .checked_add(reserved_phase_totals[phase_total])
+            .ok_or(LedgerError::ByteTotalOverflow {
+                phase,
+                category: spec.category,
+                status: spec.status,
+                current: current_phase,
+                added: spec.bytes,
+            })?;
+    }
+    state.reserved_events = requested;
+    state.reserved_totals = reserved_totals;
+    state.reserved_phase_totals = reserved_phase_totals;
+    Ok(())
+}
+
+fn release_reserved_specs(state: &mut LedgerState, specs: &[EventSpec], phase: ObservedPhase) {
+    state.reserved_events = state.reserved_events.saturating_sub(specs.len());
+    for spec in specs {
+        let total = total_index(spec.category, spec.status);
+        state.reserved_totals[total] = state.reserved_totals[total].saturating_sub(spec.bytes);
+        let phase_total = phase_total_index(phase, spec.category, spec.status);
+        state.reserved_phase_totals[phase_total] =
+            state.reserved_phase_totals[phase_total].saturating_sub(spec.bytes);
     }
 }
 
@@ -861,14 +1236,23 @@ fn ensure_available(state: &LedgerState) -> Result<(), LedgerError> {
     if state.closed {
         return Err(LedgerError::Closed);
     }
-    if let Some(fault) = state.fault {
-        return Err(LedgerError::Faulted { fault });
+    if state.retiring {
+        return Err(LedgerError::Retiring);
     }
-    Ok(())
+    ensure_unfaulted(state)
+}
+
+fn ensure_unfaulted(state: &LedgerState) -> Result<(), LedgerError> {
+    state
+        .fault
+        .map_or(Ok(()), |fault| Err(LedgerError::Faulted { fault }))
 }
 
 fn ensure_recorder(state: &mut LedgerState, epoch: u64) -> Result<(), LedgerError> {
-    ensure_available(state)?;
+    if state.closed {
+        return Err(LedgerError::Closed);
+    }
+    ensure_unfaulted(state)?;
     if state.epoch != epoch {
         state.fault = Some(LedgerFault::StaleRecorderUse);
         return Err(LedgerError::StaleEpoch {
@@ -937,6 +1321,7 @@ mod tests {
                 0
             );
         }
+
         batch.abandon();
         assert!(matches!(
             ledger.snapshot(),
@@ -944,6 +1329,47 @@ mod tests {
                 fault: LedgerFault::SubmissionAbandoned
             })
         ));
+    }
+
+    #[test]
+    fn prepared_operation_reserves_capacity_and_failure_releases_the_success_totals() {
+        let ledger = ObservedByteLedger::new(scope(), 1).unwrap();
+        let recorder = ledger.attach().unwrap();
+        let mut first = recorder.prepare(&[completed(7)]).unwrap();
+        assert!(matches!(
+            recorder.prepare(&[completed(1)]),
+            Err(LedgerError::EventCapacityExceeded {
+                capacity: 1,
+                committed: 1,
+                requested: 1,
+            })
+        ));
+        first.abort(ObservedStatus::Failed).unwrap();
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed),
+            0
+        );
+        assert_eq!(
+            snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Failed),
+            7
+        );
+    }
+
+    #[test]
+    fn prepared_operation_detects_total_overflow_before_submission() {
+        let ledger = ObservedByteLedger::new(scope(), 2).unwrap();
+        let recorder = ledger.attach().unwrap();
+        recorder.record(completed(u64::MAX)).unwrap();
+        assert!(matches!(
+            recorder.prepare(&[completed(1)]),
+            Err(LedgerError::ByteTotalOverflow {
+                current: u64::MAX,
+                added: 1,
+                ..
+            })
+        ));
+        assert_eq!(ledger.snapshot().unwrap().events.len(), 1);
     }
 
     #[test]
@@ -1114,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn sibling_with_same_public_scope_cannot_attach_or_mutate_this_instance() {
+    fn sibling_with_same_public_scope_has_distinct_instance_state() {
         let first = ObservedByteLedger::new(scope(), 4).unwrap();
         let second = ObservedByteLedger::new(scope(), 4).unwrap();
         let first_recorder = first.attach().unwrap();
@@ -1135,14 +1561,13 @@ mod tests {
                 .bytes(ObservedCategory::H2d, ObservedStatus::Completed),
             5
         );
-        assert!(matches!(first.attach(), Err(LedgerError::AlreadyAttached)));
     }
 
     #[test]
     fn moved_ledger_remains_bound_and_stale_recorder_fails_after_reset() {
         let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
         let recorder = ledger.attach().unwrap();
-        let mut moved = ledger;
+        let moved = ledger;
         recorder.record(completed(2)).unwrap();
         assert_eq!(moved.snapshot().unwrap().events.len(), 1);
         moved.reset().unwrap();
@@ -1160,7 +1585,7 @@ mod tests {
 
     #[test]
     fn duplicate_finish_and_close_are_idempotent() {
-        let mut ledger = ObservedByteLedger::new(scope(), 4).unwrap();
+        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
         let recorder = ledger.attach().unwrap();
         let mut batch = recorder.begin().unwrap();
         batch.push(completed(9)).unwrap();
@@ -1169,7 +1594,7 @@ mod tests {
         assert_eq!(ledger.snapshot().unwrap().events.len(), 1);
         ledger.close().unwrap();
         ledger.close().unwrap();
-        assert!(matches!(ledger.snapshot(), Err(LedgerError::Closed)));
+        assert_eq!(ledger.snapshot().unwrap().events.len(), 1);
     }
 
     #[test]
@@ -1199,7 +1624,7 @@ mod tests {
 
     #[test]
     fn reset_and_close_refuse_in_flight_submission() {
-        let mut ledger = ObservedByteLedger::new(scope(), 4).unwrap();
+        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
         let recorder = ledger.attach().unwrap();
         let mut batch = recorder.begin().unwrap();
         assert!(matches!(
@@ -1217,7 +1642,7 @@ mod tests {
 
     #[test]
     fn post_close_recorder_is_stale_and_cannot_publish() {
-        let mut ledger = ObservedByteLedger::new(scope(), 4).unwrap();
+        let ledger = ObservedByteLedger::new(scope(), 4).unwrap();
         let recorder = ledger.attach().unwrap();
         ledger.close().unwrap();
         assert!(matches!(

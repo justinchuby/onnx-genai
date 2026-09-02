@@ -181,6 +181,35 @@ fn add_duration(counter: &AtomicU64, elapsed: Duration) {
     counter.fetch_add(nanos, Ordering::Relaxed);
 }
 
+fn observed_receipt_suffix(result: onnx_runtime_ep_api::Result<()>) -> String {
+    result.map_or_else(
+        |error| format!("; observed-byte receipt also failed: {error}"),
+        |()| String::new(),
+    )
+}
+
+fn report_deferred_receipt_failure(error: crate::byte_telemetry::LedgerError) {
+    eprintln!(
+        "cuda_ep: ERROR: a deferred release completed without a publishable observed-byte \
+         receipt: {error}; the owning measurement ledger is faulted and cannot produce a \
+         comparable snapshot"
+    );
+}
+
+fn record_deferred_receipt(
+    recorder: Option<crate::byte_telemetry::ProductionByteRecorder>,
+    record: impl FnOnce(
+        &crate::byte_telemetry::ProductionByteRecorder,
+    ) -> Result<(), crate::byte_telemetry::LedgerError>,
+) {
+    if let Some(recorder) = recorder
+        && let Err(error) = record(&recorder)
+    {
+        recorder.taint_unreported_operation();
+        report_deferred_receipt_failure(error);
+    }
+}
+
 fn replace_global_budget(old: u64, new: u64) {
     if new >= old {
         GLOBAL_BUDGET_BYTES.fetch_add(new - old, Ordering::Relaxed);
@@ -1492,6 +1521,7 @@ pub struct CudaResidencyStats {
 /// for a consuming kernel's `TensorView`.
 pub struct CudaWeightPage {
     runtime: Arc<CudaRuntime>,
+    recorder: Option<crate::byte_telemetry::ProductionByteRecorder>,
     /// The context-owned queue that performs this page's final release after
     /// both stream tails. `None` only for pages built by a direct-upload caller
     /// that owns its own ordering (the pre-Phase-4 compatibility path).
@@ -1646,6 +1676,7 @@ enum WeightReleaseAction {
     /// A raw `CudaRuntime::alloc_raw` page.
     Runtime {
         runtime: Arc<CudaRuntime>,
+        recorder: Option<crate::byte_telemetry::ProductionByteRecorder>,
         ptr: CUdeviceptr,
         len: usize,
     },
@@ -1726,12 +1757,38 @@ impl WeightReleaseAction {
 
     fn run_inner(self) -> DeferredActionOutcome {
         match self {
-            Self::Runtime { runtime, ptr, len } => {
+            Self::Runtime {
+                runtime,
+                recorder,
+                ptr,
+                len,
+            } => {
                 // SAFETY: `ptr` came from this runtime's `alloc_raw` for this
                 // page and is freed exactly once, here, after the fences the
                 // queue recorded have completed.
                 match unsafe { runtime.free_raw(ptr) } {
-                    Ok(()) => DeferredActionOutcome::released(0),
+                    Ok(()) => {
+                        if let Some(recorder) = recorder
+                            && let Err(error) = recorder.record(EventSpec::new(
+                                ObservedCategory::DeviceRelease,
+                                ObservedBoundary::RuntimeDeviceRelease,
+                                ObservedStatus::Reclaimed,
+                                len as u64,
+                            ))
+                        {
+                            recorder.taint_unreported_operation();
+                            return DeferredActionOutcome::quarantined(
+                                AllocationReleaseState::Quarantined,
+                                0,
+                                format!(
+                                    "device release completed but its observed-byte receipt \
+                                     failed: {error}"
+                                ),
+                                None,
+                            );
+                        }
+                        DeferredActionOutcome::released(0)
+                    }
                     Err(error) => {
                         let detail =
                             format!("cuMemFree of a {len} byte weight page failed: {error}");
@@ -1773,14 +1830,14 @@ impl WeightReleaseAction {
                         accounting,
                     } => {
                         Self::refund(&allowance, accounting.unmapped_bytes);
-                        if let Some(recorder) = recorder {
-                            let _ = recorder.record(EventSpec::new(
+                        record_deferred_receipt(recorder, |recorder| {
+                            recorder.record(EventSpec::new(
                                 ObservedCategory::VmmUnmap,
                                 ObservedBoundary::WeightVmmUnmap,
                                 ObservedStatus::Reclaimed,
                                 accounting.unmapped_bytes,
-                            ));
-                        }
+                            ))
+                        });
                         DeferredActionOutcome::released(accounting.unmapped_bytes)
                     }
                     onnx_runtime_memory_governor::AllocationReleaseOutcome::Quarantined {
@@ -1790,8 +1847,8 @@ impl WeightReleaseAction {
                         // Refund only what really became unmapped; the residual
                         // stays charged and its allocator stays pinned.
                         Self::refund(&allowance, accounting.unmapped_bytes);
-                        if let Some(recorder) = recorder {
-                            let _ = recorder.record_pair(
+                        record_deferred_receipt(recorder, |recorder| {
+                            recorder.record_pair(
                                 EventSpec::new(
                                     ObservedCategory::VmmUnmap,
                                     ObservedBoundary::WeightVmmUnmap,
@@ -1804,8 +1861,8 @@ impl WeightReleaseAction {
                                     ObservedStatus::Quarantined,
                                     residual.retained_bytes,
                                 ),
-                            );
-                        }
+                            )
+                        });
                         DeferredActionOutcome::quarantined(
                             residual.state,
                             accounting.unmapped_bytes,
@@ -1821,14 +1878,14 @@ impl WeightReleaseAction {
                         )
                     }
                     onnx_runtime_memory_governor::AllocationReleaseOutcome::Failed { failure } => {
-                        if let Some(recorder) = recorder {
-                            let _ = recorder.record(EventSpec::new(
+                        record_deferred_receipt(recorder, |recorder| {
+                            recorder.record(EventSpec::new(
                                 ObservedCategory::VmmUnmap,
                                 ObservedBoundary::WeightVmmUnmap,
                                 ObservedStatus::Quarantined,
                                 len as u64,
-                            ));
-                        }
+                            ))
+                        });
                         DeferredActionOutcome::quarantined(
                             AllocationReleaseState::Quarantined,
                             0,
@@ -1860,8 +1917,8 @@ impl WeightReleaseAction {
                 match outcome {
                     Ok(crate::vmm_allocator::DecommitOutcome::Complete { accounting }) => {
                         Self::refund(&allowance, accounting.unmapped_bytes);
-                        if let Some(recorder) = recorder {
-                            let _ = recorder.record_pair(
+                        record_deferred_receipt(recorder, |recorder| {
+                            recorder.record_pair(
                                 EventSpec::new(
                                     ObservedCategory::VmmUnmap,
                                     ObservedBoundary::WeightVmmUnmap,
@@ -1878,8 +1935,8 @@ impl WeightReleaseAction {
                                     },
                                     accounting.quarantined_owned_bytes,
                                 ),
-                            );
-                        }
+                            )
+                        });
                         // Only a terminally complete decommit reopens the slot.
                         if let Some(state) = slot_state.as_ref() {
                             state.finish_release();
@@ -1912,14 +1969,14 @@ impl WeightReleaseAction {
                         if let Some(state) = slot_state.as_ref() {
                             state.poison();
                         }
-                        if let Some(recorder) = recorder {
-                            let _ = recorder.record(EventSpec::new(
+                        record_deferred_receipt(recorder, |recorder| {
+                            recorder.record(EventSpec::new(
                                 ObservedCategory::VmmUnmap,
                                 ObservedBoundary::WeightVmmUnmap,
                                 ObservedStatus::RolledBack,
                                 len as u64,
-                            ));
-                        }
+                            ))
+                        });
                         DeferredActionOutcome::quarantined(
                             AllocationReleaseState::Quarantined,
                             0,
@@ -1937,8 +1994,8 @@ impl WeightReleaseAction {
                         reason,
                     }) => {
                         Self::refund(&allowance, accounting.unmapped_bytes);
-                        if let Some(recorder) = recorder {
-                            let _ = recorder.record_pair(
+                        record_deferred_receipt(recorder, |recorder| {
+                            recorder.record_pair(
                                 EventSpec::new(
                                     ObservedCategory::VmmUnmap,
                                     ObservedBoundary::WeightVmmUnmap,
@@ -1951,8 +2008,8 @@ impl WeightReleaseAction {
                                     ObservedStatus::Quarantined,
                                     residual.retained_bytes,
                                 ),
-                            );
-                        }
+                            )
+                        });
                         if let Some(state) = slot_state.as_ref() {
                             state.poison();
                         }
@@ -1975,14 +2032,14 @@ impl WeightReleaseAction {
                         if let Some(state) = slot_state.as_ref() {
                             state.poison();
                         }
-                        if let Some(recorder) = recorder {
-                            let _ = recorder.record(EventSpec::new(
+                        record_deferred_receipt(recorder, |recorder| {
+                            recorder.record(EventSpec::new(
                                 ObservedCategory::VmmUnmap,
                                 ObservedBoundary::WeightVmmUnmap,
                                 ObservedStatus::Quarantined,
                                 len as u64,
-                            ));
-                        }
+                            ))
+                        });
                         DeferredActionOutcome::quarantined(
                             AllocationReleaseState::Quarantined,
                             0,
@@ -2004,14 +2061,14 @@ impl WeightReleaseAction {
                 len,
                 slot_state,
             } => {
-                if let Some(recorder) = recorder {
-                    let _ = recorder.record(EventSpec::new(
+                record_deferred_receipt(recorder, |recorder| {
+                    recorder.record(EventSpec::new(
                         ObservedCategory::VmmUnmap,
                         ObservedBoundary::WeightVmmUnmap,
                         ObservedStatus::Quarantined,
                         len as u64,
-                    ));
-                }
+                    ))
+                });
                 DeferredActionOutcome::quarantined(
                     AllocationReleaseState::Quarantined,
                     0,
@@ -2098,6 +2155,7 @@ impl CudaWeightPage {
             }
             WeightAllocation::Runtime => Some(WeightReleaseAction::Runtime {
                 runtime: Arc::clone(&self.runtime),
+                recorder: self.recorder.take(),
                 ptr: self.ptr,
                 len: self.len,
             }),
@@ -2123,7 +2181,7 @@ impl CudaWeightPage {
                         return Some(WeightReleaseAction::RetainedVmmSlot {
                             allocator,
                             allowance,
-                            recorder: self.runtime.observed_byte_recorder(),
+                            recorder: self.recorder.take(),
                             ptr: self.ptr,
                             len: self.len,
                             slot_state,
@@ -2132,7 +2190,7 @@ impl CudaWeightPage {
                     Some(WeightReleaseAction::VmmSlot {
                         allocator,
                         allowance,
-                        recorder: self.runtime.observed_byte_recorder(),
+                        recorder: self.recorder.take(),
                         ptr: self.ptr,
                         len: self.len,
                         slot_state,
@@ -2141,7 +2199,7 @@ impl CudaWeightPage {
                     Some(WeightReleaseAction::VmmSpan {
                         allocator,
                         allowance,
-                        recorder: self.runtime.observed_byte_recorder(),
+                        recorder: self.recorder.take(),
                         ptr: self.ptr,
                         len: self.len,
                     })
@@ -2228,6 +2286,9 @@ impl CudaWeightPage {
         if bytes.is_empty() {
             return Err(WeightHandleError::MissingRegions);
         }
+        let recorder = runtime
+            .observed_byte_recorder()
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let alloc_start = std::time::Instant::now();
         let ptr = runtime
             .alloc_raw(bytes.len())
@@ -2235,6 +2296,7 @@ impl CudaWeightPage {
         add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         let page = Self {
             runtime: Arc::clone(runtime),
+            recorder,
             queue,
             allocation: WeightAllocation::Runtime,
             ptr,
@@ -2288,6 +2350,9 @@ impl CudaWeightPage {
                 bytes.len()
             )));
         }
+        let recorder = runtime
+            .observed_byte_recorder()
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let alloc_start = std::time::Instant::now();
         let ptr = runtime
             .alloc_raw(bytes.len())
@@ -2300,6 +2365,7 @@ impl CudaWeightPage {
         // keep the source alive until the fence completes.
         let page = Self {
             runtime: Arc::clone(runtime),
+            recorder,
             queue,
             allocation: WeightAllocation::Runtime,
             ptr,
@@ -2366,6 +2432,9 @@ impl CudaWeightPage {
                 len
             )));
         }
+        let recorder = runtime
+            .observed_byte_recorder()
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let alloc_start = std::time::Instant::now();
         let ptr = runtime
             .alloc_raw(len)
@@ -2373,6 +2442,7 @@ impl CudaWeightPage {
         add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         let page = Self {
             runtime: Arc::clone(runtime),
+            recorder,
             queue,
             allocation: WeightAllocation::Runtime,
             ptr,
@@ -2448,45 +2518,65 @@ pub(crate) fn fill_staging_from_regions(
             total
         )));
     }
-    let mut offset = 0usize;
-    for region in &weight.regions {
-        let bytes = source.region_bytes(region)?;
-        if bytes.len() != region.len {
-            return Err(WeightHandleError::DeviceBinding(format!(
-                "region source returned {} bytes for a {}-byte region",
-                bytes.len(),
-                region.len
-            )));
+    let mut observation = runtime
+        .prepare_observation(&[
+            EventSpec::new(
+                ObservedCategory::SourceRead,
+                ObservedBoundary::MmapMaterialize,
+                ObservedStatus::Unsupported,
+                0,
+            ),
+            EventSpec::new(
+                ObservedCategory::MmapPageIn,
+                ObservedBoundary::MmapMaterialize,
+                ObservedStatus::Unsupported,
+                0,
+            ),
+            EventSpec::new(
+                ObservedCategory::HostWrite,
+                ObservedBoundary::MmapMaterialize,
+                ObservedStatus::Completed,
+                total as u64,
+            ),
+        ])
+        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
+    let fill = (|| {
+        let mut offset = 0usize;
+        for region in &weight.regions {
+            let bytes = source.region_bytes(region)?;
+            if bytes.len() != region.len {
+                return Err(WeightHandleError::DeviceBinding(format!(
+                    "region source returned {} bytes for a {}-byte region",
+                    bytes.len(),
+                    region.len
+                )));
+            }
+            let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+                WeightHandleError::InvalidResident("staging byte count overflow".into())
+            })?;
+            staging.as_mut_slice()[offset..end].copy_from_slice(bytes);
+            offset = end;
         }
-        let end = offset.checked_add(bytes.len()).ok_or_else(|| {
-            WeightHandleError::InvalidResident("staging byte count overflow".into())
-        })?;
-        staging.as_mut_slice()[offset..end].copy_from_slice(bytes);
-        offset = end;
+        Ok(())
+    })();
+    if let Err(error) = fill {
+        let telemetry = observation
+            .as_mut()
+            .map(|receipt| receipt.abort(ObservedStatus::Failed))
+            .transpose()
+            .err()
+            .map_or_else(String::new, |telemetry| {
+                format!("; failed staging-fill receipt also failed: {telemetry}")
+            });
+        return Err(WeightHandleError::DeviceBinding(format!(
+            "{error}{telemetry}"
+        )));
     }
     GLOBAL_STAGING_FILL_CALLS.fetch_add(1, Ordering::Relaxed);
     GLOBAL_STAGING_FILL_REGIONS.fetch_add(weight.regions.len() as u64, Ordering::Relaxed);
     GLOBAL_STAGING_FILL_BYTES.fetch_add(total as u64, Ordering::Relaxed);
-    runtime.observe_byte_pair(
-        EventSpec::new(
-            ObservedCategory::SourceRead,
-            ObservedBoundary::MmapMaterialize,
-            ObservedStatus::Unsupported,
-            0,
-        ),
-        EventSpec::new(
-            ObservedCategory::MmapPageIn,
-            ObservedBoundary::MmapMaterialize,
-            ObservedStatus::Unsupported,
-            0,
-        ),
-    );
-    runtime.observe_bytes(EventSpec::new(
-        ObservedCategory::HostWrite,
-        ObservedBoundary::MmapMaterialize,
-        ObservedStatus::Completed,
-        total as u64,
-    ));
+    CudaRuntime::commit_observation(&mut observation)
+        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
     Ok(())
 }
 
@@ -2579,12 +2669,17 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
         // Allocate the VRAM page up front, then stream each selected region into
         // its contiguous slot. The page is owned by `CudaWeightPage` on success;
         // on any copy failure we free it before returning so no VRAM leaks.
+        let recorder = self
+            .runtime
+            .observed_byte_recorder()
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let ptr = self
             .runtime
             .alloc_raw(total)
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
         let page = CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
+            recorder,
             queue: self.queue.clone(),
             allocation: WeightAllocation::Runtime,
             ptr,
@@ -4685,12 +4780,60 @@ impl CudaWeightResidency {
             .iter()
             .flat_map(|bank| &bank.members)
             .map(|member| {
-                let resident = member.weight.materialize().map_err(|error| {
-                    RouteBankReservationReject::Materialization {
+                let max_bytes = member.catalog.tensor_len() as u64;
+                let mut observation = self
+                    .runtime
+                    .prepare_observation(&[
+                        EventSpec::new(
+                            ObservedCategory::SourceRead,
+                            ObservedBoundary::ResidentMaterialize,
+                            ObservedStatus::Unsupported,
+                            0,
+                        ),
+                        EventSpec::new(
+                            ObservedCategory::MmapPageIn,
+                            ObservedBoundary::ResidentMaterialize,
+                            ObservedStatus::Unsupported,
+                            0,
+                        ),
+                        EventSpec::new(
+                            ObservedCategory::HostAllocation,
+                            ObservedBoundary::ResidentMaterialize,
+                            ObservedStatus::Committed,
+                            max_bytes,
+                        ),
+                        EventSpec::new(
+                            ObservedCategory::HostWrite,
+                            ObservedBoundary::ResidentMaterialize,
+                            ObservedStatus::Completed,
+                            max_bytes,
+                        ),
+                    ])
+                    .map_err(|error| RouteBankReservationReject::Materialization {
                         value: member.value,
-                        reason: error.to_string(),
+                        reason: format!(
+                            "reserve host materialization receipt before invoking the \
+                             materializer: {error}"
+                        ),
+                    })?;
+                let materialization = match member.weight.materialize() {
+                    Ok(materialization) => materialization,
+                    Err(error) => {
+                        let telemetry = observation
+                            .as_mut()
+                            .map(|receipt| receipt.abort(ObservedStatus::Failed))
+                            .transpose()
+                            .err()
+                            .map_or_else(String::new, |telemetry| {
+                                format!("; failed materialization receipt also failed: {telemetry}")
+                            });
+                        return Err(RouteBankReservationReject::Materialization {
+                            value: member.value,
+                            reason: format!("{error}{telemetry}"),
+                        });
                     }
-                })?;
+                };
+                let resident = materialization.resident();
                 if resident.dtype != member.weight.dtype
                     || resident.shape != member.weight.shape
                     || resident.bytes().len() != member.catalog.tensor_len()
@@ -4700,35 +4843,25 @@ impl CudaWeightResidency {
                         reason: "resolved bytes differ from finalized dtype/shape/catalog".into(),
                     });
                 }
-                self.runtime.observe_byte_pair(
-                    EventSpec::new(
-                        ObservedCategory::SourceRead,
-                        ObservedBoundary::MmapMaterialize,
-                        ObservedStatus::Unsupported,
-                        0,
-                    ),
-                    EventSpec::new(
-                        ObservedCategory::MmapPageIn,
-                        ObservedBoundary::MmapMaterialize,
-                        ObservedStatus::Unsupported,
-                        0,
-                    ),
-                );
-                self.runtime.observe_byte_pair(
-                    EventSpec::new(
-                        ObservedCategory::HostAllocation,
-                        ObservedBoundary::MmapMaterialize,
-                        ObservedStatus::Committed,
-                        resident.bytes().len() as u64,
-                    ),
-                    EventSpec::new(
-                        ObservedCategory::HostWrite,
-                        ObservedBoundary::MmapMaterialize,
-                        ObservedStatus::Completed,
-                        resident.bytes().len() as u64,
-                    ),
-                );
-                Ok((member.clone(), resident))
+                if let Some(receipt) = observation.as_mut() {
+                    receipt
+                        .set_bytes(2, materialization.allocated_bytes() as u64)
+                        .and_then(|()| receipt.set_bytes(3, materialization.written_bytes() as u64))
+                        .map_err(|error| RouteBankReservationReject::Materialization {
+                            value: member.value,
+                            reason: format!(
+                                "host materializer returned bytes outside its canonical extent: \
+                                 {error}"
+                            ),
+                        })?;
+                }
+                CudaRuntime::commit_observation(&mut observation).map_err(|error| {
+                    RouteBankReservationReject::Materialization {
+                        value: member.value,
+                        reason: format!("commit host materialization receipt: {error}"),
+                    }
+                })?;
+                Ok((member.clone(), materialization.into_resident()))
             })
             .collect::<Result<Vec<_>, RouteBankReservationReject>>()?;
 
@@ -4778,6 +4911,40 @@ impl CudaWeightResidency {
         let mut catalogs = HashMap::new();
         let mut allocators = HashMap::new();
         for (member, resident) in materialized {
+            let receipt_bytes = member.catalog.tensor_len() as u64;
+            let mut lifecycle_observation = self
+                .runtime
+                .prepare_observation(&[
+                    EventSpec::new(
+                        ObservedCategory::VmmReserve,
+                        ObservedBoundary::WeightVmmReserve,
+                        ObservedStatus::Committed,
+                        receipt_bytes,
+                    ),
+                    EventSpec::new(
+                        ObservedCategory::VmmMap,
+                        ObservedBoundary::WeightVmmMap,
+                        ObservedStatus::Committed,
+                        receipt_bytes,
+                    ),
+                    EventSpec::new(
+                        ObservedCategory::HostWrite,
+                        ObservedBoundary::MmapMaterialize,
+                        ObservedStatus::Completed,
+                        receipt_bytes,
+                    ),
+                    EventSpec::new(
+                        ObservedCategory::ExpertPublication,
+                        ObservedBoundary::WeightExpertPublish,
+                        ObservedStatus::Published,
+                        receipt_bytes,
+                    ),
+                ])
+                .map_err(|error| {
+                    RouteBankReservationReject::Reservation(format!(
+                        "reserve route-bank receipts before VMM allocation: {error}"
+                    ))
+                })?;
             let allocator = Arc::new(
                 onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator::new_with_physical_pool_and_reservation_queue(
                     Arc::clone(&context),
@@ -4801,31 +4968,21 @@ impl CudaWeightResidency {
                 )
                 .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
             let (committed, reserved) = allocator.committed_and_reserved();
-            self.runtime.observe_byte_pair(
-                EventSpec::new(
-                    ObservedCategory::VmmReserve,
-                    ObservedBoundary::WeightVmmReserve,
-                    ObservedStatus::Committed,
-                    reserved as u64,
-                ),
-                EventSpec::new(
-                    ObservedCategory::VmmMap,
-                    ObservedBoundary::WeightVmmMap,
-                    ObservedStatus::Committed,
-                    committed as u64,
-                ),
-            );
+            if let Some(receipt) = lifecycle_observation.as_mut() {
+                receipt
+                    .set_bytes(0, reserved as u64)
+                    .and_then(|()| receipt.set_bytes(1, committed as u64))
+                    .map_err(|error| {
+                        RouteBankReservationReject::Reservation(format!(
+                            "route VMM result exceeded its canonical receipt reservation: {error}"
+                        ))
+                    })?;
+            }
             let mut staging = self
                 .runtime
                 .alloc_pinned(member.catalog.tensor_len())
                 .map_err(|error| RouteBankReservationReject::Reservation(error.to_string()))?;
             staging.as_mut_slice().copy_from_slice(resident.bytes());
-            self.runtime.observe_bytes(EventSpec::new(
-                ObservedCategory::HostWrite,
-                ObservedBoundary::MmapMaterialize,
-                ObservedStatus::Completed,
-                staging.as_slice().len() as u64,
-            ));
             // SAFETY: `ptr` is the exact committed tensor reservation and the
             // measured primitive establishes completion before returning.
             let (_copy_ms, _completed) = unsafe {
@@ -4843,12 +5000,11 @@ impl CudaWeightResidency {
             catalogs.insert(member.value, member.catalog.clone());
             allocators.insert(member.value, allocator);
             by_key.insert(member.value.0 as u64, reservation);
-            self.runtime.observe_bytes(EventSpec::new(
-                ObservedCategory::ExpertPublication,
-                ObservedBoundary::WeightExpertPublish,
-                ObservedStatus::Published,
-                member.catalog.tensor_len() as u64,
-            ));
+            CudaRuntime::commit_observation(&mut lifecycle_observation).map_err(|error| {
+                RouteBankReservationReject::Reservation(format!(
+                    "commit route-bank VMM/write/publication receipts: {error}"
+                ))
+            })?;
         }
 
         let set = Arc::new(RouteReservationSet {
@@ -5624,12 +5780,17 @@ impl CudaWeightResidency {
             .acquire(bytes as usize)
             .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
         fill_staging_from_regions(&self.runtime, weight, source, staging.staging_mut())?;
+        let recorder = self
+            .runtime
+            .observed_byte_recorder()
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let ptr = self
             .runtime
             .alloc_raw(bytes as usize)
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
         let page = Arc::new(CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
+            recorder,
             queue: self.queue.clone(),
             allocation: WeightAllocation::Runtime,
             ptr,
@@ -5824,7 +5985,7 @@ impl CudaWeightResidency {
             return promoted;
         }
         if self.physical.get().is_some() {
-            let resident = weight.materialize()?;
+            let resident = weight.materialize()?.into_resident();
             GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
             let bytes = resident.bytes().to_vec();
             return self
@@ -6108,8 +6269,13 @@ impl CudaWeightResidency {
                 weight.regions.first().map(|r| r.offset).unwrap_or(0)
             );
         }
+        let recorder = self
+            .runtime
+            .observed_byte_recorder()
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let page = Arc::new(CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
+            recorder,
             queue: self.queue.clone(),
             allocation: WeightAllocation::HostMapped,
             ptr: device_ptr,
@@ -6201,7 +6367,7 @@ impl CudaWeightResidency {
             return Ok(hit);
         }
         let materialize_start = std::time::Instant::now();
-        let resident = weight.materialize()?;
+        let resident = weight.materialize()?.into_resident();
         GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
         if self.physical.get().is_some() {
@@ -6549,8 +6715,13 @@ impl CudaWeightResidency {
             }
             None => None,
         };
+        let recorder = self
+            .runtime
+            .observed_byte_recorder()
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         let page = Arc::new(CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
+            recorder,
             queue: self.queue.clone(),
             allocation: WeightAllocation::Vmm {
                 allocator: Arc::clone(&physical.allocator),
@@ -6563,25 +6734,30 @@ impl CudaWeightResidency {
             dtype,
             shape,
         });
+        let mut publication = self
+            .runtime
+            .prepare_observation(&[
+                EventSpec::new(
+                    ObservedCategory::PageIn,
+                    ObservedBoundary::WeightPageIn,
+                    ObservedStatus::Published,
+                    len as u64,
+                ),
+                EventSpec::new(
+                    ObservedCategory::ExpertPublication,
+                    ObservedBoundary::WeightExpertPublish,
+                    ObservedStatus::Published,
+                    len as u64,
+                ),
+            ])
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         if bypass {
             inner.record_bypassed_page_in(key, len as u64);
         } else {
             inner.insert_page(key, Arc::clone(&page), len as u64);
         }
-        self.runtime.observe_byte_pair(
-            EventSpec::new(
-                ObservedCategory::PageIn,
-                ObservedBoundary::WeightPageIn,
-                ObservedStatus::Published,
-                len as u64,
-            ),
-            EventSpec::new(
-                ObservedCategory::ExpertPublication,
-                ObservedBoundary::WeightExpertPublish,
-                ObservedStatus::Published,
-                len as u64,
-            ),
-        );
+        CudaRuntime::commit_observation(&mut publication)
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
         // #945 experiment 2/3: snapshot the pinned probe key's device copy right
         // after its (one and only) admission fill, so every later hit can be
         // compared against the bytes that were actually written here.
@@ -6726,6 +6902,26 @@ impl CudaWeightResidency {
                     .try_map(required_mapped)
                     .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
                 GLOBAL_WEIGHT_MAPPED_BYTES.fetch_add(required_mapped, Ordering::Relaxed);
+                let mut map_observation = match self.runtime.prepare_observation(&[EventSpec::new(
+                    ObservedCategory::VmmMap,
+                    ObservedBoundary::WeightVmmMap,
+                    ObservedStatus::Committed,
+                    required_mapped,
+                )]) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        allowance.unmap(required_mapped);
+                        let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |current| Some(current.saturating_sub(required_mapped)),
+                        );
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "reserve VMM-map receipt before physical commit: {error}"
+                        ))
+                        .into());
+                    }
+                };
                 match physical.allocator.try_commit_span(
                     ptr,
                     len,
@@ -6797,12 +6993,20 @@ impl CudaWeightResidency {
                                 failure,
                             ));
                         }
-                        self.runtime.observe_bytes(EventSpec::new(
-                            ObservedCategory::VmmMap,
-                            ObservedBoundary::WeightVmmMap,
-                            ObservedStatus::Committed,
-                            commit.newly_mapped_bytes,
-                        ));
+                        if let Some(receipt) = map_observation.as_mut() {
+                            receipt
+                                .set_bytes(0, commit.newly_mapped_bytes)
+                                .map_err(|error| {
+                                    WeightHandleError::DeviceBinding(format!(
+                                        "VMM-map result exceeded its reserved receipt: {error}"
+                                    ))
+                                })?;
+                        }
+                        CudaRuntime::commit_observation(&mut map_observation).map_err(|error| {
+                            WeightHandleError::DeviceBinding(format!(
+                                "commit VMM-map receipt: {error}"
+                            ))
+                        })?;
                         // The span is filled and (if not a bypass) about to join
                         // the resident set. Pin it now so no later admission can
                         // ever select it as an eviction victim — the whole point
@@ -6813,6 +7017,15 @@ impl CudaWeightResidency {
                         return Ok(SpanAdmit::Filled { bypass });
                     }
                     Err(error) => {
+                        if let Some(receipt) = map_observation.as_mut()
+                            && let Err(telemetry) = receipt.abort(ObservedStatus::Failed)
+                        {
+                            return Err(WeightHandleError::DeviceBinding(format!(
+                                "VMM commit failed: {error}; failed-map receipt also failed: \
+                                 {telemetry}"
+                            ))
+                            .into());
+                        }
                         allowance.unmap(required_mapped);
                         let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
                             Ordering::Relaxed,
@@ -6972,7 +7185,7 @@ impl CudaWeightResidency {
             if let Some(state) = slot_state.as_ref() {
                 state.poison();
             }
-            self.runtime.observe_byte_pair(
+            let receipt = observed_receipt_suffix(self.runtime.observe_byte_pair(
                 EventSpec::new(
                     ObservedCategory::VmmMap,
                     ObservedBoundary::WeightVmmMap,
@@ -6985,7 +7198,7 @@ impl CudaWeightResidency {
                     ObservedStatus::Quarantined,
                     len as u64,
                 ),
-            );
+            ));
             quarantine_in_flight_fill(Box::new((
                 Arc::clone(&physical.allocator),
                 allowance.clone(),
@@ -6997,7 +7210,8 @@ impl CudaWeightResidency {
             return SpanAdmitError {
                 error: WeightHandleError::DeviceBinding(format!(
                     "{}; VMM fill rollback: copy-stream completion could not be established; \
-                     the destination mapping and staging source remain charged and quarantined",
+                     the destination mapping and staging source remain charged and \
+                     quarantined{receipt}",
                     failure.error
                 )),
                 fresh_span: FreshSpanCleanup::Consumed,
@@ -7010,7 +7224,7 @@ impl CudaWeightResidency {
             {
                 Ok(crate::vmm_allocator::DecommitOutcome::Complete { accounting }) => {
                     WeightReleaseAction::refund(allowance, accounting.unmapped_bytes);
-                    self.runtime.observe_byte_pair(
+                    let receipt = observed_receipt_suffix(self.runtime.observe_byte_pair(
                         EventSpec::new(
                             ObservedCategory::VmmUnmap,
                             ObservedBoundary::WeightVmmUnmap,
@@ -7027,14 +7241,17 @@ impl CudaWeightResidency {
                             },
                             len as u64,
                         ),
-                    );
+                    ));
                     if accounting.quarantined_owned_bytes == 0 {
-                        format!("rolled back {} mapped byte(s)", accounting.unmapped_bytes)
+                        format!(
+                            "rolled back {} mapped byte(s){receipt}",
+                            accounting.unmapped_bytes
+                        )
                     } else {
                         format!(
                             "unmapped {} byte(s), but quarantined {} byte(s) of residual physical \
-                             ownership",
-                            accounting.unmapped_bytes, accounting.quarantined_owned_bytes
+                             ownership{receipt}",
+                            accounting.unmapped_bytes, accounting.quarantined_owned_bytes,
                         )
                     }
                 }
@@ -7042,7 +7259,7 @@ impl CudaWeightResidency {
                     if let Some(state) = slot_state.as_ref() {
                         state.poison();
                     }
-                    self.runtime.observe_byte_pair(
+                    let receipt = observed_receipt_suffix(self.runtime.observe_byte_pair(
                         EventSpec::new(
                             ObservedCategory::VmmUnmap,
                             ObservedBoundary::WeightVmmUnmap,
@@ -7055,10 +7272,10 @@ impl CudaWeightResidency {
                             ObservedStatus::Quarantined,
                             len as u64,
                         ),
-                    );
+                    ));
                     format!(
                         "cleanup rolled back to the partially filled mapping ({reason}); the \
-                         stable slot was poisoned and remains charged"
+                         stable slot was poisoned and remains charged{receipt}"
                     )
                 }
                 Ok(crate::vmm_allocator::DecommitOutcome::Quarantined {
@@ -7070,7 +7287,7 @@ impl CudaWeightResidency {
                     if let Some(state) = slot_state.as_ref() {
                         state.poison();
                     }
-                    self.runtime.observe_byte_pair(
+                    let receipt = observed_receipt_suffix(self.runtime.observe_byte_pair(
                         EventSpec::new(
                             ObservedCategory::VmmUnmap,
                             ObservedBoundary::WeightVmmUnmap,
@@ -7083,26 +7300,27 @@ impl CudaWeightResidency {
                             ObservedStatus::Quarantined,
                             residual.retained_bytes,
                         ),
-                    );
+                    ));
                     format!(
                         "cleanup quarantined the stable slot ({reason}); refunded {} unmapped \
-                         byte(s) and retained {} byte(s) at {:#x}",
-                        accounting.unmapped_bytes, residual.retained_bytes, residual.address
+                         byte(s) and retained {} byte(s) at {:#x}{receipt}",
+                        accounting.unmapped_bytes, residual.retained_bytes, residual.address,
                     )
                 }
                 Err(cleanup_error) => {
                     if let Some(state) = slot_state.as_ref() {
                         state.poison();
                     }
-                    self.runtime.observe_bytes(EventSpec::new(
-                        ObservedCategory::PageIn,
-                        ObservedBoundary::WeightPageIn,
-                        ObservedStatus::Quarantined,
-                        len as u64,
-                    ));
+                    let receipt =
+                        observed_receipt_suffix(self.runtime.observe_bytes(EventSpec::new(
+                            ObservedCategory::PageIn,
+                            ObservedBoundary::WeightPageIn,
+                            ObservedStatus::Quarantined,
+                            len as u64,
+                        )));
                     format!(
                         "cleanup was refused ({cleanup_error}); the stable slot was poisoned and \
-                         remains charged"
+                         remains charged{receipt}"
                     )
                 }
             }
@@ -7110,7 +7328,7 @@ impl CudaWeightResidency {
             match physical.allocator.deallocate_span_outcome(ptr) {
                 onnx_runtime_memory_governor::AllocationReleaseOutcome::Complete { accounting } => {
                     WeightReleaseAction::refund(allowance, accounting.unmapped_bytes);
-                    self.runtime.observe_byte_pair(
+                    let receipt = observed_receipt_suffix(self.runtime.observe_byte_pair(
                         EventSpec::new(
                             ObservedCategory::VmmUnmap,
                             ObservedBoundary::WeightVmmUnmap,
@@ -7123,10 +7341,10 @@ impl CudaWeightResidency {
                             ObservedStatus::RolledBack,
                             len as u64,
                         ),
-                    );
+                    ));
                     format!(
-                        "released the fresh span and refunded {} mapped byte(s)",
-                        accounting.unmapped_bytes
+                        "released the fresh span and refunded {} mapped byte(s){receipt}",
+                        accounting.unmapped_bytes,
                     )
                 }
                 onnx_runtime_memory_governor::AllocationReleaseOutcome::Quarantined {
@@ -7134,7 +7352,7 @@ impl CudaWeightResidency {
                     residual,
                 } => {
                     WeightReleaseAction::refund(allowance, accounting.unmapped_bytes);
-                    self.runtime.observe_byte_pair(
+                    let receipt = observed_receipt_suffix(self.runtime.observe_byte_pair(
                         EventSpec::new(
                             ObservedCategory::VmmUnmap,
                             ObservedBoundary::WeightVmmUnmap,
@@ -7147,10 +7365,10 @@ impl CudaWeightResidency {
                             ObservedStatus::Quarantined,
                             residual.retained_bytes,
                         ),
-                    );
+                    ));
                     format!(
                         "quarantined the fresh span; refunded {} unmapped byte(s) and retained {} \
-                         byte(s) at {:#x}: {}",
+                         byte(s) at {:#x}: {}{receipt}",
                         accounting.unmapped_bytes,
                         residual.retained_bytes,
                         residual.address,
@@ -7158,15 +7376,16 @@ impl CudaWeightResidency {
                     )
                 }
                 onnx_runtime_memory_governor::AllocationReleaseOutcome::Failed { failure } => {
-                    self.runtime.observe_bytes(EventSpec::new(
-                        ObservedCategory::PageIn,
-                        ObservedBoundary::WeightPageIn,
-                        ObservedStatus::Quarantined,
-                        len as u64,
-                    ));
+                    let receipt =
+                        observed_receipt_suffix(self.runtime.observe_bytes(EventSpec::new(
+                            ObservedCategory::PageIn,
+                            ObservedBoundary::WeightPageIn,
+                            ObservedStatus::Quarantined,
+                            len as u64,
+                        )));
                     format!(
                         "cleanup failed before a release outcome was established ({failure}); the \
-                         allocator retains the span and its charge"
+                         allocator retains the span and its charge{receipt}"
                     )
                 }
             }
@@ -8979,7 +9198,7 @@ mod tests {
             eprintln!("SKIPPED (CUDA runtime dependencies unavailable): in-flight fill test");
             return;
         };
-        let mut observed = ObservedByteLedger::new(
+        let observed = ObservedByteLedger::new_for_runtime(
             ObservedScope {
                 provider: 740,
                 device: 0,
@@ -8987,15 +9206,19 @@ mod tests {
                 generation: 1,
                 logical_session: 740,
             },
+            runtime.runtime_id(),
             128,
         )
         .expect("observed rollback ledger");
         observed
             .set_phase(ObservedPhase::Failure)
             .expect("set rollback phase");
+        let registry = Arc::new(crate::byte_telemetry::ExecutionRecorderRegistry::default());
         runtime
-            .install_observed_byte_ledger(&observed)
-            .expect("attach rollback ledger");
+            .install_observed_byte_registry(Arc::clone(&registry))
+            .expect("install rollback recorder registry");
+        let recorder = observed.recorder().expect("acquire rollback recorder");
+        let _observed_use = registry.enter(recorder);
         let granule = 2usize << 20;
         let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(
             (granule * 2) as u64,

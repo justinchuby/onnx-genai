@@ -180,7 +180,10 @@ fn lazy_weight_with_boundary(
     let resident_bytes = b_bytes.clone();
     let lazy = LazyWeight::new(boundary, DataType::Float32, shape.clone(), vec![region], {
         let shape = shape.clone();
-        move || ResidentWeight::new(DataType::Float32, shape.clone(), resident_bytes.clone())
+        move || {
+            ResidentWeight::new(DataType::Float32, shape.clone(), resident_bytes.clone())
+                .map(onnx_runtime_ep_api::ResidentWeightMaterialization::reused)
+        }
     })
     .unwrap();
     (lazy, host)
@@ -320,6 +323,7 @@ fn combined_weights(bs: &[Vec<f32>], k: usize, n: usize) -> (HostMmap, Vec<LazyW
                 let shape = shape.clone();
                 move || {
                     ResidentWeight::new(DataType::Float32, shape.clone(), resident_bytes.clone())
+                        .map(onnx_runtime_ep_api::ResidentWeightMaterialization::reused)
                 }
             })
             .unwrap();

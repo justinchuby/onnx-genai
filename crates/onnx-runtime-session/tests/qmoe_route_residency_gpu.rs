@@ -936,7 +936,12 @@ fn executor_drop_is_bounded_while_public_artifact_guard_is_held() {
         .expect("provider artifact policy")
         .provider();
     let requirement = provider
-        .executor_artifact_requirement(provider_id, scope, generation)
+        .executor_artifact_requirement(
+            provider_id,
+            scope,
+            generation,
+            onnx_runtime_ep_api::ExecutorLogicalSessionId::from_raw(scope.get()),
+        )
         .expect("query executor requirement")
         .expect("resolved QMoE executor installed route reservations");
     let holder = requirement

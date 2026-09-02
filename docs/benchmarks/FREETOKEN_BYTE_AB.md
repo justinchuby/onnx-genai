@@ -1,213 +1,150 @@
-# FreeToken byte estimates and observed production receipts
+# FreeToken byte estimates and production A/B receipts
 
-FreeToken byte evidence has two deliberately separate outputs:
+FreeToken evidence has two separate contracts:
 
-1. `freetoken_byte_ab` is a deterministic **synthetic estimate model**. It
-   performs no loader, host allocation/write, CUDA copy, VMM operation, page-in,
-   or state publication. Every modeled value is nested under an `estimated_*`
-   field and carries `declared_synthetic_model` provenance.
-2. `freetoken_byte_accounting_gpu` drives real CUDA runtime and governed weight
-   residency operations. Its `onnx-genai.freetoken-observed-bytes.v1` events are
-   recorded at the production boundary from actual arguments/results.
+1. `freetoken_byte_ab` is a deterministic synthetic **estimate** model. Its
+   schemas and fields say `estimate`; it performs no production operation.
+2. `freetoken_byte_accounting_gpu` runs structurally typed QMoE sessions through
+   the real session executor, CUDA EP, routing, lazy materialization, kernels,
+   state progression, graph capture, and replay. Its report is derived from
+   production receipts and exact output/state comparisons.
 
-Estimated values are never compared or presented as observed bytes.
+Never combine estimated and observed categories.
 
-## Synthetic estimate model
+## Authenticated observation ownership
 
-```bash
-cargo run -p onnx-genai-bench --no-default-features \
-  --bin freetoken_byte_ab -- \
-  --fixture deepseek-like \
-  --output /datadisks/disk5/justinchu/freetoken-byte-ab/deepseek-like-estimate.json
-
-cargo run -p onnx-genai-bench --no-default-features \
-  --bin freetoken_byte_ab -- \
-  --fixture glm52-like \
-  --output /datadisks/disk5/justinchu/freetoken-byte-ab/glm52-like-estimate.json
-```
-
-The output schemas are:
-
-- workload: `onnx-genai.freetoken-byte-ab.workload.v3`;
-- estimate run: `onnx-genai.freetoken-byte-ab.estimate-run.v3`;
-- estimate comparison: `onnx-genai.freetoken-byte-ab.estimate-comparison.v3`;
-- estimate taxonomy: `onnx-genai.freetoken-byte-estimate-taxonomy.v1`.
-
-Run objects contain `estimate_provenance`,
-`observed_production_events = not_observed_synthetic_estimate_only`,
-`estimated_phases`, `estimated_totals`, `estimated_residency`, and
-`estimated_failure`. Comparison deltas are named `estimated_deltas`.
-
-The built-in fixtures are structural analogues, not model gates or checkpoint
-claims:
-
-- `deepseek-like`: 256-expert typed banks plus compressed/dense state extents;
-- `glm52-like`: grouped expert banks plus recurrent/attention/temporal extents.
-
-They preserve deterministic routes, state progression, and output-token
-digests. Declared byte extents answer only “what would this model charge under
-these assumptions?” They do not establish what production read, allocated,
-copied, mapped, or published.
-
-## Observed production ledger
-
-The CUDA EP exposes a provider-owned session opener:
+There is no public label-based recorder opener. Callers may configure only a
+bounded event capacity on an unshared CUDA provider:
 
 ```text
-CudaExecutionProvider::open_observed_byte_session(
-    executor,
-    generation,
-    logical_session,
-    event_capacity,
-)
+CudaExecutionProvider::configure_observed_byte_capacity(capacity)
 ```
 
-The provider derives provider/device identity itself. Callers cannot supply a
-foreign provider id, attach a ledger through `CudaRuntime`, construct the
-private recorder, clone mutation authority, or reuse one recorder on a sibling
-provider. The public ledger permits phase selection, snapshot, reset, and close;
-production mutation remains inside the exact provider instance.
+Capacity is policy, not authority. It creates no ledger and accepts no provider,
+executor, generation, or logical-session labels.
 
-Every event carries:
+The session-private provider-artifact lifecycle creates one recorder for the
+exact provider/device/executor/generation/logical-session identity during
+finalization. The validated artifact requirement installs that recorder only
+while the owning executor performs setup, eager execution, capture, or replay.
+Sibling executors sharing one provider receive distinct ledgers. Operations on
+another provider/runtime cannot see the active recorder.
 
-- provider;
-- CUDA device;
-- executor;
-- generation;
-- logical session;
-- ledger epoch;
-- submission id;
-- event sequence;
-- phase;
-- category;
-- production boundary;
-- terminal status;
-- exact byte argument/result.
+The owning `InferenceSession` can borrow its provider-specific observation
+control through `provider_artifact_observation`. No labels are accepted at this
+boundary. Recorder construction and runtime attachment remain crate-private.
+Executor teardown retires the exact recorder; stale/reset/closed recorders reject
+new operations, and identities never wrap or reuse.
 
-The event ring is preallocated and bounded. Enabled recording performs no
-per-event heap allocation, string construction, map lookup, or mutex
-acquisition. Default-off providers allocate no ledger and do not read an
-environment variable or add a copy/synchronization.
+## Operation/telemetry transactions
 
-## Atomic submission contract
+Production CUDA operations reserve event capacity and checked byte totals before
+submitting work. The reservation is held until one terminal outcome:
 
-A submission is assembled in fixed-capacity storage. Commit:
+- successful operation → publish the complete receipt batch;
+- failed operation → publish failed/rolled-back/quarantined bytes;
+- abandoned completion → fault the ledger, so snapshot/comparison fails.
 
-1. validates ledger instance, epoch, open/fault state, event capacity,
-   submission/sequence capacity, global category totals, phase totals, and all
-   checked additions;
-2. writes the complete event batch and terminally removes pending state under
-   one short atomic gate.
+Capacity or `u64` overflow therefore fails before a measured allocation, copy,
+memset, or state-producing kernel is submitted. Reset and close refuse in-flight
+submissions. A stale recorder cannot continue writing after reset. Deferred
+release paths that cannot return an error fault the owning ledger and emit an
+explicit diagnostic; a later snapshot cannot silently omit the operation.
 
-No event or byte total is visible until all validation succeeds. Overflow at
-the first, middle, or last event commits nothing and leaves the submission
-pending. It can be explicitly aborted, or dropping it faults the ledger so a
-snapshot cannot report success. Repeated finish/abort and close are idempotent.
-Snapshot/reset/close use the same linearization authority and refuse in-flight
-submissions. A recorder used after reset faults the new epoch rather than
-silently dropping telemetry.
+Events remain bounded, ordered, and versioned. They carry provider, device,
+executor, generation, logical session, epoch, submission, sequence, phase,
+category, boundary, status, and exact bytes.
 
-## Categories, layers, and provenance
+## Host materialization receipts
 
-Categories are separate accounting planes. They must not be summed into one
-“total bytes” value:
+`ResidentWeightMaterialization` describes operations performed by that
+invocation:
 
-| Category | Observed production meaning |
-| --- | --- |
-| `source_read` | Bytes returned by an actual source read. The synthetic mmap source has no file read and emits `unsupported`, zero bytes. |
-| `mmap_page_in` | Bytes confirmed by an OS page-fault/page-in receipt. The current synthetic source emits `unsupported`, zero bytes. |
-| `host_allocation` | Capacity of a successful pinned-host allocation. Pool reuse is `reclaimed`, not a new allocation. |
-| `host_write` | Bytes actually copied into pinned staging. |
-| `device_allocation` / `device_release` | CUDA runtime allocation/reuse/release results. |
-| `h2d`, `d2h`, `d2d` | Transfer payload. Useful bytes require a completed synchronous/event receipt. Enqueue-only paths are `submitted` plus `unsupported`, never useful. |
-| `cuda_memset` | Bytes covered by a completed CUDA memset. |
-| `vmm_reserve` | Address bytes returned by a real VMM reservation. A provider arena created before ledger attachment is reported `not_observed`, not inferred per page. |
-| `vmm_map` / `vmm_unmap` | Physical mapping bytes returned by VMM commit/decommit outcomes. |
-| `page_in` | Canonical weight payload successfully published by governed residency. |
-| `expert_publication` | Payload made available to the production expert residency owner. |
-| `state_publication` | State bytes published by an instrumented state boundary. The current fixture run reports this `not_observed`; it does not infer state traffic. |
+| Kind | Host allocation | Host write |
+| --- | ---: | ---: |
+| `AllocatedAndWritten` | newly allocated bytes | bytes actually copied |
+| `ReusedResident` | 0 | 0 |
+| `SharedBacking` | 0 | 0 |
 
-Statuses keep attempted, useful, and recovery traffic distinct:
+The production external-weight materializer performs its allocation/copy inside
+`copy_from_bytes`, which creates the receipt. Route reservation consumes that
+receipt; it no longer infers operations from `resident.bytes().len()`.
 
-- `submitted`;
-- `completed`, `committed`, `published` (useful within their own category);
-- `failed`;
-- `rolled_back`;
-- `quarantined`;
-- `reclaimed`;
-- `unsupported`.
+Pinned staging is a separate real allocation/write boundary. If a materialized
+resident is copied into pinned staging, both writes are counted because both
+occurred. Cache hits, shared `Arc` values, and shared/mmap backing report zero
+resident allocation/write. Concurrent cache materialization is tested so one
+winner reports the allocation/write and deduplicated callers report reuse.
 
-Logical page/expert payload is not added to physical H2D or VMM bytes.
-`vmm_map` may differ from `page_in` because an already-owned granule can be
-reused without a new physical map.
+## Production A/B fixture
 
-## Production instrumentation points
+The GPU fixture builds two shape-driven structural cases:
 
-Observed events currently originate from:
+- `deepseek-like`: many-expert hybrid structure;
+- `glm52-like`: grouped recurrent structure.
 
-- `CudaRuntime::{alloc_raw, free_raw, alloc_pinned, htod, dtoh, dtod,
-  htod_async_elapsed_ms, memset_zero}`;
-- enqueue-only H2D/D2D runtime paths, explicitly marked unsupported for useful
-  completion accounting;
-- `PinnedStagingPool::acquire`;
-- `fill_staging_from_regions` after exact mmap-region copies;
-- `CudaWeightResidency::admit_committed_span` from
-  `SpanCommit::newly_mapped_bytes`;
-- governed page-in and expert publication;
-- deferred VMM unmap/reclaim/quarantine outcomes;
-- failed VMM fill rollback/quarantine;
-- exact per-bank route-reservation construction, mapping, H2D completion, and
-  expert publication;
-- `CsaCheckpointJournal::{checkpoint, restore_prefix}` state publication and
-  rollback after completed D2D copies.
+These names label fixtures only; runtime behavior is driven by dimensions,
+expert count, bank count, and top-k.
 
-No harness-layer `stage_expert_load(bytes_per_expert)` exists in observed
-accounting.
+Every bank/expert owns a deterministic unique packed-weight and scale pattern.
+Routes cover hot, cold, repeated, cross-bank, top-1, and top-2 selections.
+Outputs feed an explicit carried state input on the next step. The state output
+is marked as an authoritative state publication, so the executor reserves its
+telemetry before kernel submission and publishes only after successful
+execution.
 
-## A/B workload and denominators
+Baseline and optimized arms share the same model bytes, inputs, routes, shapes,
+state progression, capture schedule, and replay count. They differ only in the
+FreeToken route-residency configuration. `semantic_equivalent` is true only when
+every observed route digest, generated length, output digest, and state digest
+matches exactly.
 
-The GPU test executes identical deterministic route lists for baseline and
-optimized arms:
+Each arm executes:
 
-- baseline: completed production CUDA H2D streaming for every routed unique
-  expert;
-- optimized: the existing governed mmap → pinned staging → completed H2D →
-  VMM residency → expert publication path.
+1. provider/session finalization;
+2. prefill;
+3. direct warmup;
+4. first real CUDA graph capture;
+5. three real graph replays;
+6. four state-carrying decode steps;
+7. snapshot and teardown.
 
-Both arms verify device bytes against the same synthetic source. Setup,
-prefill, direct warmup, replay-labeled workload steps, warmed decode,
-verification, failure, and teardown are separate phases. The warmed comparison
-uses exactly four decode steps × batch two = eight generated-token
-denominators. Validation D2H is recorded under `verification`, never charged to
-decode.
+The test requires nonzero captured segments, replay events, state-publication
+bytes, H2D receipts, and route-dependent output diversity.
 
-The boundary control also captures a fixed-address D2D graph and replays it
-three times. Replay output is byte-identical. Because the generic graph replay
-path does not yet return a per-copy completion receipt, that captured D2D is
-reported as `submitted` + `unsupported`, not useful D2D; the separate
-synchronous D2D control supplies the exact completed-byte receipt.
-
-Run on an idle A100:
+Run serialized on an idle CUDA device:
 
 ```bash
 CUDA_VISIBLE_DEVICES=<idle-a100> ONNX_GENAI_CUDA_DEVICE=0 \
-ONNX_GENAI_FREETOKEN_OBSERVED_OUTPUT_DIR=<private-output-dir> \
+ONNX_GENAI_FREETOKEN_OBSERVED_OUTPUT_DIR=<private-datadisk-directory> \
 cargo test -p onnx-genai-bench --no-default-features \
   --features gpu-tests,cuda-13000 \
   --test freetoken_byte_accounting_gpu -- \
   --test-threads=1 --nocapture
 ```
 
-The reports contain the complete ordered event ledger and per-category decode
-summaries. `category_coverage` distinguishes `observed`, `unsupported`, and
-`not_observed`; `mapped_bytes_not_reclaimed` exposes committed VMM bytes that
-have not produced a reclaim receipt at snapshot time. No declared extent is
-substituted.
+The report includes structural dimensions, exact scope identities, event counts,
+cold/warm completed H2D bytes, exact deltas, capture/replay calls,
+state-publication bytes, all semantic proofs, and explicit
+`device_bytes_without_release_receipt` /
+`mapped_bytes_without_unmap_receipt` residuals for provider-lifetime resources
+whose teardown is not represented by an allocation-specific receipt.
+
+## Failure and default-off controls
+
+- Capacity-one control: the first session-owned CUDA allocation records one
+  event; the second returns the exact capacity error before allocation.
+- Ledger tests cover first/middle/last capacity and total overflow, `u64`
+  overflow, failure rollback, duplicate completion, concurrent snapshot,
+  reset/close, stale epoch, moved handles, and same-label instance isolation.
+- Public compile-fail tests reject ledger construction/cloning, direct runtime
+  attachment, and the removed label-based provider opener.
+- Without capacity configuration, the runtime owns no registry or recorder.
+  Production operations take the unchanged `OnceLock::None` branch.
 
 ## Limitations
 
-The payloads are synthetic and generated in memory. No official DeepSeek or GLM
-checkpoint is loaded. These tests establish production boundary accounting,
-identity isolation, transactional publication, route equivalence, and exact
-byte receipts. They do not establish model quality, checkpoint I/O, tokens per
-second, or end-to-end checkpoint throughput.
+The structurally typed payloads are synthetic. They execute real production
+session/CUDA boundaries but are not an official DeepSeek or GLM checkpoint.
+Reports make no checkpoint-I/O, model-quality, tokens/s, or throughput claim.
+Wall-clock time is not a correctness gate.

@@ -176,6 +176,12 @@ impl CsaCheckpointJournal {
                     "CSA checkpoint: combined carry publication bytes overflow usize".into(),
                 )
             })?;
+        let mut publication = self.runtime.prepare_observation(&[EventSpec::new(
+            ObservedCategory::StatePublication,
+            ObservedBoundary::StatePublish,
+            ObservedStatus::Published,
+            published_bytes as u64,
+        )])?;
         if main_carry_bytes > 0 {
             // SAFETY: both endpoints cover `main_carry_bytes` per the contract.
             unsafe {
@@ -190,12 +196,7 @@ impl CsaCheckpointJournal {
                     .dtod(index_carry, self.index_snapshot, index_carry_bytes)?;
             }
         }
-        self.runtime.observe_bytes(EventSpec::new(
-            ObservedCategory::StatePublication,
-            ObservedBoundary::StatePublish,
-            ObservedStatus::Published,
-            published_bytes as u64,
-        ));
+        CudaRuntime::commit_observation(&mut publication)?;
         Ok(CsaCheckpoint {
             cursors: CsaCursors::from_sequence(seq_cursor, self.ratio),
             generation,
@@ -246,6 +247,12 @@ impl CsaCheckpointJournal {
                     "CSA restore: combined rollback publication bytes overflow usize".into(),
                 )
             })?;
+        let mut publication = self.runtime.prepare_observation(&[EventSpec::new(
+            ObservedCategory::StatePublication,
+            ObservedBoundary::StatePublish,
+            ObservedStatus::RolledBack,
+            rollback_bytes as u64,
+        )])?;
         if checkpoint.main_carry_bytes > 0 {
             // SAFETY: snapshot and carry both cover `main_carry_bytes`.
             unsafe {
@@ -271,12 +278,7 @@ impl CsaCheckpointJournal {
             }
         }
         self.metrics.record_rollback();
-        self.runtime.observe_bytes(EventSpec::new(
-            ObservedCategory::StatePublication,
-            ObservedBoundary::StatePublish,
-            ObservedStatus::RolledBack,
-            rollback_bytes as u64,
-        ));
+        CudaRuntime::commit_observation(&mut publication)?;
         Ok(CsaCursors::from_sequence(accepted, self.ratio))
     }
 

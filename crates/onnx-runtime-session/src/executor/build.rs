@@ -589,7 +589,11 @@ pub(super) fn build_lazy_weight_handles_and_candidates(
                     "external weight bytes are no longer available".into(),
                 )
             })?;
-            ResidentWeight::new(dtype, shape.clone(), Arc::<[u8]>::from(bytes))
+            onnx_runtime_ep_api::ResidentWeightMaterialization::copy_from_bytes(
+                dtype,
+                shape.clone(),
+                bytes,
+            )
         })
         .map_err(|error| {
             SessionError::Internal(format!(
@@ -850,19 +854,37 @@ impl Executor {
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
     ) -> Result<Self> {
-        Self::build_with_cuda_requirement(
+        Self::build_in_logical_session(
             graph,
             weights,
             ep,
             onnx_genai_runtime_config::runtime_config().require_cuda,
+            issue_logical_session_id()?,
         )
     }
 
+    #[cfg(test)]
     pub(super) fn build_with_cuda_requirement(
         graph: Graph,
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
+    ) -> Result<Self> {
+        Self::build_in_logical_session(
+            graph,
+            weights,
+            ep,
+            require_cuda,
+            issue_logical_session_id()?,
+        )
+    }
+
+    fn build_in_logical_session(
+        graph: Graph,
+        weights: Arc<WeightStore>,
+        ep: Arc<dyn ExecutionProvider>,
+        require_cuda: bool,
+        logical_session: ExecutorLogicalSessionId,
     ) -> Result<Self> {
         Self::build_with_mode(
             graph,
@@ -870,6 +892,7 @@ impl Executor {
             ep,
             require_cuda,
             hetero_placement_env_enabled(),
+            logical_session,
         )
     }
 
@@ -879,7 +902,7 @@ impl Executor {
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
     ) -> Result<Self> {
-        Self::build_with_mode(graph, weights, ep, false, true)
+        Self::build_with_mode(graph, weights, ep, false, true, issue_logical_session_id()?)
     }
 
     fn build_with_mode(
@@ -888,6 +911,7 @@ impl Executor {
         ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
         hetero_enabled: bool,
+        logical_session: ExecutorLogicalSessionId,
     ) -> Result<Self> {
         if hetero_enabled && !require_cuda && ep.device_type() != DeviceType::Cpu {
             let cpu = auto_detect_cpu_ep()?;
@@ -917,8 +941,14 @@ impl Executor {
                 // The outer Executor is only an API coordinator. Build its
                 // legacy fields from an empty graph so no whole-model CPU
                 // kernels, weights, or activation buffers are materialized.
-                let mut coordinator =
-                    Self::build_with_mode(Graph::new(), weights, cpu, false, false)?;
+                let mut coordinator = Self::build_with_mode(
+                    Graph::new(),
+                    weights,
+                    cpu,
+                    false,
+                    false,
+                    logical_session,
+                )?;
                 coordinator.graph = planned_graph;
                 coordinator.heterogeneous = Some(Box::new(heterogeneous));
                 coordinator.execution_provider_fallback_report = None;
@@ -928,7 +958,8 @@ impl Executor {
         }
 
         let instance_id = issue_executor_instance_id()?;
-        let artifact_config = Self::resolve_artifact_config(ep.as_ref(), instance_id)?;
+        let artifact_config =
+            Self::resolve_artifact_config(ep.as_ref(), instance_id, logical_session)?;
         let mut artifact_transaction =
             ExecutorArtifactBuildTransaction::new(Arc::clone(&ep), artifact_config);
         let build = Self::build_with_artifact_transaction(
@@ -1294,7 +1325,13 @@ impl Executor {
         let opset_imports = graph.opset_imports.clone();
         registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
 
-        let sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
+        let sibling = Self::build_in_logical_session(
+            graph,
+            Arc::clone(&self.weights),
+            Arc::clone(&self.ep),
+            onnx_genai_runtime_config::runtime_config().require_cuda,
+            self.artifact_config.logical_session(),
+        )?;
         Ok(Some(sibling))
     }
 
@@ -1324,7 +1361,13 @@ impl Executor {
         let registry = InferenceRegistry::default_registry();
         let opset_imports = graph.opset_imports.clone();
         registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
-        let mut sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
+        let mut sibling = Self::build_in_logical_session(
+            graph,
+            Arc::clone(&self.weights),
+            Arc::clone(&self.ep),
+            onnx_genai_runtime_config::runtime_config().require_cuda,
+            self.artifact_config.logical_session(),
+        )?;
         sibling.graph_slot = DeviceGraphSlot::Verify;
         // Pin the sibling's StepScoped workspace. The sibling ONLY ever runs the
         // fixed M=k+1 verify shape, so its workspace is reserved once at that peak
@@ -1356,6 +1399,7 @@ impl Executor {
     fn resolve_artifact_config(
         ep: &dyn ExecutionProvider,
         instance_id: ExecutorInstanceId,
+        logical_session: ExecutorLogicalSessionId,
     ) -> Result<ExecutorArtifactConfig> {
         let artifact_policy = ep.executor_artifact_policy()?;
         if artifact_policy.device() != ep.device_id() {
@@ -1368,7 +1412,11 @@ impl Executor {
             ))
             .into());
         }
-        ExecutorArtifactConfig::issue(artifact_policy, instance_id)
+        ExecutorArtifactConfig::issue_for_logical_session(
+            artifact_policy,
+            instance_id,
+            logical_session,
+        )
     }
 
     fn place_graph(
@@ -1435,7 +1483,11 @@ impl Executor {
                 hetero_placement_env_enabled(),
             )?;
             let cpu = auto_detect_cpu_ep()?;
-            let cpu_artifact_config = Self::resolve_artifact_config(cpu.as_ref(), instance_id)?;
+            let cpu_artifact_config = Self::resolve_artifact_config(
+                cpu.as_ref(),
+                instance_id,
+                artifact_transaction.config().logical_session(),
+            )?;
             artifact_transaction.rebind(Arc::clone(&cpu), cpu_artifact_config)?;
             *graph = graph_before_ep_passes;
             *ep = cpu;
@@ -2537,6 +2589,16 @@ impl Executor {
         )
     }
 
+    fn acquire_setup_artifact_use(
+        &self,
+    ) -> Result<Option<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>>> {
+        if !self.provider_artifact_readiness.is_complete() {
+            return Ok(None);
+        }
+        self.provider_artifact_readiness
+            .acquire_use(self.ep.as_ref(), self.artifact_config, None)
+    }
+
     pub(crate) fn allocate_device_binding(
         &self,
         input_name: String,
@@ -2561,6 +2623,7 @@ impl Executor {
             .input_index
             .get(&input_name)
             .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
+        let _artifact_use = self.acquire_setup_artifact_use()?;
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -2588,6 +2651,7 @@ impl Executor {
         logical_shape: Vec<usize>,
     ) -> Result<DeviceIoBinding> {
         let bind_input = !input_name.is_empty();
+        let _artifact_use = self.acquire_setup_artifact_use()?;
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -2633,6 +2697,7 @@ impl Executor {
             .input_index
             .get(&input_name)
             .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
+        let _artifact_use = self.acquire_setup_artifact_use()?;
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -2731,6 +2796,7 @@ impl Executor {
                 "persistent output device-binding allocation",
             ));
         }
+        let _artifact_use = self.acquire_setup_artifact_use()?;
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -2925,6 +2991,12 @@ impl Executor {
 
     pub(crate) fn instance_id(&self) -> ExecutorInstanceId {
         self.instance_id
+    }
+
+    pub(crate) fn provider_artifact_observation<T: std::any::Any + Send + Sync>(
+        &self,
+    ) -> Option<&T> {
+        self.provider_artifact_readiness.observation::<T>()
     }
 
     /// Warmup: re-touch the shape-keyed cache for the compiled plan so the first

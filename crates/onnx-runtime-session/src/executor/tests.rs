@@ -548,6 +548,7 @@ impl ExecutionProvider for DeferredValidationEp {
         _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
         readiness: ExecutorArtifactReadinessEpoch,
         _graph: &Graph,
         _banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
@@ -589,6 +590,7 @@ impl ExecutionProvider for DeferredValidationEp {
         _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         _executor: ExecutorInstanceId,
         _generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
     ) -> onnx_runtime_ep_api::Result<
         Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>,
     > {
@@ -2579,6 +2581,7 @@ fn capture_shapes_seed_unresolved_external_values_without_overwriting_resolved_s
         len: 0,
         alignment: 1,
         device: onnx_runtime_ir::DeviceId::cpu(),
+        state_publication: false,
     };
     let mut external = ExternalBindings::default();
     external
@@ -5239,7 +5242,7 @@ impl Kernel for WeightDeliveryKernel {
                         "nxrt test EP expected a lazy WeightHandle".into(),
                     ));
                 };
-                let resident = lazy.materialize()?;
+                let resident = lazy.materialize()?.into_resident();
                 Self::copy_bytes(resident.bytes(), &mut outputs[0])
             }
         }
@@ -6723,7 +6726,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     unsafe {
         runtime.free_raw(control_ptr).unwrap();
     }
-    runtime.test_drain_raw_pool();
+    runtime.test_drain_raw_pool().unwrap();
     assert!(
         runtime.allocation_counts().frees > alloc_before.frees,
         "CUDA free falsifier"
@@ -8655,12 +8658,20 @@ impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
         provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
         readiness: onnx_runtime_ep_api::ExecutorArtifactReadinessEpoch,
         graph: &Graph,
         banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
     ) -> onnx_runtime_ep_api::Result<ExecutorArtifactReport> {
-        self.inner
-            .inspect_executor_artifacts(provider, executor, generation, readiness, graph, banks)
+        self.inner.inspect_executor_artifacts(
+            provider,
+            executor,
+            generation,
+            logical_session,
+            readiness,
+            graph,
+            banks,
+        )
     }
 
     fn executor_artifact_requirement(
@@ -8668,11 +8679,12 @@ impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
         provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
     ) -> onnx_runtime_ep_api::Result<
         Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>,
     > {
         self.inner
-            .executor_artifact_requirement(provider, executor, generation)
+            .executor_artifact_requirement(provider, executor, generation, logical_session)
     }
 
     fn drain_executor_artifacts(
@@ -8680,6 +8692,7 @@ impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
         provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
     ) -> onnx_runtime_ep_api::Result<()> {
         let producer_nodes = self
             .inner
@@ -8690,7 +8703,7 @@ impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
             .unwrap()
             .push((executor, generation, producer_nodes));
         self.inner
-            .drain_executor_artifacts(provider, executor, generation)
+            .drain_executor_artifacts(provider, executor, generation, logical_session)
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
@@ -8936,6 +8949,7 @@ fn strict_cuda_failed_build_rolls_back_real_qmoe_producer_and_preserves_sibling(
             provider.executor_artifact_policy().unwrap().provider(),
             sibling_id,
             failed_generation,
+            onnx_runtime_ep_api::ExecutorLogicalSessionId::from_raw(sibling_id.get()),
         )
         .expect_err("a stale generation cannot drain the live sibling");
     assert!(
@@ -8947,7 +8961,12 @@ fn strict_cuda_failed_build_rolls_back_real_qmoe_producer_and_preserves_sibling(
     let foreign_provider =
         onnx_runtime_ep_api::ExecutorArtifactProviderId::from_raw(policy.provider().get() + 1);
     let foreign_teardown = provider
-        .drain_executor_artifacts(foreign_provider, sibling_id, sibling_generation)
+        .drain_executor_artifacts(
+            foreign_provider,
+            sibling_id,
+            sibling_generation,
+            onnx_runtime_ep_api::ExecutorLogicalSessionId::from_raw(sibling_id.get()),
+        )
         .expect_err("a foreign provider label cannot drain the live sibling");
     assert!(foreign_teardown.to_string().contains("is foreign"));
     let sibling_after_hostile_teardown = provider.route_residency_executor_status(sibling_id);
@@ -9163,6 +9182,7 @@ impl ExecutionProvider for BuildTransactionProbeEp {
         provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
         readiness: onnx_runtime_ep_api::ExecutorArtifactReadinessEpoch,
         _graph: &Graph,
         _banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
@@ -9193,6 +9213,7 @@ impl ExecutionProvider for BuildTransactionProbeEp {
         provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
     ) -> onnx_runtime_ep_api::Result<()> {
         if self.panic_cleanup.swap(false, Ordering::Relaxed) {
             panic!("injected provider rollback panic");
@@ -10747,6 +10768,7 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
             len: 8,
             alignment: 8,
             device: onnx_runtime_ir::DeviceId::cpu(),
+            state_publication: false,
         },
     );
     exec.seed_warm_decode_capture_shapes(&mut mismatched, &other);

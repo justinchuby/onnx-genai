@@ -1,1012 +1,1077 @@
 #![cfg(feature = "gpu-tests")]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::fmt::Write as _;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::sys::CUdeviceptr;
-use onnx_genai_bench::freetoken_byte_ab::{
-    Phase, SemanticProof, SyntheticFixture, WorkloadSpec, run_estimate_comparison,
-    synthetic_workload,
-};
-use onnx_runtime_ep_api::{
-    ExecutionProvider, ExecutorArtifactGeneration, ExecutorInstanceId, ExternalMmapRegion,
-    LazyWeight, LazyWeightBoundary, MmapRegionSource, ResidencyResizeRequest, ResidentWeight,
-    ResizeDirection, WeightHandleError, plan_resize,
-};
+use onnx_runtime_ep_api::{ExecutionProvider, ExecutorInstanceId, ExecutorRouteResidencyConfig};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::byte_telemetry::{
-    OBSERVED_BYTE_SCHEMA, ObservedBoundary, ObservedByteLedger, ObservedCategory, ObservedEvent,
-    ObservedLayer, ObservedPhase, ObservedScope, ObservedSnapshot, ObservedStatus,
+    ObservedByteLedger, ObservedCategory, ObservedPhase, ObservedSnapshot, ObservedStatus,
 };
-use onnx_runtime_ep_cuda::runtime::CudaRuntime;
+use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
 use onnx_runtime_ep_cuda::weight_paging::DeviceOffloadPolicy;
-use onnx_runtime_ep_cuda::{CsaCheckpointJournal, CsaMetrics};
 use onnx_runtime_ir::DataType;
 use onnx_runtime_memory_governor::{
     DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
 };
+use onnx_runtime_session::{DeviceGraphCaptureResult, DeviceIoBinding, InferenceSession};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const EVENT_CAPACITY: usize = 16_384;
-const CONTROL_BYTES: usize = 64 * 1024;
+const ROWS: usize = 4;
+const EXPERTS: usize = 4;
+const EVENT_CAPACITY: usize = 65_536;
+const REPLAYS: usize = 3;
+const DECODE_STEPS: usize = 4;
+static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+static SERIAL: Mutex<()> = Mutex::new(());
 
-struct SyntheticMmap {
-    mapping_id: usize,
-    bytes: Arc<[u8]>,
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FixtureKind {
+    ManyExpertHybrid,
+    GroupedRecurrent,
 }
 
-impl MmapRegionSource for SyntheticMmap {
-    fn region_bytes(&self, region: &ExternalMmapRegion) -> Result<&[u8], WeightHandleError> {
-        if region.mapping_id != self.mapping_id {
-            return Err(WeightHandleError::DeviceBinding(format!(
-                "synthetic mmap identity mismatch: expected {}, got {}",
-                self.mapping_id, region.mapping_id
-            )));
+impl FixtureKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ManyExpertHybrid => "deepseek-like",
+            Self::GroupedRecurrent => "glm52-like",
         }
-        self.bytes
-            .get(region.offset..region.offset.saturating_add(region.len))
-            .ok_or_else(|| {
-                WeightHandleError::DeviceBinding(format!(
-                    "synthetic mmap range {}..{} exceeds {} bytes",
-                    region.offset,
-                    region.offset.saturating_add(region.len),
-                    self.bytes.len()
-                ))
-            })
+    }
+
+    fn hidden(self) -> usize {
+        match self {
+            Self::ManyExpertHybrid => 4096,
+            Self::GroupedRecurrent => 8192,
+        }
+    }
+
+    fn intermediate(self) -> usize {
+        match self {
+            Self::ManyExpertHybrid => 2048,
+            Self::GroupedRecurrent => 1024,
+        }
+    }
+
+    fn banks(self) -> usize {
+        match self {
+            Self::ManyExpertHybrid => 2,
+            Self::GroupedRecurrent => 3,
+        }
+    }
+
+    fn top_k(self) -> usize {
+        match self {
+            Self::ManyExpertHybrid => 1,
+            Self::GroupedRecurrent => 2,
+        }
+    }
+
+    fn device_budget(self) -> u64 {
+        256 << 20
     }
 }
 
-struct ObservedProvider {
-    provider: CudaExecutionProvider,
-    ledger: ObservedByteLedger,
+struct GateGuard(Option<String>);
+
+impl GateGuard {
+    fn enable() -> Self {
+        let prior = std::env::var(COARSE_RESIDENCY_ENABLE_ENV).ok();
+        unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+        Self(prior)
+    }
 }
 
-impl ObservedProvider {
-    fn new(
-        executor: u64,
-        generation: u64,
-        logical_session: u64,
-        budget_bytes: u64,
-    ) -> Result<Self> {
-        let policy = DeviceOffloadPolicy {
-            enabled: true,
-            device_budget_bytes: Some(budget_bytes),
-            ..DeviceOffloadPolicy::default()
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, value) },
+            None => unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) },
+        }
+    }
+}
+
+struct Fixture {
+    dir: PathBuf,
+    model: PathBuf,
+    kind: FixtureKind,
+}
+
+impl Fixture {
+    fn create(kind: FixtureKind) -> Result<Self> {
+        let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/deckard-freetoken-production-ab")
+            .join(format!("{}-{id}", std::process::id()));
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("create fixture directory {}", dir.display()))?;
+        let weights = dir.join("weights.bin");
+        write_weights(&weights, kind)?;
+        let model = dir.join("model.onnx.textproto");
+        fs::write(&model, model_text(kind))
+            .with_context(|| format!("write fixture model {}", model.display()))?;
+        Ok(Self { dir, model, kind })
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn write_repeated(writer: &mut BufWriter<File>, pattern: &[u8], bytes: usize) -> Result<()> {
+    ensure!(!pattern.is_empty() && bytes.is_multiple_of(pattern.len()));
+    let chunk = pattern.repeat((1 << 20) / pattern.len());
+    let mut remaining = bytes;
+    while remaining != 0 {
+        let take = remaining.min(chunk.len());
+        writer.write_all(&chunk[..take])?;
+        remaining -= take;
+    }
+    Ok(())
+}
+
+fn packed_pattern(bank: usize, expert: usize, projection: usize) -> u8 {
+    let nibble = ((bank * EXPERTS + expert + projection + 1) % 7 + 1) as u8;
+    nibble | (nibble << 4)
+}
+
+fn write_expert_tensor(
+    writer: &mut BufWriter<File>,
+    bank: usize,
+    experts: usize,
+    bytes_per_expert: usize,
+    projection: usize,
+) -> Result<()> {
+    for expert in 0..experts {
+        write_repeated(
+            writer,
+            &[packed_pattern(bank, expert, projection)],
+            bytes_per_expert,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_scale_tensor(
+    writer: &mut BufWriter<File>,
+    bank: usize,
+    experts: usize,
+    values_per_expert: usize,
+    projection: usize,
+) -> Result<()> {
+    for expert in 0..experts {
+        let scale = 0.000_01_f32 * (1 + bank * EXPERTS + expert + projection * 3) as f32;
+        write_repeated(writer, &scale.to_le_bytes(), values_per_expert * 4)?;
+    }
+    Ok(())
+}
+
+fn tensor_extents(kind: FixtureKind) -> [usize; 4] {
+    let hidden = kind.hidden();
+    let intermediate = kind.intermediate();
+    [
+        EXPERTS * intermediate * (hidden / 2),
+        EXPERTS * intermediate * (hidden / 16) * 4,
+        EXPERTS * hidden * (intermediate / 2),
+        EXPERTS * hidden * (intermediate / 16) * 4,
+    ]
+}
+
+fn write_weights(path: &Path, kind: FixtureKind) -> Result<()> {
+    let mut writer = BufWriter::new(
+        File::create(path).with_context(|| format!("create weights {}", path.display()))?,
+    );
+    let hidden = kind.hidden();
+    let intermediate = kind.intermediate();
+    for bank in 0..kind.banks() {
+        write_expert_tensor(&mut writer, bank, EXPERTS, intermediate * (hidden / 2), 0)?;
+        write_scale_tensor(&mut writer, bank, EXPERTS, intermediate * (hidden / 16), 0)?;
+        write_expert_tensor(&mut writer, bank, EXPERTS, hidden * (intermediate / 2), 1)?;
+        write_scale_tensor(&mut writer, bank, EXPERTS, hidden * (intermediate / 16), 1)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn value_info(text: &mut String, kind: &str, name: &str, columns: usize) {
+    writeln!(text, "  {kind} {{").unwrap();
+    writeln!(text, "    name: \"{name}\"").unwrap();
+    writeln!(text, "    type {{ tensor_type {{ elem_type: 1 shape {{").unwrap();
+    writeln!(text, "      dim {{ dim_value: {ROWS} }}").unwrap();
+    writeln!(text, "      dim {{ dim_value: {columns} }}").unwrap();
+    writeln!(text, "    }} }} }}").unwrap();
+    writeln!(text, "  }}").unwrap();
+}
+
+fn external_initializer(
+    text: &mut String,
+    name: &str,
+    dtype: i32,
+    dims: &[usize],
+    offset: usize,
+    len: usize,
+) {
+    writeln!(text, "  initializer {{").unwrap();
+    for dim in dims {
+        writeln!(text, "    dims: {dim}").unwrap();
+    }
+    writeln!(text, "    data_type: {dtype}").unwrap();
+    writeln!(text, "    name: \"{name}\"").unwrap();
+    writeln!(
+        text,
+        "    external_data {{ key: \"location\" value: \"weights.bin\" }}"
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "    external_data {{ key: \"offset\" value: \"{offset}\" }}"
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "    external_data {{ key: \"length\" value: \"{len}\" }}"
+    )
+    .unwrap();
+    writeln!(text, "    data_location: EXTERNAL").unwrap();
+    writeln!(text, "  }}").unwrap();
+}
+
+fn qmoe_node(text: &mut String, kind: FixtureKind, bank: usize, input: &str, output: &str) {
+    writeln!(text, "  node {{").unwrap();
+    for name in [
+        input.to_string(),
+        format!("router_{bank}"),
+        format!("b{bank}_fc1_packed"),
+        format!("b{bank}_fc1_scales"),
+        String::new(),
+        format!("b{bank}_fc2_packed"),
+        format!("b{bank}_fc2_scales"),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    ] {
+        writeln!(text, "    input: \"{name}\"").unwrap();
+    }
+    writeln!(text, "    output: \"{output}\"").unwrap();
+    writeln!(text, "    name: \"qmoe_{bank}\"").unwrap();
+    writeln!(text, "    op_type: \"QMoE\"").unwrap();
+    writeln!(text, "    domain: \"com.microsoft\"").unwrap();
+    writeln!(
+        text,
+        "    attribute {{ name: \"expert_weight_bits\" i: 4 type: INT }}"
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "    attribute {{ name: \"block_size\" i: 16 type: INT }}"
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "    attribute {{ name: \"k\" i: {} type: INT }}",
+        kind.top_k()
+    )
+    .unwrap();
+    text.push_str(
+        "    attribute { name: \"activation_type\" s: \"silu\" type: STRING }\n\
+         \x20   attribute { name: \"normalize_routing_weights\" i: 0 type: INT }\n\
+         \x20   attribute { name: \"swiglu_fusion\" i: 0 type: INT }\n",
+    );
+    writeln!(text, "  }}").unwrap();
+}
+
+fn model_text(kind: FixtureKind) -> String {
+    let hidden = kind.hidden();
+    let intermediate = kind.intermediate();
+    let extents = tensor_extents(kind);
+    let mut text = format!(
+        "ir_version: 11\nproducer_name: \"deckard-freetoken-production-ab\"\ngraph {{\n  \
+         name: \"{}\"\n",
+        kind.label()
+    );
+    for bank in 0..kind.banks() {
+        let input = if bank == 0 {
+            "hidden".to_string()
+        } else {
+            format!("bank_{}_out", bank - 1)
         };
-        let capacity = budget_bytes
-            .checked_add(2_u64 << 30)
-            .context("observed provider governor capacity overflow")?;
-        let governor: Arc<dyn MemoryGovernor + Send + Sync> = Arc::new(LedgerGovernor::new(
-            LeaseLedger::new_for_device(DeviceKey::device(0), capacity, capacity, 0),
-        ));
-        let provider = CudaExecutionProvider::initialized_with_offload_policy_and_governor(
+        let output = format!("bank_{bank}_out");
+        qmoe_node(&mut text, kind, bank, &input, &output);
+    }
+    let last = format!("bank_{}_out", kind.banks() - 1);
+    writeln!(
+        text,
+        "  node {{ input: \"{last}\" input: \"state\" output: \"output\" op_type: \"Add\" }}"
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "  node {{ input: \"output\" output: \"state_out\" op_type: \"Identity\" }}"
+    )
+    .unwrap();
+
+    let mut offset = 0usize;
+    for bank in 0..kind.banks() {
+        for (suffix, dtype, dims, len) in [
+            (
+                "fc1_packed",
+                2,
+                vec![EXPERTS, intermediate, hidden / 2],
+                extents[0],
+            ),
+            (
+                "fc1_scales",
+                1,
+                vec![EXPERTS, intermediate, hidden / 16],
+                extents[1],
+            ),
+            (
+                "fc2_packed",
+                2,
+                vec![EXPERTS, hidden, intermediate / 2],
+                extents[2],
+            ),
+            (
+                "fc2_scales",
+                1,
+                vec![EXPERTS, hidden, intermediate / 16],
+                extents[3],
+            ),
+        ] {
+            external_initializer(
+                &mut text,
+                &format!("b{bank}_{suffix}"),
+                dtype,
+                &dims,
+                offset,
+                len,
+            );
+            offset += len;
+        }
+    }
+    value_info(&mut text, "input", "hidden", hidden);
+    value_info(&mut text, "input", "state", hidden);
+    for bank in 0..kind.banks() {
+        value_info(&mut text, "input", &format!("router_{bank}"), EXPERTS);
+        value_info(&mut text, "value_info", &format!("bank_{bank}_out"), hidden);
+    }
+    value_info(&mut text, "output", "output", hidden);
+    value_info(&mut text, "output", "state_out", hidden);
+    text.push_str(
+        "}\nopset_import { domain: \"\" version: 13 }\n\
+         opset_import { domain: \"com.microsoft\" version: 1 }\n",
+    );
+    text
+}
+
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn router_bytes(kind: FixtureKind, bank: usize, selected: [usize; ROWS]) -> Vec<u8> {
+    selected
+        .into_iter()
+        .enumerate()
+        .flat_map(|(row, hot)| {
+            (0..EXPERTS).map(move |expert| {
+                if expert == hot {
+                    30.0_f32 + bank as f32
+                } else if kind.top_k() > 1 && expert == (hot + row + 1) % EXPERTS {
+                    15.0_f32 + bank as f32
+                } else {
+                    -30.0_f32
+                }
+            })
+        })
+        .flat_map(f32::to_le_bytes)
+        .collect()
+}
+
+struct LiveArm {
+    provider: Arc<CudaExecutionProvider>,
+    session: InferenceSession,
+    bindings: Vec<DeviceIoBinding>,
+    router_start: usize,
+    state_index: usize,
+    output_index: usize,
+    state_output_index: usize,
+}
+
+fn build_arm(fixture: &Fixture, route_config: ExecutorRouteResidencyConfig) -> Result<LiveArm> {
+    let capacity = 2_u64 << 30;
+    let governor: Arc<dyn MemoryGovernor + Send + Sync> = Arc::new(LedgerGovernor::new(
+        LeaseLedger::new_for_device(DeviceKey::device(0), capacity, capacity, 0),
+    ));
+    let policy = DeviceOffloadPolicy {
+        enabled: true,
+        device_budget_bytes: Some(fixture.kind.device_budget()),
+        ..DeviceOffloadPolicy::default()
+    };
+    let mut provider =
+        CudaExecutionProvider::initialized_with_offload_policy_governor_and_route_config(
             0,
             policy,
             Arc::clone(&governor),
+            route_config,
         )
-        .context("construct initialized governed CUDA provider for observed workload")?;
-        provider
-            .adopt_memory_governor(governor.as_ref(), Tier::Device, HolderId::new(executor))
-            .context("adopt mapped weight allowance for observed workload")?;
-        let ledger = provider
-            .open_observed_byte_session(
-                ExecutorInstanceId::from_raw(executor),
-                ExecutorArtifactGeneration::from_raw(generation),
-                logical_session,
-                EVENT_CAPACITY,
-            )
-            .context("open exact provider/executor observed-byte session")?;
-        Ok(Self { provider, ledger })
-    }
+        .context("construct production CUDA provider")?;
+    provider
+        .adopt_memory_governor(governor.as_ref(), Tier::Device, HolderId::new(0x2343))
+        .context("adopt production weight-residency allowance")?;
+    provider.configure_observed_byte_capacity(EVENT_CAPACITY)?;
+    let provider = Arc::new(provider);
+    let mut session = InferenceSession::builder()
+        .model(&fixture.model)
+        .execution_provider(Arc::clone(&provider) as Arc<dyn ExecutionProvider>)
+        .build()
+        .context("build production QMoE session")?;
+    session.warmup(&[]).context("finalize provider artifacts")?;
 
-    fn runtime(&self) -> &Arc<CudaRuntime> {
-        self.provider.runtime()
+    let hidden = fixture.kind.hidden();
+    let mut bindings = vec![
+        session.allocate_device_binding(
+            "hidden",
+            None::<String>,
+            DataType::Float32,
+            vec![ROWS, hidden],
+            vec![ROWS, hidden],
+        )?,
+        session.allocate_device_binding(
+            "state",
+            None::<String>,
+            DataType::Float32,
+            vec![ROWS, hidden],
+            vec![ROWS, hidden],
+        )?,
+    ];
+    let router_start = bindings.len();
+    for bank in 0..fixture.kind.banks() {
+        bindings.push(session.allocate_device_binding(
+            format!("router_{bank}"),
+            None::<String>,
+            DataType::Float32,
+            vec![ROWS, EXPERTS],
+            vec![ROWS, EXPERTS],
+        )?);
     }
+    let output_index = bindings.len();
+    bindings.push(session.allocate_device_output_binding(
+        "output",
+        DataType::Float32,
+        vec![ROWS, hidden],
+        vec![ROWS, hidden],
+    )?);
+    let state_output_index = bindings.len();
+    let mut state_output = session.allocate_device_output_binding(
+        "state_out",
+        DataType::Float32,
+        vec![ROWS, hidden],
+        vec![ROWS, hidden],
+    )?;
+    state_output.mark_state_publication();
+    bindings.push(state_output);
 
-    fn shutdown(&mut self, label: &str) -> Result<()> {
-        self.provider
-            .shutdown()
-            .with_context(|| format!("shutdown {label} observed provider"))?;
-        ensure!(
-            self.provider
-                .release_queue()
-                .wait_until_idle(std::time::Duration::from_secs(30)),
-            "{label} observed provider did not drain deferred releases"
-        );
-        Ok(())
-    }
-
-    fn into_snapshot(self, label: &str) -> Result<ObservedSnapshot> {
-        let queue = Arc::clone(self.provider.release_queue());
-        let Self { provider, ledger } = self;
-        drop(provider);
-        ensure!(
-            queue.wait_until_idle(std::time::Duration::from_secs(30)),
-            "{label} provider drop did not drain deferred releases"
-        );
-        ledger.snapshot().map_err(anyhow::Error::from)
-    }
-}
-
-fn observed_phase(phase: Phase) -> ObservedPhase {
-    match phase {
-        Phase::Setup => ObservedPhase::Setup,
-        Phase::Prefill => ObservedPhase::Prefill,
-        Phase::DirectWarmup => ObservedPhase::DirectWarmup,
-        Phase::CaptureSetup => ObservedPhase::CaptureSetup,
-        Phase::Replay => ObservedPhase::Replay,
-        Phase::DecodeSteady => ObservedPhase::DecodeSteady,
-        Phase::Failure => ObservedPhase::Failure,
-    }
-}
-
-fn reconstructed_phase_bytes(
-    snapshot: &ObservedSnapshot,
-    phase: ObservedPhase,
-    category: ObservedCategory,
-) -> Result<u64> {
-    let mut useful = 0_u64;
-    for status in ObservedStatus::ALL {
-        let reconstructed = snapshot
-            .events
-            .iter()
-            .filter(|event| {
-                event.phase == phase && event.category == category && event.status == status
-            })
-            .try_fold(0_u64, |total, event| {
-                total
-                    .checked_add(event.bytes)
-                    .context("reconstructed event byte sum overflow")
-            })?;
-        ensure!(
-            reconstructed == snapshot.phase_bytes(phase, category, status),
-            "independent {phase:?}/{category:?}/{status:?} reconstruction {reconstructed} \
-             disagrees with ledger total {}",
-            snapshot.phase_bytes(phase, category, status)
-        );
-        if status.is_useful() {
-            useful = useful
-                .checked_add(reconstructed)
-                .context("reconstructed useful byte sum overflow")?;
-        }
-    }
-    Ok(useful)
-}
-
-fn fixture_budget(workload: &WorkloadSpec) -> Result<u64> {
-    workload.banks.iter().try_fold(0_u64, |total, bank| {
-        bank.bytes_per_expert
-            .checked_mul(u64::from(bank.cache_slots))
-            .and_then(|bytes| total.checked_add(bytes))
-            .context("fixture cache budget overflow")
+    let hidden_bytes = (0..ROWS * hidden)
+        .map(|index| ((index % 29) as f32 - 14.0) * 0.002)
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    bindings[0].write_bytes(0, &hidden_bytes)?;
+    bindings[1].write_bytes(0, &vec![0_u8; ROWS * hidden * 4])?;
+    Ok(LiveArm {
+        provider,
+        session,
+        bindings,
+        router_start,
+        state_index: 1,
+        output_index,
+        state_output_index,
     })
 }
 
-fn fixture_sources(workload: &WorkloadSpec) -> Result<Vec<SyntheticMmap>> {
-    workload
-        .banks
-        .iter()
-        .enumerate()
-        .map(|(bank_index, bank)| {
-            let len = usize::try_from(bank.bytes_per_expert)
-                .context("fixture expert extent exceeds usize")?;
-            Ok(SyntheticMmap {
-                mapping_id: bank_index + 1,
-                bytes: vec![(bank_index as u8).wrapping_mul(37).wrapping_add(11); len].into(),
-            })
-        })
-        .collect()
-}
-
-fn fixture_lazy_weights(
-    workload: &WorkloadSpec,
-    sources: &[SyntheticMmap],
-) -> Result<Vec<Vec<LazyWeight>>> {
-    workload
-        .banks
-        .iter()
-        .enumerate()
-        .map(|(bank_index, bank)| {
-            let source = &sources[bank_index];
-            (0..bank.expert_count)
-                .map(|_| {
-                    let bytes = Arc::clone(&source.bytes);
-                    let shape = vec![bytes.len()];
-                    LazyWeight::new(
-                        LazyWeightBoundary::BlockQuantizedMoe,
-                        DataType::Uint8,
-                        shape.clone(),
-                        vec![ExternalMmapRegion {
-                            mapping_id: source.mapping_id,
-                            offset: 0,
-                            len: bytes.len(),
-                        }],
-                        move || {
-                            ResidentWeight::new(DataType::Uint8, shape.clone(), Arc::clone(&bytes))
-                        },
-                    )
-                    .map_err(anyhow::Error::from)
-                })
-                .collect()
-        })
-        .collect()
-}
-
-fn lazy_for_source(source: &SyntheticMmap) -> Result<LazyWeight> {
-    let bytes = Arc::clone(&source.bytes);
-    let shape = vec![bytes.len()];
-    LazyWeight::new(
-        LazyWeightBoundary::BlockQuantizedMoe,
-        DataType::Uint8,
-        shape.clone(),
-        vec![ExternalMmapRegion {
-            mapping_id: source.mapping_id,
-            offset: 0,
-            len: bytes.len(),
-        }],
-        move || ResidentWeight::new(DataType::Uint8, shape.clone(), Arc::clone(&bytes)),
-    )
-    .map_err(anyhow::Error::from)
-}
-
-fn verify_first_page(
-    runtime: &CudaRuntime,
-    page: &onnx_runtime_ep_cuda::weight_paging::CudaWeightPage,
-    expected: u8,
-) -> Result<()> {
-    let len = page.len().min(64);
-    let mut bytes = vec![0_u8; len];
-    // SAFETY: the page owns at least `len` initialized device bytes.
-    unsafe { runtime.dtoh(&mut bytes, page.device_ptr() as usize as CUdeviceptr) }
-        .context("read production-paged expert control bytes")?;
-    ensure!(
-        bytes.iter().all(|&byte| byte == expected),
-        "production-paged expert bytes differ from the synthetic mmap source"
-    );
+fn set_routes(arm: &mut LiveArm, kind: FixtureKind, routes: &[[usize; ROWS]]) -> Result<()> {
+    ensure!(routes.len() == kind.banks());
+    for (bank, selected) in routes.iter().copied().enumerate() {
+        arm.bindings[arm.router_start + bank]
+            .write_bytes(0, &router_bytes(kind, bank, selected))?;
+    }
     Ok(())
 }
 
-fn semantic_digest(workload: &WorkloadSpec) -> Result<String> {
-    let bytes = serde_json::to_vec(&workload.routes).context("serialize fixture routes")?;
-    Ok(Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct StepProof {
+    phase: &'static str,
+    generated_length: usize,
+    route_digest: String,
+    output_digest: String,
+    state_digest: String,
 }
 
-fn run_baseline(workload: &WorkloadSpec, executor: u64) -> Result<ObservedSnapshot> {
-    let budget = fixture_budget(workload)?;
-    let mut observed = ObservedProvider::new(executor, 1, executor + 10_000, budget)?;
-    let sources = fixture_sources(workload)?;
-    observed.ledger.set_phase(ObservedPhase::Setup)?;
-    let buffers = workload
-        .banks
-        .iter()
+fn execute_step(
+    arm: &mut LiveArm,
+    kind: FixtureKind,
+    phase: &'static str,
+    generated_length: usize,
+    routes: &[[usize; ROWS]],
+    replay: bool,
+) -> Result<StepProof> {
+    set_routes(arm, kind, routes)?;
+    if replay {
+        ensure!(arm.session.replay_device_graph(&mut arm.bindings)?);
+    } else {
+        arm.session
+            .run_with_device_bindings(&[], &mut arm.bindings)?;
+    }
+    let output = arm.bindings[arm.output_index].read_bytes()?;
+    let state = arm.bindings[arm.state_output_index].read_bytes()?;
+    ensure!(
+        output == state,
+        "state output must publish the exact produced output"
+    );
+    arm.bindings[arm.state_index].write_bytes(0, &state)?;
+    Ok(StepProof {
+        phase,
+        generated_length,
+        route_digest: digest(&serde_json::to_vec(routes)?),
+        output_digest: digest(&output),
+        state_digest: digest(&state),
+    })
+}
+
+fn routes(kind: FixtureKind, step: usize) -> Vec<[usize; ROWS]> {
+    (0..kind.banks())
         .map(|bank| {
-            observed
-                .runtime()
-                .alloc_raw(bank.bytes_per_expert as usize)
-                .context("allocate baseline streaming buffer")
+            [
+                (step + bank) % EXPERTS,
+                (step * 2 + bank + 1) % EXPERTS,
+                (step + bank + 2) % EXPERTS,
+                (step * 3 + bank + 3) % EXPERTS,
+            ]
         })
-        .collect::<Result<Vec<_>>>()?;
-
-    for step in &workload.routes {
-        observed.ledger.set_phase(observed_phase(step.phase))?;
-        for (bank_index, selections) in step.selections.iter().enumerate() {
-            let unique = selections.iter().copied().collect::<BTreeSet<_>>();
-            for _expert in unique {
-                // SAFETY: each baseline buffer exactly covers its bank's source.
-                unsafe {
-                    observed
-                        .runtime()
-                        .htod(&sources[bank_index].bytes, buffers[bank_index])
-                }
-                .context("complete baseline production H2D stream")?;
-            }
-        }
-    }
-    observed.ledger.set_phase(ObservedPhase::Verification)?;
-    for (bank_index, &ptr) in buffers.iter().enumerate() {
-        let mut control = [0_u8; 64];
-        // SAFETY: every fixture expert is at least 64 bytes.
-        unsafe { observed.runtime().dtoh(&mut control, ptr) }
-            .context("read baseline output control")?;
-        ensure!(
-            control
-                .iter()
-                .all(|&byte| byte == sources[bank_index].bytes[0]),
-            "baseline stream changed bank {bank_index} bytes"
-        );
-        // SAFETY: pointer came from this exact runtime and is freed once.
-        unsafe { observed.runtime().free_raw(ptr) }.context("free baseline stream buffer")?;
-    }
-    observed.ledger.set_phase(ObservedPhase::Teardown)?;
-    observed.shutdown("baseline")?;
-    observed.into_snapshot("baseline")
-}
-
-fn run_optimized(workload: &WorkloadSpec, executor: u64) -> Result<ObservedSnapshot> {
-    let budget = fixture_budget(workload)?;
-    let mut observed = ObservedProvider::new(executor, 1, executor + 10_000, budget)?;
-    let sources = fixture_sources(workload)?;
-    let lazies = fixture_lazy_weights(workload, &sources)?;
-    let residency = Arc::clone(
-        observed
-            .provider
-            .residency()
-            .context("optimized provider omitted production weight residency")?,
-    );
-    let mut verified_bank = vec![false; workload.banks.len()];
-
-    observed.ledger.set_phase(ObservedPhase::Setup)?;
-    for step in &workload.routes {
-        observed.ledger.set_phase(observed_phase(step.phase))?;
-        for (bank_index, selections) in step.selections.iter().enumerate() {
-            let unique = selections.iter().copied().collect::<BTreeSet<_>>();
-            for expert in unique {
-                let key = ((bank_index as u64) << 32) | u64::from(expert);
-                let page = residency
-                    .resident_mapped(
-                        key,
-                        &lazies[bank_index][expert as usize],
-                        &sources[bank_index],
-                    )
-                    .with_context(|| {
-                        format!(
-                            "page production expert {expert} for bank {}",
-                            workload.banks[bank_index].bank
-                        )
-                    })?;
-                if !verified_bank[bank_index] {
-                    verify_first_page(observed.runtime(), &page, sources[bank_index].bytes[0])?;
-                    verified_bank[bank_index] = true;
-                }
-            }
-        }
-    }
-    ensure!(
-        verified_bank.into_iter().all(|verified| verified),
-        "optimized workload failed to exercise every expert bank"
-    );
-    observed.ledger.set_phase(ObservedPhase::Teardown)?;
-    let shrink = ResidencyResizeRequest {
-        direction: ResizeDirection::Shrink,
-        target_bytes: budget,
-        priority: 0,
-    };
-    let outcome = residency.execute_resize(plan_resize(shrink, residency.resize_safe_point(1)), 1);
-    ensure!(
-        outcome.rejection.is_none(),
-        "optimized teardown reclaim was rejected: {:?}",
-        outcome.rejection
-    );
-    ensure!(
-        observed
-            .provider
-            .release_queue()
-            .wait_until_idle(std::time::Duration::from_secs(30)),
-        "optimized teardown did not complete VMM page releases"
-    );
-    drop(residency);
-    observed.shutdown("optimized")?;
-    observed.into_snapshot("optimized")
+        .collect()
 }
 
 #[derive(Serialize)]
-struct ArmSummary {
-    scope: ObservedScope,
-    event_count: usize,
-    decode_tokens: u64,
-    phase_useful_bytes: BTreeMap<ObservedPhase, BTreeMap<ObservedCategory, u64>>,
-    decode_useful_bytes: BTreeMap<ObservedCategory, u64>,
-    total_vmm_map_committed: u64,
-    total_vmm_unmap_reclaimed: u64,
-    mapped_bytes_not_reclaimed: u64,
-    quarantined_page_in_bytes: u64,
-    category_coverage: BTreeMap<ObservedCategory, CategoryCoverage>,
-    events: Vec<ObservedEvent>,
+struct ArmReport {
+    scope: onnx_runtime_ep_cuda::byte_telemetry::ObservedScope,
+    optimization_mode: &'static str,
+    route_residency_outcome: String,
+    events: usize,
+    event_totals: BTreeMap<
+        onnx_runtime_ep_cuda::byte_telemetry::ObservedCategory,
+        BTreeMap<ObservedStatus, u64>,
+    >,
+    cold_h2d: u64,
+    warm_h2d: u64,
+    replay_events: usize,
+    state_publications: u64,
+    device_bytes_without_release_receipt: u64,
+    mapped_bytes_without_unmap_receipt: u64,
+    proofs: Vec<StepProof>,
 }
 
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum CategoryCoverage {
-    Observed,
-    Unsupported,
-    NotObserved,
-}
-
-fn summarize(workload: &WorkloadSpec, snapshot: &ObservedSnapshot) -> Result<ArmSummary> {
-    let decode_tokens = workload
-        .routes
+fn completed_h2d(snapshot: &ObservedSnapshot, phases: &[ObservedPhase]) -> u64 {
+    phases
         .iter()
-        .filter(|step| step.phase == Phase::DecodeSteady)
-        .try_fold(0_u64, |tokens, _| {
-            tokens
-                .checked_add(u64::from(workload.batch))
-                .context("decode token denominator overflow")
-        })?;
-    let phase_useful_bytes = ObservedPhase::ALL
-        .into_iter()
-        .map(|phase| {
-            ObservedCategory::ALL
-                .into_iter()
-                .map(|category| {
-                    reconstructed_phase_bytes(snapshot, phase, category)
-                        .map(|bytes| (category, bytes))
-                })
-                .collect::<Result<BTreeMap<_, _>>>()
-                .map(|bytes| (phase, bytes))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let decode_useful_bytes = phase_useful_bytes[&ObservedPhase::DecodeSteady].clone();
-    let category_coverage = ObservedCategory::ALL
+        .map(|phase| snapshot.phase_bytes(*phase, ObservedCategory::H2d, ObservedStatus::Completed))
+        .sum()
+}
+
+fn observation(arm: &LiveArm) -> Result<&ObservedByteLedger> {
+    arm.session
+        .provider_artifact_observation::<ObservedByteLedger>()
+        .context("session omitted its exact observed-byte owner")
+}
+
+fn run_arm(fixture: &Fixture, optimized: bool) -> Result<ArmReport> {
+    let route_config = if optimized {
+        ExecutorRouteResidencyConfig::Enabled
+    } else {
+        ExecutorRouteResidencyConfig::Disabled
+    };
+    let mut arm = build_arm(fixture, route_config)?;
+    observation(&arm)?.set_phase(ObservedPhase::Prefill)?;
+    let mut proofs = vec![execute_step(
+        &mut arm,
+        fixture.kind,
+        "prefill",
+        0,
+        &routes(fixture.kind, 0),
+        false,
+    )?];
+
+    observation(&arm)?.set_phase(ObservedPhase::DirectWarmup)?;
+    proofs.push(execute_step(
+        &mut arm,
+        fixture.kind,
+        "direct_warmup",
+        1,
+        &routes(fixture.kind, 1),
+        false,
+    )?);
+
+    observation(&arm)?.set_phase(ObservedPhase::CaptureSetup)?;
+    set_routes(&mut arm, fixture.kind, &routes(fixture.kind, 2))?;
+    let capture = arm
+        .session
+        .try_capture_with_device_bindings(&[], &mut arm.bindings)?;
+    if let DeviceGraphCaptureResult::NotCapturable(reason) = capture {
+        anyhow::bail!("production capture was declined: {reason}");
+    }
+    ensure!(
+        arm.session.captured_graph_segment_count() > 0,
+        "first real CUDA graph capture must publish at least one segment"
+    );
+    let capture_output = arm.bindings[arm.output_index].read_bytes()?;
+    let capture_state = arm.bindings[arm.state_output_index].read_bytes()?;
+    ensure!(capture_output == capture_state);
+    arm.bindings[arm.state_index].write_bytes(0, &capture_state)?;
+    proofs.push(StepProof {
+        phase: "capture",
+        generated_length: 2,
+        route_digest: digest(&serde_json::to_vec(&routes(fixture.kind, 2))?),
+        output_digest: digest(&capture_output),
+        state_digest: digest(&capture_state),
+    });
+
+    observation(&arm)?.set_phase(ObservedPhase::Replay)?;
+    for replay in 0..REPLAYS {
+        proofs.push(execute_step(
+            &mut arm,
+            fixture.kind,
+            "replay",
+            3 + replay,
+            &routes(fixture.kind, 2),
+            true,
+        )?);
+    }
+
+    observation(&arm)?.set_phase(ObservedPhase::DecodeSteady)?;
+    for step in 0..DECODE_STEPS {
+        proofs.push(execute_step(
+            &mut arm,
+            fixture.kind,
+            "decode",
+            3 + REPLAYS + step,
+            &routes(fixture.kind, step + 3),
+            false,
+        )?);
+    }
+
+    let distinct_outputs = proofs
+        .iter()
+        .map(|proof| &proof.output_digest)
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        distinct_outputs.len() > 2,
+        "unique expert routes and carried state must produce nontrivial distinct outputs"
+    );
+    let reader = observation(&arm)?.read_handle();
+    let route_residency_outcome = format!(
+        "{:?}",
+        arm.provider
+            .route_residency_executor_status(ExecutorInstanceId::from_raw(
+                observation(&arm)?.scope().executor,
+            ))
+            .outcome
+    );
+    observation(&arm)?.set_phase(ObservedPhase::Teardown)?;
+    let LiveArm {
+        provider,
+        session,
+        bindings,
+        ..
+    } = arm;
+    drop(bindings);
+    drop(session);
+    let queue = Arc::clone(provider.release_queue());
+    let mut provider = Arc::try_unwrap(provider)
+        .map_err(|_| anyhow::anyhow!("production A/B provider remained shared after teardown"))?;
+    provider.shutdown()?;
+    ensure!(
+        queue.wait_until_idle(std::time::Duration::from_secs(30)),
+        "production A/B deferred releases did not reach terminal outcomes"
+    );
+    drop(provider);
+    let snapshot = reader.snapshot()?;
+    let event_totals = onnx_runtime_ep_cuda::byte_telemetry::ObservedCategory::ALL
         .into_iter()
         .map(|category| {
-            let unsupported = snapshot.events.iter().any(|event| {
-                event.category == category && event.status == ObservedStatus::Unsupported
-            });
-            let observed = snapshot
-                .events
-                .iter()
-                .any(|event| event.category == category);
-            (
-                category,
-                if unsupported {
-                    CategoryCoverage::Unsupported
-                } else if observed {
-                    CategoryCoverage::Observed
-                } else {
-                    CategoryCoverage::NotObserved
-                },
-            )
+            let statuses = ObservedStatus::ALL
+                .into_iter()
+                .map(|status| (status, snapshot.bytes(category, status)))
+                .collect();
+            (category, statuses)
         })
         .collect();
-    let total_vmm_map_committed =
-        snapshot.bytes(ObservedCategory::VmmMap, ObservedStatus::Committed);
-    let total_vmm_unmap_reclaimed =
-        snapshot.bytes(ObservedCategory::VmmUnmap, ObservedStatus::Reclaimed);
-    let mapped_bytes_not_reclaimed = total_vmm_map_committed
-        .checked_sub(total_vmm_unmap_reclaimed)
-        .context("observed VMM unmap bytes exceed committed map bytes")?;
-    Ok(ArmSummary {
+    let replay_events = snapshot
+        .events
+        .iter()
+        .filter(|event| event.phase == ObservedPhase::Replay)
+        .count();
+    let state_publications = snapshot.bytes(
+        ObservedCategory::StatePublication,
+        ObservedStatus::Published,
+    );
+    let device_bytes_without_release_receipt = snapshot
+        .bytes(
+            ObservedCategory::DeviceAllocation,
+            ObservedStatus::Committed,
+        )
+        .checked_sub(snapshot.bytes(ObservedCategory::DeviceRelease, ObservedStatus::Reclaimed))
+        .context("device release receipts exceed observed allocations")?;
+    let mapped_bytes_without_unmap_receipt = snapshot
+        .bytes(ObservedCategory::VmmMap, ObservedStatus::Committed)
+        .checked_sub(snapshot.bytes(ObservedCategory::VmmUnmap, ObservedStatus::Reclaimed))
+        .context("VMM unmap receipts exceed observed maps")?;
+    ensure!(replay_events >= REPLAYS);
+    ensure!(state_publications > 0);
+    Ok(ArmReport {
         scope: snapshot.scope,
-        event_count: snapshot.events.len(),
-        decode_tokens,
-        phase_useful_bytes,
-        decode_useful_bytes,
-        total_vmm_map_committed,
-        total_vmm_unmap_reclaimed,
-        mapped_bytes_not_reclaimed,
-        quarantined_page_in_bytes: snapshot
-            .bytes(ObservedCategory::PageIn, ObservedStatus::Quarantined),
-        category_coverage,
-        events: snapshot.events.clone(),
+        optimization_mode: if optimized { "freetoken" } else { "baseline" },
+        route_residency_outcome,
+        events: snapshot.events.len(),
+        event_totals,
+        cold_h2d: completed_h2d(&snapshot, &[ObservedPhase::Setup, ObservedPhase::Prefill]),
+        warm_h2d: completed_h2d(
+            &snapshot,
+            &[
+                ObservedPhase::DirectWarmup,
+                ObservedPhase::CaptureSetup,
+                ObservedPhase::Replay,
+                ObservedPhase::DecodeSteady,
+            ],
+        ),
+        replay_events,
+        state_publications,
+        device_bytes_without_release_receipt,
+        mapped_bytes_without_unmap_receipt,
+        proofs,
     })
 }
 
 #[derive(Serialize)]
-struct FixtureReport {
+struct ComparisonReport {
     schema: &'static str,
-    provenance: &'static str,
-    category_layers: BTreeMap<ObservedCategory, ObservedLayer>,
-    fixture: String,
-    limitation: &'static str,
-    semantic_route_digest: String,
+    fixture: FixtureKind,
+    dimensions: BTreeMap<&'static str, usize>,
     semantic_equivalent: bool,
-    baseline_semantics: SemanticProof,
-    optimized_semantics: SemanticProof,
-    decode_h2d: DecodeH2dComparison,
-    baseline: ArmSummary,
-    optimized: ArmSummary,
+    capture_calls_per_arm: usize,
+    replay_calls_per_arm: usize,
+    baseline: ArmReport,
+    optimized: ArmReport,
+    cold_h2d_delta: i128,
+    warm_h2d_delta: i128,
+    limitation: &'static str,
 }
 
-#[derive(Serialize)]
-struct DecodeH2dComparison {
-    baseline_bytes: u64,
-    optimized_bytes: u64,
-    optimized_minus_baseline: String,
-    baseline_bytes_per_token: u64,
-    optimized_bytes_per_token: u64,
-}
-
-fn write_report_if_requested(fixture: &str, report: &FixtureReport) -> Result<()> {
+fn write_report(report: &ComparisonReport) -> Result<()> {
     let Some(directory) = std::env::var_os("ONNX_GENAI_FREETOKEN_OBSERVED_OUTPUT_DIR") else {
         return Ok(());
     };
-    let directory = std::path::PathBuf::from(directory);
-    std::fs::create_dir_all(&directory)
-        .with_context(|| format!("create observed report directory {}", directory.display()))?;
-    let path = directory.join(format!("{fixture}.json"));
-    std::fs::write(&path, serde_json::to_vec_pretty(report)?)
-        .with_context(|| format!("write observed report {}", path.display()))
-}
-
-#[test]
-fn production_runtime_boundaries_record_only_completed_real_operations() -> Result<()> {
-    const PAGE_BYTES: usize = 2 << 20;
-    const MAIN_STATE_BYTES: usize = 4 << 10;
-    const INDEX_STATE_BYTES: usize = 2 << 10;
-    const STATE_BYTES: usize = MAIN_STATE_BYTES + INDEX_STATE_BYTES;
-
-    let mut observed = ObservedProvider::new(91, 3, 701, PAGE_BYTES as u64)?;
-    observed.ledger.set_phase(ObservedPhase::Setup)?;
-    let source = vec![0x5a_u8; CONTROL_BYTES];
-    let first = observed.runtime().alloc_raw(CONTROL_BYTES)?;
-    let second = observed.runtime().alloc_raw(CONTROL_BYTES)?;
-    // SAFETY: both allocations cover CONTROL_BYTES.
-    unsafe {
-        observed.runtime().memset_zero(first, CONTROL_BYTES)?;
-        observed.runtime().htod(&source, first)?;
-        observed.runtime().dtod(first, second, CONTROL_BYTES)?;
-    }
-    let mut output = vec![0_u8; CONTROL_BYTES];
-    // SAFETY: second contains CONTROL_BYTES initialized by the completed D2D.
-    unsafe { observed.runtime().dtoh(&mut output, second)? };
-    ensure!(output == source, "real CUDA boundary control changed bytes");
-
-    observed.ledger.set_phase(ObservedPhase::CaptureSetup)?;
-    observed.runtime().begin_graph_capture(&[])?;
-    // SAFETY: capture records a same-size D2D over two live fixed addresses.
-    unsafe {
-        observed
-            .runtime()
-            .dtod_async(first, second, CONTROL_BYTES)?;
-    }
-    observed.runtime().end_graph_capture()?;
-    observed.ledger.set_phase(ObservedPhase::Replay)?;
-    for _ in 0..3 {
-        observed.runtime().replay_graph()?;
-        let mut replay_output = vec![0_u8; CONTROL_BYTES];
-        // SAFETY: D2H orders after the replay and the destination covers it.
-        unsafe { observed.runtime().dtoh(&mut replay_output, second)? };
-        ensure!(
-            replay_output == source,
-            "captured production D2D replay changed control bytes"
-        );
-    }
-    observed.ledger.set_phase(ObservedPhase::CaptureSetup)?;
-    let main_state = observed.runtime().alloc_raw(MAIN_STATE_BYTES)?;
-    let index_state = observed.runtime().alloc_raw(INDEX_STATE_BYTES)?;
-    let main_source = vec![0xa5_u8; MAIN_STATE_BYTES];
-    let index_source = vec![0x5a_u8; INDEX_STATE_BYTES];
-    // SAFETY: both state allocations exactly cover their host sources.
-    unsafe {
-        observed.runtime().htod(&main_source, main_state)?;
-        observed.runtime().htod(&index_source, index_state)?;
-    }
-    let journal = CsaCheckpointJournal::new(
-        Arc::clone(observed.runtime()),
-        4,
-        MAIN_STATE_BYTES,
-        INDEX_STATE_BYTES,
-        Arc::new(CsaMetrics::default()),
-    )?;
-    // SAFETY: carry pointers and byte extents name the live allocations above.
-    let checkpoint = unsafe {
-        journal.checkpoint(
-            main_state,
-            index_state,
-            MAIN_STATE_BYTES,
-            INDEX_STATE_BYTES,
-            32,
-            3,
-        )?
-    };
-    // SAFETY: zeroing and restore stay within the live carry allocations.
-    unsafe {
-        observed
-            .runtime()
-            .memset_zero(main_state, MAIN_STATE_BYTES)?;
-        observed
-            .runtime()
-            .memset_zero(index_state, INDEX_STATE_BYTES)?;
-        journal.restore_prefix(&checkpoint, 24, 3, main_state, index_state, None)?;
-    }
-    let mut main_restored = vec![0_u8; MAIN_STATE_BYTES];
-    let mut index_restored = vec![0_u8; INDEX_STATE_BYTES];
-    // SAFETY: the restored carry allocations cover both destinations.
-    unsafe {
-        observed.runtime().dtoh(&mut main_restored, main_state)?;
-        observed.runtime().dtoh(&mut index_restored, index_state)?;
-    }
-    ensure!(
-        main_restored == main_source && index_restored == index_source,
-        "CSA checkpoint rollback did not restore exact state bytes"
-    );
-
-    let mmap = SyntheticMmap {
-        mapping_id: 91,
-        bytes: vec![0x3c_u8; PAGE_BYTES].into(),
-    };
-    let first_lazy = lazy_for_source(&mmap)?;
-    let second_lazy = lazy_for_source(&mmap)?;
-    let residency = Arc::clone(
-        observed
-            .provider
-            .residency()
-            .context("governed control provider omitted weight residency")?,
-    );
-    observed.ledger.set_phase(ObservedPhase::DirectWarmup)?;
-    let first_page = residency
-        .resident_mapped(1, &first_lazy, &mmap)
-        .context("page first real production weight")?;
-    verify_first_page(observed.runtime(), &first_page, 0x3c)?;
-    drop(first_page);
-    let second_page = residency
-        .resident_mapped(2, &second_lazy, &mmap)
-        .context("page second real production weight")?;
-    verify_first_page(observed.runtime(), &second_page, 0x3c)?;
-    drop(second_page);
-    ensure!(
-        observed
-            .provider
-            .release_queue()
-            .wait_until_idle(std::time::Duration::from_secs(30)),
-        "evicted production page did not finish its deferred VMM unmap"
-    );
-
-    observed.ledger.set_phase(ObservedPhase::Verification)?;
-    // SAFETY: both pointers came from this runtime and are freed once.
-    unsafe {
-        observed.runtime().free_raw(second)?;
-        observed.runtime().free_raw(first)?;
-        observed.runtime().free_raw(index_state)?;
-        observed.runtime().free_raw(main_state)?;
-    }
-    drop(journal);
-    drop(residency);
-    observed.ledger.set_phase(ObservedPhase::Teardown)?;
-    observed.shutdown("production boundary")?;
-    let snapshot = observed.into_snapshot("production boundary")?;
-    for (category, bytes) in [
-        (
-            ObservedCategory::CudaMemset,
-            (CONTROL_BYTES + STATE_BYTES) as u64,
-        ),
-        (
-            ObservedCategory::H2d,
-            (CONTROL_BYTES + STATE_BYTES + 2 * PAGE_BYTES) as u64,
-        ),
-        (
-            ObservedCategory::D2d,
-            (CONTROL_BYTES + 2 * STATE_BYTES) as u64,
-        ),
-        (
-            ObservedCategory::D2h,
-            (4 * CONTROL_BYTES + STATE_BYTES + 2 * 64) as u64,
-        ),
-    ] {
-        ensure!(
-            snapshot.bytes(category, ObservedStatus::Completed) == bytes,
-            "{category:?} completed bytes did not match the real operation argument"
-        );
-    }
-    ensure!(
-        snapshot.bytes(ObservedCategory::SourceRead, ObservedStatus::Completed) == 0,
-        "unperformed source reads must remain zero"
-    );
-    ensure!(
-        snapshot.bytes(ObservedCategory::SourceRead, ObservedStatus::Unsupported) == 0
-            && snapshot.events.iter().any(|event| {
-                event.category == ObservedCategory::SourceRead
-                    && event.status == ObservedStatus::Unsupported
-                    && event.bytes == 0
-            }),
-        "synthetic mmap source I/O must be explicitly unsupported with zero bytes"
-    );
-    ensure!(
-        snapshot.bytes(ObservedCategory::MmapPageIn, ObservedStatus::Completed) == 0
-            && snapshot.events.iter().any(|event| {
-                event.category == ObservedCategory::MmapPageIn
-                    && event.status == ObservedStatus::Unsupported
-                    && event.bytes == 0
-            }),
-        "synthetic mmap page-in must be explicitly unsupported with zero bytes"
-    );
-    ensure!(
-        snapshot.bytes(ObservedCategory::HostWrite, ObservedStatus::Completed)
-            == 2 * PAGE_BYTES as u64,
-        "host writes must come from the exact production staging copies"
-    );
-    ensure!(
-        snapshot.bytes(ObservedCategory::VmmMap, ObservedStatus::Committed)
-            == 2 * PAGE_BYTES as u64,
-        "VMM map bytes must come from committed production granules"
-    );
-    ensure!(
-        snapshot.bytes(ObservedCategory::VmmUnmap, ObservedStatus::Reclaimed) >= PAGE_BYTES as u64,
-        "eviction must observe the production VMM unmap result"
-    );
-    ensure!(
-        snapshot.bytes(ObservedCategory::PageIn, ObservedStatus::Published)
-            == 2 * PAGE_BYTES as u64
-            && snapshot.bytes(
-                ObservedCategory::ExpertPublication,
-                ObservedStatus::Published
-            ) == 2 * PAGE_BYTES as u64,
-        "page-in and expert publication must match the exact produced pages"
-    );
-    ensure!(
-        snapshot.bytes(
-            ObservedCategory::StatePublication,
-            ObservedStatus::Published
-        ) == STATE_BYTES as u64
-            && snapshot.bytes(
-                ObservedCategory::StatePublication,
-                ObservedStatus::RolledBack
-            ) == STATE_BYTES as u64,
-        "state publication and rollback must match exact checkpoint carry bytes"
-    );
-    ensure!(
-        snapshot.bytes(ObservedCategory::VmmReserve, ObservedStatus::Committed) == 0,
-        "provider VMM reservation happened before attachment and must not be inferred per page"
-    );
-    ensure!(
-        snapshot.events.iter().any(|event| {
-            event.phase == ObservedPhase::CaptureSetup
-                && event.category == ObservedCategory::D2d
-                && event.status == ObservedStatus::Unsupported
-        }),
-        "capture D2D must be explicitly unsupported until replay completion receipts are wired"
-    );
-    ensure!(
-        snapshot.events.iter().all(|event| {
-            event.scope == snapshot.scope
-                && event.sequence > 0
-                && event.submission > 0
-                && event.epoch == snapshot.epoch
-        }),
-        "every observed event must carry exact scope/submission/sequence identity"
-    );
-    eprintln!(
-        "freetoken_boundary_control={}",
-        serde_json::json!({
-            "schema": OBSERVED_BYTE_SCHEMA,
-            "events": snapshot.events.len(),
-            "h2d_completed": snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed),
-            "d2h_completed": snapshot.bytes(ObservedCategory::D2h, ObservedStatus::Completed),
-            "d2d_completed": snapshot.bytes(ObservedCategory::D2d, ObservedStatus::Completed),
-            "cuda_memset_completed": snapshot.bytes(
-                ObservedCategory::CudaMemset,
-                ObservedStatus::Completed
-            ),
-            "host_write_completed": snapshot.bytes(
-                ObservedCategory::HostWrite,
-                ObservedStatus::Completed
-            ),
-            "vmm_map_committed": snapshot.bytes(
-                ObservedCategory::VmmMap,
-                ObservedStatus::Committed
-            ),
-            "vmm_unmap_reclaimed": snapshot.bytes(
-                ObservedCategory::VmmUnmap,
-                ObservedStatus::Reclaimed
-            ),
-            "page_in_published": snapshot.bytes(
-                ObservedCategory::PageIn,
-                ObservedStatus::Published
-            ),
-            "state_published": snapshot.bytes(
-                ObservedCategory::StatePublication,
-                ObservedStatus::Published
-            ),
-            "state_rolled_back": snapshot.bytes(
-                ObservedCategory::StatePublication,
-                ObservedStatus::RolledBack
-            ),
-            "source_read_completed": 0,
-            "vmm_reserve": "not_observed_before_attachment"
-        })
-    );
+    let directory = PathBuf::from(directory);
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{}.json", report.fixture.label()));
+    fs::write(path, serde_json::to_vec_pretty(report)?)?;
     Ok(())
 }
 
 #[test]
-fn default_off_records_nothing_and_same_label_siblings_cannot_bleed() -> Result<()> {
-    let mut provider = CudaExecutionProvider::initialized(0)
-        .context("construct default-off CUDA provider for telemetry isolation")?;
-    let source = vec![0x2d_u8; CONTROL_BYTES];
-    let ptr = provider.runtime().alloc_raw(CONTROL_BYTES)?;
-    // SAFETY: `ptr` covers the source and is freed once below.
-    unsafe { provider.runtime().htod(&source, ptr)? };
-    unsafe { provider.runtime().free_raw(ptr)? };
-
-    ensure!(
-        provider
-            .open_observed_byte_session(
-                ExecutorInstanceId::UNSCOPED,
-                ExecutorArtifactGeneration::from_raw(9),
-                9001,
-                16,
-            )
-            .is_err(),
-        "unscoped executor identity must fail before attaching a recorder"
-    );
-    ensure!(
-        provider
-            .open_observed_byte_session(
-                ExecutorInstanceId::from_raw(501),
-                ExecutorArtifactGeneration::from_raw(0),
-                9001,
-                16,
-            )
-            .is_err(),
-        "zero generation must fail before attaching a recorder"
-    );
-    ensure!(
-        provider
-            .open_observed_byte_session(
-                ExecutorInstanceId::from_raw(501),
-                ExecutorArtifactGeneration::from_raw(9),
-                9001,
-                0,
-            )
-            .is_err(),
-        "zero event capacity must fail before attaching a recorder"
-    );
-    let ledger = provider
-        .open_observed_byte_session(
-            ExecutorInstanceId::from_raw(501),
-            ExecutorArtifactGeneration::from_raw(9),
-            9001,
-            16,
-        )
-        .context("open ledger after default-off control")?;
-    ensure!(
-        ledger.snapshot()?.events.is_empty(),
-        "operations completed before explicit attachment must not reach a hidden global ledger"
-    );
-    ensure!(
-        provider
-            .open_observed_byte_session(
-                ExecutorInstanceId::from_raw(501),
-                ExecutorArtifactGeneration::from_raw(9),
-                9001,
-                16,
-            )
-            .is_err(),
-        "one provider runtime must not accept a second recorder"
-    );
-
-    let mut sibling = CudaExecutionProvider::initialized(0)
-        .context("construct same-label sibling CUDA provider")?;
-    let sibling_ledger = sibling.open_observed_byte_session(
-        ExecutorInstanceId::from_raw(501),
-        ExecutorArtifactGeneration::from_raw(9),
-        9001,
-        16,
-    )?;
-    ensure!(
-        ledger.scope().provider != sibling_ledger.scope().provider,
-        "provider identity must be derived from the exact instance, not public executor labels"
-    );
-    let sibling_ptr = sibling.runtime().alloc_raw(CONTROL_BYTES)?;
-    // SAFETY: sibling pointer is owned by the sibling runtime.
-    unsafe { sibling.runtime().free_raw(sibling_ptr)? };
-    ensure!(
-        ledger.snapshot()?.events.is_empty(),
-        "sibling provider events bled into the first ledger"
-    );
-    ensure!(
-        !sibling_ledger.snapshot()?.events.is_empty(),
-        "sibling provider did not record its own exact event"
-    );
-    provider.shutdown()?;
-    ensure!(
-        provider
-            .release_queue()
-            .wait_until_idle(std::time::Duration::from_secs(30)),
-        "default-off provider did not drain"
-    );
-    sibling.shutdown()?;
-    ensure!(
-        sibling
-            .release_queue()
-            .wait_until_idle(std::time::Duration::from_secs(30)),
-        "sibling provider did not drain"
-    );
-    Ok(())
-}
-
-#[test]
-fn deepseek_and_glm_like_eight_token_results_come_from_production_receipts() -> Result<()> {
-    for (fixture, label, executor) in [
-        (SyntheticFixture::DeepseekLike, "deepseek-like", 101_u64),
-        (SyntheticFixture::Glm52Like, "glm52-like", 102_u64),
-    ] {
-        let workload = synthetic_workload(fixture);
-        let semantic = run_estimate_comparison(workload.clone())?;
+fn production_session_ab_proves_outputs_state_routes_capture_and_replay() -> Result<()> {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let _gate = GateGuard::enable();
+    for kind in [FixtureKind::ManyExpertHybrid, FixtureKind::GroupedRecurrent] {
+        let fixture = Fixture::create(kind)?;
+        let baseline = run_arm(&fixture, false)?;
+        let optimized = run_arm(&fixture, true)?;
+        let semantic_equivalent = baseline.proofs == optimized.proofs;
         ensure!(
-            semantic.contract.passed,
-            "{label} semantic control failed: {:?}",
-            semantic.contract.diagnostics
+            semantic_equivalent,
+            "{} baseline and optimized production outputs/state/routes diverged",
+            kind.label()
         );
-        ensure!(
-            semantic.baseline.semantics == semantic.optimized.semantics,
-            "{label} baseline/optimized semantic proofs differ"
-        );
-        let baseline = run_baseline(&workload, executor)?;
-        let optimized = run_optimized(&workload, executor + 1_000)?;
-        let baseline_summary = summarize(&workload, &baseline)?;
-        let optimized_summary = summarize(&workload, &optimized)?;
-        ensure!(
-            baseline_summary.decode_tokens == 8 && optimized_summary.decode_tokens == 8,
-            "{label} must use the exact eight-token warmed decode denominator"
-        );
-        ensure!(
-            baseline_summary.decode_useful_bytes[&ObservedCategory::H2d] > 0
-                && optimized_summary.decode_useful_bytes[&ObservedCategory::H2d] > 0,
-            "{label} did not execute a non-empty CUDA H2D path"
-        );
-        ensure!(
-            optimized_summary.decode_useful_bytes[&ObservedCategory::VmmMap] > 0,
-            "{label} optimized arm did not execute the production VMM page-in path"
-        );
-        ensure!(
-            optimized_summary.decode_useful_bytes[&ObservedCategory::PageIn] > 0
-                && optimized_summary.decode_useful_bytes[&ObservedCategory::ExpertPublication] > 0,
-            "{label} optimized arm did not publish production expert pages"
-        );
-        let baseline_h2d = baseline_summary.decode_useful_bytes[&ObservedCategory::H2d];
-        let optimized_h2d = optimized_summary.decode_useful_bytes[&ObservedCategory::H2d];
-        let optimized_minus_baseline = if optimized_h2d >= baseline_h2d {
-            (optimized_h2d - baseline_h2d).to_string()
-        } else {
-            format!("-{}", baseline_h2d - optimized_h2d)
+        ensure!(baseline.scope.provider != optimized.scope.provider);
+        ensure!(baseline.scope.executor != optimized.scope.executor);
+        let report = ComparisonReport {
+            schema: "onnx-genai.freetoken-production-ab.v2",
+            fixture: kind,
+            dimensions: BTreeMap::from([
+                ("experts", EXPERTS),
+                ("banks", kind.banks()),
+                ("top_k", kind.top_k()),
+                ("batch", ROWS),
+                ("hidden", kind.hidden()),
+                ("intermediate", kind.intermediate()),
+                ("decode_steps", DECODE_STEPS),
+            ]),
+            semantic_equivalent,
+            capture_calls_per_arm: 1,
+            replay_calls_per_arm: REPLAYS,
+            cold_h2d_delta: optimized.cold_h2d as i128 - baseline.cold_h2d as i128,
+            warm_h2d_delta: optimized.warm_h2d as i128 - baseline.warm_h2d as i128,
+            baseline,
+            optimized,
+            limitation: "synthetic structurally typed QMoE fixture; not a full checkpoint or \
+                         throughput claim",
         };
-        let report = FixtureReport {
-            schema: OBSERVED_BYTE_SCHEMA,
-            provenance: "observed_production_boundary",
-            category_layers: ObservedCategory::ALL
-                .into_iter()
-                .map(|category| (category, category.layer()))
-                .collect(),
-            fixture: label.to_string(),
-            limitation: "synthetic zero-filled expert payloads through real CUDA/VMM residency; \
-                         not a DeepSeek/GLM checkpoint or throughput claim",
-            semantic_route_digest: semantic_digest(&workload)?,
-            semantic_equivalent: true,
-            baseline_semantics: semantic.baseline.semantics,
-            optimized_semantics: semantic.optimized.semantics,
-            decode_h2d: DecodeH2dComparison {
-                baseline_bytes: baseline_h2d,
-                optimized_bytes: optimized_h2d,
-                optimized_minus_baseline,
-                baseline_bytes_per_token: baseline_h2d / baseline_summary.decode_tokens,
-                optimized_bytes_per_token: optimized_h2d / optimized_summary.decode_tokens,
-            },
-            baseline: baseline_summary,
-            optimized: optimized_summary,
-        };
-        write_report_if_requested(label, &report)?;
         eprintln!(
-            "freetoken_observed_summary={}",
-            serde_json::json!({
-                "fixture": report.fixture,
-                "decode_h2d": report.decode_h2d,
-                "baseline_events": report.baseline.event_count,
-                "optimized_events": report.optimized.event_count,
-                "semantic_equivalent": report.semantic_equivalent,
-            })
+            "freetoken_production_ab={}",
+            serde_json::to_string(&report)?
         );
+        write_report(&report)?;
     }
     Ok(())
 }
 
 #[test]
-fn observed_schema_and_boundary_names_are_stable() {
-    assert_eq!(
-        OBSERVED_BYTE_SCHEMA,
-        "onnx-genai.freetoken-observed-bytes.v1"
+fn capacity_one_rejects_second_real_session_allocation_before_cuda_work() -> Result<()> {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::create(FixtureKind::ManyExpertHybrid)?;
+    let capacity = 2_u64 << 30;
+    let governor: Arc<dyn MemoryGovernor + Send + Sync> = Arc::new(LedgerGovernor::new(
+        LeaseLedger::new_for_device(DeviceKey::device(0), capacity, capacity, 0),
+    ));
+    let mut provider =
+        CudaExecutionProvider::initialized_with_offload_policy_governor_and_route_config(
+            0,
+            DeviceOffloadPolicy {
+                enabled: true,
+                device_budget_bytes: Some(fixture.kind.device_budget()),
+                ..DeviceOffloadPolicy::default()
+            },
+            governor,
+            ExecutorRouteResidencyConfig::Disabled,
+        )?;
+    provider.configure_observed_byte_capacity(1)?;
+    let provider = Arc::new(provider);
+    let mut session = InferenceSession::builder()
+        .model(&fixture.model)
+        .execution_provider(Arc::clone(&provider) as Arc<dyn ExecutionProvider>)
+        .build()?;
+    session.warmup(&[])?;
+    let before = provider
+        .device_allocation_counts()
+        .context("allocation counters")?
+        .0;
+    let first = session.allocate_device_binding(
+        "hidden",
+        None::<String>,
+        DataType::Float32,
+        vec![ROWS, fixture.kind.hidden()],
+        vec![ROWS, fixture.kind.hidden()],
+    )?;
+    let after_first = provider
+        .device_allocation_counts()
+        .context("allocation counters")?
+        .0;
+    ensure!(after_first > before);
+    let error = session
+        .allocate_device_binding(
+            "state",
+            None::<String>,
+            DataType::Float32,
+            vec![ROWS, fixture.kind.hidden()],
+            vec![ROWS, fixture.kind.hidden()],
+        )
+        .expect_err("second allocation must fail before exceeding event capacity");
+    ensure!(
+        error.to_string().contains("event capacity 1")
+            && error.to_string().contains("no event was committed"),
+        "capacity error was not actionable: {error}"
     );
-    assert_eq!(
-        serde_json::to_string(&ObservedBoundary::AsyncCompletionUnsupported).unwrap(),
-        "\"async_completion_unsupported\""
+    ensure!(
+        provider
+            .device_allocation_counts()
+            .context("allocation counters")?
+            .0
+            == after_first,
+        "second CUDA allocation occurred despite failed telemetry preflight"
     );
-    assert_eq!(
-        serde_json::to_string(&ObservedCategory::MmapPageIn).unwrap(),
-        "\"mmap_page_in\""
+    drop(first);
+    Ok(())
+}
+
+#[test]
+fn shared_provider_sessions_isolate_exact_recorders_and_default_off_stays_empty() -> Result<()> {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::create(FixtureKind::ManyExpertHybrid)?;
+    let capacity = 2_u64 << 30;
+    let governor: Arc<dyn MemoryGovernor + Send + Sync> = Arc::new(LedgerGovernor::new(
+        LeaseLedger::new_for_device(DeviceKey::device(0), capacity, capacity, 0),
+    ));
+    let mut provider =
+        CudaExecutionProvider::initialized_with_offload_policy_governor_and_route_config(
+            0,
+            DeviceOffloadPolicy {
+                enabled: true,
+                device_budget_bytes: Some(fixture.kind.device_budget()),
+                ..DeviceOffloadPolicy::default()
+            },
+            governor,
+            ExecutorRouteResidencyConfig::Disabled,
+        )?;
+    provider.configure_observed_byte_capacity(64)?;
+    let provider = Arc::new(provider);
+    let mut first = InferenceSession::builder()
+        .model(&fixture.model)
+        .execution_provider(Arc::clone(&provider) as Arc<dyn ExecutionProvider>)
+        .build()?;
+    let mut second = InferenceSession::builder()
+        .model(&fixture.model)
+        .execution_provider(Arc::clone(&provider) as Arc<dyn ExecutionProvider>)
+        .build()?;
+    first.warmup(&[])?;
+    second.warmup(&[])?;
+    let first_observed = first
+        .provider_artifact_observation::<ObservedByteLedger>()
+        .context("first session observation")?;
+    let second_observed = second
+        .provider_artifact_observation::<ObservedByteLedger>()
+        .context("second session observation")?;
+    ensure!(first_observed.scope().provider == second_observed.scope().provider);
+    ensure!(first_observed.scope().executor != second_observed.scope().executor);
+    ensure!(first_observed.scope().logical_session != second_observed.scope().logical_session);
+    let second_before = second_observed.snapshot()?.events.len();
+    let _first_binding = first.allocate_device_binding(
+        "hidden",
+        None::<String>,
+        DataType::Float32,
+        vec![ROWS, fixture.kind.hidden()],
+        vec![ROWS, fixture.kind.hidden()],
+    )?;
+    ensure!(first_observed.snapshot()?.events.len() > 0);
+    ensure!(
+        second_observed.snapshot()?.events.len() == second_before,
+        "first session operation bled into sibling recorder"
     );
+
+    first_observed.reset()?;
+    let reset_epoch = first_observed.snapshot()?.epoch;
+    let _after_reset = first.allocate_device_binding(
+        "state",
+        None::<String>,
+        DataType::Float32,
+        vec![ROWS, fixture.kind.hidden()],
+        vec![ROWS, fixture.kind.hidden()],
+    )?;
+    ensure!(first_observed.snapshot()?.epoch == reset_epoch);
+    ensure!(first_observed.snapshot()?.events.len() == 1);
+    first_observed.close()?;
+    let before_closed_attempt = provider
+        .device_allocation_counts()
+        .context("allocation counts")?
+        .0;
+    let closed = first
+        .allocate_device_output_binding(
+            "output",
+            DataType::Float32,
+            vec![ROWS, fixture.kind.hidden()],
+            vec![ROWS, fixture.kind.hidden()],
+        )
+        .expect_err("closed exact recorder must reject new owner operations");
+    ensure!(
+        closed
+            .to_string()
+            .contains("observed-byte ledger is closed")
+    );
+    ensure!(
+        provider
+            .device_allocation_counts()
+            .context("allocation counts")?
+            .0
+            == before_closed_attempt
+    );
+    let _sibling_still_live = second.allocate_device_binding(
+        "hidden",
+        None::<String>,
+        DataType::Float32,
+        vec![ROWS, fixture.kind.hidden()],
+        vec![ROWS, fixture.kind.hidden()],
+    )?;
+
+    let default_governor: Arc<dyn MemoryGovernor + Send + Sync> = Arc::new(LedgerGovernor::new(
+        LeaseLedger::new_for_device(DeviceKey::device(0), capacity, capacity, 0),
+    ));
+    let default_provider = Arc::new(
+        CudaExecutionProvider::initialized_with_offload_policy_governor_and_route_config(
+            0,
+            DeviceOffloadPolicy {
+                enabled: true,
+                device_budget_bytes: Some(fixture.kind.device_budget()),
+                ..DeviceOffloadPolicy::default()
+            },
+            default_governor,
+            ExecutorRouteResidencyConfig::Disabled,
+        )?,
+    );
+    let mut default_session = InferenceSession::builder()
+        .model(&fixture.model)
+        .execution_provider(default_provider as Arc<dyn ExecutionProvider>)
+        .build()?;
+    default_session.warmup(&[])?;
+    ensure!(
+        default_session
+            .provider_artifact_observation::<ObservedByteLedger>()
+            .is_none(),
+        "default-off session unexpectedly created observation authority"
+    );
+    Ok(())
+}
+
+#[test]
+fn direct_provider_runtime_cannot_record_into_a_session_owned_ledger() -> Result<()> {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::create(FixtureKind::ManyExpertHybrid)?;
+    let capacity = 2_u64 << 30;
+    let governor: Arc<dyn MemoryGovernor + Send + Sync> = Arc::new(LedgerGovernor::new(
+        LeaseLedger::new_for_device(DeviceKey::device(0), capacity, capacity, 0),
+    ));
+    let mut provider =
+        CudaExecutionProvider::initialized_with_offload_policy_governor_and_route_config(
+            0,
+            DeviceOffloadPolicy {
+                enabled: true,
+                device_budget_bytes: Some(fixture.kind.device_budget()),
+                ..DeviceOffloadPolicy::default()
+            },
+            governor,
+            ExecutorRouteResidencyConfig::Disabled,
+        )?;
+    provider.configure_observed_byte_capacity(16)?;
+    let before_session = provider.runtime().alloc_raw(4096)?;
+    unsafe { provider.runtime().free_raw(before_session)? };
+    let provider = Arc::new(provider);
+    let mut session = InferenceSession::builder()
+        .model(&fixture.model)
+        .execution_provider(Arc::clone(&provider) as Arc<dyn ExecutionProvider>)
+        .build()?;
+    session.warmup(&[])?;
+    let observed = session
+        .provider_artifact_observation::<ObservedByteLedger>()
+        .context("session observation")?;
+    ensure!(observed.snapshot()?.events.is_empty());
+    let hostile_direct = provider.runtime().alloc_raw(4096)?;
+    unsafe { provider.runtime().free_raw(hostile_direct)? };
+    ensure!(
+        observed.snapshot()?.events.is_empty(),
+        "direct provider/runtime work attached to a session-owned recorder"
+    );
+    Ok(())
 }

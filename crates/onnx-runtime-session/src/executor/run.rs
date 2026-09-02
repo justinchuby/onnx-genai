@@ -139,6 +139,13 @@ impl Executor {
         self.prepare_run_buffers(inputs, external, &resolved, stage2.excluded.as_ref())?;
         drop(_phase_setup);
 
+        let state_publication_bytes = external.state_publication_bytes()?;
+        let mut state_publication = if state_publication_bytes == 0 {
+            None
+        } else {
+            self.ep.prepare_state_publication(state_publication_bytes)?
+        };
+
         // From here on a borrowed input handle may be installed in `buffers`;
         // every exit path must go through `unbind_borrowed_inputs` before the
         // caller's tensors can be dropped.
@@ -152,6 +159,11 @@ impl Executor {
             stage2,
             measure_activation_plan,
         );
+        let state_publication_result = match (&outcome, state_publication.as_mut()) {
+            (Ok(_), Some(receipt)) => receipt.publish().map_err(Into::into),
+            (Err(_), Some(receipt)) => receipt.roll_back().map_err(Into::into),
+            (_, None) => Ok(()),
+        };
         let validation = if nested {
             drop(artifact_use);
             Ok(())
@@ -184,11 +196,12 @@ impl Executor {
         if !decode_memo_eligible {
             self.scratch_resolved_shapes = resolved;
         }
-        match (outcome, validation, unbound) {
-            (_, Err(e), _) => Err(e),
-            (Err(e), _, _) => Err(e),
-            (Ok(_), Ok(()), Err(e)) => Err(e),
-            (Ok(result), Ok(()), Ok(())) => Ok(result),
+        match (outcome, state_publication_result, validation, unbound) {
+            (_, Err(e), _, _) => Err(e),
+            (Err(e), _, _, _) => Err(e),
+            (Ok(_), Ok(()), Err(e), _) => Err(e),
+            (Ok(_), Ok(()), Ok(()), Err(e)) => Err(e),
+            (Ok(result), Ok(()), Ok(()), Ok(())) => Ok(result),
         }
     }
 

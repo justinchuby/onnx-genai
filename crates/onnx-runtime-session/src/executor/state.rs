@@ -205,6 +205,10 @@ impl ProviderArtifactReadiness {
         matches!(self.outcome, ProviderArtifactOutcome::Unfinalized)
     }
 
+    pub(super) fn is_complete(&self) -> bool {
+        matches!(self.outcome, ProviderArtifactOutcome::Complete { .. })
+    }
+
     /// Finalize the current specialization exactly once, then require its
     /// outcome before any eager execution, capture, or replay.
     pub(super) fn finalize_if_needed(
@@ -220,6 +224,7 @@ impl ProviderArtifactReadiness {
                 config.provider(),
                 config.executor(),
                 config.generation(),
+                config.logical_session(),
                 self.epoch,
                 graph,
                 finalized_banks,
@@ -248,16 +253,36 @@ impl ProviderArtifactReadiness {
                             (
                                 ExecutorRouteResidencyConfig::Disabled,
                                 ExecutorArtifactState::Disabled,
-                            ) => ProviderArtifactOutcome::Complete {
-                                route_residency: ExecutorRouteResidency::Disabled,
-                                requirement: None,
+                            ) => match ep.executor_artifact_requirement(
+                                config.provider(),
+                                config.executor(),
+                                config.generation(),
+                                config.logical_session(),
+                            ) {
+                                Ok(requirement) => ProviderArtifactOutcome::Complete {
+                                    route_residency: ExecutorRouteResidency::Disabled,
+                                    requirement: requirement.map(|state| {
+                                        ProviderArtifactRequirement::new(config, state)
+                                    }),
+                                },
+                                Err(error) => ProviderArtifactOutcome::Failed(error.to_string()),
                             },
                             (
                                 ExecutorRouteResidencyConfig::Enabled,
                                 ExecutorArtifactState::Declined,
-                            ) => ProviderArtifactOutcome::Complete {
-                                route_residency: ExecutorRouteResidency::Declined,
-                                requirement: None,
+                            ) => match ep.executor_artifact_requirement(
+                                config.provider(),
+                                config.executor(),
+                                config.generation(),
+                                config.logical_session(),
+                            ) {
+                                Ok(requirement) => ProviderArtifactOutcome::Complete {
+                                    route_residency: ExecutorRouteResidency::Declined,
+                                    requirement: requirement.map(|state| {
+                                        ProviderArtifactRequirement::new(config, state)
+                                    }),
+                                },
+                                Err(error) => ProviderArtifactOutcome::Failed(error.to_string()),
                             },
                             (
                                 ExecutorRouteResidencyConfig::Enabled,
@@ -266,6 +291,7 @@ impl ProviderArtifactReadiness {
                                 config.provider(),
                                 config.executor(),
                                 config.generation(),
+                                config.logical_session(),
                             ) {
                                 Ok(Some(state)) => ProviderArtifactOutcome::Complete {
                                     route_residency: ExecutorRouteResidency::Required {
@@ -336,6 +362,10 @@ impl ProviderArtifactReadiness {
             ProviderArtifactOutcome::Complete { requirement, .. } => requirement.as_ref(),
             _ => None,
         }
+    }
+
+    pub(super) fn observation<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
+        self.requirement()?.state.observation()?.downcast_ref::<T>()
     }
 
     pub(super) fn captured_requirement(&self) -> CapturedProviderArtifactRequirement {
@@ -1114,6 +1144,7 @@ pub(super) struct ExternalValue {
     pub(super) len: usize,
     pub(super) alignment: usize,
     pub(super) device: onnx_runtime_ir::DeviceId,
+    pub(super) state_publication: bool,
 }
 
 impl ExternalValue {
@@ -1190,6 +1221,19 @@ pub(super) struct ExternalCaptureSig {
 }
 
 impl ExternalBindings {
+    pub(super) fn state_publication_bytes(&self) -> Result<u64> {
+        self.outputs
+            .values()
+            .filter(|value| value.state_publication)
+            .try_fold(0_u64, |total, value| {
+                total.checked_add(value.len as u64).ok_or_else(|| {
+                    SessionError::Internal(
+                        "state-publication output byte total overflowed u64".into(),
+                    )
+                })
+            })
+    }
+
     fn capture_shape(value: &ExternalValue) -> &[usize] {
         value.fixed_stride_shape.as_deref().unwrap_or(&value.shape)
     }

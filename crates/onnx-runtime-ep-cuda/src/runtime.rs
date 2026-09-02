@@ -26,8 +26,8 @@ use onnx_runtime_ep_api::{RawDeviceAllocationSiteStats, Result};
 
 use crate::blas::CublasLt;
 use crate::byte_telemetry::{
-    EventSpec, ObservedBoundary, ObservedByteLedger, ObservedCategory, ObservedStatus,
-    ProductionByteRecorder,
+    EventSpec, ExecutionRecorderRegistry, ObservedBoundary, ObservedCategory, ObservedStatus,
+    PendingObservedBatch, ProductionByteRecorder,
 };
 use crate::cudnn::CudnnBackend;
 use crate::dynamic_library::{CudaLibrary, require, wheel_cuda_include_paths};
@@ -764,9 +764,9 @@ pub struct CudaRuntime {
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
     async_host_to_device_copies: AtomicU64,
-    /// Exact production-boundary byte recorder. `None` is the shipped default
-    /// and leaves every operation below on its original path.
-    observed_bytes: OnceLock<ProductionByteRecorder>,
+    /// Session-authorized recorder contexts. `None` is the shipped default and
+    /// leaves every operation below on its original path.
+    observed_bytes: OnceLock<Arc<ExecutionRecorderRegistry>>,
     forced_synchronizations: AtomicU64,
     /// Completion events recorded on a transfer/compute stream, keyed by an
     /// opaque fence id handed out to the executor inside an
@@ -1069,48 +1069,98 @@ impl CudaRuntime {
         .with_capture_error_word()
     }
 
-    /// Attach one exact observed-byte ledger before the workload being
-    /// measured starts. Reconfiguration is refused because replacing the
-    /// recorder would make earlier and later events share ambiguous identity.
-    pub(crate) fn install_observed_byte_ledger(&self, ledger: &ObservedByteLedger) -> Result<()> {
-        if ledger.scope().device != self.ordinal {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: observed-byte scope names CUDA device {}, but this runtime owns CUDA \
-                 device {}; create the ledger with the exact runtime device",
-                ledger.scope().device,
-                self.ordinal
-            )));
-        }
-        let recorder = ledger.attach().map_err(|error| {
-            EpError::KernelFailed(format!(
-                "cuda_ep: attach production observed-byte ledger: {error}"
-            ))
-        })?;
-        self.observed_bytes.set(recorder).map_err(|_| {
+    pub(crate) fn install_observed_byte_registry(
+        &self,
+        registry: Arc<ExecutionRecorderRegistry>,
+    ) -> Result<()> {
+        self.observed_bytes.set(registry).map_err(|_| {
             EpError::KernelFailed(
-                "cuda_ep: production observed-byte ledger is already installed on this runtime; \
-                 rebuild the provider for a new exact scope"
+                "cuda_ep: observed-byte execution registry is already installed on this runtime"
                     .into(),
             )
         })
     }
 
     #[inline]
-    pub(crate) fn observe_bytes(&self, spec: EventSpec) {
-        if let Some(recorder) = self.observed_bytes.get() {
-            let _ = recorder.record(spec);
+    pub(crate) fn observe_bytes(&self, spec: EventSpec) -> Result<()> {
+        if let Some(recorder) = self.observed_byte_recorder()? {
+            recorder.record(spec).map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: record production observed-byte event: {error}"
+                ))
+            })?;
         }
+        Ok(())
     }
 
     #[inline]
-    pub(crate) fn observe_byte_pair(&self, first: EventSpec, second: EventSpec) {
-        if let Some(recorder) = self.observed_bytes.get() {
-            let _ = recorder.record_pair(first, second);
+    pub(crate) fn observe_byte_pair(&self, first: EventSpec, second: EventSpec) -> Result<()> {
+        if let Some(recorder) = self.observed_byte_recorder()? {
+            recorder.record_pair(first, second).map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: record production observed-byte event pair: {error}"
+                ))
+            })?;
         }
+        Ok(())
     }
 
-    pub(crate) fn observed_byte_recorder(&self) -> Option<ProductionByteRecorder> {
-        self.observed_bytes.get().cloned()
+    pub(crate) fn observed_byte_recorder(&self) -> Result<Option<ProductionByteRecorder>> {
+        self.observed_bytes
+            .get()
+            .map(|registry| registry.current(self.runtime_id))
+            .transpose()
+            .map(|recorder| recorder.flatten())
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: acquire session-authorized observed-byte recorder: {error}"
+                ))
+            })
+    }
+
+    pub(crate) fn prepare_observation(
+        &self,
+        specs: &[EventSpec],
+    ) -> Result<Option<PendingObservedBatch>> {
+        self.observed_byte_recorder()?
+            .map(|recorder| {
+                recorder.prepare(specs).map_err(|error| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep: reserve production observed-byte receipt before operation: \
+                         {error}"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn commit_observation(observation: &mut Option<PendingObservedBatch>) -> Result<()> {
+        if let Some(observation) = observation {
+            observation.commit().map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: commit production operation receipt: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn fail_observation(
+        observation: &mut Option<PendingObservedBatch>,
+        status: ObservedStatus,
+        operation: EpError,
+    ) -> EpError {
+        match observation
+            .as_mut()
+            .map(|observation| observation.abort(status))
+            .transpose()
+        {
+            Ok(_) => operation,
+            Err(telemetry) => EpError::KernelFailed(format!(
+                "{operation}; production operation also failed to publish its {status:?} \
+                 observed-byte receipt: {telemetry}"
+            )),
+        }
     }
 
     /// Allocate and zero the persistent capture-error latch word. Split out of
@@ -2919,17 +2969,30 @@ impl CudaRuntime {
         let requested = bytes.max(1);
         let class = raw_pool_size_class(requested);
         if let Some(ptr) = self.take_pooled(class) {
-            self.raw_pool_hits.fetch_add(1, Ordering::Relaxed);
-            self.raw_allocation_profile
-                .record(location, requested, class, true);
-            self.observe_bytes(EventSpec::new(
+            let mut observation = match self.prepare_observation(&[EventSpec::new(
                 ObservedCategory::DeviceAllocation,
                 ObservedBoundary::RuntimeDevicePoolReuse,
                 ObservedStatus::Reclaimed,
                 class as u64,
-            ));
+            )]) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    self.return_pooled(class, ptr);
+                    return Err(error);
+                }
+            };
+            self.raw_pool_hits.fetch_add(1, Ordering::Relaxed);
+            self.raw_allocation_profile
+                .record(location, requested, class, true);
+            Self::commit_observation(&mut observation)?;
             return Ok(ptr);
         }
+        let mut observation = self.prepare_observation(&[EventSpec::new(
+            ObservedCategory::DeviceAllocation,
+            ObservedBoundary::RuntimeDeviceAllocate,
+            ObservedStatus::Committed,
+            class as u64,
+        )])?;
         // Past the pool: this path makes a real `cuMemAlloc`, which
         // synchronizes the device and would invalidate a CUDA graph capture
         // running on another thread. Pool hits returned above take no lock, so
@@ -2942,11 +3005,23 @@ impl CudaRuntime {
             // Pooled blocks are device memory this runtime is holding back from
             // everyone else. Releasing them before reporting out-of-memory is
             // what keeps a pool from behaving like a leak under pressure.
-            self.drain_raw_pool();
+            if let Err(error) = self.drain_raw_pool() {
+                return Err(Self::fail_observation(
+                    &mut observation,
+                    ObservedStatus::Failed,
+                    error,
+                ));
+            }
             // SAFETY: as above.
             allocated = unsafe { cudarc::driver::result::malloc_sync(class) };
         }
-        let ptr = allocated.map_err(|e| driver_err("cuMemAlloc", e))?;
+        let ptr = allocated.map_err(|error| {
+            Self::fail_observation(
+                &mut observation,
+                ObservedStatus::Failed,
+                driver_err("cuMemAlloc", error),
+            )
+        })?;
         self.raw_pool_classes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2954,12 +3029,7 @@ impl CudaRuntime {
         self.allocations.fetch_add(1, Ordering::Relaxed);
         self.raw_allocation_profile
             .record(location, requested, class, false);
-        self.observe_bytes(EventSpec::new(
-            ObservedCategory::DeviceAllocation,
-            ObservedBoundary::RuntimeDeviceAllocate,
-            ObservedStatus::Committed,
-            class as u64,
-        ));
+        Self::commit_observation(&mut observation)?;
         Ok(ptr)
     }
 
@@ -3003,6 +3073,17 @@ impl CudaRuntime {
         Some(ptr)
     }
 
+    fn return_pooled(&self, class: usize, ptr: CUdeviceptr) {
+        self.raw_pool
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(class)
+            .or_default()
+            .push(ptr);
+        self.raw_pool_retained
+            .fetch_add(class as u64, Ordering::Relaxed);
+    }
+
     /// Hold a freed block for reuse, or report that the cap leaves no room.
     fn retain_pooled(&self, ptr: CUdeviceptr) -> bool {
         let limit = raw_pool_limit_bytes();
@@ -3042,7 +3123,7 @@ impl CudaRuntime {
     }
 
     /// Return every pooled block to the driver.
-    fn drain_raw_pool(&self) {
+    fn drain_raw_pool(&self) -> Result<()> {
         let drained: Vec<(CUdeviceptr, usize)> = {
             let mut pool = self.raw_pool.lock().unwrap_or_else(|e| e.into_inner());
             let mut drained = Vec::new();
@@ -3060,26 +3141,47 @@ impl CudaRuntime {
             .raw_pool_classes
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for (ptr, class) in drained {
-            classes.remove(&ptr);
+        let mut drained = drained.into_iter();
+        while let Some((ptr, class)) = drained.next() {
+            let mut observation = match self.prepare_observation(&[EventSpec::new(
+                ObservedCategory::DeviceRelease,
+                ObservedBoundary::RuntimeDeviceRelease,
+                ObservedStatus::Reclaimed,
+                class as u64,
+            )]) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    self.return_pooled(class, ptr);
+                    for (remaining_ptr, remaining_class) in drained {
+                        self.return_pooled(remaining_class, remaining_ptr);
+                    }
+                    return Err(error);
+                }
+            };
             // SAFETY: every pooled block came from `malloc_sync` on this
             // runtime's context and is freed exactly once — it was removed from
             // the pool here, so `free_raw` cannot also free it.
-            if unsafe { cudarc::driver::result::free_sync(ptr) }.is_ok() {
-                self.frees.fetch_add(1, Ordering::Relaxed);
-                self.observe_bytes(EventSpec::new(
-                    ObservedCategory::DeviceRelease,
-                    ObservedBoundary::RuntimeDeviceRelease,
-                    ObservedStatus::Reclaimed,
-                    class as u64,
+            if let Err(error) = unsafe { cudarc::driver::result::free_sync(ptr) } {
+                self.return_pooled(class, ptr);
+                for (remaining_ptr, remaining_class) in drained {
+                    self.return_pooled(remaining_class, remaining_ptr);
+                }
+                return Err(Self::fail_observation(
+                    &mut observation,
+                    ObservedStatus::Failed,
+                    driver_err("cuMemFree while draining raw allocation pool", error),
                 ));
             }
+            classes.remove(&ptr);
+            self.frees.fetch_add(1, Ordering::Relaxed);
+            Self::commit_observation(&mut observation)?;
         }
+        Ok(())
     }
 
     #[cfg(feature = "gpu-tests")]
-    pub fn test_drain_raw_pool(&self) {
-        self.drain_raw_pool();
+    pub fn test_drain_raw_pool(&self) -> Result<()> {
+        self.drain_raw_pool()
     }
 
     /// Free a device pointer previously returned by [`CudaRuntime::alloc_raw`].
@@ -3095,17 +3197,21 @@ impl CudaRuntime {
             .get(&ptr)
             .copied()
             .unwrap_or(0);
+        let mut observation = self.prepare_observation(&[EventSpec::new(
+            ObservedCategory::DeviceRelease,
+            ObservedBoundary::RuntimeDeviceRelease,
+            ObservedStatus::Reclaimed,
+            class as u64,
+        )])?;
         // A pooled free deliberately does not count here. `frees` exists to
         // report driver calls — a `cuMemFree` during graph capture invalidates
         // the capture — and retaining a block makes no driver call at all, so
         // counting it would report a capture hazard that did not happen.
         if self.retain_pooled(ptr) {
-            self.observe_bytes(EventSpec::new(
-                ObservedCategory::DeviceRelease,
-                ObservedBoundary::RuntimeDevicePoolReclaim,
-                ObservedStatus::Reclaimed,
-                class as u64,
-            ));
+            if let Some(observation) = observation.as_mut() {
+                observation.set_boundary(0, ObservedBoundary::RuntimeDevicePoolReclaim);
+            }
+            Self::commit_observation(&mut observation)?;
             return Ok(());
         }
         // A real `cuMemFree` follows; see `alloc_raw`.
@@ -3115,15 +3221,15 @@ impl CudaRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&ptr);
         // SAFETY: caller upholds the single-free contract.
-        unsafe { cudarc::driver::result::free_sync(ptr) }
-            .map_err(|e| driver_err("cuMemFree", e))?;
+        unsafe { cudarc::driver::result::free_sync(ptr) }.map_err(|error| {
+            Self::fail_observation(
+                &mut observation,
+                ObservedStatus::Failed,
+                driver_err("cuMemFree", error),
+            )
+        })?;
         self.frees.fetch_add(1, Ordering::Relaxed);
-        self.observe_bytes(EventSpec::new(
-            ObservedCategory::DeviceRelease,
-            ObservedBoundary::RuntimeDeviceRelease,
-            ObservedStatus::Reclaimed,
-            class as u64,
-        ));
+        Self::commit_observation(&mut observation)?;
         Ok(())
     }
 
@@ -3151,29 +3257,8 @@ impl CudaRuntime {
                     .into(),
             ));
         }
-        self.stream.synchronize().map_err(|e| {
-            driver_err(
-                "cuStreamSynchronize(compute) before synchronous cuMemcpyHtoD",
-                e,
-            )
-        })?;
-        // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract.
-        unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
-            .map_err(|e| driver_err("cuMemcpyHtoD", e))?;
-        // SAFETY: a null CUstream selects the current context's legacy default
-        // stream. Calling the raw API avoids constructing an allocating Arc
-        // wrapper on every request-boundary validation reset.
-        unsafe { cudarc::driver::result::stream::synchronize(std::ptr::null_mut()) }.map_err(
-            |e| {
-                driver_err(
-                    "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
-                    e,
-                )
-            },
-        )?;
-        self.host_to_device_copies.fetch_add(1, Ordering::Relaxed);
         let bytes = src.len() as u64;
-        self.observe_byte_pair(
+        let mut observation = self.prepare_observation(&[
             EventSpec::new(
                 ObservedCategory::H2d,
                 ObservedBoundary::RuntimeH2d,
@@ -3186,7 +3271,42 @@ impl CudaRuntime {
                 ObservedStatus::Completed,
                 bytes,
             ),
-        );
+        ])?;
+        self.stream.synchronize().map_err(|error| {
+            Self::fail_observation(
+                &mut observation,
+                ObservedStatus::Failed,
+                driver_err(
+                    "cuStreamSynchronize(compute) before synchronous cuMemcpyHtoD",
+                    error,
+                ),
+            )
+        })?;
+        // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract.
+        unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }.map_err(|error| {
+            Self::fail_observation(
+                &mut observation,
+                ObservedStatus::Failed,
+                driver_err("cuMemcpyHtoD", error),
+            )
+        })?;
+        // SAFETY: a null CUstream selects the current context's legacy default
+        // stream. Calling the raw API avoids constructing an allocating Arc
+        // wrapper on every request-boundary validation reset.
+        unsafe { cudarc::driver::result::stream::synchronize(std::ptr::null_mut()) }.map_err(
+            |error| {
+                Self::fail_observation(
+                    &mut observation,
+                    ObservedStatus::Failed,
+                    driver_err(
+                        "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
+                        error,
+                    ),
+                )
+            },
+        )?;
+        self.host_to_device_copies.fetch_add(1, Ordering::Relaxed);
+        Self::commit_observation(&mut observation)?;
         Ok(())
     }
 
@@ -3196,19 +3316,8 @@ impl CudaRuntime {
     /// `src` is a live device allocation of at least `dst.len()` bytes.
     pub unsafe fn dtoh(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<()> {
         self.bind()?;
-        // A stream drain plus a synchronous copy on the null stream; see
-        // `alloc_raw`.
-        let _section = capture_gate::synchronizing_section();
-        // Kernels enqueue work on the EP's dedicated non-default stream. Wait
-        // before issuing the synchronous driver copy so the host never observes
-        // bytes that were still being produced on that stream.
-        self.force_synchronize()?;
-        // SAFETY: bound context; `src` covers `dst.len()` bytes per the contract.
-        unsafe { cudarc::driver::result::memcpy_dtoh_sync(dst, src) }
-            .map_err(|e| driver_err("cuMemcpyDtoH", e))?;
-        self.device_to_host_copies.fetch_add(1, Ordering::Relaxed);
         let bytes = dst.len() as u64;
-        self.observe_byte_pair(
+        let mut observation = self.prepare_observation(&[
             EventSpec::new(
                 ObservedCategory::D2h,
                 ObservedBoundary::RuntimeD2h,
@@ -3221,7 +3330,26 @@ impl CudaRuntime {
                 ObservedStatus::Completed,
                 bytes,
             ),
-        );
+        ])?;
+        // A stream drain plus a synchronous copy on the null stream; see
+        // `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
+        // Kernels enqueue work on the EP's dedicated non-default stream. Wait
+        // before issuing the synchronous driver copy so the host never observes
+        // bytes that were still being produced on that stream.
+        self.force_synchronize().map_err(|error| {
+            Self::fail_observation(&mut observation, ObservedStatus::Failed, error)
+        })?;
+        // SAFETY: bound context; `src` covers `dst.len()` bytes per the contract.
+        unsafe { cudarc::driver::result::memcpy_dtoh_sync(dst, src) }.map_err(|error| {
+            Self::fail_observation(
+                &mut observation,
+                ObservedStatus::Failed,
+                driver_err("cuMemcpyDtoH", error),
+            )
+        })?;
+        self.device_to_host_copies.fetch_add(1, Ordering::Relaxed);
+        Self::commit_observation(&mut observation)?;
         Ok(())
     }
 
@@ -3231,19 +3359,7 @@ impl CudaRuntime {
     /// Both pointers are live allocations of at least `bytes` bytes.
     pub unsafe fn dtod(&self, src: CUdeviceptr, dst: CUdeviceptr, bytes: usize) -> Result<()> {
         self.bind()?;
-        // Kernels enqueue their writes on the EP's dedicated non-default stream,
-        // but `cuMemcpyDtoD` issues on the legacy default stream. On a
-        // non-blocking compute stream the two are not implicitly ordered, so the
-        // copy can race a producer kernel that is still writing `src` (or a
-        // consumer that already queued a read of `dst`). Drain the EP stream
-        // first so the synchronous copy always sees fully-produced bytes. This
-        // mirrors `dtoh`, which synchronizes for the same reason.
-        let _section = capture_gate::synchronizing_section();
-        self.force_synchronize()?;
-        // SAFETY: bound context; both endpoints cover `bytes` per the contract.
-        unsafe { cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes) }
-            .map_err(|e| driver_err("cuMemcpyDtoD", e))?;
-        self.observe_byte_pair(
+        let mut observation = self.prepare_observation(&[
             EventSpec::new(
                 ObservedCategory::D2d,
                 ObservedBoundary::RuntimeD2d,
@@ -3256,7 +3372,27 @@ impl CudaRuntime {
                 ObservedStatus::Completed,
                 bytes as u64,
             ),
-        );
+        ])?;
+        // Kernels enqueue their writes on the EP's dedicated non-default stream,
+        // but `cuMemcpyDtoD` issues on the legacy default stream. On a
+        // non-blocking compute stream the two are not implicitly ordered, so the
+        // copy can race a producer kernel that is still writing `src` (or a
+        // consumer that already queued a read of `dst`). Drain the EP stream
+        // first so the synchronous copy always sees fully-produced bytes. This
+        // mirrors `dtoh`, which synchronizes for the same reason.
+        let _section = capture_gate::synchronizing_section();
+        self.force_synchronize().map_err(|error| {
+            Self::fail_observation(&mut observation, ObservedStatus::Failed, error)
+        })?;
+        // SAFETY: bound context; both endpoints cover `bytes` per the contract.
+        unsafe { cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes) }.map_err(|error| {
+            Self::fail_observation(
+                &mut observation,
+                ObservedStatus::Failed,
+                driver_err("cuMemcpyDtoD", error),
+            )
+        })?;
+        Self::commit_observation(&mut observation)?;
         Ok(())
     }
 
@@ -3272,13 +3408,7 @@ impl CudaRuntime {
         bytes: usize,
     ) -> Result<()> {
         self.bind()?;
-        // SAFETY: bound context; both endpoints cover `bytes` and the runtime
-        // owns the stream on which the copy is ordered.
-        unsafe {
-            cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.stream.cu_stream())
-        }
-        .map_err(|e| driver_err("cuMemcpyDtoDAsync", e))?;
-        self.observe_byte_pair(
+        let mut observation = self.prepare_observation(&[
             EventSpec::new(
                 ObservedCategory::D2d,
                 ObservedBoundary::RuntimeD2d,
@@ -3291,7 +3421,20 @@ impl CudaRuntime {
                 ObservedStatus::Unsupported,
                 0,
             ),
-        );
+        ])?;
+        // SAFETY: bound context; both endpoints cover `bytes` and the runtime
+        // owns the stream on which the copy is ordered.
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.stream.cu_stream())
+        }
+        .map_err(|error| {
+            Self::fail_observation(
+                &mut observation,
+                ObservedStatus::Failed,
+                driver_err("cuMemcpyDtoDAsync", error),
+            )
+        })?;
+        Self::commit_observation(&mut observation)?;
         Ok(())
     }
 
@@ -3321,13 +3464,7 @@ impl CudaRuntime {
         if src.is_empty() {
             return Ok(());
         }
-        // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract,
-        // and the copy is ordered on the runtime-owned transfer stream.
-        unsafe {
-            cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream())
-        }
-        .map_err(|e| driver_err("cuMemcpyHtoDAsync", e))?;
-        self.observe_byte_pair(
+        let mut observation = self.prepare_observation(&[
             EventSpec::new(
                 ObservedCategory::H2d,
                 ObservedBoundary::RuntimeH2d,
@@ -3340,7 +3477,20 @@ impl CudaRuntime {
                 ObservedStatus::Unsupported,
                 0,
             ),
-        );
+        ])?;
+        // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract,
+        // and the copy is ordered on the runtime-owned transfer stream.
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream())
+        }
+        .map_err(|error| {
+            Self::fail_observation(
+                &mut observation,
+                ObservedStatus::Failed,
+                driver_err("cuMemcpyHtoDAsync", error),
+            )
+        })?;
+        Self::commit_observation(&mut observation)?;
         Ok(())
     }
 
@@ -3368,34 +3518,54 @@ impl CudaRuntime {
         dst: CUdeviceptr,
     ) -> std::result::Result<(f32, CopyCompleted), HtodAsyncElapsedError> {
         let bytes = src.len() as u64;
-        self.bind()
-            .map_err(|error| self.not_submitted_htod_failure(error.to_string(), bytes))?;
+        self.bind().map_err(|error| HtodAsyncElapsedError {
+            detail: error.to_string(),
+            completion: FailedHtodCompletion::NotSubmitted,
+        })?;
         if src.is_empty() {
             return Ok((0.0, CopyCompleted::new()));
         }
+        let mut observation = self
+            .prepare_observation(&[
+                EventSpec::new(
+                    ObservedCategory::H2d,
+                    ObservedBoundary::RuntimeH2d,
+                    ObservedStatus::Submitted,
+                    bytes,
+                ),
+                EventSpec::new(
+                    ObservedCategory::H2d,
+                    ObservedBoundary::RuntimeH2d,
+                    ObservedStatus::Completed,
+                    bytes,
+                ),
+            ])
+            .map_err(|error| HtodAsyncElapsedError {
+                detail: error.to_string(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            })?;
+        let fail_before_submit = |observation: &mut Option<PendingObservedBatch>,
+                                  error: EpError| {
+            let error = Self::fail_observation(observation, ObservedStatus::Failed, error);
+            HtodAsyncElapsedError {
+                detail: error.to_string(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            }
+        };
         let start = self
             .context
             .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
             .map_err(|error| {
-                self.not_submitted_htod_failure(
-                    driver_err("cuEventCreate(start)", error).to_string(),
-                    bytes,
-                )
+                fail_before_submit(&mut observation, driver_err("cuEventCreate(start)", error))
             })?;
         let end = self
             .context
             .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
             .map_err(|error| {
-                self.not_submitted_htod_failure(
-                    driver_err("cuEventCreate(end)", error).to_string(),
-                    bytes,
-                )
+                fail_before_submit(&mut observation, driver_err("cuEventCreate(end)", error))
             })?;
         start.record(&self.copy_stream).map_err(|error| {
-            self.not_submitted_htod_failure(
-                driver_err("cuEventRecord(start)", error).to_string(),
-                bytes,
-            )
+            fail_before_submit(&mut observation, driver_err("cuEventRecord(start)", error))
         })?;
         // SAFETY: caller guarantees `dst` covers `src.len()` bytes. The source
         // must remain live until `end.elapsed_ms` returns, which this method
@@ -3404,15 +3574,25 @@ impl CudaRuntime {
             cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream())
         }
         .map_err(|error| {
-            self.not_submitted_htod_failure(
-                driver_err("cuMemcpyHtoDAsync", error).to_string(),
-                bytes,
-            )
+            fail_before_submit(&mut observation, driver_err("cuMemcpyHtoDAsync", error))
         })?;
         if let Err(error) = end.record(&self.copy_stream) {
-            return Err(
-                self.settle_submitted_htod_failure(driver_err("cuEventRecord(end)", error), bytes)
+            let classified =
+                self.settle_submitted_copy_failure(driver_err("cuEventRecord(end)", error));
+            let status = if matches!(&classified.completion, FailedHtodCompletion::MayBeInFlight) {
+                ObservedStatus::Quarantined
+            } else {
+                ObservedStatus::Failed
+            };
+            let operation = Self::fail_observation(
+                &mut observation,
+                status,
+                EpError::KernelFailed(classified.detail.clone()),
             );
+            return Err(HtodAsyncElapsedError {
+                detail: operation.to_string(),
+                completion: classified.completion,
+            });
         }
         // `elapsed_ms` host-synchronizes the end event (cudarc `Event::elapsed_ms`
         // calls `end.synchronize()`), so on return the copy is complete on the
@@ -3420,28 +3600,34 @@ impl CudaRuntime {
         let elapsed_ms = match start.elapsed_ms(&end) {
             Ok(elapsed_ms) => elapsed_ms,
             Err(error) => {
-                return Err(self.settle_submitted_htod_failure(
-                    driver_err("cuEventElapsedTime", error),
-                    bytes,
-                ));
+                let classified =
+                    self.settle_submitted_copy_failure(driver_err("cuEventElapsedTime", error));
+                let status =
+                    if matches!(&classified.completion, FailedHtodCompletion::MayBeInFlight) {
+                        ObservedStatus::Quarantined
+                    } else {
+                        ObservedStatus::Failed
+                    };
+                let operation = Self::fail_observation(
+                    &mut observation,
+                    status,
+                    EpError::KernelFailed(classified.detail.clone()),
+                );
+                return Err(HtodAsyncElapsedError {
+                    detail: operation.to_string(),
+                    completion: classified.completion,
+                });
             }
         };
         self.async_host_to_device_copies
             .fetch_add(1, Ordering::Relaxed);
-        self.observe_byte_pair(
-            EventSpec::new(
-                ObservedCategory::H2d,
-                ObservedBoundary::RuntimeH2d,
-                ObservedStatus::Submitted,
-                bytes,
+        Self::commit_observation(&mut observation).map_err(|error| HtodAsyncElapsedError {
+            detail: format!(
+                "H2D DMA completed, but its reserved observed-byte receipt could not commit: \
+                 {error}"
             ),
-            EventSpec::new(
-                ObservedCategory::H2d,
-                ObservedBoundary::RuntimeH2d,
-                ObservedStatus::Completed,
-                bytes,
-            ),
-        );
+            completion: FailedHtodCompletion::Completed(CopyCompleted::new()),
+        })?;
         Ok((elapsed_ms, CopyCompleted::new()))
     }
 
@@ -3458,10 +3644,7 @@ impl CudaRuntime {
         if bytes == 0 {
             return Ok(());
         }
-        unsafe { cudarc::driver::result::memset_d8_async(dst, 0, bytes, self.stream.cu_stream()) }
-            .map_err(|error| driver_err("cuMemsetD8Async", error))?;
-        self.force_synchronize()?;
-        self.observe_byte_pair(
+        let mut observation = self.prepare_observation(&[
             EventSpec::new(
                 ObservedCategory::CudaMemset,
                 ObservedBoundary::RuntimeCudaMemset,
@@ -3474,46 +3657,20 @@ impl CudaRuntime {
                 ObservedStatus::Completed,
                 bytes as u64,
             ),
-        );
+        ])?;
+        unsafe { cudarc::driver::result::memset_d8_async(dst, 0, bytes, self.stream.cu_stream()) }
+            .map_err(|error| {
+                Self::fail_observation(
+                    &mut observation,
+                    ObservedStatus::Failed,
+                    driver_err("cuMemsetD8Async", error),
+                )
+            })?;
+        self.force_synchronize().map_err(|error| {
+            Self::fail_observation(&mut observation, ObservedStatus::Failed, error)
+        })?;
+        Self::commit_observation(&mut observation)?;
         Ok(())
-    }
-
-    fn not_submitted_htod_failure(&self, detail: String, bytes: u64) -> HtodAsyncElapsedError {
-        self.observe_bytes(EventSpec::new(
-            ObservedCategory::H2d,
-            ObservedBoundary::RuntimeH2d,
-            ObservedStatus::Failed,
-            bytes,
-        ));
-        HtodAsyncElapsedError {
-            detail,
-            completion: FailedHtodCompletion::NotSubmitted,
-        }
-    }
-
-    fn settle_submitted_htod_failure(&self, error: EpError, bytes: u64) -> HtodAsyncElapsedError {
-        let classified = self.settle_submitted_copy_failure(error);
-        let status = match &classified.completion {
-            FailedHtodCompletion::NotSubmitted | FailedHtodCompletion::Completed(_) => {
-                ObservedStatus::Failed
-            }
-            FailedHtodCompletion::MayBeInFlight => ObservedStatus::Quarantined,
-        };
-        self.observe_byte_pair(
-            EventSpec::new(
-                ObservedCategory::H2d,
-                ObservedBoundary::RuntimeH2d,
-                ObservedStatus::Submitted,
-                bytes,
-            ),
-            EventSpec::new(
-                ObservedCategory::H2d,
-                ObservedBoundary::RuntimeH2d,
-                status,
-                bytes,
-            ),
-        );
-        classified
     }
 
     fn settle_submitted_copy_failure(&self, error: EpError) -> HtodAsyncElapsedError {
@@ -3554,14 +3711,7 @@ impl CudaRuntime {
         if bytes == 0 {
             return Ok(());
         }
-
-        // SAFETY: bound context; both endpoints cover `bytes` and the copy is
-        // ordered on the runtime-owned transfer stream.
-        unsafe {
-            cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.copy_stream.cu_stream())
-        }
-        .map_err(|e| driver_err("cuMemcpyDtoDAsync", e))?;
-        self.observe_byte_pair(
+        let mut observation = self.prepare_observation(&[
             EventSpec::new(
                 ObservedCategory::D2d,
                 ObservedBoundary::RuntimeD2d,
@@ -3574,7 +3724,21 @@ impl CudaRuntime {
                 ObservedStatus::Unsupported,
                 0,
             ),
-        );
+        ])?;
+
+        // SAFETY: bound context; both endpoints cover `bytes` and the copy is
+        // ordered on the runtime-owned transfer stream.
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.copy_stream.cu_stream())
+        }
+        .map_err(|error| {
+            Self::fail_observation(
+                &mut observation,
+                ObservedStatus::Failed,
+                driver_err("cuMemcpyDtoDAsync", error),
+            )
+        })?;
+        Self::commit_observation(&mut observation)?;
         Ok(())
     }
 
@@ -3654,7 +3818,7 @@ impl CudaRuntime {
     ///
     /// A DMA was already submitted by the caller before this fence id was
     /// handed out (it is the whole reason a fence exists to resolve), so
-    /// every failure path below reuses [`CudaRuntime::settle_submitted_htod_failure`]
+    /// every failure path below reuses [`CudaRuntime::settle_submitted_copy_failure`]
     /// — the same fallback-synchronize-then-classify machinery
     /// [`CudaRuntime::htod_async_elapsed_ms`] uses — instead of returning a
     /// bare driver error: it either proves completion through a coarser
@@ -3728,18 +3892,26 @@ impl CudaRuntime {
     /// makes the transfer genuinely asynchronous and overlappable.
     pub fn alloc_pinned(&self, bytes: usize) -> Result<PinnedStaging> {
         self.bind()?;
+        let allocated_bytes = bytes.max(1) as u64;
+        let mut observation = self.prepare_observation(&[EventSpec::new(
+            ObservedCategory::HostAllocation,
+            ObservedBoundary::PinnedHostAllocate,
+            ObservedStatus::Committed,
+            allocated_bytes,
+        )])?;
         // Page-locking host memory synchronizes the device; see `alloc_raw`.
         let _section = capture_gate::synchronizing_section();
         // SAFETY: `malloc_host` returns a fresh page-locked host allocation on
         // the bound context; `PinnedStaging` owns it and frees it once on drop.
-        let ptr = unsafe { cudarc::driver::result::malloc_host(bytes.max(1), 0) }
-            .map_err(|e| driver_err("cuMemHostAlloc", e))?;
-        self.observe_bytes(EventSpec::new(
-            ObservedCategory::HostAllocation,
-            ObservedBoundary::PinnedHostAllocate,
-            ObservedStatus::Committed,
-            bytes.max(1) as u64,
-        ));
+        let ptr =
+            unsafe { cudarc::driver::result::malloc_host(bytes.max(1), 0) }.map_err(|error| {
+                Self::fail_observation(
+                    &mut observation,
+                    ObservedStatus::Failed,
+                    driver_err("cuMemHostAlloc", error),
+                )
+            })?;
+        Self::commit_observation(&mut observation)?;
         Ok(PinnedStaging {
             ptr: ptr.cast::<u8>(),
             len: bytes,
