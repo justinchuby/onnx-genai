@@ -481,6 +481,18 @@ pub trait StatePublicationReceipt: Send {
     fn roll_back(&mut self) -> Result<()>;
 }
 
+/// Stable provider-owned observation context for one executor generation.
+///
+/// This is deliberately separate from [`ExecutorArtifactRequirementState`]:
+/// observation may begin before route/reservation artifacts can be finalized,
+/// while artifact use remains unavailable until the session validates a
+/// terminal provider report. The session retains the exact state in bindings;
+/// callers cannot replace or upgrade it after construction.
+pub trait ExecutorArtifactObservationState: Send + Sync {
+    /// Execute one operation under this exact observation context.
+    fn with_observation(&self, operation: &mut dyn FnMut() -> Result<()>) -> Result<()>;
+}
+
 /// Provider-owned state retained by the session after it privately validates a
 /// `Required` artifact report. The session stores the returned `Arc` in its
 /// private executor state and in every baked graph requirement; there is no
@@ -2139,6 +2151,52 @@ pub trait ExecutionProvider: Send + Sync {
             self.device_id(),
             ExecutorRouteResidencyConfig::Disabled,
         ))
+    }
+
+    /// Whether this provider requests an executor-generation observation
+    /// context before model materialization begins.
+    ///
+    /// The default-off path performs no allocation, lookup, lock, or reference-
+    /// count operation. Participating providers allocate bounded recorder state
+    /// only after returning `true`.
+    fn executor_artifact_observation_enabled(&self) -> bool {
+        false
+    }
+
+    /// Create the stable observation-only context for one session-private
+    /// executor generation.
+    ///
+    /// `owner` is an opaque, non-zero-sized `Arc` minted and retained solely by
+    /// the session build transaction. Providers compare its allocation identity
+    /// when an exact scope already exists. This state grants no
+    /// route/reservation/artifact-use authority.
+    fn begin_executor_artifact_observation(
+        &self,
+        _provider: ExecutorArtifactProviderId,
+        _executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+        _logical_session: ExecutorLogicalSessionId,
+        _owner: Arc<dyn Any + Send + Sync>,
+    ) -> Result<Option<Arc<dyn ExecutorArtifactObservationState>>> {
+        Ok(None)
+    }
+
+    /// Bind a prepared observation context to a terminal provider-artifact
+    /// outcome after the session has validated the exact report.
+    ///
+    /// Providers that enabled early observation must require the identical
+    /// opaque `owner` allocation supplied at preparation. This transition does
+    /// not itself grant artifact use; it only permits the subsequently retained
+    /// requirement to expose the already-recorded exact-generation ledger.
+    fn commit_executor_artifact_observation(
+        &self,
+        _provider: ExecutorArtifactProviderId,
+        _executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+        _logical_session: ExecutorLogicalSessionId,
+        _owner: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Inspect provider artifacts required by one executor generation.

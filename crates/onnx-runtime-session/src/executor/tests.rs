@@ -658,7 +658,7 @@ fn route_residency_finalization_rejects_foreign_capability() {
     let mut readiness = ProviderArtifactReadiness::default();
 
     let error = readiness
-        .finalize_if_needed(&ep, config, &Graph::new(), &[])
+        .finalize_if_needed(&ep, config, &Graph::new(), &[], None)
         .expect_err("a provider cannot resolve another executor's route boundary");
     assert!(
         error
@@ -725,7 +725,7 @@ fn disabled_artifact_config_rejects_required_finalization_without_publication() 
     let mut readiness = ProviderArtifactReadiness::default();
 
     let error = readiness
-        .finalize_if_needed(&ep, config, &Graph::new(), &[])
+        .finalize_if_needed(&ep, config, &Graph::new(), &[], None)
         .expect_err("Disabled cannot accept a Required finalization");
     assert!(
         error
@@ -750,14 +750,14 @@ fn stale_finalization_epoch_replay_fails_closed() {
     .expect("issue private executor artifact configuration");
     let mut readiness = ProviderArtifactReadiness::default();
     readiness
-        .finalize_if_needed(&ep, config, &Graph::new(), &[])
+        .finalize_if_needed(&ep, config, &Graph::new(), &[], None)
         .expect("initial exact-generation finalization");
 
     readiness.advance_to(ExecutorArtifactReadinessEpoch::new(1));
     ep.replay_artifact_finalization
         .store(true, Ordering::Relaxed);
     let error = readiness
-        .finalize_if_needed(&ep, config, &Graph::new(), &[])
+        .finalize_if_needed(&ep, config, &Graph::new(), &[], None)
         .expect_err("a finalization from the previous epoch cannot be replayed");
     assert!(
         error
@@ -8781,6 +8781,46 @@ impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
 
     fn executor_artifact_policy(&self) -> onnx_runtime_ep_api::Result<ExecutorArtifactPolicy> {
         self.inner.executor_artifact_policy()
+    }
+
+    fn executor_artifact_observation_enabled(&self) -> bool {
+        self.inner.executor_artifact_observation_enabled()
+    }
+
+    fn begin_executor_artifact_observation(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> onnx_runtime_ep_api::Result<
+        Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>>,
+    > {
+        self.inner.begin_executor_artifact_observation(
+            provider,
+            executor,
+            generation,
+            logical_session,
+            owner,
+        )
+    }
+
+    fn commit_executor_artifact_observation(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
+        owner: &(dyn std::any::Any + Send + Sync),
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.commit_executor_artifact_observation(
+            provider,
+            executor,
+            generation,
+            logical_session,
+            owner,
+        )
     }
 
     fn inspect_executor_artifacts(

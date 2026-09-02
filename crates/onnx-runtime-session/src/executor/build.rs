@@ -961,15 +961,18 @@ impl Executor {
         let artifact_config =
             Self::resolve_artifact_config(ep.as_ref(), instance_id, logical_session)?;
         let mut artifact_transaction =
-            ExecutorArtifactBuildTransaction::new(Arc::clone(&ep), artifact_config);
-        let build = Self::build_with_artifact_transaction(
-            graph,
-            weights,
-            ep,
-            instance_id,
-            &mut artifact_transaction,
-            require_cuda,
-        );
+            ExecutorArtifactBuildTransaction::new(Arc::clone(&ep), artifact_config)?;
+        let build_observation = artifact_transaction.observation_state();
+        let build = with_provider_observation(build_observation.as_deref(), || {
+            Self::build_with_artifact_transaction(
+                graph,
+                weights,
+                ep,
+                instance_id,
+                &mut artifact_transaction,
+                require_cuda,
+            )
+        });
         match build {
             Ok(mut exec) => {
                 artifact_transaction.commit();
@@ -1073,6 +1076,8 @@ impl Executor {
         let mut exec = Self {
             instance_id,
             artifact_config: artifact_transaction.config(),
+            artifact_observation_owner: artifact_transaction.observation_owner(),
+            provider_observation_state: artifact_transaction.observation_state(),
             artifact_teardown_armed: false,
             graph,
             weights,
@@ -2452,13 +2457,51 @@ impl Executor {
         &mut self,
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
-        self.compile_ready_kernels(resolved)?;
-        self.provider_artifact_readiness.finalize_if_needed(
-            self.ep.as_ref(),
-            self.artifact_config,
-            &self.graph,
-            &self.finalized_expert_banks,
-        )
+        let needs_compilation = self.ready_kernels_need_compilation(resolved);
+        if !needs_compilation && !self.provider_artifact_readiness.needs_finalization() {
+            return self
+                .provider_artifact_readiness
+                .require_complete(self.ep.name(), self.artifact_config.executor());
+        }
+        let observation = self.provider_observation_state.as_ref().map(Arc::clone);
+        let observation_owner = self.artifact_observation_owner.as_ref().map(Arc::clone);
+        with_provider_observation(observation.as_deref(), || {
+            self.compile_ready_kernels(resolved)?;
+            self.provider_artifact_readiness.finalize_if_needed(
+                self.ep.as_ref(),
+                self.artifact_config,
+                &self.graph,
+                &self.finalized_expert_banks,
+                observation_owner.as_deref(),
+            )
+        })
+    }
+
+    fn ready_kernels_need_compilation(&self, resolved: &HashMap<ValueId, Vec<usize>>) -> bool {
+        (0..self.plan.len()).any(|i| {
+            let node = self.graph.node(self.plan[i].node_id);
+            if is_control_flow_op(&node.op_type, &node.domain)
+                || is_sequence_op(&node.op_type, &node.domain)
+                || !self.plan[i]
+                    .inputs
+                    .iter()
+                    .all(|input| input.is_none_or(|value| resolved.contains_key(&value)))
+            {
+                return false;
+            }
+            !self.kernel_bindings[i].as_ref().is_some_and(|binding| {
+                self.cache.contains(binding)
+                    && binding.shapes.len() == self.plan[i].inputs.len()
+                    && binding.shapes.iter().zip(&self.plan[i].inputs).all(
+                        |(bound_shape, input)| match input {
+                            Some(value) => resolved
+                                .get(value)
+                                .is_some_and(|shape| shape == bound_shape),
+                            None => bound_shape.is_empty(),
+                        },
+                    )
+            })
+        })
     }
 
     /// Compile every leaf kernel whose inputs are currently resolved.
@@ -2589,14 +2632,10 @@ impl Executor {
         )
     }
 
-    fn retain_binding_artifact_requirement(
+    fn retain_binding_observation_state(
         &self,
-    ) -> Result<Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>> {
-        if !self.provider_artifact_readiness.is_complete() {
-            return Ok(None);
-        }
-        self.provider_artifact_readiness
-            .retained_requirement_state(self.ep.as_ref(), self.artifact_config)
+    ) -> Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>> {
+        self.provider_observation_state.as_ref().map(Arc::clone)
     }
 
     pub(crate) fn allocate_device_binding(
@@ -2623,10 +2662,10 @@ impl Executor {
             .input_index
             .get(&input_name)
             .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
-        let artifact_requirement = self.retain_binding_artifact_requirement()?;
+        let artifact_observation = self.retain_binding_observation_state();
         DeviceIoBinding::allocate(
             self.ep.clone(),
-            artifact_requirement,
+            artifact_observation,
             DeviceBindingSpec {
                 input_name,
                 bind_input: true,
@@ -2652,10 +2691,10 @@ impl Executor {
         logical_shape: Vec<usize>,
     ) -> Result<DeviceIoBinding> {
         let bind_input = !input_name.is_empty();
-        let artifact_requirement = self.retain_binding_artifact_requirement()?;
+        let artifact_observation = self.retain_binding_observation_state();
         DeviceIoBinding::allocate(
             self.ep.clone(),
-            artifact_requirement,
+            artifact_observation,
             DeviceBindingSpec {
                 input_name,
                 bind_input,
@@ -2699,10 +2738,10 @@ impl Executor {
             .input_index
             .get(&input_name)
             .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
-        let artifact_requirement = self.retain_binding_artifact_requirement()?;
+        let artifact_observation = self.retain_binding_observation_state();
         DeviceIoBinding::allocate(
             self.ep.clone(),
-            artifact_requirement,
+            artifact_observation,
             DeviceBindingSpec {
                 input_name,
                 bind_input: true,
@@ -2768,7 +2807,7 @@ impl Executor {
         unsafe {
             DeviceIoBinding::from_external_memory(
                 self.ep.clone(),
-                self.retain_binding_artifact_requirement()?,
+                self.retain_binding_observation_state(),
                 DeviceBindingSpec {
                     input_name,
                     bind_input,
@@ -2800,10 +2839,10 @@ impl Executor {
                 "persistent output device-binding allocation",
             ));
         }
-        let artifact_requirement = self.retain_binding_artifact_requirement()?;
+        let artifact_observation = self.retain_binding_observation_state();
         DeviceIoBinding::allocate(
             self.ep.clone(),
-            artifact_requirement,
+            artifact_observation,
             DeviceBindingSpec {
                 input_name: String::new(),
                 bind_input: false,

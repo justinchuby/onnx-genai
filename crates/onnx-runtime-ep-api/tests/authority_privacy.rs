@@ -286,7 +286,12 @@ fn public_api_contains_no_authority_or_finalization_proof_surface() {
     assert!(provider.contains("This constructs data, not authority"));
     assert!(provider.contains("This method supplies data only"));
     assert!(provider.contains("fn inspect_executor_artifacts("));
+    assert!(provider.contains("fn begin_executor_artifact_observation("));
+    assert!(provider.contains("opaque, non-zero-sized `Arc`"));
+    assert!(!provider.contains("pub struct ExecutorArtifactObservationOwner"));
+    assert!(!provider.contains("from_labels"));
     assert!(session_executor.contains("struct ExecutorArtifactConfig"));
+    assert!(session_executor.contains("observation_owner: Option<Arc<dyn Any + Send + Sync>>"));
     assert!(!session_executor.contains("pub struct ExecutorArtifactConfig"));
     assert!(session_executor.contains("fn issue("));
     assert!(!session_executor.contains("pub fn issue("));

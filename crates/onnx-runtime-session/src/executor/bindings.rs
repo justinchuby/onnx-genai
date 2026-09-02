@@ -979,8 +979,12 @@ impl Executor {
                 "execution with persistent device bindings/state",
             ));
         }
-        let validation_submission =
-            self.begin_device_validation_submission_for_bindings(bindings)?;
+        let cold_observation = (!self.provider_artifact_readiness.is_complete())
+            .then(|| self.provider_observation_state.as_ref().map(Arc::clone))
+            .flatten();
+        let validation_submission = with_provider_observation(cold_observation.as_deref(), || {
+            self.begin_device_validation_submission_for_bindings(bindings)
+        })?;
         let external = self.prepare_external_bindings(bindings)?;
         let result = self.run_scoped_mode(
             inputs,
@@ -1136,6 +1140,7 @@ impl Executor {
             self.artifact_config,
             &self.graph,
             &self.finalized_expert_banks,
+            self.artifact_observation_owner.as_deref(),
         )?;
         let route_residency = self
             .provider_artifact_readiness

@@ -1725,6 +1725,28 @@ fn build_cuda_decoder_with_fixed_state(
     aux: AuxOutput,
     fixed_state: bool,
 ) -> anyhow::Result<NativeDecodeSession> {
+    build_cuda_decoder_with_fixed_state_and_observation(
+        graph_capture,
+        kv_max_len,
+        aux,
+        fixed_state,
+        None,
+    )
+    .map(|(session, _, _)| session)
+}
+
+#[cfg(feature = "native-cuda")]
+fn build_cuda_decoder_with_fixed_state_and_observation(
+    graph_capture: bool,
+    kv_max_len: Option<usize>,
+    aux: AuxOutput,
+    fixed_state: bool,
+    observed_byte_capacity: Option<usize>,
+) -> anyhow::Result<(
+    NativeDecodeSession,
+    Option<std::sync::Arc<onnx_runtime_ep_cuda::CudaExecutionProvider>>,
+    Option<onnx_runtime_ep_cuda::runtime::CudaTransferByteCounts>,
+)> {
     use prost::Message;
 
     let mut graph = Graph::new();
@@ -1843,12 +1865,24 @@ fn build_cuda_decoder_with_fixed_state(
     }
 
     let model = onnx_std::Model::new(graph).to_proto()?.encode_to_vec();
-    let session = InferenceSession::builder()
-        .model_bytes(&model)
-        .device(DevicePreference::Gpu { index: Some(0) })
-        .build()
-        .context("build capture-safe CUDA decoder")?;
-    if fixed_state {
+    let mut builder = InferenceSession::builder().model_bytes(&model);
+    let (observed_provider, raw_start) = if let Some(capacity) = observed_byte_capacity {
+        let mut provider = onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(0)
+            .context("initialize observed native CUDA provider")?;
+        provider
+            .configure_observed_byte_capacity(capacity)
+            .context("configure observed native CUDA provider")?;
+        let provider = std::sync::Arc::new(provider);
+        let raw_start = provider.runtime().transfer_byte_counts();
+        builder = builder.execution_provider(std::sync::Arc::clone(&provider)
+            as std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>);
+        (Some(provider), Some(raw_start))
+    } else {
+        builder = builder.device(DevicePreference::Gpu { index: Some(0) });
+        (None, None)
+    };
+    let session = builder.build().context("build capture-safe CUDA decoder")?;
+    let session = if fixed_state {
         let mut io = tiny_decoder_io();
         io.state_pairs = Some(vec![LoopStatePair {
             input: "past_key_values.0.conv_state".into(),
@@ -1874,7 +1908,8 @@ fn build_cuda_decoder_with_fixed_state(
             },
             Some(&tiny_decoder_io()),
         )
-    }
+    }?;
+    Ok((session, observed_provider, raw_start))
 }
 
 /// Build the synthetic single-layer CUDA decoder with **no** KV length bound:
@@ -2223,6 +2258,107 @@ fn native_cuda_reused_session_rezeros_recurrent_state() -> anyhow::Result<()> {
         first, second,
         "reused session must re-zero recurrent state on reset(): gen#1 {first:?} != gen#2 {second:?}"
     );
+    Ok(())
+}
+
+#[cfg(feature = "native-cuda")]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires a CUDA device; enable gpu-tests to execute"
+)]
+#[test]
+fn native_cuda_no_warmup_construction_records_cold_bindings_and_first_run() -> anyhow::Result<()> {
+    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ep_cuda::byte_telemetry::{
+        ObservedByteLedger, ObservedCategory, ObservedPhase, ObservedStatus,
+    };
+
+    let (mut session, provider, raw_start) = build_cuda_decoder_with_fixed_state_and_observation(
+        false,
+        Some(16),
+        AuxOutput::StaticUnit,
+        false,
+        Some(16_384),
+    )?;
+    let provider = provider.context("observed CUDA provider")?;
+    let raw_start = raw_start.context("raw CUDA start counters")?;
+    assert!(
+        session
+            .session
+            .provider_artifact_observation::<ObservedByteLedger>()
+            .is_none(),
+        "native decode exposed a comparable report before first-run finalization"
+    );
+    assert!(
+        session
+            .cuda
+            .as_ref()
+            .is_some_and(|cuda| !cuda.bindings.is_empty()),
+        "native decode must allocate persistent bindings before first run"
+    );
+
+    let logits = session.decode(&[5], 0)?;
+    assert_eq!(logits.len(), 1);
+    let observed = session
+        .session
+        .provider_artifact_observation::<ObservedByteLedger>()
+        .context("first run finalizes the exact native observation")?;
+    let cold = observed.snapshot()?;
+    assert!(
+        cold.phase_bytes(
+            ObservedPhase::Setup,
+            ObservedCategory::DeviceAllocation,
+            ObservedStatus::Committed,
+        ) > 0,
+        "native decode omitted pre-finalization binding allocations"
+    );
+    assert!(
+        cold.phase_bytes(
+            ObservedPhase::Setup,
+            ObservedCategory::H2d,
+            ObservedStatus::Completed,
+        ) > 0,
+        "native decode omitted pre-finalization binding uploads"
+    );
+    let reader = observed.read_handle();
+    observed.set_phase(ObservedPhase::Teardown)?;
+    drop(session);
+    provider.sync()?;
+    assert!(
+        provider
+            .release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "native decode teardown receipts did not settle"
+    );
+    let snapshot = reader.snapshot()?;
+    assert!(
+        snapshot.phase_bytes(
+            ObservedPhase::Teardown,
+            ObservedCategory::DeviceRelease,
+            ObservedStatus::Reclaimed,
+        ) > 0,
+        "native decode omitted binding teardown releases"
+    );
+    let raw_end = provider.runtime().transfer_byte_counts();
+    assert_eq!(
+        raw_end.h2d_completed - raw_start.h2d_completed,
+        snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed)
+    );
+    assert_eq!(
+        raw_end.d2h_completed - raw_start.d2h_completed,
+        snapshot.bytes(ObservedCategory::D2h, ObservedStatus::Completed)
+    );
+    assert_eq!(
+        raw_end.d2d_attempted - raw_start.d2d_attempted,
+        snapshot.bytes(ObservedCategory::D2d, ObservedStatus::Submitted)
+    );
+    assert_eq!(
+        raw_end.memset_attempted - raw_start.memset_attempted,
+        snapshot.bytes(ObservedCategory::CudaMemset, ObservedStatus::Submitted)
+    );
+    let mut provider = std::sync::Arc::try_unwrap(provider)
+        .map_err(|_| anyhow::anyhow!("native cold observation test retained the provider"))?;
+    provider.shutdown()?;
     Ok(())
 }
 

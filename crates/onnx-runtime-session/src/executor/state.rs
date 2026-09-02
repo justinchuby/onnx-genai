@@ -62,14 +62,6 @@ impl ProviderArtifactRequirement {
             state: std::ptr::NonNull::from(self.state.as_ref()),
         })
     }
-
-    fn retained_state(
-        &self,
-        config: ExecutorArtifactConfig,
-    ) -> Result<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>> {
-        self.use_context(config)?;
-        Ok(Arc::clone(&self.state))
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -287,6 +279,7 @@ impl ProviderArtifactReadiness {
         config: ExecutorArtifactConfig,
         graph: &Graph,
         finalized_banks: &[FinalizedExpertBank],
+        observation_owner: Option<&(dyn std::any::Any + Send + Sync)>,
     ) -> Result<()> {
         let executor = config.executor();
         if self.needs_finalization() {
@@ -319,7 +312,40 @@ impl ProviderArtifactReadiness {
                             self.epoch.get(),
                         ));
                     } else {
-                        self.outcome = match (config.route_residency(), report.into_state()) {
+                        let state = report.into_state();
+                        let terminal_compatible = matches!(
+                            (config.route_residency(), &state),
+                            (
+                                ExecutorRouteResidencyConfig::Disabled,
+                                ExecutorArtifactState::Disabled,
+                            ) | (
+                                ExecutorRouteResidencyConfig::Enabled,
+                                ExecutorArtifactState::Declined | ExecutorArtifactState::Required,
+                            )
+                        );
+                        if terminal_compatible && ep.executor_artifact_observation_enabled() {
+                            let Some(owner) = observation_owner else {
+                                self.outcome = ProviderArtifactOutcome::Failed(format!(
+                                    "{} enabled executor artifact observation for executor {} \
+                                     generation {} but the private build owner is missing",
+                                    ep.name(),
+                                    config.executor().get(),
+                                    config.generation().get(),
+                                ));
+                                return self.require_complete(ep.name(), executor);
+                            };
+                            if let Err(error) = ep.commit_executor_artifact_observation(
+                                config.provider(),
+                                config.executor(),
+                                config.generation(),
+                                config.logical_session(),
+                                owner,
+                            ) {
+                                self.outcome = ProviderArtifactOutcome::Failed(error.to_string());
+                                return self.require_complete(ep.name(), executor);
+                            }
+                        }
+                        self.outcome = match (config.route_residency(), state) {
                             (
                                 ExecutorRouteResidencyConfig::Disabled,
                                 ExecutorArtifactState::Disabled,
@@ -425,24 +451,6 @@ impl ProviderArtifactReadiness {
             .transpose()
     }
 
-    pub(super) fn retained_requirement_state(
-        &self,
-        ep: &dyn ExecutionProvider,
-        config: ExecutorArtifactConfig,
-    ) -> Result<Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>> {
-        self.require_complete(ep.name(), config.executor())?;
-        match &self.outcome {
-            ProviderArtifactOutcome::Complete {
-                requirement: Some(requirement),
-                ..
-            } => requirement.retained_state(config).map(Some),
-            ProviderArtifactOutcome::Complete {
-                requirement: None, ..
-            } => Ok(None),
-            _ => unreachable!("require_complete rejected non-complete artifact state"),
-        }
-    }
-
     fn requirement(&self) -> Option<&ProviderArtifactRequirement> {
         match &self.outcome {
             ProviderArtifactOutcome::Complete { requirement, .. } => requirement.as_ref(),
@@ -521,6 +529,14 @@ pub(crate) struct Executor {
     /// device, executor, and generation and required by every artifact
     /// publication/finalization call.
     pub(super) artifact_config: ExecutorArtifactConfig,
+    /// Opaque non-zero-sized build owner retained only while observation is
+    /// enabled. Provider state compares its allocation identity, never caller
+    /// labels, before reusing a prepared observation slot.
+    pub(super) artifact_observation_owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Stable observation-only context prepared before model materialization.
+    /// This is deliberately not an artifact-use requirement.
+    pub(super) provider_observation_state:
+        Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>>,
     /// False while `ExecutorArtifactBuildTransaction` still owns rollback.
     /// Armed only after the complete executor has been constructed.
     pub(super) artifact_teardown_armed: bool,

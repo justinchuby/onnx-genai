@@ -107,6 +107,14 @@ struct Fixture {
 
 impl Fixture {
     fn create(kind: FixtureKind) -> Result<Self> {
+        Self::create_with_batch_symbol(kind, false)
+    }
+
+    fn create_symbolic(kind: FixtureKind) -> Result<Self> {
+        Self::create_with_batch_symbol(kind, true)
+    }
+
+    fn create_with_batch_symbol(kind: FixtureKind, symbolic_batch: bool) -> Result<Self> {
         let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/deckard-freetoken-production-ab")
@@ -116,7 +124,7 @@ impl Fixture {
         let weights = dir.join("weights.bin");
         write_weights(&weights, kind)?;
         let model = dir.join("model.onnx.textproto");
-        fs::write(&model, model_text(kind))
+        fs::write(&model, model_text(kind, symbolic_batch))
             .with_context(|| format!("write fixture model {}", model.display()))?;
         Ok(Self { dir, model, kind })
     }
@@ -203,11 +211,15 @@ fn write_weights(path: &Path, kind: FixtureKind) -> Result<()> {
     Ok(())
 }
 
-fn value_info(text: &mut String, kind: &str, name: &str, columns: usize) {
+fn value_info(text: &mut String, kind: &str, name: &str, columns: usize, symbolic_batch: bool) {
     writeln!(text, "  {kind} {{").unwrap();
     writeln!(text, "    name: \"{name}\"").unwrap();
     writeln!(text, "    type {{ tensor_type {{ elem_type: 1 shape {{").unwrap();
-    writeln!(text, "      dim {{ dim_value: {ROWS} }}").unwrap();
+    if symbolic_batch {
+        writeln!(text, "      dim {{ dim_param: \"batch\" }}").unwrap();
+    } else {
+        writeln!(text, "      dim {{ dim_value: {ROWS} }}").unwrap();
+    }
     writeln!(text, "      dim {{ dim_value: {columns} }}").unwrap();
     writeln!(text, "    }} }} }}").unwrap();
     writeln!(text, "  }}").unwrap();
@@ -295,7 +307,7 @@ fn qmoe_node(text: &mut String, kind: FixtureKind, bank: usize, input: &str, out
     writeln!(text, "  }}").unwrap();
 }
 
-fn model_text(kind: FixtureKind) -> String {
+fn model_text(kind: FixtureKind, symbolic_batch: bool) -> String {
     let hidden = kind.hidden();
     let intermediate = kind.intermediate();
     let extents = tensor_extents(kind);
@@ -364,14 +376,26 @@ fn model_text(kind: FixtureKind) -> String {
             offset += len;
         }
     }
-    value_info(&mut text, "input", "hidden", hidden);
-    value_info(&mut text, "input", "state", hidden);
+    value_info(&mut text, "input", "hidden", hidden, symbolic_batch);
+    value_info(&mut text, "input", "state", hidden, symbolic_batch);
     for bank in 0..kind.banks() {
-        value_info(&mut text, "input", &format!("router_{bank}"), EXPERTS);
-        value_info(&mut text, "value_info", &format!("bank_{bank}_out"), hidden);
+        value_info(
+            &mut text,
+            "input",
+            &format!("router_{bank}"),
+            EXPERTS,
+            symbolic_batch,
+        );
+        value_info(
+            &mut text,
+            "value_info",
+            &format!("bank_{bank}_out"),
+            hidden,
+            symbolic_batch,
+        );
     }
-    value_info(&mut text, "output", "output", hidden);
-    value_info(&mut text, "output", "state_out", hidden);
+    value_info(&mut text, "output", "output", hidden, symbolic_batch);
+    value_info(&mut text, "output", "state_out", hidden, symbolic_batch);
     text.push_str(
         "}\nopset_import { domain: \"\" version: 13 }\n\
          opset_import { domain: \"com.microsoft\" version: 1 }\n",
@@ -409,6 +433,7 @@ struct LiveArm {
     provider: Arc<CudaExecutionProvider>,
     session: InferenceSession,
     bindings: Vec<DeviceIoBinding>,
+    raw_start: onnx_runtime_ep_cuda::runtime::CudaTransferByteCounts,
     router_start: usize,
     state_index: usize,
     output_index: usize,
@@ -438,12 +463,18 @@ fn build_arm(fixture: &Fixture, route_config: ExecutorRouteResidencyConfig) -> R
         .context("adopt production weight-residency allowance")?;
     provider.configure_observed_byte_capacity(EVENT_CAPACITY)?;
     let provider = Arc::new(provider);
-    let mut session = InferenceSession::builder()
+    let raw_start = provider.runtime().transfer_byte_counts();
+    let session = InferenceSession::builder()
         .model(&fixture.model)
         .execution_provider(Arc::clone(&provider) as Arc<dyn ExecutionProvider>)
         .build()
         .context("build production QMoE session")?;
-    session.warmup(&[]).context("finalize provider artifacts")?;
+    ensure!(
+        session
+            .provider_artifact_observation::<ObservedByteLedger>()
+            .is_none(),
+        "symbolic cold fixture unexpectedly finalized before binding allocation"
+    );
 
     let hidden = fixture.kind.hidden();
     let mut bindings = vec![
@@ -495,10 +526,17 @@ fn build_arm(fixture: &Fixture, route_config: ExecutorRouteResidencyConfig) -> R
         .collect::<Vec<_>>();
     bindings[0].write_bytes(0, &hidden_bytes)?;
     bindings[1].write_bytes(0, &vec![0_u8; ROWS * hidden * 4])?;
+    ensure!(
+        session
+            .provider_artifact_observation::<ObservedByteLedger>()
+            .is_none(),
+        "pre-finalization binding operations unexpectedly exposed a comparable report"
+    );
     Ok(LiveArm {
         provider,
         session,
         bindings,
+        raw_start,
         router_start,
         state_index: 1,
         output_index,
@@ -587,6 +625,15 @@ struct ArmReport {
     warm_d2d_submitted: u64,
     cold_memset_submitted: u64,
     warm_memset_submitted: u64,
+    cold_device_allocation_bytes: u64,
+    teardown_device_release_bytes: u64,
+    teardown_vmm_unmap_bytes: u64,
+    raw_h2d_completed: u64,
+    raw_d2h_completed: u64,
+    raw_d2d_attempted: u64,
+    raw_d2d_completed: u64,
+    raw_memset_attempted: u64,
+    raw_memset_completed: u64,
     replay_events: usize,
     state_publications: u64,
     output_publications: u64,
@@ -627,7 +674,6 @@ fn run_arm(fixture: &Fixture, optimized: bool) -> Result<ArmReport> {
         ExecutorRouteResidencyConfig::Disabled
     };
     let mut arm = build_arm(fixture, route_config)?;
-    observation(&arm)?.set_phase(ObservedPhase::Prefill)?;
     let mut proofs = vec![execute_step(
         &mut arm,
         fixture.kind,
@@ -636,6 +682,16 @@ fn run_arm(fixture: &Fixture, optimized: bool) -> Result<ArmReport> {
         &routes(fixture.kind, 0),
         false,
     )?];
+    ensure!(
+        observation(&arm)?.snapshot()?.events.iter().any(|event| {
+            event.phase == ObservedPhase::Setup
+                && matches!(
+                    event.category,
+                    ObservedCategory::DeviceAllocation | ObservedCategory::H2d
+                )
+        }),
+        "first-run finalization did not reveal pre-finalization binding receipts"
+    );
     let retained_clones_before_warm = observation(&arm)?.hot_path_stats().retained_recorder_clones;
 
     observation(&arm)?.set_phase(ObservedPhase::DirectWarmup)?;
@@ -719,10 +775,12 @@ fn run_arm(fixture: &Fixture, optimized: bool) -> Result<ArmReport> {
         provider,
         session,
         bindings,
+        raw_start,
         ..
     } = arm;
     drop(bindings);
     drop(session);
+    let raw_end = provider.runtime().transfer_byte_counts();
     let queue = Arc::clone(provider.release_queue());
     let mut provider = Arc::try_unwrap(provider)
         .map_err(|_| anyhow::anyhow!("production A/B provider remained shared after teardown"))?;
@@ -788,9 +846,97 @@ fn run_arm(fixture: &Fixture, optimized: bool) -> Result<ArmReport> {
         .bytes(ObservedCategory::VmmMap, ObservedStatus::Committed)
         .checked_sub(snapshot.bytes(ObservedCategory::VmmUnmap, ObservedStatus::Reclaimed))
         .context("VMM unmap receipts exceed observed maps")?;
+    let raw_h2d_completed = raw_end
+        .h2d_completed
+        .checked_sub(raw_start.h2d_completed)
+        .context("raw H2D counter regressed")?;
+    let raw_d2h_completed = raw_end
+        .d2h_completed
+        .checked_sub(raw_start.d2h_completed)
+        .context("raw D2H counter regressed")?;
+    let raw_d2d_attempted = raw_end
+        .d2d_attempted
+        .checked_sub(raw_start.d2d_attempted)
+        .context("raw D2D attempted counter regressed")?;
+    let raw_d2d_completed = raw_end
+        .d2d_completed
+        .checked_sub(raw_start.d2d_completed)
+        .context("raw D2D completed counter regressed")?;
+    let raw_memset_attempted = raw_end
+        .memset_attempted
+        .checked_sub(raw_start.memset_attempted)
+        .context("raw memset attempted counter regressed")?;
+    let raw_memset_completed = raw_end
+        .memset_completed
+        .checked_sub(raw_start.memset_completed)
+        .context("raw memset completed counter regressed")?;
+    ensure!(
+        raw_h2d_completed == snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed),
+        "raw CUDA H2D bytes do not reconcile with the exact ledger: raw={} ledger={}",
+        raw_h2d_completed,
+        snapshot.bytes(ObservedCategory::H2d, ObservedStatus::Completed)
+    );
+    ensure!(
+        raw_d2h_completed == snapshot.bytes(ObservedCategory::D2h, ObservedStatus::Completed),
+        "raw CUDA D2H bytes do not reconcile with the exact ledger: raw={} ledger={}",
+        raw_d2h_completed,
+        snapshot.bytes(ObservedCategory::D2h, ObservedStatus::Completed)
+    );
+    ensure!(
+        raw_d2d_attempted == snapshot.bytes(ObservedCategory::D2d, ObservedStatus::Submitted),
+        "raw CUDA D2D attempted bytes do not reconcile with the exact ledger: raw={} ledger={}",
+        raw_d2d_attempted,
+        snapshot.bytes(ObservedCategory::D2d, ObservedStatus::Submitted)
+    );
+    ensure!(
+        raw_d2d_completed == snapshot.bytes(ObservedCategory::D2d, ObservedStatus::Completed),
+        "raw CUDA D2D completed bytes do not reconcile with the exact ledger: raw={} ledger={}",
+        raw_d2d_completed,
+        snapshot.bytes(ObservedCategory::D2d, ObservedStatus::Completed)
+    );
+    ensure!(
+        raw_memset_attempted
+            == snapshot.bytes(ObservedCategory::CudaMemset, ObservedStatus::Submitted),
+        "raw CUDA memset attempted bytes do not reconcile with the exact ledger: raw={} ledger={}",
+        raw_memset_attempted,
+        snapshot.bytes(ObservedCategory::CudaMemset, ObservedStatus::Submitted)
+    );
+    ensure!(
+        raw_memset_completed
+            == snapshot.bytes(ObservedCategory::CudaMemset, ObservedStatus::Completed),
+        "raw CUDA memset completed bytes do not reconcile with the exact ledger: raw={} ledger={}",
+        raw_memset_completed,
+        snapshot.bytes(ObservedCategory::CudaMemset, ObservedStatus::Completed)
+    );
     ensure!(replay_events >= REPLAYS);
     ensure!(state_publications > 0);
     ensure!(output_publications > 0);
+    ensure!(
+        phase_bytes(
+            &snapshot,
+            &cold_phases,
+            ObservedCategory::DeviceAllocation,
+            ObservedStatus::Committed,
+        ) > 0,
+        "truly cold session recorded no binding/model device allocations"
+    );
+    ensure!(
+        phase_bytes(
+            &snapshot,
+            &cold_phases,
+            ObservedCategory::H2d,
+            ObservedStatus::Completed,
+        ) > 0,
+        "truly cold session recorded no binding/model H2D transfers"
+    );
+    ensure!(
+        snapshot.phase_bytes(
+            ObservedPhase::Teardown,
+            ObservedCategory::DeviceRelease,
+            ObservedStatus::Reclaimed,
+        ) > 0,
+        "session teardown recorded no device releases"
+    );
     ensure!(retained_clones_after_warm == retained_clones_before_warm);
     ensure!(
         hot_path.mutex_acquisitions == 0
@@ -863,6 +1009,28 @@ fn run_arm(fixture: &Fixture, optimized: bool) -> Result<ArmReport> {
             ObservedCategory::CudaMemset,
             ObservedStatus::Submitted,
         ),
+        cold_device_allocation_bytes: phase_bytes(
+            &snapshot,
+            &cold_phases,
+            ObservedCategory::DeviceAllocation,
+            ObservedStatus::Committed,
+        ),
+        teardown_device_release_bytes: snapshot.phase_bytes(
+            ObservedPhase::Teardown,
+            ObservedCategory::DeviceRelease,
+            ObservedStatus::Reclaimed,
+        ),
+        teardown_vmm_unmap_bytes: snapshot.phase_bytes(
+            ObservedPhase::Teardown,
+            ObservedCategory::VmmUnmap,
+            ObservedStatus::Reclaimed,
+        ),
+        raw_h2d_completed,
+        raw_d2h_completed,
+        raw_d2d_attempted,
+        raw_d2d_completed,
+        raw_memset_attempted,
+        raw_memset_completed,
         replay_events,
         state_publications,
         output_publications,
@@ -916,7 +1084,7 @@ fn production_session_ab_proves_outputs_state_routes_capture_and_replay() -> Res
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let _gate = GateGuard::enable();
     for kind in [FixtureKind::ManyExpertHybrid, FixtureKind::GroupedRecurrent] {
-        let fixture = Fixture::create(kind)?;
+        let fixture = Fixture::create_symbolic(kind)?;
         let baseline = run_arm(&fixture, false)?;
         let optimized = run_arm(&fixture, true)?;
         let semantic_equivalent = baseline.proofs == optimized.proofs;
@@ -948,7 +1116,7 @@ fn production_session_ab_proves_outputs_state_routes_capture_and_replay() -> Res
             );
         }
         let report = ComparisonReport {
-            schema: "onnx-genai.freetoken-production-ab.v3",
+            schema: "onnx-genai.freetoken-production-ab.v4",
             fixture: kind,
             dimensions: BTreeMap::from([
                 ("experts", EXPERTS),
@@ -985,70 +1153,61 @@ fn production_session_ab_proves_outputs_state_routes_capture_and_replay() -> Res
 }
 
 #[test]
-fn capacity_one_rejects_second_real_session_allocation_before_cuda_work() -> Result<()> {
+fn pre_finalization_binding_upgrades_in_place_and_tears_down_exactly() -> Result<()> {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let fixture = Fixture::create(FixtureKind::ManyExpertHybrid)?;
-    let capacity = 2_u64 << 30;
-    let governor: Arc<dyn MemoryGovernor + Send + Sync> = Arc::new(LedgerGovernor::new(
-        LeaseLedger::new_for_device(DeviceKey::device(0), capacity, capacity, 0),
-    ));
-    let mut provider =
-        CudaExecutionProvider::initialized_with_offload_policy_governor_and_route_config(
-            0,
-            DeviceOffloadPolicy {
-                enabled: true,
-                device_budget_bytes: Some(fixture.kind.device_budget()),
-                ..DeviceOffloadPolicy::default()
-            },
-            governor,
-            ExecutorRouteResidencyConfig::Disabled,
-        )?;
-    provider.configure_observed_byte_capacity(1)?;
-    let provider = Arc::new(provider);
-    let mut session = InferenceSession::builder()
-        .model(&fixture.model)
-        .execution_provider(Arc::clone(&provider) as Arc<dyn ExecutionProvider>)
-        .build()?;
-    session.warmup(&[])?;
-    let before = provider
-        .device_allocation_counts()
-        .context("allocation counters")?
-        .0;
-    let first = session.allocate_device_binding(
-        "hidden",
-        None::<String>,
-        DataType::Float32,
-        vec![ROWS, fixture.kind.hidden()],
-        vec![ROWS, fixture.kind.hidden()],
+    let fixture = Fixture::create_symbolic(FixtureKind::ManyExpertHybrid)?;
+    let mut arm = build_arm(&fixture, ExecutorRouteResidencyConfig::Disabled)?;
+    execute_step(
+        &mut arm,
+        fixture.kind,
+        "first_run",
+        0,
+        &routes(fixture.kind, 0),
+        false,
     )?;
-    let after_first = provider
-        .device_allocation_counts()
-        .context("allocation counters")?
-        .0;
-    ensure!(after_first > before);
-    let error = session
-        .allocate_device_binding(
-            "state",
-            None::<String>,
-            DataType::Float32,
-            vec![ROWS, fixture.kind.hidden()],
-            vec![ROWS, fixture.kind.hidden()],
-        )
-        .expect_err("second allocation must fail before exceeding event capacity");
+    let observed = observation(&arm)?;
+    let cold = observed.snapshot()?;
     ensure!(
-        error.to_string().contains("event capacity 1")
-            && error.to_string().contains("no event was committed"),
-        "capacity error was not actionable: {error}"
+        cold.phase_bytes(
+            ObservedPhase::Setup,
+            ObservedCategory::DeviceAllocation,
+            ObservedStatus::Committed,
+        ) > 0
     );
+    ensure!(
+        cold.phase_bytes(
+            ObservedPhase::Setup,
+            ObservedCategory::H2d,
+            ObservedStatus::Completed,
+        ) > 0
+    );
+    let reader = observed.read_handle();
+    observed.set_phase(ObservedPhase::Teardown)?;
+    let LiveArm {
+        provider,
+        session,
+        bindings,
+        ..
+    } = arm;
+    drop(bindings);
+    drop(session);
+    provider.sync()?;
     ensure!(
         provider
-            .device_allocation_counts()
-            .context("allocation counters")?
-            .0
-            == after_first,
-        "second CUDA allocation occurred despite failed telemetry preflight"
+            .release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "pre-finalization binding teardown did not settle"
     );
-    drop(first);
+    ensure!(
+        reader.snapshot()?.phase_bytes(
+            ObservedPhase::Teardown,
+            ObservedCategory::DeviceRelease,
+            ObservedStatus::Reclaimed,
+        ) > 0
+    );
+    let mut provider = Arc::try_unwrap(provider)
+        .map_err(|_| anyhow::anyhow!("pre-finalization binding test retained the provider"))?;
+    provider.shutdown()?;
     Ok(())
 }
 
@@ -1092,8 +1251,49 @@ fn shared_provider_sessions_isolate_exact_recorders_and_default_off_stays_empty(
     ensure!(first_observed.scope().provider == second_observed.scope().provider);
     ensure!(first_observed.scope().executor != second_observed.scope().executor);
     ensure!(first_observed.scope().logical_session != second_observed.scope().logical_session);
+    let first_scope = first_observed.scope();
+    let foreign_owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new([
+        first_scope.executor,
+        first_scope.generation,
+        first_scope.logical_session,
+    ]);
+    let foreign_reopen = provider.begin_executor_artifact_observation(
+        onnx_runtime_ep_api::ExecutorArtifactProviderId::from_raw(first_scope.provider),
+        ExecutorInstanceId::from_raw(first_scope.executor),
+        onnx_runtime_ep_api::ExecutorArtifactGeneration::from_raw(first_scope.generation),
+        onnx_runtime_ep_api::ExecutorLogicalSessionId::from_raw(first_scope.logical_session),
+        foreign_owner,
+    );
+    let foreign_reopen = match foreign_reopen {
+        Ok(_) => anyhow::bail!("foreign owner reopened an exact session observation slot"),
+        Err(error) => error,
+    };
+    ensure!(
+        foreign_reopen.to_string().contains("owner"),
+        "foreign owner refusal was not actionable: {foreign_reopen}"
+    );
+    let foreign_commit_owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new([
+        first_scope.executor,
+        first_scope.generation,
+        first_scope.logical_session,
+    ]);
+    let foreign_commit = provider
+        .commit_executor_artifact_observation(
+            onnx_runtime_ep_api::ExecutorArtifactProviderId::from_raw(first_scope.provider),
+            ExecutorInstanceId::from_raw(first_scope.executor),
+            onnx_runtime_ep_api::ExecutorArtifactGeneration::from_raw(first_scope.generation),
+            onnx_runtime_ep_api::ExecutorLogicalSessionId::from_raw(first_scope.logical_session),
+            foreign_commit_owner.as_ref(),
+        )
+        .expect_err("foreign owner must not commit exact session observation");
+    ensure!(
+        foreign_commit
+            .to_string()
+            .contains("private build owner did not match"),
+        "foreign commit refusal was not actionable: {foreign_commit}"
+    );
     let second_before = second_observed.snapshot()?.events.len();
-    let _first_binding = first.allocate_device_binding(
+    let first_binding = first.allocate_device_binding(
         "hidden",
         None::<String>,
         DataType::Float32,
@@ -1108,7 +1308,7 @@ fn shared_provider_sessions_isolate_exact_recorders_and_default_off_stays_empty(
 
     first_observed.reset()?;
     let reset_epoch = first_observed.snapshot()?.epoch;
-    let _after_reset = first.allocate_device_binding(
+    let after_reset = first.allocate_device_binding(
         "state",
         None::<String>,
         DataType::Float32,
@@ -1117,32 +1317,16 @@ fn shared_provider_sessions_isolate_exact_recorders_and_default_off_stays_empty(
     )?;
     ensure!(first_observed.snapshot()?.epoch == reset_epoch);
     ensure!(first_observed.snapshot()?.events.len() == 1);
-    first_observed.close()?;
-    let before_closed_attempt = provider
-        .device_allocation_counts()
-        .context("allocation counts")?
-        .0;
-    let closed = first
-        .allocate_device_output_binding(
-            "output",
-            DataType::Float32,
-            vec![ROWS, fixture.kind.hidden()],
-            vec![ROWS, fixture.kind.hidden()],
-        )
-        .expect_err("closed exact recorder must reject new owner operations");
-    ensure!(
-        closed
-            .to_string()
-            .contains("observed-byte ledger is closed")
-    );
+    drop(first_binding);
+    drop(after_reset);
+    provider.sync()?;
     ensure!(
         provider
-            .device_allocation_counts()
-            .context("allocation counts")?
-            .0
-            == before_closed_attempt
+            .release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "reset-era binding releases did not settle"
     );
-    let _sibling_still_live = second.allocate_device_binding(
+    let sibling_still_live = second.allocate_device_binding(
         "hidden",
         None::<String>,
         DataType::Float32,
@@ -1176,6 +1360,20 @@ fn shared_provider_sessions_isolate_exact_recorders_and_default_off_stays_empty(
             .is_none(),
         "default-off session unexpectedly created observation authority"
     );
+    drop(default_session);
+    drop(sibling_still_live);
+    drop(first);
+    drop(second);
+    provider.sync()?;
+    ensure!(
+        provider
+            .release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "shared-provider teardown receipts did not settle"
+    );
+    let mut provider = Arc::try_unwrap(provider)
+        .map_err(|_| anyhow::anyhow!("shared-provider test retained the provider"))?;
+    provider.shutdown()?;
     Ok(())
 }
 
@@ -1198,7 +1396,7 @@ fn direct_provider_runtime_cannot_record_into_a_session_owned_ledger() -> Result
             governor,
             ExecutorRouteResidencyConfig::Disabled,
         )?;
-    provider.configure_observed_byte_capacity(16)?;
+    provider.configure_observed_byte_capacity(EVENT_CAPACITY)?;
     let before_session = provider.runtime().alloc_raw(4096)?;
     unsafe { provider.runtime().free_raw(before_session)? };
     let provider = Arc::new(provider);
@@ -1210,21 +1408,42 @@ fn direct_provider_runtime_cannot_record_into_a_session_owned_ledger() -> Result
     let observed = session
         .provider_artifact_observation::<ObservedByteLedger>()
         .context("session observation")?;
-    ensure!(observed.snapshot()?.events.is_empty());
+    let events_before_direct = observed.snapshot()?.events.len();
     let hostile_direct = provider.runtime().alloc_raw(4096)?;
     unsafe { provider.runtime().free_raw(hostile_direct)? };
     ensure!(
-        observed.snapshot()?.events.is_empty(),
+        observed.snapshot()?.events.len() == events_before_direct,
         "direct provider/runtime work attached to a session-owned recorder"
     );
+    let reader = observed.read_handle();
+    drop(session);
+    provider.sync()?;
+    ensure!(
+        provider
+            .release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "direct-runtime authority test teardown receipts did not settle"
+    );
+    let mut provider = Arc::try_unwrap(provider)
+        .map_err(|_| anyhow::anyhow!("direct-runtime test retained the provider"))?;
+    provider.shutdown()?;
+    reader.snapshot()?;
     Ok(())
 }
 
 #[test]
 fn exact_binding_h2d_and_d2h_bytes_match_authoritative_cuda_call_totals() -> Result<()> {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let fixture = Fixture::create(FixtureKind::ManyExpertHybrid)?;
+    let fixture = Fixture::create_symbolic(FixtureKind::ManyExpertHybrid)?;
     let mut arm = build_arm(&fixture, ExecutorRouteResidencyConfig::Disabled)?;
+    execute_step(
+        &mut arm,
+        fixture.kind,
+        "cold_finalize",
+        0,
+        &routes(fixture.kind, 0),
+        false,
+    )?;
     observation(&arm)?.set_phase(ObservedPhase::Verification)?;
     let ledger_before = observation(&arm)?.snapshot()?;
     let raw_before = arm.provider.runtime().transfer_byte_counts();
@@ -1272,7 +1491,7 @@ fn exact_binding_h2d_and_d2h_bytes_match_authoritative_cuda_call_totals() -> Res
 #[test]
 fn eager_capture_and_replay_publish_only_after_sync_and_validation() -> Result<()> {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let fixture = Fixture::create(FixtureKind::ManyExpertHybrid)?;
+    let fixture = Fixture::create_symbolic(FixtureKind::ManyExpertHybrid)?;
     let mut arm = build_arm(&fixture, ExecutorRouteResidencyConfig::Disabled)?;
     let read_outputs = |arm: &mut LiveArm| -> Result<(Vec<u8>, Vec<u8>)> {
         Ok((

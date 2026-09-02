@@ -772,6 +772,12 @@ fn failed_parent_build_retires_child_reservations_once_and_clean_retry_isolated(
     let Some((provider, ledger)) = provider_or_skip(0) else {
         return;
     };
+    let mut provider = Arc::try_unwrap(provider)
+        .unwrap_or_else(|_| panic!("fresh failed-build provider unexpectedly shared"));
+    provider
+        .configure_observed_byte_capacity(65_536)
+        .expect("configure failed-build observation");
+    let provider = Arc::new(provider);
     let provider_baseline = ledger.used(Tier::Device);
 
     let sibling = InferenceSession::builder()

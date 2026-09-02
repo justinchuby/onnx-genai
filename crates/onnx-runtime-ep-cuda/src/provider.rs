@@ -38,18 +38,18 @@
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{
     BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
     DevicePtr, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities,
-    ExecutorArtifactGeneration, ExecutorArtifactPending, ExecutorArtifactPolicy,
-    ExecutorArtifactProviderId, ExecutorArtifactReadinessEpoch, ExecutorArtifactReport,
-    ExecutorArtifactState, ExecutorInstanceId, ExecutorKernelScope, ExecutorLogicalSessionId,
-    ExecutorRouteResidencyConfig, ExpertWeightGroup, Fence, HostToDeviceCopier, Kernel,
-    KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, SealedDeviceAllocation,
-    WorkspaceAllocation, deny, structural_input_bytes,
+    ExecutorArtifactGeneration, ExecutorArtifactObservationState, ExecutorArtifactPending,
+    ExecutorArtifactPolicy, ExecutorArtifactProviderId, ExecutorArtifactReadinessEpoch,
+    ExecutorArtifactReport, ExecutorArtifactState, ExecutorInstanceId, ExecutorKernelScope,
+    ExecutorLogicalSessionId, ExecutorRouteResidencyConfig, ExpertWeightGroup, Fence,
+    HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result,
+    SealedDeviceAllocation, WorkspaceAllocation, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
@@ -159,13 +159,98 @@ struct ExecutorRouteResidencyState {
     finalization_admission: Option<RouteFinalizationAdmission>,
     observed_generation: Option<ExecutorArtifactGeneration>,
     observed_logical_session: Option<onnx_runtime_ep_api::ExecutorLogicalSessionId>,
-    observed_bytes: Option<Arc<crate::byte_telemetry::ObservedByteLedger>>,
+    observed_owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    observation: Option<Arc<CudaArtifactObservation>>,
 }
 
 struct CudaArtifactRequirement {
     route: Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>,
-    observed: Option<Arc<crate::byte_telemetry::ObservedByteLedger>>,
-    recorder: Option<crate::byte_telemetry::ProductionByteRecorder>,
+    observation: Option<Arc<CudaArtifactObservation>>,
+}
+
+const OBSERVATION_PREPARED: u8 = 0;
+const OBSERVATION_FINALIZED: u8 = 1;
+const OBSERVATION_RETIRED: u8 = 2;
+const OBSERVATION_ABORTED: u8 = 3;
+
+fn exact_observation_owner_matches(
+    expected: Option<&Arc<dyn std::any::Any + Send + Sync>>,
+    presented: &(dyn std::any::Any + Send + Sync),
+) -> bool {
+    expected.is_some_and(|expected| std::ptr::eq(expected.as_ref(), presented))
+}
+
+struct CudaArtifactObservation {
+    ledger: Arc<crate::byte_telemetry::ObservedByteLedger>,
+    recorder: crate::byte_telemetry::ProductionByteRecorder,
+    lifecycle: AtomicU8,
+}
+
+impl CudaArtifactObservation {
+    fn new(ledger: Arc<crate::byte_telemetry::ObservedByteLedger>) -> Result<Self> {
+        let recorder = ledger.persistent_recorder().map_err(|error| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: retain prepared observed-byte recorder: {error}"
+            ))
+        })?;
+        Ok(Self {
+            ledger,
+            recorder,
+            lifecycle: AtomicU8::new(OBSERVATION_PREPARED),
+        })
+    }
+
+    fn finalize(&self) -> Result<()> {
+        match self.lifecycle.compare_exchange(
+            OBSERVATION_PREPARED,
+            OBSERVATION_FINALIZED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(OBSERVATION_FINALIZED) => Ok(()),
+            Err(OBSERVATION_RETIRED) => Err(EpError::KernelFailed(
+                "cuda_ep: cannot finalize a retired executor observation".into(),
+            )),
+            Err(OBSERVATION_ABORTED) => Err(EpError::KernelFailed(
+                "cuda_ep: cannot finalize an aborted executor observation".into(),
+            )),
+            Err(state) => Err(EpError::KernelFailed(format!(
+                "cuda_ep: executor observation has invalid lifecycle state {state}"
+            ))),
+        }
+    }
+
+    fn retire(&self) {
+        let prior = self
+            .lifecycle
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
+                OBSERVATION_PREPARED => Some(OBSERVATION_ABORTED),
+                OBSERVATION_FINALIZED => Some(OBSERVATION_RETIRED),
+                OBSERVATION_RETIRED | OBSERVATION_ABORTED => None,
+                _ => Some(OBSERVATION_ABORTED),
+            });
+        if prior.is_ok() {
+            self.ledger.retire();
+        }
+    }
+
+    fn can_back_requirement(&self) -> bool {
+        matches!(
+            self.lifecycle.load(Ordering::Acquire),
+            OBSERVATION_FINALIZED | OBSERVATION_RETIRED
+        )
+    }
+}
+
+impl onnx_runtime_ep_api::ExecutorArtifactObservationState for CudaArtifactObservation {
+    fn with_observation(&self, operation: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        let _observed = self.recorder.enter().map_err(|error| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: enter exact executor observed-byte context: {error}"
+            ))
+        })?;
+        operation()
+    }
 }
 
 struct CudaArtifactUseGuard {
@@ -230,23 +315,16 @@ impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for CudaArtifactRequi
     }
 
     fn with_observation(&self, operation: &mut dyn FnMut() -> Result<()>) -> Result<()> {
-        let _observed = self
-            .recorder
-            .as_ref()
-            .map(crate::byte_telemetry::ProductionByteRecorder::enter)
-            .transpose()
-            .map_err(|error| {
-                EpError::KernelFailed(format!(
-                    "cuda_ep: enter exact session observed-byte context: {error}"
-                ))
-            })?;
-        operation()
+        match self.observation.as_ref() {
+            Some(observation) => observation.with_observation(operation),
+            None => operation(),
+        }
     }
 
     fn observation(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        self.observed
-            .as_deref()
-            .map(|observed| observed as &(dyn std::any::Any + Send + Sync))
+        self.observation
+            .as_ref()
+            .map(|observation| observation.ledger.as_ref() as &(dyn std::any::Any + Send + Sync))
     }
 }
 
@@ -1420,7 +1498,8 @@ impl CudaExecutionProvider {
     ///
     /// This selects capacity only. It creates no recorder and returns no
     /// authority. The exact session/executor/generation lifecycle creates and
-    /// retains its own recorder during provider-artifact finalization.
+    /// retains its own observation-only recorder immediately before model
+    /// materialization, then binds it to the validated artifact outcome.
     pub fn configure_observed_byte_capacity(&mut self, event_capacity: usize) -> Result<()> {
         if event_capacity == 0 {
             return Err(EpError::KernelFailed(
@@ -1439,12 +1518,13 @@ impl CudaExecutionProvider {
         Ok(())
     }
 
-    fn ensure_observed_byte_session(
+    fn begin_observed_byte_session(
         &self,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
         logical_session: ExecutorLogicalSessionId,
-    ) -> Result<Option<Arc<crate::byte_telemetry::ObservedByteLedger>>> {
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Option<Arc<CudaArtifactObservation>>> {
         let Some(capacity) = self.observed_byte_capacity else {
             return Ok(None);
         };
@@ -1466,13 +1546,14 @@ impl CudaExecutionProvider {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = states.entry(executor).or_default();
-        if let Some(existing) = state.observed_bytes.as_ref() {
+        if let Some(existing) = state.observation.as_ref() {
             if state.observed_generation != Some(generation)
                 || state.observed_logical_session != Some(logical_session)
+                || !exact_observation_owner_matches(state.observed_owner.as_ref(), owner.as_ref())
             {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep: executor {} already owns observed-byte generation {:?} in logical \
-                     session {:?}; refusing foreign or stale generation {} / session {}",
+                     session {:?}; refusing foreign or stale generation {} / session {} / owner",
                     executor.get(),
                     state
                         .observed_generation
@@ -1486,7 +1567,7 @@ impl CudaExecutionProvider {
             }
             return Ok(Some(Arc::clone(existing)));
         }
-        let observed = Arc::new(
+        let ledger = Arc::new(
             crate::byte_telemetry::ObservedByteLedger::new_for_runtime(
                 crate::byte_telemetry::ObservedScope {
                     provider: self.artifact_provider_id.get(),
@@ -1508,10 +1589,12 @@ impl CudaExecutionProvider {
                 ))
             })?,
         );
+        let observation = Arc::new(CudaArtifactObservation::new(ledger)?);
         state.observed_generation = Some(generation);
         state.observed_logical_session = Some(logical_session);
-        state.observed_bytes = Some(Arc::clone(&observed));
-        Ok(Some(observed))
+        state.observed_owner = Some(owner);
+        state.observation = Some(Arc::clone(&observation));
+        Ok(Some(observation))
     }
 
     fn artifact_policy(&self) -> ExecutorArtifactPolicy {
@@ -5767,6 +5850,70 @@ impl ExecutionProvider for CudaExecutionProvider {
         Ok(self.artifact_policy())
     }
 
+    fn executor_artifact_observation_enabled(&self) -> bool {
+        self.observed_byte_capacity.is_some()
+    }
+
+    fn begin_executor_artifact_observation(
+        &self,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        logical_session: ExecutorLogicalSessionId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>>> {
+        self.validate_artifact_provider(provider, executor)?;
+        self.begin_observed_byte_session(executor, generation, logical_session, owner)
+            .map(|observation| {
+                observation.map(|observation| {
+                    observation as Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>
+                })
+            })
+    }
+
+    fn commit_executor_artifact_observation(
+        &self,
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        logical_session: ExecutorLogicalSessionId,
+        owner: &(dyn std::any::Any + Send + Sync),
+    ) -> Result<()> {
+        self.validate_artifact_provider(provider, executor)?;
+        let observation = {
+            let states = self
+                .route_executors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = states.get(&executor).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} has no prepared observation to commit",
+                    executor.get()
+                ))
+            })?;
+            if state.observed_generation != Some(generation)
+                || state.observed_logical_session != Some(logical_session)
+                || !exact_observation_owner_matches(state.observed_owner.as_ref(), owner)
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} observation commit is foreign or stale for generation \
+                     {} logical session {}; the exact private build owner did not match",
+                    executor.get(),
+                    generation.get(),
+                    logical_session.get()
+                )));
+            }
+            state.observation.clone().ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: executor {} generation {} has no prepared observation state",
+                    executor.get(),
+                    generation.get()
+                ))
+            })?
+        };
+        observation.finalize()
+    }
+
     fn inspect_executor_artifacts(
         &self,
         provider: ExecutorArtifactProviderId,
@@ -5778,38 +5925,47 @@ impl ExecutionProvider for CudaExecutionProvider {
         banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
     ) -> Result<ExecutorArtifactReport> {
         self.validate_artifact_provider(provider, executor)?;
-        let observed = self.ensure_observed_byte_session(executor, generation, logical_session)?;
-        let observed_recorder = observed
-            .as_ref()
-            .map(|observed| observed.persistent_recorder())
-            .transpose()
-            .map_err(|error| {
-                EpError::KernelFailed(format!(
-                    "cuda_ep: prepare observed-byte finalization context for executor {} \
-                     generation {}: {error}",
-                    executor.get(),
-                    generation.get()
-                ))
-            })?;
-        let _observed_use = observed_recorder
-            .as_ref()
-            .map(crate::byte_telemetry::ProductionByteRecorder::enter)
-            .transpose()
-            .map_err(|error| {
-                EpError::KernelFailed(format!(
-                    "cuda_ep: enter observed-byte finalization context for executor {} generation \
-                     {}: {error}",
-                    executor.get(),
-                    generation.get()
-                ))
-            })?;
-        let outcome =
-            self.route_telemetry_registry
-                .with_executor_scope(executor, generation, || {
+        let observation = {
+            let states = self
+                .route_executors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            states
+                .get(&executor)
+                .filter(|state| {
+                    state.observed_generation == Some(generation)
+                        && state.observed_logical_session == Some(logical_session)
+                })
+                .and_then(|state| state.observation.clone())
+        };
+        if self.observed_byte_capacity.is_some() && observation.is_none() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: executor {} generation {} logical session {} reached artifact \
+                 finalization without its prepared observation context",
+                executor.get(),
+                generation.get(),
+                logical_session.get()
+            )));
+        }
+        let mut outcome = None;
+        let mut finalize = || {
+            outcome = Some(self.route_telemetry_registry.with_executor_scope(
+                executor,
+                generation,
+                || {
                     self.finalize_route_residency_for_executor(
                         executor, generation, graph, readiness, banks,
                     )
-                })??;
+                },
+            )?);
+            Ok(())
+        };
+        match observation.as_ref() {
+            Some(observation) => observation.with_observation(&mut finalize)?,
+            None => finalize()?,
+        }
+        let outcome = outcome
+            .expect("provider artifact observation invokes route finalization exactly once")?;
         #[cfg(any(test, feature = "gpu-tests"))]
         if matches!(outcome, RouteArtifactFinalization::Required)
             && self
@@ -5842,7 +5998,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         logical_session: ExecutorLogicalSessionId,
     ) -> Result<Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>> {
         self.validate_artifact_provider(provider, executor)?;
-        let (active, observed) = {
+        let (active, observation) = {
             let states = self
                 .route_executors
                 .lock()
@@ -5856,18 +6012,30 @@ impl ExecutionProvider for CudaExecutionProvider {
                 .then(|| state.reservation_health.clone())
                 .flatten()
             });
-            let observed = state
+            let observation = state
                 .filter(|state| {
                     state.observed_generation == Some(generation)
                         && state.observed_logical_session == Some(logical_session)
                 })
-                .and_then(|state| state.observed_bytes.clone());
-            (active, observed)
+                .and_then(|state| state.observation.clone());
+            (active, observation)
         };
-        if self.observed_byte_capacity.is_some() && observed.is_none() {
+        if self.observed_byte_capacity.is_some() && observation.is_none() {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep: executor {} generation {} logical session {} has no matching \
-                 provider-owned observed-byte state",
+                 prepared provider-owned observation state",
+                executor.get(),
+                generation.get(),
+                logical_session.get()
+            )));
+        }
+        if observation
+            .as_ref()
+            .is_some_and(|observation| !observation.can_back_requirement())
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: executor {} generation {} logical session {} observation is not bound \
+                 to a successful artifact finalization",
                 executor.get(),
                 generation.get(),
                 logical_session.get()
@@ -5899,26 +6067,12 @@ impl ExecutionProvider for CudaExecutionProvider {
                 })
             })
             .transpose()?;
-        if route.is_none() && observed.is_none() {
+        if route.is_none() && observation.is_none() {
             return Ok(None);
         }
-        let recorder = observed
-            .as_ref()
-            .map(|observed| observed.persistent_recorder())
-            .transpose()
-            .map_err(|error| {
-                EpError::KernelFailed(format!(
-                    "cuda_ep: retain exact observed-byte recorder for executor {} generation {} \
-                     logical session {}: {error}",
-                    executor.get(),
-                    generation.get(),
-                    logical_session.get()
-                ))
-            })?;
         Ok(Some(Arc::new(CudaArtifactRequirement {
             route,
-            observed,
-            recorder,
+            observation,
         })))
     }
 
@@ -5986,7 +6140,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         logical_session: ExecutorLogicalSessionId,
     ) -> Result<()> {
         self.validate_artifact_provider(provider, executor)?;
-        if let Some(observed) = {
+        if let Some(observation) = {
             let states = self
                 .route_executors
                 .lock()
@@ -5994,11 +6148,11 @@ impl ExecutionProvider for CudaExecutionProvider {
             states.get(&executor).and_then(|state| {
                 (state.observed_generation == Some(generation)
                     && state.observed_logical_session == Some(logical_session))
-                .then(|| state.observed_bytes.clone())
+                .then(|| state.observation.clone())
                 .flatten()
             })
         } {
-            observed.retire();
+            observation.retire();
         } else if self.observed_byte_capacity.is_some() {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep: refusing to retire foreign or stale observed-byte scope executor {} \
@@ -6268,6 +6422,91 @@ mod tests {
 
     use crate::error::driver_err;
     use crate::test_support::EnvVarGuard;
+
+    fn host_observation(executor: u64) -> CudaArtifactObservation {
+        let ledger = Arc::new(
+            crate::byte_telemetry::ObservedByteLedger::new_for_runtime(
+                crate::byte_telemetry::ObservedScope {
+                    provider: 7,
+                    device: 0,
+                    executor,
+                    generation: executor + 10,
+                    logical_session: executor + 20,
+                },
+                executor + 100,
+                8,
+            )
+            .expect("host observation ledger"),
+        );
+        CudaArtifactObservation::new(ledger).expect("host observation state")
+    }
+
+    #[test]
+    fn observation_owner_uses_arc_identity_not_equal_public_labels() {
+        let exact: Arc<dyn std::any::Any + Send + Sync> = Arc::new([1_u64, 2, 3]);
+        let retained = Arc::clone(&exact);
+        let equal_labels: Arc<dyn std::any::Any + Send + Sync> = Arc::new([1_u64, 2, 3]);
+        assert!(exact_observation_owner_matches(
+            Some(&retained),
+            exact.as_ref()
+        ));
+        assert!(!exact_observation_owner_matches(
+            Some(&retained),
+            equal_labels.as_ref()
+        ));
+        assert!(!exact_observation_owner_matches(None, exact.as_ref()));
+    }
+
+    #[test]
+    fn prepared_observation_records_before_finalization_and_upgrades_in_place() {
+        let observation = host_observation(1);
+        assert!(!observation.can_back_requirement());
+        let mut operation = || {
+            let recorder = crate::byte_telemetry::current_recorder(101)
+                .expect("prepared observation is active");
+            recorder
+                .record(crate::byte_telemetry::EventSpec::new(
+                    crate::byte_telemetry::ObservedCategory::DeviceAllocation,
+                    crate::byte_telemetry::ObservedBoundary::RuntimeDeviceAllocate,
+                    crate::byte_telemetry::ObservedStatus::Committed,
+                    64,
+                ))
+                .map_err(|error| EpError::KernelFailed(error.to_string()))
+        };
+        observation
+            .with_observation(&mut operation)
+            .expect("record before finalization");
+        assert_eq!(
+            observation
+                .ledger
+                .snapshot()
+                .expect("prepared snapshot")
+                .bytes(
+                    crate::byte_telemetry::ObservedCategory::DeviceAllocation,
+                    crate::byte_telemetry::ObservedStatus::Committed,
+                ),
+            64
+        );
+
+        observation.finalize().expect("finalize exact observation");
+        assert!(observation.can_back_requirement());
+        observation.retire();
+        assert!(
+            observation.can_back_requirement(),
+            "retired successful state remains the exact stale-failing requirement"
+        );
+    }
+
+    #[test]
+    fn aborted_pre_finalization_observation_cannot_back_a_later_generation() {
+        let observation = host_observation(2);
+        observation.retire();
+        assert!(!observation.can_back_requirement());
+        let error = observation
+            .finalize()
+            .expect_err("aborted observation must not be revived");
+        assert!(error.to_string().contains("aborted"));
+    }
 
     #[test]
     fn paused_finalizer_cannot_publish_after_retirement_or_admission_replacement() {
