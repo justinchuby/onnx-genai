@@ -1011,6 +1011,12 @@ be narrower than the portable contract, but that limits only those backends.
 
 ### 12.2d Block-compressed attention records
 
+Schema v1.8 introduces the `compressed_attention` kind, its typed properties,
+and the `compressed_kv`, `compression_carry`, `index_key`, and `index_carry`
+roles. A document using any of that vocabulary **MUST** declare at least v1.8.
+Older declarations fail at the version boundary before typed parsing; unknown
+future versions fail closed. A package with no compressed state remains valid.
+
 Block-compressed attention has two distinct state disciplines. Record buffers
 append along an explicit per-layer record axis at a typed token-to-record ratio;
 compressor carries replace a fixed tensor after every step. They therefore
@@ -1023,6 +1029,15 @@ compressor carries replace a fixed tensor after every step. They therefore
 - carry groups use `update: replace`, omit `sequence_axis`, and use
   `compression_carry` plus the ratio-4-only `index_carry` role;
 - the paired groups repeat identical typed properties and cascade together.
+
+Every state cell declares its request batch axis through
+`contract.batch_layout`. Record groups additionally declare their record axis;
+the two axes must differ. Carry tensors have no token/record sequence axis and
+are atomic at rollback: rank-1 vectors and higher-rank carries are copied and
+restored wholesale, never prefix-sliced by a generic rank convention. A scalar
+rank-0 carry cannot be row-scoped and is rejected by schema validation.
+Non-contiguous carry storage is not supported by the root host snapshot ABI and
+is refused rather than copied with invented stride semantics.
 
 The record count at token length `L` is `floor(L / ratio)`. It is not a dense-KV
 token axis and must not be sized, rewound, or accounted as one. The runtime
@@ -1048,10 +1063,10 @@ its own symbolic record axis.
 Absent capability is a refusal, not emulation. The CPU native session supports
 present-to-past progression and full reset. It returns typed refusals for
 snapshot, rollback, fork, and non-zero rewind because the package declares none.
-Native CUDA likewise returns a typed device refusal: persistent compressed
-record state, cursor/capture integration, device snapshotting, and its governor
-ownership belong to stacked PR #2194, so this CPU base neither copies records
-through host fallback nor pretends they are rank-4 dense KV.
+Native CUDA likewise returns a public typed device refusal: persistent
+compressed record state, cursor/capture integration, device snapshotting, and
+its governor ownership belong to draft child #2339, so this CPU base neither
+copies records through host fallback nor pretends they are rank-4 dense KV.
 
 ### 12.3 Capabilities, cascade, fork, and reuse
 

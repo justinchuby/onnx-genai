@@ -71,11 +71,13 @@ pub use memory_authority::{
 };
 #[cfg(feature = "native-backend")]
 pub use native_decode::{
-    CompressedRecordStateInfo, CompressedStatePathStats, CompressedStateTensorPhase,
-    CompressedStateTransitionRefusal, CudaGraphDebugStats, CudaKvDebugStats,
-    NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES, NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS,
-    NativeDecodeCudaOptions, NativeDecodeDevice, NativeDecodeSession, NativeRecurrentSnapshot,
-    NativeStateOperation, NativeStateOperationRefusal,
+    CompressedRecordStateInfo, CompressedStateLoadRefusal, CompressedStatePathStats,
+    CompressedStateTensorPhase, CompressedStateTransitionRefusal, CudaGraphDebugStats,
+    CudaKvDebugStats, NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES,
+    NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS, NativeDecodeCudaOptions, NativeDecodeDevice,
+    NativeDecodeMetadataRefusal, NativeDecodeSession, NativeRecurrentSnapshot,
+    NativeStateOperation, NativeStateOperationRefusal, compressed_state_map_lookups,
+    native_cuda_provider_construction_attempts,
 };
 pub use onnx_genai_kv::{
     Applicability, CachePriority, KvDType, KvNotApplicable, KvTelemetry, KvTelemetrySnapshot,

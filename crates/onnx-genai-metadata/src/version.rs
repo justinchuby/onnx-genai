@@ -39,7 +39,7 @@ impl fmt::Display for SchemaVersion {
 pub const INITIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
 
 /// The newest version this build can read.
-pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 7);
+pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 8);
 
 /// The version that first carried encoder batching, padding, ownership levels,
 /// and the video preprocessing program.
@@ -67,11 +67,15 @@ pub const OUTPUT_PROTOCOL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 
 /// The version that made transaction-scoped publication visibility explicit.
 pub const PUBLICATION_MODE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 7);
 
+/// The version that introduced typed compressed-attention record/carry groups.
+pub const COMPRESSED_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 8);
+
 /// A serialized feature whose presence is bounded by one schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaFeature {
     OutputProtocols,
     PublicationMode,
+    CompressedStateGroups,
 }
 
 impl SchemaFeature {
@@ -79,6 +83,7 @@ impl SchemaFeature {
         match self {
             Self::OutputProtocols => OUTPUT_PROTOCOL_SCHEMA_VERSION,
             Self::PublicationMode => PUBLICATION_MODE_SCHEMA_VERSION,
+            Self::CompressedStateGroups => COMPRESSED_STATE_SCHEMA_VERSION,
         }
     }
 
@@ -89,6 +94,9 @@ impl SchemaFeature {
             }
             Self::PublicationMode => {
                 "workflow transaction publication mode and typed commit/abort reconciliation"
+            }
+            Self::CompressedStateGroups => {
+                "typed compressed-attention record/carry groups, roles, cadence, and formats"
             }
         }
     }
@@ -102,6 +110,10 @@ impl SchemaFeature {
             Self::PublicationMode => {
                 "Declare `publication_mode: commit_only` or \
                  `publication_mode: provisional_revisions`"
+            }
+            Self::CompressedStateGroups => {
+                "Declare compressed records and fixed carries as complete paired \
+                 `compressed_attention` groups"
             }
         }
     }
@@ -134,6 +146,13 @@ pub fn gate_feature_use(
              {required}. Remove `pipeline.workflow.publication_mode` to keep a pre-{required} \
              document, or upgrade `schema_version` to \"{required}\" and author a valid mode \
              (`commit_only` or `provisional_revisions`)"
+        )),
+        SchemaFeature::CompressedStateGroups => Err(format!(
+            "{path} is not legal in authored schema version {version}; {} require minimum schema \
+             version {required}. Remove the compressed-attention state declaration to retain \
+             legacy state semantics, or migrate/re-emit the package with `schema_version: \
+             \"{required}\"` and complete typed record/carry groups",
+            feature.description()
         )),
     }
 }
@@ -253,7 +272,7 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.7");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.8");
         assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
@@ -292,9 +311,9 @@ mod tests {
 
     #[test]
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
-        let error = gate(Some("1.8")).expect_err("1.8 is newer than this build");
+        let error = gate(Some("1.9")).expect_err("1.9 is newer than this build");
         assert!(
-            error.contains("declares inference-metadata schema version v1.8"),
+            error.contains("declares inference-metadata schema version v1.9"),
             "{error}"
         );
         assert!(
@@ -331,7 +350,11 @@ mod tests {
             gate(Some("1.6")).expect("1.6"),
             CANONICAL_SPECULATION_SCHEMA_VERSION
         );
-        assert_eq!(gate(Some("1.7")).expect("1.7"), SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(
+            gate(Some("1.7")).expect("1.7"),
+            PUBLICATION_MODE_SCHEMA_VERSION
+        );
+        assert_eq!(gate(Some("1.8")).expect("1.8"), SUPPORTED_SCHEMA_VERSION);
     }
 
     #[test]

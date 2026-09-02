@@ -450,6 +450,7 @@ pub(crate) fn kv_cache_bytes_per_sequence(
 ) -> anyhow::Result<u64> {
     let declared: std::collections::HashSet<&str> =
         present_to_past.values().map(String::as_str).collect();
+    let compressed_state_enabled = !compressed_records.is_empty();
     let mut tensors = Vec::new();
     for meta in session.inputs() {
         // Recurrent state is loop-carried too, and is charged separately at its
@@ -457,7 +458,7 @@ pub(crate) fn kv_cache_bytes_per_sequence(
         // magnitude -- its whole point is that it does not grow.
         if !declared.contains(meta.name.as_str())
             || is_recurrent_state_shape(&meta.shape)
-            || compressed_records.contains_past(&meta.name)
+            || (compressed_state_enabled && compressed_records.contains_past(&meta.name))
         {
             continue;
         }
@@ -646,6 +647,14 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 pub(crate) fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::Result<Tensor> {
+    if !tensor.layout.is_contiguous(&tensor.shape) {
+        bail!(
+            "native KV prefix slicing requires contiguous row-major storage, got layout {:?} for \
+             shape {:?}",
+            tensor.layout,
+            tensor.shape
+        );
+    }
     let axis_len = *tensor
         .shape
         .get(axis)

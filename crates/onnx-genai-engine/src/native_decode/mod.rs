@@ -30,7 +30,10 @@ mod kv_commit;
 mod load;
 mod paged_gqa;
 mod tensor;
-pub use csa::{CompressedStateTensorPhase, CompressedStateTransitionRefusal};
+pub use csa::{
+    CompressedStateLoadRefusal, CompressedStateTensorPhase, CompressedStateTransitionRefusal,
+    compressed_state_map_lookups,
+};
 #[cfg(feature = "native-cuda")]
 pub(crate) use tensor::recurrent_state_bytes_from_graph;
 #[cfg(test)]
@@ -52,6 +55,7 @@ pub(crate) fn configured_cuda_kv_max_len() -> anyhow::Result<Option<usize>> {
 }
 use io::*;
 pub(crate) use load::NativeDecodeLoadOptions;
+pub use load::{NativeDecodeMetadataRefusal, native_cuda_provider_construction_attempts};
 pub use paged_gqa::{
     GQA_PRESENT_ALLOCATIONS, PagedGqaConfig, flat_gqa_decode_step, gqa_present_allocations,
     paged_gqa_decode_step,
@@ -242,6 +246,9 @@ pub struct CompressedRecordStateInfo {
 /// allocation/transfer/synchronization counters for its positive proof.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompressedStatePathStats {
+    /// Hash-map probes made against the enabled compressed-state transition
+    /// index. A disabled plan owns no index, so this remains exactly zero.
+    pub state_map_lookups: u64,
     pub transitions_validated: u64,
     pub host_output_allocations: u64,
     pub host_output_bytes: u64,
@@ -398,13 +405,17 @@ impl NativeDecodeSession {
     }
 
     pub fn compressed_state_path_stats(&self) -> CompressedStatePathStats {
-        self.compressed_state_stats
+        CompressedStatePathStats {
+            state_map_lookups: self.compressed_state.map_lookups(),
+            ..self.compressed_state_stats
+        }
     }
 
     pub fn kv_layer_count(&self) -> usize {
+        let compressed_state_enabled = !self.compressed_state.is_empty();
         self.kv_inputs
             .iter()
-            .filter(|name| !self.compressed_state.contains_past(name))
+            .filter(|name| !compressed_state_enabled || !self.compressed_state.contains_past(name))
             .filter(|name| {
                 self.session
                     .inputs()
@@ -528,11 +539,14 @@ impl NativeDecodeSession {
         // Length-`past_len` batched past for every KV / recurrent-state input,
         // batch axis = N.
         for name in &self.kv_inputs {
-            let logical_len = self
-                .compressed_state
-                .record_for_past(name)
-                .map(|spec| past_len / spec.ratio.tokens_per_record())
-                .unwrap_or(past_len);
+            let logical_len = if self.compressed_state.is_empty() {
+                past_len
+            } else {
+                self.compressed_state
+                    .record_for_past(name)
+                    .map(|spec| past_len / spec.ratio.tokens_per_record())
+                    .unwrap_or(past_len)
+            };
             let tensor = make_past_input_tensor_batched(&self.session, name, batch, logical_len)?;
             owned.push((name.clone(), tensor));
         }
@@ -585,21 +599,6 @@ impl NativeDecodeSession {
             .collect()
     }
 
-    /// Past-input names of the CSA/HCA compressed-record buffers
-    /// (`past_compressed_kv.*`, `past_index_key.*`).
-    ///
-    /// Classified from typed canonical state roles and properties at load time,
-    /// not from tensor
-    /// shape: their growth axis is the backend-owned compressed-record cursor
-    /// (~tokens/ratio), so they are append-only but cannot be token-prefix-sliced
-    /// like a dense KV cache.
-    /// The fixed-size carries are excluded (they thread as recurrent
-    /// wholesale-swap state via [`Self::recurrent_past_names`]). Empty for a
-    /// graph with no CSA record state.
-    fn csa_record_past_names(&self) -> HashSet<String> {
-        self.compressed_state.past_names().cloned().collect()
-    }
-
     fn compressed_state_refusal(
         &self,
         operation: NativeStateOperation,
@@ -610,7 +609,7 @@ impl NativeDecodeSession {
         }
         let mut state_inputs = self
             .compressed_state
-            .past_names()
+            .state_past_names()
             .cloned()
             .collect::<Vec<_>>();
         state_inputs.sort();
@@ -727,7 +726,9 @@ impl NativeDecodeSession {
             );
         }
         let mut snapshot_names = self.recurrent_past_names();
-        snapshot_names.extend(self.compressed_state.state_past_names().cloned());
+        if !self.compressed_state.is_empty() {
+            snapshot_names.extend(self.compressed_state.state_past_names().cloned());
+        }
         let mut host = HashMap::with_capacity(snapshot_names.len());
         for name in &snapshot_names {
             let tensor = self.past.get(name).with_context(|| {

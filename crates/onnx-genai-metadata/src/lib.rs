@@ -11,8 +11,8 @@
 /// and semantic identities to say something no reader distinguishes.
 ///
 /// A package that uses a field a later version introduced states that later
-/// version instead, and must: see [`version`] and
-/// [`BATCHING_SCHEMA_VERSION`] / [`TOKEN_AUTHORITY_SCHEMA_VERSION`].
+/// version instead, and must: see [`version`] and its typed feature-floor
+/// constants, including [`COMPRESSED_STATE_SCHEMA_VERSION`].
 pub const SCHEMA_VERSION: &str = "v1";
 
 pub mod cache;
@@ -63,10 +63,10 @@ pub use validation::{
     PipelineValidationError, validate, validate_metadata, validate_pipeline_spec,
 };
 pub use version::{
-    BATCHING_SCHEMA_VERSION, CANONICAL_SPECULATION_SCHEMA_VERSION, DFLASH_SCHEMA_VERSION,
-    INITIAL_SCHEMA_VERSION, OUTPUT_PROTOCOL_SCHEMA_VERSION, PUBLICATION_MODE_SCHEMA_VERSION,
-    SUPPORTED_SCHEMA_VERSION, SchemaVersion, TOKEN_AUTHORITY_SCHEMA_VERSION,
-    TOOL_PROTOCOL_SCHEMA_VERSION,
+    BATCHING_SCHEMA_VERSION, CANONICAL_SPECULATION_SCHEMA_VERSION, COMPRESSED_STATE_SCHEMA_VERSION,
+    DFLASH_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION, OUTPUT_PROTOCOL_SCHEMA_VERSION,
+    PUBLICATION_MODE_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, SchemaVersion,
+    TOKEN_AUTHORITY_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

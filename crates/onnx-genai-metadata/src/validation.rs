@@ -167,6 +167,15 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
         ));
         return;
     }
+    if let Some(path) = compressed_state_schema_feature(metadata)
+        && let Err(error) = crate::version::gate_feature_use(
+            declared,
+            crate::version::SchemaFeature::CompressedStateGroups,
+            &path,
+        )
+    {
+        errors.push(error);
+    }
     validate_output_protocol_version(metadata, declared, errors);
     let has_special_tokens = metadata
         .package
@@ -185,6 +194,40 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
             crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION,
             crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION
         ));
+    }
+
+    fn compressed_state_schema_feature(metadata: &InferenceMetadata) -> Option<String> {
+        let groups = &metadata
+            .pipeline
+            .as_ref()?
+            .workflow
+            .serving
+            .as_ref()?
+            .state_service
+            .groups;
+        groups.iter().find_map(|(name, group)| {
+            let compressed = group.kind == crate::schema::StateKind::CompressedAttention
+                || matches!(
+                    group.properties,
+                    Some(crate::schema::StateGroupProperties::CompressedAttention { .. })
+                )
+                || group
+                    .ports
+                    .values()
+                    .flat_map(|ports| ports.values())
+                    .any(|alias| {
+                        matches!(
+                            alias.role,
+                            Some(
+                                crate::schema::StatePortRole::CompressedKv
+                                    | crate::schema::StatePortRole::CompressionCarry
+                                    | crate::schema::StatePortRole::IndexKey
+                                    | crate::schema::StatePortRole::IndexCarry
+                            )
+                        )
+                    });
+            compressed.then(|| format!("pipeline.workflow.serving.state_service.groups.{name}"))
+        })
     }
     let has_tool_protocol = metadata
         .package
@@ -2606,7 +2649,7 @@ fn validate_workflow(
                 );
             }
             validate_state_update(group_name, group, workflow, errors);
-            validate_state_group_properties(group_name, group, errors);
+            validate_state_group_properties(group_name, group, workflow, errors);
             validate_state_port_layers(group_name, group, errors);
             validate_attention_component_declares_sequence_role(
                 group_name, group, workflow, errors,
@@ -7575,6 +7618,7 @@ fn validate_scatter_control_ports(
 fn validate_state_group_properties(
     group_name: &str,
     group: &crate::schema::StateGroupContract,
+    workflow: &crate::schema::WorkflowSpec,
     errors: &mut Vec<String>,
 ) {
     use crate::schema::{
@@ -7635,6 +7679,33 @@ fn validate_state_group_properties(
                             "compressed-attention state group '{group_name}' cell '{cell}' must \
                              declare its layer index"
                         ));
+                    }
+                    if let Some(state) = workflow.state.get(cell) {
+                        let rank = state.contract.rank();
+                        let batch_axis = state.contract.batch_layout.request_axis();
+                        if rank == 0 {
+                            errors.push(format!(
+                                "compressed-attention state group '{group_name}' cell '{cell}' is \
+                                 scalar rank 0 and cannot carry row-scoped state; declare a \
+                                 request-aligned rank-1-or-higher tensor, or keep the scalar \
+                                 outside state_service"
+                            ));
+                        }
+                        if batch_axis.is_some_and(|axis| axis >= rank) {
+                            errors.push(format!(
+                                "compressed-attention state group '{group_name}' cell '{cell}' \
+                                 declares batch axis {batch_axis:?} outside rank {rank}"
+                            ));
+                        }
+                        if matches!(update, StateUpdate::Append)
+                            && batch_axis == group.sequence_axis
+                        {
+                            errors.push(format!(
+                                "compressed-attention state group '{group_name}' cell '{cell}' \
+                                 uses axis {batch_axis:?} for both request batch and record \
+                                 sequence; the axes must be distinct"
+                            ));
+                        }
                     }
                 }
             }

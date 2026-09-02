@@ -2,8 +2,12 @@ use super::kv_commit::KvCommitLayout;
 use super::*;
 #[cfg(feature = "native-cuda")]
 use onnx_genai_metadata::LoopStatePair;
-use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
-use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData};
+use onnx_genai_metadata::{
+    CompressedRecordFormat, CompressionRatio, CompressionRecurrence, DecoderAbi, DecoderStateGroup,
+    DecoderStatePort, KvOwnership, SequenceInputKind, StateAliasing, StateGroupCapabilities,
+    StateGroupProperties, StateKind, StatePortRole, StateUpdate,
+};
+use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData, static_shape};
 use prost::Message;
 use std::collections::BTreeMap;
 
@@ -3158,6 +3162,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
     let Some(model_dir) = qwen_cuda_smoke_model_dir() else {
         return Ok(());
     };
+    let compressed_lookups = compressed_state_map_lookups();
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))?;
     let prompt = tokenizer.encode("Hello")?;
     const HORIZON: usize = 64;
@@ -3191,7 +3196,12 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
 
     let mut cpu = NativeDecodeSession::load(model_dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
     let (cpu_tokens, _) = generate(&mut cpu)?;
+    assert_eq!(
+        cpu.compressed_state_path_stats(),
+        CompressedStatePathStats::default()
+    );
     drop(cpu);
+    assert_eq!(compressed_state_map_lookups(), compressed_lookups);
 
     let mut eager = NativeDecodeSession::load_with_cuda_options(
         model_dir.join("model.onnx"),
@@ -3213,7 +3223,12 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
     assert!(!eager_after.graph.enabled);
     assert_eq!(eager_after.graph.captures, 0);
     assert_eq!(eager_after.graph.replays, 0);
+    assert_eq!(
+        eager.compressed_state_path_stats(),
+        CompressedStatePathStats::default()
+    );
     drop(eager);
+    assert_eq!(compressed_state_map_lookups(), compressed_lookups);
 
     let mut captured = NativeDecodeSession::load_with_cuda_options(
         model_dir.join("model.onnx"),
@@ -3249,6 +3264,12 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
     assert_eq!(captured_after.graph.replays, HORIZON as u64 - 2);
     assert_eq!(captured_after.graph.fallbacks, 0);
     assert!(captured.cuda_graph_fallback_reason().is_none());
+    assert_eq!(
+        captured.compressed_state_path_stats(),
+        CompressedStatePathStats::default(),
+        "default-off first capture and warmed replay must perform zero compressed-state lookups \
+         or telemetry updates"
+    );
 
     let eager_us = eager_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;
     let captured_us = captured_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;
@@ -3272,6 +3293,12 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
         .decode(&vec![0; 129], 0)
         .expect_err("decode beyond configured KV capacity must fail");
     assert!(error.to_string().contains("CUDA KV capacity exceeded"));
+    drop(captured);
+    assert_eq!(
+        compressed_state_map_lookups(),
+        compressed_lookups,
+        "default-off capture/replay/rewind/teardown must perform zero compressed-state map lookups"
+    );
     Ok(())
 }
 
@@ -3904,12 +3931,145 @@ fn a_decoder_without_recurrent_layers_needs_no_recurrent_state() {
 fn a_decoder_without_compressed_state_records_zero_state_path_work() -> anyhow::Result<()> {
     let mut session =
         NativeDecodeSession::from_session_with_io(tiny_decoder(false), &tiny_decoder_io())?;
-    session.decode(&[1], 0)?;
+    session.decode(&[1, 2, 3], 0)?;
+    for token in [4, 5, 6] {
+        let past = session.current_len();
+        session.decode(&[token], past)?;
+    }
+    session.rewind(4)?;
+    session.reset()?;
     assert_eq!(
         session.compressed_state_path_stats(),
         CompressedStatePathStats::default(),
-        "default-off decode must perform no compressed-state validation or host materialization"
+        "absent-state prefill, warmed decode, rewind, and reset must perform no state lookup, \
+         validation, allocation, copy, synchronization, or telemetry update"
     );
+    Ok(())
+}
+
+fn low_rank_carry_plan(carry_shape: &[usize], aliasing: StateAliasing) -> csa::CompressedStatePlan {
+    let port = |role, input: &str, output: &str| DecoderStatePort {
+        role: Some(role),
+        layer: Some(0),
+        batch_axis: Some(0),
+        input: input.to_string(),
+        output: output.to_string(),
+    };
+    let properties = Some(StateGroupProperties::CompressedAttention {
+        ratio: CompressionRatio::Ratio128,
+        record_format: CompressedRecordFormat::F32,
+        recurrence: CompressionRecurrence::Standard,
+    });
+    let groups = [
+        DecoderStateGroup {
+            name: "records".to_string(),
+            kind: StateKind::CompressedAttention,
+            properties: properties.clone(),
+            sequence_axis: Some(2),
+            layout: "batch_feature_record".to_string(),
+            aliasing,
+            update: Some(StateUpdate::Append),
+            reuse: Default::default(),
+            capabilities: StateGroupCapabilities::default(),
+            ports: vec![port(
+                StatePortRole::CompressedKv,
+                "past_record",
+                "present_record",
+            )],
+        },
+        DecoderStateGroup {
+            name: "carries".to_string(),
+            kind: StateKind::CompressedAttention,
+            properties,
+            sequence_axis: None,
+            layout: "batch_carry".to_string(),
+            aliasing,
+            update: Some(StateUpdate::Replace),
+            reuse: Default::default(),
+            capabilities: StateGroupCapabilities::default(),
+            ports: vec![port(
+                StatePortRole::CompressionCarry,
+                "past_carry",
+                "present_carry",
+            )],
+        },
+    ];
+    let meta = |name: &str, shape: &[usize]| onnx_runtime_session::IoMeta {
+        name: name.to_string(),
+        dtype: DataType::Float32,
+        shape: static_shape(shape.iter().copied()),
+    };
+    csa::resolve_compressed_state(
+        &[
+            meta("past_record", &[1, 1, 0]),
+            meta("past_carry", carry_shape),
+        ],
+        &[
+            meta("present_record", &[1, 1, 0]),
+            meta("present_carry", carry_shape),
+        ],
+        &groups,
+    )
+    .expect("low-rank carry plan")
+}
+
+#[test]
+fn low_rank_carries_never_enter_token_prefix_slicing() -> anyhow::Result<()> {
+    for aliasing in [StateAliasing::Forbidden, StateAliasing::Permitted] {
+        for carry_shape in [vec![1], vec![1, 0], vec![1, 4], vec![1, 2, 1, 2]] {
+            let plan = low_rank_carry_plan(&carry_shape, aliasing);
+            let skip_names = plan.state_past_names().cloned().collect::<HashSet<_>>();
+            assert!(skip_names.contains("past_carry"));
+
+            let carry_values = (0..carry_shape.iter().product::<usize>())
+                .map(|index| 100.0 + index as f32)
+                .collect::<Vec<_>>();
+            let carry = Tensor::from_f32(&carry_shape, &carry_values)?;
+            let carry_bytes = carry.as_bytes().to_vec();
+            let carry_layout = carry.layout.clone();
+            let mut past = HashMap::from([
+                (
+                    "dense_kv".to_string(),
+                    Tensor::from_f32(&[1, 1, 4, 1], &[10.0, 20.0, 30.0, 40.0])?,
+                ),
+                ("past_carry".to_string(), carry),
+            ]);
+
+            for target in [1usize, 2, 3] {
+                let staged = backend::stage_host_prefix_rewind(&past, &skip_names, target)?;
+                assert_eq!(staged.len(), 1, "rank {carry_shape:?}, target {target}");
+                assert_eq!(staged[0].0, "dense_kv");
+                assert_eq!(staged[0].1.shape, vec![1, 1, target, 1]);
+                assert_eq!(
+                    staged[0].1.to_vec_f32(),
+                    [10.0, 20.0, 30.0][..target],
+                    "dense sequence prefix at target {target}"
+                );
+                let untouched = &past["past_carry"];
+                assert_eq!(untouched.shape, carry_shape);
+                assert_eq!(untouched.layout, carry_layout);
+                assert_eq!(untouched.as_bytes(), carry_bytes);
+            }
+
+            let snapshot = past["past_carry"].try_clone()?;
+            past.insert(
+                "past_carry".to_string(),
+                Tensor::from_f32(&carry_shape, &vec![999.0; carry_values.len()])?,
+            );
+            let staged = backend::stage_host_prefix_rewind(&past, &skip_names, 2)?;
+            for (name, tensor) in staged {
+                past.insert(name, tensor);
+            }
+            past.insert("past_carry".to_string(), snapshot);
+            assert_eq!(past["past_carry"].shape, carry_shape);
+            assert_eq!(past["past_carry"].layout, carry_layout);
+            assert_eq!(
+                past["past_carry"].as_bytes(),
+                carry_bytes,
+                "rollback/retry must restore the complete carry, never a prefix"
+            );
+        }
+    }
     Ok(())
 }
 

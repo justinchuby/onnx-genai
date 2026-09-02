@@ -8,6 +8,13 @@ use onnx_genai_metadata::{
 use onnx_runtime_ir::Dim;
 use onnx_runtime_session::{IoMeta, Tensor};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static COMPRESSED_STATE_MAP_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn compressed_state_map_lookups() -> u64 {
+    COMPRESSED_STATE_MAP_LOOKUPS.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RecordStateSpec {
@@ -17,6 +24,7 @@ pub(super) struct RecordStateSpec {
     pub input: String,
     pub output: String,
     pub ratio: CompressionRatio,
+    pub batch_axis: usize,
     pub sequence_axis: usize,
     pub dtype: DataType,
     rank: usize,
@@ -32,24 +40,41 @@ pub(super) struct CarryStateSpec {
     pub input: String,
     pub output: String,
     pub dtype: DataType,
+    batch_axis: usize,
     rank: usize,
-    non_batch_extents: Vec<usize>,
+    fixed_extents: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressedStateTransitionIndex {
+    Record(usize),
+    Carry(usize),
+}
+
+#[derive(Debug)]
+struct CompressedStateIndexes {
+    present: HashMap<String, CompressedStateTransitionIndex>,
+    record_past: HashMap<String, usize>,
+    state_past_names: HashSet<String>,
+    map_lookups: AtomicU64,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct CompressedStatePlan {
     records: Vec<RecordStateSpec>,
     carries: Vec<CarryStateSpec>,
-    present_index: HashMap<String, usize>,
-    carry_present_index: HashMap<String, usize>,
-    past_index: HashMap<String, usize>,
-    state_past_names: HashSet<String>,
+    indexes: Option<CompressedStateIndexes>,
     required_aliasing_groups: Vec<String>,
+}
+
+pub(super) enum CompressedStateTransitionSpec<'a> {
+    Record(&'a RecordStateSpec),
+    Carry(&'a CarryStateSpec),
 }
 
 impl CompressedStatePlan {
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.indexes.is_none()
     }
 
     pub fn len(&self) -> usize {
@@ -60,32 +85,61 @@ impl CompressedStatePlan {
         self.records.iter()
     }
 
-    pub fn record_for_present(&self, present: &str) -> Option<&RecordStateSpec> {
-        self.present_index
-            .get(present)
-            .map(|&index| &self.records[index])
+    pub fn transition_for_present(
+        &self,
+        present: &str,
+    ) -> Option<CompressedStateTransitionSpec<'_>> {
+        let indexes = self.indexes.as_ref()?;
+        indexes.map_lookups.fetch_add(1, Ordering::Relaxed);
+        COMPRESSED_STATE_MAP_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        match indexes.present.get(present)? {
+            CompressedStateTransitionIndex::Record(index) => {
+                Some(CompressedStateTransitionSpec::Record(&self.records[*index]))
+            }
+            CompressedStateTransitionIndex::Carry(index) => {
+                Some(CompressedStateTransitionSpec::Carry(&self.carries[*index]))
+            }
+        }
     }
 
     pub fn record_for_past(&self, past: &str) -> Option<&RecordStateSpec> {
-        self.past_index.get(past).map(|&index| &self.records[index])
+        let indexes = self.indexes.as_ref()?;
+        indexes.map_lookups.fetch_add(1, Ordering::Relaxed);
+        COMPRESSED_STATE_MAP_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        indexes
+            .record_past
+            .get(past)
+            .map(|&index| &self.records[index])
     }
 
+    #[cfg(test)]
     pub fn carry_for_present(&self, present: &str) -> Option<&CarryStateSpec> {
-        self.carry_present_index
-            .get(present)
-            .map(|&index| &self.carries[index])
+        match self.transition_for_present(present) {
+            Some(CompressedStateTransitionSpec::Carry(spec)) => Some(spec),
+            Some(CompressedStateTransitionSpec::Record(_)) | None => None,
+        }
     }
 
     pub fn contains_past(&self, past: &str) -> bool {
-        self.past_index.contains_key(past)
-    }
-
-    pub fn past_names(&self) -> impl Iterator<Item = &String> {
-        self.past_index.keys()
+        let Some(indexes) = &self.indexes else {
+            return false;
+        };
+        indexes.map_lookups.fetch_add(1, Ordering::Relaxed);
+        COMPRESSED_STATE_MAP_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        indexes.record_past.contains_key(past)
     }
 
     pub fn state_past_names(&self) -> impl Iterator<Item = &String> {
-        self.state_past_names.iter()
+        self.indexes
+            .iter()
+            .flat_map(|indexes| indexes.state_past_names.iter())
+    }
+
+    pub fn map_lookups(&self) -> u64 {
+        self.indexes
+            .as_ref()
+            .map(|indexes| indexes.map_lookups.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     pub fn required_aliasing_groups(&self) -> &[String] {
@@ -125,6 +179,7 @@ pub enum CompressedStateLoadRefusal {
         actual: DataType,
     },
     InvalidSequenceAxis(String),
+    InvalidBatchAxis(String),
     InvalidRecordLayout(String),
     PairingMismatch {
         group: String,
@@ -175,6 +230,7 @@ impl std::fmt::Display for CompressedStateLoadRefusal {
                 formatter,
                 "compressed-attention record group '{group}' must declare a valid sequence_axis"
             ),
+            Self::InvalidBatchAxis(message) => formatter.write_str(message),
             Self::InvalidRecordLayout(message) => formatter.write_str(message),
             Self::PairingMismatch {
                 group,
@@ -265,6 +321,13 @@ pub enum CompressedStateTransitionRefusal {
         port: String,
         expected: Vec<usize>,
         actual: Vec<usize>,
+    },
+    NonContiguousLayout {
+        group: String,
+        layer: usize,
+        role: StatePortRole,
+        phase: CompressedStateTensorPhase,
+        port: String,
     },
     CursorMismatch {
         group: String,
@@ -364,6 +427,20 @@ impl std::fmt::Display for CompressedStateTransitionRefusal {
                  '{port}' has shape {actual:?}, expected {expected:?}",
                 role_name(*role)
             ),
+            Self::NonContiguousLayout {
+                group,
+                layer,
+                role,
+                phase,
+                port,
+            } => write!(
+                formatter,
+                "compressed-attention group '{group}' layer {layer} role '{}' {phase} port \
+                 '{port}' is non-contiguous; root native state snapshot/restore copies exact \
+                 contiguous tensor bytes and refuses strided state rather than truncating or \
+                 reinterpreting strides",
+                role_name(*role)
+            ),
             Self::CursorMismatch {
                 group,
                 layer,
@@ -436,6 +513,7 @@ fn record_layout(
     group: &str,
     input: &IoMeta,
     output: &IoMeta,
+    batch_axis: usize,
     sequence_axis: usize,
 ) -> anyhow::Result<(Vec<(usize, usize)>, usize)> {
     if input.shape.len() != output.shape.len() || input.shape.len() < 3 {
@@ -447,6 +525,19 @@ fn record_layout(
             )),
         ));
     }
+    match (input.shape[batch_axis], output.shape[batch_axis]) {
+        (Dim::Symbolic(_), Dim::Symbolic(_)) => {}
+        (Dim::Static(past), Dim::Static(present)) if past == present => {}
+        (past, present) => {
+            return Err(anyhow::Error::new(
+                CompressedStateLoadRefusal::InvalidBatchAxis(format!(
+                    "compressed-attention record group '{group}' batch axis {batch_axis} must \
+                     preserve one batch extent across '{}' and '{}', got {past:?} and {present:?}",
+                    input.name, output.name
+                )),
+            ));
+        }
+    }
     let mut record_extents = Vec::with_capacity(input.shape.len().saturating_sub(2));
     let mut record_elements = 1_usize;
     for (axis, (past, present)) in input
@@ -456,12 +547,11 @@ fn record_layout(
         .zip(output.shape.iter().copied())
         .enumerate()
     {
-        if axis == sequence_axis {
+        if axis == batch_axis || axis == sequence_axis {
             continue;
         }
         let extent = match (past, present) {
             (Dim::Static(past), Dim::Static(present)) if past == present => Some(past),
-            (Dim::Symbolic(_), Dim::Symbolic(_)) if axis == 0 => None,
             _ => {
                 return Err(anyhow::Error::new(
                     CompressedStateLoadRefusal::InvalidRecordLayout(format!(
@@ -472,15 +562,13 @@ fn record_layout(
                 ));
             }
         };
-        if axis != 0 {
-            let extent = extent.expect("non-batch record extents are static");
-            record_extents.push((axis, extent));
-            record_elements = record_elements.checked_mul(extent).ok_or_else(|| {
-                anyhow::Error::new(CompressedStateLoadRefusal::InvalidRecordLayout(format!(
-                    "compressed-attention record group '{group}' record width overflows usize"
-                )))
-            })?;
-        }
+        let extent = extent.expect("record extents exclude batch and sequence axes");
+        record_extents.push((axis, extent));
+        record_elements = record_elements.checked_mul(extent).ok_or_else(|| {
+            anyhow::Error::new(CompressedStateLoadRefusal::InvalidRecordLayout(format!(
+                "compressed-attention record group '{group}' record width overflows usize"
+            )))
+        })?;
     }
     let record_width_bytes = input
         .dtype
@@ -495,17 +583,33 @@ fn record_layout(
     Ok((record_extents, record_width_bytes))
 }
 
-fn carry_layout(group: &str, input: &IoMeta, output: &IoMeta) -> anyhow::Result<Vec<usize>> {
-    if input.shape.len() != output.shape.len() || input.shape.is_empty() {
+fn carry_layout(
+    group: &str,
+    input: &IoMeta,
+    output: &IoMeta,
+    batch_axis: usize,
+) -> anyhow::Result<Vec<(usize, usize)>> {
+    if input.shape.len() != output.shape.len() {
         return Err(anyhow::Error::new(
             CompressedStateLoadRefusal::InvalidRecordLayout(format!(
-                "compressed-attention carry group '{group}' requires matching nonzero \
-                 input/output rank, got {:?} and {:?}",
+                "compressed-attention carry group '{group}' requires matching input/output rank, \
+                 got {:?} and {:?}",
                 input.shape, output.shape
             )),
         ));
     }
-    let mut non_batch_extents = Vec::with_capacity(input.shape.len().saturating_sub(1));
+    if input.shape.is_empty() || batch_axis >= input.shape.len() {
+        return Err(anyhow::Error::new(
+            CompressedStateLoadRefusal::InvalidBatchAxis(format!(
+                "compressed-attention carry group '{group}' requires a declared request-batch \
+                 axis within its non-scalar input/output rank, got batch axis {batch_axis} for \
+                 shapes {:?} and {:?}. Scalar carries are not row-scoped and must be rejected by \
+                 metadata validation",
+                input.shape, output.shape
+            )),
+        ));
+    }
+    let mut fixed_extents = Vec::with_capacity(input.shape.len().saturating_sub(1));
     for (axis, (past, present)) in input
         .shape
         .iter()
@@ -513,24 +617,25 @@ fn carry_layout(group: &str, input: &IoMeta, output: &IoMeta) -> anyhow::Result<
         .zip(output.shape.iter().copied())
         .enumerate()
     {
-        match (axis, past, present) {
-            (0, Dim::Symbolic(_), Dim::Symbolic(_)) => {}
-            (0, Dim::Static(past), Dim::Static(present)) if past == present => {}
-            (_, Dim::Static(past), Dim::Static(present)) if past == present => {
-                non_batch_extents.push(past);
+        match (axis == batch_axis, past, present) {
+            (true, Dim::Symbolic(_), Dim::Symbolic(_)) => {}
+            (true, Dim::Static(past), Dim::Static(present)) if past == present => {}
+            (false, Dim::Static(past), Dim::Static(present)) if past == present => {
+                fixed_extents.push((axis, past));
             }
             _ => {
                 return Err(anyhow::Error::new(
                     CompressedStateLoadRefusal::InvalidRecordLayout(format!(
                         "compressed-attention carry group '{group}' axis {axis} must preserve one \
-                         fixed extent across '{}' and '{}', got {past:?} and {present:?}",
+                         fixed extent across '{}' and '{}', got {past:?} and {present:?}; only \
+                         declared batch axis {batch_axis} may be dynamic",
                         input.name, output.name
                     )),
                 ));
             }
         }
     }
-    Ok(non_batch_extents)
+    Ok(fixed_extents)
 }
 
 pub(super) fn resolve_compressed_state(
@@ -548,6 +653,9 @@ pub(super) fn resolve_compressed_state(
     let mut plan = CompressedStatePlan::default();
     let mut occupied = HashSet::new();
     let mut layers: BTreeMap<usize, LayerEntry> = BTreeMap::new();
+    let mut present_index = HashMap::new();
+    let mut record_past_index = HashMap::new();
+    let mut state_past_names = HashSet::new();
 
     for group in groups
         .iter()
@@ -631,6 +739,17 @@ pub(super) fn resolve_compressed_state(
                     ),
                 )));
             };
+            let Some(batch_axis) = port.batch_axis else {
+                return Err(anyhow::Error::new(
+                    CompressedStateLoadRefusal::InvalidBatchAxis(format!(
+                        "compressed-attention state group '{}' role '{}' has no request-batch \
+                         axis; declare a request_aligned batch_layout on its canonical workflow \
+                         state cell",
+                        group.name,
+                        role_name(role)
+                    )),
+                ));
+            };
             let properties = (ratio, record_format, recurrence);
             let layer_entry = layers
                 .entry(layer)
@@ -692,21 +811,33 @@ pub(super) fn resolve_compressed_state(
                     ));
                 }
             }
-            plan.state_past_names.insert(port.input.clone());
+            state_past_names.insert(port.input.clone());
 
             if is_record {
                 let Some(axis) = group.sequence_axis.filter(|axis| {
-                    *axis < input.shape.len() && *axis < output.shape.len() && *axis != 0
+                    *axis < input.shape.len() && *axis < output.shape.len() && *axis != batch_axis
                 }) else {
                     return Err(anyhow::Error::new(
                         CompressedStateLoadRefusal::InvalidSequenceAxis(group.name.clone()),
                     ));
                 };
+                if batch_axis >= input.shape.len() || batch_axis >= output.shape.len() {
+                    return Err(anyhow::Error::new(
+                        CompressedStateLoadRefusal::InvalidBatchAxis(format!(
+                            "compressed-attention record group '{}' declares batch axis \
+                             {batch_axis} outside input/output shapes {:?} and {:?}",
+                            group.name, input.shape, output.shape
+                        )),
+                    ));
+                }
                 let (record_extents, record_width_bytes) =
-                    record_layout(&group.name, input, output, axis)?;
+                    record_layout(&group.name, input, output, batch_axis, axis)?;
                 let index = plan.records.len();
-                plan.present_index.insert(port.output.clone(), index);
-                plan.past_index.insert(port.input.clone(), index);
+                present_index.insert(
+                    port.output.clone(),
+                    CompressedStateTransitionIndex::Record(index),
+                );
+                record_past_index.insert(port.input.clone(), index);
                 plan.records.push(RecordStateSpec {
                     group: group.name.clone(),
                     layer,
@@ -714,6 +845,7 @@ pub(super) fn resolve_compressed_state(
                     input: port.input.clone(),
                     output: port.output.clone(),
                     ratio,
+                    batch_axis,
                     sequence_axis: axis,
                     dtype: expected,
                     rank: input.shape.len(),
@@ -721,9 +853,12 @@ pub(super) fn resolve_compressed_state(
                     record_width_bytes,
                 });
             } else {
-                let non_batch_extents = carry_layout(&group.name, input, output)?;
+                let fixed_extents = carry_layout(&group.name, input, output, batch_axis)?;
                 let index = plan.carries.len();
-                plan.carry_present_index.insert(port.output.clone(), index);
+                present_index.insert(
+                    port.output.clone(),
+                    CompressedStateTransitionIndex::Carry(index),
+                );
                 plan.carries.push(CarryStateSpec {
                     group: group.name.clone(),
                     layer,
@@ -731,8 +866,9 @@ pub(super) fn resolve_compressed_state(
                     input: port.input.clone(),
                     output: port.output.clone(),
                     dtype: expected,
+                    batch_axis,
                     rank: input.shape.len(),
-                    non_batch_extents,
+                    fixed_extents,
                 });
             }
         }
@@ -769,6 +905,14 @@ pub(super) fn resolve_compressed_state(
             )));
         }
     }
+    if !plan.records.is_empty() || !plan.carries.is_empty() {
+        plan.indexes = Some(CompressedStateIndexes {
+            present: present_index,
+            record_past: record_past_index,
+            state_past_names,
+            map_lookups: AtomicU64::new(0),
+        });
+    }
     Ok(plan)
 }
 
@@ -776,6 +920,7 @@ pub(super) fn resolve_compressed_state(
 pub(super) struct RecordTensorFacts<'a> {
     dtype: DataType,
     shape: &'a [usize],
+    contiguous: bool,
 }
 
 impl<'a> From<&'a Tensor> for RecordTensorFacts<'a> {
@@ -783,6 +928,7 @@ impl<'a> From<&'a Tensor> for RecordTensorFacts<'a> {
         Self {
             dtype: tensor.dtype,
             shape: &tensor.shape,
+            contiguous: tensor.layout.is_contiguous(&tensor.shape),
         }
     }
 }
@@ -817,7 +963,16 @@ fn validate_tensor_contract(
             actual: tensor.shape.len(),
         });
     }
-    if tensor.shape[0] != batch {
+    if !tensor.contiguous {
+        return refusal(CompressedStateTransitionRefusal::NonContiguousLayout {
+            group: spec.group.clone(),
+            layer: spec.layer,
+            role: spec.role,
+            phase,
+            port: port.to_string(),
+        });
+    }
+    if tensor.shape[spec.batch_axis] != batch {
         return refusal(CompressedStateTransitionRefusal::BatchMismatch {
             group: spec.group.clone(),
             layer: spec.layer,
@@ -825,7 +980,7 @@ fn validate_tensor_contract(
             phase,
             port: port.to_string(),
             expected: batch,
-            actual: tensor.shape[0],
+            actual: tensor.shape[spec.batch_axis],
         });
     }
     let mut actual = tensor
@@ -833,7 +988,7 @@ fn validate_tensor_contract(
         .iter()
         .copied()
         .enumerate()
-        .filter(|(axis, _)| *axis != 0 && *axis != spec.sequence_axis);
+        .filter(|(axis, _)| *axis != spec.batch_axis && *axis != spec.sequence_axis);
     let mut record_elements = 1_usize;
     let mut layout_matches = true;
     for expected in &spec.record_extents {
@@ -855,7 +1010,7 @@ fn validate_tensor_contract(
             .iter()
             .copied()
             .enumerate()
-            .filter(|(axis, _)| *axis != 0 && *axis != spec.sequence_axis)
+            .filter(|(axis, _)| *axis != spec.batch_axis && *axis != spec.sequence_axis)
             .collect();
         return refusal(CompressedStateTransitionRefusal::RecordLayoutMismatch {
             group: spec.group.clone(),
@@ -975,7 +1130,18 @@ fn validate_carry_tensor_contract(
             },
         ));
     }
-    if tensor.shape[0] != batch {
+    if !tensor.contiguous {
+        return Err(anyhow::Error::new(
+            CompressedStateTransitionRefusal::NonContiguousLayout {
+                group: spec.group.clone(),
+                layer: spec.layer,
+                role: spec.role,
+                phase,
+                port: port.to_string(),
+            },
+        ));
+    }
+    if tensor.shape[spec.batch_axis] != batch {
         return Err(anyhow::Error::new(
             CompressedStateTransitionRefusal::BatchMismatch {
                 group: spec.group.clone(),
@@ -984,14 +1150,20 @@ fn validate_carry_tensor_contract(
                 phase,
                 port: port.to_string(),
                 expected: batch,
-                actual: tensor.shape[0],
+                actual: tensor.shape[spec.batch_axis],
             },
         ));
     }
-    if tensor.shape[1..] != spec.non_batch_extents {
-        let mut expected = Vec::with_capacity(spec.rank);
-        expected.push(batch);
-        expected.extend_from_slice(&spec.non_batch_extents);
+    let layout_matches = spec
+        .fixed_extents
+        .iter()
+        .all(|&(axis, extent)| tensor.shape[axis] == extent);
+    if !layout_matches {
+        let mut expected = tensor.shape.to_vec();
+        expected[spec.batch_axis] = batch;
+        for &(axis, extent) in &spec.fixed_extents {
+            expected[axis] = extent;
+        }
         return Err(anyhow::Error::new(
             CompressedStateTransitionRefusal::CarryLayoutMismatch {
                 group: spec.group.clone(),
@@ -1060,6 +1232,14 @@ mod tests {
         }
     }
 
+    fn meta_dims(name: &str, dtype: DataType, shape: Vec<Dim>) -> IoMeta {
+        IoMeta {
+            name: name.to_string(),
+            dtype,
+            shape,
+        }
+    }
+
     fn group(
         name: &str,
         ratio: CompressionRatio,
@@ -1091,6 +1271,7 @@ mod tests {
                 .map(|(role, input, output)| DecoderStatePort {
                     role: Some(role),
                     layer: Some(0),
+                    batch_axis: Some(0),
                     input: input.to_string(),
                     output: output.to_string(),
                 })
@@ -1191,7 +1372,11 @@ mod tests {
     }
 
     fn facts(dtype: DataType, shape: &[usize]) -> RecordTensorFacts<'_> {
-        RecordTensorFacts { dtype, shape }
+        RecordTensorFacts {
+            dtype,
+            shape,
+            contiguous: true,
+        }
     }
 
     fn ratio128_spec() -> RecordStateSpec {
@@ -1474,6 +1659,230 @@ mod tests {
                     ))
             );
         }
+    }
+
+    #[test]
+    fn rank_zero_carry_is_rejected_as_non_row_scoped_state() {
+        let mut carries = group(
+            "carries",
+            CompressionRatio::Ratio128,
+            CompressedRecordFormat::F32,
+            StateUpdate::Replace,
+            vec![(
+                StatePortRole::CompressionCarry,
+                "past_carry",
+                "present_carry",
+            )],
+        );
+        carries.ports[0].batch_axis = None;
+        let error = resolve_compressed_state(
+            &[
+                meta("past_kv", DataType::Float32, &[1, 0, 8]),
+                meta("past_carry", DataType::Float32, &[]),
+            ],
+            &[
+                meta("present_kv", DataType::Float32, &[1, 0, 8]),
+                meta("present_carry", DataType::Float32, &[]),
+            ],
+            &[
+                group(
+                    "records",
+                    CompressionRatio::Ratio128,
+                    CompressedRecordFormat::F32,
+                    StateUpdate::Append,
+                    vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
+                ),
+                carries,
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<CompressedStateLoadRefusal>()
+                .is_some_and(|reason| matches!(
+                    reason,
+                    CompressedStateLoadRefusal::InvalidBatchAxis(message)
+                        if message.contains("request-batch axis")
+                )),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn rank_one_and_zero_extent_rank_two_carries_are_atomic_shapes() {
+        for shape in [vec![1], vec![1, 0]] {
+            let plan = resolve_compressed_state(
+                &[
+                    meta("past_kv", DataType::Float32, &[1, 0, 8]),
+                    meta("past_carry", DataType::Float32, &shape),
+                ],
+                &[
+                    meta("present_kv", DataType::Float32, &[1, 0, 8]),
+                    meta("present_carry", DataType::Float32, &shape),
+                ],
+                &[
+                    group(
+                        "records",
+                        CompressionRatio::Ratio128,
+                        CompressedRecordFormat::F32,
+                        StateUpdate::Append,
+                        vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
+                    ),
+                    group(
+                        "carries",
+                        CompressionRatio::Ratio128,
+                        CompressedRecordFormat::F32,
+                        StateUpdate::Replace,
+                        vec![(
+                            StatePortRole::CompressionCarry,
+                            "past_carry",
+                            "present_carry",
+                        )],
+                    ),
+                ],
+            )
+            .unwrap();
+            let spec = plan.carry_for_present("present_carry").unwrap();
+            validate_carry_transition(
+                spec,
+                facts(DataType::Float32, &shape),
+                facts(DataType::Float32, &shape),
+                1,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn dynamic_batch_and_record_axes_follow_declared_axis_numbers() {
+        let batch = SymbolId(41);
+        let records = SymbolId(42);
+        let mut record_group = group(
+            "records",
+            CompressionRatio::Ratio128,
+            CompressedRecordFormat::F32,
+            StateUpdate::Append,
+            vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
+        );
+        record_group.sequence_axis = Some(2);
+        record_group.ports[0].batch_axis = Some(1);
+        let mut carry_group = group(
+            "carries",
+            CompressionRatio::Ratio128,
+            CompressedRecordFormat::F32,
+            StateUpdate::Replace,
+            vec![(
+                StatePortRole::CompressionCarry,
+                "past_carry",
+                "present_carry",
+            )],
+        );
+        carry_group.ports[0].batch_axis = Some(1);
+        let plan = resolve_compressed_state(
+            &[
+                meta_dims(
+                    "past_kv",
+                    DataType::Float32,
+                    vec![Dim::Static(8), Dim::Symbolic(batch), Dim::Symbolic(records)],
+                ),
+                meta_dims(
+                    "past_carry",
+                    DataType::Float32,
+                    vec![Dim::Static(3), Dim::Symbolic(batch)],
+                ),
+            ],
+            &[
+                meta_dims(
+                    "present_kv",
+                    DataType::Float32,
+                    vec![Dim::Static(8), Dim::Symbolic(batch), Dim::Symbolic(records)],
+                ),
+                meta_dims(
+                    "present_carry",
+                    DataType::Float32,
+                    vec![Dim::Static(3), Dim::Symbolic(batch)],
+                ),
+            ],
+            &[record_group, carry_group],
+        )
+        .unwrap();
+        let record = plan.records().next().unwrap();
+        validate_record_transition(
+            record,
+            facts(DataType::Float32, &[8, 2, 0]),
+            facts(DataType::Float32, &[8, 2, 1]),
+            0,
+            128,
+            2,
+        )
+        .unwrap();
+        let carry = plan.carry_for_present("present_carry").unwrap();
+        validate_carry_transition(
+            carry,
+            facts(DataType::Float32, &[3, 2]),
+            facts(DataType::Float32, &[3, 2]),
+            2,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn non_contiguous_carry_is_a_typed_refusal() {
+        let plan = resolve_compressed_state(
+            &[
+                meta("past_kv", DataType::Float32, &[1, 0, 8]),
+                meta("past_carry", DataType::Float32, &[1, 3]),
+            ],
+            &[
+                meta("present_kv", DataType::Float32, &[1, 0, 8]),
+                meta("present_carry", DataType::Float32, &[1, 3]),
+            ],
+            &[
+                group(
+                    "records",
+                    CompressionRatio::Ratio128,
+                    CompressedRecordFormat::F32,
+                    StateUpdate::Append,
+                    vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
+                ),
+                group(
+                    "carries",
+                    CompressionRatio::Ratio128,
+                    CompressedRecordFormat::F32,
+                    StateUpdate::Replace,
+                    vec![(
+                        StatePortRole::CompressionCarry,
+                        "past_carry",
+                        "present_carry",
+                    )],
+                ),
+            ],
+        )
+        .unwrap();
+        let spec = plan.carry_for_present("present_carry").unwrap();
+        let error = validate_carry_transition(
+            spec,
+            RecordTensorFacts {
+                dtype: DataType::Float32,
+                shape: &[1, 3],
+                contiguous: false,
+            },
+            facts(DataType::Float32, &[1, 3]),
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<CompressedStateTransitionRefusal>()
+                .is_some_and(|reason| matches!(
+                    reason,
+                    CompressedStateTransitionRefusal::NonContiguousLayout {
+                        phase: CompressedStateTensorPhase::Past,
+                        ..
+                    }
+                )),
+            "{error:#}"
+        );
     }
 
     #[test]

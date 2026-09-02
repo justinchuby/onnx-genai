@@ -277,6 +277,11 @@ fn rebuilding_each_package_reproduces_its_abi() {
             )
         });
         let mut rebuilt_metadata = onnx_genai_metadata::schema::InferenceMetadata::default();
+        if !expected_compressed.is_empty() {
+            rebuilt_metadata.schema_version =
+                Some(onnx_genai_metadata::COMPRESSED_STATE_SCHEMA_VERSION.to_string());
+            rebuilt_metadata.package = metadata.package.clone();
+        }
         rebuilt_metadata.pipeline = Some(onnx_genai_metadata::schema::PipelineSpec {
             workflow: reemitted,
         });

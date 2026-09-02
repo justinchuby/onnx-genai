@@ -4,6 +4,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
+    publication_mode: commit_only
     inputs:
       application.attention_mask:
         contract:
@@ -905,7 +906,7 @@ pipeline:
         next: body.accepted_len
       - cell: sequence
         next: step.token
-schema_version: v1.5
+schema_version: v1.8
 package:
   tokenizer:
     algorithm: bpe

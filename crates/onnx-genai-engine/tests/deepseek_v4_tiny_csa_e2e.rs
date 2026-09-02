@@ -7,9 +7,17 @@ use onnx_genai_engine::{
     CompressedRecordStateInfo, NativeDecodeDevice, NativeDecodeSession, NativeStateOperation,
     NativeStateOperationRefusal,
 };
+#[cfg(feature = "native-cuda")]
+use onnx_genai_engine::{
+    CompressedStateLoadRefusal, NativeDecodeMetadataRefusal,
+    native_cuda_provider_construction_attempts,
+};
 use onnx_genai_metadata::{CompressionRatio, StateGroupProperties, StateKind, StatePortRole};
 use onnx_runtime_ir::DataType;
 use onnx_runtime_memory_governor::Tier;
+
+#[cfg(feature = "native-cuda")]
+static CUDA_METADATA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn fixture_dir() -> PathBuf {
     let dir = std::env::var_os("DEEPSEEK_V4_TINY_CSA_E2E_DIR")
@@ -29,6 +37,47 @@ fn fixture_dir() -> PathBuf {
         "the fixture must use the repository-governed textproto representation"
     );
     dir
+}
+
+#[cfg(feature = "native-cuda")]
+struct ScratchFixture(PathBuf);
+
+#[cfg(feature = "native-cuda")]
+impl ScratchFixture {
+    fn model(&self) -> PathBuf {
+        self.0.join("model.onnx.textproto")
+    }
+}
+
+#[cfg(feature = "native-cuda")]
+impl Drop for ScratchFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(feature = "native-cuda")]
+fn scratch_fixture(label: &str, metadata: Option<&str>) -> ScratchFixture {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    let dir = target
+        .join("pr2063-native-metadata")
+        .join(format!("{}-{label}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("remove stale scratch fixture");
+    }
+    std::fs::create_dir_all(&dir).expect("create scratch fixture");
+    std::fs::copy(
+        fixture_dir().join("model.onnx.textproto"),
+        dir.join("model.onnx.textproto"),
+    )
+    .expect("copy textproto model");
+    if let Some(metadata) = metadata {
+        std::fs::write(dir.join("inference_metadata.yaml"), metadata)
+            .expect("write scratch metadata");
+    }
+    ScratchFixture(dir)
 }
 
 fn build_cpu_session(dir: &Path) -> NativeDecodeSession {
@@ -137,6 +186,10 @@ fn cpu_prefill_and_16_decode_steps_advance_real_record_state() {
             && entry.records == 0
     }));
     let stats = session.compressed_state_path_stats();
+    assert!(
+        stats.state_map_lookups > 0,
+        "enabled compressed-state decode must exercise the production transition index"
+    );
     assert_eq!(stats.transitions_validated, 17 * 6);
     assert_eq!(stats.host_output_allocations, 17 * 6);
     assert_eq!(
@@ -358,8 +411,12 @@ fn failed_step_retry_and_reset_do_not_reuse_stale_state() {
 #[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_declines_compressed_state_before_provider_allocation() {
+    let _serial = CUDA_METADATA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let dir = fixture_dir();
     onnx_runtime_ep_cuda::vmm_allocator::reset_global_vmm_stats();
+    let constructions = native_cuda_provider_construction_attempts();
     let error = match NativeDecodeSession::load_with_resolved_io(
         dir.join("model.onnx.textproto"),
         NativeDecodeDevice::Cuda { index: Some(0) },
@@ -371,15 +428,128 @@ fn native_cuda_declines_compressed_state_before_provider_allocation() {
     };
     assert!(
         error
+            .downcast_ref::<CompressedStateLoadRefusal>()
+            .is_some_and(|reason| *reason == CompressedStateLoadRefusal::UnsupportedDevice),
+        "external callers must match the public typed CUDA refusal: {error:#}"
+    );
+    assert!(
+        error
             .to_string()
             .contains("native decode will not fall back the whole session to CPU"),
         "typed CUDA decline must explain the no-fallback policy: {error:#}"
+    );
+    assert_eq!(
+        native_cuda_provider_construction_attempts(),
+        constructions,
+        "typed compressed-state refusal must precede CUDA provider construction"
     );
     let stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
     assert_eq!(stats.reserved_bytes, 0);
     assert_eq!(stats.committed_bytes, 0);
     assert_eq!(stats.allocations, 0);
     assert_eq!(stats.commits, 0);
+}
+
+#[cfg(feature = "native-cuda")]
+#[test]
+fn malformed_state_metadata_refuses_before_cuda_provider_and_vmm_construction() {
+    let _serial = CUDA_METADATA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let document = std::fs::read_to_string(fixture_dir().join("inference_metadata.yaml")).unwrap();
+    let cases = [
+        (
+            "unknown-field",
+            document.replacen(
+                "            kind: compressed_attention\n            properties:",
+                "            kind: compressed_attention\n            future_layout: tiled\n            properties:",
+                1,
+            ),
+            false,
+        ),
+        (
+            "missing-record-format",
+            document.replacen("          record_format: fp8_e4m3_block64\n", "", 1),
+            false,
+        ),
+        (
+            "inconsistent-roles",
+            document.replacen("role: index_key", "role: compressed_kv", 1),
+            true,
+        ),
+        (
+            "unsupported-version",
+            document.replacen("schema_version: v1.8", "schema_version: v1.9", 1),
+            false,
+        ),
+        (
+            "under-versioned",
+            document.replacen("schema_version: v1.8", "schema_version: v1.7", 1),
+            false,
+        ),
+    ];
+
+    for (label, metadata, semantic) in cases {
+        let scratch = scratch_fixture(label, Some(&metadata));
+        for loader in ["resolved", "default", "kv-max", "cuda-options"] {
+            onnx_runtime_ep_cuda::vmm_allocator::reset_global_vmm_stats();
+            let constructions = native_cuda_provider_construction_attempts();
+            let result = match loader {
+                "resolved" => NativeDecodeSession::load_with_resolved_io(
+                    scratch.model(),
+                    NativeDecodeDevice::Cuda { index: Some(0) },
+                ),
+                "default" => NativeDecodeSession::load(
+                    scratch.model(),
+                    NativeDecodeDevice::Cuda { index: Some(0) },
+                ),
+                "kv-max" => NativeDecodeSession::load_with_cuda_kv_max_len(
+                    scratch.model(),
+                    NativeDecodeDevice::Cuda { index: Some(0) },
+                    Some(64),
+                ),
+                "cuda-options" => NativeDecodeSession::load_with_cuda_options(
+                    scratch.model(),
+                    NativeDecodeDevice::Cuda { index: Some(0) },
+                    Default::default(),
+                ),
+                _ => unreachable!(),
+            };
+            let error = match result {
+                Ok(_) => panic!("{label}/{loader} metadata must be refused"),
+                Err(error) => error,
+            };
+            let refusal = error
+                .downcast_ref::<NativeDecodeMetadataRefusal>()
+                .unwrap_or_else(|| {
+                    panic!("{label}/{loader} must return typed metadata refusal: {error:#}")
+                });
+            assert_eq!(
+                matches!(refusal, NativeDecodeMetadataRefusal::InvalidContract { .. }),
+                semantic,
+                "{label}/{loader}: {refusal}"
+            );
+            assert_eq!(
+                native_cuda_provider_construction_attempts(),
+                constructions,
+                "{label}/{loader} crossed CUDA provider construction"
+            );
+            assert_eq!(
+                onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats(),
+                Default::default(),
+                "{label}/{loader} crossed VMM construction"
+            );
+        }
+    }
+
+    let absent = scratch_fixture("absent-legacy-control", None);
+    let constructions = native_cuda_provider_construction_attempts();
+    let _ = NativeDecodeSession::load(absent.model(), NativeDecodeDevice::Cuda { index: Some(0) });
+    assert!(
+        native_cuda_provider_construction_attempts() > constructions,
+        "truly absent legacy metadata must cross into provider construction, proving the refusal \
+         counter is non-vacuous"
+    );
 }
 
 #[test]

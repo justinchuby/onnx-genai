@@ -219,6 +219,10 @@ pub struct DecoderStateGroup {
 pub struct DecoderStatePort {
     pub role: Option<StatePortRole>,
     pub layer: Option<usize>,
+    /// Request-batch axis derived from the canonical state cell's
+    /// `contract.batch_layout`. Compressed state is row-scoped, so absence is a
+    /// malformed lowering rather than permission to guess axis zero.
+    pub batch_axis: Option<usize>,
     pub input: String,
     pub output: String,
 }
