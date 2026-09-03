@@ -17,8 +17,9 @@ use onnx_runtime_ep_api::{
     TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{
-    DataType, EinsumClassification, EinsumContractionPlan, EinsumInput, EinsumOperandPlan,
-    EinsumPermutationPlan, EinsumPlan, EinsumSchema, EinsumShapePlan, Node, Shape, TensorLayout,
+    DataType, EinsumClassification, EinsumContractionPlan, EinsumContractionTreePlan, EinsumInput,
+    EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality, EinsumSchema,
+    EinsumShapePlan, Node, Shape, TensorLayout,
 };
 
 use super::movement::{PersistentMetadata, launch_persistent_metadata};
@@ -67,6 +68,27 @@ static WORKSPACE_PTR_LAST: AtomicU64 = AtomicU64::new(0);
 static SETUP_NS_LAST: AtomicU64 = AtomicU64::new(0);
 static PERSISTENT_METADATA_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZATION_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn contraction_tree_summary(tree: &EinsumContractionTreePlan) -> String {
+    if tree.quality() == EinsumPlannerQuality::GenericNativeFallback {
+        let reason = tree
+            .fallback_reason()
+            .expect("GenericNative planner fallback records its reason");
+        format!(
+            "the bounded planner selected GenericNative fallback because {reason} (work={}, \
+             metadata_units={}, max_depth={})",
+            tree.usage().work(),
+            tree.usage().metadata_units(),
+            tree.usage().max_depth()
+        )
+    } else {
+        format!(
+            "{} ordered candidate(s), quality {:?}",
+            tree.candidates().len(),
+            tree.quality()
+        )
+    }
+}
 
 pub fn einsum_execution_stats() -> EinsumExecutionStats {
     let last_fallback_reason = LAST_FALLBACK_REASON
@@ -347,11 +369,10 @@ fn unsupported_reason_impl(
             None
         }
         EinsumClassification::ContractionTree(tree) => Some(format!(
-            "cuda_ep Einsum `{equation}`: canonical {}-input contraction tree has {} ordered \
-             candidate(s), but CUDA temporary scheduling and multi-node capture execution are not \
-             implemented",
+            "cuda_ep Einsum `{equation}`: canonical {}-input contraction plan has {}, but CUDA \
+             temporary scheduling and multi-node capture execution are not implemented",
             tree.arity(),
-            tree.candidates().len()
+            contraction_tree_summary(tree)
         )),
         EinsumClassification::ReductionOrElementwise(_) => Some(format!(
             "cuda_ep Einsum `{equation}`: uncoupled reductions/elementwise products are not yet lowered; use native Reduce*/Mul nodes or CPU fallback"
@@ -401,11 +422,11 @@ impl KernelFactory for EinsumFactory {
             | EinsumClassification::Gemm(_) => {}
             EinsumClassification::ContractionTree(tree) => {
                 return Err(not_implemented(format!(
-                    "cuda_ep Einsum `{equation}` {}-input contraction tree with {} ordered \
-                     candidate(s); implement temporary scheduling and multi-node capture before \
-                     constructing this kernel",
+                    "cuda_ep Einsum `{equation}` {}-input contraction plan with {}; implement \
+                     GenericNative/temporary scheduling and multi-node capture before constructing \
+                     this kernel",
                     tree.arity(),
-                    tree.candidates().len()
+                    contraction_tree_summary(tree)
                 )));
             }
             EinsumClassification::ReductionOrElementwise(_) => {
@@ -1157,11 +1178,11 @@ impl Kernel for EinsumKernel {
             | EinsumClassification::DiagonalView(_) => self.run_view(inputs, outputs),
             EinsumClassification::Gemm(_) => self.run_contraction(inputs, outputs),
             EinsumClassification::ContractionTree(tree) => Err(not_implemented(format!(
-                "Einsum `{}` {}-input contraction tree execution with {} ordered candidates; \
-                 CUDA must implement the planner's temporary schedule before executing this class",
+                "Einsum `{}` {}-input contraction plan execution with {}; CUDA must implement \
+                 GenericNative and the planner's temporary schedule before executing this class",
                 self.plan.equation(),
                 tree.arity(),
-                tree.candidates().len()
+                contraction_tree_summary(tree)
             ))),
             EinsumClassification::ReductionOrElementwise(_) => Err(not_implemented(format!(
                 "Einsum `{}` reduction/elementwise canonical plan",
@@ -1330,8 +1351,33 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(reason.contains("3-input contraction tree"));
+        assert!(reason.contains("3-input contraction plan"));
         assert!(reason.contains("temporary scheduling"));
+    }
+
+    #[test]
+    fn large_arity_cuda_claim_reports_bounded_generic_fallback() {
+        let arity = 256;
+        let equation = format!(
+            "{}->",
+            std::iter::repeat_n("i", arity)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut node = Node::new(onnx_runtime_ir::NodeId(0), "Einsum", vec![], vec![]);
+        node.attributes.insert(
+            "equation".into(),
+            onnx_runtime_ir::Attribute::String(equation.into_bytes()),
+        );
+        let shapes = vec![onnx_runtime_ir::static_shape([1]); arity];
+        let dtypes = vec![DataType::Float32; arity];
+        let layouts = vec![TensorLayout::contiguous(); arity];
+        let reason = unsupported_reason_impl(&node, 12, &shapes, &dtypes, &layouts).unwrap();
+        assert!(reason.contains("GenericNative fallback"), "{reason}");
+        assert!(
+            reason.contains("work/metadata budget was exceeded"),
+            "{reason}"
+        );
     }
 
     #[test]

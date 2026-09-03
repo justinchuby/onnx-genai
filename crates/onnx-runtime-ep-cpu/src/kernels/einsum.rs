@@ -13,9 +13,9 @@ use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{
-    DataType, EinsumAxis, EinsumClassification, EinsumContractionPlan, EinsumInput,
-    EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumReductionPlan, EinsumSchema,
-    EinsumShapePlan, Node, Shape, compute_contiguous_strides,
+    DataType, EinsumAxis, EinsumClassification, EinsumContractionPlan, EinsumContractionTreePlan,
+    EinsumInput, EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality,
+    EinsumReductionPlan, EinsumSchema, EinsumShapePlan, Node, Shape, compute_contiguous_strides,
 };
 use rayon::prelude::*;
 
@@ -448,6 +448,27 @@ impl Default for EinsumFactory {
     }
 }
 
+fn contraction_tree_summary(tree: &EinsumContractionTreePlan) -> String {
+    if tree.quality() == EinsumPlannerQuality::GenericNativeFallback {
+        let reason = tree
+            .fallback_reason()
+            .expect("GenericNative planner fallback records its reason");
+        format!(
+            "the bounded planner selected GenericNative fallback because {reason} (work={}, \
+             metadata_units={}, max_depth={})",
+            tree.usage().work(),
+            tree.usage().metadata_units(),
+            tree.usage().max_depth()
+        )
+    } else {
+        format!(
+            "{} ordered candidate(s), quality {:?}",
+            tree.candidates().len(),
+            tree.quality()
+        )
+    }
+}
+
 impl KernelFactory for EinsumFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let equation = equation(node)?;
@@ -472,13 +493,13 @@ impl KernelFactory for EinsumFactory {
         match plan.classification() {
             EinsumClassification::ContractionTree(tree) => {
                 return Err(EpError::KernelFailed(format!(
-                    "Einsum equation `{}` has a canonical {}-input contraction tree with {} \
-                     ordered candidate(s), but the staged native CPU GenericNative/tree executor \
-                     is not implemented yet. The semantic plan is valid; use another provider \
-                     until the exhaustive execution handoff lands.",
+                    "Einsum equation `{}` has a canonical {}-input contraction plan where {}, but \
+                     the staged native CPU GenericNative/tree executor is not implemented yet. \
+                     The semantic plan is valid; use another provider until the exhaustive \
+                     execution handoff lands.",
                     plan.equation(),
                     tree.arity(),
-                    tree.candidates().len()
+                    contraction_tree_summary(tree)
                 )));
             }
             EinsumClassification::ViewOnlyPermutation(_)
@@ -595,13 +616,13 @@ pub fn unsupported_reason(
             }
             match plan.classification() {
                 EinsumClassification::ContractionTree(tree) => Some(format!(
-                    "Einsum `{}` has a canonical {}-input contraction tree with {} ordered \
-                     candidate(s), but the native CPU EP has not implemented the staged \
-                     GenericNative temporary scheduling and multi-node execution handoff; the \
-                     expression is schema-valid, so use another provider until it lands",
+                    "Einsum `{}` has a canonical {}-input contraction plan where {}, but the \
+                     native CPU EP has not implemented the staged GenericNative temporary \
+                     scheduling and multi-node execution handoff; the expression is schema-valid, \
+                     so use another provider until it lands",
                     plan.equation(),
                     tree.arity(),
-                    tree.candidates().len()
+                    contraction_tree_summary(tree)
                 )),
                 EinsumClassification::ViewOnlyPermutation(_)
                 | EinsumClassification::DiagonalView(_)
@@ -735,11 +756,11 @@ impl EinsumKernel {
             }
             EinsumClassification::ContractionTree(tree) => Err(EpError::KernelFailed(format!(
                 "Einsum equation `{}` reached CPU execution with an unimplemented {}-input \
-                 contraction tree ({} ordered candidates); EP placement must decline it until \
-                 the staged GenericNative/contraction-tree executor is implemented",
+                 contraction plan where {}; EP placement must decline it until the staged \
+                 GenericNative/contraction-tree executor is implemented",
                 self.plan.equation(),
                 tree.arity(),
-                tree.candidates().len()
+                contraction_tree_summary(tree)
             ))),
             _ => Err(EpError::KernelFailed(format!(
                 "Einsum equation `{}` reached CPU execution with a newer unrecognized canonical \
@@ -2651,12 +2672,32 @@ mod tests {
         let mixed_shapes = [static_shape([7, 2, 3]), static_shape([3, 4])];
         let mixed_dtypes = [DataType::Float16; 2];
         let reason = unsupported_reason(&mixed, 12, &mixed_shapes, &mixed_dtypes).unwrap();
-        assert!(reason.contains("2-input contraction tree"));
+        assert!(reason.contains("2-input contraction plan"));
         let error = EinsumFactory::default()
             .create(&mixed, &[vec![7, 2, 3], vec![3, 4]])
             .err()
             .expect("direct factory construction must also decline");
-        assert!(error.to_string().contains("2-input contraction tree"));
+        assert!(error.to_string().contains("2-input contraction plan"));
+
+        let arity = 256;
+        let equation = format!(
+            "{}->",
+            std::iter::repeat_n("i", arity)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut large = Node::new(NodeId(2), "Einsum", vec![], vec![]);
+        large
+            .attributes
+            .insert("equation".into(), Attribute::String(equation.into_bytes()));
+        let shapes = vec![static_shape([1]); arity];
+        let dtypes = vec![DataType::Float32; arity];
+        let reason = unsupported_reason(&large, 12, &shapes, &dtypes).unwrap();
+        assert!(reason.contains("GenericNative fallback"), "{reason}");
+        assert!(
+            reason.contains("work/metadata budget was exceeded"),
+            "{reason}"
+        );
     }
 
     #[test]

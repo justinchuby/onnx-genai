@@ -129,8 +129,26 @@ pub struct EinsumPlannerBudget {
     pub max_candidates: usize,
     /// Maximum logical axes eligible for exact planning.
     pub max_exact_axes: usize,
-    /// Maximum pair evaluations performed by deterministic greedy planning.
+    /// Maximum total greedy work units. The planner reserves worst-case tree,
+    /// leaf-set, stable-ID, and lowering metadata first; the remainder pays
+    /// for pair scoring.
     pub max_heuristic_candidates: usize,
+}
+
+impl EinsumPlannerBudget {
+    /// Hard structural ceiling for exact subset enumeration, independent of a
+    /// caller raising `exact_operand_limit`.
+    pub const MAX_EXACT_TREE_OPERANDS: usize = 8;
+    /// Hard ceiling for a materialized contraction tree.
+    pub const MAX_CONTRACTION_TREE_DEPTH: usize = 64;
+    /// Conservative retained-metadata allowance charged per exact candidate.
+    pub const EXACT_METADATA_UNITS_PER_CANDIDATE: usize = 1024;
+
+    /// Exact planner metadata ceiling derived from `max_candidates`.
+    pub fn exact_metadata_units_limit(self) -> Option<usize> {
+        self.max_candidates
+            .checked_mul(Self::EXACT_METADATA_UNITS_PER_CANDIDATE)
+    }
 }
 
 impl Default for EinsumPlannerBudget {
@@ -152,6 +170,38 @@ pub enum EinsumPlannerQuality {
     ExactSubsetDp,
     /// A deterministic bounded greedy tree was selected.
     DeterministicGreedy,
+    /// Tree construction exceeded a work, metadata, or depth bound, so the
+    /// semantic plan intentionally retains only its universal index program.
+    GenericNativeFallback,
+}
+
+/// Why bounded tree planning retained only the universal index program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EinsumPlannerFallbackReason {
+    /// Conservative tree/lowering metadata or total heuristic work exceeded
+    /// `max_heuristic_candidates`.
+    WorkOrMetadataBudgetExceeded,
+    /// The selected tree would exceed the explicit depth ceiling.
+    MaximumDepthExceeded,
+    /// Checked planner bookkeeping arithmetic could not represent its bounds.
+    PlanningArithmeticOverflow,
+}
+
+impl fmt::Display for EinsumPlannerFallbackReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkOrMetadataBudgetExceeded => {
+                f.write_str("the configured work/metadata budget was exceeded")
+            }
+            Self::MaximumDepthExceeded => {
+                f.write_str("the explicit contraction-tree depth ceiling was exceeded")
+            }
+            Self::PlanningArithmeticOverflow => {
+                f.write_str("checked planner bookkeeping arithmetic overflowed")
+            }
+        }
+    }
 }
 
 /// Actual state/candidate/axis consumption for one planning pass.
@@ -160,6 +210,10 @@ pub struct EinsumPlannerUsage {
     states: usize,
     candidates: usize,
     axes: usize,
+    work: usize,
+    metadata_units: usize,
+    max_depth: usize,
+    candidate_id_bytes: usize,
     budget: EinsumPlannerBudget,
 }
 
@@ -177,6 +231,29 @@ impl EinsumPlannerUsage {
     /// Logical axes in the equation.
     pub const fn axes(self) -> usize {
         self.axes
+    }
+
+    /// Total bounded planning work units. Heuristic planning includes pair
+    /// scoring plus the conservative metadata reservation; exact planning
+    /// includes candidate construction and retained subset metadata.
+    pub const fn work(self) -> usize {
+        self.work
+    }
+
+    /// Conservative units reserved for tree nodes, leaf membership, lowering
+    /// metadata, and stable candidate identifiers.
+    pub const fn metadata_units(self) -> usize {
+        self.metadata_units
+    }
+
+    /// Deepest selected binary tree node. Generic fallback reports zero.
+    pub const fn max_depth(self) -> usize {
+        self.max_depth
+    }
+
+    /// Bytes in the materialized public candidate identifiers.
+    pub const fn candidate_id_bytes(self) -> usize {
+        self.candidate_id_bytes
     }
 
     /// Configured deterministic bounds.
@@ -843,6 +920,7 @@ pub struct EinsumContractionTreePlan {
     preferred_candidate: Option<usize>,
     requires_concrete_rescore: bool,
     quality: EinsumPlannerQuality,
+    fallback_reason: Option<EinsumPlannerFallbackReason>,
     usage: EinsumPlannerUsage,
     logical_order: Vec<EinsumAxis>,
     output_axes: Vec<EinsumAxis>,
@@ -861,7 +939,9 @@ impl EinsumContractionTreePlan {
         &self.leaf_values
     }
 
-    /// Every semantically legal ordered binary tree, sorted by stable ID.
+    /// Materialized bounded candidates, sorted by stable ID. Exact planning
+    /// contains every ordered tree; greedy planning contains one; generic
+    /// fallback contains none.
     pub fn candidates(&self) -> &[EinsumContractionTreeCandidate] {
         &self.candidates
     }
@@ -880,6 +960,11 @@ impl EinsumContractionTreePlan {
     /// Whether planning was exact subset DP or bounded deterministic greedy.
     pub const fn quality(&self) -> EinsumPlannerQuality {
         self.quality
+    }
+
+    /// Structured reason for [`EinsumPlannerQuality::GenericNativeFallback`].
+    pub const fn fallback_reason(&self) -> Option<EinsumPlannerFallbackReason> {
+        self.fallback_reason
     }
 
     /// Actual bounded-planner resource use.
@@ -913,7 +998,7 @@ impl EinsumContractionTreePlan {
                 .trees
                 .into_iter()
                 .map(|tree| {
-                    let id = EinsumContractionTreeCandidateId(tree.id());
+                    let id = EinsumContractionTreeCandidateId(tree.id().to_owned());
                     let plan = match build_candidate(
                         &tree,
                         operands,
@@ -1094,24 +1179,71 @@ struct ValueDescriptor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum TreeExpr {
+enum TreeExprKind {
     Leaf(usize),
     Merge(Box<TreeExpr>, Box<TreeExpr>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TreeExpr {
+    kind: TreeExprKind,
+    id: String,
+    leaves: BTreeSet<usize>,
+    depth: usize,
+    metadata_units: usize,
+}
+
 impl TreeExpr {
-    fn id(&self) -> String {
-        match self {
-            Self::Leaf(input) => input.to_string(),
-            Self::Merge(left, right) => format!("({},{})", left.id(), right.id()),
+    fn leaf(input: usize) -> Self {
+        Self {
+            kind: TreeExprKind::Leaf(input),
+            id: input.to_string(),
+            leaves: BTreeSet::from([input]),
+            depth: 0,
+            metadata_units: 2,
         }
     }
 
-    fn leaves(&self) -> BTreeSet<usize> {
-        match self {
-            Self::Leaf(input) => BTreeSet::from([*input]),
-            Self::Merge(left, right) => left.leaves().union(&right.leaves()).copied().collect(),
+    fn merge(left: Self, right: Self) -> Result<Self, EinsumPlannerFallbackReason> {
+        let depth = left
+            .depth
+            .max(right.depth)
+            .checked_add(1)
+            .ok_or(EinsumPlannerFallbackReason::PlanningArithmeticOverflow)?;
+        if depth > EinsumPlannerBudget::MAX_CONTRACTION_TREE_DEPTH {
+            return Err(EinsumPlannerFallbackReason::MaximumDepthExceeded);
         }
+        let id_capacity = left
+            .id
+            .len()
+            .checked_add(right.id.len())
+            .and_then(|value| value.checked_add(3))
+            .ok_or(EinsumPlannerFallbackReason::PlanningArithmeticOverflow)?;
+        let mut id = String::with_capacity(id_capacity);
+        id.push('(');
+        id.push_str(&left.id);
+        id.push(',');
+        id.push_str(&right.id);
+        id.push(')');
+        let leaves: BTreeSet<_> = left.leaves.union(&right.leaves).copied().collect();
+        let metadata_units = left
+            .metadata_units
+            .checked_add(right.metadata_units)
+            .and_then(|value| value.checked_add(id.len()))
+            .and_then(|value| value.checked_add(leaves.len()))
+            .and_then(|value| value.checked_add(1))
+            .ok_or(EinsumPlannerFallbackReason::PlanningArithmeticOverflow)?;
+        Ok(Self {
+            kind: TreeExprKind::Merge(Box::new(left), Box::new(right)),
+            id,
+            leaves,
+            depth,
+            metadata_units,
+        })
+    }
+
+    fn id(&self) -> &str {
+        &self.id
     }
 }
 
@@ -1120,6 +1252,27 @@ struct PlannedTrees {
     quality: EinsumPlannerQuality,
     states: usize,
     candidates: usize,
+    work: usize,
+    metadata_units: usize,
+    max_depth: usize,
+    candidate_id_bytes: usize,
+    fallback_reason: Option<EinsumPlannerFallbackReason>,
+}
+
+impl PlannedTrees {
+    fn generic_native_fallback(reason: EinsumPlannerFallbackReason) -> Self {
+        Self {
+            trees: Vec::new(),
+            quality: EinsumPlannerQuality::GenericNativeFallback,
+            states: 0,
+            candidates: 0,
+            work: 0,
+            metadata_units: 0,
+            max_depth: 0,
+            candidate_id_bytes: 0,
+            fallback_reason: Some(reason),
+        }
+    }
 }
 
 pub(super) fn build_contraction_tree(
@@ -1163,7 +1316,7 @@ pub(super) fn build_contraction_tree(
         .trees
         .into_iter()
         .map(|tree| {
-            let id = EinsumContractionTreeCandidateId(tree.id());
+            let id = EinsumContractionTreeCandidateId(tree.id().to_owned());
             let plan = match build_candidate(
                 &tree,
                 operands,
@@ -1199,6 +1352,18 @@ pub(super) fn build_contraction_tree(
             .supported()
             .is_some_and(|candidate| candidate.cost.requires_concrete_rescore())
     });
+    let axis_count = logical_order.len();
+    let (stored_logical_order, stored_output_axes, stored_reduction_axes, stored_occurrence_inputs) =
+        if planned.quality == EinsumPlannerQuality::GenericNativeFallback {
+            (Vec::new(), Vec::new(), BTreeSet::new(), BTreeMap::new())
+        } else {
+            (
+                logical_order,
+                output_axes.to_vec(),
+                reduction_axes,
+                occurrence_inputs,
+            )
+        };
 
     EinsumContractionTreePlan {
         arity: operands.len(),
@@ -1207,16 +1372,21 @@ pub(super) fn build_contraction_tree(
         preferred_candidate,
         requires_concrete_rescore,
         quality: planned.quality,
+        fallback_reason: planned.fallback_reason,
         usage: EinsumPlannerUsage {
             states: planned.states,
             candidates: planned.candidates,
-            axes: logical_order.len(),
+            axes: axis_count,
+            work: planned.work,
+            metadata_units: planned.metadata_units,
+            max_depth: planned.max_depth,
+            candidate_id_bytes: planned.candidate_id_bytes,
             budget,
         },
-        logical_order,
-        output_axes: output_axes.to_vec(),
-        reduction_axes,
-        occurrence_inputs,
+        logical_order: stored_logical_order,
+        output_axes: stored_output_axes,
+        reduction_axes: stored_reduction_axes,
+        occurrence_inputs: stored_occurrence_inputs,
     }
 }
 
@@ -1231,7 +1401,10 @@ fn plan_trees(
     let exact_state_count = 1usize
         .checked_shl(arity as u32)
         .and_then(|n| n.checked_sub(1));
-    if arity <= budget.exact_operand_limit
+    if arity
+        <= budget
+            .exact_operand_limit
+            .min(EinsumPlannerBudget::MAX_EXACT_TREE_OPERANDS)
         && logical_order.len() <= budget.max_exact_axes
         && exact_state_count.is_some_and(|states| states <= budget.max_states)
         && let Some(exact) = enumerate_exact_trees(arity, budget)
@@ -1250,10 +1423,17 @@ fn plan_trees(
 }
 
 fn enumerate_exact_trees(arity: usize, budget: EinsumPlannerBudget) -> Option<PlannedTrees> {
-    let full = (1u64 << arity) - 1;
+    let full = 1u64.checked_shl(arity as u32)?.checked_sub(1)?;
     let mut states = BTreeMap::<u64, Vec<TreeExpr>>::new();
+    let metadata_limit = budget.exact_metadata_units_limit()?;
+    let mut metadata_units = 0usize;
     for input in 0..arity {
-        states.insert(1u64 << input, vec![TreeExpr::Leaf(input)]);
+        let leaf = TreeExpr::leaf(input);
+        metadata_units = metadata_units.checked_add(leaf.metadata_units)?;
+        if metadata_units > metadata_limit {
+            return None;
+        }
+        states.insert(1u64 << input, vec![leaf]);
     }
     let mut candidate_count = 0usize;
     for size in 2..=arity {
@@ -1278,26 +1458,66 @@ fn enumerate_exact_trees(arity: usize, budget: EinsumPlannerBudget) -> Option<Pl
                             if candidate_count > budget.max_candidates {
                                 return None;
                             }
-                            trees.push(TreeExpr::Merge(
-                                Box::new(left_tree.clone()),
-                                Box::new(right_tree.clone()),
-                            ));
+                            let tree =
+                                TreeExpr::merge(left_tree.clone(), right_tree.clone()).ok()?;
+                            metadata_units = metadata_units.checked_add(tree.metadata_units)?;
+                            if metadata_units > metadata_limit {
+                                return None;
+                            }
+                            trees.push(tree);
                         }
                     }
                 }
                 left = (left - 1) & subset;
             }
-            trees.sort_by_key(TreeExpr::id);
+            trees.sort_by(|left, right| left.id.cmp(&right.id));
             trees.dedup_by(|left, right| left == right);
             states.insert(subset, trees);
         }
     }
+    let trees = states.remove(&full).unwrap_or_default();
+    let candidate_id_bytes = trees
+        .iter()
+        .try_fold(0usize, |sum, tree| sum.checked_add(tree.id.len()))?;
+    let max_depth = trees.iter().map(|tree| tree.depth).max().unwrap_or(0);
+    let work = candidate_count.checked_add(metadata_units)?;
     Some(PlannedTrees {
-        trees: states.remove(&full).unwrap_or_default(),
+        trees,
         quality: EinsumPlannerQuality::ExactSubsetDp,
         states: states.len() + 1,
         candidates: candidate_count,
+        work,
+        metadata_units,
+        max_depth,
+        candidate_id_bytes,
+        fallback_reason: None,
     })
+}
+
+fn heuristic_metadata_bound(arity: usize, axes: usize) -> Option<usize> {
+    let square = arity.checked_mul(arity)?;
+    let digits = arity.max(1).ilog10() as usize + 1;
+    let identifiers = square.checked_mul(digits.checked_add(3)?)?;
+    let leaf_membership = arity
+        .checked_mul(arity.checked_add(1)?)?
+        .checked_div(2)?
+        .checked_mul(4)?;
+    let steps = arity.checked_mul(2)?.checked_sub(1)?;
+    let lowering_axes = steps.checked_mul(axes.max(1))?.checked_mul(16)?;
+    identifiers
+        .checked_add(leaf_membership)?
+        .checked_add(lowering_axes)
+}
+
+fn heuristic_score_units(
+    logical_order: &[EinsumAxis],
+    occurrence_inputs: &BTreeMap<EinsumAxis, BTreeSet<usize>>,
+) -> Option<usize> {
+    occurrence_inputs
+        .values()
+        .try_fold(logical_order.len().checked_add(1)?, |sum, inputs| {
+            sum.checked_add(inputs.len())
+        })
 }
 
 fn greedy_tree(
@@ -1308,27 +1528,49 @@ fn greedy_tree(
     reduction_axes: &BTreeSet<EinsumAxis>,
     budget: EinsumPlannerBudget,
 ) -> PlannedTrees {
-    let mut forest = (0..arity).map(TreeExpr::Leaf).collect::<Vec<_>>();
+    let Some(metadata_units) = heuristic_metadata_bound(arity, logical_order.len()) else {
+        return PlannedTrees::generic_native_fallback(
+            EinsumPlannerFallbackReason::PlanningArithmeticOverflow,
+        );
+    };
+    if metadata_units > budget.max_heuristic_candidates {
+        return PlannedTrees::generic_native_fallback(
+            EinsumPlannerFallbackReason::WorkOrMetadataBudgetExceeded,
+        );
+    }
+    let Some(score_units) = heuristic_score_units(logical_order, occurrence_inputs) else {
+        return PlannedTrees::generic_native_fallback(
+            EinsumPlannerFallbackReason::PlanningArithmeticOverflow,
+        );
+    };
+    let score_work_limit = budget.max_heuristic_candidates - metadata_units;
+    let mut score_work = 0usize;
+    let mut forest = (0..arity).map(TreeExpr::leaf).collect::<Vec<_>>();
     let mut candidates = 0usize;
     let mut states = 1usize;
     while forest.len() > 1 {
-        forest.sort_by_key(TreeExpr::id);
-        let mut best: Option<((EinsumCostBound, EinsumCostBound, String), usize, usize)> = None;
+        forest.sort_by(|left, right| {
+            left.depth
+                .cmp(&right.depth)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let mut best: Option<(GreedyScore, usize, usize)> = None;
         'pairs: for left in 0..forest.len() {
             for right in 0..forest.len() {
                 if left == right {
                     continue;
                 }
-                if candidates >= budget.max_heuristic_candidates {
+                let Some(next_work) = score_work.checked_add(score_units) else {
+                    break 'pairs;
+                };
+                if next_work > score_work_limit {
                     break 'pairs;
                 }
+                score_work = next_work;
                 candidates += 1;
-                let merged = TreeExpr::Merge(
-                    Box::new(forest[left].clone()),
-                    Box::new(forest[right].clone()),
-                );
                 let score = greedy_merge_score(
-                    &merged,
+                    &forest[left],
+                    &forest[right],
                     logical_order,
                     dimensions,
                     occurrence_inputs,
@@ -1336,27 +1578,31 @@ fn greedy_tree(
                 );
                 if best
                     .as_ref()
-                    .is_none_or(|(current, _, _)| compare_greedy_score(&score, current).is_lt())
+                    .is_none_or(|(current, current_left, current_right)| {
+                        compare_greedy_score(
+                            &score,
+                            &forest[left],
+                            &forest[right],
+                            current,
+                            &forest[*current_left],
+                            &forest[*current_right],
+                        )
+                        .is_lt()
+                    })
                 {
                     best = Some((score, left, right));
                 }
             }
         }
-        let (_, left, right) = best.unwrap_or_else(|| {
-            let fallback =
-                TreeExpr::Merge(Box::new(forest[0].clone()), Box::new(forest[1].clone()));
-            (
-                greedy_merge_score(
-                    &fallback,
-                    logical_order,
-                    dimensions,
-                    occurrence_inputs,
-                    reduction_axes,
-                ),
-                0,
-                1,
-            )
-        });
+        let (_, left, right) = best.unwrap_or((
+            GreedyScore {
+                output: EinsumCostBound::UnknownUpperBound,
+                reduction: EinsumCostBound::UnknownUpperBound,
+                depth: forest[0].depth.max(forest[1].depth) + 1,
+            },
+            0,
+            1,
+        ));
         let (high, low) = if left > right {
             (left, right)
         } else {
@@ -1365,66 +1611,99 @@ fn greedy_tree(
         let right_tree = forest.remove(high);
         let left_tree = forest.remove(low);
         let merged = if low == left {
-            TreeExpr::Merge(Box::new(left_tree), Box::new(right_tree))
+            TreeExpr::merge(left_tree, right_tree)
         } else {
-            TreeExpr::Merge(Box::new(right_tree), Box::new(left_tree))
+            TreeExpr::merge(right_tree, left_tree)
+        };
+        let merged = match merged {
+            Ok(merged) => merged,
+            Err(reason) => return PlannedTrees::generic_native_fallback(reason),
         };
         forest.push(merged);
         states += 1;
     }
+    let max_depth = forest.first().map_or(0, |tree| tree.depth);
+    let candidate_id_bytes = forest.first().map_or(0, |tree| tree.id.len());
     PlannedTrees {
         trees: forest,
         quality: EinsumPlannerQuality::DeterministicGreedy,
         states,
         candidates,
+        work: metadata_units + score_work,
+        metadata_units,
+        max_depth,
+        candidate_id_bytes,
+        fallback_reason: None,
     }
 }
 
+#[derive(Clone, Copy)]
+struct GreedyScore {
+    output: EinsumCostBound,
+    reduction: EinsumCostBound,
+    depth: usize,
+}
+
 fn greedy_merge_score(
-    tree: &TreeExpr,
+    left: &TreeExpr,
+    right: &TreeExpr,
     logical_order: &[EinsumAxis],
     dimensions: &BTreeMap<EinsumAxis, EinsumDimension>,
     occurrence_inputs: &BTreeMap<EinsumAxis, BTreeSet<usize>>,
     reduction_axes: &BTreeSet<EinsumAxis>,
-) -> (EinsumCostBound, EinsumCostBound, String) {
-    let leaves = tree.leaves();
-    let live_axes = logical_order
-        .iter()
-        .copied()
-        .filter(|axis| {
-            !occurrence_inputs[axis].is_disjoint(&leaves)
-                && !(reduction_axes.contains(axis) && occurrence_inputs[axis].is_subset(&leaves))
-        })
-        .collect::<Vec<_>>();
-    let reduced_axes = logical_order
-        .iter()
-        .copied()
-        .filter(|axis| reduction_axes.contains(axis) && occurrence_inputs[axis].is_subset(&leaves))
-        .collect::<Vec<_>>();
-    let output = dimension_values_product(
-        &live_axes
+) -> GreedyScore {
+    let contained = |inputs: &BTreeSet<usize>| {
+        inputs
             .iter()
-            .map(|axis| dimensions[axis])
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or(EinsumCostBound::UnknownUpperBound);
-    let reduction = dimension_values_product(
-        &reduced_axes
+            .all(|input| left.leaves.contains(input) || right.leaves.contains(input))
+    };
+    let intersects = |inputs: &BTreeSet<usize>| {
+        inputs
             .iter()
-            .map(|axis| dimensions[axis])
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or(EinsumCostBound::UnknownUpperBound);
-    (output, reduction, tree.id())
+            .any(|input| left.leaves.contains(input) || right.leaves.contains(input))
+    };
+    let axis_product = |reduced: bool| {
+        logical_order
+            .iter()
+            .copied()
+            .filter(|axis| {
+                let occurrences = &occurrence_inputs[axis];
+                let is_reduced = reduction_axes.contains(axis) && contained(occurrences);
+                if reduced {
+                    is_reduced
+                } else {
+                    intersects(occurrences) && !is_reduced
+                }
+            })
+            .try_fold(EinsumCostBound::Exact(1), |product, axis| {
+                mul_bound(
+                    product,
+                    dimension_bound(dimensions[&axis]),
+                    EinsumCostMetric::Geometry,
+                )
+            })
+            .unwrap_or(EinsumCostBound::UnknownUpperBound)
+    };
+    GreedyScore {
+        output: axis_product(false),
+        reduction: axis_product(true),
+        depth: left.depth.max(right.depth) + 1,
+    }
 }
 
 fn compare_greedy_score(
-    left: &(EinsumCostBound, EinsumCostBound, String),
-    right: &(EinsumCostBound, EinsumCostBound, String),
+    left: &GreedyScore,
+    left_tree: &TreeExpr,
+    right_tree: &TreeExpr,
+    current: &GreedyScore,
+    current_left: &TreeExpr,
+    current_right: &TreeExpr,
 ) -> Ordering {
-    compare_bound(left.0, right.0)
-        .then_with(|| compare_bound(left.1, right.1))
-        .then_with(|| left.2.cmp(&right.2))
+    compare_bound(left.output, current.output)
+        .then_with(|| compare_bound(left.reduction, current.reduction))
+        .then_with(|| left.depth.cmp(&current.depth))
+        .then_with(|| left_tree.id.cmp(&current_left.id))
+        .then_with(|| right_tree.id.cmp(&current_right.id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1511,122 +1790,116 @@ fn build_tree_expr(
     reduction_axis_set: &BTreeSet<EinsumAxis>,
     requested_output_axes: &[EinsumAxis],
 ) -> Result<ValueDescriptor, EinsumContractionTreeCandidateUnsupportedReason> {
-    match tree {
-        TreeExpr::Leaf(input) => {
-            let leaf = descriptors[&EinsumValueId(*input)].clone();
-            let local_reductions = logical_order
-                .iter()
-                .copied()
-                .filter(|axis| {
-                    reduction_axis_set.contains(axis)
-                        && occurrence_inputs[axis].is_subset(&leaf.leaves)
-                })
-                .collect::<BTreeSet<_>>();
-            if local_reductions.is_empty() {
-                return Ok(leaf);
+    let mut traversal = vec![(tree, false)];
+    let mut values = Vec::<ValueDescriptor>::new();
+    while let Some((node, visited)) = traversal.pop() {
+        match &node.kind {
+            TreeExprKind::Leaf(input) => {
+                let leaf = descriptors[&EinsumValueId(*input)].clone();
+                let local_reductions = logical_order
+                    .iter()
+                    .copied()
+                    .filter(|axis| {
+                        reduction_axis_set.contains(axis)
+                            && occurrence_inputs[axis].is_subset(&leaf.leaves)
+                    })
+                    .collect::<BTreeSet<_>>();
+                if local_reductions.is_empty() {
+                    values.push(leaf);
+                    continue;
+                }
+                let output_id = EinsumValueId(*next_value);
+                *next_value += 1;
+                let output_axes = leaf
+                    .axes
+                    .iter()
+                    .copied()
+                    .filter(|axis| !local_reductions.contains(axis))
+                    .collect::<Vec<_>>();
+                let output_axis_dimensions = leaf
+                    .axes
+                    .iter()
+                    .zip(&leaf.axis_dimensions)
+                    .filter_map(|(axis, dimension)| {
+                        (!local_reductions.contains(axis)).then_some(*dimension)
+                    })
+                    .collect::<Vec<_>>();
+                let reduction_dimensions = leaf
+                    .axes
+                    .iter()
+                    .zip(&leaf.axis_dimensions)
+                    .filter_map(|(axis, dimension)| {
+                        local_reductions.contains(axis).then_some(*dimension)
+                    })
+                    .collect::<Vec<_>>();
+                let output_elements = dimension_values_product(&output_axis_dimensions)?;
+                let reduction_elements = dimension_values_product(&reduction_dimensions)?;
+                steps.push(EinsumContractionTreeStep::UnaryReduction(
+                    EinsumUnaryReductionPlan {
+                        input: leaf.id,
+                        output: output_id,
+                        reduction_axes: logical_order
+                            .iter()
+                            .copied()
+                            .filter(|axis| local_reductions.contains(axis))
+                            .collect(),
+                        input_axes: leaf.axes.clone(),
+                        output_axes: output_axes.clone(),
+                        input_elements: leaf.elements,
+                        output_elements,
+                        reduction_elements,
+                    },
+                ));
+                let output = ValueDescriptor {
+                    id: output_id,
+                    leaves: leaf.leaves,
+                    axes: output_axes,
+                    axis_dimensions: output_axis_dimensions,
+                    elements: output_elements,
+                    requires_materialization: false,
+                };
+                descriptors.insert(output_id, output.clone());
+                values.push(output);
             }
-            let output_id = EinsumValueId(*next_value);
-            *next_value += 1;
-            let output_axes = leaf
-                .axes
-                .iter()
-                .copied()
-                .filter(|axis| !local_reductions.contains(axis))
-                .collect::<Vec<_>>();
-            let output_axis_dimensions = leaf
-                .axes
-                .iter()
-                .zip(&leaf.axis_dimensions)
-                .filter_map(|(axis, dimension)| {
-                    (!local_reductions.contains(axis)).then_some(*dimension)
-                })
-                .collect::<Vec<_>>();
-            let reduction_dimensions = leaf
-                .axes
-                .iter()
-                .zip(&leaf.axis_dimensions)
-                .filter_map(|(axis, dimension)| {
-                    local_reductions.contains(axis).then_some(*dimension)
-                })
-                .collect::<Vec<_>>();
-            let output_elements = dimension_values_product(&output_axis_dimensions)?;
-            let reduction_elements = dimension_values_product(&reduction_dimensions)?;
-            steps.push(EinsumContractionTreeStep::UnaryReduction(
-                EinsumUnaryReductionPlan {
-                    input: leaf.id,
-                    output: output_id,
-                    reduction_axes: logical_order
-                        .iter()
-                        .copied()
-                        .filter(|axis| local_reductions.contains(axis))
-                        .collect(),
-                    input_axes: leaf.axes.clone(),
-                    output_axes: output_axes.clone(),
-                    input_elements: leaf.elements,
-                    output_elements,
-                    reduction_elements,
-                },
-            ));
-            let output = ValueDescriptor {
-                id: output_id,
-                leaves: leaf.leaves,
-                axes: output_axes,
-                axis_dimensions: output_axis_dimensions,
-                elements: output_elements,
-                requires_materialization: false,
-            };
-            descriptors.insert(output_id, output.clone());
-            Ok(output)
-        }
-        TreeExpr::Merge(left, right) => {
-            let left = build_tree_expr(
-                left,
-                arity,
-                next_value,
-                steps,
-                descriptors,
-                logical_order,
-                dimensions,
-                occurrence_inputs,
-                output_axis_set,
-                reduction_axis_set,
-                requested_output_axes,
-            )?;
-            let right = build_tree_expr(
-                right,
-                arity,
-                next_value,
-                steps,
-                descriptors,
-                logical_order,
-                dimensions,
-                occurrence_inputs,
-                output_axis_set,
-                reduction_axis_set,
-                requested_output_axes,
-            )?;
-            let output_id = EinsumValueId(*next_value);
-            *next_value += 1;
-            let final_node = left.leaves.len() + right.leaves.len() == arity;
-            let (binary, output) = build_binary(
-                left,
-                right,
-                output_id,
-                final_node,
-                logical_order,
-                dimensions,
-                occurrence_inputs,
-                output_axis_set,
-                reduction_axis_set,
-                requested_output_axes,
-            )?;
-            steps.push(EinsumContractionTreeStep::BinaryContraction(Box::new(
-                binary,
-            )));
-            descriptors.insert(output_id, output.clone());
-            Ok(output)
+            TreeExprKind::Merge(left, right) if !visited => {
+                traversal.push((node, true));
+                traversal.push((right, false));
+                traversal.push((left, false));
+            }
+            TreeExprKind::Merge(_, _) => {
+                let right = values
+                    .pop()
+                    .expect("iterative post-order lowering produced the right child");
+                let left = values
+                    .pop()
+                    .expect("iterative post-order lowering produced the left child");
+                let output_id = EinsumValueId(*next_value);
+                *next_value += 1;
+                let final_node = left.leaves.len() + right.leaves.len() == arity;
+                let (binary, output) = build_binary(
+                    left,
+                    right,
+                    output_id,
+                    final_node,
+                    logical_order,
+                    dimensions,
+                    occurrence_inputs,
+                    output_axis_set,
+                    reduction_axis_set,
+                    requested_output_axes,
+                )?;
+                steps.push(EinsumContractionTreeStep::BinaryContraction(Box::new(
+                    binary,
+                )));
+                descriptors.insert(output_id, output.clone());
+                values.push(output);
+            }
         }
     }
+    debug_assert_eq!(values.len(), 1);
+    Ok(values
+        .pop()
+        .expect("a contraction tree always produces one root value"))
 }
 
 #[allow(clippy::too_many_arguments)]

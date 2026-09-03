@@ -429,7 +429,7 @@ pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
 /// Resolve and validate every default-domain `Einsum` against the model's
 /// effective imported opset before shape inference or placement.
 pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
-    use onnx_runtime_ir::{Attribute, EinsumInput, EinsumPlan};
+    use onnx_runtime_ir::{Attribute, EinsumInput, EinsumPlan, EinsumSchema, EinsumShapePlan};
 
     fn check_graph(
         graph: &Graph,
@@ -475,13 +475,28 @@ pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
                             detail: format!("input #{input} references missing value {value_id:?}"),
                         })?;
                 metadata.push(EinsumInput::from_optional(
-                    (value.dtype != onnx_runtime_ir::DataType::Undefined).then_some(value.dtype),
-                    Some(value.shape.as_slice()),
+                    graph.value_type_is_known(value_id).then_some(value.dtype),
+                    graph
+                        .value_shape_is_known(value_id)
+                        .then_some(value.shape.as_slice()),
                 ));
             }
             let plan = match EinsumPlan::build_for_opset(equation, &metadata, imported_opset) {
-                Ok(plan) => plan,
-                Err(error) if error.is_incomplete_metadata() => continue,
+                Ok(plan) => Some(plan),
+                Err(error) if error.is_incomplete_metadata() => {
+                    if let Some(shapes) = metadata
+                        .iter()
+                        .map(|input| input.shape())
+                        .collect::<Option<Vec<_>>>()
+                    {
+                        EinsumShapePlan::build_for_opset(equation, &shapes, imported_opset)
+                            .map_err(|error| LoaderError::InvalidEinsum {
+                                node: node_label(node),
+                                detail: error.to_string(),
+                            })?;
+                    }
+                    None
+                }
                 Err(error) => {
                     return Err(LoaderError::InvalidEinsum {
                         node: node_label(node),
@@ -490,18 +505,40 @@ pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
                 }
             };
             if let Some(&output_id) = node.outputs.first()
+                && graph.value_type_is_known(output_id)
                 && let Some(output) = graph.values.get(output_id)
-                && output.dtype != onnx_runtime_ir::DataType::Undefined
-                && output.dtype != plan.dtype()
             {
-                return Err(LoaderError::InvalidEinsum {
-                    node: node_label(node),
-                    detail: format!(
-                        "output dtype {:?} does not match homogeneous input dtype {:?}",
-                        output.dtype,
-                        plan.dtype()
-                    ),
-                });
+                let schema = EinsumSchema::resolve(imported_opset).map_err(|error| {
+                    LoaderError::InvalidEinsum {
+                        node: node_label(node),
+                        detail: error.to_string(),
+                    }
+                })?;
+                if !schema.supports_dtype(output.dtype) {
+                    return Err(LoaderError::InvalidEinsum {
+                        node: node_label(node),
+                        detail: format!(
+                            "output dtype {:?} is not admitted by {schema}; cast the output and \
+                             every operand to one homogeneous schema-supported dtype",
+                            output.dtype
+                        ),
+                    });
+                }
+                let input_dtype = plan
+                    .as_ref()
+                    .map(EinsumPlan::dtype)
+                    .or_else(|| metadata.iter().find_map(|input| input.dtype()));
+                if let Some(input_dtype) = input_dtype
+                    && output.dtype != input_dtype
+                {
+                    return Err(LoaderError::InvalidEinsum {
+                        node: node_label(node),
+                        detail: format!(
+                            "output dtype {:?} does not match known homogeneous input dtype {:?}",
+                            output.dtype, input_dtype
+                        ),
+                    });
+                }
             }
         }
         for subgraph in graph.subgraphs.values() {

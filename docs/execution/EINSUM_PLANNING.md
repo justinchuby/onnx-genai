@@ -29,6 +29,14 @@ Evidence is pinned to ONNX main commit
 `Einsum-12`-compatible source entry points. Imported-model paths use
 `build_for_opset` or resolve `EinsumSchema` and call `build_for_schema`.
 
+Loader validation distinguishes declared metadata from graph-construction
+placeholders through `Graph::value_type_is_known` and
+`Graph::value_shape_is_known`. A placeholder `Float32`/empty shape is never
+treated as a declared scalar. Known dtypes (including a declared output dtype)
+and every provable known-shape constraint are still validated when other
+metadata is absent; only facts that require the missing rank, dimensions, or
+dtype are deferred to shape inference and runtime validation.
+
 ## Universal semantics
 
 Every legal equation produces an `EinsumSemanticPlan` and a mandatory
@@ -58,9 +66,11 @@ optimization subtype over the same semantic/index program.
 
 ## General contraction trees
 
-Every multi-operand semantic plan also publishes a bounded binary contraction
-tree, including outer/Hadamard products even when a simpler execution class is
-available.
+Every multi-operand semantic plan publishes either a bounded binary contraction
+candidate set or an explicit `GenericNativeFallback` planner result, including
+outer/Hadamard products even when a simpler execution class is available. The
+fallback is an optimization decision, never a semantic rejection: the universal
+index program remains complete for arbitrary operand counts.
 
 Each intermediate records:
 
@@ -87,12 +97,31 @@ The default `EinsumPlannerBudget` is explicit:
 - at most 64 DP states;
 - at most 4096 exact candidates;
 - at most 64 logical axes on the exact path;
-- at most 4096 pair evaluations on the deterministic greedy path.
+- at most 4096 total greedy work units, including a conservative reservation
+  for tree nodes, source-leaf membership, stable IDs, lowering metadata, and
+  pair scoring.
 
 If any exact-path bound is exceeded, planning switches to the bounded stable
-greedy heuristic. `EinsumPlannerQuality` and `EinsumPlannerUsage` publish the
-selected mode and actual state/candidate/axis use. Candidate IDs are stable
-lexicographic tree expressions and are the final tie-break.
+greedy heuristic. Exact enumeration has an additional hard structural ceiling
+of `EinsumPlannerBudget::MAX_EXACT_TREE_OPERANDS` (eight), exact retained
+metadata is bounded by
+`max_candidates * EinsumPlannerBudget::EXACT_METADATA_UNITS_PER_CANDIDATE`,
+and contraction depth is capped by
+`EinsumPlannerBudget::MAX_CONTRACTION_TREE_DEPTH` (64). If the greedy work,
+metadata, or depth bound cannot represent a candidate, the plan reports
+`GenericNativeFallback`, zero tree candidates, and zero tree metadata while
+retaining arbitrary-N semantics through `EinsumGenericNativePlan`.
+
+`EinsumPlannerQuality` and `EinsumPlannerUsage` publish the selected mode,
+state/candidate/axis use, total work, metadata units, maximum depth, and public
+candidate-ID bytes. `fallback_reason()` distinguishes a work/metadata budget
+decision, the depth ceiling, and checked bookkeeping overflow. Candidate IDs
+are constructed incrementally once, remain stable lexicographic tree
+expressions for materialized candidates, and are the final tie-break.
+Equal-cost greedy merges prefer shallower trees before the ID tie-break, so tied
+unit-extent products remain balanced rather than producing a skew chain.
+Lowering walks the bounded tree in iterative post-order; it does not recurse
+with operand count.
 
 Static and concrete costs use checked `u128`: FLOPs, unary/product work,
 intermediate elements/bytes, peak live bytes, temporary traffic,

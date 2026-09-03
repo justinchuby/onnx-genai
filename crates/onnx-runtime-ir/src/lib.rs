@@ -75,10 +75,11 @@ pub use einsum::{
     EinsumExecutionSelection, EinsumGemmGeometry, EinsumGenericNativePlan, EinsumIndexProgram,
     EinsumInput, EinsumIntegerOverflowSemantics, EinsumLabel, EinsumLogicalAxis, EinsumOperandAxis,
     EinsumOperandIndexProgram, EinsumOperandPlan, EinsumOverflowTarget, EinsumPermutationPlan,
-    EinsumPlan, EinsumPlanError, EinsumPlanErrorKind, EinsumPlannerBudget, EinsumPlannerQuality,
-    EinsumPlannerUsage, EinsumPrecisionPolicy, EinsumReductionPlan, EinsumResolveError,
-    EinsumResolvedContractionCost, EinsumSchema, EinsumSchemaError, EinsumSemanticPlan,
-    EinsumShapePlan, EinsumSupportedContractionTreeCandidate, EinsumTemporaryStoragePolicy,
+    EinsumPlan, EinsumPlanError, EinsumPlanErrorKind, EinsumPlannerBudget,
+    EinsumPlannerFallbackReason, EinsumPlannerQuality, EinsumPlannerUsage, EinsumPrecisionPolicy,
+    EinsumReductionPlan, EinsumResolveError, EinsumResolvedContractionCost, EinsumSchema,
+    EinsumSchemaError, EinsumSemanticPlan, EinsumShapePlan,
+    EinsumSupportedContractionTreeCandidate, EinsumTemporaryStoragePolicy,
     EinsumTemporaryValuePlan, EinsumUnaryReductionPlan, EinsumValueId,
 };
 pub use error::{GraphError, IrError, Result};

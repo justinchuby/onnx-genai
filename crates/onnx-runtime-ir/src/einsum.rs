@@ -22,9 +22,10 @@ pub use tree::{
     EinsumContractionTreeCandidateId, EinsumContractionTreeCandidatePlan,
     EinsumContractionTreeCandidateUnsupportedReason, EinsumContractionTreePlan,
     EinsumContractionTreeStep, EinsumCostBound, EinsumCostMetric, EinsumPlannerBudget,
-    EinsumPlannerQuality, EinsumPlannerUsage, EinsumResolvedContractionCost,
-    EinsumSupportedContractionTreeCandidate, EinsumTemporaryStoragePolicy,
-    EinsumTemporaryValuePlan, EinsumUnaryReductionPlan, EinsumValueId,
+    EinsumPlannerFallbackReason, EinsumPlannerQuality, EinsumPlannerUsage,
+    EinsumResolvedContractionCost, EinsumSupportedContractionTreeCandidate,
+    EinsumTemporaryStoragePolicy, EinsumTemporaryValuePlan, EinsumUnaryReductionPlan,
+    EinsumValueId,
 };
 
 /// The ONNX `Einsum` schema selected by the imported `ai.onnx` opset.
@@ -881,7 +882,7 @@ pub enum EinsumPlanErrorKind {
     InputDtypeMismatch {
         /// Input index.
         input: usize,
-        /// Dtype established by input 0.
+        /// Dtype established by the first available input type.
         expected: DataType,
         /// Rejected dtype.
         actual: DataType,
@@ -1082,7 +1083,7 @@ impl fmt::Display for EinsumPlanError {
                 actual,
             } => write!(
                 f,
-                "input #{input} has dtype {actual:?}, but input #0 established dtype {expected:?}"
+                "input #{input} has dtype {actual:?}, but another known input established homogeneous dtype {expected:?}"
             ),
             EinsumPlanErrorKind::InputRankMismatch {
                 input,
@@ -1260,6 +1261,9 @@ impl EinsumPlan {
     ) -> Result<Self, EinsumPlanError> {
         let normalized = normalize_equation(equation);
         let parsed = ParsedEquation::parse(&normalized, inputs.len())?;
+        if inputs.iter().any(|input| input.shape.is_none()) {
+            validate_partial_input_shapes(&normalized, &parsed, inputs, schema, planner_budget)?;
+        }
         let (dtype, input_meta) = validate_inputs(&normalized, inputs, schema)?;
         let precision = EinsumPrecisionPolicy::for_dtype(dtype);
         let shape = build_shape_plan(normalized, parsed, input_meta, schema, planner_budget)?;
@@ -1977,17 +1981,132 @@ struct InputMeta {
     shape: Vec<EinsumDimension>,
 }
 
+fn validate_partial_input_shapes<D: EinsumDimensionValue>(
+    equation: &str,
+    parsed: &ParsedEquation,
+    inputs: &[EinsumInput<'_, D>],
+    schema: EinsumSchema,
+    planner_budget: EinsumPlannerBudget,
+) -> Result<(), EinsumPlanError> {
+    let mut known_ellipsis_rank = None;
+    for (input, (term, metadata)) in parsed.inputs.iter().zip(inputs).enumerate() {
+        let Some(shape) = metadata.shape else {
+            continue;
+        };
+        let named_labels = term.named_count().ok_or_else(|| {
+            EinsumPlanError::new(
+                equation,
+                EinsumPlanErrorKind::GeometryOverflow {
+                    target: EinsumOverflowTarget::Input(input),
+                },
+            )
+        })?;
+        let rank = shape.len();
+        let ellipsis_rank = if term.has_ellipsis {
+            rank.checked_sub(named_labels)
+        } else if rank == named_labels {
+            Some(0)
+        } else {
+            None
+        }
+        .ok_or_else(|| {
+            EinsumPlanError::new(
+                equation,
+                EinsumPlanErrorKind::InputRankMismatch {
+                    input,
+                    rank,
+                    named_labels,
+                    has_ellipsis: term.has_ellipsis,
+                },
+            )
+        })?;
+        if term.has_ellipsis {
+            if let Some((first_input, first_rank)) = known_ellipsis_rank {
+                if ellipsis_rank != first_rank {
+                    return Err(EinsumPlanError::new(
+                        equation,
+                        EinsumPlanErrorKind::EllipsisRankMismatch {
+                            first_input,
+                            first_rank,
+                            input,
+                            rank: ellipsis_rank,
+                        },
+                    ));
+                }
+            } else {
+                known_ellipsis_rank = Some((input, ellipsis_rank));
+            }
+        }
+    }
+
+    let assumed_ellipsis_rank = known_ellipsis_rank.map_or(0, |(_, rank)| rank);
+    let input_meta = parsed
+        .inputs
+        .iter()
+        .zip(inputs)
+        .enumerate()
+        .map(|(input, (term, metadata))| {
+            if let Some(shape) = metadata.shape {
+                return Ok(InputMeta {
+                    shape: shape
+                        .iter()
+                        .map(|dimension| {
+                            dimension
+                                .einsum_static_size()
+                                .map_or(EinsumDimension::Dynamic, EinsumDimension::Static)
+                        })
+                        .collect(),
+                });
+            }
+            let named_labels = term.named_count().ok_or_else(|| {
+                EinsumPlanError::new(
+                    equation,
+                    EinsumPlanErrorKind::GeometryOverflow {
+                        target: EinsumOverflowTarget::Input(input),
+                    },
+                )
+            })?;
+            let rank = named_labels
+                .checked_add(if term.has_ellipsis {
+                    assumed_ellipsis_rank
+                } else {
+                    0
+                })
+                .ok_or_else(|| {
+                    EinsumPlanError::new(
+                        equation,
+                        EinsumPlanErrorKind::GeometryOverflow {
+                            target: EinsumOverflowTarget::Input(input),
+                        },
+                    )
+                })?;
+            Ok(InputMeta {
+                shape: vec![EinsumDimension::Dynamic; rank],
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    build_shape_plan(
+        equation.to_owned(),
+        parsed.clone(),
+        input_meta,
+        schema,
+        planner_budget,
+    )
+    .map(drop)
+}
+
 fn validate_inputs<D: EinsumDimensionValue>(
     equation: &str,
     inputs: &[EinsumInput<'_, D>],
     schema: EinsumSchema,
 ) -> Result<(DataType, Vec<InputMeta>), EinsumPlanError> {
-    let mut result = Vec::with_capacity(inputs.len());
     let mut expected_dtype = None;
+    let mut missing_dtype = None;
     for (input, metadata) in inputs.iter().enumerate() {
-        let dtype = metadata.dtype.ok_or_else(|| {
-            EinsumPlanError::new(equation, EinsumPlanErrorKind::MissingInputDtype { input })
-        })?;
+        let Some(dtype) = metadata.dtype else {
+            missing_dtype.get_or_insert(input);
+            continue;
+        };
         if !schema.supports_dtype(dtype) {
             return Err(EinsumPlanError::new(
                 equation,
@@ -2012,6 +2131,16 @@ fn validate_inputs<D: EinsumDimensionValue>(
         } else {
             expected_dtype = Some(dtype);
         }
+    }
+    if let Some(input) = missing_dtype {
+        return Err(EinsumPlanError::new(
+            equation,
+            EinsumPlanErrorKind::MissingInputDtype { input },
+        ));
+    }
+
+    let mut result = Vec::with_capacity(inputs.len());
+    for (input, metadata) in inputs.iter().enumerate() {
         let shape = metadata.shape.ok_or_else(|| {
             EinsumPlanError::new(equation, EinsumPlanErrorKind::MissingInputShape { input })
         })?;
@@ -3301,6 +3430,33 @@ mod tests {
         assert!(matches!(
             error_kind("i->i", &missing_shape),
             EinsumPlanErrorKind::MissingInputShape { input: 0 }
+        ));
+
+        let known_invalid_after_unknown = [
+            EinsumInput::<usize>::from_optional(None, None),
+            EinsumInput::<usize>::from_optional(Some(DataType::Bool), None),
+        ];
+        assert!(matches!(
+            error_kind("i,i->i", &known_invalid_after_unknown),
+            EinsumPlanErrorKind::UnsupportedInputDtype {
+                input: 1,
+                dtype: DataType::Bool,
+                ..
+            }
+        ));
+
+        let invalid_known_shape_before_unknown = [
+            EinsumInput::from_optional(Some(DataType::Float32), Some(&[2usize, 3][..])),
+            EinsumInput::<usize>::from_optional(Some(DataType::Float32), None),
+        ];
+        assert!(matches!(
+            error_kind("i,j->ij", &invalid_known_shape_before_unknown),
+            EinsumPlanErrorKind::InputRankMismatch {
+                input: 0,
+                rank: 2,
+                named_labels: 1,
+                ..
+            }
         ));
 
         let unsupported = [EinsumInput::new(DataType::Bool, &shape)];

@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use onnx_runtime_ir::{
     DataType, EinsumAxis, EinsumBinaryLowering, EinsumContractionCost, EinsumContractionTreeStep,
     EinsumCostBound, EinsumExecutionSelection, EinsumInput, EinsumIntegerOverflowSemantics,
-    EinsumPlan, EinsumPlanErrorKind, EinsumPlannerBudget, EinsumPlannerQuality, EinsumSchema,
-    EinsumTemporaryStoragePolicy,
+    EinsumPlan, EinsumPlanErrorKind, EinsumPlannerBudget, EinsumPlannerFallbackReason,
+    EinsumPlannerQuality, EinsumSchema, EinsumTemporaryStoragePolicy,
 };
 
 type LegalCase<'a> = (&'a str, Vec<&'a [usize]>, Vec<usize>);
@@ -168,7 +168,7 @@ fn every_required_legal_equation_has_generic_native_semantics() {
 
 #[test]
 fn arbitrary_four_eight_and_sixteen_operand_equations_are_bounded() {
-    for arity in [4usize, 8, 16] {
+    for arity in [4usize, 5, 8, 16] {
         let equation = format!(
             "{}->",
             std::iter::repeat_n("i", arity)
@@ -414,10 +414,25 @@ fn exact_subset_dp_matches_independent_brute_force_tree_enumerator() {
             .map(|candidate| candidate.id().as_str().to_string())
             .collect::<BTreeSet<_>>();
         assert_eq!(actual, brute_tree_ids(&(0..arity).collect::<Vec<_>>()));
-        assert_eq!(tree(&plan).quality(), EinsumPlannerQuality::ExactSubsetDp);
+        let tree = tree(&plan);
+        assert_eq!(tree.quality(), EinsumPlannerQuality::ExactSubsetDp);
+        assert!(tree.usage().max_depth() < arity);
+        assert_eq!(
+            tree.usage().candidate_id_bytes(),
+            tree.candidates()
+                .iter()
+                .map(|candidate| candidate.id().as_str().len())
+                .sum::<usize>()
+        );
+        assert!(tree.usage().work() >= tree.usage().metadata_units());
+        assert!(tree.usage().candidates() <= tree.usage().budget().max_candidates);
+        assert!(
+            tree.usage().metadata_units()
+                <= tree.usage().budget().exact_metadata_units_limit().unwrap()
+        );
         if arity == 4 {
             assert_eq!(
-                tree(&plan).preferred_candidate().unwrap().id().as_str(),
+                tree.preferred_candidate().unwrap().id().as_str(),
                 actual.first().unwrap(),
                 "symmetric equal-cost trees use the stable lexicographic tie-break"
             );
@@ -521,9 +536,108 @@ fn large_planning_is_deterministic_budgeted_and_stably_tied() {
             .unwrap();
     assert_eq!(
         tree(&forced).quality(),
+        EinsumPlannerQuality::GenericNativeFallback
+    );
+    assert_eq!(
+        tree(&forced).fallback_reason(),
+        Some(EinsumPlannerFallbackReason::WorkOrMetadataBudgetExceeded)
+    );
+    assert!(tree(&forced).candidates().is_empty());
+    assert_eq!(tree(&forced).usage().work(), 0);
+    assert_eq!(tree(&forced).usage().metadata_units(), 0);
+}
+
+#[test]
+fn tied_unit_extents_build_a_balanced_bounded_greedy_candidate() {
+    let arity = 20;
+    let equation = format!(
+        "{}->",
+        std::iter::repeat_n("i", arity)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let owned = vec![vec![1usize]; arity];
+    let shapes = owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let first = plan(EinsumSchema::V12, &equation, DataType::Float32, &shapes);
+    let second = plan(EinsumSchema::V12, &equation, DataType::Float32, &shapes);
+    let first_tree = tree(&first);
+    let second_tree = tree(&second);
+
+    assert_eq!(
+        first_tree.quality(),
         EinsumPlannerQuality::DeterministicGreedy
     );
-    assert!(tree(&forced).usage().candidates() <= 8);
+    assert_eq!(first_tree.usage(), second_tree.usage());
+    assert!(first_tree.usage().max_depth() <= 5);
+    assert!(first_tree.usage().max_depth() <= EinsumPlannerBudget::MAX_CONTRACTION_TREE_DEPTH);
+    assert!(first_tree.usage().work() <= first_tree.usage().budget().max_heuristic_candidates);
+    assert!(first_tree.usage().metadata_units() <= first_tree.usage().work());
+    let selected = first_tree.preferred_candidate().unwrap();
+    assert_eq!(
+        selected.id(),
+        second_tree.preferred_candidate().unwrap().id()
+    );
+    assert_eq!(
+        first_tree.usage().candidate_id_bytes(),
+        selected.id().as_str().len()
+    );
+    let selected = selected.supported().unwrap();
+    assert_eq!(
+        selected
+            .steps()
+            .iter()
+            .filter(|step| matches!(step, EinsumContractionTreeStep::BinaryContraction(_)))
+            .count(),
+        arity - 1
+    );
+    assert!(
+        selected
+            .temporaries()
+            .iter()
+            .map(|temporary| temporary.leaf_inputs().len())
+            .sum::<usize>()
+            <= arity * 6
+    );
+}
+
+#[test]
+fn hundreds_and_thousands_of_operands_use_zero_tree_metadata_fallback() {
+    let one = [1usize];
+    for arity in [256usize, 1024, 2048] {
+        let equation = format!(
+            "{}->",
+            std::iter::repeat_n("i", arity)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let inputs = vec![EinsumInput::new(DataType::Float32, &one); arity];
+        let plan = EinsumPlan::build_for_schema(&equation, &inputs, EinsumSchema::V12).unwrap();
+        let tree = tree(&plan);
+
+        assert_eq!(tree.quality(), EinsumPlannerQuality::GenericNativeFallback);
+        assert_eq!(
+            tree.fallback_reason(),
+            Some(EinsumPlannerFallbackReason::WorkOrMetadataBudgetExceeded)
+        );
+        assert!(tree.candidates().is_empty());
+        assert!(tree.preferred_candidate().is_none());
+        assert_eq!(tree.usage().states(), 0);
+        assert_eq!(tree.usage().candidates(), 0);
+        assert_eq!(tree.usage().work(), 0);
+        assert_eq!(tree.usage().metadata_units(), 0);
+        assert_eq!(tree.usage().max_depth(), 0);
+        assert_eq!(tree.usage().candidate_id_bytes(), 0);
+        assert_eq!(
+            plan.generic_native().index_program().operands().len(),
+            arity
+        );
+
+        let shapes = vec![&one[..]; arity];
+        assert_eq!(
+            plan.select_concrete_execution(&shapes, u128::MAX).unwrap(),
+            EinsumExecutionSelection::GenericNative
+        );
+    }
 }
 
 #[test]
