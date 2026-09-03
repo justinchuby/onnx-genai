@@ -187,6 +187,11 @@ algorithm's minimum A/B/C/D alignment so later launches cannot silently weaken
 that proof. F16/BF16 cuBLASLt selection excludes in-place and output-type
 split-K reductions, then verifies the selected split-K/reduction configuration;
 unsupported alignment or precision contracts fall back to `GenericNative`.
+One transactional arithmetic snapshot owns both the selected Auto route and all
+of its private device resources. Capture reuses that exact direct-or-semantic
+decision instead of redispatching, and every private pointer is checked against
+the active graph's registered ownership set before launch. Failed replacement
+warms leave the prior complete snapshot installed.
 F16/BF16 inputs and intermediates accumulate in f32 and narrow once at the final
 output. Integer arithmetic uses explicit unsigned intermediates and narrows
 after each operation, implementing exact declared-width modular arithmetic

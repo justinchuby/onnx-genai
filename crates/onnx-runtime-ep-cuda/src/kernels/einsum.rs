@@ -422,8 +422,7 @@ impl KernelFactory for EinsumFactory {
             runtime: self.runtime.clone(),
             input_shapes: input_shapes.to_vec(),
             plan,
-            execution: Mutex::new(None),
-            semantic_execution: Mutex::new(None),
+            arithmetic_execution: Mutex::new(None),
             view_metadata: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
             view_materialization: Mutex::new(None),
             view_alias_warmed: AtomicBool::new(false),
@@ -660,6 +659,119 @@ impl CachedGemm {
     fn algorithm_contract(&self) -> RowMajorGemmAlgorithmContract {
         self.plan.algorithm_contract()
     }
+
+    fn workspace_bytes(&self) -> usize {
+        self.plan.workspace_bytes()
+    }
+
+    fn workspace_ptr(&self) -> CUdeviceptr {
+        self.workspace
+            .as_ref()
+            .map_or(0, |workspace| workspace.ptr())
+    }
+
+    fn resource(&self) -> Option<DeviceGraphResource> {
+        self.workspace
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
+    }
+
+    fn require_capture_resource(&self, runtime: &CudaRuntime) -> Result<()> {
+        if let Some(resource) = self.resource() {
+            runtime.require_registered_address_capture(
+                resource.identity(),
+                "Einsum direct cuBLASLt workspace",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+enum ArithmeticExecution {
+    Direct(CachedExecution),
+    Semantic(CudaEinsumPlan),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArithmeticRequest {
+    route: EinsumRouteOverride,
+    memory_ceiling_bytes: u128,
+}
+
+#[derive(Clone, Copy)]
+struct ContractionPointers {
+    a: CUdeviceptr,
+    b: CUdeviceptr,
+    c: CUdeviceptr,
+}
+
+struct ArithmeticExecutionSnapshot {
+    request: ArithmeticRequest,
+    execution: ArithmeticExecution,
+}
+
+impl ArithmeticExecutionSnapshot {
+    fn matches(
+        &self,
+        request: ArithmeticRequest,
+        inputs: &[TensorView],
+        output: &mut TensorMut,
+        pointers: ContractionPointers,
+    ) -> Result<bool> {
+        if self.request != request {
+            return Ok(false);
+        }
+        match &self.execution {
+            ArithmeticExecution::Direct(cached) => {
+                if !cached.matches_metadata(inputs, output) {
+                    return Ok(false);
+                }
+                match &cached.kind {
+                    ExecutionKind::Gemm(gemm) => {
+                        gemm.supports(&cached.layout, pointers.a, pointers.b, pointers.c)
+                    }
+                    ExecutionKind::NoOp | ExecutionKind::ZeroFill => Ok(true),
+                }
+            }
+            ArithmeticExecution::Semantic(plan) => {
+                let requested = match request.route {
+                    EinsumRouteOverride::Auto => RequestedRoute::Auto,
+                    EinsumRouteOverride::GenericNative => RequestedRoute::GenericNative,
+                    EinsumRouteOverride::Optimized => RequestedRoute::Optimized,
+                    EinsumRouteOverride::CudaCublas => return Ok(false),
+                };
+                Ok(plan.matches(requested, request.memory_ceiling_bytes, inputs, output))
+            }
+        }
+    }
+
+    fn resources(&self) -> Vec<DeviceGraphResource> {
+        match &self.execution {
+            ArithmeticExecution::Direct(CachedExecution {
+                kind: ExecutionKind::Gemm(gemm),
+                ..
+            }) => gemm.resource().into_iter().collect(),
+            ArithmeticExecution::Direct(CachedExecution {
+                kind: ExecutionKind::NoOp | ExecutionKind::ZeroFill,
+                ..
+            }) => Vec::new(),
+            ArithmeticExecution::Semantic(plan) => plan.resources(),
+        }
+    }
+
+    fn require_capture_resources(&self, runtime: &CudaRuntime) -> Result<()> {
+        match &self.execution {
+            ArithmeticExecution::Direct(CachedExecution {
+                kind: ExecutionKind::Gemm(gemm),
+                ..
+            }) => gemm.require_capture_resource(runtime),
+            ArithmeticExecution::Direct(CachedExecution {
+                kind: ExecutionKind::NoOp | ExecutionKind::ZeroFill,
+                ..
+            }) => Ok(()),
+            ArithmeticExecution::Semantic(plan) => plan.require_capture_resources(runtime),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -684,8 +796,7 @@ pub struct EinsumKernel {
     runtime: Arc<CudaRuntime>,
     input_shapes: Vec<Vec<usize>>,
     plan: EinsumShapePlan,
-    execution: Mutex<Option<CachedExecution>>,
-    semantic_execution: Mutex<Option<CudaEinsumPlan>>,
+    arithmetic_execution: Mutex<Option<ArithmeticExecutionSnapshot>>,
     view_metadata: Mutex<PersistentMetadata>,
     view_materialization: Mutex<Option<ViewMaterialization>>,
     view_alias_warmed: AtomicBool,
@@ -965,7 +1076,6 @@ impl EinsumKernel {
         b: CUdeviceptr,
         c: CUdeviceptr,
     ) -> Result<CachedExecution> {
-        let start = Instant::now();
         let EinsumPlanningClassification::Gemm(contraction) = self.plan.planning_classification()
         else {
             unreachable!("compile_contraction is called only for GEMM plans");
@@ -981,6 +1091,8 @@ impl EinsumKernel {
         } else if layout.k == 0 {
             ExecutionKind::ZeroFill
         } else {
+            self.runtime
+                .staged_warm_cache_mutation("Einsum direct cuBLASLt planning")?;
             let params = StridedBatchedGemmParams {
                 dtype: einsum_dtype(dtype)?,
                 a,
@@ -1011,15 +1123,8 @@ impl EinsumKernel {
                     workspace_bytes,
                 )?)
             };
-            WORKSPACE_BYTES_LAST.store(workspace_bytes as u64, Ordering::Relaxed);
-            WORKSPACE_PTR_LAST.store(
-                workspace.as_ref().map_or(0, |workspace| workspace.ptr()),
-                Ordering::Relaxed,
-            );
             ExecutionKind::Gemm(CachedGemm { plan, workspace })
         };
-        SETUP_NS_LAST.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        PLAN_BUILDS.fetch_add(1, Ordering::Relaxed);
         Ok(CachedExecution {
             dtype,
             input_shapes: self.input_shapes.clone(),
@@ -1028,163 +1133,257 @@ impl EinsumKernel {
         })
     }
 
-    fn run_contraction(
+    fn build_arithmetic_execution(
+        &self,
+        dtype: DataType,
+        inputs: &[TensorView],
+        output: &mut TensorMut,
+        request: ArithmeticRequest,
+        pointers: ContractionPointers,
+    ) -> Result<ArithmeticExecutionSnapshot> {
+        let execution = match request.route {
+            EinsumRouteOverride::CudaCublas => {
+                if !self.fast_contraction_eligible(inputs, output) {
+                    return Err(not_implemented(format!(
+                        "Einsum `{}` cannot take the forced cuBLASLt route because its dtype, \
+                         strides, broadcast, diagonal, or output permutation does not satisfy the \
+                         descriptor contract",
+                        self.plan.equation()
+                    )));
+                }
+                ArithmeticExecution::Direct(
+                    self.compile_contraction(dtype, pointers.a, pointers.b, pointers.c)?,
+                )
+            }
+            EinsumRouteOverride::GenericNative => {
+                ArithmeticExecution::Semantic(CudaEinsumPlan::build(
+                    &self.plan,
+                    dtype,
+                    inputs,
+                    output,
+                    &self.runtime,
+                    RequestedRoute::GenericNative,
+                    request.memory_ceiling_bytes,
+                )?)
+            }
+            EinsumRouteOverride::Optimized => ArithmeticExecution::Semantic(CudaEinsumPlan::build(
+                &self.plan,
+                dtype,
+                inputs,
+                output,
+                &self.runtime,
+                RequestedRoute::Optimized,
+                request.memory_ceiling_bytes,
+            )?),
+            EinsumRouteOverride::Auto => {
+                if self.fast_contraction_eligible(inputs, output) {
+                    match self.compile_contraction(dtype, pointers.a, pointers.b, pointers.c) {
+                        Ok(execution) => ArithmeticExecution::Direct(execution),
+                        Err(_) => ArithmeticExecution::Semantic(CudaEinsumPlan::build(
+                            &self.plan,
+                            dtype,
+                            inputs,
+                            output,
+                            &self.runtime,
+                            RequestedRoute::Auto,
+                            request.memory_ceiling_bytes,
+                        )?),
+                    }
+                } else {
+                    ArithmeticExecution::Semantic(CudaEinsumPlan::build(
+                        &self.plan,
+                        dtype,
+                        inputs,
+                        output,
+                        &self.runtime,
+                        RequestedRoute::Auto,
+                        request.memory_ceiling_bytes,
+                    )?)
+                }
+            }
+        };
+        Ok(ArithmeticExecutionSnapshot { request, execution })
+    }
+
+    fn run_arithmetic(
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
-        fallback_to_generic: bool,
+        requested: EinsumRouteOverride,
+        memory_ceiling_bytes: u128,
     ) -> Result<()> {
         let dtype = self.validate_common(inputs, outputs)?;
-        if inputs.iter().any(|input| !input.is_contiguous()) || !outputs[0].is_contiguous() {
-            return Err(not_implemented(format!(
-                "Einsum `{}` GEMM/BMM contraction with non-contiguous input/output",
-                self.plan.equation()
-            )));
-        }
-        let output_context = format!(
-            "cuda_ep Einsum `{}` contraction output",
-            self.plan.equation()
-        );
-        let output_range = checked_nonnegative_strided_byte_range(
-            cuptr(outputs[0].data.0 as *const c_void),
-            outputs[0].byte_offset,
-            outputs[0].dtype,
-            outputs[0].shape,
-            outputs[0].strides,
-            &output_context,
-        )?;
-        for (index, input) in inputs.iter().enumerate() {
-            let input_context = format!(
-                "cuda_ep Einsum `{}` contraction input #{index}",
-                self.plan.equation()
-            );
-            let input_range = checked_nonnegative_strided_byte_range(
-                cuptr(input.data.0),
-                input.byte_offset,
-                input.dtype,
-                input.shape,
-                input.strides,
-                &input_context,
-            )?;
-            if overlaps(output_range, input_range) {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep Einsum `{}`: contraction output byte range {output_range:?} overlaps input #{index} byte range {input_range:?}; use non-overlapping storage",
-                    self.plan.equation()
-                )));
-            }
-        }
-        let a_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
-        let b_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
-        let c_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        self.validate_no_output_alias(inputs, &mut outputs[0])?;
+        let pointers = ContractionPointers {
+            a: inputs
+                .first()
+                .map(|input| cuptr(input.data_ptr::<u8>() as *const c_void))
+                .unwrap_or(0),
+            b: inputs
+                .get(1)
+                .map(|input| cuptr(input.data_ptr::<u8>() as *const c_void))
+                .unwrap_or(0),
+            c: cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void),
+        };
+        let request = ArithmeticRequest {
+            route: requested,
+            memory_ceiling_bytes,
+        };
         let capturing = self.runtime.is_capturing()?;
-        let mut execution = self.execution.lock().map_err(|_| {
+        let mut published = self.arithmetic_execution.lock().map_err(|_| {
             EpError::KernelFailed(format!(
-                "cuda_ep Einsum `{}`: execution-plan lock was poisoned",
+                "cuda_ep Einsum `{}`: arithmetic execution-snapshot lock was poisoned",
                 self.plan.equation()
             ))
         })?;
-        if execution
+        let cache_hit = published
             .as_ref()
-            .is_some_and(|cached| !cached.matches_metadata(inputs, &outputs[0]))
-        {
+            .map(|snapshot| snapshot.matches(request, inputs, &mut outputs[0], pointers))
+            .transpose()?
+            .unwrap_or(false);
+        if !cache_hit && capturing {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep Einsum `{}`: runtime dtype/shape/output changed after the immutable CUDA plan was built",
+                "cuda_ep Einsum `{}`: exact dtype/shape/stride/address/route and cuBLASLt \
+                 alignment snapshot was not warmed before CUDA graph capture",
                 self.plan.equation()
             )));
         }
-        let alignment_matches = match execution.as_ref() {
-            Some(cached) => match &cached.kind {
-                ExecutionKind::Gemm(gemm) => gemm.supports(&cached.layout, a_ptr, b_ptr, c_ptr)?,
-                ExecutionKind::NoOp | ExecutionKind::ZeroFill => true,
-            },
-            None => false,
-        };
-        let needs_compile = execution.is_none() || !alignment_matches;
-        let replacing = execution.is_some();
-        let compiled = if needs_compile {
-            if capturing {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep Einsum `{}`: exact dtype/shape/layout and cuBLASLt pointer-alignment \
-                     contract were not warmed before CUDA graph capture",
-                    self.plan.equation(),
-                )));
-            }
-            match self.compile_contraction(dtype, a_ptr, b_ptr, c_ptr) {
-                Ok(compiled) => Some(compiled),
-                Err(_) if fallback_to_generic => {
-                    drop(execution);
-                    return self.run_semantic(
-                        inputs,
-                        outputs,
-                        RequestedRoute::Auto,
-                        plan::DEFAULT_MEMORY_CEILING_BYTES,
-                    );
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
+
+        let start = Instant::now();
+        let candidate = if cache_hit {
             PLAN_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             None
+        } else {
+            Some(self.build_arithmetic_execution(
+                dtype,
+                inputs,
+                &mut outputs[0],
+                request,
+                pointers,
+            )?)
         };
-        let cached = execution
-            .as_ref()
-            .or(compiled.as_ref())
-            .expect("an existing or staged contraction plan is present");
-        if cached.layout.output_shape.as_slice() != outputs[0].shape {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep Einsum `{}`: output shape {:?}, expected {:?}",
-                self.plan.equation(),
-                outputs[0].shape,
-                cached.layout.output_shape
-            )));
+        let prepared = if cache_hit {
+            published.as_ref()
+        } else {
+            candidate.as_ref()
+        }
+        .expect("an existing or staged arithmetic snapshot is present");
+        if capturing {
+            prepared.require_capture_resources(&self.runtime)?;
         }
 
-        match &cached.kind {
-            ExecutionKind::NoOp => {}
-            ExecutionKind::ZeroFill => {
-                self.runtime.bind()?;
-                // SAFETY: C covers the validated contiguous output byte length;
-                // the memset is stream-ordered and capture-safe.
-                unsafe {
-                    cudarc::driver::result::memset_d8_async(
-                        c_ptr,
+        let (route, workspace_bytes, workspace_ptr, metadata_bytes, capture_launches) =
+            match &prepared.execution {
+                ArithmeticExecution::Direct(cached) => {
+                    if cached.layout.output_shape.as_slice() != outputs[0].shape {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep Einsum `{}`: output shape {:?}, expected {:?}",
+                            self.plan.equation(),
+                            outputs[0].shape,
+                            cached.layout.output_shape
+                        )));
+                    }
+                    let (workspace_bytes, workspace_ptr, contract) = match &cached.kind {
+                        ExecutionKind::NoOp => (0, 0, None),
+                        ExecutionKind::ZeroFill => {
+                            self.runtime.bind()?;
+                            // SAFETY: C covers the validated contiguous output byte length;
+                            // the memset is stream-ordered and capture-safe.
+                            unsafe {
+                                cudarc::driver::result::memset_d8_async(
+                                    pointers.c,
+                                    0,
+                                    outputs[0].byte_size(),
+                                    self.runtime.stream_ptr(),
+                                )
+                            }
+                            .map_err(|error| {
+                                driver_err("zero-fill empty Einsum contraction", error)
+                            })?;
+                            ZERO_FILL_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                            (0, 0, None)
+                        }
+                        ExecutionKind::Gemm(gemm) => {
+                            gemm.launch(
+                                &cached.layout,
+                                &self.runtime,
+                                pointers.a,
+                                pointers.b,
+                                pointers.c,
+                            )?;
+                            GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                            if cached.layout.left_order == StorageOrder::Transposed
+                                || cached.layout.right_order == StorageOrder::Transposed
+                            {
+                                DESCRIPTOR_TRANSPOSE_GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                CANONICAL_GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                            }
+                            (
+                                gemm.workspace_bytes(),
+                                gemm.workspace_ptr(),
+                                Some(gemm.algorithm_contract()),
+                            )
+                        }
+                    };
+                    *LAST_CUBLAS_ALGORITHM_CONTRACT
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = contract;
+                    (
+                        CudaEinsumRoute::CudaCublas,
+                        workspace_bytes,
+                        workspace_ptr,
                         0,
-                        outputs[0].byte_size(),
-                        self.runtime.stream_ptr(),
+                        1,
                     )
                 }
-                .map_err(|error| driver_err("zero-fill empty Einsum contraction", error))?;
-                ZERO_FILL_LAUNCHES.fetch_add(1, Ordering::Relaxed);
-            }
-            ExecutionKind::Gemm(gemm) => {
-                gemm.launch(&cached.layout, &self.runtime, a_ptr, b_ptr, c_ptr)?;
-                GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
-                if cached.layout.left_order == StorageOrder::Transposed
-                    || cached.layout.right_order == StorageOrder::Transposed
-                {
-                    DESCRIPTOR_TRANSPOSE_GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    CANONICAL_GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                ArithmeticExecution::Semantic(plan) => {
+                    plan.launch(&self.runtime)?;
+                    let summary = plan.summary();
+                    match summary.route {
+                        CudaEinsumRoute::GenericNative => {
+                            GENERIC_NATIVE_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        CudaEinsumRoute::OptimizedDp | CudaEinsumRoute::OptimizedHeuristic => {
+                            OPTIMIZED_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                            OPTIMIZED_STEP_LAUNCHES
+                                .fetch_add(summary.kernel_launches as u64, Ordering::Relaxed);
+                            OPTIMIZED_CUBLAS_LAUNCHES
+                                .fetch_add(summary.cublas_launches as u64, Ordering::Relaxed);
+                        }
+                        CudaEinsumRoute::ViewAlias
+                        | CudaEinsumRoute::ViewMaterialized
+                        | CudaEinsumRoute::CudaCublas => {
+                            unreachable!(
+                                "semantic plan cannot report a view or direct cuBLAS route"
+                            )
+                        }
+                    }
+                    (
+                        summary.route,
+                        summary.workspace_bytes,
+                        plan.workspace_ptr(),
+                        summary.metadata_bytes,
+                        summary.kernel_launches as u64,
+                    )
                 }
-            }
-        };
-        *LAST_CUBLAS_ALGORITHM_CONTRACT
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = match &cached.kind {
-            ExecutionKind::Gemm(gemm) => Some(gemm.algorithm_contract()),
-            ExecutionKind::NoOp | ExecutionKind::ZeroFill => None,
-        };
-        if capturing {
-            CAPTURE_RECORDINGS.fetch_add(1, Ordering::Relaxed);
-        }
-        if let Some(compiled) = compiled {
-            if replacing {
+            };
+        if let Some(candidate) = candidate {
+            if published.is_some() {
                 PLAN_REWARMS.fetch_add(1, Ordering::Relaxed);
             }
-            *execution = Some(compiled);
+            *published = Some(candidate);
+            PLAN_BUILDS.fetch_add(1, Ordering::Relaxed);
+            SETUP_NS_LAST.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        WORKSPACE_BYTES_LAST.store(workspace_bytes as u64, Ordering::Relaxed);
+        WORKSPACE_PTR_LAST.store(workspace_ptr, Ordering::Relaxed);
+        PERSISTENT_METADATA_BYTES_LAST.store(metadata_bytes as u64, Ordering::Relaxed);
+        self.record_route(route);
+        if capturing {
+            CAPTURE_RECORDINGS.fetch_add(capture_launches, Ordering::Relaxed);
         }
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
-        self.record_route(CudaEinsumRoute::CudaCublas);
         Ok(())
     }
 
@@ -1193,7 +1392,10 @@ impl EinsumKernel {
         inputs: &[TensorView],
         output: &mut TensorMut,
     ) -> Result<()> {
-        let output_context = format!("cuda_ep Einsum `{}` generic output", self.plan.equation());
+        let output_context = format!(
+            "cuda_ep Einsum `{}` arithmetic output",
+            self.plan.equation()
+        );
         let output_range = checked_strided_byte_range(
             cuptr(output.data.0 as *const c_void),
             output.byte_offset,
@@ -1204,7 +1406,7 @@ impl EinsumKernel {
         )?;
         for (index, input) in inputs.iter().enumerate() {
             let input_context = format!(
-                "cuda_ep Einsum `{}` generic input #{index}",
+                "cuda_ep Einsum `{}` arithmetic input #{index}",
                 self.plan.equation()
             );
             let input_range = checked_strided_byte_range(
@@ -1224,94 +1426,6 @@ impl EinsumKernel {
                 )));
             }
         }
-        Ok(())
-    }
-
-    fn run_semantic(
-        &self,
-        inputs: &[TensorView],
-        outputs: &mut [TensorMut],
-        requested: RequestedRoute,
-        memory_ceiling_bytes: u128,
-    ) -> Result<()> {
-        let dtype = self.validate_common(inputs, outputs)?;
-        self.validate_no_output_alias(inputs, &mut outputs[0])?;
-        let capturing = self.runtime.is_capturing()?;
-        let mut execution = self.semantic_execution.lock().map_err(|_| {
-            EpError::KernelFailed(format!(
-                "cuda_ep Einsum `{}`: semantic-plan lock was poisoned",
-                self.plan.equation()
-            ))
-        })?;
-        let cache_hit = execution.as_ref().is_some_and(|plan| {
-            plan.matches(requested, memory_ceiling_bytes, inputs, &mut outputs[0])
-        });
-        if !cache_hit && capturing {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep Einsum `{}`: exact dtype/shape/stride/address/route signature was not \
-                 warmed before CUDA graph capture",
-                self.plan.equation()
-            )));
-        }
-
-        let start = Instant::now();
-        let candidate = if cache_hit {
-            PLAN_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-            None
-        } else {
-            Some(CudaEinsumPlan::build(
-                &self.plan,
-                dtype,
-                inputs,
-                &mut outputs[0],
-                &self.runtime,
-                requested,
-                memory_ceiling_bytes,
-            )?)
-        };
-        let prepared = execution
-            .as_ref()
-            .or(candidate.as_ref())
-            .expect("a cached or staged CUDA Einsum plan is present");
-        if capturing {
-            prepared.require_capture_resources(&self.runtime)?;
-        }
-        prepared.launch(&self.runtime)?;
-        let summary = prepared.summary();
-        let workspace_ptr = prepared.workspace_ptr();
-        if let Some(candidate) = candidate {
-            if execution.is_some() {
-                PLAN_REWARMS.fetch_add(1, Ordering::Relaxed);
-            }
-            *execution = Some(candidate);
-            PLAN_BUILDS.fetch_add(1, Ordering::Relaxed);
-            SETUP_NS_LAST.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
-        match summary.route {
-            CudaEinsumRoute::GenericNative => {
-                GENERIC_NATIVE_LAUNCHES.fetch_add(1, Ordering::Relaxed);
-            }
-            CudaEinsumRoute::OptimizedDp | CudaEinsumRoute::OptimizedHeuristic => {
-                OPTIMIZED_LAUNCHES.fetch_add(1, Ordering::Relaxed);
-                OPTIMIZED_STEP_LAUNCHES
-                    .fetch_add(summary.kernel_launches as u64, Ordering::Relaxed);
-                OPTIMIZED_CUBLAS_LAUNCHES
-                    .fetch_add(summary.cublas_launches as u64, Ordering::Relaxed);
-            }
-            CudaEinsumRoute::ViewAlias
-            | CudaEinsumRoute::ViewMaterialized
-            | CudaEinsumRoute::CudaCublas => {
-                unreachable!("semantic plan cannot report a view or direct cuBLAS route")
-            }
-        }
-        WORKSPACE_BYTES_LAST.store(summary.workspace_bytes as u64, Ordering::Relaxed);
-        WORKSPACE_PTR_LAST.store(workspace_ptr, Ordering::Relaxed);
-        PERSISTENT_METADATA_BYTES_LAST.store(summary.metadata_bytes as u64, Ordering::Relaxed);
-        self.record_route(summary.route);
-        if capturing {
-            CAPTURE_RECORDINGS.fetch_add(summary.kernel_launches as u64, Ordering::Relaxed);
-        }
-        self.last_call_capture_safe.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1524,28 +1638,10 @@ impl EinsumKernel {
         memory_ceiling_bytes: u128,
     ) -> Result<()> {
         match route {
-            EinsumRouteOverride::GenericNative => self.run_semantic(
-                inputs,
-                outputs,
-                RequestedRoute::GenericNative,
-                memory_ceiling_bytes,
-            ),
-            EinsumRouteOverride::Optimized => self.run_semantic(
-                inputs,
-                outputs,
-                RequestedRoute::Optimized,
-                memory_ceiling_bytes,
-            ),
-            EinsumRouteOverride::CudaCublas => {
-                if !self.fast_contraction_eligible(inputs, &outputs[0]) {
-                    return Err(not_implemented(format!(
-                        "Einsum `{}` cannot take the forced cuBLASLt route because its dtype, \
-                         strides, broadcast, diagonal, or output permutation does not satisfy the \
-                         descriptor contract",
-                        self.plan.equation()
-                    )));
-                }
-                self.run_contraction(inputs, outputs, false)
+            EinsumRouteOverride::GenericNative
+            | EinsumRouteOverride::Optimized
+            | EinsumRouteOverride::CudaCublas => {
+                self.run_arithmetic(inputs, outputs, route, memory_ceiling_bytes)
             }
             EinsumRouteOverride::Auto => match self.plan.planning_classification() {
                 EinsumPlanningClassification::ViewOnlyPermutation(_)
@@ -1555,12 +1651,7 @@ impl EinsumKernel {
                 {
                     self.run_view(inputs, outputs)
                 }
-                EinsumPlanningClassification::Gemm(_)
-                    if self.fast_contraction_eligible(inputs, &outputs[0]) =>
-                {
-                    self.run_contraction(inputs, outputs, true)
-                }
-                _ => self.run_semantic(inputs, outputs, RequestedRoute::Auto, memory_ceiling_bytes),
+                _ => self.run_arithmetic(inputs, outputs, route, memory_ceiling_bytes),
             },
         }
     }
@@ -1611,45 +1702,25 @@ impl Kernel for EinsumKernel {
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
         let mut resources = Vec::with_capacity(2);
-        if let Ok(execution) = self.execution.lock()
-            && let Some(CachedExecution {
-                kind: ExecutionKind::Gemm(gemm),
-                ..
-            }) = execution.as_ref()
-            && let Some(workspace) = gemm.workspace.as_ref()
+        if let Ok(execution) = self.arithmetic_execution.lock()
+            && let Some(execution) = execution.as_ref()
         {
-            resources.push(GraphDeviceAllocation::device_graph_resource(workspace));
+            resources.extend(execution.resources());
         }
         if let Ok(metadata) = self.view_metadata.lock()
             && let Some(resource) = metadata.device_graph_resource()
         {
             resources.push(resource);
         }
-        if let Ok(execution) = self.semantic_execution.lock()
-            && let Some(execution) = execution.as_ref()
-        {
-            resources.extend(execution.resources());
-        }
         resources
     }
 
     fn capture_support(&self) -> CaptureSupport {
-        let semantic_warmed = self
-            .semantic_execution
+        let arithmetic_warmed = self
+            .arithmetic_execution
             .lock()
             .is_ok_and(|execution| execution.is_some());
-        let last_route = self.last_route.lock().ok().and_then(|route| *route);
-        if semantic_warmed
-            && matches!(
-                last_route,
-                Some(
-                    CudaEinsumRoute::GenericNative
-                        | CudaEinsumRoute::OptimizedDp
-                        | CudaEinsumRoute::OptimizedHeuristic
-                )
-            )
-            && self.last_call_capture_safe.load(Ordering::Relaxed)
-        {
+        if arithmetic_warmed && self.last_call_capture_safe.load(Ordering::Relaxed) {
             return CaptureSupport::Supported;
         }
         match self.plan.planning_classification() {
@@ -1684,27 +1755,12 @@ impl Kernel for EinsumKernel {
                     )),
                 }
             }
-            EinsumPlanningClassification::Gemm(_) => match self.execution.lock() {
-                Ok(execution)
-                    if execution.is_some()
-                        && self.last_call_capture_safe.load(Ordering::Relaxed) =>
-                {
-                    CaptureSupport::Supported
-                }
-                Ok(_) => CaptureSupport::unsupported(format!(
-                    "Einsum `{}` must warm its exact dtype/shape/layout and persistent cuBLASLt workspace before capture",
-                    self.plan.equation()
-                )),
-                Err(_) => CaptureSupport::unsupported(format!(
-                    "Einsum `{}` execution-plan lock was poisoned",
-                    self.plan.equation()
-                )),
-            },
-            EinsumPlanningClassification::ContractionTree(_)
+            EinsumPlanningClassification::Gemm(_)
+            | EinsumPlanningClassification::ContractionTree(_)
             | EinsumPlanningClassification::ReductionOrElementwise(_) => {
                 CaptureSupport::unsupported(format!(
-                    "Einsum `{}` must warm its exact GenericNative/optimized \
-                     dtype/shape/stride/address signature before capture",
+                    "Einsum `{}` must warm its exact arithmetic route, dtype/shape/stride/address \
+                     signature, and private resources before capture",
                     self.plan.equation()
                 ))
             }

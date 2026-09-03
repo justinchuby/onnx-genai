@@ -845,7 +845,7 @@ fn misaligned_contiguous_subviews_use_a_proven_cublaslt_alignment_contract() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn forced_f16_cublaslt_narrows_once_after_f32_reduction() {
+fn forced_f16_cublaslt_narrows_once_and_rejects_unregistered_workspace_capture() {
     let _lock = suite_lock();
     let ep = require_cuda();
     let runtime = ep.runtime();
@@ -909,12 +909,11 @@ fn forced_f16_cublaslt_narrows_once_after_f32_reduction() {
             )],
             route,
         )
-        .unwrap();
     };
 
-    execute(EinsumRouteOverride::GenericNative, &mut generic_output);
+    execute(EinsumRouteOverride::GenericNative, &mut generic_output).unwrap();
     reset_einsum_execution_stats();
-    execute(EinsumRouteOverride::CudaCublas, &mut cublas_output);
+    execute(EinsumRouteOverride::CudaCublas, &mut cublas_output).unwrap();
     runtime.synchronize().unwrap();
 
     let mut generic_bytes = vec![0u8; 2];
@@ -962,10 +961,174 @@ fn forced_f16_cublaslt_narrows_once_after_f32_reduction() {
          output_type_partials=0x{output_type_partials:04x}"
     );
 
+    #[cfg(feature = "gpu-tests")]
+    if einsum_execution_stats().workspace_bytes != 0 {
+        assert_eq!(
+            kernel.device_graph_resources().len(),
+            1,
+            "the direct cuBLASLt workspace must be exposed as a graph resource"
+        );
+        runtime.test_begin_unregistered_graph_capture().unwrap();
+        let error = execute(EinsumRouteOverride::CudaCublas, &mut cublas_output)
+            .expect_err("unregistered capture must reject a private cuBLASLt workspace");
+        assert!(
+            error.to_string().contains("no registered ownership token"),
+            "{error}"
+        );
+        runtime.test_end_unregistered_graph_capture().unwrap();
+
+        runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+        execute(EinsumRouteOverride::CudaCublas, &mut cublas_output).unwrap();
+        runtime.end_graph_capture().unwrap();
+        let counts_before_drop = runtime.allocation_counts();
+        drop(kernel);
+        assert_eq!(
+            runtime.allocation_counts(),
+            counts_before_drop,
+            "the installed graph must retain the direct cuBLASLt workspace after kernel drop"
+        );
+        runtime.replay_graph().unwrap();
+        runtime.synchronize().unwrap();
+        let mut replay_bytes = vec![0u8; 2];
+        unsafe {
+            runtime
+                .dtoh(&mut replay_bytes, cuptr(cublas_output.as_ptr()))
+                .unwrap();
+        }
+        assert_eq!(
+            u16::from_ne_bytes(replay_bytes.try_into().unwrap()),
+            narrow_once
+        );
+        assert!(runtime.reset_graph().unwrap());
+        eprintln!(
+            "CUDA_EINSUM_DIRECT_WORKSPACE_CAPTURE workspace_bytes={} \
+             unregistered=rejected registered_replay_after_drop=ok",
+            einsum_execution_stats().workspace_bytes
+        );
+    }
+
     ep.deallocate(a).unwrap();
     ep.deallocate(b).unwrap();
     ep.deallocate(generic_output).unwrap();
     ep.deallocate(cublas_output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn auto_fallback_snapshot_is_reused_for_capture_and_replay() {
+    #[cfg(feature = "gpu-tests")]
+    auto_fallback_snapshot_is_reused_for_capture_and_replay_gpu();
+}
+
+#[cfg(feature = "gpu-tests")]
+fn auto_fallback_snapshot_is_reused_for_capture_and_replay_gpu() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let input_shapes = [vec![16usize, 64], vec![64usize, 8]];
+    let output_shape = [16usize, 8];
+    let (kernel, inputs, buffers, mut output) =
+        make_direct_kernel(&ep, "ik,kj->ij", &input_shapes, &output_shape);
+    let input_strides = inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect::<Vec<_>>();
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let views = inputs
+        .iter()
+        .zip(&buffers)
+        .zip(&input_strides)
+        .map(|((input, buffer), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                input.dtype,
+                &input.shape,
+                strides,
+                ep.device_id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let execute = |output: &mut onnx_runtime_ep_api::DeviceBuffer| {
+        kernel.execute(
+            &views,
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+        )
+    };
+
+    reset_einsum_execution_stats();
+    runtime.fail_warm_transaction_at_for_test(1);
+    execute(&mut output).unwrap();
+    let warm = einsum_execution_stats();
+    let fallback_route = warm
+        .last_route
+        .expect("Auto fallback warm must publish a route");
+    assert_ne!(
+        fallback_route,
+        onnx_runtime_ep_cuda::CudaEinsumRoute::CudaCublas,
+        "faulted direct planning must publish the semantic fallback route"
+    );
+    assert_eq!(warm.plan_builds, 1);
+    assert!(kernel.capture_support().is_supported());
+
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute(&mut output).unwrap();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+    runtime.synchronize().unwrap();
+    let captured = einsum_execution_stats();
+    assert_eq!(captured.last_route, Some(fallback_route));
+    assert_eq!(
+        captured.plan_builds, 1,
+        "capture must consume the warmed Auto fallback snapshot"
+    );
+    assert!(captured.plan_cache_hits >= 1);
+    eprintln!(
+        "CUDA_EINSUM_AUTO_FALLBACK_CAPTURE route={fallback_route:?} \
+         builds={} cache_hits={}",
+        captured.plan_builds, captured.plan_cache_hits
+    );
+
+    let mut bytes = vec![0u8; output_shape.iter().product::<usize>() * 4];
+    unsafe { runtime.dtoh(&mut bytes, cuptr(output.as_ptr())).unwrap() };
+    let expected = f64_gemm_reference(
+        &quantize(
+            &decode_floats(&inputs[0].bytes, DataType::Float32),
+            DataType::Float32,
+        ),
+        &quantize(
+            &decode_floats(&inputs[1].bytes, DataType::Float32),
+            DataType::Float32,
+        ),
+        1,
+        16,
+        64,
+        8,
+        false,
+        false,
+        0,
+        0,
+    );
+    assert_close(
+        &decode_floats(&bytes, DataType::Float32),
+        &expected,
+        DataType::Float32,
+        "captured Auto fallback replay",
+    );
+    assert!(runtime.reset_graph().unwrap());
+
+    for buffer in buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output).unwrap();
 }
 
 #[cfg_attr(
