@@ -61,12 +61,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceRequirement,
+    CaptureSupport, DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata,
+    TensorMut, TensorView, WorkspaceRequirement,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -543,27 +543,43 @@ pub fn dsa_plugin_capture_stats_for_test() -> (u64, u64, u64) {
     )
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DsaWorkspace {
     runtime: Arc<CudaRuntime>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<DsaWorkspaceAllocation>>,
     bytes: usize,
+}
+
+#[derive(Debug)]
+struct DsaWorkspaceAllocation {
+    allocation: Arc<GraphDeviceAllocation>,
+    bytes: usize,
+}
+
+impl Drop for DsaWorkspaceAllocation {
+    fn drop(&mut self) {
+        DSA_WORKSPACE_RELEASES.fetch_add(1, Ordering::Relaxed);
+        DSA_WORKSPACE_LIVE_BYTES.fetch_sub(self.bytes as u64, Ordering::Release);
+    }
 }
 
 impl DsaWorkspace {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            ptr: 0,
+            allocation: None,
             bytes: 0,
         }
     }
 
     fn reserve(&mut self, bytes: usize) -> Result<CUdeviceptr> {
         let bytes = bytes.max(1);
-        if self.bytes >= bytes {
-            DSA_WORKSPACE_LAST_PTR.store(self.ptr, Ordering::Relaxed);
-            return Ok(self.ptr);
+        if self.bytes >= bytes
+            && let Some(allocation) = self.allocation.as_ref()
+        {
+            let ptr = allocation.allocation.ptr();
+            DSA_WORKSPACE_LAST_PTR.store(ptr, Ordering::Relaxed);
+            return Ok(ptr);
         }
         if self.runtime.is_capturing()? {
             return Err(error(format!(
@@ -571,45 +587,29 @@ impl DsaWorkspace {
             )));
         }
 
-        let ptr = self.runtime.alloc_raw(bytes)?;
-        if self.ptr != 0 {
-            if let Err(sync_error) = self.runtime.drain_for_unmap() {
-                // SAFETY: `ptr` was allocated above and has not escaped.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(sync_error);
-            }
-            // SAFETY: synchronization completed all prior users of `self.ptr`,
-            // which remains exclusively owned by this workspace.
-            if let Err(free_error) = unsafe { self.runtime.free_raw(self.ptr) } {
-                // SAFETY: `ptr` was allocated above and has not escaped.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(free_error);
-            }
-            DSA_WORKSPACE_RELEASES.fetch_add(1, Ordering::Relaxed);
-            DSA_WORKSPACE_LIVE_BYTES.fetch_sub(self.bytes as u64, Ordering::Relaxed);
+        if self.allocation.is_some() {
+            self.runtime.drain_for_unmap()?;
         }
+        let allocation = Arc::new(DsaWorkspaceAllocation {
+            allocation: GraphDeviceAllocation::allocate(&self.runtime, bytes)?,
+            bytes,
+        });
+        self.runtime
+            .staged_warm_cache_mutation("DsaIndexSelect workspace allocation")?;
 
-        self.ptr = ptr;
+        let ptr = allocation.allocation.ptr();
+        self.allocation = Some(allocation);
         self.bytes = bytes;
         DSA_WORKSPACE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         DSA_WORKSPACE_LIVE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
         DSA_WORKSPACE_LAST_PTR.store(ptr, Ordering::Release);
         Ok(ptr)
     }
-}
 
-impl Drop for DsaWorkspace {
-    fn drop(&mut self) {
-        if self.ptr == 0 {
-            return;
-        }
-        // SAFETY: `self.ptr` was allocated by this runtime, remains exclusively
-        // owned here, and is released exactly once.
-        let _ = unsafe { self.runtime.free_raw(self.ptr) };
-        DSA_WORKSPACE_RELEASES.fetch_add(1, Ordering::Relaxed);
-        DSA_WORKSPACE_LIVE_BYTES.fetch_sub(self.bytes as u64, Ordering::Release);
-        self.ptr = 0;
-        self.bytes = 0;
+    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        self.allocation.as_ref().map(|allocation| {
+            DeviceGraphResource::new(Arc::as_ptr(allocation) as usize, Arc::clone(allocation))
+        })
     }
 }
 
@@ -717,6 +717,15 @@ impl Kernel for DsaIndexSelectKernel {
         false
     }
 
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.workspace
+            .lock()
+            .ok()
+            .and_then(|workspace| workspace.device_graph_resource())
+            .into_iter()
+            .collect()
+    }
+
     fn capture_support(&self) -> CaptureSupport {
         if self.warmed.load(Ordering::Relaxed) {
             CaptureSupport::Supported
@@ -733,7 +742,13 @@ impl DsaIndexSelectKernel {
     #[doc(hidden)]
     pub fn workspace_snapshot(&self) -> (u64, usize) {
         let workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
-        (workspace.ptr, workspace.bytes)
+        (
+            workspace
+                .allocation
+                .as_ref()
+                .map_or(0, |allocation| allocation.allocation.ptr()),
+            workspace.bytes,
+        )
     }
 
     #[doc(hidden)]
@@ -808,8 +823,9 @@ impl DsaIndexSelectKernel {
         let capturing = self.runtime.is_capturing()?;
 
         let layout = dsa_index_select_workspace_layout(dims)?;
-        let mut workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
-        let workspace_ptr = workspace.reserve(layout.bytes)?;
+        let mut published_workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        let mut workspace_candidate = published_workspace.clone();
+        let workspace_ptr = workspace_candidate.reserve(layout.bytes)?;
 
         let query_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let key_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
@@ -823,7 +839,7 @@ impl DsaIndexSelectKernel {
         {
             let test_replays = DSA_TEST_CAPTURE_REPLAYS.swap(0, Ordering::AcqRel);
             if test_replays != 0 {
-                return self.execute_capture_replay_test_seam(
+                let result = self.execute_capture_replay_test_seam(
                     query_ptr,
                     key_ptr,
                     weights_ptr,
@@ -835,6 +851,10 @@ impl DsaIndexSelectKernel {
                     dtype_code(dtype)?,
                     test_replays,
                 );
+                if result.is_ok() && !capturing {
+                    *published_workspace = workspace_candidate;
+                }
+                return result;
             }
         }
 
@@ -857,6 +877,7 @@ impl DsaIndexSelectKernel {
             // is guaranteed compiled and the workspace sized, so capture may now
             // record this kernel with stable device addresses.
             self.runtime.synchronize()?;
+            *published_workspace = workspace_candidate;
             self.warmed.store(true, Ordering::Relaxed);
             Ok(())
         }

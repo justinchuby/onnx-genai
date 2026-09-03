@@ -7,13 +7,13 @@
 use std::sync::Arc;
 
 use cudarc::driver::sys::CUdeviceptr;
-use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
 use onnx_runtime_ir::{Node, Shape};
 
 use crate::kernels::csa_state_group::{
     CsaStateGroupBytes, CsaStateGroupCharge, CsaStateGroupLedger,
 };
-use crate::runtime::CudaRuntime;
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation};
 
 const ATTN_WIDTH: usize = 583;
 const INDEX_WIDTH: usize = 68;
@@ -123,12 +123,11 @@ impl CsaBufferLayout {
 /// Stable-address buffers reserved once for a CSA runner. They are intentionally
 /// not read by B0: graph-threaded `past_* → present_*` remains authoritative.
 pub(crate) struct CsaDeviceBufferManager {
-    runtime: Arc<CudaRuntime>,
     pub(crate) layout: CsaBufferLayout,
     /// B6 pooled scratch (index transform / scores / selection / attention
     /// scores). Reserved once at runner init with stable addresses so the
     /// device-only capture path never allocates per call.
-    workspaces: Vec<CUdeviceptr>,
+    workspaces: Vec<Arc<GraphDeviceAllocation>>,
     /// RAII accounting charge against the CSA state-group ledger, holding the
     /// governor [`MemoryLease`] for these bytes. Held for the manager's lifetime
     /// so residency is released from the one accounting authority
@@ -169,23 +168,15 @@ impl CsaDeviceBufferManager {
             )
             .map_err(EpError::from)?;
         let mut workspaces = Vec::with_capacity(workspace_bytes.len());
-        let rollback = |workspaces: &mut Vec<CUdeviceptr>| {
-            for ptr in workspaces.drain(..).rev() {
-                // SAFETY: each pointer was allocated by this runtime and has not escaped.
-                let _ = unsafe { runtime.free_raw(ptr) };
-            }
-        };
         for &size in workspace_bytes {
-            match runtime.alloc_raw(size.max(1)) {
-                Ok(ptr) => workspaces.push(ptr),
+            match GraphDeviceAllocation::allocate(&runtime, size.max(1)) {
+                Ok(allocation) => workspaces.push(allocation),
                 Err(error) => {
-                    rollback(&mut workspaces);
                     return Err(error);
                 }
             }
         }
         Ok(Self {
-            runtime,
             layout,
             workspaces,
             charge,
@@ -194,7 +185,7 @@ impl CsaDeviceBufferManager {
 
     /// Stable address of pooled workspace `index` (reserved in `reserve`).
     pub(crate) fn workspace(&self, index: usize) -> CUdeviceptr {
-        self.workspaces[index]
+        self.workspaces[index].ptr()
     }
 
     /// Bytes this manager currently holds against the CSA state-group ledger.
@@ -204,14 +195,12 @@ impl CsaDeviceBufferManager {
     pub(crate) fn charged_bytes(&self) -> u64 {
         self.charge.total()
     }
-}
 
-impl Drop for CsaDeviceBufferManager {
-    fn drop(&mut self) {
-        for ptr in self.workspaces.drain(..).rev() {
-            // SAFETY: this manager exclusively owns every pointer it reserved.
-            let _ = unsafe { self.runtime.free_raw(ptr) };
-        }
+    pub(crate) fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.workspaces
+            .iter()
+            .map(GraphDeviceAllocation::device_graph_resource)
+            .collect()
     }
 }
 

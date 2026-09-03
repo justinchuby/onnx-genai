@@ -60,10 +60,11 @@
 //!   crate-internal producer-side seam a future consumer will drive.
 
 use cudarc::driver::sys::CUdeviceptr;
-use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::runtime::CudaRuntime;
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation};
 
 // ---------------------------------------------------------------------------
 // Header layout (design §2.3). Six u32 words, device-resident, one per armed
@@ -269,8 +270,8 @@ pub(crate) struct ArmedTelemetry {
     num_experts: usize,
     routes_per_row: u32,
     words: usize,
-    bitmap: CUdeviceptr,
-    header: CUdeviceptr,
+    bitmap: Arc<GraphDeviceAllocation>,
+    header: Arc<GraphDeviceAllocation>,
     /// Host-side window/epoch counter. Stamped into `header[H_EPOCH]` at arm
     /// (window 1) and at every `reset_boundary`; held fixed for the whole
     /// window. There is no device epoch counter and no reset kernel.
@@ -287,7 +288,7 @@ impl ArmedTelemetry {
     /// rejection if the properties are unsupported; the caller then leaves
     /// telemetry disabled and ordinary inference is unaffected.
     pub(crate) fn arm(
-        runtime: &CudaRuntime,
+        runtime: &Arc<CudaRuntime>,
         config: RouteTelemetryConfig,
     ) -> std::result::Result<Self, TelemetryUnsupported> {
         let device = runtime.ordinal();
@@ -315,19 +316,10 @@ impl ArmedTelemetry {
 
         let words = words_for(config.num_experts);
         let bitmap_bytes = words * 4;
-        let bitmap = runtime
-            .alloc_raw(bitmap_bytes.max(1))
+        let bitmap = GraphDeviceAllocation::allocate(runtime, bitmap_bytes.max(1))
             .map_err(|error| TelemetryUnsupported::Alloc(error.to_string()))?;
-        let header = match runtime.alloc_raw(HEADER_BYTES) {
-            Ok(pointer) => pointer,
-            Err(error) => {
-                // SAFETY: `bitmap` came from this runtime and no launch reads it.
-                unsafe {
-                    let _ = runtime.free_raw(bitmap);
-                }
-                return Err(TelemetryUnsupported::Alloc(error.to_string()));
-            }
-        };
+        let header = GraphDeviceAllocation::allocate(runtime, HEADER_BYTES)
+            .map_err(|error| TelemetryUnsupported::Alloc(error.to_string()))?;
 
         let armed = Self {
             request_id: config.request_id,
@@ -343,7 +335,6 @@ impl ArmedTelemetry {
         };
         // Open the first window: stamp identity + epoch 1 and zero the record.
         if let Err(error) = armed.open_window(runtime) {
-            armed.free(runtime);
             return Err(TelemetryUnsupported::Alloc(error.to_string()));
         }
         Ok(armed)
@@ -369,10 +360,10 @@ impl ArmedTelemetry {
         // SAFETY: `header` is a live `HEADER_BYTES` allocation from this runtime;
         // `bitmap` is a live `bitmap_bytes` allocation. Both cover the sources.
         unsafe {
-            runtime.htod(&header_bytes, self.header)?;
+            runtime.htod(&header_bytes, self.header.ptr())?;
             if self.bitmap_bytes > 0 {
                 let zeros = vec![0u8; self.bitmap_bytes];
-                runtime.htod(&zeros, self.bitmap)?;
+                runtime.htod(&zeros, self.bitmap.ptr())?;
             }
         }
         Ok(())
@@ -426,12 +417,12 @@ impl ArmedTelemetry {
 
     /// Device pointer to the route bitmap passed to the fused route kernel.
     pub(crate) fn bitmap_ptr(&self) -> CUdeviceptr {
-        self.bitmap
+        self.bitmap.ptr()
     }
 
     /// Device pointer to the header passed to the fused route kernel.
     pub(crate) fn header_ptr(&self) -> CUdeviceptr {
-        self.header
+        self.header.ptr()
     }
 
     /// Total device bytes held by this record (for teardown/accounting tests).
@@ -444,7 +435,7 @@ impl ArmedTelemetry {
     /// Device virtual address of the bitmap (stable for the armed lifetime).
     /// Used by capture/replay tests to prove the pointer never moves.
     pub(crate) fn bitmap_addr(&self) -> CUdeviceptr {
-        self.bitmap
+        self.bitmap.ptr()
     }
 
     /// Copy the header and bitmap back to the host (test/observability only —
@@ -457,13 +448,13 @@ impl ArmedTelemetry {
         unsafe {
             let header_bytes =
                 std::slice::from_raw_parts_mut(header.as_mut_ptr() as *mut u8, HEADER_BYTES);
-            runtime.dtoh(header_bytes, self.header)?;
+            runtime.dtoh(header_bytes, self.header.ptr())?;
             if self.words > 0 {
                 let bitmap_bytes = std::slice::from_raw_parts_mut(
                     bitmap.as_mut_ptr() as *mut u8,
                     self.bitmap_bytes,
                 );
-                runtime.dtoh(bitmap_bytes, self.bitmap)?;
+                runtime.dtoh(bitmap_bytes, self.bitmap.ptr())?;
             }
         }
         Ok(TelemetrySnapshot {
@@ -526,29 +517,22 @@ impl ArmedTelemetry {
         let byte_offset = index.checked_mul(4).ok_or_else(|| {
             EpError::KernelFailed("cuda_ep: telemetry test header offset overflow".into())
         })?;
-        let destination = self.header.checked_add(byte_offset as u64).ok_or_else(|| {
-            EpError::KernelFailed("cuda_ep: telemetry test header address overflow".into())
-        })?;
+        let destination = self
+            .header
+            .ptr()
+            .checked_add(byte_offset as u64)
+            .ok_or_else(|| {
+                EpError::KernelFailed("cuda_ep: telemetry test header address overflow".into())
+            })?;
         // SAFETY: `destination` names one u32 word within the live header.
         unsafe { runtime.htod(&value.to_ne_bytes(), destination) }
     }
 
-    /// Best-effort free. Drains in-flight launches first (a captured/eager route
-    /// kernel may still reference these pointers), then releases the record.
-    pub(crate) fn free(&self, runtime: &CudaRuntime) {
-        let _ = runtime.drain_for_unmap();
-        self.free_after_stream_fences(runtime);
-    }
-
-    /// Free after the provider's deferred-release queue has observed both
-    /// stream-tail fences for this telemetry generation.
-    pub(crate) fn free_after_stream_fences(&self, runtime: &CudaRuntime) {
-        // SAFETY: every pointer came from this runtime, prior launches have been
-        // fenced or drained, and each is freed exactly once.
-        unsafe {
-            let _ = runtime.free_raw(self.header);
-            let _ = runtime.free_raw(self.bitmap);
-        }
+    pub(crate) fn device_graph_resources(&self) -> [DeviceGraphResource; 2] {
+        [
+            GraphDeviceAllocation::device_graph_resource(&self.bitmap),
+            GraphDeviceAllocation::device_graph_resource(&self.header),
+        ]
     }
 }
 

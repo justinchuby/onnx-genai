@@ -116,10 +116,10 @@ impl Drop for CapturedGraph {
             context.record_err(unsafe { result::graph::destroy(graph) });
         }
 
-        // Graph launches already queued on `stream` may still be in flight.
-        // Releasing a resource enqueues its final allocation release behind the
-        // stream tail, so keeping the owners through handle destruction is the
-        // required ordering boundary.
+        // A replay admitted before reset may already be queued even after its
+        // enqueue guard retired. Wait for that stream tail before a resource
+        // owner can return an embedded address to the raw allocation pool.
+        context.record_err(self.stream.synchronize());
         self.resources.clear();
     }
 }
@@ -149,6 +149,8 @@ pub(crate) struct CudaGraphLifecycle {
     installed_generation: AtomicU64,
     active_replays: AtomicUsize,
     lock_acquisitions: AtomicU64,
+    completed_captures: AtomicU64,
+    replay_launches: AtomicU64,
 }
 
 struct ReplaySet {
@@ -210,6 +212,8 @@ impl CudaGraphLifecycle {
             installed_generation: AtomicU64::new(0),
             active_replays: AtomicUsize::new(0),
             lock_acquisitions: AtomicU64::new(0),
+            completed_captures: AtomicU64::new(0),
+            replay_launches: AtomicU64::new(0),
         }
     }
 
@@ -222,6 +226,13 @@ impl CudaGraphLifecycle {
 
     pub(crate) fn lock_acquisition_count(&self) -> u64 {
         self.lock_acquisitions.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn execution_counts(&self) -> (u64, u64) {
+        (
+            self.completed_captures.load(Ordering::Relaxed),
+            self.replay_launches.load(Ordering::Relaxed),
+        )
     }
 
     fn admit_replay(&self, token: DeviceGraphToken) -> Result<AdmittedReplay<'_>> {
@@ -396,6 +407,7 @@ impl CudaGraphLifecycle {
         })));
         self.installed_generation
             .store(token.generation(), Ordering::Release);
+        self.completed_captures.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -430,6 +442,7 @@ impl CudaGraphLifecycle {
                 .launch()
                 .map_err(|error| driver_err("launch CUDA graph executable", error))?;
             after_launch();
+            self.replay_launches.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -457,7 +470,9 @@ impl CudaGraphLifecycle {
         })?;
         graph
             .launch()
-            .map_err(|error| driver_err("launch CUDA graph segment", error))
+            .map_err(|error| driver_err("launch CUDA graph segment", error))?;
+        self.replay_launches.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Abort an in-progress segment capture: terminate the stream capture,

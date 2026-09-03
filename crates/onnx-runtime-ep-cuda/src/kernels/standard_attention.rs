@@ -82,14 +82,14 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 const BLOCK: u32 = 256;
 /// Threads per block for `attention_row` (one block services one score row).
@@ -999,11 +999,7 @@ pub struct StandardAttentionKernel {
     /// so the captured hot path performs no per-op allocation. Reserved lazily
     /// during the eager warmup step and reused (never grown) during CUDA-graph
     /// capture/replay.
-    workspace: Mutex<StdAttnWorkspace>,
-    /// Set to the single-token decode signature after a successful
-    /// capture-eligible call; gates [`Self::capture_support`] to Supported only
-    /// once such a step has been warmed (mirrors GroupQueryAttention).
-    last_capture_safe_signature: Mutex<Option<StdAttnCaptureSignature>>,
+    warm_state: Mutex<StdAttnWarmState>,
 }
 
 /// Decode signature warmed as capture-safe. A subsequent capture pass reuses
@@ -1011,6 +1007,8 @@ pub struct StandardAttentionKernel {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StdAttnCaptureSignature {
     dtype: DataType,
+    inputs: Vec<(DataType, Vec<usize>, bool)>,
+    outputs: Vec<(DataType, Vec<usize>)>,
     batch: usize,
     q_heads: usize,
     kv_heads: usize,
@@ -1018,6 +1016,17 @@ struct StdAttnCaptureSignature {
     key_cap: usize,
     head_size: usize,
     v_head_size: usize,
+}
+
+#[derive(Clone)]
+struct StdAttnCaptureReady {
+    signature: StdAttnCaptureSignature,
+    resources: Vec<DeviceGraphResource>,
+}
+
+struct StdAttnWarmState {
+    workspace: StdAttnWorkspace,
+    capture_ready: Option<Arc<StdAttnCaptureReady>>,
 }
 
 const WS_SCORES: usize = 0;
@@ -1429,24 +1438,30 @@ fn std_attention_workspace_requirement(
     })
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct StdWorkspaceSlot {
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
     bytes: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct StdAttnWorkspace {
     runtime: Arc<CudaRuntime>,
     slots: [StdWorkspaceSlot; WS_COUNT],
+    used: [bool; WS_COUNT],
 }
 
 impl StdAttnWorkspace {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            slots: [StdWorkspaceSlot::default(); WS_COUNT],
+            slots: std::array::from_fn(|_| StdWorkspaceSlot::default()),
+            used: [false; WS_COUNT],
         }
+    }
+
+    fn begin_call(&mut self) {
+        self.used.fill(false);
     }
 
     /// Return a device pointer for slot `index` with at least `bytes` capacity.
@@ -1454,10 +1469,19 @@ impl StdAttnWorkspace {
     /// — but never during graph capture, where a grow would record an illegal
     /// allocation, so the caller must have warmed the exact decode shape first.
     fn reserve(&mut self, index: usize, bytes: usize) -> Result<CUdeviceptr> {
+        self.used[index] = true;
         let bytes = bytes.max(1);
-        let slot = self.slots[index];
-        if slot.bytes >= bytes {
-            return Ok(slot.ptr);
+        let slot = &self.slots[index];
+        if slot.bytes >= bytes
+            && let Some(allocation) = slot.allocation.as_ref()
+        {
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    GraphDeviceAllocation::device_graph_resource(allocation).identity(),
+                    "Attention workspace allocation",
+                )?;
+            }
+            return Ok(allocation.ptr());
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(format!(
@@ -1465,32 +1489,30 @@ impl StdAttnWorkspace {
                  capture; warm the fixed decode shape before capture"
             )));
         }
-        let ptr = self.runtime.alloc_raw(bytes)?;
-        if slot.ptr != 0 {
+        if slot.allocation.is_some() {
             // A growing (prefill/eager) shape may outgrow a slot warmed for a
             // smaller step. Wait for queued users of the old storage before
             // freeing; the fixed-capacity decode path never reaches here.
-            if let Err(error) = self.runtime.synchronize() {
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(error);
-            }
-            if let Err(error) = unsafe { self.runtime.free_raw(slot.ptr) } {
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(error);
-            }
+            self.runtime.drain_for_unmap()?;
         }
-        self.slots[index] = StdWorkspaceSlot { ptr, bytes };
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes)?;
+        self.runtime
+            .staged_warm_cache_mutation(&format!("Attention workspace slot {index} allocation"))?;
+        let ptr = allocation.ptr();
+        self.slots[index] = StdWorkspaceSlot {
+            allocation: Some(allocation),
+            bytes,
+        };
         Ok(ptr)
     }
-}
 
-impl Drop for StdAttnWorkspace {
-    fn drop(&mut self) {
-        for slot in &self.slots {
-            if slot.ptr != 0 {
-                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
-            }
-        }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.slots
+            .iter()
+            .zip(self.used)
+            .filter_map(|(slot, used)| used.then_some(slot.allocation.as_ref()).flatten())
+            .map(GraphDeviceAllocation::device_graph_resource)
+            .collect()
     }
 }
 
@@ -1537,8 +1559,10 @@ impl KernelFactory for StandardAttentionFactory {
             softcap,
             output_count: node.outputs.len(),
             since_version: self.since_version,
-            workspace: Mutex::new(StdAttnWorkspace::new(self.runtime.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            warm_state: Mutex::new(StdAttnWarmState {
+                workspace: StdAttnWorkspace::new(self.runtime.clone()),
+                capture_ready: None,
+            }),
         }))
     }
 }
@@ -1819,6 +1843,43 @@ impl StandardAttentionKernel {
 }
 
 impl StandardAttentionKernel {
+    fn validate_capture_signature(
+        state: &StdAttnWarmState,
+        signature: &StdAttnCaptureSignature,
+    ) -> Result<()> {
+        let ready = state.capture_ready.as_ref().ok_or_else(|| {
+            EpError::KernelFailed(
+                "Attention: CUDA graph capture began without a successful warmed decode \
+                 signature. HOW: run the exact fixed-capacity decode call eagerly before \
+                 capture."
+                    .into(),
+            )
+        })?;
+        if ready.signature != *signature {
+            return Err(EpError::KernelFailed(format!(
+                "Attention: signature changed during CUDA graph capture: warmed={:?}, \
+                 current={signature:?}. HOW: abort capture and warm the exact replacement.",
+                ready.signature
+            )));
+        }
+        Ok(())
+    }
+
+    fn publish_capture_ready(
+        state: &mut StdAttnWarmState,
+        signature: StdAttnCaptureSignature,
+        resources: Vec<DeviceGraphResource>,
+    ) {
+        state.capture_ready = Some(Arc::new(StdAttnCaptureReady {
+            signature,
+            resources,
+        }));
+    }
+
+    fn publish_capture_unsupported(state: &mut StdAttnWarmState) {
+        state.capture_ready = None;
+    }
+
     fn run(
         &self,
         inputs: &[TensorView],
@@ -2229,6 +2290,38 @@ impl StandardAttentionKernel {
             let capturing = self.runtime.is_capturing()?;
             let staged_decode_eligible = (stage_key || stage_value) && batch == 1 && q_seq == 1;
             let capture_workspace_eligible = dev_length_eligible || staged_decode_eligible;
+            let capture_signature = capture_workspace_eligible.then(|| StdAttnCaptureSignature {
+                dtype,
+                inputs: inputs
+                    .iter()
+                    .map(|input| (input.dtype, input.shape.to_vec(), input.is_absent()))
+                    .collect(),
+                outputs: outputs
+                    .iter()
+                    .map(|output| (output.dtype, output.shape.to_vec()))
+                    .collect(),
+                batch,
+                q_heads,
+                kv_heads,
+                q_seq,
+                key_cap,
+                head_size,
+                v_head_size,
+            });
+            let mut warm_state = self
+                .warm_state
+                .lock()
+                .map_err(|_| EpError::KernelFailed("Attention: warm-state lock poisoned".into()))?;
+            if capturing {
+                let signature = capture_signature.as_ref().ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "Attention: the current call is not a capture-eligible fixed-capacity \
+                         decode signature. HOW: abort capture and warm this exact route eagerly."
+                            .into(),
+                    )
+                })?;
+                Self::validate_capture_signature(&warm_state, signature)?;
+            }
             // FlashDecoding split-KV: engage on the capture-safe fixed-capacity
             // decode route. `num_splits`/`chunk` derive only from the fixed cap
             // and row count, so the choice is identical under eager and capture.
@@ -2251,10 +2344,10 @@ impl StandardAttentionKernel {
                 }
                 None => 0,
             };
+            let mut workspace_candidate = warm_state.workspace.clone();
+            workspace_candidate.begin_call();
             let mut ws = if capture_workspace_eligible {
-                Some(self.workspace.lock().map_err(|_| {
-                    EpError::KernelFailed("Attention: workspace lock poisoned".into())
-                })?)
+                Some(&mut workspace_candidate)
             } else {
                 None
             };
@@ -2482,8 +2575,6 @@ impl StandardAttentionKernel {
                 unsafe { self.runtime.htod(offsets_bytes, offsets_ptr)? };
                 unsafe { self.runtime.htod(pad_bytes, pad_limits_ptr)? };
             }
-            drop(ws);
-
             // Build present_key / present_value on the device. In capacity mode
             // the append writes only the new rows [past_seq, total_seq) into
             // their fixed slot; the dense path rebuilds all rows.
@@ -2738,19 +2829,13 @@ impl StandardAttentionKernel {
             // single-token step has run through the device-length workspace path
             // with no per-op allocation or synchronize. `capture_support` gates
             // on this so the session only captures a warmed decode shape.
-            if capture_workspace_eligible {
-                let signature = StdAttnCaptureSignature {
-                    dtype,
-                    batch,
-                    q_heads,
-                    kv_heads,
-                    q_seq,
-                    key_cap,
-                    head_size,
-                    v_head_size,
-                };
-                if let Ok(mut slot) = self.last_capture_safe_signature.lock() {
-                    *slot = Some(signature);
+            if !capturing {
+                if let Some(signature) = capture_signature {
+                    let resources = workspace_candidate.device_graph_resources();
+                    warm_state.workspace = workspace_candidate;
+                    Self::publish_capture_ready(&mut warm_state, signature, resources);
+                } else {
+                    Self::publish_capture_unsupported(&mut warm_state);
                 }
             }
             Ok(())
@@ -2808,12 +2893,27 @@ impl Kernel for StandardAttentionKernel {
         false
     }
 
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.warm_state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .capture_ready
+                    .as_ref()
+                    .map(|ready| ready.resources.clone())
+            })
+            .unwrap_or_default()
+    }
+
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // Eligible once a single-token decode step has been warmed with all
         // scratch reserved in the persistent workspace and its control uploads
         // done outside capture.
-        match self.last_capture_safe_signature.lock() {
-            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+        match self.warm_state.lock() {
+            Ok(state) if state.capture_ready.is_some() => {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            }
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "requires a warmed capture-eligible single-token decode step",
             ),
@@ -2924,8 +3024,10 @@ mod alias_tests {
             softcap: 0.0,
             output_count: 3,
             since_version: 24,
-            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            warm_state: Mutex::new(StdAttnWarmState {
+                workspace: StdAttnWorkspace::new(rt.clone()),
+                capture_ready: None,
+            }),
         };
 
         // Runs one decode step; when `alias` the present KV outputs share the
@@ -3128,8 +3230,10 @@ mod alias_tests {
             softcap: 0.0,
             output_count: 3,
             since_version: 24,
-            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            warm_state: Mutex::new(StdAttnWarmState {
+                workspace: StdAttnWorkspace::new(rt.clone()),
+                capture_ready: None,
+            }),
         };
 
         // Lay a `[heads, valid, dim]` contiguous tensor into a `[heads, cap, dim]`
@@ -3298,8 +3402,10 @@ mod alias_tests {
             softcap: 0.0,
             output_count: 1,
             since_version: 24,
-            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            warm_state: Mutex::new(StdAttnWarmState {
+                workspace: StdAttnWorkspace::new(rt.clone()),
+                capture_ready: None,
+            }),
         };
         const NEG: f32 = -65504.0;
         let mask_kind = 1i32; // f32 additive bias
@@ -3397,8 +3503,10 @@ mod alias_tests {
             softcap: 0.0,
             output_count: 1,
             since_version: 24,
-            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            warm_state: Mutex::new(StdAttnWarmState {
+                workspace: StdAttnWorkspace::new(rt.clone()),
+                capture_ready: None,
+            }),
         };
         // No warmed decode step yet -> capture declined.
         assert!(
@@ -3409,16 +3517,21 @@ mod alias_tests {
             "fresh kernel must decline capture until a fixed-capacity device-valid-length decode step is warmed"
         );
         // Simulate a warmed single-token decode step recording its signature.
-        *kernel.last_capture_safe_signature.lock().unwrap() = Some(StdAttnCaptureSignature {
-            dtype: DataType::Float16,
-            batch: 1,
-            q_heads: 1,
-            kv_heads: 1,
-            q_seq: 1,
-            key_cap: 4096,
-            head_size: 192,
-            v_head_size: 128,
-        });
+        kernel.warm_state.lock().unwrap().capture_ready = Some(Arc::new(StdAttnCaptureReady {
+            signature: StdAttnCaptureSignature {
+                dtype: DataType::Float16,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                batch: 1,
+                q_heads: 1,
+                kv_heads: 1,
+                q_seq: 1,
+                key_cap: 4096,
+                head_size: 192,
+                v_head_size: 128,
+            },
+            resources: Vec::new(),
+        }));
         assert!(
             matches!(
                 kernel.capture_support(),

@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    EpError, ExecutorArtifactGeneration, ExecutorInstanceId, ExecutorRouteResidencyConfig, Kernel,
-    KernelFactory, Result, TensorMut, TensorView,
+    DeviceGraphResource, EpError, ExecutorArtifactGeneration, ExecutorInstanceId,
+    ExecutorRouteResidencyConfig, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
@@ -29,7 +29,7 @@ use crate::kernels::expert_route_telemetry::{
 };
 use crate::kernels::{qmoe_gemm, qmoe_grouping};
 use crate::route_residency::RouteTelemetrySource;
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 const MODULE: &str = "qmoe_affine_v1";
 const ROUTE_ENTRY: &str = "qmoe_route";
@@ -1468,6 +1468,10 @@ impl Kernel for SharedQMoEKernel {
         self.0.supports_strided_input(input_idx)
     }
 
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.0.device_graph_resources()
+    }
+
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         self.0.capture_support()
     }
@@ -1550,8 +1554,10 @@ impl QMoEFactory {
             attributes,
             bits: bits as usize,
             block_size: block_size as usize,
-            scratch: Mutex::new(ScratchPool::default()),
-            warmed: AtomicBool::new(false),
+            warm_state: Mutex::new(QMoEWarmState {
+                scratch: ScratchPool::default(),
+                capture_ready: None,
+            }),
             telemetry,
         })
     }
@@ -1622,6 +1628,7 @@ pub struct QMoERouteTelemetry {
     runtime: Arc<CudaRuntime>,
     routes_per_row: usize,
     state: Mutex<Option<ArmedTelemetry>>,
+    last_call_used: AtomicBool,
 }
 
 impl QMoERouteTelemetry {
@@ -1630,6 +1637,7 @@ impl QMoERouteTelemetry {
             runtime,
             routes_per_row,
             state: Mutex::new(None),
+            last_call_used: AtomicBool::new(false),
         }
     }
 
@@ -1652,7 +1660,8 @@ impl QMoERouteTelemetry {
         let armed = ArmedTelemetry::arm(&self.runtime, config)?;
         let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         if let Some(previous) = telemetry.take() {
-            previous.free(&self.runtime);
+            let _ = self.runtime.drain_for_unmap();
+            drop(previous);
         }
         *telemetry = Some(armed);
         Ok(())
@@ -1662,7 +1671,8 @@ impl QMoERouteTelemetry {
     pub fn disarm_route_telemetry(&self) {
         let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         if let Some(previous) = telemetry.take() {
-            previous.free(&self.runtime);
+            let _ = self.runtime.drain_for_unmap();
+            drop(previous);
         }
     }
 
@@ -1672,7 +1682,7 @@ impl QMoERouteTelemetry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(previous) = telemetry.take() {
-            previous.free_after_stream_fences(&self.runtime);
+            drop(previous);
         }
     }
 
@@ -1712,14 +1722,63 @@ impl QMoERouteTelemetry {
             .map(ArmedTelemetry::bitmap_addr)
     }
 
-    fn launch_ptrs(&self, experts: usize) -> (CUdeviceptr, CUdeviceptr) {
-        let telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
+    fn launch_ptrs(&self, experts: usize) -> Result<(CUdeviceptr, CUdeviceptr)> {
+        let telemetry = self
+            .state
+            .lock()
+            .map_err(|_| error("cuda_ep QMoE telemetry poisoned"))?;
         match telemetry.as_ref() {
             Some(armed) if armed.matches_experts(experts) => {
-                (armed.bitmap_ptr(), armed.header_ptr())
+                if self.runtime.is_capturing()? {
+                    for resource in armed.device_graph_resources() {
+                        self.runtime.require_registered_address_capture(
+                            resource.identity(),
+                            "QMoE route telemetry allocation",
+                        )?;
+                    }
+                }
+                self.last_call_used.store(true, Ordering::Relaxed);
+                Ok((armed.bitmap_ptr(), armed.header_ptr()))
             }
-            _ => (0, 0),
+            _ => {
+                self.last_call_used.store(false, Ordering::Relaxed);
+                Ok((0, 0))
+            }
         }
+    }
+
+    fn capture_resource_ids(&self, experts: usize) -> Vec<usize> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|telemetry| {
+                telemetry
+                    .as_ref()
+                    .filter(|armed| armed.matches_experts(experts))
+                    .map(|armed| {
+                        armed
+                            .device_graph_resources()
+                            .iter()
+                            .map(|resource| resource.identity())
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        if !self.last_call_used.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        self.state
+            .lock()
+            .ok()
+            .and_then(|telemetry| {
+                telemetry
+                    .as_ref()
+                    .map(|armed| armed.device_graph_resources().into_iter().collect())
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -1728,7 +1787,8 @@ impl Drop for QMoERouteTelemetry {
         if let Ok(telemetry) = self.state.get_mut()
             && let Some(armed) = telemetry.take()
         {
-            armed.free(&self.runtime);
+            let _ = self.runtime.drain_for_unmap();
+            drop(armed);
         }
     }
 }
@@ -1738,12 +1798,82 @@ pub struct QMoEKernel {
     attributes: MoeAttributes,
     bits: usize,
     block_size: usize,
-    scratch: Mutex<ScratchPool>,
-    warmed: AtomicBool,
+    warm_state: Mutex<QMoEWarmState>,
     telemetry: Option<Arc<QMoERouteTelemetry>>,
 }
 
+struct QMoEWarmState {
+    scratch: ScratchPool,
+    capture_ready: Option<Arc<QMoECaptureReady>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QMoECaptureSignature {
+    inputs: Vec<(DataType, Vec<usize>, bool)>,
+    outputs: Vec<(DataType, Vec<usize>)>,
+    telemetry_resource_ids: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct QMoECaptureReady {
+    signature: QMoECaptureSignature,
+    resources: Vec<DeviceGraphResource>,
+}
+
 impl QMoEKernel {
+    fn capture_signature(
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        telemetry_resource_ids: Vec<usize>,
+    ) -> QMoECaptureSignature {
+        QMoECaptureSignature {
+            inputs: inputs
+                .iter()
+                .map(|input| (input.dtype, input.shape.to_vec(), input.is_absent()))
+                .collect(),
+            outputs: outputs
+                .iter()
+                .map(|output| (output.dtype, output.shape.to_vec()))
+                .collect(),
+            telemetry_resource_ids,
+        }
+    }
+
+    fn validate_capture_signature(
+        state: &QMoEWarmState,
+        signature: &QMoECaptureSignature,
+    ) -> Result<()> {
+        let ready = state.capture_ready.as_ref().ok_or_else(|| {
+            error(
+                "QMoE capture began without a successful warmed call. HOW: run the exact \
+                 fixed-shape QMoE call eagerly before capture.",
+            )
+        })?;
+        if ready.signature != *signature {
+            return Err(error(format!(
+                "QMoE signature changed during CUDA graph capture: warmed={:?}, \
+                 current={signature:?}. HOW: abort capture and warm the exact replacement.",
+                ready.signature
+            )));
+        }
+        Ok(())
+    }
+
+    fn publish_capture_ready(
+        state: &mut QMoEWarmState,
+        signature: QMoECaptureSignature,
+        resources: Vec<DeviceGraphResource>,
+    ) {
+        state.capture_ready = Some(Arc::new(QMoECaptureReady {
+            signature,
+            resources,
+        }));
+    }
+
+    fn publish_capture_unsupported(state: &mut QMoEWarmState) {
+        state.capture_ready = None;
+    }
+
     #[doc(hidden)]
     pub fn arm_route_telemetry(
         &self,
@@ -1951,9 +2081,8 @@ impl Kernel for QMoEKernel {
     ///   stream itself with `drain_for_unmap` (an unconditional barrier,
     ///   unlike `synchronize`), only when a slot actually grows (see its doc
     ///   comment) — the case this really guards against.
-    /// - teardown safety: `Drop for QMoEKernel` now performs its own
-    ///   best-effort `drain_for_unmap` before freeing scratch, since it can no
-    ///   longer assume a prior call already synced.
+    /// - teardown safety: graph-retained immutable scratch owners keep every
+    ///   captured address alive through graph reset/destruction.
     ///
     /// The trailing `synchronize()` call itself is kept, not removed: it
     /// establishes no correctness guarantee of its own in the default
@@ -1965,6 +2094,9 @@ impl Kernel for QMoEKernel {
     /// this call's kernels still surfaces synchronously from `execute` itself
     /// under that debug flag, matching prior behavior.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.last_call_used.store(false, Ordering::Relaxed);
+        }
         if !(7..=21).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
                 "expected 7 to 21 inputs and exactly 1 output, got {} inputs and {} outputs",
@@ -2140,7 +2272,26 @@ impl Kernel for QMoEKernel {
                 "output must be contiguous on the CUDA execution provider",
             ));
         }
+        let capturing = self.runtime.is_capturing()?;
+        let telemetry_resource_ids = self.telemetry.as_ref().map_or_else(Vec::new, |telemetry| {
+            telemetry.capture_resource_ids(experts)
+        });
+        let capture_signature = Self::capture_signature(inputs, outputs, telemetry_resource_ids);
+        let mut warm_state = self
+            .warm_state
+            .lock()
+            .map_err(|_| error("QMoE warm-state lock poisoned"))?;
+        if capturing {
+            Self::validate_capture_signature(&warm_state, &capture_signature)?;
+        }
         if rows == 0 || hidden == 0 {
+            if capturing {
+                return Err(error(
+                    "QMoE empty work is not capture-eligible. HOW: abort capture and run this \
+                     signature eagerly.",
+                ));
+            }
+            Self::publish_capture_unsupported(&mut warm_state);
             return Ok(());
         }
 
@@ -2191,11 +2342,8 @@ impl Kernel for QMoEKernel {
             })
             .transpose()?;
 
-        let capturing = self.runtime.is_capturing()?;
-        let mut scratch = self
-            .scratch
-            .lock()
-            .map_err(|_| error("QMoE scratch pool mutex poisoned"))?;
+        let mut scratch = warm_state.scratch.clone();
+        scratch.begin_call();
         let route_indices = scratch.ensure(&self.runtime, 0, route_index_bytes, capturing)?;
         let route_weights = scratch.ensure(&self.runtime, 1, route_weight_bytes, capturing)?;
         let fc1_output = (!fused_gate_up_decode)
@@ -2347,10 +2495,10 @@ impl Kernel for QMoEKernel {
         // capacity — the pointers are null and the route kernel is
         // byte-identical; a capacity mismatch leaves telemetry inert for this
         // call and never fails inference.
-        let (telemetry_bitmap, telemetry_header) = self
-            .telemetry
-            .as_ref()
-            .map_or((0, 0), |telemetry| telemetry.launch_ptrs(experts));
+        let (telemetry_bitmap, telemetry_header) = match &self.telemetry {
+            Some(telemetry) => telemetry.launch_ptrs(experts)?,
+            None => (0, 0),
+        };
 
         self.launch_route(
             router_probs_ptr,
@@ -2499,7 +2647,12 @@ impl Kernel for QMoEKernel {
         // this impl.
         if !capturing {
             self.runtime.synchronize()?;
-            self.warmed.store(true, Ordering::Relaxed);
+            let mut resources = scratch.device_graph_resources();
+            if let Some(telemetry) = &self.telemetry {
+                resources.extend(telemetry.device_graph_resources());
+            }
+            warm_state.scratch = scratch;
+            Self::publish_capture_ready(&mut warm_state, capture_signature, resources);
         }
         Ok(())
     }
@@ -2508,14 +2661,31 @@ impl Kernel for QMoEKernel {
         false
     }
 
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.warm_state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .capture_ready
+                    .as_ref()
+                    .map(|ready| ready.resources.clone())
+            })
+            .unwrap_or_default()
+    }
+
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        if self.warmed.load(Ordering::Relaxed) {
-            onnx_runtime_ep_api::CaptureSupport::Supported
-        } else {
-            onnx_runtime_ep_api::CaptureSupport::unsupported(
+        match self.warm_state.lock() {
+            Ok(state) if state.capture_ready.is_some() => {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            }
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "requires a warmed fixed-shape eager QMoE pass to size the pooled scratch and \
                  compile every routed expert kernel",
-            )
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "QMoE capture readiness is unavailable because its state lock was poisoned",
+            ),
         }
     }
 }
@@ -3269,21 +3439,23 @@ fn float_widen_entry(name: &str, dtype: DataType) -> Result<Option<&'static str>
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ScratchSlot {
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
     capacity: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ScratchPool {
     slots: [ScratchSlot; SCRATCH_SLOTS],
+    used: [bool; SCRATCH_SLOTS],
 }
 
 impl Default for ScratchPool {
     fn default() -> Self {
         Self {
-            slots: [ScratchSlot::default(); SCRATCH_SLOTS],
+            slots: std::array::from_fn(|_| ScratchSlot::default()),
+            used: [false; SCRATCH_SLOTS],
         }
     }
 }
@@ -3299,15 +3471,24 @@ impl ScratchPool {
     /// this call wants to free it.
     fn ensure(
         &mut self,
-        runtime: &CudaRuntime,
+        runtime: &Arc<CudaRuntime>,
         index: usize,
         bytes: usize,
         capturing: bool,
     ) -> Result<CUdeviceptr> {
         let slot = &mut self.slots[index];
         let bytes = bytes.max(1);
-        if slot.ptr != 0 && slot.capacity >= bytes {
-            return Ok(slot.ptr);
+        self.used[index] = true;
+        if slot.capacity >= bytes
+            && let Some(allocation) = slot.allocation.as_ref()
+        {
+            if capturing {
+                runtime.require_registered_address_capture(
+                    GraphDeviceAllocation::device_graph_resource(allocation).identity(),
+                    "QMoE scratch allocation",
+                )?;
+            }
+            return Ok(allocation.ptr());
         }
         if capturing {
             return Err(error(format!(
@@ -3315,7 +3496,7 @@ impl ScratchPool {
                 slot.capacity
             )));
         }
-        if slot.ptr != 0 {
+        if slot.allocation.is_some() {
             // `free_raw` returns to a shared, size-classed pool rather than the
             // driver in the common case, so a stale pointer can be handed to an
             // unrelated caller almost immediately — there is no synchronization
@@ -3332,45 +3513,41 @@ impl ScratchPool {
             // this cost is not paid on the steady-state path.
             runtime.drain_for_unmap()?;
         }
-        let fresh = runtime.alloc_raw(bytes)?;
-        if slot.ptr != 0 {
-            // SAFETY: the previous pointer came from this runtime, every prior
-            // kernel that could read it has retired (drained above), and it is
-            // replaced only after the new allocation succeeds.
-            unsafe {
-                let _ = runtime.free_raw(slot.ptr);
-            }
-        }
-        slot.ptr = fresh;
+        let fresh = GraphDeviceAllocation::allocate(runtime, bytes)?;
+        runtime.staged_warm_cache_mutation(&format!("QMoE scratch slot {index} allocation"))?;
+        let ptr = fresh.ptr();
+        slot.allocation = Some(fresh);
         slot.capacity = bytes;
-        Ok(fresh)
+        Ok(ptr)
+    }
+
+    fn begin_call(&mut self) {
+        self.used.fill(false);
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.slots
+            .iter()
+            .zip(self.used)
+            .filter_map(|(slot, used)| used.then_some(slot.allocation.as_ref()).flatten())
+            .map(GraphDeviceAllocation::device_graph_resource)
+            .collect()
     }
 }
 
 impl Drop for QMoEKernel {
     fn drop(&mut self) {
-        let scratch = self
-            .scratch
+        let state = self
+            .warm_state
             .get_mut()
-            .expect("cuda_ep QMoE scratch pool poisoned");
-        if scratch.slots.iter().any(|slot| slot.ptr != 0) {
-            // `execute()` no longer syncs after every call, so a launch from
-            // the last call may still be in flight and reading these scratch
-            // buffers. `Drop` can't propagate a `Result`, so this is a
-            // best-effort barrier: on error (e.g. a poisoned/lost device) we
-            // still proceed to free, matching the pre-existing "errors are
-            // swallowed at teardown" behavior of the `free_raw` calls below.
+            .expect("cuda_ep QMoE warm state poisoned");
+        if state
+            .scratch
+            .slots
+            .iter()
+            .any(|slot| slot.allocation.is_some())
+        {
             let _ = self.runtime.drain_for_unmap();
-        }
-        for slot in scratch.slots.iter_mut().rev() {
-            if slot.ptr != 0 {
-                // SAFETY: every non-zero pointer came from this runtime, the
-                // drain above (best-effort) has retired prior in-flight
-                // kernels, and each pointer is freed exactly once here.
-                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
-                slot.ptr = 0;
-                slot.capacity = 0;
-            }
         }
     }
 }

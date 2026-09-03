@@ -16,7 +16,8 @@
 
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
-    CaptureSupport, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+    CaptureSupport, DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, KernelMatch,
+    TensorMut, TensorView,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -1068,4 +1069,340 @@ fn seq_independent_static_shape_is_capture_eligible_via_metadata_flag() {
     ep.deallocate(a_buf).unwrap();
     ep.deallocate(b_buf).unwrap();
     ep.deallocate(y_buf).unwrap();
+}
+
+struct BroadcastCaptureCase {
+    op: &'static str,
+    opset: u64,
+    input_dtype: DataType,
+    output_dtype: DataType,
+    a_values: Vec<u8>,
+    b_values: Vec<u8>,
+    expected: Vec<u8>,
+    rewarm_a_values: Vec<u8>,
+    rewarm_b_values: Vec<u8>,
+    rewarm_expected: Vec<u8>,
+}
+
+fn owned_bytes<T: Copy>(values: &[T]) -> Vec<u8> {
+    bytes(values).to_vec()
+}
+
+fn upload(ep: &CudaExecutionProvider, data: &[u8]) -> DeviceBuffer {
+    let buffer = ep.allocate(data.len(), 256).unwrap();
+    unsafe { ep.runtime().htod(data, cuptr(buffer.as_ptr())).unwrap() };
+    buffer
+}
+
+fn download(ep: &CudaExecutionProvider, buffer: &DeviceBuffer, bytes: usize) -> Vec<u8> {
+    let mut data = vec![0; bytes];
+    unsafe {
+        ep.runtime()
+            .dtoh(&mut data, cuptr(buffer.as_ptr()))
+            .unwrap()
+    };
+    data
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_broadcast(
+    ep: &CudaExecutionProvider,
+    kernel: &dyn Kernel,
+    input_dtype: DataType,
+    output_dtype: DataType,
+    a: &DeviceBuffer,
+    a_shape: &[usize],
+    b: &DeviceBuffer,
+    b_shape: &[usize],
+    output: &mut DeviceBuffer,
+    output_shape: &[usize],
+) {
+    let a_strides = compute_contiguous_strides(a_shape);
+    let b_strides = compute_contiguous_strides(b_shape);
+    let output_strides = compute_contiguous_strides(output_shape);
+    let inputs = [
+        TensorView::new(
+            DevicePtr(a.as_ptr()),
+            input_dtype,
+            a_shape,
+            &a_strides,
+            ep.device_id(),
+        ),
+        TensorView::new(
+            DevicePtr(b.as_ptr()),
+            input_dtype,
+            b_shape,
+            &b_strides,
+            ep.device_id(),
+        ),
+    ];
+    let output = TensorMut::new(
+        DevicePtrMut(output.as_mut_ptr()),
+        output_dtype,
+        output_shape,
+        &output_strides,
+        ep.device_id(),
+    );
+    kernel.execute(&inputs, &mut [output]).unwrap();
+}
+
+fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastCaptureCase) {
+    let runtime = ep.runtime();
+    let a_shape = [1usize, 2, 3];
+    let a_b_shape = [3usize];
+    let rewarm_shape = [2usize, 1, 3];
+    let rewarm_b_shape = [2usize, 1, 1];
+
+    let a = upload(ep, &case.a_values);
+    let b = upload(ep, &case.b_values);
+    let mut output = ep.allocate(case.expected.len(), 256).unwrap();
+    let mut kernel = ep
+        .get_kernel(
+            &Node::new(NodeId(0), case.op, vec![], vec![]),
+            &[],
+            case.opset,
+        )
+        .unwrap();
+    kernel.set_capture_seq_independent(true);
+    assert!(
+        !kernel.cuda_graph_compatible(),
+        "{} must remain capture-unsupported until its metadata is warmed",
+        case.op
+    );
+    assert!(
+        kernel.device_graph_resources().is_empty(),
+        "{} must not publish a metadata owner before warmup",
+        case.op
+    );
+    let error = runtime
+        .begin_graph_capture(&[kernel.as_ref()])
+        .expect_err("an unwarmed broadcast kernel must be rejected before CUDA capture");
+    assert!(
+        error.to_string().contains("rejected before begin_capture"),
+        "{} returned an unactionable unwarmed-capture error: {error}",
+        case.op
+    );
+    assert!(!runtime.is_capturing().unwrap());
+
+    execute_broadcast(
+        ep,
+        kernel.as_ref(),
+        case.input_dtype,
+        case.output_dtype,
+        &a,
+        &a_shape,
+        &b,
+        &a_b_shape,
+        &mut output,
+        &a_shape,
+    );
+    assert_eq!(
+        download(ep, &output, case.expected.len()),
+        case.expected,
+        "{} warm output is incorrect",
+        case.op
+    );
+    assert!(
+        kernel.cuda_graph_compatible(),
+        "{} must advertise capture only after a successful warm",
+        case.op
+    );
+    let resource = kernel.device_graph_resources();
+    assert_eq!(
+        resource.len(),
+        1,
+        "{} must publish its BroadcastMetadataCache owner",
+        case.op
+    );
+    let captured_resource = resource[0].identity();
+    drop(resource);
+
+    let graph_counts = runtime.graph_execution_counts();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute_broadcast(
+        ep,
+        kernel.as_ref(),
+        case.input_dtype,
+        case.output_dtype,
+        &a,
+        &a_shape,
+        &b,
+        &a_b_shape,
+        &mut output,
+        &a_shape,
+    );
+    runtime.end_graph_capture().unwrap();
+    assert_eq!(
+        runtime.graph_segment_count().unwrap(),
+        1,
+        "{} capture must install one non-vacuous graph segment",
+        case.op
+    );
+    assert_eq!(
+        runtime.graph_execution_counts().captures,
+        graph_counts.captures + 1,
+        "{} capture was not installed",
+        case.op
+    );
+
+    let frees_before_drop = runtime.allocation_counts().frees;
+    let pooled_before_drop = runtime.raw_pool_retained_bytes();
+    drop(kernel);
+    assert_eq!(
+        runtime.allocation_counts().frees,
+        frees_before_drop,
+        "{} kernel drop freed metadata still retained by the graph",
+        case.op
+    );
+    assert_eq!(
+        runtime.raw_pool_retained_bytes(),
+        pooled_before_drop,
+        "{} kernel drop returned graph-retained metadata to the raw pool",
+        case.op
+    );
+
+    let rewarm_a = upload(ep, &case.rewarm_a_values);
+    let rewarm_b = upload(ep, &case.rewarm_b_values);
+    let mut rewarm_output = ep.allocate(case.rewarm_expected.len(), 256).unwrap();
+    let mut rewarm_kernel = ep
+        .get_kernel(
+            &Node::new(NodeId(1), case.op, vec![], vec![]),
+            &[],
+            case.opset,
+        )
+        .unwrap();
+    rewarm_kernel.set_capture_seq_independent(true);
+    execute_broadcast(
+        ep,
+        rewarm_kernel.as_ref(),
+        case.input_dtype,
+        case.output_dtype,
+        &rewarm_a,
+        &rewarm_shape,
+        &rewarm_b,
+        &rewarm_b_shape,
+        &mut rewarm_output,
+        &rewarm_shape,
+    );
+    assert_eq!(
+        download(ep, &rewarm_output, case.rewarm_expected.len()),
+        case.rewarm_expected,
+        "{} rewarm output is incorrect",
+        case.op
+    );
+    let rewarm_resources = rewarm_kernel.device_graph_resources();
+    assert_eq!(rewarm_resources.len(), 1);
+    assert_ne!(
+        rewarm_resources[0].identity(),
+        captured_resource,
+        "{} rewarm must not replace the owner retained by the installed graph",
+        case.op
+    );
+    drop(rewarm_resources);
+
+    let counts_before_rewarm_drop = runtime.allocation_counts();
+    let pooled_before_rewarm_drop = runtime.raw_pool_retained_bytes();
+    drop(rewarm_kernel);
+    assert!(
+        runtime.allocation_counts().frees > counts_before_rewarm_drop.frees
+            || runtime.raw_pool_retained_bytes() > pooled_before_rewarm_drop,
+        "{} dropping the uncaptured rewarm kernel must release its metadata owner",
+        case.op
+    );
+
+    unsafe {
+        runtime
+            .htod(&vec![0xa5; case.expected.len()], cuptr(output.as_mut_ptr()))
+            .unwrap()
+    };
+    runtime.replay_graph().unwrap();
+    assert_eq!(
+        download(ep, &output, case.expected.len()),
+        case.expected,
+        "{} replay used stale or recycled broadcast metadata after kernel drop/rewarm",
+        case.op
+    );
+    assert_eq!(runtime.check_capture_error().unwrap(), 0);
+    assert_eq!(
+        runtime.graph_execution_counts().replays,
+        graph_counts.replays + 1,
+        "{} installed graph was not replayed",
+        case.op
+    );
+
+    let counts_before_reset = runtime.allocation_counts();
+    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+    assert!(runtime.reset_graph().unwrap());
+    assert!(
+        runtime.allocation_counts().frees > counts_before_reset.frees
+            || runtime.raw_pool_retained_bytes() > pooled_before_reset,
+        "{} graph reset must release its retained metadata owner",
+        case.op
+    );
+
+    for buffer in [a, b, output, rewarm_a, rewarm_b, rewarm_output] {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn capture_capable_broadcast_families_register_and_retain_metadata_owners() {
+    let ep = require_cuda();
+    let cases = [
+        BroadcastCaptureCase {
+            op: "Add",
+            opset: 17,
+            input_dtype: DataType::Float32,
+            output_dtype: DataType::Float32,
+            a_values: owned_bytes(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            b_values: owned_bytes(&[10.0_f32, 20.0, 30.0]),
+            expected: owned_bytes(&[11.0_f32, 22.0, 33.0, 14.0, 25.0, 36.0]),
+            rewarm_a_values: owned_bytes(&[100.0_f32, 101.0, 102.0, 200.0, 201.0, 202.0]),
+            rewarm_b_values: owned_bytes(&[1.0_f32, 10.0]),
+            rewarm_expected: owned_bytes(&[101.0_f32, 102.0, 103.0, 210.0, 211.0, 212.0]),
+        },
+        BroadcastCaptureCase {
+            op: "Greater",
+            opset: 17,
+            input_dtype: DataType::Float32,
+            output_dtype: DataType::Bool,
+            a_values: owned_bytes(&[1.0_f32, 4.0, 3.0, 8.0, 2.0, 9.0]),
+            b_values: owned_bytes(&[2.0_f32, 3.0, 4.0]),
+            expected: vec![0, 1, 0, 1, 0, 1],
+            rewarm_a_values: owned_bytes(&[1.0_f32, 4.0, 3.0, 8.0, 2.0, 9.0]),
+            rewarm_b_values: owned_bytes(&[3.0_f32, 4.0]),
+            rewarm_expected: vec![0, 1, 0, 1, 0, 1],
+        },
+        BroadcastCaptureCase {
+            op: "BitwiseAnd",
+            opset: 18,
+            input_dtype: DataType::Int32,
+            output_dtype: DataType::Int32,
+            a_values: owned_bytes(&[7_i32, 6, 5, 4, 3, 2]),
+            b_values: owned_bytes(&[3_i32, 5, 6]),
+            expected: owned_bytes(&[3_i32, 4, 4, 0, 1, 2]),
+            rewarm_a_values: owned_bytes(&[7_i32, 6, 5, 4, 3, 2]),
+            rewarm_b_values: owned_bytes(&[1_i32, 2]),
+            rewarm_expected: owned_bytes(&[1_i32, 0, 1, 0, 2, 2]),
+        },
+        BroadcastCaptureCase {
+            op: "PRelu",
+            opset: 16,
+            input_dtype: DataType::Float32,
+            output_dtype: DataType::Float32,
+            a_values: owned_bytes(&[-1.0_f32, -2.0, -3.0, 4.0, 5.0, 6.0]),
+            b_values: owned_bytes(&[0.5_f32, 2.0, -1.0]),
+            expected: owned_bytes(&[-0.5_f32, -4.0, 3.0, 4.0, 5.0, 6.0]),
+            rewarm_a_values: owned_bytes(&[-4.0_f32, -2.0, 3.0, -1.0, 5.0, -6.0]),
+            rewarm_b_values: owned_bytes(&[0.25_f32, 2.0]),
+            rewarm_expected: owned_bytes(&[-1.0_f32, -0.5, 3.0, -2.0, 5.0, -12.0]),
+        },
+    ];
+    for case in cases {
+        exercise_broadcast_capture_owner(&ep, case);
+    }
 }

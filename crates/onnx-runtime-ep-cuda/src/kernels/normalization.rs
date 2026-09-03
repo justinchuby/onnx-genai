@@ -39,12 +39,13 @@ use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use onnx_runtime_ep_api::{
-    DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    DeviceGraphResource, DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result,
+    TensorMut, TensorView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr, raw_ptr};
 
 use super::softmax::resolve_axis;
 
@@ -2046,6 +2047,7 @@ impl KernelFactory for SkipSimplifiedLayerNormFactory {
             metadata: Mutex::new(SkipBroadcastMetadataCache::new(self.runtime.clone())),
             bf16_scratch: Mutex::new(NormBf16Scratch::new(self.runtime.clone())),
             last_call_capture_safe: AtomicBool::new(false),
+            last_call_used_bf16_scratch: AtomicBool::new(false),
         }))
     }
 }
@@ -2061,16 +2063,93 @@ pub struct SkipSimplifiedLayerNormKernel {
     /// on the hot path, which is what keeps the bf16 path graph-capture safe.
     bf16_scratch: Mutex<NormBf16Scratch>,
     last_call_capture_safe: AtomicBool,
+    last_call_used_bf16_scratch: AtomicBool,
+}
+
+struct SkipNormWarmRollback<'a> {
+    kernel: &'a SkipSimplifiedLayerNormKernel,
+    metadata: Option<SkipBroadcastMetadataCache>,
+    scratch: Option<NormBf16Scratch>,
+    capture_safe: bool,
+    used_bf16_scratch: bool,
+    committed: bool,
+}
+
+impl<'a> SkipNormWarmRollback<'a> {
+    fn new(kernel: &'a SkipSimplifiedLayerNormKernel) -> Result<Self> {
+        Ok(Self {
+            metadata: Some(
+                kernel
+                    .metadata
+                    .lock()
+                    .map_err(|_| {
+                        EpError::KernelFailed(
+                            "cuda_ep SkipSimplifiedLayerNormalization: metadata lock poisoned"
+                                .into(),
+                        )
+                    })?
+                    .clone(),
+            ),
+            scratch: Some(
+                kernel
+                    .bf16_scratch
+                    .lock()
+                    .map_err(|_| {
+                        EpError::KernelFailed(
+                            "cuda_ep SkipSimplifiedLayerNormalization: scratch lock poisoned"
+                                .into(),
+                        )
+                    })?
+                    .clone(),
+            ),
+            capture_safe: kernel.last_call_capture_safe.load(Ordering::Relaxed),
+            used_bf16_scratch: kernel.last_call_used_bf16_scratch.load(Ordering::Relaxed),
+            kernel,
+            committed: false,
+        })
+    }
+
+    fn finish(mut self, result: Result<()>) -> Result<()> {
+        self.committed = result.is_ok();
+        result
+    }
+}
+
+impl Drop for SkipNormWarmRollback<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if !self.kernel.runtime.is_capturing().unwrap_or(true) {
+            let _ = self.kernel.runtime.drain_for_unmap();
+        }
+        if let Some(metadata) = self.metadata.take()
+            && let Ok(mut current) = self.kernel.metadata.lock()
+        {
+            *current = metadata;
+        }
+        if let Some(scratch) = self.scratch.take()
+            && let Ok(mut current) = self.kernel.bf16_scratch.lock()
+        {
+            *current = scratch;
+        }
+        self.kernel
+            .last_call_capture_safe
+            .store(self.capture_safe, Ordering::Relaxed);
+        self.kernel
+            .last_call_used_bf16_scratch
+            .store(self.used_bf16_scratch, Ordering::Relaxed);
+    }
 }
 
 /// Persistent device arena that stages BFloat16 operands through Float32 without
 /// per-call allocation. Mirrors the `Bf16Scratch` pattern in `matmul_nbits`: a
 /// single grow-only buffer whose base address stays fixed across decode steps,
 /// so the casts recorded into a CUDA graph replay against a stable pointer.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct NormBf16Scratch {
     runtime: Arc<CudaRuntime>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
     cap: usize,
 }
 
@@ -2078,7 +2157,7 @@ impl NormBf16Scratch {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            ptr: 0,
+            allocation: None,
             cap: 0,
         }
     }
@@ -2088,36 +2167,34 @@ impl NormBf16Scratch {
     /// moved, so a call that grows the arena is not capture-safe; steady decode
     /// (fixed shapes) never grows after the first warm call.
     fn ensure(&mut self, bytes: usize) -> Result<(CUdeviceptr, bool)> {
-        if bytes <= self.cap && self.ptr != 0 {
-            return Ok((self.ptr, false));
+        if bytes <= self.cap
+            && let Some(allocation) = self.allocation.as_ref()
+        {
+            return Ok((allocation.ptr(), false));
         }
-        if self.ptr != 0 {
-            // SAFETY: exclusively owned; freed once before replacement. A grow
-            // only happens off the captured hot path (first warm call / shape
-            // change), so no queued replay references the old buffer.
-            unsafe { self.runtime.free_raw(self.ptr)? };
-            self.ptr = 0;
+        if self.allocation.is_some() {
+            self.runtime.drain_for_unmap()?;
         }
-        self.ptr = self.runtime.alloc_raw(bytes.max(1))?;
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes.max(1))?;
+        self.runtime
+            .staged_warm_cache_mutation("SkipSimplifiedLayerNorm bf16 scratch allocation")?;
+        let ptr = allocation.ptr();
+        self.allocation = Some(allocation);
         self.cap = bytes;
-        Ok((self.ptr, true))
+        Ok((ptr, true))
+    }
+
+    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        self.allocation
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
-impl Drop for NormBf16Scratch {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            // SAFETY: this persistent buffer is exclusively owned by the kernel.
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SkipBroadcastMetadataCache {
     runtime: Arc<CudaRuntime>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
     input_shape: Vec<usize>,
     skip_shape: Vec<usize>,
 }
@@ -2126,15 +2203,18 @@ impl SkipBroadcastMetadataCache {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            ptr: 0,
+            allocation: None,
             input_shape: Vec::new(),
             skip_shape: Vec::new(),
         }
     }
 
     fn reserve(&mut self, input_shape: &[usize], skip_shape: &[usize]) -> Result<CUdeviceptr> {
-        if self.ptr != 0 && self.input_shape == input_shape && self.skip_shape == skip_shape {
-            return Ok(self.ptr);
+        if self.input_shape == input_shape
+            && self.skip_shape == skip_shape
+            && let Some(allocation) = self.allocation.as_ref()
+        {
+            return Ok(allocation.ptr());
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
@@ -2146,45 +2226,30 @@ impl SkipBroadcastMetadataCache {
 
         let metadata = skip_broadcast_metadata(input_shape, skip_shape);
         let metadata_bytes = u64_bytes(&metadata);
-        let ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, metadata_bytes.len())?;
         // SAFETY: `ptr` exactly covers the metadata byte slice.
-        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, ptr) } {
-            // SAFETY: `ptr` is still exclusively owned and no launch used it.
-            let _ = unsafe { self.runtime.free_raw(ptr) };
-            return Err(error);
-        }
-        if self.ptr != 0 {
+        unsafe { self.runtime.htod(metadata_bytes, allocation.ptr()) }?;
+        self.runtime.staged_warm_cache_mutation(
+            "SkipSimplifiedLayerNorm broadcast metadata allocation/upload",
+        )?;
+        if self.allocation.is_some() {
             // A dynamic shape change may replace metadata still referenced by
             // queued work. Fixed-shape decode always takes the cache-hit path.
-            if let Err(error) = self.runtime.synchronize() {
-                // SAFETY: `ptr` is still exclusively owned and has not escaped.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(error);
-            }
-            // SAFETY: synchronization completed all prior users of `self.ptr`.
-            if let Err(error) = unsafe { self.runtime.free_raw(self.ptr) } {
-                // SAFETY: `ptr` is still exclusively owned and has not escaped.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(error);
-            }
+            self.runtime.synchronize()?;
         }
-        self.ptr = ptr;
+        let ptr = allocation.ptr();
+        self.allocation = Some(allocation);
         self.input_shape.clear();
         self.input_shape.extend_from_slice(input_shape);
         self.skip_shape.clear();
         self.skip_shape.extend_from_slice(skip_shape);
         Ok(ptr)
     }
-}
 
-impl Drop for SkipBroadcastMetadataCache {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            let _ = self.runtime.synchronize();
-            // SAFETY: this cache exclusively owns the persistent allocation.
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
-        }
+    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        self.allocation
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -2489,7 +2554,10 @@ impl SkipSimplifiedLayerNormKernel {
     }
 
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let rollback = SkipNormWarmRollback::new(self)?;
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        self.last_call_used_bf16_scratch
+            .store(false, Ordering::Relaxed);
         let op = "SkipSimplifiedLayerNormalization";
         if !(3..=4).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 4 {
             return Err(EpError::KernelFailed(format!(
@@ -2515,9 +2583,11 @@ impl SkipSimplifiedLayerNormKernel {
                 && skip.numel() == input.numel()
                 && bias.is_none()
             {
-                return self.run_bf16_native(inputs, outputs);
+                return rollback.finish(self.run_bf16_native(inputs, outputs));
             }
-            return self.run_bf16_via_f32(inputs, outputs);
+            self.last_call_used_bf16_scratch
+                .store(true, Ordering::Relaxed);
+            return rollback.finish(self.run_bf16_via_f32(inputs, outputs));
         }
         require_f16_or_f32(op, "input", input.dtype)?;
         let is_half = input.dtype == DataType::Float16;
@@ -2764,7 +2834,7 @@ impl SkipSimplifiedLayerNormKernel {
         // additionally demotes when its arena grows during capture (see
         // `run_bf16_via_f32`).
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
-        Ok(())
+        rollback.finish(Ok(()))
     }
 }
 
@@ -2774,6 +2844,21 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
     }
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
+    }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        let mut resources = Vec::with_capacity(2);
+        if let Ok(metadata) = self.metadata.lock()
+            && let Some(resource) = metadata.device_graph_resource()
+        {
+            resources.push(resource);
+        }
+        if self.last_call_used_bf16_scratch.load(Ordering::Relaxed)
+            && let Ok(scratch) = self.bf16_scratch.lock()
+            && let Some(resource) = scratch.device_graph_resource()
+        {
+            resources.push(resource);
+        }
+        resources
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         if self.last_call_capture_safe.load(Ordering::Relaxed) {
@@ -3630,6 +3715,7 @@ mod tests {
                 metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
                 bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
                 last_call_capture_safe: AtomicBool::new(false),
+                last_call_used_bf16_scratch: AtomicBool::new(false),
             };
             kernel.run(&inputs, &mut [output]).unwrap();
         }
@@ -3773,6 +3859,7 @@ mod tests {
             metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
             bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
             last_call_capture_safe: AtomicBool::new(false),
+            last_call_used_bf16_scratch: AtomicBool::new(false),
         };
         kernel.run(&inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
@@ -3946,6 +4033,7 @@ mod tests {
             metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
             bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
             last_call_capture_safe: AtomicBool::new(false),
+            last_call_used_bf16_scratch: AtomicBool::new(false),
         };
         kernel
             .run(
@@ -4294,6 +4382,7 @@ mod tests {
                 metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
                 bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
                 last_call_capture_safe: AtomicBool::new(false),
+                last_call_used_bf16_scratch: AtomicBool::new(false),
             };
             kernel.run(&inputs, &mut [output]).unwrap();
         }

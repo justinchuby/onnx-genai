@@ -134,7 +134,8 @@ impl KernelFactory for ConvFactory {
                 .transpose()?
                 .unwrap_or("NOTSET")
                 .to_owned(),
-            conv_plan: Mutex::new(CudnnConvPlanCache::new()),
+            conv_plan: Mutex::new(None),
+            prepared_conv_plan: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
@@ -158,7 +159,11 @@ pub struct ConvKernel {
     kernel_shape: Option<Vec<i64>>,
     group: i64,
     auto_pad: String,
-    conv_plan: Mutex<CudnnConvPlanCache>,
+    /// Last successfully executed cuDNN plan. Workspace queries never mutate it.
+    conv_plan: Mutex<Option<CudnnConvPlanCache>>,
+    /// Prospective plan for the immediately following execution. Abandoning the
+    /// dispatch or failing workspace allocation leaves `conv_plan` untouched.
+    prepared_conv_plan: Mutex<Option<CudnnConvPlanCache>>,
     last_call_capture_safe: AtomicBool,
 }
 
@@ -403,6 +408,9 @@ impl ConvKernel {
         inputs: &[TensorMetadata<'_>],
         capturing: bool,
     ) -> Result<WorkspaceRequirement> {
+        *self.prepared_conv_plan.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Conv: prepared cuDNN plan lock was poisoned".into())
+        })? = None;
         let (Some(x), Some(w)) = (inputs.first(), inputs.get(1)) else {
             return Ok(WorkspaceRequirement::NONE);
         };
@@ -445,12 +453,31 @@ impl ConvKernel {
             groups: i32::try_from(plan.groups)
                 .map_err(|_| EpError::KernelFailed("cuda_ep Conv: group exceeds i32".into()))?,
         };
-        let mut cache = self.conv_plan.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep Conv: cuDNN plan cache lock was poisoned".into())
-        })?;
-        let bytes = self.runtime.cudnn().with_handle(|handle| {
-            handle.conv_workspace_bytes(&mut cache, &spec, bias_present, capturing)
-        })?;
+        let current = self
+            .conv_plan
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed("cuda_ep Conv: cuDNN plan cache lock was poisoned".into())
+            })?
+            .clone();
+        let prepared =
+            if let Some(current) = current.filter(|current| current.matches(&spec, bias_present)) {
+                current
+            } else if capturing {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep Conv: cuDNN convolution signature changed during CUDA graph capture; \
+                 abort capture and warm the exact fixed shape first"
+                        .into(),
+                ));
+            } else {
+                self.runtime
+                    .cudnn()
+                    .with_handle(|handle| handle.prepare_conv(&spec, bias_present))?
+            };
+        let bytes = prepared.workspace_bytes();
+        *self.prepared_conv_plan.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Conv: prepared cuDNN plan lock was poisoned".into())
+        })? = Some(prepared);
         Ok(governed_workspace_requirement(bytes))
     }
 
@@ -551,15 +578,47 @@ impl ConvKernel {
             output_numel: outputs[0].numel(),
         };
         let capturing = self.runtime.is_capturing()?;
-        let mut conv_plan = self.conv_plan.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep Conv: cuDNN plan cache lock was poisoned".into())
-        })?;
-        self.runtime.cudnn().with_handle(|handle| {
-            handle.conv2d(&mut conv_plan, &spec, buffers, workspace, capturing)
-        })?;
-        drop(conv_plan);
+        let prepared = self
+            .prepared_conv_plan
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed("cuda_ep Conv: prepared cuDNN plan lock was poisoned".into())
+            })?
+            .take();
+        let current = self
+            .conv_plan
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed("cuda_ep Conv: cuDNN plan cache lock was poisoned".into())
+            })?
+            .clone();
+        let conv_plan = if let Some(prepared) =
+            prepared.filter(|prepared| prepared.matches(&spec, bias.is_some()))
+        {
+            prepared
+        } else if let Some(current) =
+            current.filter(|current| current.matches(&spec, bias.is_some()))
+        {
+            current
+        } else if capturing {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Conv: cuDNN convolution signature changed during CUDA graph capture; \
+                 abort capture and warm the exact fixed shape first"
+                    .into(),
+            ));
+        } else {
+            self.runtime
+                .cudnn()
+                .with_handle(|handle| handle.prepare_conv(&spec, bias.is_some()))?
+        };
+        self.runtime
+            .cudnn()
+            .with_handle(|handle| handle.conv2d(&conv_plan, &spec, buffers, workspace))?;
         if !capturing {
             self.runtime.synchronize()?;
+            *self.conv_plan.lock().map_err(|_| {
+                EpError::KernelFailed("cuda_ep Conv: cuDNN plan cache lock was poisoned".into())
+            })? = Some(conv_plan);
         }
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
         Ok(())

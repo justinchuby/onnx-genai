@@ -62,6 +62,7 @@ pub(crate) mod device_token_writer;
 pub mod dft;
 pub mod dropout;
 pub mod dsa_index_select;
+pub mod einsum;
 pub mod elementwise;
 pub mod expert_route_telemetry;
 mod flash_attention;
@@ -200,6 +201,7 @@ use pointwise::{
 /// prioritised list of remaining / custom-kernel ops.
 pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul",
+    "Einsum",
     "MatMulNBits",
     "QMoE",
     "BlockQuantizedMatMul",
@@ -507,6 +509,7 @@ static CUDA_ATTENTION_DTYPES: &[DataType] = &[
 /// Bounded CUDA Unique consumes f32 and returns f32 Y plus i64 metadata.
 static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 static CUDA_NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+static CUDA_EINSUM_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16];
 
 /// Element types the CUDA EP advertises for `(op_type, domain)`.
 ///
@@ -524,6 +527,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("STFT", "") => CUDA_STFT_DTYPES,
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
+        ("Einsum", "") => CUDA_EINSUM_DTYPES,
 
         // Block-quantized GEMM / MoE: f16/f32 activation + Uint8 packed weight.
         ("MatMulNBits", "com.microsoft")
@@ -722,6 +726,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("MatMul", "", 1),
         Box::new(matmul::MatMulFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Einsum", "", 12),
+        Box::new(einsum::EinsumFactory {
             runtime: runtime.clone(),
         }),
     );

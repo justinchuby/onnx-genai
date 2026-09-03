@@ -7,15 +7,15 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{
-    DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
-    TensorView, WorkspaceRequirement, WorkspaceView,
+    DeviceGraphResource, DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result,
+    TensorMetadata, TensorMut, TensorView, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::blas::{self, GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmEx, GemmParams};
 use crate::error::driver_err;
 use crate::kernels::marlin_gemm;
-use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr, raw_ptr};
 
 const DEQUANT_MODULE: &str = "matmul_nbits_dequant_f32";
 const DEQUANT_ENTRY: &str = "matmul_nbits_dequant_f32";
@@ -6748,7 +6748,7 @@ impl KernelFactory for MatMulNBitsFactory {
 
 #[derive(Debug)]
 struct Accuracy4Workspace {
-    runtime: Arc<CudaRuntime>,
+    allocation: Arc<GraphDeviceAllocation>,
     quantized_activation: CUdeviceptr,
     activation_scale: CUdeviceptr,
     padded_k: usize,
@@ -6760,9 +6760,10 @@ impl Accuracy4Workspace {
         // Per-K-block int8 activation scales: one f32 per weight block.
         let k_blocks = padded_k / block_size;
         let scale_bytes = k_blocks * std::mem::size_of::<f32>();
-        let quantized_activation = runtime.alloc_raw(padded_k + scale_bytes)?;
+        let allocation = GraphDeviceAllocation::allocate(&runtime, padded_k + scale_bytes)?;
+        let quantized_activation = allocation.ptr();
         Ok(Self {
-            runtime,
+            allocation,
             quantized_activation,
             activation_scale: quantized_activation + padded_k as CUdeviceptr,
             padded_k,
@@ -6770,14 +6771,9 @@ impl Accuracy4Workspace {
     }
 }
 
-impl Drop for Accuracy4Workspace {
-    fn drop(&mut self) {
-        if self.quantized_activation != 0 {
-            // SAFETY: this persistent buffer is exclusively owned by the kernel.
-            let _ = unsafe { self.runtime.free_raw(self.quantized_activation) };
-            self.quantized_activation = 0;
-            self.activation_scale = 0;
-        }
+impl Accuracy4Workspace {
+    fn device_graph_resource(&self) -> DeviceGraphResource {
+        GraphDeviceAllocation::device_graph_resource(&self.allocation)
     }
 }
 
@@ -6795,41 +6791,51 @@ impl Drop for Accuracy4Workspace {
 #[derive(Debug)]
 struct Bf16Scratch {
     runtime: Arc<CudaRuntime>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
     cap: usize,
+    used: bool,
 }
 
 impl Bf16Scratch {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            ptr: 0,
+            allocation: None,
             cap: 0,
+            used: false,
         }
+    }
+
+    fn begin_call(&mut self) {
+        self.used = false;
     }
 
     /// Ensure the arena holds at least `bytes`, returning its base pointer.
     fn ensure(&mut self, bytes: usize) -> Result<CUdeviceptr> {
+        self.used = true;
         if bytes > self.cap {
-            if self.ptr != 0 {
-                // SAFETY: exclusively owned; freed once before replacement.
-                unsafe { self.runtime.free_raw(self.ptr)? };
-                self.ptr = 0;
+            if self.allocation.is_some() {
+                self.runtime.drain_for_unmap()?;
             }
-            self.ptr = self.runtime.alloc_raw(bytes.max(1))?;
+            self.allocation = Some(GraphDeviceAllocation::allocate(
+                &self.runtime,
+                bytes.max(1),
+            )?);
             self.cap = bytes;
         }
-        Ok(self.ptr)
+        Ok(self
+            .allocation
+            .as_ref()
+            .map_or(0, |allocation| allocation.ptr()))
     }
-}
 
-impl Drop for Bf16Scratch {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            // SAFETY: this persistent buffer is exclusively owned by the kernel.
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
+    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        if !self.used {
+            return None;
         }
+        self.allocation
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -6845,8 +6851,9 @@ impl Drop for Bf16Scratch {
 #[derive(Debug)]
 struct Bf16ConstCache {
     runtime: Arc<CudaRuntime>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
     cap: usize,
+    used: bool,
     /// One entry per cached constant: `(src_ptr, numel, byte_offset)`.
     slots: Vec<(CUdeviceptr, usize, usize)>,
 }
@@ -6855,10 +6862,15 @@ impl Bf16ConstCache {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            ptr: 0,
+            allocation: None,
             cap: 0,
+            used: false,
             slots: Vec::new(),
         }
+    }
+
+    fn begin_call(&mut self) {
+        self.used = false;
     }
 
     /// Return the Float16 device pointers holding the staged copies of the
@@ -6867,6 +6879,7 @@ impl Bf16ConstCache {
     /// is allocated once (before CUDA-graph capture, during warmup) and never
     /// grows again for a given node, so replays hit only cache lookups.
     fn staged(&mut self, consts: &[(CUdeviceptr, usize)]) -> Result<Vec<CUdeviceptr>> {
+        self.used = true;
         let matches =
             self.slots.len() == consts.len()
                 && self.slots.iter().zip(consts).all(
@@ -6880,7 +6893,12 @@ impl Bf16ConstCache {
         Ok(self
             .slots
             .iter()
-            .map(|(_, _, offset)| self.ptr + *offset as CUdeviceptr)
+            .map(|(_, _, offset)| {
+                self.allocation
+                    .as_ref()
+                    .map_or(0, |allocation| allocation.ptr())
+                    + *offset as CUdeviceptr
+            })
             .collect())
     }
 
@@ -6895,20 +6913,25 @@ impl Bf16ConstCache {
             total += round(numel * f16);
         }
         if total > self.cap {
-            if self.ptr != 0 {
-                // SAFETY: exclusively owned; freed once before replacement.
-                unsafe { self.runtime.free_raw(self.ptr)? };
-                self.ptr = 0;
+            if self.allocation.is_some() {
+                self.runtime.drain_for_unmap()?;
             }
-            self.ptr = self.runtime.alloc_raw(total.max(1))?;
+            self.allocation = Some(GraphDeviceAllocation::allocate(
+                &self.runtime,
+                total.max(1),
+            )?);
             self.cap = total;
         }
+        let base = self
+            .allocation
+            .as_ref()
+            .map_or(0, |allocation| allocation.ptr());
         for (src, numel, offset) in &slots {
             super::cast::launch_cast_raw(
                 &self.runtime,
                 cuptr(*src as *const c_void),
                 DataType::BFloat16,
-                self.ptr + *offset as CUdeviceptr,
+                base + *offset as CUdeviceptr,
                 DataType::Float16,
                 *numel,
             )?;
@@ -6916,15 +6939,14 @@ impl Bf16ConstCache {
         self.slots = slots;
         Ok(())
     }
-}
 
-impl Drop for Bf16ConstCache {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            // SAFETY: this persistent buffer is exclusively owned by the kernel.
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
+    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        if !self.used {
+            return None;
         }
+        self.allocation
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -7000,6 +7022,15 @@ impl MatMulNBitsKernel {
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        self.marlin_repack_cache.begin_call();
+        self.bf16_scratch
+            .lock()
+            .map_err(|_| error("BFloat16 scratch lock poisoned"))?
+            .begin_call();
+        self.bf16_const_cache
+            .lock()
+            .map_err(|_| error("BFloat16 constant cache lock poisoned"))?
+            .begin_call();
         let max_inputs = if self.gate_up_swiglu { 8 } else { 7 };
         if !(3..=max_inputs).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
@@ -8311,7 +8342,7 @@ impl MatMulNBitsKernel {
             if split_k > 1 {
                 let bytes = marlin_gemm::splitk_partials_len(split_k, args.m, args.n)
                     * std::mem::size_of::<f32>();
-                let (partials, warm) = marlin_gemm::ensure_scratch(&self.runtime, 4, bytes)?;
+                let (partials, warm) = self.marlin_repack_cache.ensure_scratch(4, bytes)?;
                 marlin_gemm::launch_marlin_gemm_splitk(&self.runtime, args, split_k, partials)?;
                 return Ok(warm);
             }
@@ -8361,7 +8392,7 @@ impl MatMulNBitsKernel {
         // Pooled normalized-activation scratch (slot 0). On a warm replay this is
         // already allocated, so the whole path is allocation-free.
         let scratch_bytes = m * self.k * std::mem::size_of::<half::f16>();
-        let (scratch, scratch_warm) = marlin_gemm::ensure_scratch(&self.runtime, 0, scratch_bytes)?;
+        let (scratch, scratch_warm) = self.marlin_repack_cache.ensure_scratch(0, scratch_bytes)?;
 
         self.launch_rmsnorm_prefill(activation, gamma, scratch, m)?;
         let args = marlin_gemm::MarlinGemmArgs {
@@ -8431,7 +8462,7 @@ impl MatMulNBitsKernel {
         // does), so both projections read the same normalized copy.
         let act_ptr = if let Some(gamma) = gamma {
             let norm_bytes = m * self.k * std::mem::size_of::<half::f16>();
-            let (norm, _warm) = marlin_gemm::ensure_scratch(&self.runtime, 0, norm_bytes)?;
+            let (norm, _warm) = self.marlin_repack_cache.ensure_scratch(0, norm_bytes)?;
             self.launch_rmsnorm_prefill(activation, gamma, norm, m)?;
             norm
         } else {
@@ -8441,11 +8472,11 @@ impl MatMulNBitsKernel {
         let out_bytes = output.byte_size();
         // Slot 1 holds the gate projection, as on the Marlin path; the up
         // projection writes the real output and SiluMul folds them in place.
-        let (gate_buf, _warm) = marlin_gemm::ensure_scratch(&self.runtime, 1, out_bytes)?;
+        let (gate_buf, _warm) = self.marlin_repack_cache.ensure_scratch(1, out_bytes)?;
         // Slots 5 and 6 hold the two dequantized weights. They must differ: both
         // are live across the second GEMM.
-        let (weight_gate, _warm) = marlin_gemm::ensure_scratch(&self.runtime, 5, weight_bytes)?;
-        let (weight_up, _warm) = marlin_gemm::ensure_scratch(&self.runtime, 6, weight_bytes)?;
+        let (weight_gate, _warm) = self.marlin_repack_cache.ensure_scratch(5, weight_bytes)?;
+        let (weight_up, _warm) = self.marlin_repack_cache.ensure_scratch(6, weight_bytes)?;
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
 
         for (packed, scales, zero_points, weight, out) in [
@@ -8540,7 +8571,7 @@ impl MatMulNBitsKernel {
         // then read that single normalized copy.
         let (act_ptr, norm_warm) = if let Some(gamma) = gamma {
             let norm_bytes = m * self.k * std::mem::size_of::<half::f16>();
-            let (norm, norm_warm) = marlin_gemm::ensure_scratch(&self.runtime, 0, norm_bytes)?;
+            let (norm, norm_warm) = self.marlin_repack_cache.ensure_scratch(0, norm_bytes)?;
             self.launch_rmsnorm_prefill(activation, gamma, norm, m)?;
             (norm, norm_warm)
         } else {
@@ -8550,7 +8581,7 @@ impl MatMulNBitsKernel {
         // Pooled gate-projection scratch (slot 1). The up projection writes the
         // real output; SiluMul folds them into the output in place.
         let out_bytes = output.byte_size();
-        let (gate_buf, gate_s_warm) = marlin_gemm::ensure_scratch(&self.runtime, 1, out_bytes)?;
+        let (gate_buf, gate_s_warm) = self.marlin_repack_cache.ensure_scratch(1, out_bytes)?;
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
 
         let gate_args = marlin_gemm::MarlinGemmArgs {
@@ -10899,7 +10930,7 @@ impl MatMulNBitsKernel {
         // `cuMemCreate`/`cuMemSetAccess`/`cuMemUnmap` for every map and unmap of
         // a buffer this large — enough allocator time to swamp the GEMM the
         // dequantize exists to feed. Slot 5 is unused by the Marlin fused paths.
-        let (weight, _warm) = marlin_gemm::ensure_scratch(&self.runtime, 5, weight_bytes)?;
+        let (weight, _warm) = self.marlin_repack_cache.ensure_scratch(5, weight_bytes)?;
         let result = self
             .launch_dequant_f16(
                 packed,
@@ -11131,6 +11162,26 @@ impl Kernel for MatMulNBitsKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         false
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        let mut resources = self.marlin_repack_cache.device_graph_resources();
+        if let Some(workspace) = &self.accuracy4_workspace
+            && let Ok(workspace) = workspace.lock()
+        {
+            resources.push(workspace.device_graph_resource());
+        }
+        if let Ok(scratch) = self.bf16_scratch.lock()
+            && let Some(resource) = scratch.device_graph_resource()
+        {
+            resources.push(resource);
+        }
+        if let Ok(cache) = self.bf16_const_cache.lock()
+            && let Some(resource) = cache.device_graph_resource()
+        {
+            resources.push(resource);
+        }
+        resources
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {

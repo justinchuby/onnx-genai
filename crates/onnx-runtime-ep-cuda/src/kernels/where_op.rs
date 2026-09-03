@@ -15,12 +15,14 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use super::elementwise::{broadcast_strides, require_matching_capture_signature, u64_bytes};
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 const BLOCK: u32 = 256;
 const WHERE_SOURCE: &str = r#"
@@ -83,11 +85,11 @@ struct WhereCaptureSignature {
 /// metadata for a three-input `Where`. Reused across decode steps whenever the
 /// operand shapes are unchanged, so a captured launch performs **no** per-step
 /// host allocation, upload, free, or synchronize.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct WhereMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<WhereMetadataKey>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
 }
 
 impl WhereMetadataCache {
@@ -95,20 +97,37 @@ impl WhereMetadataCache {
         Self {
             runtime,
             key: None,
-            ptr: 0,
+            allocation: None,
         }
     }
 
     fn prepare(&mut self, key: &WhereMetadataKey) -> Result<CUdeviceptr> {
         if self.key.as_ref() == Some(key) {
-            return Ok(self.ptr);
+            let ptr = self.allocation.as_ref().map_or_else(
+                || {
+                    Err(EpError::KernelFailed(
+                        "cuda_ep Where: cached broadcast metadata lost its device allocation"
+                            .into(),
+                    ))
+                },
+                |allocation| Ok(allocation.ptr()),
+            )?;
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    self.device_graph_resource()
+                        .expect("cached Where allocation is present")
+                        .identity(),
+                    "Where broadcast metadata",
+                )?;
+            }
+            return Ok(ptr);
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
                 "cuda_ep Where: broadcast metadata shape changed during CUDA graph capture; warm the fixed decode shape before capture".into(),
             ));
         }
-        if self.ptr != 0 {
+        if self.allocation.is_some() {
             self.runtime.synchronize()?;
         }
 
@@ -120,36 +139,21 @@ impl WhereMetadataCache {
             metadata.push(0);
         }
         let metadata_bytes = u64_bytes(&metadata);
-        let ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, metadata_bytes.len())?;
         // SAFETY: allocation exactly covers the metadata byte slice.
-        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, ptr) } {
-            // SAFETY: `ptr` is still owned by this cache and no launch used it.
-            let _ = unsafe { self.runtime.free_raw(ptr) };
-            return Err(error);
-        }
-        if self.ptr != 0 {
-            // SAFETY: synchronization completed all prior launches using the old
-            // pointer, which remains exclusively owned by this cache.
-            if let Err(error) = unsafe { self.runtime.free_raw(self.ptr) } {
-                // SAFETY: the replacement has not escaped or been launched.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-                return Err(error);
-            }
-        }
+        unsafe { self.runtime.htod(metadata_bytes, allocation.ptr()) }?;
+        self.runtime
+            .staged_warm_cache_mutation("Where broadcast metadata allocation/upload")?;
+        let ptr = allocation.ptr();
         self.key = Some(key.clone());
-        self.ptr = ptr;
+        self.allocation = Some(allocation);
         Ok(ptr)
     }
-}
 
-impl Drop for WhereMetadataCache {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            // SAFETY: the live pointer was allocated by this runtime and remains
-            // exclusively owned by this cache.
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
-        }
+    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        self.allocation
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -165,7 +169,7 @@ impl Kernel for WhereKernel {
         let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep Where capture signature lock was poisoned".into())
         })?;
-        let warmed_signature = last_signature.take();
+        let warmed_signature = last_signature.clone();
 
         if inputs.len() != 3 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -234,12 +238,11 @@ impl Kernel for WhereKernel {
         let func = self
             .runtime
             .nvrtc_function("where_op", WHERE_SOURCE, "where_bytes")?;
-        let metadata_ptr = {
-            let mut metadata = self.metadata.lock().map_err(|_| {
-                EpError::KernelFailed("cuda_ep Where metadata lock was poisoned".into())
-            })?;
-            metadata.prepare(&key)?
-        };
+        let mut metadata = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Where metadata lock was poisoned".into())
+        })?;
+        let mut metadata_candidate = metadata.clone();
+        let metadata_ptr = metadata_candidate.prepare(&key)?;
         let condition_ptr = cuptr(condition.data_ptr::<u8>() as *const c_void);
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(y.data_ptr::<u8>() as *const c_void);
@@ -272,11 +275,22 @@ impl Kernel for WhereKernel {
             })
         }
         .map_err(|e| driver_err("launch where_bytes", e))?;
+        if !self.runtime.is_capturing()? {
+            *metadata = metadata_candidate;
+        }
         *last_signature = current_signature;
         Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
+    }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.last_capture_safe_signature.lock() {

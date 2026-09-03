@@ -425,21 +425,18 @@ impl CudnnHandle<'_> {
         .map_err(|e| cudnn_err("cudnnSoftmaxForward", e))
     }
 
-    /// Query the exact cuDNN reduce workspace bytes for one signature, caching
-    /// only host descriptors and the queried size.
+    /// Build an independent cuDNN reduce plan for one signature.
     ///
     /// The executor owns the actual device workspace through the provider's
-    /// governed allocator. This cache exists only to avoid re-querying the
-    /// cuDNN signature during capture, where a shape or axes change must be
-    /// rejected rather than silently re-planning.
-    pub fn reduce_workspace_bytes(
+    /// governed allocator. Callers stage this host-only plan until the matching
+    /// execution succeeds, then publish it as part of their immutable warmed
+    /// snapshot.
+    pub fn prepare_reduce(
         &self,
-        cache: &mut CudnnReduceCache,
         input_spec: &TensorDescriptorSpec,
         output_spec: &TensorDescriptorSpec,
         op: CudnnReduceOp,
-        capturing: bool,
-    ) -> Result<usize> {
+    ) -> Result<CudnnReduceCache> {
         if input_spec.dtype() != output_spec.dtype() {
             return Err(EpError::KernelFailed(
                 "cuda_ep: cuDNN reduction input/output descriptor dtypes differ".into(),
@@ -458,17 +455,42 @@ impl CudnnHandle<'_> {
             input: input_spec.clone(),
             output: output_spec.clone(),
         };
-        if cache.key.as_ref() != Some(&key) {
-            if capturing {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: cuDNN reduction signature changed during CUDA graph capture; \
-                     warm the fixed decode shape before capture"
-                        .into(),
-                ));
-            }
-            self.prepare_reduce_cache(cache, input_spec, output_spec, op, key)?;
-        }
+        let a_desc = RawTensorDescriptor::new(input_spec)?;
+        let c_desc = RawTensorDescriptor::new(output_spec)?;
+        let reduce = RawReductionDescriptor::new_f32_comp(op)?;
 
+        // SAFETY: the handle is live and stream-bound; the tensor and reduction
+        // descriptors were just created and are still alive.
+        let workspace_bytes = unsafe {
+            result::get_reduction_workspace_size(self.reduce_handle, reduce.0, a_desc.0, c_desc.0)
+        }
+        .map_err(|e| cudnn_err("cudnnGetReductionWorkspaceSize", e))?;
+
+        Ok(CudnnReduceCache {
+            key: Some(key),
+            input_desc: Some(a_desc),
+            output_desc: Some(c_desc),
+            reduce_desc: Some(reduce),
+            workspace_bytes,
+        })
+    }
+
+    /// Return the exact workspace bytes from an already-prepared immutable
+    /// reduction plan, rejecting any attempt to pair it with another signature.
+    pub fn reduce_workspace_bytes(
+        &self,
+        cache: &CudnnReduceCache,
+        input_spec: &TensorDescriptorSpec,
+        output_spec: &TensorDescriptorSpec,
+        op: CudnnReduceOp,
+    ) -> Result<usize> {
+        if !cache.matches(input_spec, output_spec, op) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: prepared cuDNN reduction plan does not match the requested signature; \
+                 prepare the exact reduction before execution"
+                    .into(),
+            ));
+        }
         Ok(cache.workspace_bytes)
     }
 
@@ -498,16 +520,14 @@ impl CudnnHandle<'_> {
     #[allow(clippy::too_many_arguments)]
     pub fn reduce_with_workspace(
         &self,
-        cache: &mut CudnnReduceCache,
+        cache: &CudnnReduceCache,
         input_spec: &TensorDescriptorSpec,
         output_spec: &TensorDescriptorSpec,
         op: CudnnReduceOp,
         buffers: CudnnBufferPair,
         workspace: Option<WorkspaceView>,
-        capturing: bool,
     ) -> Result<()> {
-        let workspace_bytes =
-            self.reduce_workspace_bytes(cache, input_spec, output_spec, op, capturing)?;
+        let workspace_bytes = self.reduce_workspace_bytes(cache, input_spec, output_spec, op)?;
 
         let reduce = cache
             .reduce_desc
@@ -548,58 +568,37 @@ impl CudnnHandle<'_> {
         .map_err(|e| cudnn_err("cudnnReduceTensor", e))
     }
 
-    /// (Re)build the cached descriptors and queried workspace bytes for a new
-    /// reduce signature. Only ever called in eager mode (a signature change
-    /// during capture is rejected by [`CudnnHandle::reduce_with_workspace`]).
-    fn prepare_reduce_cache(
-        &self,
-        cache: &mut CudnnReduceCache,
-        input_spec: &TensorDescriptorSpec,
-        output_spec: &TensorDescriptorSpec,
-        op: CudnnReduceOp,
-        key: CudnnReduceKey,
-    ) -> Result<()> {
-        let a_desc = RawTensorDescriptor::new(input_spec)?;
-        let c_desc = RawTensorDescriptor::new(output_spec)?;
-        let reduce = RawReductionDescriptor::new_f32_comp(op)?;
-
-        // SAFETY: the handle is live and stream-bound; the tensor and reduction
-        // descriptors were just created and are still alive.
-        let workspace_bytes = unsafe {
-            result::get_reduction_workspace_size(self.reduce_handle, reduce.0, a_desc.0, c_desc.0)
-        }
-        .map_err(|e| cudnn_err("cudnnGetReductionWorkspaceSize", e))?;
-
-        cache.input_desc = Some(a_desc);
-        cache.output_desc = Some(c_desc);
-        cache.reduce_desc = Some(reduce);
-        cache.workspace_bytes = workspace_bytes;
-        cache.key = Some(key);
-        Ok(())
-    }
-
-    /// Query the exact cuDNN convolution workspace bytes for one signature,
-    /// caching only the selected forward algorithm and queried size.
-    pub fn conv_workspace_bytes(
-        &self,
-        cache: &mut CudnnConvPlanCache,
-        spec: &CudnnConvSpec,
-        has_bias: bool,
-        capturing: bool,
-    ) -> Result<usize> {
+    /// Build an independent cuDNN convolution plan for one signature.
+    pub fn prepare_conv(&self, spec: &CudnnConvSpec, has_bias: bool) -> Result<CudnnConvPlanCache> {
         let key = CudnnConvKey {
             spec: spec.clone(),
             has_bias,
         };
-        if cache.key.as_ref() != Some(&key) {
-            if capturing {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: cuDNN convolution signature changed during CUDA graph capture; \
-                     warm the fixed shape before capture"
-                        .into(),
-                ));
-            }
-            self.prepare_conv_cache(cache, spec, has_bias, key)?;
+        let (algo, workspace_bytes) = match spec.dtype {
+            CudnnTensorType::F32 => self.conv_plan_t::<f32>(spec, has_bias)?,
+            CudnnTensorType::F16 => self.conv_plan_t::<f16>(spec, has_bias)?,
+            CudnnTensorType::Bf16 => self.conv_plan_t::<bf16>(spec, has_bias)?,
+        };
+        Ok(CudnnConvPlanCache {
+            key: Some(key),
+            algo: Some(algo),
+            workspace_bytes,
+        })
+    }
+
+    /// Return the workspace bytes from an immutable matching convolution plan.
+    pub fn conv_workspace_bytes(
+        &self,
+        cache: &CudnnConvPlanCache,
+        spec: &CudnnConvSpec,
+        has_bias: bool,
+    ) -> Result<usize> {
+        if !cache.matches(spec, has_bias) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: prepared cuDNN convolution plan does not match the requested signature; \
+                 prepare the exact convolution before execution"
+                    .into(),
+            ));
         }
         Ok(cache.workspace_bytes)
     }
@@ -609,14 +608,12 @@ impl CudnnHandle<'_> {
     /// [`CudnnHandle::conv_workspace_bytes`].
     pub fn conv2d(
         &self,
-        cache: &mut CudnnConvPlanCache,
+        cache: &CudnnConvPlanCache,
         spec: &CudnnConvSpec,
         buffers: CudnnConvBuffers,
         workspace: Option<WorkspaceView>,
-        capturing: bool,
     ) -> Result<()> {
-        let workspace_bytes =
-            self.conv_workspace_bytes(cache, spec, buffers.bias.is_some(), capturing)?;
+        let workspace_bytes = self.conv_workspace_bytes(cache, spec, buffers.bias.is_some())?;
         let algo = cache.algo.ok_or_else(|| {
             EpError::KernelFailed("cuda_ep: missing cuDNN convolution plan".into())
         })?;
@@ -641,24 +638,6 @@ impl CudnnHandle<'_> {
                 (bf16::from_f32(1.0), bf16::from_f32(0.0)),
             ),
         }
-    }
-
-    fn prepare_conv_cache(
-        &self,
-        cache: &mut CudnnConvPlanCache,
-        spec: &CudnnConvSpec,
-        has_bias: bool,
-        key: CudnnConvKey,
-    ) -> Result<()> {
-        let (algo, workspace_bytes) = match spec.dtype {
-            CudnnTensorType::F32 => self.conv_plan_t::<f32>(spec, has_bias)?,
-            CudnnTensorType::F16 => self.conv_plan_t::<f16>(spec, has_bias)?,
-            CudnnTensorType::Bf16 => self.conv_plan_t::<bf16>(spec, has_bias)?,
-        };
-        cache.key = Some(key);
-        cache.algo = Some(algo);
-        cache.workspace_bytes = workspace_bytes;
-        Ok(())
     }
 
     fn conv_plan_t<T: CudnnDataType + Copy>(
@@ -1059,7 +1038,7 @@ struct CudnnConvKey {
     has_bias: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CudnnConvPlanCache {
     key: Option<CudnnConvKey>,
     algo: Option<sys::cudnnConvolutionFwdAlgo_t>,
@@ -1067,8 +1046,16 @@ pub struct CudnnConvPlanCache {
 }
 
 impl CudnnConvPlanCache {
-    pub fn new() -> Self {
-        Self::default()
+    pub(crate) fn matches(&self, spec: &CudnnConvSpec, has_bias: bool) -> bool {
+        self.key.as_ref()
+            == Some(&CudnnConvKey {
+                spec: spec.clone(),
+                has_bias,
+            })
+    }
+
+    pub(crate) fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes
     }
 }
 
@@ -1110,6 +1097,25 @@ impl CudnnReduceCache {
             reduce_desc: None,
             workspace_bytes: 0,
         }
+    }
+
+    fn matches(
+        &self,
+        input_spec: &TensorDescriptorSpec,
+        output_spec: &TensorDescriptorSpec,
+        op: CudnnReduceOp,
+    ) -> bool {
+        self.key.as_ref()
+            == Some(&CudnnReduceKey {
+                op,
+                input: input_spec.clone(),
+                output: output_spec.clone(),
+            })
+    }
+
+    /// Exact executor-owned workspace size queried for this plan.
+    pub(crate) fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes
     }
 }
 

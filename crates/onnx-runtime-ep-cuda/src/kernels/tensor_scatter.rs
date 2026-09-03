@@ -20,7 +20,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::movement::PersistentMetadata;
@@ -268,13 +270,11 @@ impl Kernel for TensorScatterKernel {
                 .into_iter()
                 .map(|value| value as u64),
         );
-        let metadata_ptr = self
-            .metadata
-            .lock()
-            .map_err(|_| {
-                EpError::KernelFailed("cuda_ep TensorScatter: metadata lock was poisoned".into())
-            })?
-            .prepare(&metadata_values, "TensorScatter")?;
+        let mut metadata_cache = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep TensorScatter: metadata lock was poisoned".into())
+        })?;
+        let metadata_candidate = metadata_cache.stage(&metadata_values, "TensorScatter")?;
+        let metadata_ptr = metadata_candidate.ptr("TensorScatter")?;
 
         let function =
             self.runtime
@@ -328,6 +328,7 @@ impl Kernel for TensorScatterKernel {
         }
         .map_err(|error| driver_err("launch tensor_scatter", error))?;
         if !capturing {
+            *metadata_cache = metadata_candidate;
             *warmed_signature = Some(signature);
         }
         Ok(())
@@ -336,7 +337,14 @@ impl Kernel for TensorScatterKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
+    }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,

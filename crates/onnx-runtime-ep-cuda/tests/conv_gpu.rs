@@ -695,10 +695,22 @@ fn cudnn_conv_prepared_workspace_reuses_the_injected_allocator_and_captures() {
             "a warmed cuDNN Conv with prepared workspace must be capture-supported"
         );
 
+        let mut prospective_x_shape = x_shape.clone();
+        prospective_x_shape[2] += 8;
+        prospective_x_shape[3] += 8;
+        let prospective_metadata = [
+            TensorMetadata::new(dtype, &prospective_x_shape, true),
+            TensorMetadata::new(dtype, &w_shape, true),
+            TensorMetadata::new(dtype, &b_shape, true),
+        ];
+        kernel
+            .workspace_requirement(&prospective_metadata)
+            .expect("prospective Conv workspace query must stage without replacing the warm");
+
         let kernels: [&dyn onnx_runtime_ep_api::Kernel; 1] = [kernel.as_ref()];
         runtime
             .begin_graph_capture(&kernels)
-            .expect("begin Conv CUDA graph capture");
+            .expect("an abandoned prospective Conv query must leave signature A capturable");
         {
             let output = TensorMut::new(
                 DevicePtrMut(captured.as_mut_ptr()),

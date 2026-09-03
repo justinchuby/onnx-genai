@@ -2179,8 +2179,11 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     )
     .unwrap_err();
     assert!(format!("{error}").contains("dtype, decode mode, or shape changed"));
-    let _ = runtime.end_graph_capture();
-    assert!(!kernel.cuda_graph_compatible());
+    runtime.abort_graph_capture().unwrap();
+    assert!(
+        kernel.cuda_graph_compatible(),
+        "a rejected GQA capture attempt must preserve the prior successful warm state"
+    );
 
     for buffer in [
         prefill_output,

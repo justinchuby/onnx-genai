@@ -36,7 +36,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DeviceGraphResource, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ep_cpu::kernels::compressed_sparse_attention::CompressedSparseAttentionFactory as CpuCsaFactory;
 use onnx_runtime_ir::{
     DataType, DeviceId, Dim, Node, Shape, as_static_shape, compute_contiguous_strides,
@@ -2522,6 +2524,10 @@ impl Kernel for CompressedSparseAttentionKernel {
     fn supports_strided_input(&self, input_idx: usize) -> bool {
         let device_path = !self.force_host && (self.device_resident_ratio128 || self.capturable);
         !device_path || matches!(input_idx, 6 | 17)
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.device_state.device_graph_resources()
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {

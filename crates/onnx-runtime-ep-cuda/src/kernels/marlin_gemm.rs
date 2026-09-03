@@ -68,10 +68,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
 
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 /// NVRTC module + entry names for the Marlin int4 tensor-core GEMM.
 pub const MARLIN_MODULE: &str = "matmul_nbits_marlin_gemm";
@@ -176,18 +176,37 @@ pub fn marlin_splitk_enabled() -> bool {
 /// the repack, including captured CUDA-graph replays.
 #[derive(Debug)]
 struct RepackEntry {
-    ptr: CUdeviceptr,
-    runtime: Arc<CudaRuntime>,
+    allocation: Arc<GraphDeviceAllocation>,
 }
 
-#[derive(Debug)]
+impl RepackEntry {
+    fn ptr(&self) -> CUdeviceptr {
+        self.allocation.ptr()
+    }
+
+    fn device_graph_resource(&self) -> DeviceGraphResource {
+        GraphDeviceAllocation::device_graph_resource(&self.allocation)
+    }
+}
+
 pub(super) struct RepackCache {
     runtime: Arc<CudaRuntime>,
     map: Mutex<HashMap<(usize, usize, usize, usize), RepackEntry>>,
+    last_used: Mutex<Vec<Arc<GraphDeviceAllocation>>>,
+    scratch_used: Mutex<Vec<DeviceGraphResource>>,
     /// Device bytes held by `map`. These are raw `cuMemAlloc`s, invisible to
     /// the VMM arena, so without a counter this memory cannot be reported at
     /// all — it shows up only as an unexplained gap against `nvidia-smi`.
     bytes: AtomicUsize,
+}
+
+impl std::fmt::Debug for RepackCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RepackCache")
+            .field("retained_bytes", &self.retained_bytes())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RepackCache {
@@ -195,6 +214,8 @@ impl RepackCache {
         Self {
             runtime,
             map: Mutex::new(HashMap::new()),
+            last_used: Mutex::new(Vec::new()),
+            scratch_used: Mutex::new(Vec::new()),
             bytes: AtomicUsize::new(0),
         }
     }
@@ -213,12 +234,73 @@ impl RepackCache {
     /// the VMM arena cannot even see. Dropping them costs a re-repack if a
     /// later prefill needs them, never a wrong answer.
     pub(super) fn release_all(&self) {
+        self.last_used
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        self.scratch_used
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         let mut map = self.map.lock().expect("marlin repack cache poisoned");
-        for (_, entry) in map.drain() {
-            // SAFETY: exclusively owned by the cache; freed once here.
-            let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
-        }
+        map.clear();
         self.bytes.store(0, Ordering::Relaxed);
+    }
+
+    pub(super) fn begin_call(&self) {
+        self.last_used
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        self.scratch_used
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    pub(super) fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        let mut resources: Vec<DeviceGraphResource> = self
+            .last_used
+            .lock()
+            .map(|allocations| {
+                allocations
+                    .iter()
+                    .map(GraphDeviceAllocation::device_graph_resource)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Ok(scratch) = self.scratch_used.lock() {
+            resources.extend(scratch.iter().cloned());
+        }
+        resources
+    }
+
+    pub(super) fn ensure_scratch(&self, slot: u32, bytes: usize) -> Result<(CUdeviceptr, bool)> {
+        let (ptr, warm, resource) = ensure_scratch(&self.runtime, slot, bytes)?;
+        let mut scratch = self
+            .scratch_used
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !scratch
+            .iter()
+            .any(|existing| existing.identity() == resource.identity())
+        {
+            scratch.push(resource);
+        }
+        Ok((ptr, warm))
+    }
+
+    fn record_use(&self, allocation: &Arc<GraphDeviceAllocation>) {
+        let mut last_used = self
+            .last_used
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !last_used
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, allocation))
+        {
+            last_used.push(Arc::clone(allocation));
+        }
     }
 
     /// Ensure the repacked tensor-core weights for `packed` exist on device,
@@ -237,7 +319,11 @@ impl RepackCache {
         {
             let cache = self.map.lock().expect("marlin repack cache poisoned");
             if let Some(entry) = cache.get(&key) {
-                return Ok((entry.ptr, true));
+                let allocation = Arc::clone(&entry.allocation);
+                let ptr = allocation.ptr();
+                drop(cache);
+                self.record_use(&allocation);
+                return Ok((ptr, true));
             }
         }
         if self.runtime.is_capturing()? {
@@ -248,43 +334,27 @@ impl RepackCache {
             ));
         }
         let bytes = repacked_bytes(n, k);
-        let out = self.runtime.alloc_raw(bytes)?;
-        if let Err(e) = launch_marlin_repack(&self.runtime, packed, out, n, k, group_size) {
-            // SAFETY: `out` was just allocated here and is otherwise unreferenced.
-            let _ = unsafe { self.runtime.free_raw(out) };
-            return Err(e);
-        }
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes)?;
+        let out = allocation.ptr();
+        launch_marlin_repack(&self.runtime, packed, out, n, k, group_size)?;
         let mut cache = self.map.lock().expect("marlin repack cache poisoned");
         // Another thread may have inserted the same key while we repacked; keep one.
         if let Some(entry) = cache.get(&key) {
-            let winner = entry.ptr;
+            let winner = Arc::clone(&entry.allocation);
             drop(cache);
-            // SAFETY: `out` is our just-allocated duplicate; free it once.
-            let _ = unsafe { self.runtime.free_raw(out) };
-            return Ok((winner, true));
+            self.record_use(&winner);
+            return Ok((winner.ptr(), true));
         }
         cache.insert(
             key,
             RepackEntry {
-                ptr: out,
-                runtime: self.runtime.clone(),
+                allocation: Arc::clone(&allocation),
             },
         );
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        drop(cache);
+        self.record_use(&allocation);
         Ok((out, false))
-    }
-}
-
-impl Drop for RepackCache {
-    fn drop(&mut self) {
-        let cache = self
-            .map
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner());
-        for (_, entry) in cache.drain() {
-            // SAFETY: each repack is exclusively owned by this kernel cache.
-            let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
-        }
     }
 }
 
@@ -293,14 +363,16 @@ impl Drop for RepackCache {
 /// activation buffer). Like the repack cache, this exists so a **warm** replay
 /// performs no allocation and stays CUDA-graph capture-safe: during capture M is
 /// fixed, so warmup pre-allocates the exact size and replays reuse the same
-/// device pointer. Buffers are keyed by `(ordinal, slot, bytes)` — the `slot`
-/// discriminator guarantees two simultaneously-live scratches of equal size
-/// within one op (e.g. normalized `[M,K]` and gate `[M,N]` when `K == N`) never
-/// alias. Reuse across sequential ops is safe: each op fully consumes its
-/// scratch before returning and execution is serial on the stream.
+/// device pointer. Buffers are keyed by `(runtime identity, slot, bytes)` — the
+/// runtime identity prevents a later context on the same ordinal from receiving
+/// an address allocated by its predecessor, while the `slot` discriminator
+/// guarantees two simultaneously-live scratches of equal size within one op
+/// (e.g. normalized `[M,K]` and gate `[M,N]` when `K == N`) never alias. Reuse
+/// across sequential ops is safe: each op fully consumes its scratch before
+/// returning and execution is serial on the stream.
 struct ScratchCache {
-    map: HashMap<(u32, u32, usize), RepackEntry>,
-    order: VecDeque<(u32, u32, usize)>,
+    map: HashMap<(u64, u32, usize), RepackEntry>,
+    order: VecDeque<(u64, u32, usize)>,
     /// Device bytes currently held by `map`. Tracked because the cap below is
     /// on bytes, and because this memory is invisible to the VMM arena — it is
     /// a raw `cuMemAlloc` — so without a counter it cannot be reported at all.
@@ -330,6 +402,30 @@ pub fn scratch_cache_bytes() -> usize {
     scratch_cache().lock().map(|cache| cache.bytes).unwrap_or(0)
 }
 
+pub(crate) fn release_scratch_for_runtime(runtime_id: u64) {
+    let retired = {
+        let mut cache = scratch_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let keys = cache
+            .map
+            .keys()
+            .filter(|key| key.0 == runtime_id)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut retired = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(entry) = cache.map.remove(&key) {
+                cache.bytes = cache.bytes.saturating_sub(key.2);
+                retired.push(entry);
+            }
+        }
+        cache.order.retain(|key| key.0 != runtime_id);
+        retired
+    };
+    drop(retired);
+}
+
 fn scratch_cache() -> &'static Mutex<ScratchCache> {
     SCRATCH_CACHE.get_or_init(|| {
         Mutex::new(ScratchCache {
@@ -349,14 +445,14 @@ pub fn ensure_scratch(
     runtime: &Arc<CudaRuntime>,
     slot: u32,
     bytes: usize,
-) -> Result<(CUdeviceptr, bool)> {
-    let key = (runtime.ordinal(), slot, bytes);
+) -> Result<(CUdeviceptr, bool, DeviceGraphResource)> {
+    let key = (runtime.runtime_id(), slot, bytes);
     {
         let cache = scratch_cache()
             .lock()
             .expect("marlin scratch cache poisoned");
         if let Some(entry) = cache.map.get(&key) {
-            return Ok((entry.ptr, true));
+            return Ok((entry.ptr(), true, entry.device_graph_resource()));
         }
     }
     if runtime.is_capturing()? {
@@ -366,22 +462,18 @@ pub fn ensure_scratch(
                 .into(),
         ));
     }
-    let ptr = runtime.alloc_raw(bytes.max(1))?;
+    let allocation = GraphDeviceAllocation::allocate(runtime, bytes.max(1))?;
+    let ptr = allocation.ptr();
     let mut cache = scratch_cache()
         .lock()
         .expect("marlin scratch cache poisoned");
     if let Some(entry) = cache.map.get(&key) {
-        let winner = entry.ptr;
-        drop(cache);
-        // SAFETY: `ptr` is our just-allocated duplicate; free it once.
-        let _ = unsafe { runtime.free_raw(ptr) };
-        return Ok((winner, true));
+        return Ok((entry.ptr(), true, entry.device_graph_resource()));
     }
     cache.map.insert(
         key,
         RepackEntry {
-            ptr,
-            runtime: runtime.clone(),
+            allocation: Arc::clone(&allocation),
         },
     );
     cache.order.push_back(key);
@@ -395,11 +487,14 @@ pub fn ensure_scratch(
             && let Some(entry) = cache.map.remove(&evict)
         {
             cache.bytes = cache.bytes.saturating_sub(evict.2);
-            // SAFETY: exclusively owned by the cache; freed once on eviction.
-            let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
+            drop(entry);
         }
     }
-    Ok((ptr, false))
+    Ok((
+        ptr,
+        false,
+        GraphDeviceAllocation::device_graph_resource(&allocation),
+    ))
 }
 
 /// Repack ONNX `MatMulNBits` int4 weights (`[N, k_blocks, group/2]`, N-major

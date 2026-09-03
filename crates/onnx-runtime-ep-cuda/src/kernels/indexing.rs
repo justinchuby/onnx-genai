@@ -5,12 +5,14 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::movement::PersistentMetadata;
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 const BLOCK: u32 = 256;
 pub const SCATTER_CAPTURE_ERROR_INDEX: u32 = 256;
@@ -402,10 +404,7 @@ fn validate_nd_indices(
     Ok(())
 }
 
-fn upload_meta(
-    runtime: &CudaRuntime,
-    values: &[usize],
-) -> Result<cudarc::driver::sys::CUdeviceptr> {
+fn upload_meta(runtime: &Arc<CudaRuntime>, values: &[usize]) -> Result<Arc<GraphDeviceAllocation>> {
     let values = values.iter().map(|&v| v as u64).collect::<Vec<_>>();
     let bytes = unsafe {
         std::slice::from_raw_parts(
@@ -413,14 +412,14 @@ fn upload_meta(
             std::mem::size_of_val(values.as_slice()),
         )
     };
-    let ptr = runtime.alloc_raw(bytes.len().max(1))?;
+    let allocation = GraphDeviceAllocation::allocate(runtime, bytes.len().max(1))?;
     if !bytes.is_empty()
-        && let Err(error) = unsafe { runtime.htod(bytes, ptr) }
+        && let Err(error) = unsafe { runtime.htod(bytes, allocation.ptr()) }
     {
-        let _ = unsafe { runtime.free_raw(ptr) };
         return Err(error);
     }
-    Ok(ptr)
+    runtime.staged_warm_cache_mutation("indexing metadata allocation/upload")?;
+    Ok(allocation)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -429,11 +428,11 @@ struct ScatterMetadataKey {
     indices_shape: Vec<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ScatterMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<ScatterMetadataKey>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
 }
 
 impl ScatterMetadataCache {
@@ -441,7 +440,7 @@ impl ScatterMetadataCache {
         Self {
             runtime,
             key: None,
-            ptr: 0,
+            allocation: None,
         }
     }
 
@@ -451,15 +450,32 @@ impl ScatterMetadataCache {
             indices_shape: indices_shape.to_vec(),
         };
         if self.key.as_ref() == Some(&key) {
-            return Ok(self.ptr);
+            let ptr = self.allocation.as_ref().map_or_else(
+                || {
+                    Err(EpError::KernelFailed(
+                        "cuda_ep ScatterElements: cached metadata lost its device allocation"
+                            .into(),
+                    ))
+                },
+                |allocation| Ok(allocation.ptr()),
+            )?;
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    self.device_graph_resource()
+                        .expect("cached ScatterElements allocation is present")
+                        .identity(),
+                    "ScatterElements metadata",
+                )?;
+            }
+            return Ok(ptr);
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
                 "cuda_ep ScatterElements: shape changed during CUDA graph capture; warm the exact shape first".into(),
             ));
         }
-        if self.ptr != 0 {
-            self.runtime.synchronize()?;
+        if self.allocation.is_some() {
+            self.runtime.drain_for_unmap()?;
         }
 
         let mut meta = compute_contiguous_strides(indices_shape)
@@ -472,25 +488,17 @@ impl ScatterMetadataCache {
                 .map(|value| value as usize),
         );
         meta.extend(data_shape.iter().copied());
-        let ptr = upload_meta(&self.runtime, &meta)?;
-        if self.ptr != 0 {
-            // SAFETY: synchronization above completed every prior launch using
-            // the old cache-owned pointer.
-            unsafe { self.runtime.free_raw(self.ptr) }?;
-        }
+        let allocation = upload_meta(&self.runtime, &meta)?;
+        let ptr = allocation.ptr();
         self.key = Some(key);
-        self.ptr = ptr;
+        self.allocation = Some(allocation);
         Ok(ptr)
     }
-}
 
-impl Drop for ScatterMetadataCache {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            // SAFETY: the cache exclusively owns this persistent allocation.
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
-        }
+    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        self.allocation
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -516,11 +524,11 @@ struct GatherElementsMetadataKey {
     indices_shape: Vec<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct GatherElementsMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<GatherElementsMetadataKey>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
 }
 
 impl GatherElementsMetadataCache {
@@ -528,7 +536,7 @@ impl GatherElementsMetadataCache {
         Self {
             runtime,
             key: None,
-            ptr: 0,
+            allocation: None,
         }
     }
 
@@ -538,15 +546,31 @@ impl GatherElementsMetadataCache {
             indices_shape: indices_shape.to_vec(),
         };
         if self.key.as_ref() == Some(&key) {
-            return Ok(self.ptr);
+            let ptr = self.allocation.as_ref().map_or_else(
+                || {
+                    Err(EpError::KernelFailed(
+                        "cuda_ep GatherElements: cached metadata lost its device allocation".into(),
+                    ))
+                },
+                |allocation| Ok(allocation.ptr()),
+            )?;
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    self.device_graph_resource()
+                        .expect("cached GatherElements allocation is present")
+                        .identity(),
+                    "GatherElements metadata",
+                )?;
+            }
+            return Ok(ptr);
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
                 "cuda_ep GatherElements: shape changed during CUDA graph capture; warm the exact shape first".into(),
             ));
         }
-        if self.ptr != 0 {
-            self.runtime.synchronize()?;
+        if self.allocation.is_some() {
+            self.runtime.drain_for_unmap()?;
         }
 
         let mut meta = indices_shape.to_vec();
@@ -561,22 +585,17 @@ impl GatherElementsMetadataCache {
                 .map(|value| value as usize),
         );
         meta.extend(data_shape.iter().copied());
-        let ptr = upload_meta(&self.runtime, &meta)?;
-        if self.ptr != 0 {
-            unsafe { self.runtime.free_raw(self.ptr) }?;
-        }
+        let allocation = upload_meta(&self.runtime, &meta)?;
+        let ptr = allocation.ptr();
         self.key = Some(key);
-        self.ptr = ptr;
+        self.allocation = Some(allocation);
         Ok(ptr)
     }
-}
 
-impl Drop for GatherElementsMetadataCache {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
-        }
+    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        self.allocation
+            .as_ref()
+            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -683,7 +702,8 @@ impl Kernel for GatherElementsKernel {
         let mut metadata = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep GatherElements: metadata lock was poisoned".into())
         })?;
-        let meta_ptr = metadata.prepare(data.shape, indices.shape)?;
+        let mut metadata_candidate = metadata.clone();
+        let meta_ptr = metadata_candidate.prepare(data.shape, indices.shape)?;
         let data_ptr = cuptr(data.data_ptr::<u8>() as *const c_void);
         let indices_ptr = cuptr(indices.data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
@@ -723,14 +743,23 @@ impl Kernel for GatherElementsKernel {
         }
         .map_err(|e| driver_err("launch gather_elements", e))?;
         if !capturing {
-            *warmed_signature = Some(signature);
             self.runtime.synchronize()?;
+            *metadata = metadata_candidate;
+            *warmed_signature = Some(signature);
         }
         Ok(())
     }
 
     fn supports_strided_input(&self, _: usize) -> bool {
         false
+    }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
@@ -904,13 +933,11 @@ impl Kernel for ScatterNdKernel {
             .map(|value| value as u64)
             .collect::<Vec<_>>();
         metadata_values.extend(data.shape.iter().map(|&value| value as u64));
-        let metadata_ptr = self
-            .metadata
-            .lock()
-            .map_err(|_| {
-                EpError::KernelFailed("cuda_ep ScatterND: metadata lock was poisoned".into())
-            })?
-            .prepare(&metadata_values, "ScatterND")?;
+        let mut metadata_cache = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep ScatterND: metadata lock was poisoned".into())
+        })?;
+        let metadata_candidate = metadata_cache.stage(&metadata_values, "ScatterND")?;
+        let metadata_ptr = metadata_candidate.ptr("ScatterND")?;
         let entry = match data.dtype {
             DataType::Float16 => "scatter_nd_f16",
             DataType::Float32 => "scatter_nd_f32",
@@ -958,6 +985,7 @@ impl Kernel for ScatterNdKernel {
         }
         .map_err(|error| driver_err(&format!("launch {entry}"), error))?;
         if !capturing {
+            *metadata_cache = metadata_candidate;
             *warmed_signature = Some(signature);
         }
         Ok(())
@@ -966,7 +994,14 @@ impl Kernel for ScatterNdKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
+    }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
@@ -1102,7 +1137,8 @@ impl Kernel for ScatterElementsKernel {
         let mut metadata = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep ScatterElements: metadata lock was poisoned".into())
         })?;
-        let meta_ptr = metadata.prepare(data.shape, indices.shape)?;
+        let mut metadata_candidate = metadata.clone();
+        let meta_ptr = metadata_candidate.prepare(data.shape, indices.shape)?;
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
         let indices_ptr = cuptr(indices.data_ptr::<u8>() as *const c_void);
         let updates_ptr = cuptr(updates.data_ptr::<u8>() as *const c_void);
@@ -1141,6 +1177,7 @@ impl Kernel for ScatterElementsKernel {
         }
         .map_err(|error| driver_err(&format!("launch {entry}"), error))?;
         if !capturing {
+            *metadata = metadata_candidate;
             *warmed_signature = Some(signature);
         }
         Ok(())
@@ -1148,6 +1185,14 @@ impl Kernel for ScatterElementsKernel {
 
     fn supports_strided_input(&self, _: usize) -> bool {
         false
+    }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {

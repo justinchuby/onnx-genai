@@ -351,7 +351,9 @@ fn seq_major_decode_is_bit_identical_to_head_major() {
             if capture {
                 // Prove the fixed-stride seq-major decode records and replays
                 // inside a CUDA graph: warm up above, capture one step, replay.
-                runtime.begin_graph_capture(&[]).unwrap();
+                runtime
+                    .begin_graph_capture(&[&kernel as &dyn onnx_runtime_ep_api::Kernel])
+                    .unwrap();
                 kernel.execute(&inputs, &mut outputs).unwrap();
                 runtime.end_graph_capture().unwrap();
                 runtime.replay_graph().unwrap();
@@ -709,7 +711,9 @@ fn seq_major_full_generation_prefill_and_decode_is_bit_identical() {
             ];
             kernel.execute(&decode_inputs, &mut decode_outputs).unwrap();
             if capture {
-                runtime.begin_graph_capture(&[]).unwrap();
+                runtime
+                    .begin_graph_capture(&[&kernel as &dyn onnx_runtime_ep_api::Kernel])
+                    .unwrap();
                 kernel.execute(&decode_inputs, &mut decode_outputs).unwrap();
                 runtime.end_graph_capture().unwrap();
                 assert_eq!(

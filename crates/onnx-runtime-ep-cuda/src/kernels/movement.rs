@@ -1,19 +1,51 @@
 //! Dtype-agnostic CUDA kernels for ONNX construction and movement operators.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::elementwise::{broadcast_strides, u64_bytes};
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 const BLOCK: u32 = 256;
+
+/// Production-path counters for explicit CUDA `Transpose` materialization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MovementExecutionStats {
+    pub transpose_launches: u64,
+    pub capture_recordings: u64,
+    pub persistent_metadata_bytes: u64,
+    pub materialization_bytes: u64,
+}
+
+static TRANSPOSE_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static TRANSPOSE_CAPTURE_RECORDINGS: AtomicU64 = AtomicU64::new(0);
+static TRANSPOSE_METADATA_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+static TRANSPOSE_MATERIALIZATION_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+
+pub fn movement_execution_stats() -> MovementExecutionStats {
+    MovementExecutionStats {
+        transpose_launches: TRANSPOSE_LAUNCHES.load(Ordering::Relaxed),
+        capture_recordings: TRANSPOSE_CAPTURE_RECORDINGS.load(Ordering::Relaxed),
+        persistent_metadata_bytes: TRANSPOSE_METADATA_BYTES_LAST.load(Ordering::Relaxed),
+        materialization_bytes: TRANSPOSE_MATERIALIZATION_BYTES_LAST.load(Ordering::Relaxed),
+    }
+}
+
+pub fn reset_movement_execution_stats() {
+    TRANSPOSE_LAUNCHES.store(0, Ordering::Relaxed);
+    TRANSPOSE_CAPTURE_RECORDINGS.store(0, Ordering::Relaxed);
+    TRANSPOSE_METADATA_BYTES_LAST.store(0, Ordering::Relaxed);
+    TRANSPOSE_MATERIALIZATION_BYTES_LAST.store(0, Ordering::Relaxed);
+}
+
 const MOVEMENT_SOURCE: &str = r#"
 extern "C" __global__ void expand_bytes(
     const unsigned char* input, unsigned char* output,
@@ -204,11 +236,11 @@ fn host_ints(runtime: &CudaRuntime, view: &TensorView, op: &str) -> Result<Vec<i
     })
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct PersistentMetadata {
     runtime: Arc<CudaRuntime>,
     values: Option<Vec<u64>>,
-    ptr: CUdeviceptr,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
 }
 
 impl PersistentMetadata {
@@ -216,13 +248,35 @@ impl PersistentMetadata {
         Self {
             runtime,
             values: None,
-            ptr: 0,
+            allocation: None,
         }
     }
 
-    pub(super) fn prepare(&mut self, values: &[u64], op: &str) -> Result<CUdeviceptr> {
+    pub(super) fn stage(&self, values: &[u64], op: &str) -> Result<Self> {
+        let mut candidate = self.clone();
+        candidate.prepare(values, op)?;
+        Ok(candidate)
+    }
+
+    fn prepare(&mut self, values: &[u64], op: &str) -> Result<CUdeviceptr> {
         if self.values.as_deref() == Some(values) {
-            return Ok(self.ptr);
+            let ptr = self.allocation.as_ref().map_or_else(
+                || {
+                    Err(EpError::KernelFailed(format!(
+                        "cuda_ep {op}: cached persistent metadata lost its device allocation"
+                    )))
+                },
+                |allocation| Ok(allocation.ptr()),
+            )?;
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_address_capture(
+                    self.device_graph_resource()
+                        .expect("cached metadata allocation is present")
+                        .identity(),
+                    "persistent kernel metadata",
+                )?;
+            }
+            return Ok(ptr);
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(format!(
@@ -235,30 +289,40 @@ impl PersistentMetadata {
         } else {
             values
         });
-        let ptr = self.runtime.alloc_raw(bytes.len())?;
-        if let Err(error) = unsafe { self.runtime.htod(bytes, ptr) } {
-            let _ = unsafe { self.runtime.free_raw(ptr) };
-            return Err(error);
-        }
-        if self.ptr != 0 {
-            unsafe { self.runtime.free_raw(self.ptr) }?;
-        }
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes.len())?;
+        unsafe { self.runtime.htod(bytes, allocation.ptr()) }?;
+        self.runtime
+            .staged_warm_cache_mutation(&format!("{op} metadata allocation/upload"))?;
         self.values = Some(values.to_vec());
-        self.ptr = ptr;
+        let ptr = allocation.ptr();
+        self.allocation = Some(allocation);
         Ok(ptr)
     }
-}
 
-impl Drop for PersistentMetadata {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            self.ptr = 0;
-        }
+    pub(super) fn ptr(&self, op: &str) -> Result<CUdeviceptr> {
+        self.allocation.as_ref().map_or_else(
+            || {
+                Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: staged persistent metadata has no device allocation"
+                )))
+            },
+            |allocation| Ok(allocation.ptr()),
+        )
+    }
+
+    pub(super) fn allocation_bytes(&self) -> usize {
+        self.allocation
+            .as_ref()
+            .map_or(0, |allocation| allocation.bytes())
+    }
+
+    pub(super) fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
+        let allocation = self.allocation.as_ref()?;
+        Some(GraphDeviceAllocation::device_graph_resource(allocation))
     }
 }
 
-fn launch_persistent_metadata(
+pub(super) fn launch_persistent_metadata(
     runtime: &CudaRuntime,
     entry: &'static str,
     input: &TensorView,
@@ -651,13 +715,11 @@ impl Kernel for ExpandKernel {
         }
         let mut metadata = out_shape.iter().map(|&v| v as u64).collect::<Vec<_>>();
         metadata.extend(broadcast_strides(inputs[0].shape, &out_shape));
-        let metadata_ptr = self
-            .metadata
-            .lock()
-            .map_err(|_| {
-                EpError::KernelFailed("cuda_ep Expand: metadata lock was poisoned".into())
-            })?
-            .prepare(&metadata, "Expand")?;
+        let mut metadata_cache = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Expand: metadata lock was poisoned".into())
+        })?;
+        let metadata_candidate = metadata_cache.stage(&metadata, "Expand")?;
+        let metadata_ptr = metadata_candidate.ptr("Expand")?;
         launch_persistent_metadata(
             &self.runtime,
             "expand_bytes",
@@ -666,12 +728,21 @@ impl Kernel for ExpandKernel {
             metadata_ptr,
         )?;
         if !capturing {
+            *metadata_cache = metadata_candidate;
             *warmed_signature = Some(signature);
         }
         Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
+    }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
@@ -778,13 +849,12 @@ impl Kernel for TransposeKernel {
                 "cuda_ep Transpose: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
             ));
         }
-        let metadata_ptr = self
-            .metadata
-            .lock()
-            .map_err(|_| {
-                EpError::KernelFailed("cuda_ep Transpose: metadata lock was poisoned".into())
-            })?
-            .prepare(&metadata, "Transpose")?;
+        let mut persistent = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Transpose: metadata lock was poisoned".into())
+        })?;
+        let metadata_candidate = persistent.stage(&metadata, "Transpose")?;
+        let metadata_ptr = metadata_candidate.ptr("Transpose")?;
+        let metadata_bytes = metadata_candidate.allocation_bytes();
         launch_persistent_metadata(
             &self.runtime,
             "transpose_bytes",
@@ -792,13 +862,29 @@ impl Kernel for TransposeKernel {
             &mut outputs[0],
             metadata_ptr,
         )?;
+        TRANSPOSE_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+        TRANSPOSE_METADATA_BYTES_LAST.store(metadata_bytes as u64, Ordering::Relaxed);
+        TRANSPOSE_MATERIALIZATION_BYTES_LAST
+            .store(outputs[0].byte_size() as u64, Ordering::Relaxed);
+        if capturing {
+            TRANSPOSE_CAPTURE_RECORDINGS.fetch_add(1, Ordering::Relaxed);
+        }
         if !capturing {
+            *persistent = metadata_candidate;
             *warmed_signature = Some(signature);
         }
         Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
+    }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
@@ -1007,20 +1093,21 @@ impl Kernel for SliceKernel {
         let func = self
             .runtime
             .nvrtc_function("movement_ops", MOVEMENT_SOURCE, "slice_bytes")?;
-        let dims_ptr = self
+        let mut dims_cache = self
             .dims
             .lock()
-            .map_err(|_| EpError::KernelFailed("cuda_ep Slice: dims lock was poisoned".into()))?
-            .prepare(&dims, "Slice")?;
+            .map_err(|_| EpError::KernelFailed("cuda_ep Slice: dims lock was poisoned".into()))?;
+        let dims_candidate = dims_cache.stage(&dims, "Slice")?;
+        let dims_ptr = dims_candidate.ptr("Slice")?;
         let stride_bits = strides
             .iter()
             .map(|&value| value as u64)
             .collect::<Vec<_>>();
-        let strides_ptr = self
-            .strides
-            .lock()
-            .map_err(|_| EpError::KernelFailed("cuda_ep Slice: strides lock was poisoned".into()))?
-            .prepare(&stride_bits, "Slice")?;
+        let mut strides_cache = self.strides.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Slice: strides lock was poisoned".into())
+        })?;
+        let strides_candidate = strides_cache.stage(&stride_bits, "Slice")?;
+        let strides_ptr = strides_candidate.ptr("Slice")?;
         let input_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let rank = expected.len() as i32;
@@ -1045,6 +1132,8 @@ impl Kernel for SliceKernel {
         }
         .map_err(|e| driver_err("launch slice_bytes", e))?;
         if !capturing {
+            *dims_cache = dims_candidate;
+            *strides_cache = strides_candidate;
             *warmed_signature = Some(SliceCaptureSignature {
                 dtype: inputs[0].dtype,
                 input_shape: inputs[0].shape.to_vec(),
@@ -1056,6 +1145,20 @@ impl Kernel for SliceKernel {
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
+    }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        let mut resources = Vec::with_capacity(2);
+        if let Ok(dims) = self.dims.lock()
+            && let Some(resource) = dims.device_graph_resource()
+        {
+            resources.push(resource);
+        }
+        if let Ok(strides) = self.strides.lock()
+            && let Some(resource) = strides.device_graph_resource()
+        {
+            resources.push(resource);
+        }
+        resources
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
@@ -1154,11 +1257,11 @@ impl Kernel for TileKernel {
                 .iter()
                 .map(|&v| v as u64),
         );
-        let metadata_ptr = self
-            .metadata
-            .lock()
-            .map_err(|_| EpError::KernelFailed("cuda_ep Tile: metadata lock was poisoned".into()))?
-            .prepare(&metadata, "Tile")?;
+        let mut metadata_cache = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Tile: metadata lock was poisoned".into())
+        })?;
+        let metadata_candidate = metadata_cache.stage(&metadata, "Tile")?;
+        let metadata_ptr = metadata_candidate.ptr("Tile")?;
         launch_persistent_metadata(
             &self.runtime,
             "tile_bytes",
@@ -1167,12 +1270,21 @@ impl Kernel for TileKernel {
             metadata_ptr,
         )?;
         if !capturing {
+            *metadata_cache = metadata_candidate;
             *warmed_signature = Some(signature);
         }
         Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
+    }
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {

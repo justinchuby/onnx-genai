@@ -50,15 +50,14 @@
 //! * an axis out of `[-rank, rank)` → rejected, naming the axis.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
 
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceRequirement, WorkspaceView,
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -67,7 +66,7 @@ use crate::cudnn::{
     governed_workspace_requirement,
 };
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 /// NVRTC source: one block per output element, reducing over its group of
 /// `reduce_count` elements addressed by `base_off[o] + delta_off[r]`.
@@ -525,25 +524,89 @@ pub(crate) struct ReductionPlan {
     pub out_shape: Vec<usize>,
 }
 
-/// Row-major contiguous strides for `shape`.
-fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
-    let mut strides = vec![0i64; shape.len()];
-    let mut acc = 1i64;
-    for d in (0..shape.len()).rev() {
-        strides[d] = acc;
-        acc *= shape[d] as i64;
-    }
-    strides
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReductionGeometry {
+    input_count: usize,
+    out_count: usize,
+    reduce_count: usize,
 }
 
-fn contiguous_strides_usize(shape: &[usize]) -> Vec<usize> {
+fn checked_shape_product(
+    op: &str,
+    shape: &[usize],
+    axes: impl Iterator<Item = usize>,
+    purpose: &str,
+) -> Result<usize> {
+    let axes = axes.collect::<Vec<_>>();
+    if axes.iter().any(|&axis| shape[axis] == 0) {
+        return Ok(0);
+    }
+    let mut product = 1usize;
+    for axis in axes {
+        let dimension = shape[axis];
+        product = product.checked_mul(dimension).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep {op}: shape-product overflow while planning {purpose} for input shape \
+                 {shape:?}: axis {axis} has dimension {dimension}, which cannot multiply the \
+                 partial product {product} within usize. HOW: reduce the tensor dimensions before \
+                 workspace planning/admission."
+            ))
+        })?;
+    }
+    Ok(product)
+}
+
+impl ReductionGeometry {
+    fn checked(op: &str, shape: &[usize], reduce: &[bool]) -> Result<Self> {
+        if shape.len() != reduce.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: reduction geometry has rank {} for input shape {shape:?}, but the \
+                 reduce mask has length {}",
+                shape.len(),
+                reduce.len()
+            )));
+        }
+        let out_count = checked_shape_product(
+            op,
+            shape,
+            (0..shape.len()).filter(|&axis| !reduce[axis]),
+            "output elements from kept axes",
+        )?;
+        let reduce_count = checked_shape_product(
+            op,
+            shape,
+            (0..shape.len()).filter(|&axis| reduce[axis]),
+            "elements per reduction group",
+        )?;
+        let input_count = checked_shape_product(op, shape, 0..shape.len(), "input elements")?;
+        Ok(Self {
+            input_count,
+            out_count,
+            reduce_count,
+        })
+    }
+}
+
+fn block_reduction_parallel(geometry: &ReductionGeometry, sm_count: usize) -> bool {
+    geometry.out_count >= sm_count || geometry.reduce_count <= REDUCE_BLOCK as usize
+}
+
+/// Checked row-major contiguous strides for `shape`.
+fn contiguous_strides_usize(op: &str, shape: &[usize]) -> Result<Vec<usize>> {
     let mut strides = vec![0usize; shape.len()];
     let mut acc = 1usize;
     for d in (0..shape.len()).rev() {
         strides[d] = acc;
-        acc *= shape[d];
+        acc = acc.checked_mul(shape[d]).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep {op}: stride-product overflow for input shape {shape:?} at axis {d}: \
+                 dimension {} cannot multiply the trailing stride {} within usize. HOW: reduce \
+                 the tensor dimensions before workspace planning/admission.",
+                shape[d], strides[d]
+            ))
+        })?;
     }
-    strides
+    Ok(strides)
 }
 
 fn reduced_output_shape(in_shape: &[usize], reduce: &[bool], keepdims: bool) -> Vec<usize> {
@@ -563,6 +626,7 @@ fn reduced_output_shape(in_shape: &[usize], reduce: &[bool], keepdims: bool) -> 
 /// Build same-rank input/output descriptors; squeezed ONNX output dimensions
 /// remain size-one in cuDNN because this preserves the same contiguous storage.
 pub(crate) fn cudnn_reduce_specs(
+    op: &str,
     dtype: DataType,
     in_shape: &[usize],
     reduce: &[bool],
@@ -572,21 +636,37 @@ pub(crate) fn cudnn_reduce_specs(
         .zip(reduce)
         .map(|(&dim, &is_reduced)| if is_reduced { 1 } else { dim })
         .collect();
-    let input = TensorDescriptorSpec::new(dtype, in_shape, &contiguous_strides_usize(in_shape))?;
-    let output = TensorDescriptorSpec::new(
-        dtype,
-        &cudnn_out_shape,
-        &contiguous_strides_usize(&cudnn_out_shape),
-    )?;
+    let input_strides = contiguous_strides_usize(op, in_shape)?;
+    let output_strides = contiguous_strides_usize(op, &cudnn_out_shape)?;
+    let input = TensorDescriptorSpec::new(dtype, in_shape, &input_strides)?;
+    let output = TensorDescriptorSpec::new(dtype, &cudnn_out_shape, &output_strides)?;
     Ok((input, output))
 }
 
 /// Build the [`ReductionPlan`] for `in_shape`, a `reduce[d]` mask, and
 /// `keepdims`. The `base`/`delta` split is exact because row-major strides are
 /// independent per axis (see the module docs).
-pub(crate) fn build_plan(in_shape: &[usize], reduce: &[bool], keepdims: bool) -> ReductionPlan {
+fn build_plan(
+    op: &str,
+    in_shape: &[usize],
+    reduce: &[bool],
+    keepdims: bool,
+    geometry: &ReductionGeometry,
+) -> Result<ReductionPlan> {
     let rank = in_shape.len();
-    let strides = contiguous_strides(in_shape);
+    let strides = contiguous_strides_usize(op, in_shape)?
+        .into_iter()
+        .enumerate()
+        .map(|(axis, stride)| {
+            i64::try_from(stride).map_err(|_| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep {op}: offset-geometry overflow for input shape {in_shape:?} at axis \
+                     {axis}: contiguous stride {stride} exceeds i64. HOW: reduce the tensor \
+                     dimensions before workspace planning/admission."
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let kept_axes: Vec<usize> = (0..rank).filter(|&d| !reduce[d]).collect();
     let red_axes: Vec<usize> = (0..rank).filter(|&d| reduce[d]).collect();
@@ -594,38 +674,89 @@ pub(crate) fn build_plan(in_shape: &[usize], reduce: &[bool], keepdims: bool) ->
     let kept_dims: Vec<usize> = kept_axes.iter().map(|&d| in_shape[d]).collect();
     let red_dims: Vec<usize> = red_axes.iter().map(|&d| in_shape[d]).collect();
 
-    let base = enumerate_offsets(&kept_dims, &kept_axes, &strides);
-    let delta = enumerate_offsets(&red_dims, &red_axes, &strides);
+    let base = enumerate_offsets(
+        op,
+        in_shape,
+        &kept_dims,
+        &kept_axes,
+        &strides,
+        geometry.out_count.max(1),
+        "kept-axis offsets",
+    )?;
+    let delta = enumerate_offsets(
+        op,
+        in_shape,
+        &red_dims,
+        &red_axes,
+        &strides,
+        geometry.reduce_count.max(1),
+        "reduced-axis offsets",
+    )?;
 
     // Output shape: kept dims in order; reduced dims become size-1 (keepdims) or
     // are squeezed out.
     let out_shape = reduced_output_shape(in_shape, reduce, keepdims);
 
-    ReductionPlan {
+    Ok(ReductionPlan {
         base,
         delta,
         out_shape,
-    }
+    })
 }
 
 /// Enumerate the input offsets for every multi-index over `dims` (row-major),
 /// where `axes[k]` is the input axis of `dims[k]` and `strides` are the input
 /// strides. Returns `[0]` for an empty dim set (a single all-zero coordinate).
-fn enumerate_offsets(dims: &[usize], axes: &[usize], strides: &[i64]) -> Vec<i64> {
-    let total: usize = dims.iter().product::<usize>().max(1);
-    let mut out = Vec::with_capacity(total);
+fn enumerate_offsets(
+    op: &str,
+    in_shape: &[usize],
+    dims: &[usize],
+    axes: &[usize],
+    strides: &[i64],
+    total: usize,
+    purpose: &str,
+) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(total).map_err(|error| {
+        EpError::KernelFailed(format!(
+            "cuda_ep {op}: could not reserve {total} {purpose} entries for input shape \
+             {in_shape:?}: {error}. HOW: reduce the tensor dimensions before execution."
+        ))
+    })?;
     let mut idx = vec![0usize; dims.len()];
     loop {
         let mut off = 0i64;
         for k in 0..dims.len() {
-            off += idx[k] as i64 * strides[axes[k]];
+            let axis = axes[k];
+            let coord = i64::try_from(idx[k]).map_err(|_| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep {op}: offset-geometry overflow while planning {purpose} for input \
+                     shape {in_shape:?}: coordinate {} on axis {axis} exceeds i64",
+                    idx[k]
+                ))
+            })?;
+            let term = coord.checked_mul(strides[axis]).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep {op}: offset-geometry overflow while planning {purpose} for input \
+                     shape {in_shape:?}: coordinate {coord} times stride {} on axis {axis} \
+                     exceeds i64",
+                    strides[axis]
+                ))
+            })?;
+            off = off.checked_add(term).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep {op}: offset-geometry overflow while planning {purpose} for input \
+                     shape {in_shape:?}: adding axis {axis} contribution {term} to partial offset \
+                     {off} exceeds i64"
+                ))
+            })?;
         }
         out.push(off);
         if !next_index(dims, &mut idx) {
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Increment a row-major multi-index `idx` within `dims`; returns `false` on
@@ -667,10 +798,8 @@ macro_rules! reduce_factory {
                     noop_with_empty_axes,
                     runtime: self.runtime.clone(),
                     reduce_metadata: Mutex::new(ReductionMetadataCache::new(self.runtime.clone())),
-                    cudnn_reduce: Mutex::new(CudnnReduceCache::new()),
-                    warmed_axes: Mutex::new(None),
-                    prepared_axes: Mutex::new(None),
-                    last_call_capture_safe: AtomicBool::new(false),
+                    prepared_execution: Mutex::new(None),
+                    capture_ready: Mutex::new(None),
                 }))
             }
         }
@@ -705,19 +834,15 @@ pub struct ReduceKernel {
     /// into a captured CUDA graph segment instead of shredding it with a
     /// per-call `alloc`/`htod`/`sync`/`free`.
     reduce_metadata: Mutex<ReductionMetadataCache>,
-    /// Cached cuDNN descriptors + exact workspace bytes for the float cuDNN
-    /// reduce path. The executor owns the actual persistent workspace.
-    cudnn_reduce: Mutex<CudnnReduceCache>,
-    /// Axes resolved from the optional axes **input** on the last eager call,
-    /// reused during CUDA graph capture where a device read of that input is
-    /// illegal. `None` until the first 2-input eager call warms it.
-    warmed_axes: Mutex<Option<Vec<i64>>>,
-    /// Axes prepared for the immediately-following dispatch. Execution-time
-    /// workspace planning can resolve a runtime axes input before
-    /// `execute_with_workspace`; stash the exact axes here so the launch path
-    /// can reuse them without a second device→host read.
-    prepared_axes: Mutex<Option<Vec<i64>>>,
-    last_call_capture_safe: AtomicBool,
+    /// Prospective dispatch state produced by the execution-time workspace
+    /// query. It is never capture-visible: allocation failure or an abandoned
+    /// dispatch may leave a candidate here, but the last successful immutable
+    /// snapshot remains authoritative until matching execution succeeds.
+    prepared_execution: Mutex<Option<PreparedReductionExecution>>,
+    /// Immutable signature and complete private-resource set from the most
+    /// recent successful capture-safe call. Failed replacement calls leave it
+    /// untouched; a successful replacement publishes the new state atomically.
+    capture_ready: Mutex<Option<Arc<ReductionCaptureReady>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -731,20 +856,107 @@ struct ReductionMetadataKey {
 #[derive(Debug)]
 struct ReductionMetadataCache {
     runtime: Arc<CudaRuntime>,
-    key: Option<ReductionMetadataKey>,
-    base: CUdeviceptr,
-    delta: CUdeviceptr,
-    axes: CUdeviceptr,
+    current: Option<PreparedReductionMetadata>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedReductionMetadata {
+    key: ReductionMetadataKey,
+    base: Arc<GraphDeviceAllocation>,
+    delta: Arc<GraphDeviceAllocation>,
+    axes: Arc<GraphDeviceAllocation>,
+}
+
+impl PreparedReductionMetadata {
+    fn pointers(&self) -> (CUdeviceptr, CUdeviceptr, CUdeviceptr) {
+        (self.base.ptr(), self.delta.ptr(), self.axes.ptr())
+    }
+
+    fn resources(&self) -> Vec<DeviceGraphResource> {
+        [&self.base, &self.delta, &self.axes]
+            .into_iter()
+            .map(GraphDeviceAllocation::device_graph_resource)
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReductionCaptureRoute {
+    Cudnn,
+    Nvrtc,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReductionCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+    reduce: Vec<bool>,
+    axes: Vec<i64>,
+    keepdims: bool,
+    route: ReductionCaptureRoute,
+}
+
+#[derive(Clone)]
+struct ReductionCaptureReady {
+    signature: ReductionCaptureSignature,
+    resources: Vec<DeviceGraphResource>,
+    cudnn: Option<Arc<Mutex<CudnnReduceCache>>>,
+}
+
+impl std::fmt::Debug for ReductionCaptureReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReductionCaptureReady")
+            .field("signature", &self.signature)
+            .field(
+                "resource_ids",
+                &ReduceKernel::capture_resource_ids(&self.resources),
+            )
+            .field("has_cudnn_plan", &self.cudnn.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct PreparedReductionExecution {
+    input_dtype: DataType,
+    input_shape: Vec<usize>,
+    input_count: usize,
+    axes_input_ptr: Option<usize>,
+    capturing: bool,
+    axes_raw: Option<Vec<i64>>,
+    reduce: Vec<bool>,
+    geometry: ReductionGeometry,
+    route: ReductionCaptureRoute,
+    cudnn: Option<Arc<Mutex<CudnnReduceCache>>>,
+    workspace: WorkspaceRequirement,
+    capture_snapshot: Option<Arc<ReductionCaptureReady>>,
+}
+
+impl std::fmt::Debug for PreparedReductionExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedReductionExecution")
+            .field("input_dtype", &self.input_dtype)
+            .field("input_shape", &self.input_shape)
+            .field("input_count", &self.input_count)
+            .field("axes_input_ptr", &self.axes_input_ptr)
+            .field("capturing", &self.capturing)
+            .field("axes_raw", &self.axes_raw)
+            .field("reduce", &self.reduce)
+            .field("geometry", &self.geometry)
+            .field("route", &self.route)
+            .field("has_cudnn_plan", &self.cudnn.is_some())
+            .field("workspace", &self.workspace)
+            .field("has_capture_snapshot", &self.capture_snapshot.is_some())
+            .finish()
+    }
 }
 
 impl ReductionMetadataCache {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            key: None,
-            base: 0,
-            delta: 0,
-            axes: 0,
+            current: None,
         }
     }
 
@@ -755,98 +967,52 @@ impl ReductionMetadataCache {
         keepdims: bool,
         axes: &[i64],
         plan: &ReductionPlan,
-    ) -> Result<(CUdeviceptr, CUdeviceptr, CUdeviceptr)> {
+    ) -> Result<PreparedReductionMetadata> {
         let key = ReductionMetadataKey {
             input_shape: input_shape.to_vec(),
             reduce: reduce.to_vec(),
             keepdims,
             axes: axes.to_vec(),
         };
-        if self.key.as_ref() == Some(&key) {
-            return Ok((self.base, self.delta, self.axes));
+        if let Some(current) = &self.current
+            && current.key == key
+        {
+            return Ok(current.clone());
         }
         if self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
                 "cuda_ep ReduceSum: int64 reduction metadata changed during CUDA graph capture; warm the fixed decode shape before capture".into(),
             ));
         }
-        if self.base != 0 || self.delta != 0 || self.axes != 0 {
+        if self.current.is_some() {
             self.runtime.synchronize()?;
         }
 
         let base_bytes = as_i64_bytes(&plan.base);
         let delta_bytes = as_i64_bytes(&plan.delta);
         let axes_bytes = as_i64_bytes(axes);
-        let base = self.runtime.alloc_raw(base_bytes.len().max(1))?;
-        let delta = match self.runtime.alloc_raw(delta_bytes.len().max(1)) {
-            Ok(delta) => delta,
-            Err(error) => {
-                // SAFETY: `base` is fresh and has not escaped this cache.
-                let _ = unsafe { self.runtime.free_raw(base) };
-                return Err(error);
-            }
-        };
-        let axes_ptr = match self.runtime.alloc_raw(axes_bytes.len().max(1)) {
-            Ok(axes_ptr) => axes_ptr,
-            Err(error) => {
-                // SAFETY: both pointers are fresh and have not escaped.
-                let _ = unsafe { self.runtime.free_raw(base) };
-                let _ = unsafe { self.runtime.free_raw(delta) };
-                return Err(error);
-            }
-        };
+        let base = GraphDeviceAllocation::allocate(&self.runtime, base_bytes.len().max(1))?;
+        let delta = GraphDeviceAllocation::allocate(&self.runtime, delta_bytes.len().max(1))?;
+        let axes = GraphDeviceAllocation::allocate(&self.runtime, axes_bytes.len().max(1))?;
         let upload = (|| {
             // SAFETY: all fresh allocations cover their corresponding slices.
-            unsafe { self.runtime.htod(&base_bytes, base) }?;
-            unsafe { self.runtime.htod(&delta_bytes, delta) }?;
-            unsafe { self.runtime.htod(&axes_bytes, axes_ptr) }
+            unsafe { self.runtime.htod(&base_bytes, base.ptr()) }?;
+            unsafe { self.runtime.htod(&delta_bytes, delta.ptr()) }?;
+            unsafe { self.runtime.htod(&axes_bytes, axes.ptr()) }
         })();
-        if let Err(error) = upload {
-            // SAFETY: none of the fresh pointers escaped or were launched.
-            let _ = unsafe { self.runtime.free_raw(base) };
-            let _ = unsafe { self.runtime.free_raw(delta) };
-            let _ = unsafe { self.runtime.free_raw(axes_ptr) };
-            return Err(error);
-        }
+        upload?;
 
-        if self.base != 0 {
-            // SAFETY: synchronization above completed every prior launch using
-            // these cache-owned pointers.
-            unsafe { self.runtime.free_raw(self.base) }?;
-        }
-        if self.delta != 0 {
-            // SAFETY: same ownership and synchronization invariant as `base`.
-            unsafe { self.runtime.free_raw(self.delta) }?;
-        }
-        if self.axes != 0 {
-            // SAFETY: same ownership and synchronization invariant as `base`.
-            unsafe { self.runtime.free_raw(self.axes) }?;
-        }
-        self.key = Some(key);
-        self.base = base;
-        self.delta = delta;
-        self.axes = axes_ptr;
-        Ok((base, delta, axes_ptr))
+        let prepared = PreparedReductionMetadata {
+            key,
+            base,
+            delta,
+            axes,
+        };
+        Ok(prepared)
     }
-}
 
-impl Drop for ReductionMetadataCache {
-    fn drop(&mut self) {
-        if self.base != 0 {
-            // SAFETY: this cache exclusively owns the live pointer.
-            let _ = unsafe { self.runtime.free_raw(self.base) };
-            self.base = 0;
-        }
-        if self.delta != 0 {
-            // SAFETY: this cache exclusively owns the live pointer.
-            let _ = unsafe { self.runtime.free_raw(self.delta) };
-            self.delta = 0;
-        }
-        if self.axes != 0 {
-            // SAFETY: this cache exclusively owns the live pointer.
-            let _ = unsafe { self.runtime.free_raw(self.axes) };
-            self.axes = 0;
-        }
+    fn commit(&mut self, prepared: PreparedReductionMetadata) {
+        self.current = Some(prepared);
     }
 }
 
@@ -887,6 +1053,97 @@ pub(crate) fn resolve_reduce_mask(
 }
 
 impl ReduceKernel {
+    fn capture_signature(
+        &self,
+        x: &TensorView,
+        output: &TensorMut,
+        reduce: &[bool],
+        axes: &[i64],
+        route: ReductionCaptureRoute,
+    ) -> ReductionCaptureSignature {
+        ReductionCaptureSignature {
+            dtype: x.dtype,
+            input_shape: x.shape.to_vec(),
+            output_shape: output.shape.to_vec(),
+            reduce: reduce.to_vec(),
+            axes: axes.to_vec(),
+            keepdims: self.keepdims,
+            route,
+        }
+    }
+
+    fn capture_resource_ids(resources: &[DeviceGraphResource]) -> Vec<usize> {
+        resources
+            .iter()
+            .map(DeviceGraphResource::identity)
+            .collect()
+    }
+
+    fn validate_captured_snapshot(
+        ready: Arc<ReductionCaptureReady>,
+        signature: &ReductionCaptureSignature,
+    ) -> Result<Arc<ReductionCaptureReady>> {
+        if ready.signature != *signature {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep ReduceSum: reduction signature changed during CUDA graph capture: \
+                 warmed={:?}, current={signature:?}. HOW: end or abort capture, then warm the \
+                 exact replacement signature before capturing it.",
+                ready.signature
+            )));
+        }
+        Ok(ready)
+    }
+
+    fn validate_captured_resources(
+        &self,
+        ready: &ReductionCaptureReady,
+        resources: &[DeviceGraphResource],
+    ) -> Result<()> {
+        let warmed_ids = Self::capture_resource_ids(&ready.resources);
+        let current_ids = Self::capture_resource_ids(resources);
+        if warmed_ids != current_ids {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep ReduceSum: private reduction resources changed during CUDA graph \
+                 capture: warmed={warmed_ids:?}, current={current_ids:?}. HOW: abort capture and \
+                 successfully warm the exact signature/resources before retrying."
+            )));
+        }
+        for resource in resources {
+            self.runtime.require_registered_address_capture(
+                resource.identity(),
+                "Reduce metadata allocation",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn publish_capture_ready(
+        &self,
+        signature: ReductionCaptureSignature,
+        resources: Vec<DeviceGraphResource>,
+        cudnn: Option<Arc<Mutex<CudnnReduceCache>>>,
+    ) -> Result<()> {
+        *self.capture_ready.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
+            )
+        })? = Some(Arc::new(ReductionCaptureReady {
+            signature,
+            resources,
+            cudnn,
+        }));
+        Ok(())
+    }
+
+    fn publish_capture_unsupported(&self) -> Result<()> {
+        *self.capture_ready.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
+            )
+        })? = None;
+        Ok(())
+    }
+
     /// Read the optional axes **input** (opset 13/18+) off the device as `i64`.
     fn read_axes_input(&self, op: &str, axes: &TensorView) -> Result<Vec<i64>> {
         if !axes.is_contiguous() {
@@ -935,95 +1192,204 @@ impl ReduceKernel {
                 ));
             }
             let cached_axes = self
-                .reduce_metadata
+                .capture_ready
                 .lock()
                 .map_err(|_| {
                     EpError::KernelFailed(
-                        "cuda_ep ReduceSum: metadata cache lock was poisoned".into(),
+                        "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
                     )
                 })?
-                .key
                 .as_ref()
-                .map(|key| key.axes.clone());
+                .map(|ready| ready.signature.axes.clone());
             let axes = match cached_axes {
                 Some(axes) => axes,
-                None => self
-                    .warmed_axes
-                    .lock()
-                    .map_err(|_| {
-                        EpError::KernelFailed(
-                            "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
-                        )
-                    })?
-                    .clone()
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep ReduceSum: axes were not warmed before CUDA graph capture"
-                                .into(),
-                        )
-                    })?,
+                None => {
+                    return Err(EpError::KernelFailed(
+                        "cuda_ep ReduceSum: axes were not part of a successful warmed capture \
+                         signature before CUDA graph capture"
+                            .into(),
+                    ));
+                }
             };
             Ok(Some(axes))
         } else if inputs.len() == 2 {
-            let axes = self.read_axes_input(op, &inputs[1])?;
-            *self.warmed_axes.lock().map_err(|_| {
-                EpError::KernelFailed(
-                    "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
-                )
-            })? = Some(axes.clone());
-            Ok(Some(axes))
+            self.read_axes_input(op, &inputs[1]).map(Some)
         } else {
             Ok(self.axes_attr.clone())
         }
     }
 
-    fn cudnn_workspace_requirement_for_shape(
+    fn route_for(
         &self,
         dtype: DataType,
         shape: &[usize],
         reduce: &[bool],
-        capturing: bool,
-    ) -> Result<WorkspaceRequirement> {
-        let Some(cudnn_op) = self.op.cudnn_op() else {
-            return Ok(WorkspaceRequirement::NONE);
-        };
-        if dtype != DataType::Float32 || !self.runtime.cudnn().is_available() {
-            return Ok(WorkspaceRequirement::NONE);
+        geometry: &ReductionGeometry,
+    ) -> ReductionCaptureRoute {
+        if dtype != DataType::Float32
+            || self.op.cudnn_op().is_none()
+            || !self.runtime.cudnn().is_available()
+            || shape.is_empty()
+            || !reduce.iter().any(|&axis| axis)
+        {
+            return ReductionCaptureRoute::Nvrtc;
         }
-
-        let reduce_count_hint: usize = shape
-            .iter()
-            .zip(reduce.iter())
-            .filter(|&(_, &r)| r)
-            .map(|(&d, _)| d)
-            .product();
-        let out_count_hint: usize = shape
-            .iter()
-            .zip(reduce.iter())
-            .filter(|&(_, &r)| !r)
-            .map(|(&d, _)| d)
-            .product();
         let sm_count = self.runtime.capabilities().multiprocessor_count() as usize;
-        let block_reduction_parallel =
-            out_count_hint >= sm_count || reduce_count_hint <= REDUCE_BLOCK as usize;
-        if block_reduction_parallel {
-            return Ok(WorkspaceRequirement::NONE);
+        if block_reduction_parallel(geometry, sm_count) {
+            ReductionCaptureRoute::Nvrtc
+        } else {
+            ReductionCaptureRoute::Cudnn
+        }
+    }
+
+    fn ready_matches_dispatch(
+        &self,
+        ready: &ReductionCaptureReady,
+        dtype: DataType,
+        shape: &[usize],
+        reduce: &[bool],
+        axes_raw: &Option<Vec<i64>>,
+        route: ReductionCaptureRoute,
+    ) -> bool {
+        ready.signature.dtype == dtype
+            && ready.signature.input_shape == shape
+            && ready.signature.reduce == reduce
+            && ready.signature.axes == axes_raw.as_deref().unwrap_or(&[])
+            && ready.signature.keepdims == self.keepdims
+            && ready.signature.route == route
+    }
+
+    fn prepared_matches_inputs(
+        prepared: &PreparedReductionExecution,
+        inputs: &[TensorView],
+        capturing: bool,
+    ) -> bool {
+        let Some(input) = inputs.first() else {
+            return false;
+        };
+        let axes_input_ptr = inputs
+            .get(1)
+            .map(|axes| cuptr(axes.data_ptr::<u8>() as *const c_void) as usize);
+        prepared.input_dtype == input.dtype
+            && prepared.input_shape == input.shape
+            && prepared.input_count == inputs.len()
+            && prepared.axes_input_ptr == axes_input_ptr
+            && prepared.capturing == capturing
+    }
+
+    fn prepare_execution(
+        &self,
+        inputs: &[TensorView],
+        capturing: bool,
+    ) -> Result<PreparedReductionExecution> {
+        if !(1..=2).contains(&inputs.len()) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {}: expected 1-2 inputs (data[, axes]), got {}",
+                self.op.name(),
+                inputs.len()
+            )));
+        }
+        let x = &inputs[0];
+        let axes_raw = self.resolve_axes_for_dispatch(self.op.name(), inputs, capturing)?;
+        let reduce = resolve_reduce_mask(
+            self.op.name(),
+            &axes_raw,
+            x.shape.len(),
+            self.noop_with_empty_axes,
+        )?;
+        let geometry = ReductionGeometry::checked(self.op.name(), x.shape, &reduce)?;
+        let route = self.route_for(x.dtype, x.shape, &reduce, &geometry);
+        let ready = self
+            .capture_ready
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
+                )
+            })?
+            .clone();
+        let capture_snapshot = capturing
+            .then(|| {
+                ready.clone().ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep ReduceSum: capture began without a successful warmed reduction \
+                     snapshot. HOW: abort capture and execute the exact fixed-shape reduction \
+                     successfully before retrying."
+                            .into(),
+                    )
+                })
+            })
+            .transpose()?;
+        if let Some(ready) = &capture_snapshot
+            && !self.ready_matches_dispatch(ready, x.dtype, x.shape, &reduce, &axes_raw, route)
+        {
+            return Err(EpError::KernelFailed(
+                "cuda_ep ReduceSum: reduction signature changed during CUDA graph capture. \
+             HOW: abort capture and successfully warm the exact replacement signature \
+             before retrying."
+                    .into(),
+            ));
         }
 
-        let (input_spec, output_spec) = cudnn_reduce_specs(dtype, shape, reduce)?;
-        let mut cache = self.cudnn_reduce.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep ReduceSum: cuDNN reduce cache lock was poisoned".into())
-        })?;
-        let bytes = self.runtime.cudnn().with_handle(|handle| {
-            handle.reduce_workspace_bytes(
-                &mut cache,
-                &input_spec,
-                &output_spec,
-                cudnn_op,
-                capturing,
-            )
-        })?;
-        Ok(governed_workspace_requirement(bytes))
+        let cudnn = if route == ReductionCaptureRoute::Cudnn {
+            if let Some(ready) = ready.as_ref().filter(|ready| {
+                self.ready_matches_dispatch(ready, x.dtype, x.shape, &reduce, &axes_raw, route)
+            }) {
+                Some(ready.cudnn.clone().ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep ReduceSum: warmed cuDNN reduction snapshot is missing its \
+                         descriptor/workspace plan"
+                            .into(),
+                    )
+                })?)
+            } else if capturing {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep ReduceSum: reduction signature changed during CUDA graph capture. \
+                     HOW: abort capture and successfully warm the exact f32 cuDNN reduction \
+                     signature before retrying."
+                        .into(),
+                ));
+            } else {
+                let cudnn_op = self.op.cudnn_op().expect("cuDNN route has an operation");
+                let (input_spec, output_spec) =
+                    cudnn_reduce_specs(self.op.name(), x.dtype, x.shape, &reduce)?;
+                let plan = self.runtime.cudnn().with_handle(|handle| {
+                    handle.prepare_reduce(&input_spec, &output_spec, cudnn_op)
+                })?;
+                self.runtime
+                    .staged_warm_cache_mutation("Reduce cuDNN workspace query")?;
+                Some(Arc::new(Mutex::new(plan)))
+            }
+        } else {
+            None
+        };
+        let workspace = match &cudnn {
+            Some(plan) => {
+                let plan = plan.lock().map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep ReduceSum: staged cuDNN plan lock was poisoned".into(),
+                    )
+                })?;
+                governed_workspace_requirement(plan.workspace_bytes())
+            }
+            None => WorkspaceRequirement::NONE,
+        };
+        Ok(PreparedReductionExecution {
+            input_dtype: x.dtype,
+            input_shape: x.shape.to_vec(),
+            input_count: inputs.len(),
+            axes_input_ptr: inputs
+                .get(1)
+                .map(|axes| cuptr(axes.data_ptr::<u8>() as *const c_void) as usize),
+            capturing,
+            axes_raw,
+            reduce,
+            geometry,
+            route,
+            cudnn,
+            workspace,
+            capture_snapshot,
+        })
     }
 
     fn workspace_requirement_from_metadata(
@@ -1044,14 +1410,15 @@ impl ReduceKernel {
             return Ok(WorkspaceRequirement::NONE);
         }
         let axes_raw = if inputs.len() == 2 {
-            self.warmed_axes
+            self.capture_ready
                 .lock()
                 .map_err(|_| {
                     EpError::KernelFailed(
-                        "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
+                        "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
                     )
                 })?
-                .clone()
+                .as_ref()
+                .map(|ready| ready.signature.axes.clone())
         } else {
             self.axes_attr.clone()
         };
@@ -1061,10 +1428,52 @@ impl ReduceKernel {
             x.shape.len(),
             self.noop_with_empty_axes,
         )?;
+        let geometry = ReductionGeometry::checked(self.op.name(), x.shape, &reduce)?;
         if x.shape.is_empty() || !reduce.iter().any(|&axis| axis) {
             return Ok(WorkspaceRequirement::NONE);
         }
-        self.cudnn_workspace_requirement_for_shape(x.dtype, x.shape, &reduce, capturing)
+        let route = self.route_for(x.dtype, x.shape, &reduce, &geometry);
+        if route != ReductionCaptureRoute::Cudnn {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let current = self
+            .capture_ready
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep ReduceSum: capture-ready signature lock was poisoned".into(),
+                )
+            })?
+            .clone();
+        let plan = if let Some(ready) = current.as_ref().filter(|ready| {
+            self.ready_matches_dispatch(ready, x.dtype, x.shape, &reduce, &axes_raw, route)
+        }) {
+            ready.cudnn.clone().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep ReduceSum: warmed cuDNN reduction snapshot is missing its \
+                     descriptor/workspace plan"
+                        .into(),
+                )
+            })?
+        } else if capturing {
+            return Err(EpError::KernelFailed(
+                "cuda_ep ReduceSum: metadata workspace query does not match the immutable \
+                 reduction snapshot being captured. HOW: abort capture and warm the exact \
+                 signature first."
+                    .into(),
+            ));
+        } else {
+            let cudnn_op = self.op.cudnn_op().expect("cuDNN route has an operation");
+            let (input_spec, output_spec) =
+                cudnn_reduce_specs(self.op.name(), x.dtype, x.shape, &reduce)?;
+            Arc::new(Mutex::new(self.runtime.cudnn().with_handle(|handle| {
+                handle.prepare_reduce(&input_spec, &output_spec, cudnn_op)
+            })?))
+        };
+        let plan = plan.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep ReduceSum: cuDNN plan lock was poisoned".into())
+        })?;
+        Ok(governed_workspace_requirement(plan.workspace_bytes()))
     }
 
     fn run(
@@ -1120,23 +1529,24 @@ impl ReduceKernel {
         }
         let rank = x.shape.len();
 
-        // Resolve axes: input 1 (opset 13/18+) beats the attribute; both absent
-        // means reduce-all (unless noop_with_empty_axes selects identity).
         let capturing = self.runtime.is_capturing()?;
-        let axes_raw = match self
-            .prepared_axes
+        let candidate = self
+            .prepared_execution
             .lock()
             .map_err(|_| {
                 EpError::KernelFailed(
-                    "cuda_ep ReduceSum: prepared-axes cache lock was poisoned".into(),
+                    "cuda_ep ReduceSum: prepared-execution lock was poisoned".into(),
                 )
             })?
-            .take()
-        {
-            Some(axes) => Some(axes),
-            None => self.resolve_axes_for_dispatch(op, inputs, capturing)?,
+            .take();
+        let prepared = match candidate {
+            Some(candidate) if Self::prepared_matches_inputs(&candidate, inputs, capturing) => {
+                candidate
+            }
+            _ => self.prepare_execution(inputs, capturing)?,
         };
-        let reduce = resolve_reduce_mask(op, &axes_raw, rank, self.noop_with_empty_axes)?;
+        let axes_raw = prepared.axes_raw.clone();
+        let reduce = prepared.reduce.clone();
         let expected_shape = reduced_output_shape(x.shape, &reduce, self.keepdims);
 
         if outputs[0].shape != expected_shape.as_slice() {
@@ -1147,17 +1557,33 @@ impl ReduceKernel {
             )));
         }
 
-        if x.numel() == 0 || outputs[0].numel() == 0 {
+        if prepared.geometry.input_count == 0 || prepared.geometry.out_count == 0 {
+            if capturing {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: an empty reduction cannot replace the successful warmed \
+                     signature during CUDA graph capture. HOW: abort capture and warm this exact \
+                     empty signature outside capture."
+                )));
+            }
+            self.publish_capture_unsupported()?;
             return Ok(());
         }
 
         if (!reduce.iter().any(|&axis| axis) || rank == 0) && self.op.ext_tags().is_none() {
+            if capturing {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: an identity reduction cannot replace the successful warmed \
+                     signature during CUDA graph capture. HOW: abort capture and run this \
+                     signature eagerly."
+                )));
+            }
             let src = cuptr(x.data_ptr::<u8>() as *const c_void);
             let dst = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
             if src != dst {
                 // SAFETY: identity reduction has equal input/output storage size.
                 unsafe { self.runtime.dtod(src, dst, x.byte_size()) }?;
             }
+            self.publish_capture_unsupported()?;
             return Ok(());
         }
 
@@ -1191,53 +1617,56 @@ impl ReduceKernel {
         // (`CUDNN_STATUS_NOT_SUPPORTED`, cuDNN 9.10/9.20). Both take the single
         // fused fp16/bf16-IO f32-accumulation block reduction below instead.
         //
-        // `out_count_hint`/`reduce_count_hint` mirror `build_plan`'s
+        // The checked prepared geometry mirrors `build_plan`'s
         // `base.len()`/`delta.len()` (product of kept / reduced dims); the
         // identity (no-axis) case already returned above.
-        let reduce_count_hint: usize = x
-            .shape
-            .iter()
-            .zip(reduce.iter())
-            .filter(|&(_, &r)| r)
-            .map(|(&d, _)| d)
-            .product();
-        let out_count_hint: usize = x
-            .shape
-            .iter()
-            .zip(reduce.iter())
-            .filter(|&(_, &r)| !r)
-            .map(|(&d, _)| d)
-            .product();
-        let sm_count = self.runtime.capabilities().multiprocessor_count() as usize;
-        let block_reduction_parallel =
-            out_count_hint >= sm_count || reduce_count_hint <= REDUCE_BLOCK as usize;
-        if x.dtype == DataType::Float32
-            && !block_reduction_parallel
-            && let Some(cudnn_op) = cudnn_op
-            && self.runtime.cudnn().is_available()
-        {
-            let (input_spec, output_spec) = cudnn_reduce_specs(x.dtype, x.shape, &reduce)?;
+        if prepared.route == ReductionCaptureRoute::Cudnn {
+            let cudnn_op = cudnn_op.expect("cuDNN route has a reduction operation");
+            let signature = self.capture_signature(
+                x,
+                &outputs[0],
+                &reduce,
+                axes_raw.as_deref().unwrap_or(&[]),
+                ReductionCaptureRoute::Cudnn,
+            );
+            let captured = prepared
+                .capture_snapshot
+                .clone()
+                .map(|ready| Self::validate_captured_snapshot(ready, &signature))
+                .transpose()?;
+            if let Some(captured) = &captured {
+                self.validate_captured_resources(captured, &[])?;
+            }
+            let (input_spec, output_spec) =
+                cudnn_reduce_specs(self.op.name(), x.dtype, x.shape, &reduce)?;
             let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
             let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-            let mut cache = self.cudnn_reduce.lock().map_err(|_| {
-                EpError::KernelFailed(
-                    "cuda_ep ReduceSum: cuDNN reduce cache lock was poisoned".into(),
-                )
+            let plan = captured
+                .as_ref()
+                .and_then(|ready| ready.cudnn.clone())
+                .or(prepared.cudnn.clone())
+                .ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep ReduceSum: cuDNN route has no staged descriptor/workspace plan"
+                            .into(),
+                    )
+                })?;
+            let cache = plan.lock().map_err(|_| {
+                EpError::KernelFailed("cuda_ep ReduceSum: cuDNN plan lock was poisoned".into())
             })?;
             self.runtime.cudnn().with_handle(|handle| {
                 handle.reduce_with_workspace(
-                    &mut cache,
+                    &cache,
                     &input_spec,
                     &output_spec,
                     cudnn_op,
                     CudnnBufferPair {
                         input: x_ptr,
                         output: y_ptr,
-                        input_numel: x.numel(),
-                        output_numel: outputs[0].numel(),
+                        input_numel: prepared.geometry.input_count,
+                        output_numel: prepared.geometry.out_count,
                     },
                     workspace,
-                    capturing,
                 )
             })?;
             drop(cache);
@@ -1247,18 +1676,16 @@ impl ReduceKernel {
             // the float reduce fold into the captured segment.
             if !capturing {
                 self.runtime.synchronize()?;
+                self.runtime
+                    .staged_warm_cache_mutation("Reduce cuDNN execution")?;
+                self.publish_capture_ready(signature, Vec::new(), Some(plan))?;
             }
-            self.last_call_capture_safe.store(true, Ordering::Relaxed);
             return Ok(());
         }
 
-        let plan = build_plan(x.shape, &reduce, self.keepdims);
-        let out_count = plan.base.len();
-        let reduce_count = plan.delta.len();
-        if out_count == 0 || reduce_count == 0 {
-            // Empty input (a zero dim) — nothing to compute.
-            return Ok(());
-        }
+        let plan = build_plan(op, x.shape, &reduce, self.keepdims, &prepared.geometry)?;
+        let out_count = prepared.geometry.out_count;
+        let reduce_count = prepared.geometry.reduce_count;
 
         // NVRTC block-reduction path (Int64 DATA reduce; f16 and bf16 sum/mean,
         // which take the single-kernel fused fp16/bf16-IO f32-accumulation path
@@ -1273,11 +1700,23 @@ impl ReduceKernel {
         // graph. A signature change mid-capture is rejected by `prepare` rather
         // than reallocating device memory inside the capture.
         let axes = axes_raw.as_deref().unwrap_or(&[]);
+        let signature =
+            self.capture_signature(x, &outputs[0], &reduce, axes, ReductionCaptureRoute::Nvrtc);
+        let captured = prepared
+            .capture_snapshot
+            .clone()
+            .map(|ready| Self::validate_captured_snapshot(ready, &signature))
+            .transpose()?;
         let mut metadata = self.reduce_metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep ReduceSum: metadata cache lock was poisoned".into())
         })?;
-        let (base_buf, delta_buf, expected_axes) =
-            metadata.prepare(x.shape, &reduce, self.keepdims, axes, &plan)?;
+        let prepared = metadata.prepare(x.shape, &reduce, self.keepdims, axes, &plan)?;
+        drop(metadata);
+        let (base_buf, delta_buf, expected_axes) = prepared.pointers();
+        let resources = prepared.resources();
+        if let Some(captured) = &captured {
+            self.validate_captured_resources(captured, &resources)?;
+        }
         // Only the Int64 DATA reduce reads the axes device buffer, so it alone
         // validates the captured axes against the warmed metadata. The float/
         // bf16 block reduce bakes the reduce mask into base/delta and never reads
@@ -1295,7 +1734,17 @@ impl ReduceKernel {
             reduce_count,
             capturing,
         )?;
-        self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        if !capturing {
+            self.reduce_metadata
+                .lock()
+                .map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep ReduceSum: metadata cache lock was poisoned".into(),
+                    )
+                })?
+                .commit(prepared);
+            self.publish_capture_ready(signature, resources, None)?;
+        }
         Ok(())
     }
 
@@ -1456,42 +1905,15 @@ impl Kernel for ReduceKernel {
     fn workspace_requirement_for_execution(
         &self,
         inputs: &[TensorView],
-        metadata: &[TensorMetadata<'_>],
+        _metadata: &[TensorMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
-        if self.op.cudnn_op().is_none()
-            || inputs.first().map(|input| input.dtype) != Some(DataType::Float32)
-            || !self.runtime.cudnn().is_available()
-        {
-            *self.prepared_axes.lock().map_err(|_| {
-                EpError::KernelFailed(
-                    "cuda_ep ReduceSum: prepared-axes cache lock was poisoned".into(),
-                )
-            })? = None;
-            return self
-                .workspace_requirement_from_metadata(metadata, self.runtime.is_capturing()?);
-        }
         let capturing = self.runtime.is_capturing()?;
-        let axes_raw = self.resolve_axes_for_dispatch(self.op.name(), inputs, capturing)?;
-        *self.prepared_axes.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep ReduceSum: prepared-axes cache lock was poisoned".into())
-        })? = axes_raw.clone();
-        let reduce = resolve_reduce_mask(
-            self.op.name(),
-            &axes_raw,
-            inputs.first().map_or(0, |input| input.shape.len()),
-            self.noop_with_empty_axes,
-        )?;
-        if inputs.first().is_some_and(|input| input.shape.is_empty())
-            || !reduce.iter().any(|&axis| axis)
-        {
-            return Ok(WorkspaceRequirement::NONE);
-        }
-        self.cudnn_workspace_requirement_for_shape(
-            inputs[0].dtype,
-            inputs[0].shape,
-            &reduce,
-            capturing,
-        )
+        let prepared = self.prepare_execution(inputs, capturing)?;
+        let requirement = prepared.workspace;
+        *self.prepared_execution.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep ReduceSum: prepared-execution lock was poisoned".into())
+        })? = Some(prepared);
+        Ok(requirement)
     }
 
     fn execute_with_workspace(
@@ -1507,13 +1929,23 @@ impl Kernel for ReduceKernel {
         false
     }
 
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.capture_ready
+            .lock()
+            .ok()
+            .and_then(|ready| ready.as_ref().map(|ready| ready.resources.clone()))
+            .unwrap_or_default()
+    }
+
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        if self.last_call_capture_safe.load(Ordering::Relaxed) {
-            onnx_runtime_ep_api::CaptureSupport::Supported
-        } else {
-            onnx_runtime_ep_api::CaptureSupport::unsupported(
+        match self.capture_ready.lock() {
+            Ok(ready) if ready.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "requires a warmed fixed-shape ReduceSum path with warmed axes metadata and prepared persistent cuDNN workspace",
-            )
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "reduction capture readiness is unavailable because its state lock was poisoned",
+            ),
         }
     }
 }
@@ -1542,14 +1974,18 @@ mod tests {
 
     #[test]
     fn strides_are_row_major() {
-        assert_eq!(contiguous_strides(&[2, 3, 4]), vec![12, 4, 1]);
+        assert_eq!(
+            contiguous_strides_usize("ReduceSum", &[2, 3, 4]).unwrap(),
+            vec![12, 4, 1]
+        );
     }
 
     #[test]
     fn plan_reduce_last_axis_keepdims() {
         // [2,3] reduce axis 1, keepdims → out [2,1]; 2 groups of 3.
         let reduce = [false, true];
-        let plan = build_plan(&[2, 3], &reduce, true);
+        let geometry = ReductionGeometry::checked("ReduceSum", &[2, 3], &reduce).unwrap();
+        let plan = build_plan("ReduceSum", &[2, 3], &reduce, true, &geometry).unwrap();
         assert_eq!(plan.out_shape, vec![2, 1]);
         assert_eq!(plan.base, vec![0, 3]); // row starts
         assert_eq!(plan.delta, vec![0, 1, 2]); // within-row offsets
@@ -1559,7 +1995,8 @@ mod tests {
     fn plan_reduce_axis0_no_keepdims() {
         // [2,3] reduce axis 0, keepdims=false → out [3]; 3 groups of 2.
         let reduce = [true, false];
-        let plan = build_plan(&[2, 3], &reduce, false);
+        let geometry = ReductionGeometry::checked("ReduceSum", &[2, 3], &reduce).unwrap();
+        let plan = build_plan("ReduceSum", &[2, 3], &reduce, false, &geometry).unwrap();
         assert_eq!(plan.out_shape, vec![3]);
         assert_eq!(plan.base, vec![0, 1, 2]); // column starts
         assert_eq!(plan.delta, vec![0, 3]); // stride down the column
@@ -1568,10 +2005,99 @@ mod tests {
     #[test]
     fn plan_reduce_all_axes() {
         let reduce = [true, true];
-        let plan = build_plan(&[2, 3], &reduce, true);
+        let geometry = ReductionGeometry::checked("ReduceSum", &[2, 3], &reduce).unwrap();
+        let plan = build_plan("ReduceSum", &[2, 3], &reduce, true, &geometry).unwrap();
         assert_eq!(plan.out_shape, vec![1, 1]);
         assert_eq!(plan.base, vec![0]);
         assert_eq!(plan.delta, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn reduction_geometry_rejects_input_product_overflow_without_allocating() {
+        let shape = [usize::MAX, 2];
+        let reduce = [false, true];
+        let error = ReductionGeometry::checked("ReduceMean", &shape, &reduce).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cuda_ep ReduceMean"), "{message}");
+        assert!(message.contains(&format!("{shape:?}")), "{message}");
+        assert!(message.contains("axis 1"), "{message}");
+        assert!(message.contains("shape-product overflow"), "{message}");
+        assert!(message.contains("input elements"), "{message}");
+        assert!(
+            message.contains("workspace planning/admission"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reduction_geometry_rejects_reduction_extent_overflow_without_allocating() {
+        let shape = [usize::MAX, 2];
+        let reduce = [true, true];
+        let error = ReductionGeometry::checked("ReduceSum", &shape, &reduce).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cuda_ep ReduceSum"), "{message}");
+        assert!(message.contains(&format!("{shape:?}")), "{message}");
+        assert!(message.contains("axis 1"), "{message}");
+        assert!(
+            message.contains("elements per reduction group"),
+            "{message}"
+        );
+        assert!(
+            message.contains("workspace planning/admission"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reduction_geometry_rejects_output_extent_overflow_without_allocating() {
+        let shape = [usize::MAX, 2];
+        let reduce = [false, false];
+        let error = ReductionGeometry::checked("ReduceMax", &shape, &reduce).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cuda_ep ReduceMax"), "{message}");
+        assert!(message.contains(&format!("{shape:?}")), "{message}");
+        assert!(message.contains("axis 1"), "{message}");
+        assert!(
+            message.contains("output elements from kept axes"),
+            "{message}"
+        );
+        assert!(
+            message.contains("workspace planning/admission"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reduction_geometry_boundary_and_zero_dimension_are_stable() {
+        let boundary_shape = [usize::MAX, 1];
+        let boundary_reduce = [false, true];
+        let boundary =
+            ReductionGeometry::checked("ReduceSum", &boundary_shape, &boundary_reduce).unwrap();
+        assert_eq!(boundary.input_count, usize::MAX);
+        assert_eq!(boundary.out_count, usize::MAX);
+        assert_eq!(boundary.reduce_count, 1);
+
+        let zero_shape = [usize::MAX, 2, 0];
+        let zero_reduce = [true, true, true];
+        let zero = ReductionGeometry::checked("ReduceSum", &zero_shape, &zero_reduce).unwrap();
+        assert_eq!(zero.input_count, 0);
+        assert_eq!(zero.out_count, 1);
+        assert_eq!(zero.reduce_count, 0);
+    }
+
+    #[test]
+    fn reduction_route_geometry_boundaries_match_the_documented_heuristic() {
+        let below_sm_large_group =
+            ReductionGeometry::checked("ReduceSum", &[127, 257], &[false, true]).unwrap();
+        assert!(!block_reduction_parallel(&below_sm_large_group, 128));
+
+        let fills_sms =
+            ReductionGeometry::checked("ReduceSum", &[128, 257], &[false, true]).unwrap();
+        assert!(block_reduction_parallel(&fills_sms, 128));
+
+        let small_group =
+            ReductionGeometry::checked("ReduceSum", &[127, 256], &[false, true]).unwrap();
+        assert!(block_reduction_parallel(&small_group, 128));
     }
 
     #[test]
@@ -1653,25 +2179,41 @@ mod tests {
 
     #[test]
     fn cudnn_specs_keep_reduced_axes_as_size_one() {
-        let (input, output) =
-            cudnn_reduce_specs(DataType::BFloat16, &[2, 3, 4], &[true, false, true]).unwrap();
+        let (input, output) = cudnn_reduce_specs(
+            "ReduceSum",
+            DataType::BFloat16,
+            &[2, 3, 4],
+            &[true, false, true],
+        )
+        .unwrap();
         assert_eq!(input.dims(), &[1, 2, 3, 4]);
         assert_eq!(input.strides(), &[24, 12, 4, 1]);
         assert_eq!(output.dims(), &[1, 1, 3, 1]);
         assert_eq!(output.strides(), &[3, 3, 1, 1]);
+    }
+
+    #[test]
+    fn cudnn_stride_overflow_is_an_error_not_a_debug_only_panic() {
+        let shape = [usize::MAX, 2];
+        let error =
+            cudnn_reduce_specs("ReduceSum", DataType::Float32, &shape, &[false, true]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cuda_ep ReduceSum"), "{message}");
+        assert!(message.contains(&format!("{shape:?}")), "{message}");
+        assert!(message.contains("axis 0"), "{message}");
+        assert!(message.contains("stride-product overflow"), "{message}");
     }
 }
 
 #[cfg(test)]
 mod claim_probes {
     use std::ffi::c_void;
-    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, Kernel, TensorMut, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId};
 
-    use super::{CudnnReduceCache, ReduceKernel, ReduceOp, ReductionMetadataCache};
+    use super::{ReduceKernel, ReduceOp, ReductionMetadataCache};
     use crate::runtime::CudaRuntime;
 
     fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
@@ -1686,10 +2228,8 @@ mod claim_probes {
             noop_with_empty_axes: false,
             runtime: runtime.clone(),
             reduce_metadata: Mutex::new(ReductionMetadataCache::new(runtime.clone())),
-            cudnn_reduce: Mutex::new(CudnnReduceCache::new()),
-            warmed_axes: Mutex::new(None),
-            prepared_axes: Mutex::new(None),
-            last_call_capture_safe: AtomicBool::new(false),
+            prepared_execution: Mutex::new(None),
+            capture_ready: Mutex::new(None),
         }
     }
 
