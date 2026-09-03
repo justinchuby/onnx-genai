@@ -337,7 +337,8 @@ impl ExecutionProvider for CpuExecutionProvider {
         // where the explicit decode budget is turned into a process-wide bound
         // on prefill/MLAS Rayon parallelism (and, on Linux, CPU affinity) -- a
         // no-op unless a budget is set.
-        crate::kernels::matmul_nbits::bound_process_to_decode_budget();
+        crate::kernels::matmul_nbits::try_bound_process_to_decode_budget()
+            .map_err(EpError::KernelFailed)?;
         self.initialized = true;
         Ok(())
     }

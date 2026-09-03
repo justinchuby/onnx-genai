@@ -40,12 +40,13 @@
 //! the contended case. A bare spread therefore pays the locality cost *and*
 //! creates a straggler, which is a fair description of the losing arm.
 //!
-//! [`crate::decode_spmd`] now spreads one worker per physical core **and**
-//! reserves a core for the dispatcher. Quiet-host A/B against the compact
-//! layout, four launches per arm with an A/A null agreeing to 0.17%: 3.2%
-//! faster on llama and **29% less CPU per token**, and the dispatcher-yield
-//! counter falls 5.00 to 0.00 per token, which is the straggler mechanism
-//! closing.
+//! The dedicated-host `spread` selector places one worker per physical core
+//! **and** reserves a core for the dispatcher. Quiet-host A/B against compact,
+//! four launches per arm with an A/A null agreeing to 0.17%: spread was 3.2%
+//! faster on llama and used **29% less CPU per token**, and the
+//! dispatcher-yield counter fell 5.00 to 0.00 per token, which is the
+//! straggler mechanism closing. That result justifies the explicit selector;
+//! it does not justify assuming an edge device owns the host.
 //!
 //! Two parts of the old conclusion **do** survive and should not be re-litigated
 //! without measurement:
@@ -58,8 +59,10 @@
 //!   four DRAM-bandwidth hogs: compact 4.54 ms/token against spread 5.03--6.26.
 //!   With eight hogs covering both halves the ranking inverts (compact 15.92
 //!   against spread 6.08), because then the compact layout has 8 contended cores
-//!   and the spread has 16. The spread is the right default for a dedicated host
-//!   or a cpuset, which is the deployment target; it is not free on a shared box.
+//!   and the spread has 16. Neither arm dominates every co-tenant shape. The
+//!   deployment default therefore stays compact and leaves physical-core
+//!   headroom where SMT permits; dedicated hosts can explicitly select
+//!   `ONNX_GENAI_CPU_DECODE_PLACEMENT=spread`.
 //!
 //! Capping how many *spinning* workers live inside a mask remains a separate and
 //! still-useful lever.

@@ -52,6 +52,15 @@ Modes:
   whose CPU count covers `ONNX_GENAI_CPU_DECODE_THREADS`, so the per-op
   fork-join barrier and the first-touched packed int4 weights stay node-local.
 - `node:<index>` -- pin to a named NUMA node; an unknown index is a clear error.
+- `numa-split` -- explicitly build node-local sub-pools across all usable NUMA
+  nodes.
+
+For the persistent SPMD pool, explicit `off` performs one production
+`allowed_cpus()` capacity-discovery read so the worker count still respects an
+external `taskset`/cgroup restriction and leaves dispatcher headroom. It does
+not invoke the per-worker affinity setter or read-back API, and does not replace
+the creating thread's mask. Worker kernel affinity masks therefore remain the
+inherited mask.
 
 Because the packed int4 decode weights are lazily first-touched inside the
 `with_decode_pool_scope` installation (on a pinned worker), they land on the
@@ -75,12 +84,22 @@ bit-identical with and without pinning (it only changes placement, not math).
 `ONNX_GENAI_CPU_DECODE_PLACEMENT` selects how the workers are arranged inside
 that set. The two are orthogonal and can be combined.
 
-- unset / `spread` -- **default**. Worker `i` takes a distinct physical core for
-  as long as cores last, only then doubling up on SMT siblings. Fastest on a
-  host the process has to itself.
-- `compact` -- SMT siblings are filled before the next core is used, so an
-  N-worker pool occupies about `N / siblings` physical cores and leaves the rest
-  of the machine to a co-tenant.
+- unset / `compact` -- **shared-host default**. SMT siblings are filled before
+  the next core is used, so an N-worker pool occupies about `N / siblings`
+  physical cores. The automatic worker count is capped after reserving
+  scheduling capacity for the inline dispatcher, so the active decode threads
+  leave at least half the process's logical CPU capacity available to a
+  co-tenant. On an exact 2-core/4-thread SMT mask, the sole worker and dispatcher
+  are bound to the two siblings of one physical core for the decode scope, so
+  the other physical core is wholly available to a co-tenant. If that topology
+  or the required worker pin cannot be proved, the pool fails safe to one
+  dispatcher-owned lane instead of retaining an unpinned resident worker. On an
+  exact two-CPU mask the dispatcher likewise owns the sole compute lane and no
+  resident worker is spawned. This also holds for a one-CPU-per-core `taskset`.
+- `spread` -- explicit dedicated-host opt-in. Worker `i` takes a distinct
+  physical core for as long as cores last, only then doubling up on SMT
+  siblings; its automatic width may use every allowed physical core (subject to
+  the existing dispatcher/service-core reserve).
 
 Neither is universally better, which is why it is a selector and not a constant.
 Measured with four DRAM-bandwidth hogs on a 16-core/32-thread host, `compact`
@@ -88,10 +107,9 @@ ran 4.54 ms/token against `spread`'s 5.03--6.26; with eight hogs covering both
 halves the ranking inverts (`compact` 15.92 against `spread` 6.08). The full
 table is in `crates/onnx-runtime-ep-cpu/src/core_topology.rs`'s module docs.
 
-An unrecognized value is reported on stderr once and then treated as `spread`,
-rather than refusing to decode: unlike `ONNX_GENAI_CPU_DECODE_AFFINITY`, which
-decides which CPUs the process may touch, this knob only ranks a set already
-chosen, so a misspelling must not be fatal. It is never silent.
+An unrecognized value is a configuration error. CPU EP initialization fails
+with a diagnostic that names the variable, rejected value, and accepted modes;
+it never silently selects either policy.
 
 Because the ordering is only a ranking of a permitted set, both values are
 permutations of the same CPU list: no placement policy can widen or shrink the
@@ -108,8 +126,8 @@ sub-pools joined by a two-level barrier), which is the remaining lever.
 ## Implemented increment: persistent SPMD decode pool (barrier fusion)
 
 The persistent SPMD pool is the **default** CPU decode path (`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL`
-unset auto-enables it; `=0` opts out to the flat Rayon + auto-`compact` legacy
-path; `=1` forces it on even where the auto policy would decline). It replaces
+unset or `=1` selects it deterministically; `=0` opts out to the flat Rayon
+legacy path; `=auto` explicitly enables load-adaptive calibration). It replaces
 the per-op rayon fork-join region -- there are ~141 `MatMulNBits` ops per decoded
 token, each previously a separate parallel region whose *join barrier* dominates
 once the int4 kernel itself is L3-resident -- with **one persistent worker set**
@@ -121,9 +139,11 @@ existing packed int4 / MLAS SQNBit kernels; only the orchestration changes).
 Design (mirrors the `numa-split` two-level structure so it inherits its
 node-local placement and exact reduction order):
 
-- On first decode use, spawn `ONNX_GENAI_CPU_DECODE_THREADS` workers, pinned one
-  per CPU across the covering NUMA node(s) via the same runtime topology probe as
-  `ONNX_GENAI_CPU_DECODE_AFFINITY` (no hardcoded socket/core counts, Rule 2).
+- On first decode use, spawn the resolved worker budget. Shared-host `compact`
+  fills SMT siblings first and includes dispatcher capacity in its automatic
+  limit; explicit `spread` takes distinct physical cores first. Pin targets come
+  from the same runtime topology probe as `ONNX_GENAI_CPU_DECODE_AFFINITY` (no
+  hardcoded socket/core counts, Rule 2).
 - Each op is broadcast by bumping a `sequence` counter the spinning workers watch;
   completion is tracked with **per-node** counters so the dispatcher reads mostly
   node-local cache lines and never pays a cross-socket coherency round trip on the
@@ -140,15 +160,14 @@ sequential real packed-int4 M=1 MatMulNBits kernels in fresh subprocesses, compa
 every output byte, asserts that the persistent pool actually dispatched the ON
 case, and uses 31 workers to cover uneven node/row sharding.
 
-Generality / fallback (Rule 2, Rule 5): **default-on with opt-out**. When
-`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL` is unset the pool auto-enables and logs
-the activation once; `=0` opts out (flat legacy path) and `=1` forces it on. Auto-
-enable is conservative -- it only fires on hosts with >= 4 logical CPUs, where a
-spinning worker set is safe; tiny/single-core hosts and `THREADS=0` fall back to
-the flat path. On a single-node host, a non-NUMA machine, or when NUMA topology
-is undiscoverable, the pool collapses to a single worker group instead of the
-two-level node split; it does not switch back to the bounded Rayon pool. That
-single group is **not** unconditionally unpinned: `node_shards` passes the
+Generality / fallback (Rule 2, Rule 5): **default-on with opt-out**. Unset or
+`=1` deterministically uses the pool, `=auto` opts into live calibration, and
+`=0` or `THREADS=0` uses the flat path. A single-CPU cpuset also falls back
+because it cannot host both a spinning worker and the dispatcher safely. On a
+single-node host, a non-NUMA machine, or when NUMA topology is undiscoverable,
+the pool collapses to a single worker group instead of the two-level node split;
+it does not switch back to the bounded Rayon pool. That single group is **not**
+unconditionally unpinned: `node_shards` passes the
 process's allowed CPU set (`allowed_cpus()`, i.e. the cpuset/taskset mask) into
 the fallback shard, and `SpmdDecodePools::build` **best-effort pins** every
 worker to those CPUs on platforms that support pinning (Linux, Windows). Only
@@ -159,15 +178,18 @@ itself is portable `std` atomics + `thread::park`; only the optional CPU pinning
 is platform-specific and best-effort.
 
 Default worker count (Rule 2, topology-derived): when
-`ONNX_GENAI_CPU_DECODE_THREADS` is unset the persistent pool uses **half the
-logical CPUs** (at least one), *not* the flat pool's eight-worker ceiling. The
-flat pool caps at eight because its per-op fork/join regresses beyond that; the
-persistent pool replaces that fork/join with one hot broadcast barrier, so it
-keeps scaling with cores until the memory-bandwidth knee. Half leaves a full set
-of hardware threads free for the dispatcher (which runs the forward inline and
-spins on the completion counters), prefill's global pool, and co-tenants -- a
-*fully*-subscribed spinning pool starves the dispatcher and collapses (measured
-below). An explicit `ONNX_GENAI_CPU_DECODE_THREADS` is always honored.
+`ONNX_GENAI_CPU_DECODE_THREADS` is unset, shared-host `compact` uses at most
+`floor((logical_capacity - 1) / 2)` workers (at least one): after adding the
+inline dispatcher, at least half the logical capacity remains free. This is
+*not* the flat pool's eight-worker ceiling. Explicit `spread` may instead use one
+worker per allowed physical core. The flat pool caps at eight because its per-op
+fork/join regresses beyond that; the persistent pool replaces that fork/join
+with one hot broadcast barrier, so it keeps scaling with cores until the
+memory-bandwidth knee. The compact cap leaves scheduler capacity free for
+prefill's global pool and co-tenants; a *fully*-subscribed spinning pool starves
+the dispatcher and collapses (measured below). An explicit
+`ONNX_GENAI_CPU_DECODE_THREADS` is always
+honored.
 
 Decode strategy precedence is explicit (Rule 5): **explicit `numa-split` env >
 persistent SPMD (default, unless an explicit non-`numa-split` affinity defers it)
@@ -224,5 +246,6 @@ Persistent-pool worker-count sweep (why half, and why not all cores):
 | 96 (all logical CPUs) | **1.36** (dispatcher starved by spinning workers) |
 
 Throughput plateaus at ~half the logical CPUs and *collapses* at full
-subscription, which is exactly why the default is half-cores (not all cores) and
-why an explicit override is clamped to the host.
+subscription, which is why the shared-host default accounts for the dispatcher
+inside a half-capacity active-thread budget and why an explicit override is
+clamped to the host.

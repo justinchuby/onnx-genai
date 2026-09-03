@@ -38,6 +38,118 @@
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::{
+    cell::RefCell,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AffinityCallCounts {
+    pub(crate) capacity_read: usize,
+    pub(crate) pin: usize,
+    pub(crate) set: usize,
+    pub(crate) readback: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct AffinityCallCounter {
+    capacity_read: AtomicUsize,
+    pin: AtomicUsize,
+    set: AtomicUsize,
+    readback: AtomicUsize,
+}
+
+#[cfg(test)]
+impl AffinityCallCounter {
+    pub(crate) fn snapshot(&self) -> AffinityCallCounts {
+        AffinityCallCounts {
+            capacity_read: self.capacity_read.load(Ordering::Relaxed),
+            pin: self.pin.load(Ordering::Relaxed),
+            set: self.set.load(Ordering::Relaxed),
+            readback: self.readback.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFFINITY_CALL_COUNTER: RefCell<Option<Arc<AffinityCallCounter>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct AffinityCallCounterGuard(Option<Arc<AffinityCallCounter>>);
+
+#[cfg(test)]
+impl Drop for AffinityCallCounterGuard {
+    fn drop(&mut self) {
+        AFFINITY_CALL_COUNTER.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_affinity_call_counter(counter: Arc<AffinityCallCounter>) -> impl Drop {
+    let previous = AFFINITY_CALL_COUNTER.with(|slot| slot.replace(Some(counter)));
+    AffinityCallCounterGuard(previous)
+}
+
+#[cfg(test)]
+pub(crate) fn with_affinity_call_counter<T>(
+    counter: Arc<AffinityCallCounter>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let _guard = install_affinity_call_counter(counter);
+    f()
+}
+
+#[cfg(test)]
+pub(crate) fn current_affinity_call_counter() -> Option<Arc<AffinityCallCounter>> {
+    AFFINITY_CALL_COUNTER.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+fn record_capacity_read() {
+    AFFINITY_CALL_COUNTER.with(|slot| {
+        if let Some(counter) = slot.borrow().as_ref() {
+            counter.capacity_read.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_pin_call() {
+    AFFINITY_CALL_COUNTER.with(|slot| {
+        if let Some(counter) = slot.borrow().as_ref() {
+            counter.pin.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_set_call() {
+    AFFINITY_CALL_COUNTER.with(|slot| {
+        if let Some(counter) = slot.borrow().as_ref() {
+            counter.set.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_readback_call() {
+    AFFINITY_CALL_COUNTER.with(|slot| {
+        if let Some(counter) = slot.borrow().as_ref() {
+            counter.readback.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
 
 /// Selects how the decode pool binds its workers to CPUs.
 ///
@@ -61,12 +173,13 @@ const ACCEPTED_MODES: &str = "`off`, `compact`, `node:<index>`, `numa-split`";
 /// Orthogonal to [`DECODE_AFFINITY_ENV`], which selects *which* CPUs the pool
 /// may use. This selects how the workers are arranged inside that set:
 ///
-/// * `spread` -- worker `i` takes a distinct physical core for as long as cores
-///   last, only then doubling up on SMT siblings. Fastest on a host the process
-///   has to itself, which is what `crate::core_topology`'s module docs measure.
 /// * `compact` -- workers fill a core's SMT siblings before moving to the next
 ///   core, so an N-worker pool occupies about `N / siblings` cores and leaves
-///   the rest of the machine free for a co-tenant.
+///   the rest of the machine free for a co-tenant. This is the shared-host-safe
+///   default.
+/// * `spread` -- worker `i` takes a distinct physical core for as long as cores
+///   last, only then doubling up on SMT siblings. This dedicated-host layout is
+///   available only by explicit opt-in.
 ///
 /// Neither is universally better, which is exactly why it is a selector and not
 /// a constant. Measured with four DRAM-bandwidth hogs on a 16-core/32-thread
@@ -76,7 +189,7 @@ const ACCEPTED_MODES: &str = "`off`, `compact`, `node:<index>`, `numa-split`";
 pub const DECODE_PLACEMENT_ENV: &str = "ONNX_GENAI_CPU_DECODE_PLACEMENT";
 
 /// The complete set of accepted placement modes.
-const ACCEPTED_PLACEMENTS: &str = "`spread`, `compact`";
+const ACCEPTED_PLACEMENTS: &str = "`compact` (default), `spread`";
 
 /// How a decode pool's workers are laid out across the CPUs it may use.
 ///
@@ -85,11 +198,11 @@ const ACCEPTED_PLACEMENTS: &str = "`spread`, `compact`";
 /// asserting `Spread`, not correctness, and must say so -- see #1802.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CorePlacement {
-    /// One worker per physical core for as long as cores last.
-    #[default]
-    Spread,
     /// SMT siblings filled before the next core is used.
+    #[default]
     Compact,
+    /// One worker per physical core for as long as cores last.
+    Spread,
 }
 
 impl CorePlacement {
@@ -108,36 +221,15 @@ impl CorePlacement {
 
     /// The placement selected for this process, read once.
     ///
-    /// An unparseable value is reported once and then treated as the default.
-    /// The sibling [`DecodeAffinity`] selector rejects hard because it decides
-    /// *which* CPUs the process may touch and a wrong answer there is a
-    /// correctness question; this one decides only how workers are arranged
-    /// inside a set already chosen, so refusing to decode because a tuning knob
-    /// is misspelled would be the worse failure. It is still never silent.
-    ///
-    /// `OnceLock` makes "reported once" structural rather than a promise: the
-    /// closure runs at most once per process.
+    /// Invalid configuration fails loudly instead of silently changing the
+    /// deployment policy. CPU EP initialization validates this as a normal
+    /// error; direct pool construction has no error channel, so it panics with
+    /// the same actionable message.
     pub fn from_env() -> Self {
-        static V: OnceLock<CorePlacement> = OnceLock::new();
-        *V.get_or_init(|| Self::from_value(std::env::var(DECODE_PLACEMENT_ENV).ok().as_deref()))
-    }
-
-    /// [`Self::from_env`] without the cache or the environment read.
-    ///
-    /// Split out because the fallback is otherwise untestable: `from_env`
-    /// memoizes process-wide, so a test driving it would fix the policy for
-    /// every other test in the binary and could still only ever observe one
-    /// value. This half is the part with a decision in it.
-    fn from_value(raw: Option<&str>) -> Self {
-        match Self::parse(raw) {
-            Ok(placement) => placement,
-            Err(message) => {
-                eprintln!(
-                    "onnx-genai: {message}; using `{}`",
-                    Self::default().as_str()
-                );
-                Self::default()
-            }
+        static V: OnceLock<std::result::Result<CorePlacement, String>> = OnceLock::new();
+        match V.get_or_init(|| Self::parse(std::env::var(DECODE_PLACEMENT_ENV).ok().as_deref())) {
+            Ok(placement) => *placement,
+            Err(message) => panic!("invalid CPU scheduler configuration: {message}"),
         }
     }
 
@@ -229,7 +321,7 @@ impl DecodeAffinity {
                 } else {
                     Err(format!(
                         "{DECODE_AFFINITY_ENV}=`{raw}` is not a recognized affinity mode; \
-                         expected `off`, `compact`, or `node:<index>`"
+                         accepted modes are {ACCEPTED_MODES}"
                     ))
                 }
             }
@@ -241,7 +333,7 @@ impl DecodeAffinity {
     /// single, consistent, actionable diagnostic (see [`Self::resolve`]).
     pub fn from_env() -> std::result::Result<Self, String> {
         let raw = std::env::var(DECODE_AFFINITY_ENV).ok();
-        Self::resolve(raw.as_deref(), NumaTopology::detect().as_ref())
+        resolve_scheduler_affinity(raw.as_deref())
     }
 
     /// Parse `raw` and validate it against `topology`, producing one consistent
@@ -275,6 +367,32 @@ impl DecodeAffinity {
             )),
         }
     }
+}
+
+fn resolve_scheduler_affinity(raw: Option<&str>) -> std::result::Result<DecodeAffinity, String> {
+    #[cfg(not(miri))]
+    {
+        DecodeAffinity::resolve(raw, NumaTopology::detect().as_ref())
+    }
+    #[cfg(miri)]
+    {
+        // Miri aborts on filesystem directory iteration, so it cannot discover
+        // Linux NUMA nodes. Resolve against an unavailable topology instead:
+        // malformed values and node selectors still fail loudly, while
+        // topology-independent values need no host probe.
+        DecodeAffinity::resolve(raw, None)
+    }
+}
+
+/// Validate both user-facing CPU scheduler selectors without applying affinity.
+///
+/// Called before CPU EP initialization performs any process-wide affinity
+/// operation, so a typo fails with a clear error and cannot partially change
+/// process state before being rejected.
+pub fn validate_scheduler_configuration() -> std::result::Result<(), String> {
+    CorePlacement::parse(std::env::var(DECODE_PLACEMENT_ENV).ok().as_deref())?;
+    DecodeAffinity::from_env()?;
+    Ok(())
 }
 
 /// The CPU membership of the host's NUMA nodes, keyed by node index.
@@ -525,6 +643,8 @@ fn build_cpu_mask(cpu: usize) -> Option<Vec<libc::c_ulong>> {
 /// but never aborts decode.
 #[cfg(target_os = "linux")]
 pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_pin_call();
     // Size the mask from `cpu` itself so a large CPU index can never index past
     // a fixed 1024-bit `cpu_set_t`; on overflow we fall back to unpinned.
     let mask = build_cpu_mask(cpu)
@@ -548,6 +668,8 @@ pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> 
 
 #[cfg(target_os = "windows")]
 pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_pin_call();
     windows_imp::pin_current_thread_to_cpu(cpu)
 }
 
@@ -560,6 +682,8 @@ pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> 
 /// never builds a pinning pool there.
 #[cfg(target_os = "macos")]
 pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_pin_call();
     Err(format!(
         "thread-to-core affinity is not supported on macOS; \
          decode worker for cpu {cpu} runs unpinned (no-op)"
@@ -571,6 +695,8 @@ pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> 
 /// not reached in practice because [`pinning_supported`] gates it off.
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_pin_call();
     Err(format!(
         "thread-to-core affinity is not implemented on this platform; \
          decode worker for cpu {cpu} runs unpinned (no-op)"
@@ -611,6 +737,8 @@ fn build_cpu_mask_multi(cpus: &[usize]) -> Option<Vec<libc::c_ulong>> {
 /// cgroup) is reported so the caller can log it, but never aborts inference.
 #[cfg(target_os = "linux")]
 pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_set_call();
     if cpus.is_empty() {
         return Err("cannot set CPU affinity to an empty CPU set".to_string());
     }
@@ -638,6 +766,8 @@ pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), St
 /// so this is a documented no-op that reports the reason for the caller to log.
 #[cfg(not(target_os = "linux"))]
 pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_set_call();
     let _ = cpus;
     Err("process-wide CPU affinity masking is only implemented on Linux (no-op)".to_string())
 }
@@ -666,40 +796,9 @@ pub fn explicit_decode_affinity_requested() -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-/// Order `pool` so that one CPU per physical core comes first, then the SMT
-/// siblings, and keep the first `count`.
-///
-/// This is the whole point of [`choose_budget_cpus`] on an SMT host: a budget of
-/// `count` CPUs taken as the `count` lowest indices lands on `count / 2`
-/// physical cores whenever the kernel numbers siblings adjacently (`0-1`,
-/// `2-3`, … on AMD EPYC and on every Intel host since Skylake-SP). Two threads
-/// sharing one core's front end do not add a core's worth of throughput, so the
-/// naive mask halves the machine and then burns twice the CPU proving it.
-///
-/// Leaders come from [`CoreTopology::leaders_within`], which only ever returns
-/// CPUs already in `pool`, so this reorders — it never widens the mask. When the
-/// topology is unknown every CPU is its own leader and the result is exactly the
-/// ascending prefix the old code produced.
-fn scatter_across_cores(
-    pool: &[usize],
-    count: usize,
-    cores: Option<&crate::core_topology::CoreTopology>,
-) -> Vec<usize> {
-    let leaders: Vec<usize> = match cores {
-        Some(cores) => cores.leaders_within(pool),
-        None => pool.to_vec(),
-    };
-    let leader_set: std::collections::BTreeSet<usize> = leaders.iter().copied().collect();
-    let mut ranked = leaders;
-    ranked.extend(pool.iter().copied().filter(|cpu| !leader_set.contains(cpu)));
-    ranked.truncate(count);
-    ranked.sort_unstable();
-    ranked
-}
-
 /// How many logical CPUs a NUMA node must hold to supply `count` distinct
-/// physical cores: `count × threads-per-core`, or `count` itself when the SMT
-/// map is unknown.
+/// physical cores for explicit spread placement: `count × threads-per-core`,
+/// or `count` itself when the SMT map is unknown.
 ///
 /// The node search in [`NumaTopology::cpus_for`] is sized in *logical* CPUs, so
 /// asking it for `count` would accept a node that has only `count / 2` cores and
@@ -715,15 +814,15 @@ fn smt_scaled_request(count: usize, cores: Option<&crate::core_topology::CoreTop
 }
 
 /// Pick `count` CPUs to confine the whole process to, preferring CPUs packed on
-/// a single NUMA node for memory-bandwidth and barrier locality and spread one
-/// per physical core for throughput.
+/// a single NUMA node for memory-bandwidth and barrier locality, then arranging
+/// them according to `placement`.
 ///
 /// Pure and platform-independent so it is unit-testable without touching the
 /// kernel. `topology` is expected to already be restricted to the process's
 /// allowed CPU set; `allowed` is the raw allowed list used both to keep the
 /// result within the process cpuset and to top up the selection when no single
 /// node covers `count`; `cores` is the SMT sibling map used to rank the survivors
-/// (see [`scatter_across_cores`]). The result never exceeds `count`, never
+/// (see [`order_pin_targets_for`]). The result never exceeds `count`, never
 /// contains a CPU outside `allowed` (when `allowed` is known), and is returned in
 /// ascending order. Returns `None` when `count` is zero or no usable CPU can be
 /// chosen.
@@ -732,6 +831,7 @@ fn choose_budget_cpus(
     allowed: Option<&[usize]>,
     count: usize,
     cores: Option<&crate::core_topology::CoreTopology>,
+    placement: CorePlacement,
 ) -> Option<Vec<usize>> {
     if count == 0 {
         return None;
@@ -740,10 +840,14 @@ fn choose_budget_cpus(
         allowed.map(|a| a.iter().copied().collect());
     let mut pool: Vec<usize> = Vec::new();
     if let Some(topology) = topology {
-        // Prefer a node that can supply `count` distinct *cores*; only if no node
-        // is that large does the search fall back to sizing in logical CPUs, so a
-        // budget that fits on one node still stays on one node.
-        let wide = smt_scaled_request(count, cores);
+        // Explicit spread needs enough logical CPUs to supply `count` distinct
+        // cores. Compact needs only `count` logical CPUs. In either case, fall
+        // back to the ordinary logical-CPU request so a budget that fits on one
+        // node stays on one node.
+        let wide = match placement {
+            CorePlacement::Compact => count,
+            CorePlacement::Spread => smt_scaled_request(count, cores),
+        };
         if wide > count
             && let Ok(Some(node_cpus)) = topology.cpus_for(&DecodeAffinity::Compact, wide)
             && node_cpus.len() >= wide
@@ -761,9 +865,9 @@ fn choose_budget_cpus(
     }
     pool.sort_unstable();
     pool.dedup();
-    // Top up *before* ranking: a second node's CPUs are new physical cores, and
-    // they must compete for leader slots against the first node's SMT siblings
-    // rather than be appended after a mask that is already full.
+    // Top up *before* ranking so every candidate participates in the selected
+    // policy. In particular, spread must let a second node's cores compete with
+    // the first node's SMT siblings instead of appending them after a full mask.
     if pool.len() < count
         && let Some(allowed) = allowed
     {
@@ -775,15 +879,18 @@ fn choose_budget_cpus(
         extra.sort_unstable();
         pool.extend(extra);
     }
-    let selected = scatter_across_cores(&pool, count, cores);
+    let mut selected = order_pin_targets_for(&pool, cores, placement);
+    selected.truncate(count);
+    selected.sort_unstable();
     (!selected.is_empty()).then_some(selected)
 }
 
 /// Resolve the `count` CPUs the process should be confined to on the running
 /// host: detect NUMA topology, intersect it with the process's allowed CPU set,
-/// and pick CPUs packed on a single node where possible (see
-/// [`choose_budget_cpus`]). Returns `None` when no usable CPU set can be
-/// determined (e.g. the allowed set is unknown and no topology is discoverable).
+/// and pick CPUs packed on a single node where possible using the selected
+/// [`CorePlacement`] (see [`choose_budget_cpus`]). Returns `None` when no usable
+/// CPU set can be determined (e.g. the allowed set is unknown and no topology
+/// is discoverable).
 pub fn select_budget_cpus(count: usize) -> Option<Vec<usize>> {
     let allowed = allowed_cpus();
     let restricted = NumaTopology::detect().map(|t| t.restrict_to_allowed(allowed.as_deref()));
@@ -792,6 +899,7 @@ pub fn select_budget_cpus(count: usize) -> Option<Vec<usize>> {
         allowed.as_deref(),
         count,
         crate::core_topology::host(),
+        CorePlacement::from_env(),
     )
 }
 
@@ -811,10 +919,12 @@ pub fn select_budget_cpus(count: usize) -> Option<Vec<usize>> {
 /// returns `false`. The caller is expected to choose the conservative,
 /// node-local behaviour on `false`.
 pub fn host_is_single_numa_node() -> bool {
-    single_numa_node_with_allowed(
-        host_numa_node_cpu_lists().as_ref(),
-        allowed_cpus().as_deref(),
-    )
+    let allowed = allowed_cpus();
+    host_is_single_numa_node_with_allowed(allowed.as_deref())
+}
+
+pub(crate) fn host_is_single_numa_node_with_allowed(allowed: Option<&[usize]>) -> bool {
+    single_numa_node_with_allowed(host_numa_node_cpu_lists().as_ref(), allowed)
 }
 
 /// Every NUMA node the host reports with its CPU list, *unfiltered* -- unlike
@@ -867,6 +977,8 @@ fn single_numa_node_with_allowed(
 /// never try to pin to a CPU outside the process's cpuset. `None` means "do not
 /// restrict" — we could not learn the mask, so we do not guess one.
 pub fn allowed_cpus() -> Option<Vec<usize>> {
+    #[cfg(test)]
+    record_capacity_read();
     #[cfg(target_os = "linux")]
     {
         linux_allowed_cpus()
@@ -883,14 +995,19 @@ pub fn allowed_cpus() -> Option<Vec<usize>> {
 
 /// What asking the **calling thread** which CPUs it may run on returned.
 ///
-/// Three states, not two, and deliberately not `Option<Vec<usize>>`: a caller
+/// Four states, not two, and deliberately not `Option<Vec<usize>>`: a caller
 /// that cannot tell "this target has no affinity query" from "the query ran and
-/// failed" from "here is the mask" will eventually collapse the first two into
-/// the third's success path. That collapse is exactly how a pool comes to report
-/// a placement nothing observed -- the defect behind #1792 -- so the type makes
-/// it unrepresentable rather than merely discouraged.
+/// failed" from "the query was intentionally skipped" from "here is the mask"
+/// will eventually collapse the first three into the fourth's success path.
+/// That collapse is exactly how a pool comes to report a placement nothing
+/// observed -- the defect behind #1792 -- so the type makes it unrepresentable
+/// rather than merely discouraged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObservedAffinity {
+    /// No query was made because the caller explicitly requested no affinity
+    /// operations. The worker's kernel mask can still be inspected externally
+    /// by TID without making the worker participate in affinity management.
+    NotQueried,
     /// The kernel reported this thread's effective CPU set.
     Cpus(Vec<usize>),
     /// The query is implemented for this target but failed at runtime (a
@@ -906,12 +1023,12 @@ impl ObservedAffinity {
     /// The observed CPU set, or `None` when the mask was never obtained.
     ///
     /// Callers that only want the happy path use this; callers that must *fail
-    /// closed* match on the variants, because `None` here is two very different
-    /// facts glued together.
+    /// closed* match on the variants, because `None` here is three very
+    /// different facts glued together.
     pub fn cpus(&self) -> Option<&[usize]> {
         match self {
             Self::Cpus(cpus) => Some(cpus),
-            Self::QueryFailed(_) | Self::Unsupported => None,
+            Self::NotQueried | Self::QueryFailed(_) | Self::Unsupported => None,
         }
     }
 
@@ -958,6 +1075,8 @@ pub const fn affinity_observation_supported() -> bool {
 /// Windows `GetThreadGroupAffinity(GetCurrentThread(), ..)` both scope to the
 /// caller, so this must be called *on* the thread being asked about.
 pub fn observe_current_thread_cpus() -> ObservedAffinity {
+    #[cfg(test)]
+    record_readback_call();
     #[cfg(all(target_os = "linux", not(miri)))]
     {
         match linux_thread_cpus() {
@@ -1172,8 +1291,8 @@ pub fn plan_decode_affinity(worker_count: usize) -> std::result::Result<DecodePl
 ///
 /// See [`order_pin_targets_for`] for the ordering itself. This wrapper exists
 /// so the production call sites read the policy from one place and cannot
-/// drift apart, and so the many tests that assert the spread ordering keep
-/// working against an explicit policy rather than an ambient one.
+/// drift apart. Tests name a policy through [`order_pin_targets_for`] instead
+/// of inheriting this process-wide selector.
 pub(crate) fn order_pin_targets(
     cpus: &[usize],
     cores: Option<&crate::core_topology::CoreTopology>,
@@ -1197,25 +1316,12 @@ pub(crate) fn order_pin_targets(
 /// policies and both before and after #1805's follow-up; the callers are
 /// cpusets, which cannot contain one.)
 ///
-/// # Who uses it, and a reversal
+/// # Who uses it
 ///
-/// Applied by the fork-join pool, where a worker handed a share of the
-/// arithmetic wants its own core's front end, **and now also by the persistent
-/// SPMD pool** ([`crate::decode_spmd`]'s shard builder).
-///
-/// The SPMD half is a reversal. This doc previously said the spinning pool was
-/// deliberately left compact, on the strength of the 0.133 ms vs 0.079 ms
-/// experiment recorded in [`crate::core_topology`]'s module docs. What that
-/// experiment did not separate is the *dispatcher*: the inline dispatcher
-/// spin-waits on the completion counters, and with every physical core taken by
-/// a worker it has nowhere to run but some worker's SMT sibling, making that
-/// worker the straggler the whole barrier waits for on every op. Pinning only
-/// the dispatcher and changing nothing else measured 2.1x (19.58 ms/token on a
-/// CPU inside the worker set against 8.77 ms on a free core), with 600
-/// involuntary context switches per token in the contended case. So the
-/// spinning pool is spread *and* [`crate::decode_spmd`] reserves a core for the
-/// dispatcher; see [`crate::core_topology`]'s module docs for what survives of
-/// the compact-mask result and what does not.
+/// Applied by the fork-join pool and by the persistent SPMD pool
+/// ([`crate::decode_spmd`]'s shard builder). Compact is the shared-host default;
+/// the dispatcher reservation remains in force. Spread preserves the measured
+/// dedicated-host layout, but only when explicitly selected.
 ///
 /// Still **not** applied to the `numa-split` sub-pools
 /// ([`crate::decode_numa`]), whose per-node reserve frees a logical CPU rather
@@ -1550,6 +1656,20 @@ mod windows_imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(miri)]
+    #[test]
+    fn miri_scheduler_validation_needs_no_topology_directory_walk() {
+        assert_eq!(
+            resolve_scheduler_affinity(None).unwrap(),
+            DecodeAffinity::Off
+        );
+        for invalid in ["typo", "node:not-a-number", "node:0"] {
+            let message = resolve_scheduler_affinity(Some(invalid)).unwrap_err();
+            assert!(message.contains(DECODE_AFFINITY_ENV), "{message}");
+            assert!(message.contains("accepted modes"), "{message}");
+        }
+    }
 
     /// The support flag must not claim less than the call delivers.
     ///
@@ -2176,6 +2296,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_allowed_cpu_scope_is_the_calling_threads_sched_getaffinity_mask() {
+        let allowed = allowed_cpus().expect("Linux must expose the calling thread's affinity");
+        let target = *allowed
+            .first()
+            .expect("a runnable Linux thread must have an allowed CPU");
+        std::thread::spawn(move || {
+            set_current_thread_affinity(&[target])
+                .expect("narrow the probe thread to one allowed CPU");
+            assert_eq!(
+                allowed_cpus(),
+                Some(vec![target]),
+                "allowed CPU discovery used a machine-wide online/present list instead of \
+                 this thread's sched_getaffinity mask"
+            );
+        })
+        .join()
+        .expect("affinity-scope probe thread");
+    }
+
+    #[test]
     fn auto_enable_pins_compact_on_multi_node_host() {
         // Env unset + >= 2 usable nodes + pinning supported -> auto `compact`.
         let topology = two_node_topology();
@@ -2272,7 +2413,14 @@ mod tests {
         let allowed: Vec<usize> = (0..16).collect();
         // Four CPUs fit inside node 0, so all four come from the smallest-index
         // node that covers the count -- packed on one node for locality.
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 4, None).unwrap();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            4,
+            None,
+            CorePlacement::Compact,
+        )
+        .unwrap();
         assert_eq!(chosen, vec![0, 1, 2, 3]);
     }
 
@@ -2282,7 +2430,14 @@ mod tests {
         let allowed: Vec<usize> = (0..16).collect();
         // Twelve exceeds either 8-CPU node, so the largest node fills first and
         // the rest are topped up from the allowed set, never exceeding count.
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 12, None).unwrap();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            12,
+            None,
+            CorePlacement::Compact,
+        )
+        .unwrap();
         assert_eq!(chosen.len(), 12);
         assert!(chosen.iter().all(|cpu| allowed.contains(cpu)));
     }
@@ -2293,21 +2448,38 @@ mod tests {
         // The process is only allowed on four CPUs; a larger request is clamped
         // to exactly those CPUs and never pins outside the cpuset.
         let allowed = vec![8, 9, 10, 11];
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 8, None).unwrap();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            8,
+            None,
+            CorePlacement::Compact,
+        )
+        .unwrap();
         assert_eq!(chosen, vec![8, 9, 10, 11]);
     }
 
     #[test]
     fn choose_budget_cpus_without_topology_uses_allowed_prefix() {
         let allowed = vec![2, 3, 5, 7, 11];
-        let chosen = choose_budget_cpus(None, Some(&allowed), 3, None).unwrap();
+        let chosen =
+            choose_budget_cpus(None, Some(&allowed), 3, None, CorePlacement::Compact).unwrap();
         assert_eq!(chosen, vec![2, 3, 5]);
     }
 
     #[test]
     fn choose_budget_cpus_returns_none_without_any_usable_cpu() {
-        assert!(choose_budget_cpus(None, None, 4, None).is_none());
-        assert!(choose_budget_cpus(Some(&two_node_topology()), Some(&[0]), 0, None).is_none());
+        assert!(choose_budget_cpus(None, None, 4, None, CorePlacement::Compact).is_none());
+        assert!(
+            choose_budget_cpus(
+                Some(&two_node_topology()),
+                Some(&[0]),
+                0,
+                None,
+                CorePlacement::Compact
+            )
+            .is_none()
+        );
     }
 
     /// 16 logical CPUs, siblings adjacent (`0-1`, `2-3`, …) — the layout of
@@ -2327,9 +2499,51 @@ mod tests {
         // With it, the same four-CPU budget covers four distinct cores. Measured
         // on a 16-core EPYC 9V74: 4 threads on 4 cores ran an 8B QKV prefill in
         // 33.5 ms against 54.3 ms for 4 threads on 2 cores, using less CPU time.
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 4, Some(&smt)).unwrap();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            4,
+            Some(&smt),
+            CorePlacement::Spread,
+        )
+        .unwrap();
         assert_eq!(chosen, vec![0, 2, 4, 6]);
         assert_eq!(smt.physical_cores_within(&chosen), 4);
+    }
+
+    #[test]
+    fn compact_budget_cpus_fill_siblings_before_claiming_more_cores() {
+        let topology = two_node_topology();
+        let allowed: Vec<usize> = (0..16).collect();
+        let smt = adjacent_smt_topology();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            4,
+            Some(&smt),
+            CorePlacement::Compact,
+        )
+        .unwrap();
+        assert_eq!(chosen, vec![0, 1, 2, 3]);
+        assert_eq!(
+            smt.physical_cores_within(&chosen),
+            2,
+            "the shared-host default must leave the other cores available"
+        );
+
+        let spread = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            4,
+            Some(&smt),
+            CorePlacement::Spread,
+        )
+        .unwrap();
+        assert_eq!(spread, vec![0, 2, 4, 6]);
+        assert_ne!(
+            chosen, spread,
+            "the explicit dedicated-host selector must change the process mask"
+        );
     }
 
     #[test]
@@ -2339,7 +2553,14 @@ mod tests {
         let smt = adjacent_smt_topology();
         // Node 0 holds 8 CPUs = 4 cores. A 6-CPU budget therefore takes node 0's
         // 4 leaders plus the 2 lowest siblings, and stays inside one node.
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 6, Some(&smt)).unwrap();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            6,
+            Some(&smt),
+            CorePlacement::Spread,
+        )
+        .unwrap();
         assert_eq!(chosen.len(), 6);
         assert!(chosen.iter().all(|cpu| (0..8).contains(cpu)));
         assert!([0, 2, 4, 6].iter().all(|cpu| chosen.contains(cpu)));
@@ -2352,9 +2573,23 @@ mod tests {
         // A taskset of one full core plus one lone sibling: ranking must never
         // invent CPU 4 just because it is a leader the process cannot use.
         let allowed = vec![2, 3, 5];
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 3, Some(&smt)).unwrap();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            3,
+            Some(&smt),
+            CorePlacement::Spread,
+        )
+        .unwrap();
         assert_eq!(chosen, vec![2, 3, 5]);
-        let two = choose_budget_cpus(Some(&topology), Some(&allowed), 2, Some(&smt)).unwrap();
+        let two = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            2,
+            Some(&smt),
+            CorePlacement::Spread,
+        )
+        .unwrap();
         assert_eq!(
             two,
             vec![2, 5],
@@ -2369,7 +2604,14 @@ mod tests {
         let smt = adjacent_smt_topology();
         // Ranking only reorders; asking for every CPU must still return every
         // CPU, so the full-width case cannot regress.
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 16, Some(&smt)).unwrap();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            16,
+            Some(&smt),
+            CorePlacement::Spread,
+        )
+        .unwrap();
         assert_eq!(chosen, allowed);
     }
 
@@ -2397,12 +2639,26 @@ mod tests {
         // Sized in threads, node 0 "covers" a budget of 4 -- but it is two cores.
         // Sized in cores the search needs 8 CPUs, which only node 1 has, so the
         // budget lands on four distinct cores of one node instead of two.
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 4, Some(&smt)).unwrap();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            4,
+            Some(&smt),
+            CorePlacement::Spread,
+        )
+        .unwrap();
         assert_eq!(chosen, vec![4, 6, 8, 10]);
         assert_eq!(smt.physical_cores_within(&chosen), 4);
         // Without the SMT map the old behaviour stands: the smallest-index node
         // that covers the thread count.
-        let flat = choose_budget_cpus(Some(&topology), Some(&allowed), 4, None).unwrap();
+        let flat = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            4,
+            None,
+            CorePlacement::Spread,
+        )
+        .unwrap();
         assert_eq!(flat, vec![0, 1, 2, 3]);
     }
 
@@ -2419,7 +2675,14 @@ mod tests {
         // Ranking *after* the top-up spends all eight slots on eight distinct
         // cores. Appending the top-up to an already-full mask (the old order)
         // returned `[0, 1, 6, 7, 8, 9, 10, 11]` -- four cores for eight threads.
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 8, Some(&smt)).unwrap();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            8,
+            Some(&smt),
+            CorePlacement::Spread,
+        )
+        .unwrap();
         assert_eq!(chosen, vec![0, 2, 4, 6, 8, 10, 12, 14]);
         assert_eq!(smt.physical_cores_within(&chosen), 8);
     }
@@ -2432,7 +2695,14 @@ mod tests {
         // Node 0 holds 8 CPUs = 4 cores. A budget of 8 could reach 8 cores by
         // spanning both nodes, but NUMA locality wins: the whole budget stays on
         // node 0 and simply uses both threads of each of its four cores.
-        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 8, Some(&smt)).unwrap();
+        let chosen = choose_budget_cpus(
+            Some(&topology),
+            Some(&allowed),
+            8,
+            Some(&smt),
+            CorePlacement::Spread,
+        )
+        .unwrap();
         assert_eq!(chosen, (0..8).collect::<Vec<_>>());
     }
 
@@ -2452,22 +2722,21 @@ mod tests {
             order_pin_targets_for(&node, None, CorePlacement::Spread),
             node
         );
-        // ...and the default really is the policy this asserts, stated
-        // separately so a changed default fails with its own name rather than
-        // looking like an ordering bug.
-        assert_eq!(CorePlacement::default(), CorePlacement::Spread);
+        // ...and spread is not the default. A dedicated-host layout must be
+        // selected explicitly rather than inherited from an unset variable.
+        assert_eq!(CorePlacement::default(), CorePlacement::Compact);
     }
 
     #[test]
     fn placement_parse_accepts_exactly_the_documented_modes() {
-        assert_eq!(CorePlacement::parse(None).unwrap(), CorePlacement::Spread);
+        assert_eq!(CorePlacement::parse(None).unwrap(), CorePlacement::Compact);
         assert_eq!(
             CorePlacement::parse(Some("")).unwrap(),
-            CorePlacement::Spread
+            CorePlacement::Compact
         );
         assert_eq!(
             CorePlacement::parse(Some("  ")).unwrap(),
-            CorePlacement::Spread
+            CorePlacement::Compact
         );
         assert_eq!(
             CorePlacement::parse(Some(" spread ")).unwrap(),
@@ -2503,26 +2772,25 @@ mod tests {
     }
 
     #[test]
-    fn an_unparseable_placement_falls_back_without_going_silent() {
-        // The fallback path, which `from_env` alone cannot exercise: it caches
-        // process-wide, so whichever value the first caller in the binary sees
-        // is the only one any test could ever observe.
+    fn invalid_scheduler_selectors_are_rejected_before_affinity_is_applied() {
         for bad in ["Spread", "one-per-core", "1"] {
-            assert_eq!(
-                CorePlacement::from_value(Some(bad)),
-                CorePlacement::default(),
-                "an unrecognized placement must fall back to the default rather than \
-                 selecting something arbitrary"
+            let message = CorePlacement::parse(Some(bad)).unwrap_err();
+            assert!(message.contains(DECODE_PLACEMENT_ENV), "{message}");
+            assert!(message.contains(bad), "{message}");
+            assert!(
+                message.contains("compact") && message.contains("spread"),
+                "{message}"
             );
         }
-        // ...and the accepted values are not merely tolerated by the same path.
-        assert_eq!(
-            CorePlacement::from_value(Some("compact")),
-            CorePlacement::Compact,
-            "the fallback path swallowed a value it was supposed to honor, which would \
-             make the knob inert while looking like it parsed"
-        );
-        assert_eq!(CorePlacement::from_value(None), CorePlacement::default());
+
+        let message = DecodeAffinity::parse(Some("sideways")).unwrap_err();
+        assert!(message.contains(DECODE_AFFINITY_ENV), "{message}");
+        for mode in ["off", "compact", "node:<index>", "numa-split"] {
+            assert!(
+                message.contains(mode),
+                "the invalid-affinity error omitted accepted mode `{mode}`: {message}"
+            );
+        }
     }
 
     #[test]
