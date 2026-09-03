@@ -77,7 +77,7 @@ plugin EPs (via C ABI bridge) handle them.
 | DequantizeLinear | 10 | INT4/INT8 weight dequantization. |
 | QuantizeLinear | 10 | Activation quantization. |
 | QLinearMatMul | 10 | Quantized matmul. |
-| Einsum | 12 | Shared validated planning contract. Native CPU executes canonical view/diagonal, reduction/elementwise, and binary GEMM/BMM plan classes; native CUDA lowers capture-safe GEMM/BMM plans and zero-copy permutation/diagonal views (`f32`/`f16`). BFloat16 is outside the canonical opset-12 type constraint; general N-way contractions decline with a structured reason. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md) and [CUDA_COVERAGE.md](CUDA_COVERAGE.md). |
+| Einsum | 12 | Shared validated planning contract, including deterministic ordered contraction-tree candidates for coupled 2/3-input expressions. Native CPU executes canonical view/diagonal, reduction/elementwise, and flat binary GEMM/BMM plan classes; native CUDA lowers capture-safe flat GEMM/BMM plans and zero-copy permutation/diagonal views (`f32`/`f16`). Both EPs defensively decline the new tree class until its temporary schedule is implemented. BFloat16 is outside the canonical opset-12 type constraint; reduced ellipses, >3-input coupled trees, and reduced axes spanning three operands decline with structured reasons. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md) and [CUDA_COVERAGE.md](CUDA_COVERAGE.md). |
 | Tile | 6 | Repeat for broadcasting. |
 | Range | 11 | Position IDs generation. |
 | CumSum | 11 | Position computation. |

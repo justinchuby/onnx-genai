@@ -465,13 +465,38 @@ impl KernelFactory for EinsumFactory {
                 "Einsum: canonical planning failed for `{equation}`: {error}"
             ))
         })?;
-        if let EinsumClassification::Unsupported(reason) = plan.classification() {
-            return Err(EpError::KernelFailed(format!(
-                "Einsum equation `{}` is valid but unsupported by the native CPU EP: {reason}. \
-                 Supported native classes are view/diagonal, reduction or elementwise product, \
-                 and binary GEMM/BMM-compatible contractions.",
-                plan.equation()
-            )));
+        match plan.classification() {
+            EinsumClassification::ContractionTree(tree) => {
+                return Err(EpError::KernelFailed(format!(
+                    "Einsum equation `{}` has a canonical {}-input contraction tree with {} \
+                     ordered candidate(s), but native CPU tree execution is not implemented. \
+                     Supported native classes remain view/diagonal, reduction or elementwise \
+                     product, and one-node binary GEMM/BMM contractions.",
+                    plan.equation(),
+                    tree.arity(),
+                    tree.candidates().len()
+                )));
+            }
+            EinsumClassification::Unsupported(reason) => {
+                return Err(EpError::KernelFailed(format!(
+                    "Einsum equation `{}` is valid but unsupported by the native CPU EP: {reason}. \
+                     Supported native classes are view/diagonal, reduction or elementwise product, \
+                     and binary GEMM/BMM-compatible contractions.",
+                    plan.equation()
+                )));
+            }
+            EinsumClassification::ViewOnlyPermutation(_)
+            | EinsumClassification::DiagonalView(_)
+            | EinsumClassification::ReductionOrElementwise(_)
+            | EinsumClassification::Gemm(_) => {}
+            _ => {
+                return Err(EpError::KernelFailed(format!(
+                    "Einsum equation `{}` uses a newer canonical classification that this native \
+                     CPU factory does not recognize; update the claim and execution paths before \
+                     constructing the kernel",
+                    plan.equation()
+                )));
+            }
         }
         let mode = execution_mode()?;
         let flops = match plan.classification() {
@@ -572,13 +597,29 @@ pub fn unsupported_reason(
                 ));
             }
             match plan.classification() {
+                EinsumClassification::ContractionTree(tree) => Some(format!(
+                    "Einsum `{}` has a canonical {}-input contraction tree with {} ordered \
+                     candidate(s), but the native CPU EP has not implemented temporary scheduling \
+                     and multi-node execution; use another provider until that handoff is added",
+                    plan.equation(),
+                    tree.arity(),
+                    tree.candidates().len()
+                )),
                 EinsumClassification::Unsupported(reason) => Some(format!(
                     "Einsum `{}` is valid but not a native CPU lowering: {reason}. Supported \
                      native classes are view/diagonal, reduction or elementwise product, and \
                      binary GEMM/BMM-compatible contractions.",
                     plan.equation()
                 )),
-                _ => None,
+                EinsumClassification::ViewOnlyPermutation(_)
+                | EinsumClassification::DiagonalView(_)
+                | EinsumClassification::ReductionOrElementwise(_)
+                | EinsumClassification::Gemm(_) => None,
+                _ => Some(format!(
+                    "Einsum `{}` uses a newer canonical classification that this native CPU EP \
+                     does not recognize; update the CPU EP before assigning this node",
+                    plan.equation()
+                )),
             }
         }
         Err(error) => Some(format!(
@@ -700,9 +741,22 @@ impl EinsumKernel {
                 self.execute_oracle(inputs, outputs)?;
                 Ok(EinsumRoute::Oracle)
             }
+            EinsumClassification::ContractionTree(tree) => Err(EpError::KernelFailed(format!(
+                "Einsum equation `{}` reached CPU execution with an unimplemented {}-input \
+                 contraction tree ({} ordered candidates); EP placement must decline it until \
+                 temporary scheduling and binary-step execution are implemented",
+                self.plan.equation(),
+                tree.arity(),
+                tree.candidates().len()
+            ))),
             EinsumClassification::Unsupported(reason) => Err(EpError::KernelFailed(format!(
                 "Einsum equation `{}` reached execution with an unsupported canonical plan: \
                  {reason}",
+                self.plan.equation()
+            ))),
+            _ => Err(EpError::KernelFailed(format!(
+                "Einsum equation `{}` reached CPU execution with a newer unrecognized canonical \
+                 classification; update the CPU EP and its claim gate before executing it",
                 self.plan.equation()
             ))),
         }
@@ -2604,6 +2658,20 @@ mod tests {
         );
         assert!(!support.is_supported());
         assert!(support.reason().unwrap().contains("3-input contraction"));
+
+        let mut mixed = Node::new(NodeId(1), "Einsum", vec![], vec![]);
+        mixed
+            .attributes
+            .insert("equation".into(), Attribute::String(b"aik,kj->ij".to_vec()));
+        let mixed_shapes = [static_shape([7, 2, 3]), static_shape([3, 4])];
+        let mixed_dtypes = [DataType::Float16; 2];
+        let reason = unsupported_reason(&mixed, &mixed_shapes, &mixed_dtypes).unwrap();
+        assert!(reason.contains("2-input contraction tree"));
+        let error = EinsumFactory::default()
+            .create(&mixed, &[vec![7, 2, 3], vec![3, 4]])
+            .err()
+            .expect("direct factory construction must also decline");
+        assert!(error.to_string().contains("2-input contraction tree"));
     }
 
     #[test]

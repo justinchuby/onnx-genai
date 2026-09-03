@@ -65,12 +65,18 @@ pub use device::{DeviceId, DeviceType};
 pub use domain::{AI_ONNX_DOMAIN, is_default_domain, normalize_domain};
 pub use dtype::DataType;
 pub use einsum::{
-    EinsumAxis, EinsumAxisRef, EinsumClassification, EinsumConcreteGemmGeometry,
-    EinsumContractionPlan, EinsumDimension, EinsumDimensionRule, EinsumDimensionValue,
-    EinsumEquationSide, EinsumGemmGeometry, EinsumInput, EinsumLabel, EinsumLogicalAxis,
-    EinsumOperandAxis, EinsumOperandPlan, EinsumOverflowTarget, EinsumPermutationPlan, EinsumPlan,
-    EinsumPlanError, EinsumPlanErrorKind, EinsumReductionPlan, EinsumResolveError, EinsumShapePlan,
-    EinsumUnsupportedReason,
+    EinsumAxis, EinsumAxisRef, EinsumBinaryContractionPlan, EinsumClassification,
+    EinsumConcreteContractionTreeCandidate, EinsumConcreteContractionTreePlan,
+    EinsumConcreteGemmGeometry, EinsumContractionCost, EinsumContractionPlan,
+    EinsumContractionTreeCandidate, EinsumContractionTreeCandidateId,
+    EinsumContractionTreeCandidatePlan, EinsumContractionTreeCandidateUnsupportedReason,
+    EinsumContractionTreePlan, EinsumContractionTreeStep, EinsumCostBound, EinsumCostMetric,
+    EinsumDimension, EinsumDimensionRule, EinsumDimensionValue, EinsumEquationSide,
+    EinsumGemmGeometry, EinsumInput, EinsumLabel, EinsumLogicalAxis, EinsumOperandAxis,
+    EinsumOperandPlan, EinsumOverflowTarget, EinsumPermutationPlan, EinsumPlan, EinsumPlanError,
+    EinsumPlanErrorKind, EinsumReductionPlan, EinsumResolveError, EinsumResolvedContractionCost,
+    EinsumShapePlan, EinsumSupportedContractionTreeCandidate, EinsumTemporaryValuePlan,
+    EinsumUnaryReductionPlan, EinsumUnsupportedReason, EinsumValueId,
 };
 pub use error::{GraphError, IrError, Result};
 pub use graph::{Graph, ModelFunction, ModelFunctionKey};

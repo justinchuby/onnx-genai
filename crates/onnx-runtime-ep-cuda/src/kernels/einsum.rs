@@ -1,6 +1,6 @@
 //! Capture-safe CUDA execution for canonical ONNX `Einsum` plans.
 //!
-//! The equation is parsed exactly once by [`EinsumPlan`] when the
+//! The equation is parsed exactly once by [`EinsumShapePlan`] when the
 //! shape-specialized kernel is created. Execution consumes only the plan's axis
 //! mappings. Binary contractions whose contiguous storage can be represented by
 //! cuBLASLt layouts run without materialized operand transposes; view-only
@@ -18,7 +18,7 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{
     DataType, EinsumClassification, EinsumContractionPlan, EinsumInput, EinsumOperandPlan,
-    EinsumPermutationPlan, EinsumPlan, Node, Shape, TensorLayout,
+    EinsumPermutationPlan, EinsumPlan, EinsumShapePlan, Node, Shape, TensorLayout,
 };
 
 use super::movement::{PersistentMetadata, launch_persistent_metadata};
@@ -222,7 +222,7 @@ fn storage_order(
 }
 
 fn contraction_structure_reason(
-    plan: &EinsumPlan,
+    plan: &EinsumShapePlan,
     contraction: &EinsumContractionPlan,
 ) -> Option<String> {
     if contraction
@@ -318,7 +318,7 @@ fn unsupported_reason_impl(
             None
         }
         EinsumClassification::Gemm(contraction) => {
-            if let Some(reason) = contraction_structure_reason(&plan, contraction) {
+            if let Some(reason) = contraction_structure_reason(plan.shape_plan(), contraction) {
                 return Some(reason);
             }
             if layouts
@@ -336,17 +336,34 @@ fn unsupported_reason_impl(
                 .iter()
                 .map(|shape| onnx_runtime_ir::as_static_shape(shape))
                 .collect::<Option<Vec<_>>>()
-                && let Err(error) = concrete_contraction_layout(&plan, contraction, &concrete)
+                && let Err(error) = concrete_contraction_layout(
+                    plan.shape_plan(),
+                    contraction,
+                    &concrete,
+                    plan.dtype(),
+                )
             {
                 return Some(error.to_string());
             }
             None
         }
+        EinsumClassification::ContractionTree(tree) => Some(format!(
+            "cuda_ep Einsum `{equation}`: canonical {}-input contraction tree has {} ordered \
+             candidate(s), but CUDA temporary scheduling and multi-node capture execution are not \
+             implemented",
+            tree.arity(),
+            tree.candidates().len()
+        )),
         EinsumClassification::ReductionOrElementwise(_) => Some(format!(
             "cuda_ep Einsum `{equation}`: uncoupled reductions/elementwise products are not yet lowered; use native Reduce*/Mul nodes or CPU fallback"
         )),
         EinsumClassification::Unsupported(reason) => Some(format!(
             "cuda_ep Einsum `{equation}`: canonical planner classified this contraction as unsupported: {reason}"
+        )),
+        _ => Some(format!(
+            "cuda_ep Einsum `{equation}`: canonical planner returned a newer classification that \
+             this CUDA EP does not recognize; update claim, execution, and capture paths before \
+             assigning the node"
         )),
     }
 }
@@ -374,17 +391,40 @@ pub struct EinsumFactory {
 impl KernelFactory for EinsumFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let equation = equation(node)?.to_owned();
-        // Kernel-cache entries are shape-specialized. Build the immutable
-        // structural plan once here; Float32 supplies a supported placeholder
-        // type because the factory API carries shapes but not value dtypes.
-        // Runtime execution separately validates the real common dtype.
-        let inputs = input_shapes
-            .iter()
-            .map(|shape| EinsumInput::new(DataType::Float32, shape.as_slice()))
-            .collect::<Vec<_>>();
-        let plan = EinsumPlan::build(&equation, &inputs).map_err(|error| {
+        let input_shape_refs = input_shapes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let plan = EinsumShapePlan::build(&equation, &input_shape_refs).map_err(|error| {
             EpError::KernelFailed(format!("cuda_ep Einsum `{equation}`: {error}"))
         })?;
+        match plan.classification() {
+            EinsumClassification::ViewOnlyPermutation(_)
+            | EinsumClassification::DiagonalView(_)
+            | EinsumClassification::Gemm(_) => {}
+            EinsumClassification::ContractionTree(tree) => {
+                return Err(not_implemented(format!(
+                    "cuda_ep Einsum `{equation}` {}-input contraction tree with {} ordered \
+                     candidate(s); implement temporary scheduling and multi-node capture before \
+                     constructing this kernel",
+                    tree.arity(),
+                    tree.candidates().len()
+                )));
+            }
+            EinsumClassification::ReductionOrElementwise(_) => {
+                return Err(not_implemented(format!(
+                    "cuda_ep Einsum `{equation}` reduction/elementwise canonical plan"
+                )));
+            }
+            EinsumClassification::Unsupported(reason) => {
+                return Err(not_implemented(format!(
+                    "cuda_ep Einsum `{equation}` canonical plan: {reason}"
+                )));
+            }
+            _ => {
+                return Err(not_implemented(format!(
+                    "cuda_ep Einsum `{equation}` newer unrecognized canonical classification; \
+                     update claim, factory, execution, and capture paths before constructing it"
+                )));
+            }
+        }
         Ok(Box::new(EinsumKernel {
             runtime: self.runtime.clone(),
             input_shapes: input_shapes.to_vec(),
@@ -456,9 +496,10 @@ fn operand_batch_stride(
 }
 
 fn concrete_contraction_layout(
-    plan: &EinsumPlan,
+    plan: &EinsumShapePlan,
     contraction: &EinsumContractionPlan,
     input_shapes: &[Vec<usize>],
+    dtype: DataType,
 ) -> Result<ContractionLayout> {
     let [left_shape, right_shape] = input_shapes else {
         return Err(EpError::KernelFailed(format!(
@@ -519,7 +560,7 @@ fn concrete_contraction_layout(
         right_matrix,
     )?;
     Ok(ContractionLayout {
-        dtype: plan.dtype(),
+        dtype,
         output_shape,
         batch_shape: geometry.batch_shape().to_vec(),
         m: geometry.m(),
@@ -623,7 +664,7 @@ impl ViewMaterialization {
 pub struct EinsumKernel {
     runtime: Arc<CudaRuntime>,
     input_shapes: Vec<Vec<usize>>,
-    plan: EinsumPlan,
+    plan: EinsumShapePlan,
     execution: Mutex<Option<CachedExecution>>,
     view_metadata: Mutex<PersistentMetadata>,
     view_materialization: Mutex<Option<ViewMaterialization>>,
@@ -774,8 +815,8 @@ impl EinsumKernel {
         if let Some(reason) = contraction_structure_reason(&self.plan, contraction) {
             return Err(not_implemented(reason));
         }
-        let mut layout = concrete_contraction_layout(&self.plan, contraction, &self.input_shapes)?;
-        layout.dtype = dtype;
+        let layout =
+            concrete_contraction_layout(&self.plan, contraction, &self.input_shapes, dtype)?;
         let output_numel = checked_product(&layout.output_shape, "output")?;
         let kind = if output_numel == 0 {
             ExecutionKind::NoOp
@@ -1120,12 +1161,24 @@ impl Kernel for EinsumKernel {
             EinsumClassification::ViewOnlyPermutation(_)
             | EinsumClassification::DiagonalView(_) => self.run_view(inputs, outputs),
             EinsumClassification::Gemm(_) => self.run_contraction(inputs, outputs),
+            EinsumClassification::ContractionTree(tree) => Err(not_implemented(format!(
+                "Einsum `{}` {}-input contraction tree execution with {} ordered candidates; \
+                 CUDA must implement the planner's temporary schedule before executing this class",
+                self.plan.equation(),
+                tree.arity(),
+                tree.candidates().len()
+            ))),
             EinsumClassification::ReductionOrElementwise(_) => Err(not_implemented(format!(
                 "Einsum `{}` reduction/elementwise canonical plan",
                 self.plan.equation()
             ))),
             EinsumClassification::Unsupported(reason) => Err(not_implemented(format!(
                 "Einsum `{}` canonical plan: {reason}",
+                self.plan.equation()
+            ))),
+            _ => Err(not_implemented(format!(
+                "Einsum `{}` newer unrecognized canonical classification; update CUDA claim, \
+                 execution, and capture paths before running it",
                 self.plan.equation()
             ))),
         }
@@ -1237,12 +1290,18 @@ impl Kernel for EinsumKernel {
                     self.plan.equation()
                 )),
             },
+            EinsumClassification::ContractionTree(_) => CaptureSupport::unsupported(
+                "CUDA Einsum contraction-tree temporary scheduling and multi-node capture are not implemented",
+            ),
             EinsumClassification::ReductionOrElementwise(_) => CaptureSupport::unsupported(
                 "CUDA Einsum reduction/elementwise lowering is not implemented",
             ),
             EinsumClassification::Unsupported(reason) => {
                 CaptureSupport::unsupported(format!("unsupported canonical Einsum plan: {reason}"))
             }
+            _ => CaptureSupport::unsupported(
+                "CUDA Einsum received a newer unrecognized canonical classification",
+            ),
         }
     }
 }
@@ -1257,6 +1316,33 @@ mod tests {
             .map(|shape| EinsumInput::new(DataType::Float32, shape))
             .collect::<Vec<_>>();
         EinsumPlan::build(equation, &inputs).unwrap()
+    }
+
+    #[test]
+    fn multilinear_tree_is_declined_before_cuda_execution() {
+        let mut node = Node::new(onnx_runtime_ir::NodeId(0), "Einsum", vec![], vec![]);
+        node.attributes.insert(
+            "equation".into(),
+            onnx_runtime_ir::Attribute::String(b"i,ij,j->".to_vec()),
+        );
+        let shapes = [
+            onnx_runtime_ir::static_shape([2]),
+            onnx_runtime_ir::static_shape([2, 8]),
+            onnx_runtime_ir::static_shape([8]),
+        ];
+        let reason = unsupported_reason_impl(
+            &node,
+            &shapes,
+            &[DataType::Float32; 3],
+            &[
+                TensorLayout::contiguous(),
+                TensorLayout::contiguous(),
+                TensorLayout::contiguous(),
+            ],
+        )
+        .unwrap();
+        assert!(reason.contains("3-input contraction tree"));
+        assert!(reason.contains("temporary scheduling"));
     }
 
     #[test]
@@ -1275,7 +1361,13 @@ mod tests {
                 .iter()
                 .map(|shape| shape.to_vec())
                 .collect::<Vec<_>>();
-            let layout = concrete_contraction_layout(&plan, contraction, &concrete).unwrap();
+            let layout = concrete_contraction_layout(
+                plan.shape_plan(),
+                contraction,
+                &concrete,
+                DataType::Float32,
+            )
+            .unwrap();
             assert_eq!(
                 layout.left_order == StorageOrder::Transposed,
                 left,
@@ -1295,9 +1387,13 @@ mod tests {
         let EinsumClassification::Gemm(contraction) = broadcast.classification() else {
             panic!("expected GEMM");
         };
-        let layout =
-            concrete_contraction_layout(&broadcast, contraction, &[vec![2, 3], vec![6, 5, 3, 4]])
-                .unwrap();
+        let layout = concrete_contraction_layout(
+            broadcast.shape_plan(),
+            contraction,
+            &[vec![2, 3], vec![6, 5, 3, 4]],
+            DataType::Float32,
+        )
+        .unwrap();
         assert_eq!(layout.left_batch_stride, 0);
         assert_eq!(layout.right_batch_stride, 12);
 
@@ -1306,9 +1402,10 @@ mod tests {
             panic!("expected GEMM");
         };
         let error = concrete_contraction_layout(
-            &partial,
+            partial.shape_plan(),
             contraction,
             &[vec![2, 1, 3, 4], vec![2, 5, 4, 6]],
+            DataType::Float32,
         )
         .unwrap_err();
         assert!(error.to_string().contains("partial multi-axis batch"));

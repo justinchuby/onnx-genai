@@ -13,6 +13,18 @@ use std::fmt;
 
 use crate::{DataType, Dim};
 
+mod tree;
+
+pub use tree::{
+    EinsumBinaryContractionPlan, EinsumConcreteContractionTreeCandidate,
+    EinsumConcreteContractionTreePlan, EinsumContractionCost, EinsumContractionTreeCandidate,
+    EinsumContractionTreeCandidateId, EinsumContractionTreeCandidatePlan,
+    EinsumContractionTreeCandidateUnsupportedReason, EinsumContractionTreePlan,
+    EinsumContractionTreeStep, EinsumCostBound, EinsumCostMetric, EinsumResolvedContractionCost,
+    EinsumSupportedContractionTreeCandidate, EinsumTemporaryValuePlan, EinsumUnaryReductionPlan,
+    EinsumValueId,
+};
+
 /// A dimension value that can expose a statically known extent to the planner.
 ///
 /// Dynamic/symbolic dimensions return `None`. The plan preserves their runtime
@@ -489,6 +501,7 @@ impl EinsumContractionPlan {
 /// Why a legal einsum is not one of the native lowering classes implemented by
 /// the shared foundation.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EinsumUnsupportedReason {
     /// A reduced label couples three or more operands.
     NaryContraction {
@@ -508,6 +521,22 @@ pub enum EinsumUnsupportedReason {
     /// axes, requiring a general broadcast contraction.
     ReducedEllipsis {
         /// Reduced ellipsis axes.
+        axes: Vec<EinsumAxis>,
+    },
+    /// A coupled contraction has more operands than the initial tree planner
+    /// can enumerate.
+    InputCountExceedsContractionTreeLimit {
+        /// Number of operands in the equation.
+        input_count: usize,
+        /// Maximum supported coupled-contraction arity.
+        maximum: usize,
+    },
+    /// One reduced axis occurs in more than two distinct operands and therefore
+    /// requires a Hadamard/outer intermediate rather than pairwise elimination.
+    ReducedAxisSpansTooManyOperands {
+        /// Maximum distinct operand count supported per reduced axis.
+        maximum: usize,
+        /// Rejected axes.
         axes: Vec<EinsumAxis>,
     },
 }
@@ -536,12 +565,25 @@ impl fmt::Display for EinsumUnsupportedReason {
                 "broadcast {} is reduced instead of retained as batch output",
                 display_axes(axes)
             ),
+            Self::InputCountExceedsContractionTreeLimit {
+                input_count,
+                maximum,
+            } => write!(
+                f,
+                "{input_count}-input coupled contraction exceeds the initial ordered-tree limit of {maximum} operands"
+            ),
+            Self::ReducedAxisSpansTooManyOperands { maximum, axes } => write!(
+                f,
+                "{} occurs in more than {maximum} operands and would require a Hadamard/outer intermediate before reduction",
+                display_axes(axes)
+            ),
         }
     }
 }
 
 /// Structural semantics of a validated equation.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EinsumClassification {
     /// One-input permutation/identity with no arithmetic.
     ViewOnlyPermutation(EinsumPermutationPlan),
@@ -551,6 +593,9 @@ pub enum EinsumClassification {
     ReductionOrElementwise(EinsumReductionPlan),
     /// Binary GEMM/BMM-compatible contraction.
     Gemm(EinsumContractionPlan),
+    /// Ordered binary-tree candidates for coupled two- or three-input
+    /// contractions that need leaf-local reductions and/or two binary nodes.
+    ContractionTree(EinsumContractionTreePlan),
     /// Legal ONNX semantics, but not one of the native lowering classes above.
     Unsupported(EinsumUnsupportedReason),
 }
@@ -605,6 +650,7 @@ impl fmt::Display for EinsumEquationSide {
 
 /// Structured cause of a planning failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EinsumPlanErrorKind {
     /// Einsum requires at least one input.
     NoInputs,
@@ -751,6 +797,11 @@ pub enum EinsumPlanErrorKind {
     GeometryOverflow {
         /// Product that overflowed.
         target: EinsumOverflowTarget,
+    },
+    /// Runtime tree re-scoring requires a non-zero fixed-width element size.
+    InvalidElementSize {
+        /// Rejected byte width.
+        element_size: usize,
     },
 }
 
@@ -920,6 +971,10 @@ impl fmt::Display for EinsumPlanError {
             EinsumPlanErrorKind::GeometryOverflow { target } => {
                 write!(f, "{target} overflows `usize`; use smaller dimensions")
             }
+            EinsumPlanErrorKind::InvalidElementSize { element_size } => write!(
+                f,
+                "runtime contraction-tree re-score received element size {element_size}; provide a non-zero fixed-width dtype byte size"
+            ),
         }
     }
 }
@@ -1058,6 +1113,18 @@ impl EinsumPlan {
         input_shapes: &[&[usize]],
     ) -> Result<Option<EinsumConcreteGemmGeometry>, EinsumPlanError> {
         self.shape.resolve_concrete_gemm_geometry(input_shapes)
+    }
+
+    /// Re-score every ordered contraction-tree candidate for concrete runtime
+    /// shapes. Intermediate values are stored in the Einsum node's common
+    /// dtype; accumulation precision inside each unary/binary step remains an
+    /// execution-provider policy.
+    pub fn resolve_concrete_contraction_tree(
+        &self,
+        input_shapes: &[&[usize]],
+    ) -> Result<Option<EinsumConcreteContractionTreePlan>, EinsumPlanError> {
+        self.shape
+            .resolve_concrete_contraction_tree(input_shapes, self.dtype.byte_size())
     }
 }
 
@@ -1323,6 +1390,34 @@ impl EinsumShapePlan {
             )?,
             batch_shape,
         }))
+    }
+
+    /// Re-score every ordered contraction-tree candidate for concrete runtime
+    /// shapes and a caller-supplied common element width.
+    ///
+    /// Shape-only consumers must pass the real runtime dtype's fixed byte
+    /// width; this API never fabricates one.
+    pub fn resolve_concrete_contraction_tree(
+        &self,
+        input_shapes: &[&[usize]],
+        element_size: usize,
+    ) -> Result<Option<EinsumConcreteContractionTreePlan>, EinsumPlanError> {
+        let EinsumClassification::ContractionTree(tree) = &self.classification else {
+            return Ok(None);
+        };
+        if element_size == 0 {
+            return Err(EinsumPlanError::new(
+                &self.equation,
+                EinsumPlanErrorKind::InvalidElementSize { element_size },
+            ));
+        }
+        let dimensions = self.resolve_concrete_axes(input_shapes)?;
+        Ok(Some(tree.resolve(
+            &dimensions,
+            input_shapes,
+            &self.operands,
+            element_size,
+        )))
     }
 
     fn resolve_concrete_axes(
@@ -2110,39 +2205,78 @@ fn classify(
         .filter(|axis| distinct_input_count(*axis) > 1)
         .collect();
 
-    if operands.len() > 2 && !cross_reduction_axes.is_empty() {
-        return Ok(EinsumClassification::Unsupported(
-            EinsumUnsupportedReason::NaryContraction {
-                input_count: operands.len(),
-                axes: cross_reduction_axes,
+    if cross_reduction_axes.is_empty() {
+        let mut iteration_axes = output_axes.to_vec();
+        iteration_axes.extend_from_slice(reduction_axes);
+        let operand_axis_mappings = operands
+            .iter()
+            .map(|operand| {
+                operand
+                    .unique_axes
+                    .iter()
+                    .map(|axis| {
+                        iteration_axes
+                            .iter()
+                            .position(|candidate| *candidate == axis.axis)
+                            .expect("every logical operand axis is retained or reduced")
+                    })
+                    .collect()
+            })
+            .collect();
+        return Ok(EinsumClassification::ReductionOrElementwise(
+            EinsumReductionPlan {
+                iteration_axes,
+                output_rank: output_axes.len(),
+                operand_axis_mappings,
             },
         ));
     }
 
-    if operands.len() == 2 && !cross_reduction_axes.is_empty() {
-        let reduced_ellipsis: Vec<_> = cross_reduction_axes
-            .iter()
-            .copied()
-            .filter(|axis| matches!(axis, EinsumAxis::Ellipsis(_)))
-            .collect();
-        if !reduced_ellipsis.is_empty() {
-            return Ok(EinsumClassification::Unsupported(
-                EinsumUnsupportedReason::ReducedEllipsis {
-                    axes: reduced_ellipsis,
-                },
-            ));
-        }
+    let reduced_ellipsis: Vec<_> = cross_reduction_axes
+        .iter()
+        .copied()
+        .filter(|axis| matches!(axis, EinsumAxis::Ellipsis(_)))
+        .collect();
+    if !reduced_ellipsis.is_empty() {
+        return Ok(EinsumClassification::Unsupported(
+            EinsumUnsupportedReason::ReducedEllipsis {
+                axes: reduced_ellipsis,
+            },
+        ));
+    }
+
+    if operands.len() > 3 {
+        return Ok(EinsumClassification::Unsupported(
+            EinsumUnsupportedReason::InputCountExceedsContractionTreeLimit {
+                input_count: operands.len(),
+                maximum: 3,
+            },
+        ));
+    }
+
+    let too_wide_axes: Vec<_> = cross_reduction_axes
+        .iter()
+        .copied()
+        .filter(|axis| distinct_input_count(*axis) > 2)
+        .collect();
+    if !too_wide_axes.is_empty() {
+        return Ok(EinsumClassification::Unsupported(
+            EinsumUnsupportedReason::ReducedAxisSpansTooManyOperands {
+                maximum: 2,
+                axes: too_wide_axes,
+            },
+        ));
+    }
+
+    if operands.len() == 2 {
         let local_reduction_axes: Vec<_> = reduction_axes
             .iter()
             .copied()
             .filter(|axis| distinct_input_count(*axis) == 1)
             .collect();
         if !local_reduction_axes.is_empty() {
-            return Ok(EinsumClassification::Unsupported(
-                EinsumUnsupportedReason::MixedContractionAndOperandReduction {
-                    contract_axes: cross_reduction_axes,
-                    local_reduction_axes,
-                },
+            return Ok(EinsumClassification::ContractionTree(
+                tree::build_contraction_tree(operands, logical_axes, output_axes, reduction_axes),
             ));
         }
         return build_contraction(
@@ -2155,29 +2289,8 @@ fn classify(
         .map(EinsumClassification::Gemm);
     }
 
-    let mut iteration_axes = output_axes.to_vec();
-    iteration_axes.extend_from_slice(reduction_axes);
-    let operand_axis_mappings = operands
-        .iter()
-        .map(|operand| {
-            operand
-                .unique_axes
-                .iter()
-                .map(|axis| {
-                    iteration_axes
-                        .iter()
-                        .position(|candidate| *candidate == axis.axis)
-                        .expect("every logical operand axis is retained or reduced")
-                })
-                .collect()
-        })
-        .collect();
-    Ok(EinsumClassification::ReductionOrElementwise(
-        EinsumReductionPlan {
-            iteration_axes,
-            output_rank: output_axes.len(),
-            operand_axis_mappings,
-        },
+    Ok(EinsumClassification::ContractionTree(
+        tree::build_contraction_tree(operands, logical_axes, output_axes, reduction_axes),
     ))
 }
 
@@ -2696,21 +2809,15 @@ mod tests {
         let nary = plan("ij,jk,kl->il", &[&[2, 3], &[3, 4], &[4, 5]]);
         assert!(matches!(
             nary.classification(),
-            EinsumClassification::Unsupported(EinsumUnsupportedReason::NaryContraction {
-                input_count: 3,
-                axes,
-            }) if axes.len() == 2
+            EinsumClassification::ContractionTree(tree)
+                if tree.arity() == 3 && tree.candidates().len() == 12
         ));
 
         let mixed = plan("aik,kj->ij", &[&[7, 2, 3], &[3, 4]]);
         assert!(matches!(
             mixed.classification(),
-            EinsumClassification::Unsupported(
-                EinsumUnsupportedReason::MixedContractionAndOperandReduction {
-                    contract_axes,
-                    local_reduction_axes,
-                }
-            ) if contract_axes.len() == 1 && local_reduction_axes.len() == 1
+            EinsumClassification::ContractionTree(tree)
+                if tree.arity() == 2 && tree.candidates().len() == 2
         ));
 
         let ellipsis = plan("...i,...i->i", &[&[5, 3], &[1, 3]]);
