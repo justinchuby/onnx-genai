@@ -76,5 +76,11 @@ route actually taken, planner quality, measured workspace, capture result, and
 output tensor. Capture assertions require nonzero captures and replays with zero
 fallbacks. `verify_observation` checks all fields against one oracle evaluation.
 
-The harness deliberately ships no CPU or CUDA adapter and no placeholder route.
-Backend owners must wire genuine forcing/telemetry before a route test can pass.
+The CPU EP supplies a real adapter in
+`crates/onnx-runtime-ep-cpu/tests/einsum_conformance.rs`. It executes every
+shared legal case through forced GenericNative, exercises every applicable
+exact-DP, deterministic-heuristic, and MatMul probe, reports measured route and
+workspace observations, and compares against this crate's independent oracle.
+It also adds explicit all-integer-width, 128-operand fallback, and
+parallel-versus-scalar checks. CUDA remains responsible for supplying its own
+adapter; no placeholder observation is accepted.

@@ -29,9 +29,5 @@ fn schema_aware_cpu_helper_uses_the_explicit_effective_opset() {
     let opset27 = unsupported_reason_for_opset(&node, 27, &shapes, &[DataType::BFloat16]).unwrap();
     assert!(opset27.contains("not admitted by Einsum-12"), "{opset27}");
 
-    let opset28 = unsupported_reason_for_opset(&node, 28, &shapes, &[DataType::BFloat16]).unwrap();
-    assert!(
-        opset28.contains("supports only Float32 and Float16"),
-        "{opset28}"
-    );
+    assert!(unsupported_reason_for_opset(&node, 28, &shapes, &[DataType::BFloat16]).is_none());
 }

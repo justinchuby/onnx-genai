@@ -34,7 +34,7 @@
 mod cdylib_resolve;
 use onnx_runtime_ort_testkit as ort_path;
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::ptr;
@@ -72,6 +72,30 @@ fn lock_ort_ep() -> MutexGuard<'static, ()> {
         );
         poisoned.into_inner()
     })
+}
+
+struct ScopedEnv {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnv {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        unsafe { std::env::set_var(name, value) };
+        Self { name, previous }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1311,6 +1335,42 @@ unsafe fn make_bfloat16_tensor(
     }
 }
 
+unsafe fn make_typed_tensor<T>(
+    api: *const ort::OrtApi,
+    data: &mut [T],
+    shape: &[i64],
+    dtype: ort::ONNXTensorElementDataType,
+    label: &str,
+) -> *mut ort::OrtValue {
+    unsafe {
+        let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
+        let status = ((*api).CreateCpuMemoryInfo.unwrap())(
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
+        );
+        check_status(api, status, &format!("CreateCpuMemoryInfo({label})"));
+
+        let mut value: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+            mem_info,
+            data.as_mut_ptr().cast(),
+            std::mem::size_of_val(data),
+            shape.as_ptr(),
+            shape.len(),
+            dtype,
+            &mut value,
+        );
+        check_status(
+            api,
+            status,
+            &format!("CreateTensorWithDataAsOrtValue({label})"),
+        );
+        ((*api).ReleaseMemoryInfo.unwrap())(mem_info);
+        value
+    }
+}
+
 unsafe fn make_int32_tensor(
     api: *const ort::OrtApi,
     data: &mut [i32],
@@ -1673,6 +1733,7 @@ enum ConcurrentEinsumRoute {
     View,
     Reduction,
     MaterializedGemm,
+    GenericNative,
 }
 
 struct ConcurrentEinsumModel {
@@ -1687,6 +1748,7 @@ impl ConcurrentEinsumRoute {
             Self::View => "view",
             Self::Reduction => "reduction",
             Self::MaterializedGemm => "materialized_gemm",
+            Self::GenericNative => "generic_native",
         }
     }
 
@@ -1695,6 +1757,7 @@ impl ConcurrentEinsumRoute {
             Self::View => 0,
             Self::Reduction => 1,
             Self::MaterializedGemm => 2,
+            Self::GenericNative => 3,
         }
     }
 }
@@ -1705,6 +1768,17 @@ fn einsum_model_text(
     inputs: &[(&str, &[i64])],
     output: (&str, &[i64]),
     opset: i64,
+) -> String {
+    einsum_model_text_typed(name, equation, inputs, output, opset, 1)
+}
+
+fn einsum_model_text_typed(
+    name: &str,
+    equation: &str,
+    inputs: &[(&str, &[i64])],
+    output: (&str, &[i64]),
+    opset: i64,
+    elem_type: i32,
 ) -> String {
     let mut text = String::new();
     writeln!(text, "ir_version: 11").unwrap();
@@ -1725,7 +1799,7 @@ fn einsum_model_text(
     for (input, shape) in inputs {
         writeln!(
             text,
-            "  input {{ name: \"{input}\" type {{ tensor_type {{ elem_type: 1 shape {{"
+            "  input {{ name: \"{input}\" type {{ tensor_type {{ elem_type: {elem_type} shape {{"
         )
         .unwrap();
         for dim in *shape {
@@ -1735,8 +1809,8 @@ fn einsum_model_text(
     }
     writeln!(
         text,
-        "  output {{ name: \"{}\" type {{ tensor_type {{ elem_type: 1 shape {{",
-        output.0
+        "  output {{ name: \"{}\" type {{ tensor_type {{ elem_type: {elem_type} shape {{",
+        output.0,
     )
     .unwrap();
     for dim in output.1 {
@@ -1914,6 +1988,60 @@ unsafe fn run_concurrent_einsum_once(
                 ((*api).ReleaseValue.unwrap())(right_value);
             }
         }
+        ConcurrentEinsumRoute::GenericNative => {
+            const ROWS: usize = 128;
+            const COLS: usize = 32_768;
+            let mut left = (0..ROWS * COLS)
+                .map(|index| ((index + seed * 13) % 31) as f32 * 0.03125 - 0.5)
+                .collect::<Vec<_>>();
+            let mut right = (0..ROWS * COLS)
+                .map(|index| ((index + seed * 19) % 29) as f32 * 0.03125 - 0.4375)
+                .collect::<Vec<_>>();
+            let expected = left
+                .chunks_exact(COLS)
+                .zip(right.chunks_exact(COLS))
+                .map(|(left, right)| {
+                    left.iter()
+                        .zip(right)
+                        .fold(0.0f32, |sum, (&a, &b)| sum + a * b)
+                })
+                .collect::<Vec<_>>();
+            let left_value =
+                unsafe { make_float_tensor(api, &mut left, &[ROWS as i64, COLS as i64]) };
+            let right_value =
+                unsafe { make_float_tensor(api, &mut right, &[ROWS as i64, COLS as i64]) };
+            let inputs = [
+                left_value as *const ort::OrtValue,
+                right_value as *const ort::OrtValue,
+            ];
+            let status = unsafe {
+                ((*api).Run.unwrap())(
+                    session,
+                    ptr::null(),
+                    input_names.as_ptr(),
+                    inputs.as_ptr(),
+                    2,
+                    output_names.as_ptr(),
+                    1,
+                    &mut output,
+                )
+            };
+            unsafe { check_status(api, status, "concurrent GenericNative Einsum Run") };
+            let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+            unsafe {
+                check_status(
+                    api,
+                    ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr),
+                    "concurrent GenericNative Einsum output",
+                )
+            };
+            let actual = unsafe { std::slice::from_raw_parts(data_ptr.cast::<f32>(), ROWS) };
+            assert_eq!(actual, expected);
+            unsafe {
+                ((*api).ReleaseValue.unwrap())(left_value);
+                ((*api).ReleaseValue.unwrap())(right_value);
+            }
+        }
     }
     assert!(!output.is_null());
     unsafe { ((*api).ReleaseValue.unwrap())(output) };
@@ -1938,6 +2066,7 @@ fn concurrent_same_session_einsum_runs_are_isolated() {
         ConcurrentEinsumRoute::Reduction,
         ConcurrentEinsumRoute::MaterializedGemm,
         ConcurrentEinsumRoute::View,
+        ConcurrentEinsumRoute::GenericNative,
     ] {
         let model = match route {
             ConcurrentEinsumRoute::View => ConcurrentEinsumModel {
@@ -1955,6 +2084,11 @@ fn concurrent_same_session_einsum_runs_are_isolated() {
                 inputs: vec![("A", vec![8, 1, 32, 32]), ("B", vec![4, 32, 32, 16, 16])],
                 output: ("C", vec![16, 4, 16, 8, 1]),
             },
+            ConcurrentEinsumRoute::GenericNative => ConcurrentEinsumModel {
+                equation: "ij,ij->i",
+                inputs: vec![("A", vec![128, 32_768]), ("B", vec![128, 32_768])],
+                output: ("C", vec![128]),
+            },
         };
         let input_refs = model
             .inputs
@@ -1971,6 +2105,8 @@ fn concurrent_same_session_einsum_runs_are_isolated() {
         let model_path =
             write_generated_model(&format!("einsum_concurrent_{}", route.label()), &model_text);
         let registration = format!("cpu_ep_einsum_concurrent_{}", route.label());
+        let mode = matches!(route, ConcurrentEinsumRoute::GenericNative)
+            .then(|| ScopedEnv::set("NXRT_CPU_EINSUM_MODE", "generic-native"));
         let Some((_lib, api, env, opts, session)) =
             (unsafe { conformance_setup(&registration, &model_path, true) })
         else {
@@ -1980,6 +2116,7 @@ fn concurrent_same_session_einsum_runs_are_isolated() {
             );
             return;
         };
+        drop(mode);
 
         unsafe {
             assert_ops_assigned_to_our_ep(api, session, &["Einsum"], &registration);
@@ -2159,6 +2296,391 @@ fn conformance_einsum_f32_f16_and_mixed_case_reach_native_cpu_kernel() {
             conformance_teardown(api, env, opts, session, &registration);
         }
     }
+}
+
+#[test]
+fn conformance_einsum_generic_native_all_einsum12_numeric_dtypes() {
+    let _lock = lock_ort_ep();
+    let _mode = ScopedEnv::set("NXRT_CPU_EINSUM_MODE", "generic-native");
+    let ep_path = skip_if_missing!(
+        find_ep_cdylib(),
+        "conformance_einsum_generic_native_all_einsum12_numeric_dtypes: EP cdylib not found"
+    );
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+
+    macro_rules! run_identity {
+        ($label:literal, $dtype:expr, $opset:expr, $values:expr, $ty:ty) => {{
+            let model_text = einsum_model_text_typed(
+                concat!("einsum_generic_", $label),
+                "i->i",
+                &[("A", &[4])],
+                ("C", &[4]),
+                $opset,
+                $dtype as i32,
+            );
+            let model_path =
+                write_generated_model(concat!("einsum_generic_", $label), &model_text);
+            let registration = concat!("cpu_ep_einsum_generic_", $label);
+            unsafe {
+                reset_ep_counter(&ep_lib, b"nxrt_ep_reset_executed_node_count");
+                reset_ep_counter(&ep_lib, b"nxrt_ep_reset_einsum_route_telemetry");
+            }
+            let Some((_lib, api, env, opts, session)) =
+                (unsafe { conformance_setup(registration, &model_path, true) })
+            else {
+                eprintln!(
+                    "*** SKIPPED: conformance_einsum_generic_native_all_einsum12_numeric_dtypes — \
+                     ORT or EP cdylib not found ***"
+                );
+                return;
+            };
+            unsafe { assert_ops_assigned_to_our_ep(api, session, &["Einsum"], registration) };
+            let mut values: Vec<$ty> = $values;
+            let input =
+                unsafe { make_typed_tensor(api, &mut values, &[4], $dtype, $label) };
+            let inputs = [input as *const ort::OrtValue];
+            let input_names = [c"A".as_ptr()];
+            let output_names = [c"C".as_ptr()];
+            let mut output: *mut ort::OrtValue = ptr::null_mut();
+            let status = unsafe {
+                ((*api).Run.unwrap())(
+                    session,
+                    ptr::null(),
+                    input_names.as_ptr(),
+                    inputs.as_ptr(),
+                    1,
+                    output_names.as_ptr(),
+                    1,
+                    &mut output,
+                )
+            };
+            unsafe { check_status(api, status, concat!("Run(Einsum ", $label, ")")) };
+            let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+            unsafe {
+                check_status(
+                    api,
+                    ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr),
+                    concat!("GetTensorMutableData(Einsum ", $label, ")"),
+                )
+            };
+            let actual = unsafe { std::slice::from_raw_parts(data_ptr.cast::<$ty>(), values.len()) };
+            assert_eq!(actual, values.as_slice(), "{} identity output", $label);
+            assert_eq!(
+                unsafe { read_ep_counter(&ep_lib, b"nxrt_ep_executed_node_count") },
+                1,
+                "{} must execute on this EP",
+                $label
+            );
+            let route_count: libloading::Symbol<'_, unsafe extern "C" fn(usize) -> usize> = unsafe {
+                ep_lib
+                    .get(b"nxrt_ep_einsum_route_count")
+                    .expect("CPU plugin exports Einsum route telemetry")
+            };
+            assert_eq!(
+                unsafe { route_count(2) },
+                1,
+                "{} must fire GenericNative exactly once",
+                $label
+            );
+            unsafe {
+                ((*api).ReleaseValue.unwrap())(output);
+                ((*api).ReleaseValue.unwrap())(input);
+                conformance_teardown(api, env, opts, session, registration);
+            }
+        }};
+    }
+
+    run_identity!(
+        "u8",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+        12,
+        vec![0u8, 1, u8::MAX, 17],
+        u8
+    );
+    run_identity!(
+        "u16",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16,
+        12,
+        vec![0u16, 1, u16::MAX, 257],
+        u16
+    );
+    run_identity!(
+        "u32",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
+        12,
+        vec![0u32, 1, u32::MAX, 65_537],
+        u32
+    );
+    run_identity!(
+        "u64",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64,
+        12,
+        vec![0u64, 1, u64::MAX, 4_294_967_297],
+        u64
+    );
+    run_identity!(
+        "i8",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
+        12,
+        vec![0i8, -1, i8::MIN, i8::MAX],
+        i8
+    );
+    run_identity!(
+        "i16",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16,
+        12,
+        vec![0i16, -1, i16::MIN, i16::MAX],
+        i16
+    );
+    run_identity!(
+        "i32",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+        12,
+        vec![0i32, -1, i32::MIN, i32::MAX],
+        i32
+    );
+    run_identity!(
+        "i64",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+        12,
+        vec![0i64, -1, i64::MIN, i64::MAX],
+        i64
+    );
+    run_identity!(
+        "f16",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
+        12,
+        vec![
+            f32_to_f16_bits(0.0),
+            f32_to_f16_bits(-1.0),
+            f32_to_f16_bits(0.5),
+            f32_to_f16_bits(3.25),
+        ],
+        u16
+    );
+    run_identity!(
+        "f32",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        12,
+        vec![0.0f32, -1.0, 0.5, 3.25],
+        f32
+    );
+    run_identity!(
+        "f64",
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE,
+        12,
+        vec![0.0f64, -1.0, 0.5, 3.25],
+        f64
+    );
+}
+
+#[test]
+fn conformance_einsum12_bfloat16_is_rejected_before_execution() {
+    let _lock = lock_ort_ep();
+    let model_text = einsum_model_text_typed(
+        "einsum12_bfloat16_invalid",
+        "i->i",
+        &[("A", &[4])],
+        ("C", &[4]),
+        12,
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 as i32,
+    );
+    let model_path = write_generated_model("einsum12_bfloat16_invalid", &model_text);
+    let Some((_lib, api, env, opts, session, domain, custom_op, status)) = (unsafe {
+        conformance_setup_with_session_status(
+            "cpu_ep_einsum12_bfloat16_invalid",
+            &model_path,
+            true,
+            None,
+        )
+    }) else {
+        eprintln!(
+            "*** SKIPPED: conformance_einsum12_bfloat16_is_rejected_before_execution — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+    assert!(
+        !status.is_null(),
+        "Einsum-12 BFloat16 must be rejected instead of reaching execution"
+    );
+    let message = unsafe { CStr::from_ptr(((*api).GetErrorMessage.unwrap())(status)) }
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        message.contains("BFloat16")
+            || message.contains("tensor(bfloat16)")
+            || message.contains("type"),
+        "unexpected Einsum-12 BFloat16 rejection: {message}"
+    );
+    unsafe {
+        ((*api).ReleaseStatus.unwrap())(status);
+        conformance_teardown_with_custom_domain(
+            api,
+            env,
+            opts,
+            session,
+            "cpu_ep_einsum12_bfloat16_invalid",
+            domain,
+        );
+    }
+    drop(custom_op);
+}
+
+#[test]
+fn conformance_einsum_optimized_routes_and_large_arity_fallback_are_real() {
+    let _lock = lock_ort_ep();
+    let _mode = ScopedEnv::set("NXRT_CPU_EINSUM_MODE", "optimized");
+    let ep_path = skip_if_missing!(
+        find_ep_cdylib(),
+        "conformance_einsum_optimized_routes_and_large_arity_fallback_are_real: EP cdylib not found"
+    );
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+    let route_count: libloading::Symbol<'_, unsafe extern "C" fn(usize) -> usize> = unsafe {
+        ep_lib
+            .get(b"nxrt_ep_einsum_route_count")
+            .expect("CPU plugin exports Einsum route telemetry")
+    };
+
+    let run = |label: &str,
+               equation: String,
+               shapes: Vec<Vec<i64>>,
+               output_shape: Vec<i64>,
+               mut data: Vec<Vec<f32>>,
+               expected: Vec<f32>,
+               route_index: usize|
+     -> bool {
+        let names = (0..shapes.len())
+            .map(|index| format!("A{index}"))
+            .collect::<Vec<_>>();
+        let input_refs = names
+            .iter()
+            .zip(&shapes)
+            .map(|(name, shape)| (name.as_str(), shape.as_slice()))
+            .collect::<Vec<_>>();
+        let model_text = einsum_model_text(
+            &format!("einsum_route_{label}"),
+            &equation,
+            &input_refs,
+            ("C", &output_shape),
+            12,
+        );
+        let model_path = write_generated_model(&format!("einsum_route_{label}"), &model_text);
+        let registration = format!("cpu_ep_einsum_route_{label}");
+        unsafe {
+            reset_ep_counter(&ep_lib, b"nxrt_ep_reset_executed_node_count");
+            reset_ep_counter(&ep_lib, b"nxrt_ep_reset_einsum_route_telemetry");
+        }
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(&registration, &model_path, true) })
+        else {
+            return false;
+        };
+        unsafe { assert_ops_assigned_to_our_ep(api, session, &["Einsum"], &registration) };
+        let values = data
+            .iter_mut()
+            .zip(&shapes)
+            .map(|(values, shape)| unsafe { make_float_tensor(api, values, shape) })
+            .collect::<Vec<_>>();
+        let input_values = values
+            .iter()
+            .map(|&value| value as *const ort::OrtValue)
+            .collect::<Vec<_>>();
+        let input_names = names
+            .iter()
+            .map(|name| CString::new(name.as_str()).unwrap())
+            .collect::<Vec<_>>();
+        let input_name_ptrs = input_names
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect::<Vec<_>>();
+        let output_names = [c"C".as_ptr()];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        let status = unsafe {
+            ((*api).Run.unwrap())(
+                session,
+                ptr::null(),
+                input_name_ptrs.as_ptr(),
+                input_values.as_ptr(),
+                input_values.len(),
+                output_names.as_ptr(),
+                1,
+                &mut output,
+            )
+        };
+        unsafe { check_status(api, status, &format!("Run(Einsum route {label})")) };
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        unsafe {
+            check_status(
+                api,
+                ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr),
+                &format!("GetTensorMutableData(Einsum route {label})"),
+            )
+        };
+        let actual = unsafe { std::slice::from_raw_parts(data_ptr.cast::<f32>(), expected.len()) };
+        assert_eq!(actual, expected.as_slice(), "{label} output");
+        assert_eq!(
+            unsafe { route_count(route_index) },
+            1,
+            "{label} must fire route telemetry index {route_index}"
+        );
+        assert_eq!(
+            unsafe { read_ep_counter(&ep_lib, b"nxrt_ep_executed_node_count") },
+            1,
+            "{label} must execute exactly once"
+        );
+        unsafe {
+            ((*api).ReleaseValue.unwrap())(output);
+            for value in values {
+                ((*api).ReleaseValue.unwrap())(value);
+            }
+            conformance_teardown(api, env, opts, session, &registration);
+        }
+        true
+    };
+
+    assert!(run(
+        "exact_dp",
+        "i,i,i->".into(),
+        vec![vec![4096]; 3],
+        vec![],
+        vec![vec![1.0; 4096]; 3],
+        vec![4096.0],
+        3,
+    ));
+    assert!(run(
+        "heuristic",
+        format!(
+            "{}->",
+            std::iter::repeat_n("i", 8).collect::<Vec<_>>().join(",")
+        ),
+        vec![vec![512]; 8],
+        vec![],
+        vec![vec![1.0; 512]; 8],
+        vec![512.0],
+        4,
+    ));
+    assert!(run(
+        "generic_fallback",
+        format!(
+            "{}->",
+            std::iter::repeat_n("i", 128).collect::<Vec<_>>().join(",")
+        ),
+        vec![vec![1]; 128],
+        vec![],
+        vec![vec![1.0]; 128],
+        vec![1.0],
+        2,
+    ));
+    assert!(run(
+        "matmul",
+        "ik,kj->ij".into(),
+        vec![vec![2, 3], vec![3, 2]],
+        vec![2, 2],
+        vec![vec![1.0; 6], vec![1.0; 6]],
+        vec![3.0; 4],
+        5,
+    ));
 }
 
 // ─── Conformance: mixed partition (Add + NonZero) ────────────────────────────

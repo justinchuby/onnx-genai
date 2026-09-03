@@ -4,6 +4,7 @@
 //! shape-specialized kernel is built. Execution consumes only the plan's
 //! structural classification and axis maps.
 
+use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -13,42 +14,58 @@ use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{
-    DataType, EinsumAxis, EinsumContractionPlan, EinsumContractionTreePlan, EinsumInput,
+    DataType, EinsumAxis, EinsumBinaryContractionPlan, EinsumContractionPlan,
+    EinsumContractionTreePlan, EinsumContractionTreeStep, EinsumGenericNativePlan, EinsumInput,
     EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality,
-    EinsumPlanningClassification, EinsumReductionPlan, EinsumSchema, EinsumShapePlan, Node, Shape,
+    EinsumPlanningClassification, EinsumSchema, EinsumShapePlan,
+    EinsumSupportedContractionTreeCandidate, EinsumUnaryReductionPlan, EinsumValueId, Node, Shape,
     compute_contiguous_strides,
 };
 use rayon::prelude::*;
 
 use super::{check_arity, matmul::MatMulKernel, to_dense_bytes, write_dense_bytes};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{
+    ComputeDomain, NumericElem, to_dense_f32_widen, write_dense, write_dense_f32_narrow,
+};
 use crate::kernels::governed_accumulator_budget::{
     DEFAULT_PER_THREAD_ACCUMULATOR_BYTES, DEFAULT_PROCESS_ACCUMULATOR_BYTES, GovernedAccumulator,
     GovernedAccumulatorBudget,
 };
 use crate::strided::next_index;
 
-/// Diagnostic execution switch used by `benches/einsum.rs`.
+/// Diagnostic execution switch used by `benches/einsum.rs` and conformance.
 ///
-/// `oracle` routes arithmetic through the canonical plan's generic
-/// high-precision evaluator instead of the native lowering. It is a
-/// correctness diagnostic, not a replaceable performance baseline. The default is
-/// `optimized`. It is read only when a kernel is constructed.
+/// `generic-native` forces the universal semantic index program and
+/// `optimized` permits compatible view/reduction/MatMul/tree routes. `oracle`
+/// retains the pre-existing high-precision diagnostic. The value is read only
+/// when a kernel is constructed.
 pub const EINSUM_MODE_ENV: &str = "NXRT_CPU_EINSUM_MODE";
 
+/// CPU Einsum route policy captured immutably by a compiled kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExecutionMode {
+pub enum EinsumExecutionMode {
+    /// Preserve compatible native fast paths and use GenericNative as fallback.
     Optimized,
+    /// Force the universal index program for every arithmetic expression.
+    GenericNative,
+    /// High-precision diagnostic retained for benchmark validation.
     Oracle,
 }
+
+#[cfg(test)]
+type ExecutionMode = EinsumExecutionMode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EinsumRoute {
     ViewCopy,
     Reduction,
+    GenericNative,
+    OptimizedDp,
+    OptimizedHeuristic,
     Oracle,
     MatMulDirect,
     MatMulMaterialized,
+    MatMulScalar,
 }
 
 impl EinsumRoute {
@@ -56,14 +73,56 @@ impl EinsumRoute {
         match self {
             Self::ViewCopy => "view-copy",
             Self::Reduction => "reduction-native",
+            Self::GenericNative => "generic-native",
+            Self::OptimizedDp => "optimized-dp",
+            Self::OptimizedHeuristic => "optimized-heuristic",
             Self::Oracle => "oracle-diagnostic",
             Self::MatMulDirect => "matmul-direct",
             Self::MatMulMaterialized => "matmul-materialized",
+            Self::MatMulScalar => "matmul-scalar",
+        }
+    }
+
+    const fn telemetry_index(self) -> usize {
+        match self {
+            Self::ViewCopy => 0,
+            Self::Reduction => 1,
+            Self::GenericNative => 2,
+            Self::OptimizedDp => 3,
+            Self::OptimizedHeuristic => 4,
+            Self::MatMulDirect => 5,
+            Self::MatMulMaterialized => 6,
+            Self::MatMulScalar => 7,
+            Self::Oracle => 8,
         }
     }
 }
 
-/// Process-wide byte accounting for Float32 Einsum scratch retained between
+const EINSUM_TELEMETRY_ROUTES: usize = 9;
+static EINSUM_ROUTE_COUNTS: [AtomicUsize; EINSUM_TELEMETRY_ROUTES] =
+    [const { AtomicUsize::new(0) }; EINSUM_TELEMETRY_ROUTES];
+
+/// Reset process-local CPU Einsum route counters.
+#[doc(hidden)]
+pub fn reset_route_telemetry() {
+    for count in &EINSUM_ROUTE_COUNTS {
+        count.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Return the number of successful dispatches for a telemetry route index.
+///
+/// Indices are `0=view`, `1=reduction`, `2=generic-native`,
+/// `3=optimized-dp`, `4=optimized-heuristic`, `5=matmul-direct`,
+/// `6=matmul-materialized`, `7=matmul-scalar`, and `8=oracle`.
+#[doc(hidden)]
+pub fn route_telemetry_count(route: usize) -> usize {
+    EINSUM_ROUTE_COUNTS
+        .get(route)
+        .map_or(0, |count| count.load(Ordering::Relaxed))
+}
+
+/// Process-wide byte accounting for typed Einsum scratch retained between
 /// calls. Admission is deliberately absent here: each compiled session owns an
 /// immutable [`EinsumScratchRetention`] verdict. The only process-global state
 /// is the aggregate byte ceiling shared by those independent sessions.
@@ -84,7 +143,22 @@ thread_local! {
 }
 
 struct EinsumScratchSlot {
-    accumulator: Mutex<GovernedAccumulator<f32>>,
+    accumulator: Mutex<Box<dyn ErasedGovernedAccumulator>>,
+}
+
+trait ErasedGovernedAccumulator: Send {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn capacity_bytes(&self) -> usize;
+}
+
+impl<T: Send + 'static> ErasedGovernedAccumulator for GovernedAccumulator<T> {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn capacity_bytes(&self) -> usize {
+        GovernedAccumulator::capacity_bytes(self)
+    }
 }
 
 #[derive(Default)]
@@ -104,13 +178,13 @@ struct EinsumScratchRetentionInner {
 }
 
 impl EinsumScratchRetentionInner {
-    fn register(self: &Arc<Self>, buffer: Vec<f32>) -> Option<EinsumTlsScratch> {
+    fn register<T: Send + 'static>(self: &Arc<Self>, buffer: Vec<T>) -> Option<EinsumTlsScratch> {
         let mut accumulator = GovernedAccumulator::new();
         if !accumulator.try_park(buffer, self.budget) {
             return None;
         }
         let slot = Arc::new(EinsumScratchSlot {
-            accumulator: Mutex::new(accumulator),
+            accumulator: Mutex::new(Box::new(accumulator)),
         });
         let registration = {
             let mut slots = self
@@ -126,6 +200,7 @@ impl EinsumScratchRetentionInner {
             owner: Arc::downgrade(self),
             slot: Arc::downgrade(&slot),
             registration,
+            element_type: TypeId::of::<T>(),
         })
     }
 
@@ -157,11 +232,16 @@ struct EinsumTlsScratch {
     owner: Weak<EinsumScratchRetentionInner>,
     slot: Weak<EinsumScratchSlot>,
     registration: u64,
+    element_type: TypeId,
 }
 
 impl EinsumTlsScratch {
     fn belongs_to(&self, owner: &Arc<EinsumScratchRetentionInner>) -> bool {
         self.owner.ptr_eq(&Arc::downgrade(owner))
+    }
+
+    fn stores<T: 'static>(&self) -> bool {
+        self.element_type == TypeId::of::<T>()
     }
 }
 
@@ -220,7 +300,7 @@ impl EinsumScratchRetention {
         self.inner.admitted
     }
 
-    fn take(&self) -> Result<Vec<f32>> {
+    fn take<T: Send + 'static>(&self) -> Result<Vec<T>> {
         EINSUM_SCRATCH
             .try_with(|scratch| {
                 let mut scratch = scratch.try_borrow_mut().map_err(|_| {
@@ -236,7 +316,7 @@ impl EinsumScratchRetention {
                 }
                 if !scratch
                     .as_ref()
-                    .is_some_and(|entry| entry.belongs_to(&self.inner))
+                    .is_some_and(|entry| entry.belongs_to(&self.inner) && entry.stores::<T>())
                 {
                     *scratch = None;
                 }
@@ -251,6 +331,14 @@ impl EinsumScratchRetention {
                     .accumulator
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let accumulator = accumulator
+                    .as_any_mut()
+                    .downcast_mut::<GovernedAccumulator<T>>()
+                    .ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "Einsum: the typed scratch slot changed type while checked out".into(),
+                        )
+                    })?;
                 Ok(accumulator.take())
             })
             .map_err(|_| {
@@ -261,7 +349,7 @@ impl EinsumScratchRetention {
             })?
     }
 
-    fn park(&self, buffer: Vec<f32>) {
+    fn park<T: Send + 'static>(&self, buffer: Vec<T>) {
         if !self.inner.admitted {
             let _ = EINSUM_SCRATCH.try_with(|scratch| {
                 if let Ok(mut scratch) = scratch.try_borrow_mut() {
@@ -277,21 +365,26 @@ impl EinsumScratchRetention {
             };
             if !scratch
                 .as_ref()
-                .is_some_and(|entry| entry.belongs_to(&self.inner))
+                .is_some_and(|entry| entry.belongs_to(&self.inner) && entry.stores::<T>())
             {
                 *scratch = None;
             }
             if let Some(slot) = scratch.as_ref().and_then(|entry| entry.slot.upgrade()) {
-                let parked = slot
+                let mut erased = slot
                     .accumulator
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .try_park(
-                        buffer
-                            .take()
-                            .expect("Einsum scratch buffer is parked at most once"),
-                        self.inner.budget,
-                    );
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let parked = erased
+                    .as_any_mut()
+                    .downcast_mut::<GovernedAccumulator<T>>()
+                    .is_some_and(|accumulator| {
+                        accumulator.try_park(
+                            buffer
+                                .take()
+                                .expect("Einsum scratch buffer is parked at most once"),
+                            self.inner.budget,
+                        )
+                    });
                 if !parked {
                     *scratch = None;
                 }
@@ -308,16 +401,24 @@ impl EinsumScratchRetention {
         });
     }
 
-    fn with_f32_scratch<T>(
+    fn with_scratch<T: Default + Send + 'static, R>(
         &self,
         len: usize,
-        execute: impl FnOnce(&mut Vec<f32>) -> Result<T>,
-    ) -> Result<T> {
+        execute: impl FnOnce(&mut Vec<T>) -> Result<R>,
+    ) -> Result<R> {
         let mut buffer = self.take()?;
-        resize_f32(&mut buffer, len)?;
+        resize_scratch(&mut buffer, len)?;
         let value = execute(&mut buffer)?;
         self.park(buffer);
         Ok(value)
+    }
+
+    fn with_f32_scratch<R>(
+        &self,
+        len: usize,
+        execute: impl FnOnce(&mut Vec<f32>) -> Result<R>,
+    ) -> Result<R> {
+        self.with_scratch(len, execute)
     }
 
     fn current_thread_capacity_bytes(&self) -> usize {
@@ -347,10 +448,11 @@ impl EinsumScratchRetention {
     }
 }
 
-const CONCURRENCY_ROUTES: usize = 3;
+const CONCURRENCY_ROUTES: usize = 4;
 const CONCURRENCY_VIEW: usize = 0;
 const CONCURRENCY_REDUCTION: usize = 1;
 const CONCURRENCY_MATERIALIZED_GEMM: usize = 2;
+const CONCURRENCY_GENERIC: usize = 3;
 static CONCURRENCY_PROBE_ENABLED: AtomicBool = AtomicBool::new(false);
 static CONCURRENCY_ACTIVE: [AtomicUsize; CONCURRENCY_ROUTES] =
     [const { AtomicUsize::new(0) }; CONCURRENCY_ROUTES];
@@ -426,8 +528,9 @@ pub struct EinsumKernel {
     plan: EinsumShapePlan,
     matmul: MatMulKernel,
     scratch_retention: EinsumScratchRetention,
-    mode: ExecutionMode,
+    mode: EinsumExecutionMode,
     flops: Option<u64>,
+    last_workspace_bytes: AtomicUsize,
     #[cfg(test)]
     last_route: std::sync::atomic::AtomicU8,
 }
@@ -435,38 +538,36 @@ pub struct EinsumKernel {
 /// Factory for [`EinsumKernel`].
 pub struct EinsumFactory {
     scratch_retention: EinsumScratchRetention,
+    mode: Option<EinsumExecutionMode>,
 }
 
 impl EinsumFactory {
     pub fn new(scratch_retention: EinsumScratchRetention) -> Self {
-        Self { scratch_retention }
+        Self {
+            scratch_retention,
+            mode: None,
+        }
+    }
+
+    /// Construct a factory with an explicit immutable execution policy.
+    ///
+    /// This avoids process-global environment mutation in conformance and
+    /// benchmark adapters while keeping the ordinary provider configuration
+    /// compatible with [`EINSUM_MODE_ENV`].
+    pub fn with_execution_mode(
+        scratch_retention: EinsumScratchRetention,
+        mode: EinsumExecutionMode,
+    ) -> Self {
+        Self {
+            scratch_retention,
+            mode: Some(mode),
+        }
     }
 }
 
 impl Default for EinsumFactory {
     fn default() -> Self {
         Self::new(EinsumScratchRetention::default())
-    }
-}
-
-fn contraction_tree_summary(tree: &EinsumContractionTreePlan) -> String {
-    if tree.quality() == EinsumPlannerQuality::GenericNativeFallback {
-        let reason = tree
-            .fallback_reason()
-            .expect("GenericNative planner fallback records its reason");
-        format!(
-            "the bounded planner selected GenericNative fallback because {reason} (work={}, \
-             metadata_units={}, max_depth={})",
-            tree.usage().work(),
-            tree.usage().metadata_units(),
-            tree.usage().max_depth()
-        )
-    } else {
-        format!(
-            "{} ordered candidate(s), quality {:?}",
-            tree.candidates().len(),
-            tree.quality()
-        )
     }
 }
 
@@ -483,32 +584,7 @@ impl KernelFactory for EinsumFactory {
                 ))
             },
         )?;
-        match plan.planning_classification() {
-            EinsumPlanningClassification::ContractionTree(tree) => {
-                return Err(EpError::KernelFailed(format!(
-                    "Einsum equation `{}` has a canonical {}-input contraction plan where {}, but \
-                     the staged native CPU GenericNative/tree executor is not implemented yet. \
-                     The semantic plan is valid; use another provider until the exhaustive \
-                     execution handoff lands.",
-                    plan.equation(),
-                    tree.arity(),
-                    contraction_tree_summary(tree)
-                )));
-            }
-            EinsumPlanningClassification::ViewOnlyPermutation(_)
-            | EinsumPlanningClassification::DiagonalView(_)
-            | EinsumPlanningClassification::ReductionOrElementwise(_)
-            | EinsumPlanningClassification::Gemm(_) => {}
-            _ => {
-                return Err(EpError::KernelFailed(format!(
-                    "Einsum equation `{}` uses a newer canonical classification that this native \
-                     CPU factory does not recognize; update the claim and execution paths before \
-                     constructing the kernel",
-                    plan.equation()
-                )));
-            }
-        }
-        let mode = execution_mode()?;
+        let mode = self.mode.map_or_else(execution_mode, Ok)?;
         let flops = match plan.planning_classification() {
             EinsumPlanningClassification::Gemm(gemm) => gemm_flops(gemm),
             _ => None,
@@ -519,6 +595,7 @@ impl KernelFactory for EinsumFactory {
             scratch_retention: self.scratch_retention.clone(),
             mode,
             flops,
+            last_workspace_bytes: AtomicUsize::new(0),
             #[cfg(test)]
             last_route: std::sync::atomic::AtomicU8::new(0),
         }))
@@ -542,20 +619,26 @@ fn equation(node: &Node) -> Result<&str> {
     })
 }
 
-fn execution_mode() -> Result<ExecutionMode> {
+fn execution_mode() -> Result<EinsumExecutionMode> {
     match std::env::var(EINSUM_MODE_ENV) {
-        Ok(value) if value.eq_ignore_ascii_case("oracle") => Ok(ExecutionMode::Oracle),
+        Ok(value) if value.eq_ignore_ascii_case("oracle") => Ok(EinsumExecutionMode::Oracle),
+        Ok(value)
+            if value.eq_ignore_ascii_case("generic")
+                || value.eq_ignore_ascii_case("generic-native") =>
+        {
+            Ok(EinsumExecutionMode::GenericNative)
+        }
         Ok(value) if value.eq_ignore_ascii_case("optimized") || value.trim().is_empty() => {
-            Ok(ExecutionMode::Optimized)
+            Ok(EinsumExecutionMode::Optimized)
         }
         Ok(value) => Err(EpError::KernelFailed(format!(
-            "Einsum: {EINSUM_MODE_ENV}={value:?} is invalid. HOW: use `optimized` (default) or \
-             `oracle` for a high-precision correctness diagnostic."
+            "Einsum: {EINSUM_MODE_ENV}={value:?} is invalid. HOW: use `optimized` (default), \
+             `generic-native`, or `oracle` for a high-precision correctness diagnostic."
         ))),
-        Err(std::env::VarError::NotPresent) => Ok(ExecutionMode::Optimized),
+        Err(std::env::VarError::NotPresent) => Ok(EinsumExecutionMode::Optimized),
         Err(std::env::VarError::NotUnicode(_)) => Err(EpError::KernelFailed(format!(
-            "Einsum: {EINSUM_MODE_ENV} is not valid UTF-8. HOW: unset it or use `optimized` or \
-             `oracle`."
+            "Einsum: {EINSUM_MODE_ENV} is not valid UTF-8. HOW: unset it or use `optimized`, \
+             `generic-native`, or `oracle`."
         ))),
     }
 }
@@ -602,40 +685,7 @@ pub fn unsupported_reason_for_opset(
         .map(|(shape, &dtype)| EinsumInput::new(dtype, shape))
         .collect();
     match EinsumPlan::build_for_opset(equation, &inputs, opset) {
-        Ok(plan) => {
-            if let Some((index, dtype)) = input_dtypes
-                .iter()
-                .copied()
-                .enumerate()
-                .find(|(_, dtype)| !matches!(dtype, DataType::Float32 | DataType::Float16))
-            {
-                return Some(format!(
-                    "Einsum `{equation}` input #{index} has canonical dtype {dtype:?}, but the \
-                     native CPU kernel supports only Float32 and Float16. HOW: cast every operand \
-                     to Float32 or Float16, or use another execution provider."
-                ));
-            }
-            match plan.planning_classification() {
-                EinsumPlanningClassification::ContractionTree(tree) => Some(format!(
-                    "Einsum `{}` has a canonical {}-input contraction plan where {}, but the \
-                     native CPU EP has not implemented the staged GenericNative temporary \
-                     scheduling and multi-node execution handoff; the expression is schema-valid, \
-                     so use another provider until it lands",
-                    plan.equation(),
-                    tree.arity(),
-                    contraction_tree_summary(tree)
-                )),
-                EinsumPlanningClassification::ViewOnlyPermutation(_)
-                | EinsumPlanningClassification::DiagonalView(_)
-                | EinsumPlanningClassification::ReductionOrElementwise(_)
-                | EinsumPlanningClassification::Gemm(_) => None,
-                _ => Some(format!(
-                    "Einsum `{}` uses a newer canonical classification that this native CPU EP \
-                     does not recognize; update the CPU EP before assigning this node",
-                    plan.equation()
-                )),
-            }
-        }
+        Ok(_) => None,
         Err(error) => Some(format!(
             "Einsum canonical planning rejected `{equation}`: {error}"
         )),
@@ -656,11 +706,12 @@ impl Kernel for EinsumKernel {
     }
 
     fn may_produce_views(&self) -> bool {
-        matches!(
-            self.plan.planning_classification(),
-            EinsumPlanningClassification::ViewOnlyPermutation(_)
-                | EinsumPlanningClassification::DiagonalView(_)
-        )
+        self.mode == EinsumExecutionMode::Optimized
+            && matches!(
+                self.plan.planning_classification(),
+                EinsumPlanningClassification::ViewOnlyPermutation(_)
+                    | EinsumPlanningClassification::DiagonalView(_)
+            )
     }
 
     fn view_outputs(
@@ -672,8 +723,11 @@ impl Kernel for EinsumKernel {
         if num_outputs != 1 || output_shapes.len() != 1 {
             return None;
         }
+        if self.mode != EinsumExecutionMode::Optimized {
+            return None;
+        }
         let dtype = inputs.first()?.dtype;
-        if !matches!(dtype, DataType::Float32 | DataType::Float16)
+        if !self.plan.schema().supports_dtype(dtype)
             || inputs.iter().any(|input| input.dtype != dtype)
         {
             return None;
@@ -712,11 +766,19 @@ impl Kernel for EinsumKernel {
 }
 
 impl EinsumKernel {
-    fn with_f32_scratch<T>(
+    fn with_scratch<T: Default + Send + 'static, R>(
         &self,
         len: usize,
-        execute: impl FnOnce(&mut Vec<f32>) -> Result<T>,
-    ) -> Result<T> {
+        execute: impl FnOnce(&mut Vec<T>) -> Result<R>,
+    ) -> Result<R> {
+        self.scratch_retention.with_scratch(len, execute)
+    }
+
+    fn with_f32_scratch<R>(
+        &self,
+        len: usize,
+        execute: impl FnOnce(&mut Vec<f32>) -> Result<R>,
+    ) -> Result<R> {
         self.scratch_retention.with_f32_scratch(len, execute)
     }
 
@@ -725,54 +787,70 @@ impl EinsumKernel {
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
     ) -> Result<EinsumRoute> {
+        self.last_workspace_bytes.store(0, Ordering::Relaxed);
         self.validate_execution(inputs, outputs)?;
+        if self.mode == EinsumExecutionMode::GenericNative {
+            let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_GENERIC);
+            self.execute_generic_native(inputs, outputs)?;
+            return Ok(self.finish_route(EinsumRoute::GenericNative));
+        }
+        if self.mode == EinsumExecutionMode::Oracle {
+            let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_GENERIC);
+            if matches!(inputs[0].dtype, DataType::Float32 | DataType::Float16) {
+                self.execute_oracle(inputs, outputs)?;
+            } else {
+                self.execute_generic_native(inputs, outputs)?;
+            }
+            return Ok(self.finish_route(EinsumRoute::Oracle));
+        }
+
         match self.plan.planning_classification() {
             EinsumPlanningClassification::ViewOnlyPermutation(permutation)
             | EinsumPlanningClassification::DiagonalView(permutation) => {
-                self.record_route(1);
                 let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_VIEW);
                 self.execute_view_copy(inputs, outputs, permutation)?;
-                Ok(EinsumRoute::ViewCopy)
+                Ok(self.finish_route(EinsumRoute::ViewCopy))
             }
-            EinsumPlanningClassification::ReductionOrElementwise(reduction) => {
-                self.record_route(if self.mode == ExecutionMode::Oracle {
-                    4
-                } else {
-                    2
-                });
+            EinsumPlanningClassification::ReductionOrElementwise(_) => {
                 let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_REDUCTION);
-                self.execute_reduction(inputs, outputs, reduction)?;
-                Ok(if self.mode == ExecutionMode::Oracle {
-                    EinsumRoute::Oracle
-                } else {
-                    EinsumRoute::Reduction
-                })
+                self.execute_generic_native(inputs, outputs)?;
+                Ok(self.finish_route(EinsumRoute::Reduction))
             }
-            EinsumPlanningClassification::Gemm(gemm) if self.mode == ExecutionMode::Optimized => {
-                self.execute_gemm(inputs, outputs, gemm)
+            EinsumPlanningClassification::Gemm(gemm)
+                if matches!(
+                    inputs[0].dtype,
+                    DataType::Float16 | DataType::BFloat16 | DataType::Float32
+                ) =>
+            {
+                let route = self.execute_gemm(inputs, outputs, gemm)?;
+                Ok(self.finish_route(route))
             }
-            EinsumPlanningClassification::Gemm(_) => {
-                self.record_route(4);
-                self.execute_oracle(inputs, outputs)?;
-                Ok(EinsumRoute::Oracle)
+            EinsumPlanningClassification::Gemm(gemm) => {
+                let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_GENERIC);
+                crate::dispatch_arith!(inputs[0].dtype, "Einsum", T => {
+                    self.execute_scalar_gemm_typed::<T>(inputs, outputs, gemm)
+                })?;
+                Ok(self.finish_route(EinsumRoute::MatMulScalar))
             }
             EinsumPlanningClassification::ContractionTree(tree) => {
-                Err(EpError::KernelFailed(format!(
-                    "Einsum equation `{}` reached CPU execution with an unimplemented {}-input \
-                 contraction plan where {}; EP placement must decline it until the staged \
-                 GenericNative/contraction-tree executor is implemented",
-                    self.plan.equation(),
-                    tree.arity(),
-                    contraction_tree_summary(tree)
-                )))
+                let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_GENERIC);
+                let route = self.execute_contraction_tree_or_generic(inputs, outputs, tree)?;
+                Ok(self.finish_route(route))
             }
-            _ => Err(EpError::KernelFailed(format!(
-                "Einsum equation `{}` reached CPU execution with a newer unrecognized canonical \
-                 classification; update the CPU EP and its claim gate before executing it",
-                self.plan.equation()
-            ))),
+            _ => {
+                let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_GENERIC);
+                self.execute_generic_native(inputs, outputs)?;
+                Ok(self.finish_route(EinsumRoute::GenericNative))
+            }
         }
     }
+
+    fn finish_route(&self, route: EinsumRoute) -> EinsumRoute {
+        EINSUM_ROUTE_COUNTS[route.telemetry_index()].fetch_add(1, Ordering::Relaxed);
+        self.record_route(route);
+        route
+    }
+
     fn validate_execution(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(
             "Einsum",
@@ -792,14 +870,18 @@ impl EinsumKernel {
                     input.device
                 )));
             }
-            if !matches!(input.dtype, DataType::Float32 | DataType::Float16) {
+            if !self.plan.schema().supports_dtype(input.dtype) {
                 return Err(EpError::KernelFailed(format!(
-                    "Einsum `{}` input #{index} has unsupported dtype {:?}; expected Float32 or \
-                     Float16 in the staged native CPU executor. Einsum-28 admits BFloat16 \
-                     semantically, but its CPU execution handoff is not implemented yet. HOW: \
-                     cast every operand to Float32 or Float16 or use another provider.",
+                    "Einsum `{}` input #{index} has dtype {:?}, which is not admitted by {}. HOW: \
+                     use a homogeneous numeric dtype supported by that schema{}.",
                     self.plan.equation(),
-                    input.dtype
+                    input.dtype,
+                    self.plan.schema(),
+                    if input.dtype == DataType::BFloat16 {
+                        " or import ai.onnx opset 28+ for BFloat16"
+                    } else {
+                        ""
+                    }
                 )));
             }
             if input.dtype != inputs[0].dtype {
@@ -871,23 +953,9 @@ impl EinsumKernel {
         )
         .with_byte_offset(input.byte_offset);
         let dense = to_dense_bytes(&view)?;
+        self.last_workspace_bytes
+            .store(dense.len(), Ordering::Relaxed);
         write_dense_bytes(&mut outputs[0], &dense)
-    }
-
-    fn execute_reduction(
-        &self,
-        inputs: &[TensorView],
-        outputs: &mut [TensorMut],
-        reduction: &EinsumReductionPlan,
-    ) -> Result<()> {
-        self.execute_generic(
-            inputs,
-            outputs,
-            reduction.iteration_axes(),
-            reduction.output_rank(),
-            reduction.operand_axis_mappings(),
-            self.mode == ExecutionMode::Oracle,
-        )
     }
 
     fn execute_oracle(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -919,6 +987,407 @@ impl EinsumKernel {
             &mappings,
             true,
         )
+    }
+
+    fn execute_generic_native(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> Result<()> {
+        crate::dispatch_arith!(inputs[0].dtype, "Einsum", T => {
+            self.execute_generic_native_typed::<T>(
+                inputs,
+                outputs,
+                self.plan.generic_native(),
+            )
+        })
+    }
+
+    fn execute_generic_native_typed<T: EinsumElement>(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        generic: &EinsumGenericNativePlan,
+    ) -> Result<()> {
+        let program = generic.index_program();
+        let iteration_shape = axes_shape(&self.plan, program.iteration_axes())?;
+        let output_rank = program.output_rank();
+        let output_shape = iteration_shape.get(..output_rank).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "Einsum `{}` GenericNative output rank {output_rank} exceeds iteration rank {}",
+                self.plan.equation(),
+                iteration_shape.len()
+            ))
+        })?;
+        let reduction_shape = &iteration_shape[output_rank..];
+        let output_len = checked_numel("GenericNative output", output_shape)?;
+        let reduction_len = checked_numel("GenericNative reduction", reduction_shape)?;
+        if output_len == 0 {
+            return Ok(());
+        }
+        let prepared =
+            prepare_generic_inputs::<T>(self.plan.equation(), inputs, generic, &iteration_shape)?;
+        let work = (output_len as u128)
+            .checked_mul(reduction_len.max(1) as u128)
+            .and_then(|value| value.checked_mul(prepared.len() as u128))
+            .ok_or_else(|| {
+                geometry_overflow(self.plan.equation(), "GenericNative work accounting")
+            })?;
+        let tile = generic_output_tile(reduction_len, prepared.len(), output_len);
+
+        self.with_scratch::<<T as NumericElem>::Acc, _>(output_len, |accumulators| {
+            let evaluate = |first_tile: usize, output: &mut [<T as NumericElem>::Acc]| {
+                let first_output = first_tile * tile;
+                let mut coordinates = vec![0usize; iteration_shape.len()];
+                for (local, destination) in output.iter_mut().enumerate() {
+                    let output_linear = first_output + local;
+                    decode_row_major(output_linear, output_shape, &mut coordinates[..output_rank]);
+                    let mut sum = <T as NumericElem>::Acc::default();
+                    for reduction_linear in 0..reduction_len {
+                        decode_row_major(
+                            reduction_linear,
+                            reduction_shape,
+                            &mut coordinates[output_rank..],
+                        );
+                        let mut product = T::one();
+                        for input in &prepared {
+                            product = product.c_mul(input.read(&coordinates));
+                        }
+                        sum = if reduction_linear == 0 {
+                            product
+                        } else {
+                            sum.c_add(product)
+                        };
+                    }
+                    *destination = sum;
+                }
+            };
+
+            const PARALLEL_GENERIC_WORK_ITEMS: u128 = 128 * 1024;
+            if output_len > 1 && work >= PARALLEL_GENERIC_WORK_ITEMS {
+                crate::task_runtime::chunk_runs_mut(accumulators, tile, 1, evaluate);
+            } else {
+                evaluate(0, accumulators);
+            }
+            self.last_workspace_bytes.store(
+                output_len.saturating_mul(std::mem::size_of::<T::Acc>()),
+                Ordering::Relaxed,
+            );
+            T::write_accumulators(&mut outputs[0], accumulators)
+        })
+    }
+
+    fn execute_contraction_tree_or_generic(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        tree: &EinsumContractionTreePlan,
+    ) -> Result<EinsumRoute> {
+        if tree.quality() == EinsumPlannerQuality::GenericNativeFallback {
+            self.execute_generic_native(inputs, outputs)?;
+            return Ok(EinsumRoute::GenericNative);
+        }
+        let input_shapes = inputs.iter().map(|input| input.shape).collect::<Vec<_>>();
+        let accumulator_size = accumulator_element_size(inputs[0].dtype);
+        let output_bytes = checked_numel("contraction-tree output", outputs[0].shape)?
+            .checked_mul(accumulator_size)
+            .ok_or_else(|| {
+                geometry_overflow(self.plan.equation(), "contraction-tree output bytes")
+            })?;
+        let temporary_ceiling =
+            u128::from(DEFAULT_PER_THREAD_ACCUMULATOR_BYTES).saturating_sub(output_bytes as u128);
+        let concrete = self
+            .plan
+            .resolve_concrete_contraction_tree(&input_shapes, accumulator_size)
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "Einsum `{}` could not resolve its concrete contraction tree: {error}",
+                    self.plan.equation()
+                ))
+            })?;
+        let Some(selected) = concrete
+            .as_ref()
+            .and_then(|tree| tree.preferred_candidate_with_memory_ceiling(temporary_ceiling))
+        else {
+            self.execute_generic_native(inputs, outputs)?;
+            return Ok(EinsumRoute::GenericNative);
+        };
+        let peak_temporary_bytes = selected
+            .cost()
+            .map(|cost| cost.peak_live_temporary_bytes())
+            .unwrap_or(0);
+        let workspace_bytes = peak_temporary_bytes
+            .checked_add(output_bytes as u128)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| {
+                geometry_overflow(self.plan.equation(), "contraction-tree workspace bytes")
+            })?;
+        self.last_workspace_bytes
+            .store(workspace_bytes, Ordering::Relaxed);
+        let candidate = tree
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.id() == selected.id())
+            .and_then(|candidate| candidate.supported())
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "Einsum `{}` selected contraction candidate `{}` without a matching \
+                     supported structural plan",
+                    self.plan.equation(),
+                    selected.id()
+                ))
+            })?;
+        crate::dispatch_arith!(inputs[0].dtype, "Einsum", T => {
+            self.execute_contraction_tree_typed::<T>(inputs, outputs, candidate)
+        })?;
+        Ok(match tree.quality() {
+            EinsumPlannerQuality::ExactSubsetDp => EinsumRoute::OptimizedDp,
+            EinsumPlannerQuality::DeterministicGreedy => EinsumRoute::OptimizedHeuristic,
+            EinsumPlannerQuality::GenericNativeFallback => unreachable!("handled above"),
+        })
+    }
+
+    fn execute_scalar_gemm_typed<T: EinsumElement>(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        gemm: &EinsumContractionPlan,
+    ) -> Result<()> {
+        let left = TreeValue::Leaf(prepare_tree_leaf::<T>(
+            self.plan.equation(),
+            &inputs[0],
+            &self.plan.operands()[0],
+        )?);
+        let right = TreeValue::Leaf(prepare_tree_leaf::<T>(
+            self.plan.equation(),
+            &inputs[1],
+            &self.plan.operands()[1],
+        )?);
+        let mut canonical_axes = Vec::new();
+        canonical_axes.extend_from_slice(gemm.batch_axes());
+        canonical_axes.extend_from_slice(gemm.left_free_axes());
+        canonical_axes.extend_from_slice(gemm.right_free_axes());
+        let mut iteration_axes = canonical_axes.clone();
+        iteration_axes.extend_from_slice(gemm.contract_axes());
+        let iteration_shape = axes_shape(&self.plan, &iteration_axes)?;
+        let output_rank = canonical_axes.len();
+        let canonical_shape = iteration_shape[..output_rank].to_vec();
+        let canonical_len = checked_numel("scalar GEMM output", &canonical_shape)?;
+        let mut canonical = Vec::new();
+        resize_scratch(&mut canonical, canonical_len)?;
+        let left = prepare_tree_accessor(
+            self.plan.equation(),
+            &left,
+            &iteration_axes,
+            &iteration_shape,
+        )?;
+        let right = prepare_tree_accessor(
+            self.plan.equation(),
+            &right,
+            &iteration_axes,
+            &iteration_shape,
+        )?;
+        evaluate_tree_product::<T>(
+            &mut canonical,
+            &iteration_shape[..output_rank],
+            &iteration_shape[output_rank..],
+            &[left, right],
+        )?;
+        let final_value = DenseTreeValue {
+            axes: canonical_axes,
+            shape: canonical_shape,
+            data: canonical,
+        };
+        let requested_len = checked_numel("scalar GEMM requested output", outputs[0].shape)?;
+        let workspace_bytes = canonical_len
+            .checked_add(requested_len)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<T::Acc>()))
+            .ok_or_else(|| geometry_overflow(self.plan.equation(), "scalar GEMM workspace"))?;
+        self.last_workspace_bytes
+            .store(workspace_bytes, Ordering::Relaxed);
+        self.with_scratch::<T::Acc, _>(requested_len, |requested| {
+            permute_tree_output(
+                self.plan.equation(),
+                &self.plan,
+                &final_value,
+                gemm.output_permutation(),
+                requested,
+            )?;
+            T::write_accumulators(&mut outputs[0], requested)
+        })
+    }
+
+    fn execute_contraction_tree_typed<T: EinsumElement>(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        candidate: &EinsumSupportedContractionTreeCandidate,
+    ) -> Result<()> {
+        let max_value = candidate
+            .steps()
+            .iter()
+            .map(EinsumContractionTreeStep::output)
+            .map(EinsumValueId::index)
+            .chain(std::iter::once(candidate.final_output().index()))
+            .max()
+            .unwrap_or(inputs.len().saturating_sub(1));
+        let mut values: Vec<Option<TreeValue<T>>> = (0..=max_value).map(|_| None).collect();
+        for (input_index, input) in inputs.iter().enumerate() {
+            let operand = self.plan.operands().get(input_index).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "Einsum `{}` contraction tree references missing input #{input_index}",
+                    self.plan.equation()
+                ))
+            })?;
+            values[input_index] = Some(TreeValue::Leaf(prepare_tree_leaf::<T>(
+                self.plan.equation(),
+                input,
+                operand,
+            )?));
+        }
+
+        let mut temporary_slots: Vec<Option<Vec<T::Acc>>> =
+            (0..candidate.cost().slot_count()).map(|_| None).collect();
+        let mut temporary_plans = vec![None; values.len()];
+        for temporary in candidate.temporaries() {
+            let value = temporary.value().index();
+            if value >= temporary_plans.len() || temporary.slot() >= temporary_slots.len() {
+                return Err(EpError::KernelFailed(format!(
+                    "Einsum `{}` contraction candidate has an invalid temporary schedule for {}",
+                    self.plan.equation(),
+                    temporary.value()
+                )));
+            }
+            temporary_plans[value] = Some((temporary.slot(), temporary.last_use_step()));
+        }
+
+        for (step_index, step) in candidate.steps().iter().enumerate() {
+            let (output_id, output_axes, input_ids, mut buffer) = match step {
+                EinsumContractionTreeStep::UnaryReduction(unary) => {
+                    let output_id = unary.output();
+                    let buffer = take_tree_output_buffer(
+                        self.plan.equation(),
+                        output_id,
+                        unary.output_axes(),
+                        candidate.final_output(),
+                        &temporary_plans,
+                        &mut temporary_slots,
+                        &self.plan,
+                    )?;
+                    (output_id, unary.output_axes(), vec![unary.input()], buffer)
+                }
+                EinsumContractionTreeStep::BinaryContraction(binary) => {
+                    let output_id = binary.output();
+                    let buffer = take_tree_output_buffer(
+                        self.plan.equation(),
+                        output_id,
+                        binary.canonical_output_axes(),
+                        candidate.final_output(),
+                        &temporary_plans,
+                        &mut temporary_slots,
+                        &self.plan,
+                    )?;
+                    (
+                        output_id,
+                        binary.canonical_output_axes(),
+                        vec![binary.left(), binary.right()],
+                        buffer,
+                    )
+                }
+                _ => {
+                    return Err(EpError::KernelFailed(format!(
+                        "Einsum `{}` contraction candidate contains a newer unsupported step",
+                        self.plan.equation()
+                    )));
+                }
+            };
+            if values.get(output_id.index()).is_some_and(Option::is_some) {
+                return Err(EpError::KernelFailed(format!(
+                    "Einsum `{}` contraction candidate produces {} more than once",
+                    self.plan.equation(),
+                    output_id
+                )));
+            }
+
+            match step {
+                EinsumContractionTreeStep::UnaryReduction(unary) => {
+                    execute_tree_unary(
+                        &self.plan,
+                        unary,
+                        value_at(self.plan.equation(), &values, unary.input())?,
+                        &mut buffer,
+                    )?;
+                }
+                EinsumContractionTreeStep::BinaryContraction(binary) => {
+                    let left = value_at(self.plan.equation(), &values, binary.left())?;
+                    let right = value_at(self.plan.equation(), &values, binary.right())?;
+                    execute_tree_binary(&self.plan, binary, left, right, &mut buffer)?;
+                }
+                _ => {
+                    return Err(EpError::KernelFailed(format!(
+                        "Einsum `{}` contraction candidate contains a newer unsupported step",
+                        self.plan.equation()
+                    )));
+                }
+            }
+            let shape = axes_shape(&self.plan, output_axes)?;
+            values[output_id.index()] = Some(TreeValue::Dense(DenseTreeValue {
+                axes: output_axes.to_vec(),
+                shape,
+                data: buffer,
+            }));
+
+            for input_id in input_ids {
+                let index = input_id.index();
+                if temporary_plans
+                    .get(index)
+                    .and_then(|plan| *plan)
+                    .is_some_and(|(_, last_use)| last_use == step_index)
+                    && let Some(TreeValue::Dense(value)) = values[index].take()
+                {
+                    let slot = temporary_plans[index]
+                        .expect("temporary plan was checked above")
+                        .0;
+                    if temporary_slots[slot].is_some() {
+                        return Err(EpError::KernelFailed(format!(
+                            "Einsum `{}` contraction temporary slot {slot} was released twice at \
+                             step {step_index}",
+                            self.plan.equation()
+                        )));
+                    }
+                    temporary_slots[slot] = Some(value.data);
+                }
+            }
+        }
+
+        let final_value = values
+            .get_mut(candidate.final_output().index())
+            .and_then(Option::take)
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "Einsum `{}` contraction candidate did not produce final value {}",
+                    self.plan.equation(),
+                    candidate.final_output()
+                ))
+            })?;
+        let TreeValue::Dense(final_value) = final_value else {
+            return Err(EpError::KernelFailed(format!(
+                "Einsum `{}` contraction candidate ended at an input leaf",
+                self.plan.equation()
+            )));
+        };
+        let output_shape = outputs[0].shape.to_vec();
+        let output_len = checked_numel("contraction-tree final output", &output_shape)?;
+        self.with_scratch::<T::Acc, _>(output_len, |requested| {
+            permute_tree_output(
+                self.plan.equation(),
+                &self.plan,
+                &final_value,
+                candidate.final_output_permutation(),
+                requested,
+            )?;
+            T::write_accumulators(&mut outputs[0], requested)
+        })
     }
 
     fn execute_generic(
@@ -1159,7 +1628,6 @@ impl EinsumKernel {
         if !output_aliases_input
             && let (Some(left), Some(right), Some(output)) = (left, right, output)
         {
-            self.record_route(3);
             let left_view = TensorView::new(
                 inputs[0].data,
                 inputs[0].dtype,
@@ -1189,7 +1657,6 @@ impl EinsumKernel {
             return Ok(EinsumRoute::MatMulDirect);
         }
 
-        self.record_route(5);
         let left_view = TensorView::new(
             inputs[0].data,
             inputs[0].dtype,
@@ -1208,6 +1675,16 @@ impl EinsumKernel {
         .with_byte_offset(inputs[1].byte_offset);
         let left_dense = to_dense_f32_widen("Einsum", &left_view)?;
         let right_dense = to_dense_f32_widen("Einsum", &right_view)?;
+        let materialized_input_bytes = [&left_dense, &right_dense]
+            .into_iter()
+            .map(|data| match data {
+                Cow::Borrowed(_) => Some(0),
+                Cow::Owned(data) => data.len().checked_mul(std::mem::size_of::<f32>()),
+            })
+            .try_fold(0usize, |total, bytes| {
+                bytes.and_then(|bytes| total.checked_add(bytes))
+            })
+            .ok_or_else(|| geometry_overflow(self.plan.equation(), "GEMM input workspace"))?;
         let batch_rank = gemm.batch_axes().len();
         let left_shape = flattened_gemm_shape(
             &left_ordered.shape[..batch_rank],
@@ -1239,6 +1716,12 @@ impl EinsumKernel {
             flattened_gemm_shape(geometry.batch_shape(), geometry.m(), geometry.n());
         let canonical_strides = compute_contiguous_strides(&canonical_shape);
         let canonical_len = checked_numel("GEMM output", &canonical_shape)?;
+        let workspace_bytes = canonical_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| bytes.checked_add(materialized_input_bytes))
+            .ok_or_else(|| geometry_overflow(self.plan.equation(), "GEMM workspace"))?;
+        self.last_workspace_bytes
+            .store(workspace_bytes, Ordering::Relaxed);
         let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_MATERIALIZED_GEMM);
         self.with_f32_scratch(canonical_len, |f32_output| {
             let canonical_output = TensorMut::new(
@@ -1256,13 +1739,668 @@ impl EinsumKernel {
     }
 
     #[cfg(test)]
-    fn record_route(&self, route: u8) {
-        self.last_route
-            .store(route, std::sync::atomic::Ordering::Relaxed);
+    fn record_route(&self, route: EinsumRoute) {
+        self.last_route.store(
+            u8::try_from(route.telemetry_index() + 1).expect("route index fits u8"),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     #[cfg(not(test))]
-    fn record_route(&self, _route: u8) {}
+    fn record_route(&self, _route: EinsumRoute) {}
+}
+
+trait EinsumElement: NumericElem + Send + Sync + 'static
+where
+    Self::Acc: Send + Sync + 'static,
+{
+    fn one() -> Self::Acc {
+        Self::from_f32_scalar(1.0).to_acc()
+    }
+
+    fn write_accumulators(output: &mut TensorMut, data: &[Self::Acc]) -> Result<()>;
+}
+
+macro_rules! impl_einsum_float32_accumulator {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl EinsumElement for $ty {
+                fn write_accumulators(output: &mut TensorMut, data: &[f32]) -> Result<()> {
+                    write_dense_f32_narrow("Einsum", output, data)
+                }
+            }
+        )+
+    };
+}
+
+impl_einsum_float32_accumulator!(f32, half::f16, half::bf16);
+
+impl EinsumElement for f64 {
+    fn write_accumulators(output: &mut TensorMut, data: &[f64]) -> Result<()> {
+        write_dense::<f64>(output, data)
+    }
+}
+
+macro_rules! impl_einsum_integer {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl EinsumElement for $ty {
+                fn write_accumulators(output: &mut TensorMut, data: &[$ty]) -> Result<()> {
+                    write_dense::<$ty>(output, data)
+                }
+            }
+        )+
+    };
+}
+
+impl_einsum_integer!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+#[derive(Clone, Copy)]
+struct ReadPtr<T>(*const T);
+
+impl<T> ReadPtr<T> {
+    fn get(self) -> *const T {
+        self.0
+    }
+}
+
+// SAFETY: GenericNative only constructs this wrapper from immutable TensorView
+// inputs. The call owns no mutable reference to their storage until all
+// parallel reads have completed; an aliased output is written only afterwards.
+unsafe impl<T: Sync> Send for ReadPtr<T> {}
+// SAFETY: See the `Send` implementation above.
+unsafe impl<T: Sync> Sync for ReadPtr<T> {}
+
+struct PreparedGenericInput<T> {
+    origin: ReadPtr<T>,
+    iteration_strides: Vec<i128>,
+}
+
+impl<T: EinsumElement> PreparedGenericInput<T> {
+    #[inline]
+    fn read(&self, coordinates: &[usize]) -> T::Acc {
+        let offset = self
+            .iteration_strides
+            .iter()
+            .zip(coordinates)
+            .fold(0i128, |sum, (&stride, &index)| sum + stride * index as i128);
+        // `prepare_generic_inputs` proves the complete addressed range fits
+        // `isize`, and every coordinate here is inside that range.
+        let offset = offset as isize;
+        // SAFETY: the executor validates the backing view bounds before kernel
+        // dispatch. `offset` is derived only from in-range coordinates and the
+        // plan's physical-axis map, including diagonal stride summation and
+        // ellipsis broadcast zero-strides. Reads are unaligned because
+        // `byte_offset` need only satisfy dtype alignment, not Rust `T`.
+        unsafe { self.origin.get().offset(offset).read_unaligned().to_acc() }
+    }
+}
+
+struct TreeLeaf<T> {
+    origin: ReadPtr<T>,
+    axes: Vec<EinsumAxis>,
+    shape: Vec<usize>,
+    strides: Vec<i128>,
+}
+
+struct DenseTreeValue<A> {
+    axes: Vec<EinsumAxis>,
+    shape: Vec<usize>,
+    data: Vec<A>,
+}
+
+enum TreeValue<T: EinsumElement> {
+    Leaf(TreeLeaf<T>),
+    Dense(DenseTreeValue<T::Acc>),
+}
+
+enum TreeReadSource<T: EinsumElement> {
+    Leaf(ReadPtr<T>),
+    Accumulator(ReadPtr<T::Acc>),
+}
+
+struct TreeAccessor<T: EinsumElement> {
+    source: TreeReadSource<T>,
+    iteration_strides: Vec<i128>,
+}
+
+impl<T: EinsumElement> TreeAccessor<T> {
+    #[inline]
+    fn read(&self, coordinates: &[usize]) -> T::Acc {
+        let offset = self
+            .iteration_strides
+            .iter()
+            .zip(coordinates)
+            .fold(0i128, |sum, (&stride, &index)| sum + stride * index as i128)
+            as isize;
+        // SAFETY: `prepare_tree_accessor` proves the complete addressed range
+        // fits `isize`; the source leaf or temporary remains alive and
+        // immutable until the blocking tile dispatch returns.
+        unsafe {
+            match self.source {
+                TreeReadSource::Leaf(pointer) => {
+                    pointer.get().offset(offset).read_unaligned().to_acc()
+                }
+                TreeReadSource::Accumulator(pointer) => {
+                    pointer.get().offset(offset).read_unaligned()
+                }
+            }
+        }
+    }
+}
+
+fn prepare_tree_leaf<T: EinsumElement>(
+    equation: &str,
+    input: &TensorView,
+    operand: &EinsumOperandPlan,
+) -> Result<TreeLeaf<T>> {
+    if input.dtype != T::DTYPE {
+        return Err(EpError::KernelFailed(format!(
+            "Einsum `{equation}` contraction tree expected {:?}, but input #{} has {:?}",
+            T::DTYPE,
+            operand.input(),
+            input.dtype
+        )));
+    }
+    let mut axes = Vec::with_capacity(operand.unique_axes().len());
+    let mut shape = Vec::with_capacity(operand.unique_axes().len());
+    let mut strides = Vec::with_capacity(operand.unique_axes().len());
+    for logical in operand.unique_axes() {
+        let &first = logical.input_axes().first().ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "Einsum `{equation}` input #{} has a logical axis with no physical source axis",
+                operand.input()
+            ))
+        })?;
+        let stride = logical
+            .input_axes()
+            .iter()
+            .try_fold(0i128, |sum, &physical| {
+                sum.checked_add(i128::from(input.strides[physical]))
+            })
+            .ok_or_else(|| geometry_overflow(equation, "contraction-tree diagonal stride"))?;
+        axes.push(logical.axis());
+        shape.push(input.shape[first]);
+        strides.push(stride);
+    }
+    validate_iteration_address_range(equation, input, &shape, &strides)?;
+    Ok(TreeLeaf {
+        origin: ReadPtr(input.data_ptr::<T>()),
+        axes,
+        shape,
+        strides,
+    })
+}
+
+fn value_at<'a, T: EinsumElement>(
+    equation: &str,
+    values: &'a [Option<TreeValue<T>>],
+    id: EinsumValueId,
+) -> Result<&'a TreeValue<T>> {
+    values
+        .get(id.index())
+        .and_then(Option::as_ref)
+        .ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "Einsum `{equation}` contraction candidate referenced unavailable value {id}"
+            ))
+        })
+}
+
+fn take_tree_output_buffer<A: Default>(
+    equation: &str,
+    output: EinsumValueId,
+    output_axes: &[EinsumAxis],
+    final_output: EinsumValueId,
+    temporary_plans: &[Option<(usize, usize)>],
+    slots: &mut [Option<Vec<A>>],
+    plan: &EinsumShapePlan,
+) -> Result<Vec<A>> {
+    let shape = axes_shape(plan, output_axes)?;
+    let len = checked_numel("contraction-tree temporary", &shape)?;
+    let mut buffer = if output == final_output {
+        Vec::new()
+    } else {
+        let (slot, _) = temporary_plans
+            .get(output.index())
+            .and_then(|entry| *entry)
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "Einsum `{equation}` contraction candidate omitted storage for {output}"
+                ))
+            })?;
+        slots
+            .get_mut(slot)
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "Einsum `{equation}` contraction candidate references missing slot {slot}"
+                ))
+            })?
+            .take()
+            .unwrap_or_default()
+    };
+    resize_scratch(&mut buffer, len)?;
+    Ok(buffer)
+}
+
+fn prepare_tree_accessor<T: EinsumElement>(
+    equation: &str,
+    value: &TreeValue<T>,
+    iteration_axes: &[EinsumAxis],
+    iteration_shape: &[usize],
+) -> Result<TreeAccessor<T>> {
+    let (source, axes, shape, source_strides): (
+        TreeReadSource<T>,
+        &[EinsumAxis],
+        &[usize],
+        Vec<i128>,
+    ) = match value {
+        TreeValue::Leaf(value) => (
+            TreeReadSource::Leaf(value.origin),
+            &value.axes,
+            &value.shape,
+            value.strides.clone(),
+        ),
+        TreeValue::Dense(value) => (
+            TreeReadSource::Accumulator(ReadPtr(value.data.as_ptr())),
+            &value.axes,
+            &value.shape,
+            compute_contiguous_strides(&value.shape)
+                .into_iter()
+                .map(i128::from)
+                .collect(),
+        ),
+    };
+    if axes.len() != shape.len() || axes.len() != source_strides.len() {
+        return Err(EpError::KernelFailed(format!(
+            "Einsum `{equation}` contraction value has inconsistent axis/shape/stride ranks"
+        )));
+    }
+    let mut iteration_strides = vec![0i128; iteration_axes.len()];
+    for (source_axis, axis) in axes.iter().enumerate() {
+        let iteration_axis = iteration_axes
+            .iter()
+            .position(|candidate| candidate == axis)
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "Einsum `{equation}` contraction step omitted live {axis}"
+                ))
+            })?;
+        iteration_strides[iteration_axis] =
+            if shape[source_axis] == 1 && iteration_shape[iteration_axis] != 1 {
+                0
+            } else {
+                source_strides[source_axis]
+            };
+    }
+    validate_offset_range(
+        equation,
+        "contraction-tree value",
+        iteration_shape,
+        &iteration_strides,
+    )?;
+    Ok(TreeAccessor {
+        source,
+        iteration_strides,
+    })
+}
+
+fn execute_tree_unary<T: EinsumElement>(
+    shape_plan: &EinsumShapePlan,
+    unary: &EinsumUnaryReductionPlan,
+    input: &TreeValue<T>,
+    output: &mut [T::Acc],
+) -> Result<()> {
+    let mut iteration_axes = unary.output_axes().to_vec();
+    iteration_axes.extend_from_slice(unary.reduction_axes());
+    let iteration_shape = axes_shape(shape_plan, &iteration_axes)?;
+    let output_rank = unary.output_axes().len();
+    let accessor = prepare_tree_accessor(
+        shape_plan.equation(),
+        input,
+        &iteration_axes,
+        &iteration_shape,
+    )?;
+    evaluate_tree_product::<T>(
+        output,
+        &iteration_shape[..output_rank],
+        &iteration_shape[output_rank..],
+        &[accessor],
+    )
+}
+
+fn execute_tree_binary<T: EinsumElement>(
+    shape_plan: &EinsumShapePlan,
+    binary: &EinsumBinaryContractionPlan,
+    left: &TreeValue<T>,
+    right: &TreeValue<T>,
+    output: &mut [T::Acc],
+) -> Result<()> {
+    let mut iteration_axes = binary.canonical_output_axes().to_vec();
+    iteration_axes.extend_from_slice(binary.contract_axes());
+    let iteration_shape = axes_shape(shape_plan, &iteration_axes)?;
+    let output_rank = binary.canonical_output_axes().len();
+    let left = prepare_tree_accessor(
+        shape_plan.equation(),
+        left,
+        &iteration_axes,
+        &iteration_shape,
+    )?;
+    let right = prepare_tree_accessor(
+        shape_plan.equation(),
+        right,
+        &iteration_axes,
+        &iteration_shape,
+    )?;
+    evaluate_tree_product::<T>(
+        output,
+        &iteration_shape[..output_rank],
+        &iteration_shape[output_rank..],
+        &[left, right],
+    )
+}
+
+fn evaluate_tree_product<T: EinsumElement>(
+    output: &mut [T::Acc],
+    output_shape: &[usize],
+    reduction_shape: &[usize],
+    inputs: &[TreeAccessor<T>],
+) -> Result<()> {
+    let output_len = checked_numel("contraction-tree output", output_shape)?;
+    if output.len() != output_len {
+        return Err(EpError::KernelFailed(format!(
+            "Einsum contraction-tree output buffer has {} elements, expected {output_len}",
+            output.len()
+        )));
+    }
+    if output_len == 0 {
+        return Ok(());
+    }
+    let reduction_len = checked_numel("contraction-tree reduction", reduction_shape)?;
+    let iteration_rank = output_shape.len() + reduction_shape.len();
+    let work = (output_len as u128)
+        .checked_mul(reduction_len.max(1) as u128)
+        .and_then(|value| value.checked_mul(inputs.len() as u128))
+        .ok_or_else(|| EpError::KernelFailed("Einsum contraction-tree work overflowed".into()))?;
+    let tile = generic_output_tile(reduction_len, inputs.len(), output_len);
+    let evaluate = |first_tile: usize, destination: &mut [T::Acc]| {
+        let first_output = first_tile * tile;
+        let mut coordinates = vec![0usize; iteration_rank];
+        for (local, value) in destination.iter_mut().enumerate() {
+            decode_row_major(
+                first_output + local,
+                output_shape,
+                &mut coordinates[..output_shape.len()],
+            );
+            let mut sum = T::Acc::default();
+            for reduction_linear in 0..reduction_len {
+                decode_row_major(
+                    reduction_linear,
+                    reduction_shape,
+                    &mut coordinates[output_shape.len()..],
+                );
+                let mut product = T::one();
+                for input in inputs {
+                    product = product.c_mul(input.read(&coordinates));
+                }
+                sum = if reduction_linear == 0 {
+                    product
+                } else {
+                    sum.c_add(product)
+                };
+            }
+            *value = sum;
+        }
+    };
+    const PARALLEL_TREE_WORK_ITEMS: u128 = 128 * 1024;
+    if output_len > 1 && work >= PARALLEL_TREE_WORK_ITEMS {
+        crate::task_runtime::chunk_runs_mut(output, tile, 1, evaluate);
+    } else {
+        evaluate(0, output);
+    }
+    Ok(())
+}
+
+fn permute_tree_output<A: Copy>(
+    equation: &str,
+    plan: &EinsumShapePlan,
+    final_value: &DenseTreeValue<A>,
+    permutation: &[usize],
+    requested: &mut [A],
+) -> Result<()> {
+    let requested_shape = axes_shape(plan, plan.output_axes())?;
+    let requested_len = checked_numel("contraction-tree requested output", &requested_shape)?;
+    if requested.len() != requested_len || final_value.data.len() != requested_len {
+        return Err(EpError::KernelFailed(format!(
+            "Einsum `{equation}` contraction final element count mismatch: canonical={}, \
+             requested={}, output={requested_len}",
+            final_value.data.len(),
+            requested.len()
+        )));
+    }
+    if requested_len == 0 {
+        return Ok(());
+    }
+    if final_value.axes == plan.output_axes()
+        && (permutation.is_empty() || permutation.iter().copied().eq(0..permutation.len()))
+    {
+        requested.copy_from_slice(&final_value.data);
+        return Ok(());
+    }
+    if permutation.len() != requested_shape.len() || permutation.len() != final_value.shape.len() {
+        return Err(EpError::KernelFailed(format!(
+            "Einsum `{equation}` contraction final permutation rank {} does not match requested \
+             rank {} and canonical rank {}",
+            permutation.len(),
+            requested_shape.len(),
+            final_value.shape.len()
+        )));
+    }
+    let canonical_strides = compute_contiguous_strides(&final_value.shape);
+    let mut requested_index = vec![0usize; requested_shape.len()];
+    for (linear, destination) in requested.iter_mut().enumerate() {
+        decode_row_major(linear, &requested_shape, &mut requested_index);
+        let mut canonical_offset = 0usize;
+        for (requested_axis, &canonical_axis) in permutation.iter().enumerate() {
+            let stride = usize::try_from(canonical_strides[canonical_axis]).map_err(|_| {
+                EpError::KernelFailed(format!(
+                    "Einsum `{equation}` contraction final stride is negative"
+                ))
+            })?;
+            canonical_offset = canonical_offset
+                .checked_add(
+                    requested_index[requested_axis]
+                        .checked_mul(stride)
+                        .ok_or_else(|| {
+                            geometry_overflow(equation, "contraction final output offset")
+                        })?,
+                )
+                .ok_or_else(|| geometry_overflow(equation, "contraction final output offset"))?;
+        }
+        *destination = *final_value.data.get(canonical_offset).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "Einsum `{equation}` contraction final offset {canonical_offset} exceeds {} \
+                 canonical element(s)",
+                final_value.data.len()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_offset_range(
+    equation: &str,
+    target: &str,
+    shape: &[usize],
+    strides: &[i128],
+) -> Result<()> {
+    let (mut minimum, mut maximum) = (0i128, 0i128);
+    for (&extent, &stride) in shape.iter().zip(strides) {
+        let span = i128::try_from(extent.saturating_sub(1))
+            .ok()
+            .and_then(|extent| extent.checked_mul(stride))
+            .ok_or_else(|| geometry_overflow(equation, target))?;
+        if span < 0 {
+            minimum = minimum
+                .checked_add(span)
+                .ok_or_else(|| geometry_overflow(equation, target))?;
+        } else {
+            maximum = maximum
+                .checked_add(span)
+                .ok_or_else(|| geometry_overflow(equation, target))?;
+        }
+    }
+    if minimum < isize::MIN as i128 || maximum > isize::MAX as i128 {
+        return Err(geometry_overflow(equation, target));
+    }
+    Ok(())
+}
+
+fn prepare_generic_inputs<T: EinsumElement>(
+    equation: &str,
+    inputs: &[TensorView],
+    generic: &EinsumGenericNativePlan,
+    iteration_shape: &[usize],
+) -> Result<Vec<PreparedGenericInput<T>>> {
+    let programs = generic.index_program().operands();
+    if programs.len() != inputs.len() {
+        return Err(EpError::KernelFailed(format!(
+            "Einsum `{equation}` GenericNative program has {} operand map(s), but execution \
+             supplied {} input(s)",
+            programs.len(),
+            inputs.len()
+        )));
+    }
+    programs
+        .iter()
+        .map(|program| {
+            let input = inputs.get(program.input()).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "Einsum `{equation}` GenericNative program references missing input #{}",
+                    program.input()
+                ))
+            })?;
+            if input.dtype != T::DTYPE {
+                return Err(EpError::KernelFailed(format!(
+                    "Einsum `{equation}` GenericNative typed dispatch expected {:?}, but input #{} \
+                     has {:?}",
+                    T::DTYPE,
+                    program.input(),
+                    input.dtype
+                )));
+            }
+            let mappings = program.physical_axis_to_iteration_axis();
+            let broadcasts = program.physical_axis_broadcasts_when_one();
+            if mappings.len() != input.shape.len() || broadcasts.len() != input.shape.len() {
+                return Err(EpError::KernelFailed(format!(
+                    "Einsum `{equation}` GenericNative map for input #{} has {} axis entries and \
+                     {} broadcast entries for runtime rank {}",
+                    program.input(),
+                    mappings.len(),
+                    broadcasts.len(),
+                    input.shape.len()
+                )));
+            }
+            let mut iteration_strides = vec![0i128; iteration_shape.len()];
+            for physical_axis in 0..input.shape.len() {
+                let iteration_axis = mappings[physical_axis];
+                let iteration_extent = *iteration_shape.get(iteration_axis).ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "Einsum `{equation}` input #{} physical axis {physical_axis} maps to \
+                         missing iteration axis {iteration_axis}",
+                        program.input()
+                    ))
+                })?;
+                let stride = if broadcasts[physical_axis]
+                    && input.shape[physical_axis] == 1
+                    && iteration_extent != 1
+                {
+                    0
+                } else {
+                    i128::from(input.strides[physical_axis])
+                };
+                iteration_strides[iteration_axis] = iteration_strides[iteration_axis]
+                    .checked_add(stride)
+                    .ok_or_else(|| geometry_overflow(equation, "GenericNative diagonal stride"))?;
+            }
+            validate_iteration_address_range(equation, input, iteration_shape, &iteration_strides)?;
+            Ok(PreparedGenericInput {
+                origin: ReadPtr(input.data_ptr::<T>()),
+                iteration_strides,
+            })
+        })
+        .collect()
+}
+
+fn validate_iteration_address_range(
+    equation: &str,
+    input: &TensorView,
+    shape: &[usize],
+    strides: &[i128],
+) -> Result<()> {
+    let (mut minimum, mut maximum) = (0i128, 0i128);
+    for (&extent, &stride) in shape.iter().zip(strides) {
+        let span = i128::try_from(extent.saturating_sub(1))
+            .ok()
+            .and_then(|extent| extent.checked_mul(stride))
+            .ok_or_else(|| geometry_overflow(equation, "GenericNative address range"))?;
+        if span < 0 {
+            minimum = minimum
+                .checked_add(span)
+                .ok_or_else(|| geometry_overflow(equation, "GenericNative minimum address"))?;
+        } else {
+            maximum = maximum
+                .checked_add(span)
+                .ok_or_else(|| geometry_overflow(equation, "GenericNative maximum address"))?;
+        }
+    }
+    if minimum < isize::MIN as i128 || maximum > isize::MAX as i128 {
+        return Err(geometry_overflow(equation, "GenericNative element address"));
+    }
+    let element_size = input.dtype.byte_size() as i128;
+    let origin = i128::try_from(input.data.0 as usize)
+        .ok()
+        .and_then(|base| base.checked_add(input.byte_offset as i128))
+        .ok_or_else(|| geometry_overflow(equation, "GenericNative byte origin"))?;
+    let first = minimum
+        .checked_mul(element_size)
+        .and_then(|offset| origin.checked_add(offset))
+        .ok_or_else(|| geometry_overflow(equation, "GenericNative minimum byte address"))?;
+    let end = maximum
+        .checked_mul(element_size)
+        .and_then(|offset| origin.checked_add(offset))
+        .and_then(|last| last.checked_add(element_size))
+        .ok_or_else(|| geometry_overflow(equation, "GenericNative maximum byte address"))?;
+    if first < 0 || end > usize::MAX as i128 {
+        return Err(geometry_overflow(
+            equation,
+            "GenericNative host pointer range",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_row_major(mut linear: usize, shape: &[usize], coordinates: &mut [usize]) {
+    debug_assert_eq!(shape.len(), coordinates.len());
+    for axis in (0..shape.len()).rev() {
+        coordinates[axis] = linear % shape[axis];
+        linear /= shape[axis];
+    }
+}
+
+fn generic_output_tile(reduction_len: usize, operand_count: usize, output_len: usize) -> usize {
+    const TARGET_WORK_ITEMS_PER_TILE: usize = 32 * 1024;
+    let work_per_output = reduction_len.saturating_mul(operand_count).max(1);
+    TARGET_WORK_ITEMS_PER_TILE
+        .div_ceil(work_per_output)
+        .clamp(1, output_len)
+}
+
+fn accumulator_element_size(dtype: DataType) -> usize {
+    match dtype {
+        DataType::Float16 | DataType::BFloat16 => std::mem::size_of::<f32>(),
+        _ => dtype.byte_size(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1528,18 +2666,18 @@ fn gemm_flops(gemm: &EinsumContractionPlan) -> Option<u64> {
     })
 }
 
-fn resize_f32(buffer: &mut Vec<f32>, len: usize) -> Result<()> {
+fn resize_scratch<T: Default>(buffer: &mut Vec<T>, len: usize) -> Result<()> {
     if len > buffer.len() {
         buffer
             .try_reserve_exact(len - buffer.len())
             .map_err(|error| {
                 EpError::KernelFailed(format!(
-                    "Einsum could not reserve {} bytes of temporary Float32 workspace: {error}",
-                    len.saturating_mul(std::mem::size_of::<f32>())
+                    "Einsum could not reserve {} bytes of typed temporary workspace: {error}",
+                    len.saturating_mul(std::mem::size_of::<T>())
                 ))
             })?;
     }
-    buffer.resize(len, 0.0);
+    buffer.resize_with(len, T::default);
     Ok(())
 }
 
@@ -1591,7 +2729,7 @@ fn views_may_overlap(input: &TensorView, output: &TensorMut) -> bool {
     input_range.0 < output_range.1 && output_range.0 < input_range.1
 }
 
-/// Current reusable Float32 scratch capacity held by an Einsum kernel.
+/// Current reusable typed scratch capacity held by an Einsum kernel.
 ///
 /// Used by the benchmark to report steady-state workspace rather than infer it
 /// from tensor shapes.
@@ -1599,6 +2737,13 @@ fn views_may_overlap(input: &TensorView, output: &TensorMut) -> bool {
 pub fn benchmark_scratch_capacity_bytes(kernel: &dyn Kernel) -> Option<usize> {
     let kernel = kernel.as_any().downcast_ref::<EinsumKernel>()?;
     Some(kernel.scratch_retention.current_thread_capacity_bytes())
+}
+
+/// Execution workspace attributed by the most recent successful dispatch.
+#[doc(hidden)]
+pub fn benchmark_last_workspace_bytes(kernel: &dyn Kernel) -> Option<usize> {
+    let kernel = kernel.as_any().downcast_ref::<EinsumKernel>()?;
+    Some(kernel.last_workspace_bytes.load(Ordering::Relaxed))
 }
 
 /// Execute one validation dispatch and return the native branch that fired.
@@ -1690,12 +2835,30 @@ mod tests {
             matmul: MatMulKernel::default(),
             scratch_retention,
             mode,
+            last_workspace_bytes: AtomicUsize::new(0),
             last_route: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
     fn kernel(equation: &str, shapes: &[Vec<usize>], mode: ExecutionMode) -> Box<dyn Kernel> {
         kernel_with_retention(equation, shapes, mode, EinsumScratchRetention::default())
+    }
+
+    fn kernel_for_opset(
+        equation: &str,
+        shapes: &[Vec<usize>],
+        opset: i64,
+        mode: EinsumExecutionMode,
+    ) -> Box<dyn Kernel> {
+        let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
+        node.version = Some(opset);
+        node.attributes.insert(
+            "equation".into(),
+            Attribute::String(equation.as_bytes().to_vec()),
+        );
+        EinsumFactory::with_execution_mode(EinsumScratchRetention::default(), mode)
+            .create(&node, shapes)
+            .unwrap()
     }
 
     fn route(kernel: &dyn Kernel) -> u8 {
@@ -1776,6 +2939,33 @@ mod tests {
             "the parked allocation must be checked out again"
         );
         assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), retained);
+    }
+
+    #[test]
+    fn typed_scratch_switches_width_without_cross_type_reuse_or_accounting_leak() {
+        let _guard = begin_scratch_test(128, 128);
+        let retention = test_retention(true);
+        retention
+            .with_scratch::<f32, _>(16, |buffer| {
+                buffer.fill(3.0);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 64);
+
+        retention
+            .with_scratch::<f64, _>(8, |buffer| {
+                assert!(buffer.iter().all(|&value| value == 0.0));
+                buffer.fill(5.0);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            TEST_SCRATCH_BUDGET.live_bytes(),
+            64,
+            "changing accumulator dtype must release the old reservation before parking the new one"
+        );
+        assert_eq!(retention.active_slots(), 1);
     }
 
     #[test]
@@ -1881,6 +3071,25 @@ mod tests {
         let len = with_test_scratch(&retention, 0, |buffer| Ok(buffer.len()))
             .expect("zero-sized scratch succeeds");
         assert_eq!(len, 0);
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
+        assert_eq!(retention.current_thread_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn zero_output_generic_execution_allocates_no_typed_scratch() {
+        let _guard = begin_scratch_test(128, 128);
+        let retention = test_retention(true);
+        let kernel = kernel_with_retention(
+            "i->i",
+            &[vec![0]],
+            EinsumExecutionMode::GenericNative,
+            retention.clone(),
+        );
+        let input = Owned::f32(&[0], &[]);
+        let mut output = Owned::zeros_f32(&[0]);
+        kernel
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
         assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
         assert_eq!(retention.current_thread_capacity_bytes(), 0);
     }
@@ -2174,7 +3383,7 @@ mod tests {
         gemm.execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), [4., 2., 10., 5.]);
-        assert_eq!(route(&*gemm), 3);
+        assert_eq!(route(&*gemm), 6);
 
         let bmm = kernel(
             "bik,bjk->bij",
@@ -2201,7 +3410,7 @@ mod tests {
                 1., 2., 3., 6., 4., 5., 6., 15., 4., 4., 3., 2., 4., 8., 4., 1.
             ]
         );
-        assert_eq!(route(&*bmm), 3);
+        assert_eq!(route(&*bmm), 6);
     }
 
     #[test]
@@ -2264,7 +3473,7 @@ mod tests {
             out.to_f32(),
             [90., 202., 110., 254., 100., 228., 120., 280.]
         );
-        assert_eq!(route(&*multi), 5);
+        assert_eq!(route(&*multi), 7);
 
         let diagonal = kernel(
             "iik,kj->ij",
@@ -2304,7 +3513,7 @@ mod tests {
             .execute(&[left.view(), right.view()], &mut [expected.view_mut()])
             .unwrap();
         assert_close(&actual.to_f32(), &expected.to_f32(), 1e-5);
-        assert_eq!(route(&*broadcasted), 5);
+        assert_eq!(route(&*broadcasted), 7);
     }
 
     #[test]
@@ -2420,7 +3629,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(left.to_f32(), [2., 6., 6., 12.]);
-        assert_eq!(route(&*gemm), 5);
+        assert_eq!(route(&*gemm), 7);
+    }
+
+    #[test]
+    fn generic_native_is_alias_safe_and_reads_negative_strides() {
+        let generic = kernel("ij->ji", &[vec![2, 2]], EinsumExecutionMode::GenericNative);
+        let mut tensor = Owned::f32(&[2, 2], &[1., 2., 3., 4.]);
+        let shape = tensor.shape.clone();
+        let strides = tensor.strides.clone();
+        let pointer = tensor.bytes.as_mut_ptr();
+        let input = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(pointer.cast_const().cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+        let mut output = TensorMut::new(
+            DevicePtrMut(pointer.cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+        generic
+            .execute(&[input], std::slice::from_mut(&mut output))
+            .unwrap();
+        assert_eq!(tensor.to_f32(), [1., 3., 2., 4.]);
+        assert_eq!(route(&*generic), 3);
+
+        let reverse = kernel("i->i", &[vec![3]], EinsumExecutionMode::GenericNative);
+        let storage = Owned::f32(&[3], &[1., 2., 3.]);
+        let reverse_shape = [3usize];
+        let reverse_strides = [-1i64];
+        let reversed = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(storage.bytes.as_ptr().cast()),
+            DataType::Float32,
+            &reverse_shape,
+            &reverse_strides,
+            DeviceId::cpu(),
+        )
+        .with_byte_offset(2 * std::mem::size_of::<f32>());
+        let mut output = Owned::zeros_f32(&[3]);
+        reverse
+            .execute(&[reversed], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(output.to_f32(), [3., 2., 1.]);
+    }
+
+    #[test]
+    fn empty_integer_reduction_is_zero_and_validation_failure_is_transactional() {
+        let reduction = kernel("i->", &[vec![0]], EinsumExecutionMode::GenericNative);
+        let input = Owned::i32(&[0], &[]);
+        let mut output = Owned::zeros(DataType::Int32, &[]);
+        reduction
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(output.to_i32(), [0]);
+
+        let identity = kernel("i->i", &[vec![2]], EinsumExecutionMode::GenericNative);
+        let input = Owned::i32(&[2], &[7, 11]);
+        let mut output = Owned::f32(&[2], &[123.0, 456.0]);
+        let before = output.bytes.clone();
+        let error = identity
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("output dtype"), "{error}");
+        assert_eq!(
+            output.bytes, before,
+            "validation errors must not partially modify the output"
+        );
     }
 
     #[test]
@@ -2445,8 +3725,8 @@ mod tests {
         oracle_kernel
             .execute(&[a.view(), b.view()], &mut [oracle.view_mut()])
             .unwrap();
-        assert_eq!(route(&*optimized), 3);
-        assert_eq!(route(&*oracle_kernel), 4);
+        assert_eq!(route(&*optimized), 6);
+        assert_eq!(route(&*oracle_kernel), 9);
         assert_eq!(oracle.to_f32(), [1., 2e10, 12., 10.]);
         assert_close(&fast.to_f32(), &oracle.to_f32(), 1024.0);
     }
@@ -2639,7 +3919,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_general_contraction_is_declined_before_kernel_creation() {
+    fn general_contractions_and_planner_fallback_execute_natively() {
         let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
         node.attributes.insert(
             "equation".into(),
@@ -2647,12 +3927,11 @@ mod tests {
         );
         let shapes = [
             static_shape([2, 3]),
-            static_shape([3, 4]),
-            static_shape([4, 5]),
+            static_shape([3, 2]),
+            static_shape([2, 2]),
         ];
         let dtypes = [DataType::Float32; 3];
-        let reason = unsupported_reason_for_opset(&node, 12, &shapes, &dtypes).unwrap();
-        assert!(reason.contains("3-input contraction"));
+        assert!(unsupported_reason_for_opset(&node, 12, &shapes, &dtypes).is_none());
 
         let provider = crate::CpuExecutionProvider::new();
         let support = provider.supports_op(
@@ -2666,8 +3945,19 @@ mod tests {
                 onnx_runtime_ir::TensorLayout::contiguous(),
             ],
         );
-        assert!(!support.is_supported());
-        assert!(support.reason().unwrap().contains("3-input contraction"));
+        assert!(support.is_supported(), "{:?}", support.reason());
+        let contraction = provider
+            .get_kernel(&node, &[vec![2, 3], vec![3, 2], vec![2, 2]], 12)
+            .expect("general contraction compiles");
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[3, 2], &[1., 0., 0., 1., 1., 1.]);
+        let c = Owned::f32(&[2, 2], &[2., 0., 0., 3.]);
+        let mut out = Owned::zeros_f32(&[2, 2]);
+        contraction
+            .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
+            .expect("general contraction executes");
+        assert_eq!(out.to_f32(), [8., 15., 20., 33.]);
+        assert_eq!(route(&*contraction), 4);
 
         let mut mixed = Node::new(NodeId(1), "Einsum", vec![], vec![]);
         mixed
@@ -2675,16 +3965,12 @@ mod tests {
             .insert("equation".into(), Attribute::String(b"aik,kj->ij".to_vec()));
         let mixed_shapes = [static_shape([7, 2, 3]), static_shape([3, 4])];
         let mixed_dtypes = [DataType::Float16; 2];
-        let reason =
-            unsupported_reason_for_opset(&mixed, 12, &mixed_shapes, &mixed_dtypes).unwrap();
-        assert!(reason.contains("2-input contraction plan"));
-        let error = EinsumFactory::default()
+        assert!(unsupported_reason_for_opset(&mixed, 12, &mixed_shapes, &mixed_dtypes).is_none());
+        EinsumFactory::default()
             .create(&mixed, &[vec![7, 2, 3], vec![3, 4]])
-            .err()
-            .expect("direct factory construction must also decline");
-        assert!(error.to_string().contains("2-input contraction plan"));
+            .expect("mixed local reduction compiles");
 
-        let arity = 256;
+        let arity = 128;
         let equation = format!(
             "{}->",
             std::iter::repeat_n("i", arity)
@@ -2697,12 +3983,23 @@ mod tests {
             .insert("equation".into(), Attribute::String(equation.into_bytes()));
         let shapes = vec![static_shape([1]); arity];
         let dtypes = vec![DataType::Float32; arity];
-        let reason = unsupported_reason_for_opset(&large, 12, &shapes, &dtypes).unwrap();
-        assert!(reason.contains("GenericNative fallback"), "{reason}");
-        assert!(
-            reason.contains("work/metadata budget was exceeded"),
-            "{reason}"
-        );
+        assert!(unsupported_reason_for_opset(&large, 12, &shapes, &dtypes).is_none());
+        let kernel = EinsumFactory::with_execution_mode(
+            EinsumScratchRetention::default(),
+            EinsumExecutionMode::Optimized,
+        )
+        .create(&large, &vec![vec![1]; arity])
+        .expect("planner fallback compiles");
+        let operands = (0..arity)
+            .map(|_| Owned::f32(&[1], &[1.0]))
+            .collect::<Vec<_>>();
+        let views = operands.iter().map(Owned::view).collect::<Vec<_>>();
+        let mut output = Owned::zeros_f32(&[]);
+        kernel
+            .execute(&views, &mut [output.view_mut()])
+            .expect("128-input GenericNative fallback executes");
+        assert_eq!(output.to_f32(), [1.0]);
+        assert_eq!(route(&*kernel), 3);
     }
 
     #[test]
@@ -2720,12 +4017,7 @@ mod tests {
             .expect("must reject");
         assert!(opset27.contains("not admitted by Einsum-12"), "{opset27}");
 
-        let opset28 = unsupported_reason_for_opset(&node, 28, &shape, &[DataType::BFloat16])
-            .expect("must decline");
-        assert!(
-            opset28.contains("supports only Float32 and Float16"),
-            "{opset28}"
-        );
+        assert!(unsupported_reason_for_opset(&node, 28, &shape, &[DataType::BFloat16]).is_none());
 
         node.version = Some(28);
         EinsumFactory::default()
@@ -2760,9 +4052,7 @@ mod tests {
         let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
         node.attributes
             .insert("equation".into(), Attribute::String(b"i->i".to_vec()));
-        let reason =
-            unsupported_reason(&node, &[int_shape], &[DataType::Int32]).expect("must decline");
-        assert!(reason.contains("supports only Float32 and Float16"));
+        assert!(unsupported_reason(&node, &[int_shape], &[DataType::Int32]).is_none());
 
         let direct = kernel("i->i", &[vec![2]], ExecutionMode::Optimized);
         let input = Owned::bf16(&[2], &[1.0, 2.0]);
@@ -2777,10 +4067,13 @@ mod tests {
             .execute(&[input.view()], &mut [output.view_mut()])
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("Einsum-28 admits BFloat16 semantically"),
-            "{error}"
-        );
+        assert!(error.contains("not admitted by Einsum-12"), "{error}");
         assert!(error.contains("HOW:"), "{error}");
+
+        let bf16 = kernel_for_opset("i->i", &[vec![2]], 28, EinsumExecutionMode::GenericNative);
+        let mut output = Owned::zeros(DataType::BFloat16, &[2]);
+        bf16.execute(&[input.view()], &mut [output.view_mut()])
+            .expect("Einsum-28 BFloat16 executes");
+        assert_eq!(output.to_u16_bits(), input.to_u16_bits());
     }
 }

@@ -13,12 +13,13 @@ use common::{FloatDType, Tensor, assert_close, float_values, make_kernel, proces
 use criterion::{BenchmarkId, Criterion, Throughput, black_box};
 use onnx_runtime_ep_api::{Kernel, KernelFactory};
 use onnx_runtime_ep_cpu::kernels::einsum::{
-    EINSUM_MODE_ENV, EinsumFactory, benchmark_execute_route, benchmark_scratch_capacity_bytes,
+    EINSUM_MODE_ENV, EinsumFactory, benchmark_execute_route, benchmark_last_workspace_bytes,
+    benchmark_scratch_capacity_bytes,
 };
 use onnx_runtime_hostmon::{AllowedCpus, Contention};
 use onnx_runtime_ir::{Attribute, Node, NodeId};
 
-const EXPECTED_CRITERION_SELECTORS: usize = 12;
+const EXPECTED_CRITERION_SELECTORS: usize = 26;
 const ABSOLUTE_REPS: usize = 3;
 const INTERLEAVED_BLOCKS: usize = 3;
 const TARGET_WINDOW: Duration = Duration::from_millis(100);
@@ -183,6 +184,24 @@ fn cases() -> Vec<Case> {
             tolerance: 0.0,
             expected_route: "view-copy",
         },
+        Case {
+            name: "trilinear_batched",
+            equation: "bi,bij,bj->b",
+            input_shapes: vec![vec![64, 128], vec![64, 128, 128], vec![64, 128]],
+            output_shape: vec![64],
+            dtype: FloatDType::F32,
+            tolerance: 2e-3,
+            expected_route: "optimized-dp",
+        },
+        Case {
+            name: "nary_8_shared_reduction",
+            equation: "i,i,i,i,i,i,i,i->",
+            input_shapes: vec![vec![16_384]; 8],
+            output_shape: vec![],
+            dtype: FloatDType::F32,
+            tolerance: 2e-3,
+            expected_route: "optimized-heuristic",
+        },
     ]
 }
 
@@ -258,19 +277,25 @@ fn hash_values(values: &[f32]) -> u64 {
 fn validate_case(
     case: &Case,
     optimized: &dyn Kernel,
+    generic: &dyn Kernel,
     oracle_kernel: &dyn Kernel,
     tensors: &[Tensor],
 ) {
     let views = tensors.iter().map(Tensor::view).collect::<Vec<_>>();
     let mut fast = Tensor::zeros(case.dtype, &case.output_shape);
+    let mut generic_output = Tensor::zeros(case.dtype, &case.output_shape);
     let mut oracle_output = Tensor::zeros(case.dtype, &case.output_shape);
     let route = benchmark_execute_route(optimized, &views, &mut [fast.view_mut()])
         .expect("optimized Einsum route probe must execute")
+        .expect("route probe must receive an Einsum kernel");
+    let generic_route = benchmark_execute_route(generic, &views, &mut [generic_output.view_mut()])
+        .expect("GenericNative Einsum route probe must execute")
         .expect("route probe must receive an Einsum kernel");
     oracle_kernel
         .execute(&views, &mut [oracle_output.view_mut()])
         .expect("Einsum correctness oracle must execute");
     let fast = fast.to_f32();
+    let generic = generic_output.to_f32();
     let oracle = oracle_output.to_f32();
     let nonzero = oracle.iter().filter(|value| **value != 0.0).count();
     assert!(
@@ -283,7 +308,13 @@ fn validate_case(
         "{} fired an unexpected native route",
         case.name
     );
+    assert_eq!(
+        generic_route, "generic-native",
+        "{} did not force GenericNative",
+        case.name
+    );
     assert_close(&fast, &oracle, case.tolerance);
+    assert_close(&generic, &oracle, case.tolerance);
     let max_abs_error = fast
         .iter()
         .zip(&oracle)
@@ -291,7 +322,7 @@ fn validate_case(
         .fold(0.0f32, f32::max);
     println!(
         "EINSUM_VALIDATE case={} dtype={} equation={} route={} shared_input_hash={:016x} \
-         native_hash={:016x} oracle_hash={:016x} oracle_nonzero={nonzero} \
+         native_hash={:016x} generic_hash={:016x} oracle_hash={:016x} oracle_nonzero={nonzero} \
          max_abs_error={max_abs_error:.9} tolerance={:.9} exact_equal={}",
         case.name,
         case.dtype.name(),
@@ -299,6 +330,7 @@ fn validate_case(
         route,
         hash_tensors(tensors),
         hash_values(&fast),
+        hash_values(&generic),
         hash_values(&oracle),
         case.tolerance,
         fast == oracle,
@@ -980,8 +1012,9 @@ fn bench_einsum(c: &mut Criterion, allowed: &AllowedCpus, emit_evidence: bool) {
         let tensors = inputs(&case);
         let views = tensors.iter().map(Tensor::view).collect::<Vec<_>>();
         let (optimized, optimized_setup) = kernel_with_mode(&case, "optimized");
+        let (generic, generic_setup) = kernel_with_mode(&case, "generic-native");
         let (oracle, oracle_setup) = kernel_with_mode(&case, "oracle");
-        validate_case(&case, &*optimized, &*oracle, &tensors);
+        validate_case(&case, &*optimized, &*generic, &*oracle, &tensors);
         let mut allocation_probe_output = Tensor::zeros(case.dtype, &case.output_shape);
         reset_allocations();
         let route = benchmark_execute_route(
@@ -993,12 +1026,15 @@ fn bench_einsum(c: &mut Criterion, allowed: &AllowedCpus, emit_evidence: bool) {
         .expect("allocation route probe must receive Einsum");
         let (allocation_calls, allocated_bytes) = allocations();
         let workspace = benchmark_scratch_capacity_bytes(&*optimized).unwrap_or(0);
+        let dispatch_workspace = benchmark_last_workspace_bytes(&*optimized).unwrap_or(0);
         println!(
-            "EINSUM_SETUP case={} native_us={:.3} oracle_us={:.3} route={} \
-             reusable_workspace_bytes={workspace} steady_allocations={allocation_calls} \
+            "EINSUM_SETUP case={} native_us={:.3} generic_us={:.3} oracle_us={:.3} route={} \
+             dispatch_workspace_bytes={dispatch_workspace} reusable_workspace_bytes={workspace} \
+             steady_allocations={allocation_calls} \
              steady_allocated_bytes={allocated_bytes}",
             case.name,
             optimized_setup.as_secs_f64() * 1e6,
+            generic_setup.as_secs_f64() * 1e6,
             oracle_setup.as_secs_f64() * 1e6,
             route,
         );
@@ -1015,6 +1051,7 @@ fn bench_einsum(c: &mut Criterion, allowed: &AllowedCpus, emit_evidence: bool) {
             case.output_shape.iter().product::<usize>() as u64,
         ));
         let mut optimized_output = Tensor::zeros(case.dtype, &case.output_shape);
+        let mut generic_output = Tensor::zeros(case.dtype, &case.output_shape);
         run_criterion_arm(case.name, allowed, emit_evidence, || {
             group.bench_with_input(BenchmarkId::new(case.name, "native"), &(), |bencher, _| {
                 bencher.iter(|| {
@@ -1026,6 +1063,20 @@ fn bench_einsum(c: &mut Criterion, allowed: &AllowedCpus, emit_evidence: bool) {
                         .unwrap()
                 });
             });
+            group.bench_with_input(
+                BenchmarkId::new(case.name, "generic-native"),
+                &(),
+                |bencher, _| {
+                    bencher.iter(|| {
+                        generic
+                            .execute(
+                                black_box(&views),
+                                black_box(&mut [generic_output.view_mut()]),
+                            )
+                            .unwrap()
+                    });
+                },
+            );
         });
     }
     group.finish();
