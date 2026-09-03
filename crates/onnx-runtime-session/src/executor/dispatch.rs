@@ -576,6 +576,7 @@ impl Executor {
         let cache = &mut self.cache;
         let kernel_bindings = &mut self.kernel_bindings;
         let provider_artifact_readiness = &mut self.provider_artifact_readiness;
+        let artifact_observation_owner = self.artifact_observation_owner.as_deref();
         let finalized_expert_banks = &self.finalized_expert_banks;
         let capture_growing = &self.capture_growing_symbols;
         let weights = &self.weights;
@@ -684,6 +685,7 @@ impl Executor {
             artifact_config,
             ctx.graph,
             finalized_expert_banks,
+            artifact_observation_owner,
         )?;
         for (index, (view, info)) in views.iter_mut().zip(&in_infos).enumerate() {
             if let Some(sealed) = kernel.constant_input_override(index) {

@@ -137,6 +137,10 @@ ENGINE_DEFAULT_OFF_TARGET = "native_cuda_default_off_state_capture_gpu"
 ENGINE_BASE_FEATURES = "native-cuda,cuda-13000"
 ENGINE_GPU_FEATURES = "gpu-tests,cuda-13000"
 ENGINE_DEFAULT_OFF_MIN_TESTS = 1
+BENCH_PACKAGE = "onnx-genai-bench"
+BENCH_FREETOKEN_TARGET = "freetoken_byte_accounting_gpu"
+BENCH_FREETOKEN_FEATURES = "gpu-tests,cuda-13000"
+BENCH_FREETOKEN_MIN_TESTS = 4
 
 
 def run(command: list[str | Path]) -> subprocess.CompletedProcess[str]:
@@ -1143,6 +1147,24 @@ def verify_production_feature_targets() -> tuple[list[str], list[str]]:
         )
     )
 
+    # The FreeToken receipt target is feature-required by its manifest, so it
+    # has no without-gpu-tests binary to compare. Census the exact feature-on
+    # target explicitly: otherwise a new benchmark-crate GPU test sits outside
+    # the CUDA EP/memory directory scans and can disappear while this checker
+    # still reports a complete inventory.
+    bench_binary = build_named_test_binary(
+        BENCH_PACKAGE, BENCH_FREETOKEN_TARGET, BENCH_FREETOKEN_FEATURES
+    )
+    bench_inventory = list_inventory(bench_binary)
+    errors.extend(
+        feature_target_inventory_errors(
+            f"{BENCH_PACKAGE}/{BENCH_FREETOKEN_TARGET} with {BENCH_FREETOKEN_FEATURES}",
+            bench_binary,
+            bench_inventory,
+            BENCH_FREETOKEN_MIN_TESTS,
+        )
+    )
+
     summaries = [
         f"{CUDA_PLUGIN_PACKAGE}/{CUDA_PLUGIN_TARGET}: "
         f"{len(plugin_inventory)} test(s) compiled with {CUDA_PLUGIN_FEATURES}",
@@ -1152,6 +1174,8 @@ def verify_production_feature_targets() -> tuple[list[str], list[str]]:
         f"{ENGINE_PACKAGE}/{ENGINE_DEFAULT_OFF_TARGET}: "
         f"{len(engine_base_inventory)} test(s) present without gpu-tests and ignored; "
         f"{len(engine_gpu_inventory)} present with gpu-tests and compiled only",
+        f"{BENCH_PACKAGE}/{BENCH_FREETOKEN_TARGET}: "
+        f"{len(bench_inventory)} test(s) compiled with {BENCH_FREETOKEN_FEATURES}",
     ]
     return summaries, errors
 

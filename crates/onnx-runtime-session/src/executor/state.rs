@@ -25,6 +25,7 @@ impl ProviderArtifactRequirement {
         Self { config, state }
     }
 
+    #[cfg(test)]
     pub(super) fn acquire_use(
         &self,
         config: ExecutorArtifactConfig,
@@ -42,6 +43,67 @@ impl ProviderArtifactRequirement {
             )));
         }
         self.state.acquire_use().map_err(Into::into)
+    }
+
+    fn use_context(&self, config: ExecutorArtifactConfig) -> Result<ProviderArtifactUseContext> {
+        if self.config != config {
+            return Err(SessionError::Internal(format!(
+                "baked provider-artifact requirement names provider {} executor {} generation {}, \
+                 but the active private session scope is provider {} executor {} generation {}",
+                self.config.provider().get(),
+                self.config.executor().get(),
+                self.config.generation().get(),
+                config.provider().get(),
+                config.executor().get(),
+                config.generation().get(),
+            )));
+        }
+        Ok(ProviderArtifactUseContext {
+            state: std::ptr::NonNull::from(self.state.as_ref()),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ProviderArtifactUseContext {
+    state: std::ptr::NonNull<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>,
+}
+
+impl ProviderArtifactUseContext {
+    pub(super) fn with_use<T>(self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.invoke(operation, |state, invoke| state.with_use(invoke))
+    }
+
+    pub(super) fn with_observation<T>(self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.invoke(operation, |state, invoke| state.with_observation(invoke))
+    }
+
+    fn invoke<T>(
+        self,
+        operation: impl FnOnce() -> Result<T>,
+        enter: impl FnOnce(
+            &dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState,
+            &mut dyn FnMut() -> onnx_runtime_ep_api::Result<()>,
+        ) -> onnx_runtime_ep_api::Result<()>,
+    ) -> Result<T> {
+        let mut operation = Some(operation);
+        let mut result = None;
+        let mut invoke = || {
+            result = Some(operation
+                .take()
+                .expect("provider artifact operation is invoked exactly once")(
+            ));
+            Ok(())
+        };
+        // SAFETY: the context is minted only from an Arc retained by the
+        // executor readiness state, a captured graph requirement, or a device
+        // binding. Its caller keeps that owner alive for the complete call.
+        enter(unsafe { self.state.as_ref() }, &mut invoke).map_err(SessionError::from)?;
+        result.unwrap_or_else(|| {
+            Err(SessionError::Internal(
+                "execution provider returned from with_use without invoking the operation".into(),
+            ))
+        })
     }
 }
 
@@ -205,6 +267,10 @@ impl ProviderArtifactReadiness {
         matches!(self.outcome, ProviderArtifactOutcome::Unfinalized)
     }
 
+    pub(super) fn is_complete(&self) -> bool {
+        matches!(self.outcome, ProviderArtifactOutcome::Complete { .. })
+    }
+
     /// Finalize the current specialization exactly once, then require its
     /// outcome before any eager execution, capture, or replay.
     pub(super) fn finalize_if_needed(
@@ -213,6 +279,7 @@ impl ProviderArtifactReadiness {
         config: ExecutorArtifactConfig,
         graph: &Graph,
         finalized_banks: &[FinalizedExpertBank],
+        observation_owner: Option<&(dyn std::any::Any + Send + Sync)>,
     ) -> Result<()> {
         let executor = config.executor();
         if self.needs_finalization() {
@@ -220,6 +287,7 @@ impl ProviderArtifactReadiness {
                 config.provider(),
                 config.executor(),
                 config.generation(),
+                config.logical_session(),
                 self.epoch,
                 graph,
                 finalized_banks,
@@ -244,20 +312,73 @@ impl ProviderArtifactReadiness {
                             self.epoch.get(),
                         ));
                     } else {
-                        self.outcome = match (config.route_residency(), report.into_state()) {
+                        let state = report.into_state();
+                        let terminal_compatible = matches!(
+                            (config.route_residency(), &state),
                             (
                                 ExecutorRouteResidencyConfig::Disabled,
                                 ExecutorArtifactState::Disabled,
-                            ) => ProviderArtifactOutcome::Complete {
-                                route_residency: ExecutorRouteResidency::Disabled,
-                                requirement: None,
+                            ) | (
+                                ExecutorRouteResidencyConfig::Enabled,
+                                ExecutorArtifactState::Declined | ExecutorArtifactState::Required,
+                            )
+                        );
+                        if terminal_compatible && ep.executor_artifact_observation_enabled() {
+                            let Some(owner) = observation_owner else {
+                                self.outcome = ProviderArtifactOutcome::Failed(format!(
+                                    "{} enabled executor artifact observation for executor {} \
+                                     generation {} but the private build owner is missing",
+                                    ep.name(),
+                                    config.executor().get(),
+                                    config.generation().get(),
+                                ));
+                                return self.require_complete(ep.name(), executor);
+                            };
+                            if let Err(error) = ep.commit_executor_artifact_observation(
+                                config.provider(),
+                                config.executor(),
+                                config.generation(),
+                                config.logical_session(),
+                                owner,
+                            ) {
+                                self.outcome = ProviderArtifactOutcome::Failed(error.to_string());
+                                return self.require_complete(ep.name(), executor);
+                            }
+                        }
+                        self.outcome = match (config.route_residency(), state) {
+                            (
+                                ExecutorRouteResidencyConfig::Disabled,
+                                ExecutorArtifactState::Disabled,
+                            ) => match ep.executor_artifact_requirement(
+                                config.provider(),
+                                config.executor(),
+                                config.generation(),
+                                config.logical_session(),
+                            ) {
+                                Ok(requirement) => ProviderArtifactOutcome::Complete {
+                                    route_residency: ExecutorRouteResidency::Disabled,
+                                    requirement: requirement.map(|state| {
+                                        ProviderArtifactRequirement::new(config, state)
+                                    }),
+                                },
+                                Err(error) => ProviderArtifactOutcome::Failed(error.to_string()),
                             },
                             (
                                 ExecutorRouteResidencyConfig::Enabled,
                                 ExecutorArtifactState::Declined,
-                            ) => ProviderArtifactOutcome::Complete {
-                                route_residency: ExecutorRouteResidency::Declined,
-                                requirement: None,
+                            ) => match ep.executor_artifact_requirement(
+                                config.provider(),
+                                config.executor(),
+                                config.generation(),
+                                config.logical_session(),
+                            ) {
+                                Ok(requirement) => ProviderArtifactOutcome::Complete {
+                                    route_residency: ExecutorRouteResidency::Declined,
+                                    requirement: requirement.map(|state| {
+                                        ProviderArtifactRequirement::new(config, state)
+                                    }),
+                                },
+                                Err(error) => ProviderArtifactOutcome::Failed(error.to_string()),
                             },
                             (
                                 ExecutorRouteResidencyConfig::Enabled,
@@ -266,6 +387,7 @@ impl ProviderArtifactReadiness {
                                 config.provider(),
                                 config.executor(),
                                 config.generation(),
+                                config.logical_session(),
                             ) {
                                 Ok(Some(state)) => ProviderArtifactOutcome::Complete {
                                     route_residency: ExecutorRouteResidency::Required {
@@ -303,14 +425,12 @@ impl ProviderArtifactReadiness {
         self.require_complete(ep.name(), executor)
     }
 
-    /// Acquire the exact provider-owned use lease selected by private session
-    /// finalization or baked into a captured graph.
-    pub(super) fn acquire_use(
+    pub(super) fn use_context(
         &self,
         ep: &dyn ExecutionProvider,
         config: ExecutorArtifactConfig,
         exact_requirement: Option<&CapturedProviderArtifactRequirement>,
-    ) -> Result<Option<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>>> {
+    ) -> Result<Option<ProviderArtifactUseContext>> {
         self.require_complete(ep.name(), config.executor())?;
         let current = match &self.outcome {
             ProviderArtifactOutcome::Complete { requirement, .. } => requirement.as_ref(),
@@ -327,7 +447,7 @@ impl ProviderArtifactReadiness {
             }
         };
         requirement
-            .map(|requirement| requirement.acquire_use(config))
+            .map(|requirement| requirement.use_context(config))
             .transpose()
     }
 
@@ -336,6 +456,10 @@ impl ProviderArtifactReadiness {
             ProviderArtifactOutcome::Complete { requirement, .. } => requirement.as_ref(),
             _ => None,
         }
+    }
+
+    pub(super) fn observation<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
+        self.requirement()?.state.observation()?.downcast_ref::<T>()
     }
 
     pub(super) fn captured_requirement(&self) -> CapturedProviderArtifactRequirement {
@@ -405,6 +529,14 @@ pub(crate) struct Executor {
     /// device, executor, and generation and required by every artifact
     /// publication/finalization call.
     pub(super) artifact_config: ExecutorArtifactConfig,
+    /// Opaque non-zero-sized build owner retained only while observation is
+    /// enabled. Provider state compares its allocation identity, never caller
+    /// labels, before reusing a prepared observation slot.
+    pub(super) artifact_observation_owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Stable observation-only context prepared before model materialization.
+    /// This is deliberately not an artifact-use requirement.
+    pub(super) provider_observation_state:
+        Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>>,
     /// False while `ExecutorArtifactBuildTransaction` still owns rollback.
     /// Armed only after the complete executor has been constructed.
     pub(super) artifact_teardown_armed: bool,
@@ -1114,6 +1246,10 @@ pub(super) struct ExternalValue {
     pub(super) len: usize,
     pub(super) alignment: usize,
     pub(super) device: onnx_runtime_ir::DeviceId,
+    pub(super) state_publication: bool,
+    pub(super) output_publication: bool,
+    pub(super) publication_rollback_ptr: Option<usize>,
+    pub(super) publication_poison_ptr: usize,
 }
 
 impl ExternalValue {
@@ -1165,6 +1301,51 @@ impl ExternalValue {
             )
         })
     }
+
+    pub(super) fn snapshot_publication(&self, ep: &dyn ExecutionProvider) -> Result<()> {
+        let Some(rollback_ptr) = self.publication_rollback_ptr else {
+            return Ok(());
+        };
+        let source = self.readable_buffer()?;
+        // SAFETY: the exact DeviceIoBinding owns this rollback allocation and
+        // is exclusively borrowed for the complete run.
+        let mut rollback = unsafe {
+            DeviceBuffer::from_borrowed_mut_parts(
+                rollback_ptr as *mut std::ffi::c_void,
+                self.device,
+                self.len,
+                self.alignment,
+            )
+        }
+        .ok_or_else(|| SessionError::Internal("publication rollback pointer is null".into()))?;
+        ep.copy_for_publication(&source, &mut rollback, self.len)?;
+        Ok(())
+    }
+
+    pub(super) fn restore_publication(&self, ep: &dyn ExecutionProvider) -> Result<()> {
+        let Some(rollback_ptr) = self.publication_rollback_ptr else {
+            return Ok(());
+        };
+        // SAFETY: both aliases are bounded by the live binding and its private
+        // rollback allocation; the run still owns the binding exclusively.
+        let rollback = unsafe {
+            DeviceBuffer::from_borrowed_parts(
+                rollback_ptr as *mut std::ffi::c_void,
+                self.device,
+                self.len,
+                self.alignment,
+            )
+        };
+        let mut destination = self.writable_buffer()?;
+        if let Err(error) = ep.copy_for_publication(&rollback, &mut destination, self.len) {
+            if self.publication_poison_ptr != 0 {
+                // SAFETY: the binding is exclusively borrowed for this run.
+                unsafe { *(self.publication_poison_ptr as *mut bool) = true };
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -1190,6 +1371,70 @@ pub(super) struct ExternalCaptureSig {
 }
 
 impl ExternalBindings {
+    pub(super) fn publication_bytes(&self) -> Result<(u64, u64)> {
+        self.outputs
+            .values()
+            .try_fold((0_u64, 0_u64), |(state_total, output_total), value| {
+                let state_total = if value.state_publication {
+                    state_total.checked_add(value.len as u64).ok_or_else(|| {
+                        SessionError::Internal(
+                            "state-publication output byte total overflowed u64".into(),
+                        )
+                    })?
+                } else {
+                    state_total
+                };
+                let output_total = if value.output_publication {
+                    output_total.checked_add(value.len as u64).ok_or_else(|| {
+                        SessionError::Internal(
+                            "ordinary output-publication byte total overflowed u64".into(),
+                        )
+                    })?
+                } else {
+                    output_total
+                };
+                Ok((state_total, output_total))
+            })
+    }
+
+    pub(super) fn snapshot_publications(&self, ep: &dyn ExecutionProvider) -> Result<()> {
+        for value in self
+            .outputs
+            .values()
+            .filter(|value| value.state_publication || value.output_publication)
+        {
+            value.snapshot_publication(ep)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_publications(&self, ep: &dyn ExecutionProvider) -> Result<()> {
+        let mut errors = Vec::new();
+        for value in self
+            .outputs
+            .values()
+            .filter(|value| value.state_publication || value.output_publication)
+        {
+            if let Err(error) = value.restore_publication(ep) {
+                errors.push(error);
+            }
+        }
+        let sync = ep.sync().map_err(SessionError::from);
+        if errors.is_empty() {
+            return sync;
+        }
+        Err(SessionError::Internal(format!(
+            "failed to restore {} externally bound output publication(s): {}; cleanup sync={:?}",
+            errors.len(),
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+            sync.err()
+        )))
+    }
+
     fn capture_shape(value: &ExternalValue) -> &[usize] {
         value.fixed_stride_shape.as_deref().unwrap_or(&value.shape)
     }

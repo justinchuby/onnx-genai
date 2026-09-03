@@ -84,6 +84,7 @@ compile_error!(
 
 pub mod arch;
 pub mod blas;
+pub mod byte_telemetry;
 pub mod capture;
 pub mod cudnn;
 pub mod cufft;
@@ -190,4 +191,4 @@ pub fn device_argmax_scratch_words(elements: usize, batch: usize) -> usize {
     kernels::device_argmax::scratch_words(elements, batch)
 }
 pub use onnx_runtime_ep_api::RawDeviceAllocationSiteStats as CudaRawAllocationSiteStats;
-pub use runtime::{CudaAllocationCounts, CudaRuntime};
+pub use runtime::{CudaAllocationCounts, CudaRuntime, CudaTransferByteCounts};

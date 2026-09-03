@@ -49,6 +49,28 @@ impl ExecutorInstanceId {
     }
 }
 
+/// Process-unique identity of one logical inference session.
+///
+/// A logical session may own several executor instances (base decode,
+/// decode-inline, and verify). Providers receive this only as routing data and
+/// must validate it against exact provider-owned executor-generation state
+/// before using it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ExecutorLogicalSessionId(u64);
+
+impl ExecutorLogicalSessionId {
+    /// Stable numeric representation for provider-owned maps and diagnostics.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Reconstitute an identity stored in session-private lifecycle state.
+    #[doc(hidden)]
+    pub const fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 /// Exact provider-instance label echoed through session artifact calls.
 ///
 /// This is intentionally non-secret routing data, not a capability. The
@@ -447,12 +469,64 @@ pub struct DeviceValidationRegistration {
 /// transitions. Providers without mutable artifact state return `None`.
 pub trait ExecutorArtifactUseGuard: Send + Sync {}
 
+/// Transactional receipt for bound state/output publication.
+///
+/// The provider prepares this in caller-owned stack scope while exact
+/// observation authority is active. Attempted bytes are marked at submission;
+/// useful bytes publish only after synchronization and owner validation, or
+/// roll back when execution/completion fails.
+pub trait StatePublicationReceipt: Send {
+    fn mark_submitted(&mut self);
+    fn publish(&mut self) -> Result<()>;
+    fn roll_back(&mut self) -> Result<()>;
+}
+
+/// Stable provider-owned observation context for one executor generation.
+///
+/// This is deliberately separate from [`ExecutorArtifactRequirementState`]:
+/// observation may begin before route/reservation artifacts can be finalized,
+/// while artifact use remains unavailable until the session validates a
+/// terminal provider report. The session retains the exact state in bindings;
+/// callers cannot replace or upgrade it after construction.
+pub trait ExecutorArtifactObservationState: Send + Sync {
+    /// Execute one operation under this exact observation context.
+    fn with_observation(&self, operation: &mut dyn FnMut() -> Result<()>) -> Result<()>;
+}
+
 /// Provider-owned state retained by the session after it privately validates a
 /// `Required` artifact report. The session stores the returned `Arc` in its
 /// private executor state and in every baked graph requirement; there is no
 /// public constructor, issuer, binder, proof resolver, or finalization path.
 pub trait ExecutorArtifactRequirementState: Send + Sync {
     fn acquire_use(&self) -> Result<Box<dyn ExecutorArtifactUseGuard>>;
+
+    /// Execute one operation under this exact retained requirement.
+    ///
+    /// The default preserves providers that only expose an owned guard. A
+    /// provider with a preallocated hot-path context overrides this method so
+    /// executor entry, binding transfers, capture and replay do not allocate a
+    /// boxed guard merely to establish scoped authority.
+    fn with_use(&self, operation: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        let _guard = self.acquire_use()?;
+        operation()
+    }
+
+    /// Execute under provider-specific production observation authority without
+    /// acquiring a mutable artifact lease. Device bindings use this after the
+    /// session privately attached the exact retained requirement.
+    fn with_observation(&self, operation: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        operation()
+    }
+
+    /// Provider-specific observation control retained by the exact session
+    /// lifecycle owner.
+    ///
+    /// The session exposes only the observation belonging to its privately
+    /// validated requirement state; no provider/executor/generation labels are
+    /// accepted at that access boundary.
+    fn observation(&self) -> Option<&(dyn Any + Send + Sync)> {
+        None
+    }
 }
 
 impl DeviceValidationRegistration {
@@ -2079,6 +2153,52 @@ pub trait ExecutionProvider: Send + Sync {
         ))
     }
 
+    /// Whether this provider requests an executor-generation observation
+    /// context before model materialization begins.
+    ///
+    /// The default-off path performs no allocation, lookup, lock, or reference-
+    /// count operation. Participating providers allocate bounded recorder state
+    /// only after returning `true`.
+    fn executor_artifact_observation_enabled(&self) -> bool {
+        false
+    }
+
+    /// Create the stable observation-only context for one session-private
+    /// executor generation.
+    ///
+    /// `owner` is an opaque, non-zero-sized `Arc` minted and retained solely by
+    /// the session build transaction. Providers compare its allocation identity
+    /// when an exact scope already exists. This state grants no
+    /// route/reservation/artifact-use authority.
+    fn begin_executor_artifact_observation(
+        &self,
+        _provider: ExecutorArtifactProviderId,
+        _executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+        _logical_session: ExecutorLogicalSessionId,
+        _owner: Arc<dyn Any + Send + Sync>,
+    ) -> Result<Option<Arc<dyn ExecutorArtifactObservationState>>> {
+        Ok(None)
+    }
+
+    /// Bind a prepared observation context to a terminal provider-artifact
+    /// outcome after the session has validated the exact report.
+    ///
+    /// Providers that enabled early observation must require the identical
+    /// opaque `owner` allocation supplied at preparation. This transition does
+    /// not itself grant artifact use; it only permits the subsequently retained
+    /// requirement to expose the already-recorded exact-generation ledger.
+    fn commit_executor_artifact_observation(
+        &self,
+        _provider: ExecutorArtifactProviderId,
+        _executor: ExecutorInstanceId,
+        _generation: ExecutorArtifactGeneration,
+        _logical_session: ExecutorLogicalSessionId,
+        _owner: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Inspect provider artifacts required by one executor generation.
     ///
     /// Static build and every newly compiled symbolic/dynamic specialization
@@ -2094,11 +2214,13 @@ pub trait ExecutionProvider: Send + Sync {
     /// This method supplies data only. It cannot finalize a session: the
     /// session validates the report against its private immutable policy and
     /// readiness epoch before publishing a runnable state.
+    #[allow(clippy::too_many_arguments)]
     fn inspect_executor_artifacts(
         &self,
         _provider: ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        _logical_session: ExecutorLogicalSessionId,
         readiness: ExecutorArtifactReadinessEpoch,
         _graph: &Graph,
         _banks: &[crate::FinalizedExpertBank],
@@ -2126,6 +2248,7 @@ pub trait ExecutionProvider: Send + Sync {
         _provider: ExecutorArtifactProviderId,
         _executor: ExecutorInstanceId,
         _generation: ExecutorArtifactGeneration,
+        _logical_session: ExecutorLogicalSessionId,
     ) -> Result<()> {
         Ok(())
     }
@@ -2145,8 +2268,26 @@ pub trait ExecutionProvider: Send + Sync {
         _provider: ExecutorArtifactProviderId,
         _executor: ExecutorInstanceId,
         _generation: ExecutorArtifactGeneration,
+        _logical_session: ExecutorLogicalSessionId,
     ) -> Result<Option<Arc<dyn ExecutorArtifactRequirementState>>> {
         Ok(None)
+    }
+
+    /// Run one output-publication transaction with preflighted state/output
+    /// telemetry.
+    ///
+    /// Non-participating providers invoke `operation` with no receipt.
+    /// Participating providers reserve before invoking it so capacity/overflow
+    /// failure prevents the state-producing operation from being submitted.
+    /// The callback shape keeps the provider receipt stack-owned and allocation
+    /// free on warmed eager/capture/replay paths.
+    fn with_output_publication(
+        &self,
+        _state_bytes: u64,
+        _output_bytes: u64,
+        operation: &mut dyn FnMut(Option<&mut dyn StatePublicationReceipt>) -> Result<()>,
+    ) -> Result<()> {
+        operation(None)
     }
 
     /// Explicit device allocation/free counters, when the EP exposes them.
@@ -2378,6 +2519,18 @@ pub trait ExecutionProvider: Send + Sync {
             "{}: device-to-device copy is not implemented",
             self.name()
         )))
+    }
+
+    /// Snapshot or restore a complete externally bound output before semantic
+    /// publication. Host/synchronous providers use their ordinary copy;
+    /// stream-ordered providers override this to preserve capture safety.
+    fn copy_for_publication(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> Result<()> {
+        self.copy(src, dst, bytes)
     }
 
     /// EP-specific optimization passes, run after the generic optimizer.

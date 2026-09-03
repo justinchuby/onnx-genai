@@ -2047,10 +2047,13 @@ dependencies = [
  "onnx-runtime-hostmon",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-session",
  "onnx-runtime-tracer",
  "prost",
+ "serde",
  "serde_json",
+ "sha2",
  "tokenizers",
  "tokio",
 ]
@@ -2477,6 +2480,7 @@ dependencies = [
  "onnx-runtime-quantization",
  "onnx-runtime-shape-inference",
  "onnx-runtime-virtual-memory",
+ "serde",
  "thiserror 2.0.19",
 ]
 

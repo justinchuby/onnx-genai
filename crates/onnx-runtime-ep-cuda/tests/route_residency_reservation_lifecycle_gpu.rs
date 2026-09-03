@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use onnx_runtime_ep_api::{
     ExecutionProvider, ExecutorArtifactGeneration, ExecutorArtifactPending,
     ExecutorArtifactProviderId, ExecutorArtifactReadinessEpoch, ExecutorArtifactState,
-    ExecutorInstanceId, ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight, LazyWeight,
-    LazyWeightBoundary, ResidentWeight, expert_weight_groups,
+    ExecutorInstanceId, ExecutorLogicalSessionId, ExternalMmapRegion, FinalizedExpertBank,
+    FinalizedExpertWeight, LazyWeight, LazyWeightBoundary, ResidentWeight, expert_weight_groups,
 };
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
 use onnx_runtime_ep_cuda::route_residency::{
@@ -30,6 +30,7 @@ struct ArtifactScope {
     provider: ExecutorArtifactProviderId,
     executor: ExecutorInstanceId,
     generation: ExecutorArtifactGeneration,
+    logical_session: ExecutorLogicalSessionId,
 }
 
 fn artifact_scope(provider: &CudaExecutionProvider) -> ArtifactScope {
@@ -41,6 +42,9 @@ fn artifact_scope(provider: &CudaExecutionProvider) -> ArtifactScope {
         executor: ExecutorInstanceId::from_raw(NEXT_EXECUTOR.fetch_add(1, Ordering::Relaxed)),
         generation: ExecutorArtifactGeneration::from_raw(
             NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+        ),
+        logical_session: ExecutorLogicalSessionId::from_raw(
+            NEXT_EXECUTOR.fetch_add(1, Ordering::Relaxed),
         ),
     }
 }
@@ -57,6 +61,7 @@ fn finalize_artifacts(
             scope.provider,
             scope.executor,
             scope.generation,
+            scope.logical_session,
             readiness,
             graph,
             banks,
@@ -68,7 +73,12 @@ fn drain_artifacts(
     provider: &CudaExecutionProvider,
     scope: ArtifactScope,
 ) -> onnx_runtime_ep_api::Result<()> {
-    provider.drain_executor_artifacts(scope.provider, scope.executor, scope.generation)
+    provider.drain_executor_artifacts(
+        scope.provider,
+        scope.executor,
+        scope.generation,
+        scope.logical_session,
+    )
 }
 
 struct GateGuard(Option<String>);
@@ -214,7 +224,10 @@ fn qmoe_graph_and_bank(mapping_id: usize) -> (Graph, NodeId, FinalizedExpertBank
                     offset,
                     len: TENSOR_BYTES,
                 }],
-                move || ResidentWeight::new(dtype, resident_shape.clone(), Arc::clone(&bytes)),
+                move || {
+                    ResidentWeight::new(dtype, resident_shape.clone(), Arc::clone(&bytes))
+                        .map(onnx_runtime_ep_api::ResidentWeightMaterialization::reused)
+                },
             )
             .expect("lazy weight");
             FinalizedExpertWeight {
@@ -331,7 +344,12 @@ fn real_producer_installs_executor_scoped_banks_once() {
         "sibling executors own distinct stable addresses"
     );
     let first_requirement = provider
-        .executor_artifact_requirement(first.provider, first.executor, first.generation)
+        .executor_artifact_requirement(
+            first.provider,
+            first.executor,
+            first.generation,
+            first.logical_session,
+        )
         .expect("query first executor requirement")
         .expect("installed reservations publish an exact requirement");
 
@@ -669,6 +687,7 @@ fn retirement_registry_reclaims_churn_and_blocks_live_generation_aba() {
                 artifact.provider,
                 artifact.executor,
                 artifact.generation,
+                artifact.logical_session,
             )
             .expect("query churn requirement")
             .expect("installed generation");
@@ -737,6 +756,7 @@ fn retirement_registry_reclaims_churn_and_blocks_live_generation_aba() {
             replacement.provider,
             replacement.executor,
             replacement.generation,
+            replacement.logical_session,
         )
         .expect("replacement requirement")
         .expect("replacement installed");
@@ -874,6 +894,7 @@ fn default_off_retains_allocates_and_registers_nothing() {
                 artifact.provider,
                 artifact.executor,
                 artifact.generation,
+                artifact.logical_session,
             )
             .expect("query default-off requirement")
             .is_none(),

@@ -43,6 +43,7 @@
 //! refuses to dispatch on failure. That check is the sole thing that makes
 //! ep-cpu's unchecked pointer derefs sound.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,11 +54,11 @@ use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, DeviceValidationRegistration, DeviceValidationToken, EpError,
     ExecutionProvider, ExecutorArtifactGeneration, ExecutorArtifactPending, ExecutorArtifactPolicy,
     ExecutorArtifactReadinessEpoch, ExecutorArtifactState, ExecutorInstanceId,
-    ExecutorRouteResidencyConfig, ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight,
-    Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
-    expert_weight_groups, lazy_weight_candidates,
+    ExecutorLogicalSessionId, ExecutorRouteResidencyConfig, ExternalMmapRegion,
+    FinalizedExpertBank, FinalizedExpertWeight, Kernel, KernelConstantInput, KernelInput,
+    KernelMatch, LazyWeight, LazyWeightBoundary, StructuralCaptureDecline, TensorBacking,
+    TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
+    WorkspaceRequirement, WorkspaceView, expert_weight_groups, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -88,6 +89,7 @@ use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tens
 
 static NEXT_EXECUTOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_ARTIFACT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_LOGICAL_SESSION: AtomicU64 = AtomicU64::new(1);
 
 fn allocate_non_reusable_identity(counter: &AtomicU64, exhausted: &'static str) -> Result<u64> {
     counter
@@ -113,6 +115,14 @@ fn issue_artifact_generation() -> Result<ExecutorArtifactGeneration> {
     .map(ExecutorArtifactGeneration::from_raw)
 }
 
+fn issue_logical_session_id() -> Result<ExecutorLogicalSessionId> {
+    allocate_non_reusable_identity(
+        &NEXT_LOGICAL_SESSION,
+        "logical session id space exhausted; refusing to wrap and create an ABA collision",
+    )
+    .map(ExecutorLogicalSessionId::from_raw)
+}
+
 /// The session-private lifecycle value. Public EP crates see only its routing
 /// labels and can return reports; they cannot construct, clone, or finalize
 /// this authority.
@@ -121,14 +131,25 @@ struct ExecutorArtifactConfig {
     policy: ExecutorArtifactPolicy,
     executor: ExecutorInstanceId,
     generation: ExecutorArtifactGeneration,
+    logical_session: ExecutorLogicalSessionId,
 }
 
 impl ExecutorArtifactConfig {
+    #[cfg(test)]
     fn issue(policy: ExecutorArtifactPolicy, executor: ExecutorInstanceId) -> Result<Self> {
+        Self::issue_for_logical_session(policy, executor, issue_logical_session_id()?)
+    }
+
+    fn issue_for_logical_session(
+        policy: ExecutorArtifactPolicy,
+        executor: ExecutorInstanceId,
+        logical_session: ExecutorLogicalSessionId,
+    ) -> Result<Self> {
         Ok(Self {
             policy,
             executor,
             generation: issue_artifact_generation()?,
+            logical_session,
         })
     }
 
@@ -144,6 +165,10 @@ impl ExecutorArtifactConfig {
         self.generation
     }
 
+    fn logical_session(self) -> ExecutorLogicalSessionId {
+        self.logical_session
+    }
+
     fn route_residency(self) -> ExecutorRouteResidencyConfig {
         self.policy.route_residency()
     }
@@ -154,7 +179,12 @@ fn drain_executor_artifacts_panic_safe(
     config: ExecutorArtifactConfig,
 ) -> onnx_runtime_ep_api::Result<()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ep.drain_executor_artifacts(config.provider(), config.executor(), config.generation())
+        ep.drain_executor_artifacts(
+            config.provider(),
+            config.executor(),
+            config.generation(),
+            config.logical_session(),
+        )
     }))
     .unwrap_or_else(|_| {
         Err(EpError::KernelFailed(format!(
@@ -176,20 +206,94 @@ fn drain_executor_artifacts_panic_safe(
 struct ExecutorArtifactBuildTransaction {
     ep: Arc<dyn ExecutionProvider>,
     config: ExecutorArtifactConfig,
+    observation_owner: Option<Arc<dyn Any + Send + Sync>>,
+    observation_state: Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>>,
     active: bool,
 }
 
+fn with_provider_observation<T>(
+    observation: Option<&dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let Some(observation) = observation else {
+        return operation();
+    };
+    let mut operation = Some(operation);
+    let mut result = None;
+    let mut invoke = || {
+        result = Some(operation
+            .take()
+            .expect("provider observation operation is invoked exactly once")(
+        ));
+        Ok(())
+    };
+    observation
+        .with_observation(&mut invoke)
+        .map_err(SessionError::from)?;
+    result.unwrap_or_else(|| {
+        Err(SessionError::Internal(
+            "execution provider returned from observation without invoking the operation".into(),
+        ))
+    })
+}
+
 impl ExecutorArtifactBuildTransaction {
-    fn new(ep: Arc<dyn ExecutionProvider>, config: ExecutorArtifactConfig) -> Self {
-        Self {
+    fn new(ep: Arc<dyn ExecutionProvider>, config: ExecutorArtifactConfig) -> Result<Self> {
+        let mut transaction = Self {
             ep,
             config,
+            observation_owner: None,
+            observation_state: None,
             active: true,
-        }
+        };
+        transaction.prepare_observation()?;
+        Ok(transaction)
     }
 
     fn config(&self) -> ExecutorArtifactConfig {
         self.config
+    }
+
+    fn observation_owner(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.observation_owner.as_ref().map(Arc::clone)
+    }
+
+    fn observation_state(
+        &self,
+    ) -> Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>> {
+        self.observation_state.as_ref().map(Arc::clone)
+    }
+
+    fn prepare_observation(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        if !self.ep.executor_artifact_observation_enabled() {
+            return Ok(());
+        }
+        let owner: Arc<dyn Any + Send + Sync> = Arc::new([
+            self.config.executor().get(),
+            self.config.generation().get(),
+            self.config.logical_session().get(),
+        ]);
+        self.observation_owner = Some(Arc::clone(&owner));
+        self.observation_state = self
+            .ep
+            .begin_executor_artifact_observation(
+                self.config.provider(),
+                self.config.executor(),
+                self.config.generation(),
+                self.config.logical_session(),
+                owner,
+            )?
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "{} enabled executor artifact observation but returned no state for executor \
+                     {} generation {}",
+                    self.ep.name(),
+                    self.config.executor().get(),
+                    self.config.generation().get(),
+                ))
+            })
+            .map(Some)?;
+        Ok(())
     }
 
     fn rebind(
@@ -200,7 +304,10 @@ impl ExecutorArtifactBuildTransaction {
         self.abort()?;
         self.ep = ep;
         self.config = config;
+        self.observation_owner = None;
+        self.observation_state = None;
         self.active = true;
+        self.prepare_observation()?;
         Ok(())
     }
 

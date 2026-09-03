@@ -130,6 +130,7 @@ fn whole_layer_weights_salted(
                     materialize_shape.clone(),
                     vec![0u8; layer_bytes],
                 )
+                .map(onnx_runtime_ep_api::ResidentWeightMaterialization::reused)
             })
             .unwrap();
         lazies.push(lazy);
@@ -795,6 +796,7 @@ fn ineligible_boundary_declines_typed_without_building() {
                 vec![materialize_len],
                 vec![0u8; materialize_len],
             )
+            .map(onnx_runtime_ep_api::ResidentWeightMaterialization::reused)
         },
     )
     .unwrap();

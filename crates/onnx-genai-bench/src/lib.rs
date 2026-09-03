@@ -8,6 +8,7 @@ use onnx_genai_engine::{ProcessorContext, TokenId};
 use tokenizers::Tokenizer;
 
 pub mod decode_gap;
+pub mod freetoken_byte_ab;
 #[cfg(feature = "bench-native")]
 pub mod model_io;
 #[cfg(feature = "bench-native")]

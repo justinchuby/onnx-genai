@@ -772,6 +772,12 @@ fn failed_parent_build_retires_child_reservations_once_and_clean_retry_isolated(
     let Some((provider, ledger)) = provider_or_skip(0) else {
         return;
     };
+    let mut provider = Arc::try_unwrap(provider)
+        .unwrap_or_else(|_| panic!("fresh failed-build provider unexpectedly shared"));
+    provider
+        .configure_observed_byte_capacity(65_536)
+        .expect("configure failed-build observation");
+    let provider = Arc::new(provider);
     let provider_baseline = ledger.used(Tier::Device);
 
     let sibling = InferenceSession::builder()
@@ -936,7 +942,12 @@ fn executor_drop_is_bounded_while_public_artifact_guard_is_held() {
         .expect("provider artifact policy")
         .provider();
     let requirement = provider
-        .executor_artifact_requirement(provider_id, scope, generation)
+        .executor_artifact_requirement(
+            provider_id,
+            scope,
+            generation,
+            onnx_runtime_ep_api::ExecutorLogicalSessionId::from_raw(scope.get()),
+        )
         .expect("query executor requirement")
         .expect("resolved QMoE executor installed route reservations");
     let holder = requirement

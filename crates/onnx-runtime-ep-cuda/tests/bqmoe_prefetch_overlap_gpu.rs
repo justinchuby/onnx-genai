@@ -282,6 +282,7 @@ fn layered_weights(layer_bytes: u64, layers: usize) -> (LayeredMmap, Vec<LazyWei
                         dtype_shape.clone(),
                         vec![pattern; layer_bytes],
                     )
+                    .map(onnx_runtime_ep_api::ResidentWeightMaterialization::reused)
                 }
             })
             .unwrap();

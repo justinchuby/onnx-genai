@@ -949,7 +949,7 @@ impl PrefillTransfer for CudaPrefillTransfer {
                 .staging
                 .as_mut()
                 .ok_or_else(|| CudaPrefillError::new("fill_slot on an unreserved slot"))?;
-            fill_staging_from_regions(req.weight, req.source, staging)
+            fill_staging_from_regions(&self.runtime, req.weight, req.source, staging)
                 .map_err(|error| CudaPrefillError::new(format!("staging fill: {error}")))?;
         }
 

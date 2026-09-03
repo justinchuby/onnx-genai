@@ -21,6 +21,25 @@ impl Executor {
     pub(super) fn begin_device_validation_submission(
         &mut self,
     ) -> Result<DeviceValidationSubmission> {
+        let context = if self.provider_artifact_readiness.is_complete() {
+            self.provider_artifact_readiness.use_context(
+                self.ep.as_ref(),
+                self.artifact_config,
+                None,
+            )?
+        } else {
+            None
+        };
+        let mut operation = || self.begin_device_validation_submission_unscoped();
+        match context {
+            Some(context) => context.with_observation(operation),
+            None => operation(),
+        }
+    }
+
+    fn begin_device_validation_submission_unscoped(
+        &mut self,
+    ) -> Result<DeviceValidationSubmission> {
         let registration = self
             .validation_registration
             .as_ref()
@@ -32,6 +51,27 @@ impl Executor {
     }
 
     pub(super) fn begin_device_validation_submission_for_bindings(
+        &mut self,
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceValidationSubmission> {
+        let context = if self.provider_artifact_readiness.is_complete() {
+            self.provider_artifact_readiness.use_context(
+                self.ep.as_ref(),
+                self.artifact_config,
+                None,
+            )?
+        } else {
+            None
+        };
+        let mut operation =
+            || self.begin_device_validation_submission_for_bindings_unscoped(bindings);
+        match context {
+            Some(context) => context.with_observation(operation),
+            None => operation(),
+        }
+    }
+
+    fn begin_device_validation_submission_for_bindings_unscoped(
         &mut self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceValidationSubmission> {
@@ -126,69 +166,182 @@ impl Executor {
         let route_residency = self
             .provider_artifact_readiness
             .route_residency(self.ep.name(), self.instance_id)?;
-        let artifact_use = self.provider_artifact_readiness.acquire_use(
+        let artifact_context = self.provider_artifact_readiness.use_context(
             self.ep.as_ref(),
             self.artifact_config,
             artifact_requirement.as_ref(),
         )?;
-        let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
-        let measure_activation_plan = !nested
-            && mode == RunMode::Eager
-            && stage2.plan.is_none()
-            && activation_memory_planning_enabled();
-        self.prepare_run_buffers(inputs, external, &resolved, stage2.excluded.as_ref())?;
-        drop(_phase_setup);
+        let ep_ptr = Arc::as_ptr(&self.ep);
+        let run_under_observation = || {
+            let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
+            let measure_activation_plan = !nested
+                && mode == RunMode::Eager
+                && stage2.plan.is_none()
+                && activation_memory_planning_enabled();
+            self.prepare_run_buffers(inputs, external, &resolved, stage2.excluded.as_ref())?;
+            drop(_phase_setup);
 
-        // From here on a borrowed input handle may be installed in `buffers`;
-        // every exit path must go through `unbind_borrowed_inputs` before the
-        // caller's tensors can be dropped.
-        let outcome = self.execute_and_collect(
-            mode,
-            nested,
-            outer_scope,
-            external,
-            &mut resolved,
-            decode_memo_eligible,
-            stage2,
-            measure_activation_plan,
-        );
-        let validation = if nested {
-            drop(artifact_use);
-            Ok(())
-        } else {
-            let defer_until_binding_read = !self.graph.outputs.is_empty()
-                && mode != RunMode::Capture
-                && outcome.is_ok()
-                && self
-                    .graph
-                    .outputs
-                    .iter()
-                    .all(|output| external.outputs.contains_key(output))
-                && !route_residency.is_required();
-            if artifact_use.is_some() {
-                let sync = self.ep.sync();
-                drop(artifact_use);
-                match sync {
-                    Ok(()) => self.finish_device_validation_boundary_after_sync(route_residency),
-                    Err(error) => Err(error.into()),
-                }
-            } else {
-                drop(artifact_use);
-                self.finish_device_validation(defer_until_binding_read, route_residency)
+            external.snapshot_publications(self.ep.as_ref())?;
+            let (state_publication_bytes, output_publication_bytes) =
+                external.publication_bytes()?;
+            let mut stage2 = Some(stage2);
+            let mut transaction_result = None;
+            let mut transaction = |mut state_publication: Option<
+                &mut dyn onnx_runtime_ep_api::StatePublicationReceipt,
+            >| {
+                transaction_result = Some({
+                    // The route/use lease covers submission through
+                    // synchronization. The outer observation context remains
+                    // active through validation and publication/rollback.
+                    let mut execute_and_sync = || {
+                        if let Some(receipt) = state_publication.as_mut() {
+                            receipt.mark_submitted();
+                        }
+                        let outcome = self.execute_and_collect(
+                            mode,
+                            nested,
+                            outer_scope,
+                            external,
+                            &mut resolved,
+                            decode_memo_eligible,
+                            stage2
+                                .take()
+                                .expect("publication transaction is invoked exactly once"),
+                            measure_activation_plan,
+                        );
+                        let sync = if nested || artifact_context.is_none() {
+                            Ok(())
+                        } else {
+                            self.ep.sync().map_err(SessionError::from)
+                        };
+                        Ok((outcome, sync))
+                    };
+                    let execution = match artifact_context {
+                        Some(context) => context.with_use(execute_and_sync),
+                        None => execute_and_sync(),
+                    };
+                    let (outcome, sync) = match execution {
+                        Ok(execution) => execution,
+                        Err(error) => (Err(error), Ok(())),
+                    };
+
+                    let sync_succeeded = sync.is_ok();
+                    let validation = if nested {
+                        Ok(())
+                    } else {
+                        let defer_until_binding_read = !self.graph.outputs.is_empty()
+                            && mode != RunMode::Capture
+                            && outcome.is_ok()
+                            && self
+                                .graph
+                                .outputs
+                                .iter()
+                                .all(|output| external.outputs.contains_key(output))
+                            && !route_residency.is_required();
+                        match sync {
+                            Err(error) => Err(error),
+                            Ok(()) if artifact_context.is_some() => {
+                                self.finish_device_validation_boundary_after_sync(route_residency)
+                            }
+                            Ok(()) => self.finish_device_validation(
+                                defer_until_binding_read,
+                                route_residency,
+                            ),
+                        }
+                    };
+                    if sync_succeeded && let Some(submission) = validation_submission.as_mut() {
+                        submission.disarm();
+                    }
+
+                    let operation_succeeded = outcome.is_ok() && validation.is_ok();
+                    let state_restore = if operation_succeeded {
+                        Ok(())
+                    } else {
+                        external.restore_publications(self.ep.as_ref())
+                    };
+                    let publication = match state_publication.as_mut() {
+                        Some(receipt) if operation_succeeded => {
+                            receipt.publish().map_err(Into::into)
+                        }
+                        Some(receipt) => receipt.roll_back().map_err(Into::into),
+                        None => Ok(()),
+                    };
+                    let unbound = self.unbind_borrowed_inputs();
+                    if !decode_memo_eligible {
+                        self.scratch_resolved_shapes = std::mem::take(&mut resolved);
+                    }
+
+                    match (outcome, validation, state_restore, publication, unbound) {
+                        (Err(primary), _, Ok(()), Ok(()), Ok(())) => Err(primary),
+                        (Err(primary), _, state_restore, publication, unbound) => {
+                            Err(SessionError::Internal(format!(
+                                "{primary}; cleanup after failed execution also failed: \
+                                 state_restore={:?}, publication={:?}, unbind={:?}",
+                                state_restore.err(),
+                                publication.err(),
+                                unbound.err()
+                            )))
+                        }
+                        (Ok(_), Err(primary), Ok(()), Ok(()), Ok(())) => Err(primary),
+                        (Ok(_), Err(primary), state_restore, publication, unbound) => {
+                            Err(SessionError::Internal(format!(
+                                "{primary}; cleanup after synchronization/validation failure also \
+                                 failed: state_restore={:?}, publication={:?}, unbind={:?}",
+                                state_restore.err(),
+                                publication.err(),
+                                unbound.err()
+                            )))
+                        }
+                        (Ok(_), Ok(()), Err(primary), publication, unbound) => {
+                            Err(SessionError::Internal(format!(
+                                "{primary}; publication rollback after restore failure={:?}; \
+                                 borrowed-input cleanup={:?}",
+                                publication.err(),
+                                unbound.err()
+                            )))
+                        }
+                        (Ok(_), Ok(()), Ok(()), Err(primary), Ok(())) => Err(primary),
+                        (Ok(_), Ok(()), Ok(()), Err(primary), Err(unbind)) => {
+                            Err(SessionError::Internal(format!(
+                                "{primary}; borrowed-input cleanup also failed: {unbind}"
+                            )))
+                        }
+                        (Ok(_), Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
+                        (Ok(result), Ok(()), Ok(()), Ok(()), Ok(())) => Ok(result),
+                    }
+                });
+                Ok(())
+            };
+            // SAFETY: `self.ep` retains this allocation for the complete run.
+            let publication_entry = unsafe { &*ep_ptr }.with_output_publication(
+                state_publication_bytes,
+                output_publication_bytes,
+                &mut transaction,
+            );
+            if let Err(primary) = publication_entry {
+                let sync = self.ep.sync().map_err(SessionError::from);
+                let unbound = self.unbind_borrowed_inputs();
+                return match (sync, unbound) {
+                    (Ok(()), Ok(())) => Err(primary.into()),
+                    (sync, unbound) => Err(SessionError::Internal(format!(
+                        "{primary}; cleanup after output-publication preflight failure also \
+                         failed: sync={:?}, unbind={:?}",
+                        sync.err(),
+                        unbound.err()
+                    ))),
+                };
             }
+            transaction_result.unwrap_or_else(|| {
+                Err(SessionError::Internal(
+                    "execution provider returned from output-publication transaction without \
+                     invoking the operation"
+                        .into(),
+                ))
+            })
         };
-        if let Some(submission) = validation_submission.as_mut() {
-            submission.disarm();
-        }
-        let unbound = self.unbind_borrowed_inputs();
-        if !decode_memo_eligible {
-            self.scratch_resolved_shapes = resolved;
-        }
-        match (outcome, validation, unbound) {
-            (_, Err(e), _) => Err(e),
-            (Err(e), _, _) => Err(e),
-            (Ok(_), Ok(()), Err(e)) => Err(e),
-            (Ok(result), Ok(()), Ok(())) => Ok(result),
+        match artifact_context {
+            Some(context) => context.with_observation(run_under_observation),
+            None => run_under_observation(),
         }
     }
 

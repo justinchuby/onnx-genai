@@ -369,6 +369,7 @@ impl ExecutionProvider for HostDownloadCountingEp {
         _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
         readiness: ExecutorArtifactReadinessEpoch,
         graph: &Graph,
         _banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
@@ -475,6 +476,7 @@ impl ExecutionProvider for HostDownloadCountingEp {
         _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         _executor: ExecutorInstanceId,
         _generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
     ) -> EpResult<Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>> {
         Ok(matches!(
             self.artifact_finalization,
@@ -499,6 +501,7 @@ impl ExecutionProvider for HostDownloadCountingEp {
         _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         _generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
     ) -> EpResult<()> {
         *self
             .route_drains

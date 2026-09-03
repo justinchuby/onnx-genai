@@ -113,6 +113,7 @@ fn expert_bank(num_experts: usize, expert_bytes: usize) -> (HostMmap, Vec<LazyWe
                 let shape = shape.clone();
                 move || {
                     ResidentWeight::new(DataType::Float32, shape.clone(), resident_bytes.clone())
+                        .map(onnx_runtime_ep_api::ResidentWeightMaterialization::reused)
                 }
             })
             .unwrap();

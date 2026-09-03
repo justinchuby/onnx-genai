@@ -70,7 +70,84 @@ impl ResidentWeight {
             bytes,
         })
     }
+}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostMaterializationKind {
+    AllocatedAndWritten,
+    ReusedResident,
+    SharedBacking,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResidentWeightMaterialization {
+    resident: ResidentWeight,
+    kind: HostMaterializationKind,
+    allocated_bytes: usize,
+    written_bytes: usize,
+}
+
+impl ResidentWeightMaterialization {
+    /// Allocate new immutable host storage and copy exactly `bytes.len()` bytes
+    /// into it during this invocation.
+    pub fn copy_from_bytes(
+        dtype: DataType,
+        shape: Vec<usize>,
+        bytes: &[u8],
+    ) -> Result<Self, WeightHandleError> {
+        let resident = ResidentWeight::new(dtype, shape, Arc::<[u8]>::from(bytes))?;
+        Ok(Self {
+            resident,
+            kind: HostMaterializationKind::AllocatedAndWritten,
+            allocated_bytes: bytes.len(),
+            written_bytes: bytes.len(),
+        })
+    }
+
+    /// Return an already-resident allocation without attributing a new
+    /// allocation or write to this invocation.
+    pub fn reused(resident: ResidentWeight) -> Self {
+        Self {
+            resident,
+            kind: HostMaterializationKind::ReusedResident,
+            allocated_bytes: 0,
+            written_bytes: 0,
+        }
+    }
+
+    /// Return immutable shared/mmap-backed storage without copying it during
+    /// this invocation.
+    pub fn shared(resident: ResidentWeight) -> Self {
+        Self {
+            resident,
+            kind: HostMaterializationKind::SharedBacking,
+            allocated_bytes: 0,
+            written_bytes: 0,
+        }
+    }
+
+    pub fn resident(&self) -> &ResidentWeight {
+        &self.resident
+    }
+
+    pub fn into_resident(self) -> ResidentWeight {
+        self.resident
+    }
+
+    pub const fn kind(&self) -> HostMaterializationKind {
+        self.kind
+    }
+
+    pub const fn allocated_bytes(&self) -> usize {
+        self.allocated_bytes
+    }
+
+    pub const fn written_bytes(&self) -> usize {
+        self.written_bytes
+    }
+}
+
+impl ResidentWeight {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -289,14 +366,14 @@ pub fn expert_weight_groups(graph: &Graph) -> Vec<ExpertWeightGroup> {
 }
 
 pub trait ResidentWeightMaterializer: Send + Sync {
-    fn materialize(&self) -> Result<ResidentWeight, WeightHandleError>;
+    fn materialize(&self) -> Result<ResidentWeightMaterialization, WeightHandleError>;
 }
 
 impl<F> ResidentWeightMaterializer for F
 where
-    F: Fn() -> Result<ResidentWeight, WeightHandleError> + Send + Sync,
+    F: Fn() -> Result<ResidentWeightMaterialization, WeightHandleError> + Send + Sync,
 {
-    fn materialize(&self) -> Result<ResidentWeight, WeightHandleError> {
+    fn materialize(&self) -> Result<ResidentWeightMaterialization, WeightHandleError> {
         self()
     }
 }
@@ -375,7 +452,7 @@ impl LazyWeight {
     }
 
     /// Materialize the unchanged stock-EP resident behavior.
-    pub fn materialize(&self) -> Result<ResidentWeight, WeightHandleError> {
+    pub fn materialize(&self) -> Result<ResidentWeightMaterialization, WeightHandleError> {
         self.resident_materializer.materialize()
     }
 }
@@ -397,7 +474,9 @@ impl WeightHandle {
             Self::Lazy(weight) if capabilities.advertises(NXRT_WEIGHT_PAGING_CAPABILITY) => {
                 Ok(NegotiatedWeight::Lazy(weight.clone()))
             }
-            Self::Lazy(weight) => Ok(NegotiatedWeight::Resident(weight.materialize()?)),
+            Self::Lazy(weight) => Ok(NegotiatedWeight::Resident(
+                weight.materialize()?.into_resident(),
+            )),
         }
     }
 
@@ -425,7 +504,9 @@ impl NegotiatedWeight {
     pub fn materialize_host_fallback(&self) -> Result<ResidentWeight, WeightHandleError> {
         match self {
             Self::Resident(weight) => Ok(weight.clone()),
-            Self::Lazy(weight) => weight.materialize(),
+            Self::Lazy(weight) => weight
+                .materialize()
+                .map(ResidentWeightMaterialization::into_resident),
         }
     }
 
@@ -1286,6 +1367,7 @@ fn validate_decision(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex};
 
     use super::*;
 
@@ -1304,7 +1386,7 @@ mod tests {
     fn lazy() -> WeightHandle {
         WeightHandle::Lazy(
             LazyWeight::block_quantized_moe(DataType::Uint8, vec![4], vec![region()], || {
-                Ok(resident())
+                Ok(ResidentWeightMaterialization::reused(resident()))
             })
             .unwrap(),
         )
@@ -1328,7 +1410,7 @@ mod tests {
         let lazy = WeightHandle::Lazy(
             LazyWeight::block_quantized_moe(DataType::Uint8, vec![4], vec![region()], move || {
                 counter.fetch_add(1, Ordering::Relaxed);
-                Ok(resident())
+                Ok(ResidentWeightMaterialization::reused(resident()))
             })
             .unwrap(),
         );
@@ -1341,8 +1423,96 @@ mod tests {
         assert_eq!(weight.boundary, LazyWeightBoundary::BlockQuantizedMoe);
         assert_eq!(weight.regions, vec![region()]);
         assert_eq!(materializations.load(Ordering::Relaxed), 0);
-        assert_eq!(weight.materialize().unwrap().bytes(), &[1, 2, 3, 4]);
+        assert_eq!(
+            weight.materialize().unwrap().resident().bytes(),
+            &[1, 2, 3, 4]
+        );
         assert_eq!(materializations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn materialization_receipts_count_operations_not_resident_length() {
+        let copied =
+            ResidentWeightMaterialization::copy_from_bytes(DataType::Uint8, vec![4], &[1, 2, 3, 4])
+                .unwrap();
+        assert_eq!(copied.kind(), HostMaterializationKind::AllocatedAndWritten);
+        assert_eq!(copied.allocated_bytes(), 4);
+        assert_eq!(copied.written_bytes(), 4);
+
+        let reused = ResidentWeightMaterialization::reused(copied.resident().clone());
+        assert_eq!(reused.kind(), HostMaterializationKind::ReusedResident);
+        assert_eq!(reused.allocated_bytes(), 0);
+        assert_eq!(reused.written_bytes(), 0);
+
+        let shared = ResidentWeightMaterialization::shared(reused.resident().clone());
+        assert_eq!(shared.kind(), HostMaterializationKind::SharedBacking);
+        assert_eq!(shared.allocated_bytes(), 0);
+        assert_eq!(shared.written_bytes(), 0);
+        assert_eq!(shared.resident().bytes().len(), 4);
+    }
+
+    #[test]
+    fn concurrent_materialization_deduplicates_one_allocation_and_reports_zero_cache_hits() {
+        let cache = Arc::new(Mutex::new(None::<ResidentWeight>));
+        let allocations = Arc::new(AtomicUsize::new(0));
+        let cache_for_materializer = Arc::clone(&cache);
+        let allocations_for_materializer = Arc::clone(&allocations);
+        let lazy = Arc::new(
+            LazyWeight::block_quantized_moe(DataType::Uint8, vec![4], vec![region()], move || {
+                let mut cached = cache_for_materializer.lock().unwrap();
+                if let Some(resident) = cached.as_ref() {
+                    return Ok(ResidentWeightMaterialization::reused(resident.clone()));
+                }
+                let materialization = ResidentWeightMaterialization::copy_from_bytes(
+                    DataType::Uint8,
+                    vec![4],
+                    &[9, 8, 7, 6],
+                )?;
+                allocations_for_materializer.fetch_add(1, Ordering::Relaxed);
+                *cached = Some(materialization.resident().clone());
+                Ok(materialization)
+            })
+            .unwrap(),
+        );
+        let barrier = Arc::new(Barrier::new(8));
+        let receipts = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    let lazy = Arc::clone(&lazy);
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        lazy.materialize().unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(allocations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            receipts
+                .iter()
+                .map(ResidentWeightMaterialization::allocated_bytes)
+                .sum::<usize>(),
+            4
+        );
+        assert_eq!(
+            receipts
+                .iter()
+                .map(ResidentWeightMaterialization::written_bytes)
+                .sum::<usize>(),
+            4
+        );
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| receipt.kind() == HostMaterializationKind::ReusedResident)
+                .count(),
+            7
+        );
     }
 
     #[test]

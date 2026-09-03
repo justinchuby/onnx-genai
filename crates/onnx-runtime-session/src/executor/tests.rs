@@ -132,6 +132,7 @@ struct DeferredValidationEp {
     next_validation_generation: Arc<AtomicU64>,
     validation_consume_attempts: Arc<AtomicUsize>,
     sync_calls: Arc<AtomicUsize>,
+    sync_failure: Arc<AtomicBool>,
     panic_next: Arc<AtomicBool>,
     graph_reset_failure: Arc<AtomicBool>,
     graph_reset_calls: Arc<AtomicUsize>,
@@ -165,6 +166,13 @@ impl onnx_runtime_ep_api::ExecutorArtifactRequirementState for TestArtifactRequi
         &self,
     ) -> onnx_runtime_ep_api::Result<Box<dyn onnx_runtime_ep_api::ExecutorArtifactUseGuard>> {
         Ok(Box::new(TestArtifactUseGuard))
+    }
+
+    fn with_use(
+        &self,
+        operation: &mut dyn FnMut() -> onnx_runtime_ep_api::Result<()>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        operation()
     }
 }
 
@@ -223,6 +231,7 @@ impl DeferredValidationEp {
             next_validation_generation: Arc::new(AtomicU64::new(1)),
             validation_consume_attempts: Arc::new(AtomicUsize::new(0)),
             sync_calls: Arc::new(AtomicUsize::new(0)),
+            sync_failure: Arc::new(AtomicBool::new(false)),
             panic_next: Arc::new(AtomicBool::new(false)),
             graph_reset_failure: Arc::new(AtomicBool::new(false)),
             graph_reset_calls: Arc::new(AtomicUsize::new(0)),
@@ -374,11 +383,40 @@ impl ExecutionProvider for DeferredValidationEp {
         self.cpu.copy_to_host(src, dst)
     }
 
+    fn copy_device_to_device(
+        &self,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        dst: &mut DeviceBuffer,
+        dst_offset: usize,
+        bytes: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        if src_offset + bytes > src.len() || dst_offset + bytes > dst.len() {
+            return Err(EpError::KernelFailed(
+                "test D2D publication copy exceeds its host buffers".into(),
+            ));
+        }
+        // SAFETY: both test buffers are host allocations and ranges were checked.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().cast::<u8>().add(src_offset),
+                dst.as_mut_ptr().cast::<u8>().add(dst_offset),
+                bytes,
+            );
+        }
+        Ok(())
+    }
+
     fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
         self.sync_calls.fetch_add(1, Ordering::Relaxed);
         self.synchronized_executions
             .store(self.executions.load(Ordering::Relaxed), Ordering::Relaxed);
         self.route_lifecycle_events.lock().unwrap().push("sync");
+        if self.sync_failure.swap(false, Ordering::Relaxed) {
+            return Err(EpError::KernelFailed(
+                "forced deferred-validation synchronization failure".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -548,6 +586,7 @@ impl ExecutionProvider for DeferredValidationEp {
         _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
         readiness: ExecutorArtifactReadinessEpoch,
         _graph: &Graph,
         _banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
@@ -589,6 +628,7 @@ impl ExecutionProvider for DeferredValidationEp {
         _provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         _executor: ExecutorInstanceId,
         _generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
     ) -> onnx_runtime_ep_api::Result<
         Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>,
     > {
@@ -618,7 +658,7 @@ fn route_residency_finalization_rejects_foreign_capability() {
     let mut readiness = ProviderArtifactReadiness::default();
 
     let error = readiness
-        .finalize_if_needed(&ep, config, &Graph::new(), &[])
+        .finalize_if_needed(&ep, config, &Graph::new(), &[], None)
         .expect_err("a provider cannot resolve another executor's route boundary");
     assert!(
         error
@@ -685,7 +725,7 @@ fn disabled_artifact_config_rejects_required_finalization_without_publication() 
     let mut readiness = ProviderArtifactReadiness::default();
 
     let error = readiness
-        .finalize_if_needed(&ep, config, &Graph::new(), &[])
+        .finalize_if_needed(&ep, config, &Graph::new(), &[], None)
         .expect_err("Disabled cannot accept a Required finalization");
     assert!(
         error
@@ -710,14 +750,14 @@ fn stale_finalization_epoch_replay_fails_closed() {
     .expect("issue private executor artifact configuration");
     let mut readiness = ProviderArtifactReadiness::default();
     readiness
-        .finalize_if_needed(&ep, config, &Graph::new(), &[])
+        .finalize_if_needed(&ep, config, &Graph::new(), &[], None)
         .expect("initial exact-generation finalization");
 
     readiness.advance_to(ExecutorArtifactReadinessEpoch::new(1));
     ep.replay_artifact_finalization
         .store(true, Ordering::Relaxed);
     let error = readiness
-        .finalize_if_needed(&ep, config, &Graph::new(), &[])
+        .finalize_if_needed(&ep, config, &Graph::new(), &[], None)
         .expect_err("a finalization from the previous epoch cannot be replayed");
     assert!(
         error
@@ -1305,6 +1345,70 @@ fn route_residency_owner_boundary_forces_device_bound_receipt_synchronization() 
         1,
         "a failed owner receipt must prevent route-boundary consumption"
     );
+}
+
+#[test]
+fn bound_output_publication_waits_for_sync_and_owner_validation_and_retry_is_clean() {
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.route_boundary_required.store(true, Ordering::Relaxed);
+    ep.fail_next.store(false, Ordering::Relaxed);
+    let (mut executor, mut bindings) =
+        deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+
+    let bytes = |values: [f32; 2]| {
+        values
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    let read = |binding: &mut DeviceIoBinding| {
+        binding
+            .read_bytes()
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
+            .collect::<Vec<_>>()
+    };
+
+    bindings[0].write_bytes(0, &bytes([3.0, 7.0])).unwrap();
+    bindings[1].write_bytes(0, &bytes([11.0, 13.0])).unwrap();
+    ep.fail_next.store(true, Ordering::Relaxed);
+    let validation = executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect_err("owner validation must reject the prepared output");
+    assert!(
+        validation
+            .to_string()
+            .contains("device validation failed (flags=0x40)"),
+        "{validation}"
+    );
+    assert_eq!(read(&mut bindings[1]), vec![11.0, 13.0]);
+
+    ep.fail_next.store(false, Ordering::Relaxed);
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("retry after validation rollback");
+    assert_eq!(read(&mut bindings[1]), vec![3.0, 7.0]);
+
+    bindings[0].write_bytes(0, &bytes([17.0, 19.0])).unwrap();
+    bindings[1].write_bytes(0, &bytes([23.0, 29.0])).unwrap();
+    ep.sync_failure.store(true, Ordering::Relaxed);
+    let sync = executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect_err("synchronization must reject the prepared output");
+    assert!(
+        sync.to_string()
+            .contains("forced deferred-validation synchronization failure"),
+        "{sync}"
+    );
+    assert_eq!(read(&mut bindings[1]), vec![23.0, 29.0]);
+
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("retry after synchronization rollback");
+    assert_eq!(read(&mut bindings[1]), vec![17.0, 19.0]);
 }
 
 #[test]
@@ -2579,6 +2683,10 @@ fn capture_shapes_seed_unresolved_external_values_without_overwriting_resolved_s
         len: 0,
         alignment: 1,
         device: onnx_runtime_ir::DeviceId::cpu(),
+        state_publication: false,
+        output_publication: false,
+        publication_rollback_ptr: None,
+        publication_poison_ptr: 0,
     };
     let mut external = ExternalBindings::default();
     external
@@ -5239,7 +5347,7 @@ impl Kernel for WeightDeliveryKernel {
                         "nxrt test EP expected a lazy WeightHandle".into(),
                     ));
                 };
-                let resident = lazy.materialize()?;
+                let resident = lazy.materialize()?.into_resident();
                 Self::copy_bytes(resident.bytes(), &mut outputs[0])
             }
         }
@@ -6723,7 +6831,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     unsafe {
         runtime.free_raw(control_ptr).unwrap();
     }
-    runtime.test_drain_raw_pool();
+    runtime.test_drain_raw_pool().unwrap();
     assert!(
         runtime.allocation_counts().frees > alloc_before.frees,
         "CUDA free falsifier"
@@ -6846,8 +6954,24 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         HOST_ALLOCATION_SIZES.with(Cell::get)
     );
     assert_eq!(runtime.allocation_counts(), allocations);
-    assert_eq!(runtime.transfer_counts(), transfers);
-    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+    let replay_transfers = runtime.transfer_counts();
+    assert_eq!(replay_transfers.host_to_device, transfers.host_to_device);
+    let validation_reads = replay_transfers.device_to_host - transfers.device_to_host;
+    assert!(
+        (1..=3).contains(&validation_reads),
+        "the first completion-correct replay must read its owner/capture validation receipts \
+         before publishing bound output/state; observed {validation_reads} D2H read(s)"
+    );
+    assert_eq!(
+        replay_transfers.async_host_to_device,
+        transfers.async_host_to_device
+    );
+    assert_eq!(
+        runtime.forced_synchronization_count(),
+        synchronizations + 2,
+        "the first captured launch synchronizes for completion validation and the publication \
+         boundary"
+    );
     assert_eq!(
         onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
         preparation
@@ -6893,8 +7017,17 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         });
         host_allocations += replay_allocations;
         assert_eq!(runtime.allocation_counts(), allocations);
-        assert_eq!(runtime.transfer_counts(), transfers);
-        assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+        let replay_transfers = runtime.transfer_counts();
+        assert_eq!(replay_transfers.host_to_device, transfers.host_to_device);
+        assert_eq!(
+            replay_transfers.device_to_host,
+            transfers.device_to_host + 1
+        );
+        assert_eq!(
+            replay_transfers.async_host_to_device,
+            transfers.async_host_to_device
+        );
+        assert_eq!(runtime.forced_synchronization_count(), synchronizations + 2);
         assert_eq!(
             onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
             preparation
@@ -8650,17 +8783,65 @@ impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
         self.inner.executor_artifact_policy()
     }
 
+    fn executor_artifact_observation_enabled(&self) -> bool {
+        self.inner.executor_artifact_observation_enabled()
+    }
+
+    fn begin_executor_artifact_observation(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> onnx_runtime_ep_api::Result<
+        Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>>,
+    > {
+        self.inner.begin_executor_artifact_observation(
+            provider,
+            executor,
+            generation,
+            logical_session,
+            owner,
+        )
+    }
+
+    fn commit_executor_artifact_observation(
+        &self,
+        provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+        logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
+        owner: &(dyn std::any::Any + Send + Sync),
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.inner.commit_executor_artifact_observation(
+            provider,
+            executor,
+            generation,
+            logical_session,
+            owner,
+        )
+    }
+
     fn inspect_executor_artifacts(
         &self,
         provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
         readiness: onnx_runtime_ep_api::ExecutorArtifactReadinessEpoch,
         graph: &Graph,
         banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
     ) -> onnx_runtime_ep_api::Result<ExecutorArtifactReport> {
-        self.inner
-            .inspect_executor_artifacts(provider, executor, generation, readiness, graph, banks)
+        self.inner.inspect_executor_artifacts(
+            provider,
+            executor,
+            generation,
+            logical_session,
+            readiness,
+            graph,
+            banks,
+        )
     }
 
     fn executor_artifact_requirement(
@@ -8668,11 +8849,12 @@ impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
         provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
     ) -> onnx_runtime_ep_api::Result<
         Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactRequirementState>>,
     > {
         self.inner
-            .executor_artifact_requirement(provider, executor, generation)
+            .executor_artifact_requirement(provider, executor, generation, logical_session)
     }
 
     fn drain_executor_artifacts(
@@ -8680,6 +8862,7 @@ impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
         provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
     ) -> onnx_runtime_ep_api::Result<()> {
         let producer_nodes = self
             .inner
@@ -8690,7 +8873,7 @@ impl ExecutionProvider for StrictCudaBuildRollbackProbeEp {
             .unwrap()
             .push((executor, generation, producer_nodes));
         self.inner
-            .drain_executor_artifacts(provider, executor, generation)
+            .drain_executor_artifacts(provider, executor, generation, logical_session)
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
@@ -8936,6 +9119,7 @@ fn strict_cuda_failed_build_rolls_back_real_qmoe_producer_and_preserves_sibling(
             provider.executor_artifact_policy().unwrap().provider(),
             sibling_id,
             failed_generation,
+            onnx_runtime_ep_api::ExecutorLogicalSessionId::from_raw(sibling_id.get()),
         )
         .expect_err("a stale generation cannot drain the live sibling");
     assert!(
@@ -8947,7 +9131,12 @@ fn strict_cuda_failed_build_rolls_back_real_qmoe_producer_and_preserves_sibling(
     let foreign_provider =
         onnx_runtime_ep_api::ExecutorArtifactProviderId::from_raw(policy.provider().get() + 1);
     let foreign_teardown = provider
-        .drain_executor_artifacts(foreign_provider, sibling_id, sibling_generation)
+        .drain_executor_artifacts(
+            foreign_provider,
+            sibling_id,
+            sibling_generation,
+            onnx_runtime_ep_api::ExecutorLogicalSessionId::from_raw(sibling_id.get()),
+        )
         .expect_err("a foreign provider label cannot drain the live sibling");
     assert!(foreign_teardown.to_string().contains("is foreign"));
     let sibling_after_hostile_teardown = provider.route_residency_executor_status(sibling_id);
@@ -9163,6 +9352,7 @@ impl ExecutionProvider for BuildTransactionProbeEp {
         provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
         readiness: onnx_runtime_ep_api::ExecutorArtifactReadinessEpoch,
         _graph: &Graph,
         _banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
@@ -9193,6 +9383,7 @@ impl ExecutionProvider for BuildTransactionProbeEp {
         provider: onnx_runtime_ep_api::ExecutorArtifactProviderId,
         executor: ExecutorInstanceId,
         generation: ExecutorArtifactGeneration,
+        _logical_session: onnx_runtime_ep_api::ExecutorLogicalSessionId,
     ) -> onnx_runtime_ep_api::Result<()> {
         if self.panic_cleanup.swap(false, Ordering::Relaxed) {
             panic!("injected provider rollback panic");
@@ -10747,6 +10938,10 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
             len: 8,
             alignment: 8,
             device: onnx_runtime_ir::DeviceId::cpu(),
+            state_publication: false,
+            output_publication: false,
+            publication_rollback_ptr: None,
+            publication_poison_ptr: 0,
         },
     );
     exec.seed_warm_decode_capture_shapes(&mut mismatched, &other);

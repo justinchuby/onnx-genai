@@ -60,11 +60,12 @@ pub use provider::{
     ArgmaxTieBreak, BoundBufferOwnership, CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner,
     DeviceGraphSlot, DeviceGraphToken, DeviceValidationOwner, DeviceValidationRegistration,
     DeviceValidationToken, EpConfig, EpId, ExecutionProvider, ExecutorArtifactGeneration,
-    ExecutorArtifactPending, ExecutorArtifactPolicy, ExecutorArtifactProviderId,
-    ExecutorArtifactReadinessEpoch, ExecutorArtifactReport, ExecutorArtifactRequirementState,
-    ExecutorArtifactState, ExecutorArtifactUseGuard, ExecutorInstanceId, ExecutorKernelScope,
+    ExecutorArtifactObservationState, ExecutorArtifactPending, ExecutorArtifactPolicy,
+    ExecutorArtifactProviderId, ExecutorArtifactReadinessEpoch, ExecutorArtifactReport,
+    ExecutorArtifactRequirementState, ExecutorArtifactState, ExecutorArtifactUseGuard,
+    ExecutorInstanceId, ExecutorKernelScope, ExecutorLogicalSessionId,
     ExecutorRouteResidencyConfig, Fence, HostToDeviceCopier, RawDeviceAllocationSiteStats,
-    SealedDeviceAllocation, StructuralCaptureDecline, WorkspaceAllocation,
+    SealedDeviceAllocation, StatePublicationReceipt, StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{
@@ -72,16 +73,16 @@ pub use tensor::{
 };
 pub use weight::{
     AdmissionPolicyInput, EvictionClass, ExecutionProviderCapabilities, ExpertWeightGroup,
-    FinalizedExpertBank, FinalizedExpertWeight, LazyDeviceWeightBinder, LazyWeight,
-    LazyWeightBoundary, LazyWeightCandidate, MmapRegionSource, NXRT_WEIGHT_PAGING_CAPABILITY,
-    NegotiatedWeight, PagedWeight, Phase3aHostOnlyBinder, ResidencyDecision,
-    ResidencyDegradationReason, ResidencyPlan, ResidencyPolicy, ResidencyPolicyInput,
-    ResidencyResizeOutcome, ResidencyResizePlan, ResidencyResizeRequest, ResidentWeight,
-    ResidentWeightMaterializer, ResizeDirection, ResizeRejection, ResizeSafePoint,
-    RoutedResidencyCoverage, RoutedResidencyGuardHandle, RoutedResidencyProof,
-    RoutedResidencyRequirement, StaticProfileResidencyPolicy, WeightHandle, WeightHandleError,
-    WholeBankReason, WholeBankResidentPolicy, expert_weight_groups, lazy_weight_candidates,
-    plan_residency, plan_resize, prove_routed_residency,
+    FinalizedExpertBank, FinalizedExpertWeight, HostMaterializationKind, LazyDeviceWeightBinder,
+    LazyWeight, LazyWeightBoundary, LazyWeightCandidate, MmapRegionSource,
+    NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight, PagedWeight, Phase3aHostOnlyBinder,
+    ResidencyDecision, ResidencyDegradationReason, ResidencyPlan, ResidencyPolicy,
+    ResidencyPolicyInput, ResidencyResizeOutcome, ResidencyResizePlan, ResidencyResizeRequest,
+    ResidentWeight, ResidentWeightMaterialization, ResidentWeightMaterializer, ResizeDirection,
+    ResizeRejection, ResizeSafePoint, RoutedResidencyCoverage, RoutedResidencyGuardHandle,
+    RoutedResidencyProof, RoutedResidencyRequirement, StaticProfileResidencyPolicy, WeightHandle,
+    WeightHandleError, WholeBankReason, WholeBankResidentPolicy, expert_weight_groups,
+    lazy_weight_candidates, plan_residency, plan_resize, prove_routed_residency,
 };
 
 // Re-export the device vocabulary from the IR so EP authors have one import.

@@ -339,6 +339,9 @@ pub struct DeviceIoBinding {
     fixed_physical_strides: bool,
     buffer: Option<DeviceBuffer>,
     allocator: Arc<dyn ExecutionProvider>,
+    artifact_observation: Option<Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>>,
+    publication_rollback: Option<DeviceBuffer>,
+    publication_poisoned: bool,
     transfer_stats: DeviceBindingTransferStats,
     /// Most recent graph generation that captured this address. A stale token
     /// cannot reset another executor's graph.
@@ -348,11 +351,194 @@ pub struct DeviceIoBinding {
     /// Exact deferred-validation generation whose output was submitted into
     /// this binding. Foreign bindings never receive this token.
     device_validation: Option<DeviceValidationToken>,
+    state_publication: bool,
+    output_publication: bool,
+}
+
+fn with_artifact_observation<T>(
+    observation: Option<&dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let Some(observation) = observation else {
+        return operation();
+    };
+    let mut operation = Some(operation);
+    let mut result = None;
+    let mut invoke = || {
+        result = Some(operation
+            .take()
+            .expect("device-binding artifact operation is invoked exactly once")(
+        ));
+        Ok(())
+    };
+    observation.with_observation(&mut invoke)?;
+    result.unwrap_or_else(|| {
+        Err(SessionError::Internal(
+            "execution provider returned from binding observation without invoking the operation"
+                .into(),
+        ))
+    })
+}
+
+fn with_artifact_observation_ptr<T>(
+    observation: Option<
+        std::ptr::NonNull<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>,
+    >,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let Some(observation) = observation else {
+        return operation();
+    };
+    let mut operation = Some(operation);
+    let mut result = None;
+    let mut invoke = || {
+        result = Some(operation
+            .take()
+            .expect("device-binding artifact operation is invoked exactly once")(
+        ));
+        Ok(())
+    };
+    // SAFETY: every pointer passed here is borrowed from an Arc retained by the
+    // binding for the complete call.
+    unsafe { observation.as_ref() }.with_observation(&mut invoke)?;
+    result.unwrap_or_else(|| {
+        Err(SessionError::Internal(
+            "execution provider returned from binding observation without invoking the operation"
+                .into(),
+        ))
+    })
+}
+
+fn check_device_validation(
+    allocator: &dyn ExecutionProvider,
+    registration: &DeviceValidationRegistration,
+    validation: Option<DeviceValidationToken>,
+) -> Result<()> {
+    let Some(token) = validation else {
+        return Ok(());
+    };
+    let flags = allocator.consume_device_validation_error(registration, token)?;
+    if flags != 0 {
+        return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+            "{}: device validation failed (flags=0x{flags:x})",
+            allocator.name()
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 impl DeviceIoBinding {
+    /// Mark this output as authoritative session state.
+    ///
+    /// The executor reserves a provider state-publication receipt before
+    /// submitting the operation and publishes it only after successful
+    /// execution.
+    pub fn mark_state_publication(&mut self) -> Result<()> {
+        if self.output_name.is_none() {
+            return Err(SessionError::ExternalBuffer {
+                binding: self.input_name.clone(),
+                reason: "state publication requires an output binding".into(),
+            });
+        }
+        if self.publication_rollback.is_none() {
+            let bytes = self.buffer().len();
+            self.publication_rollback = Some(with_artifact_observation(
+                self.artifact_observation.as_deref(),
+                || {
+                    Ok(self
+                        .allocator
+                        .allocate(bytes, TensorLayout::contiguous().alignment)?)
+                },
+            )?);
+        }
+        self.state_publication = true;
+        self.output_publication = false;
+        Ok(())
+    }
+
+    pub(crate) fn state_publication_bytes(&self) -> u64 {
+        if self.state_publication && self.output_name.is_some() {
+            self.buffer().len() as u64
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn output_publication_bytes(&self) -> u64 {
+        if self.output_publication && self.output_name.is_some() {
+            self.buffer().len() as u64
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn disable_output_publication_transaction(&mut self) {
+        self.output_publication = false;
+    }
+
+    pub(crate) fn publication_rollback_ptr(&self) -> Option<usize> {
+        self.publication_rollback
+            .as_ref()
+            .map(|buffer| buffer.as_ptr() as usize)
+    }
+
+    pub(crate) fn publication_poison_ptr(&mut self) -> *mut bool {
+        &mut self.publication_poisoned
+    }
+
+    pub(crate) fn publication_is_poisoned(&self) -> bool {
+        self.publication_poisoned
+    }
+
+    pub(crate) fn snapshot_publication(&mut self) -> Result<()> {
+        if !self.state_publication && !self.output_publication {
+            return Ok(());
+        }
+        let source = self
+            .buffer
+            .as_ref()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        let rollback = self.publication_rollback.as_mut().ok_or_else(|| {
+            SessionError::Internal(format!(
+                "device binding '{}' has publication semantics but no rollback allocation",
+                self.input_name
+            ))
+        })?;
+        self.allocator
+            .copy_for_publication(source, rollback, source.len())?;
+        Ok(())
+    }
+
+    pub(crate) fn restore_publication(&mut self) -> Result<()> {
+        if !self.state_publication && !self.output_publication {
+            return Ok(());
+        }
+        let rollback = self.publication_rollback.as_ref().ok_or_else(|| {
+            SessionError::Internal(format!(
+                "device binding '{}' has publication semantics but no rollback allocation",
+                self.input_name
+            ))
+        })?;
+        let destination = self
+            .buffer
+            .as_mut()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        if let Err(error) =
+            self.allocator
+                .copy_for_publication(rollback, destination, destination.len())
+        {
+            self.publication_poisoned = true;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn allocate(
         allocator: Arc<dyn ExecutionProvider>,
+        artifact_observation: Option<
+            Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>,
+        >,
         spec: DeviceBindingSpec,
     ) -> Result<Self> {
         let DeviceBindingSpec {
@@ -393,18 +579,39 @@ impl DeviceIoBinding {
                 std::slice::from_ref(&default_range)
             }
         };
-        let buffer = allocator_for_buffer.allocate_committed(
-            allocation_bytes,
-            TensorLayout::contiguous().alignment,
-            ranges,
-        )?;
-        let validation_registration = match allocator.register_device_validation_owner() {
-            Ok(registration) => registration,
-            Err(error) => {
-                let _ = allocator.deallocate(buffer);
-                return Err(error.into());
-            }
-        };
+        let output_publication = output_name.is_some() && !bind_input;
+        let (buffer, publication_rollback, validation_registration) =
+            with_artifact_observation(artifact_observation.as_deref(), || {
+                let buffer = allocator_for_buffer.allocate_committed(
+                    allocation_bytes,
+                    TensorLayout::contiguous().alignment,
+                    ranges,
+                )?;
+                let publication_rollback = if output_publication {
+                    match allocator_for_buffer
+                        .allocate(allocation_bytes, TensorLayout::contiguous().alignment)
+                    {
+                        Ok(buffer) => Some(buffer),
+                        Err(error) => {
+                            allocator.deallocate(buffer)?;
+                            return Err(error.into());
+                        }
+                    }
+                } else {
+                    None
+                };
+                let validation_registration = match allocator.register_device_validation_owner() {
+                    Ok(registration) => registration,
+                    Err(error) => {
+                        allocator.deallocate(buffer)?;
+                        if let Some(rollback) = publication_rollback {
+                            allocator.deallocate(rollback)?;
+                        }
+                        return Err(error.into());
+                    }
+                };
+                Ok((buffer, publication_rollback, validation_registration))
+            })?;
         Ok(Self {
             input_name,
             bind_input,
@@ -417,10 +624,15 @@ impl DeviceIoBinding {
             fixed_physical_strides,
             buffer: Some(buffer),
             allocator,
+            artifact_observation,
+            publication_rollback,
+            publication_poisoned: false,
             transfer_stats: DeviceBindingTransferStats::default(),
             device_graph_token: None,
             validation_registration: Some(validation_registration),
             device_validation: None,
+            state_publication: false,
+            output_publication,
         })
     }
 
@@ -450,6 +662,9 @@ impl DeviceIoBinding {
     /// aliasing requirements cannot be, which is why this is `unsafe`.
     pub(crate) unsafe fn from_external_memory(
         allocator: Arc<dyn ExecutionProvider>,
+        artifact_observation: Option<
+            Arc<dyn onnx_runtime_ep_api::ExecutorArtifactObservationState>,
+        >,
         spec: DeviceBindingSpec,
         ptr: *mut core::ffi::c_void,
         len_bytes: usize,
@@ -507,7 +722,24 @@ impl DeviceIoBinding {
             binding: input_name.clone(),
             reason: "it is null; pass the address of a real allocation".to_string(),
         })?;
-        let validation_registration = allocator.register_device_validation_owner()?;
+        let output_publication = output_name.is_some() && !bind_input;
+        let (publication_rollback, validation_registration) =
+            with_artifact_observation(artifact_observation.as_deref(), || {
+                let publication_rollback = if output_publication {
+                    Some(allocator.allocate(required, TensorLayout::contiguous().alignment)?)
+                } else {
+                    None
+                };
+                match allocator.register_device_validation_owner() {
+                    Ok(registration) => Ok((publication_rollback, registration)),
+                    Err(error) => {
+                        if let Some(rollback) = publication_rollback {
+                            allocator.deallocate(rollback)?;
+                        }
+                        Err(error.into())
+                    }
+                }
+            })?;
         Ok(Self {
             input_name,
             bind_input,
@@ -520,10 +752,15 @@ impl DeviceIoBinding {
             fixed_physical_strides,
             buffer: Some(buffer),
             allocator,
+            artifact_observation,
+            publication_rollback,
+            publication_poisoned: false,
             transfer_stats: DeviceBindingTransferStats::default(),
             device_graph_token: None,
             validation_registration: Some(validation_registration),
             device_validation: None,
+            state_publication: false,
+            output_publication,
         })
     }
 
@@ -605,6 +842,10 @@ impl DeviceIoBinding {
 
     pub(crate) fn set_device_validation(&mut self, token: DeviceValidationToken) {
         self.device_validation = Some(token);
+    }
+
+    pub(crate) fn clear_device_validation(&mut self) {
+        self.device_validation = None;
     }
 
     #[cfg(test)]
@@ -761,8 +1002,11 @@ impl DeviceIoBinding {
                 ),
             });
         }
-        self.allocator
-            .copy_device_to_device(buffer, 0, scratch, 0, bytes)?;
+        with_artifact_observation(self.artifact_observation.as_deref(), || {
+            self.allocator
+                .copy_device_to_device(buffer, 0, scratch, 0, bytes)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -784,8 +1028,11 @@ impl DeviceIoBinding {
                 ),
             });
         }
-        self.allocator
-            .copy_device_to_device(scratch, 0, buffer, 0, bytes)?;
+        with_artifact_observation(self.artifact_observation.as_deref(), || {
+            self.allocator
+                .copy_device_to_device(scratch, 0, buffer, 0, bytes)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -794,12 +1041,16 @@ impl DeviceIoBinding {
     }
 
     pub fn write_bytes(&mut self, byte_offset: usize, bytes: &[u8]) -> Result<()> {
+        let observation = self.artifact_observation.as_deref();
+        let allocator = self.allocator.as_ref();
         let buffer = self
             .buffer
             .as_mut()
             .expect("DeviceIoBinding buffer taken only in Drop");
-        self.allocator
-            .copy_from_host_at(bytes, buffer, byte_offset)?;
+        with_artifact_observation(observation, || {
+            allocator.copy_from_host_at(bytes, buffer, byte_offset)?;
+            Ok(())
+        })?;
         self.transfer_stats.host_upload_calls += 1;
         self.transfer_stats.host_upload_bytes += bytes.len() as u64;
         Ok(())
@@ -812,31 +1063,37 @@ impl DeviceIoBinding {
     }
 
     pub fn read_bytes_into(&mut self, bytes: &mut [u8]) -> Result<()> {
-        if bytes.is_empty() {
-            self.allocator.sync()?;
-        } else {
-            self.allocator.copy_to_host(self.buffer(), bytes)?;
-        }
-        self.check_and_reset_device_validation()?;
+        let observation = self.artifact_observation.as_deref();
+        let allocator = self.allocator.as_ref();
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        let validation = self.device_validation;
+        let registration = self
+            .validation_registration
+            .as_ref()
+            .expect("device binding validation registration exists until Drop");
+        with_artifact_observation(observation, || {
+            if bytes.is_empty() {
+                allocator.sync()?;
+            } else {
+                allocator.copy_to_host(buffer, bytes)?;
+            }
+            if let Some(token) = validation {
+                let flags = allocator.consume_device_validation_error(registration, token)?;
+                if flags != 0 {
+                    return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                        "{}: device validation failed (flags=0x{flags:x})",
+                        allocator.name()
+                    ))
+                    .into());
+                }
+            }
+            Ok(())
+        })?;
         self.transfer_stats.host_download_calls += 1;
         self.transfer_stats.host_download_bytes += bytes.len() as u64;
-        Ok(())
-    }
-
-    fn check_and_reset_device_validation(&self) -> Result<()> {
-        let Some(token) = self.device_validation else {
-            return Ok(());
-        };
-        let flags = self
-            .allocator
-            .consume_device_validation_error(self.validation_registration(), token)?;
-        if flags != 0 {
-            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                "{}: device validation failed (flags=0x{flags:x})",
-                self.allocator.name()
-            ))
-            .into());
-        }
         Ok(())
     }
 
@@ -861,9 +1118,18 @@ impl DeviceIoBinding {
             });
         }
         let mut bytes = vec![0; byte_len];
+        let observation = self.artifact_observation.as_deref();
+        let allocator = self.allocator.as_ref();
+        let validation = self.device_validation;
+        let registration = self
+            .validation_registration
+            .as_ref()
+            .expect("device binding validation registration exists until Drop");
         if byte_len == 0 {
-            self.allocator.sync()?;
-            self.check_and_reset_device_validation()?;
+            with_artifact_observation(observation, || {
+                allocator.sync()?;
+                check_device_validation(allocator, registration, validation)
+            })?;
             return Ok(bytes);
         }
         // SAFETY: the offset range is checked inside the live allocation above;
@@ -876,8 +1142,10 @@ impl DeviceIoBinding {
                 buffer.alignment(),
             )
         };
-        self.allocator.copy_to_host(&alias, &mut bytes)?;
-        self.check_and_reset_device_validation()?;
+        with_artifact_observation(observation, || {
+            allocator.copy_to_host(&alias, &mut bytes)?;
+            check_device_validation(allocator, registration, validation)
+        })?;
         self.transfer_stats.host_download_calls += 1;
         self.transfer_stats.host_download_bytes += bytes.len() as u64;
         Ok(bytes)
@@ -1045,6 +1313,10 @@ impl std::fmt::Debug for DeviceIoBinding {
 
 impl Drop for DeviceIoBinding {
     fn drop(&mut self) {
+        let artifact_observation = self
+            .artifact_observation
+            .as_deref()
+            .map(std::ptr::NonNull::from);
         if let Some(buffer) = self.buffer.take() {
             let mut safe_to_release = true;
             if let Err(error) = self.allocator.sync() {
@@ -1083,7 +1355,15 @@ impl Drop for DeviceIoBinding {
                 );
             }
             if safe_to_release {
-                let _ = self.allocator.deallocate(buffer);
+                if let Err(error) = with_artifact_observation_ptr(artifact_observation, || {
+                    self.allocator.deallocate(buffer)?;
+                    Ok(())
+                }) {
+                    eprintln!(
+                        "[onnx-runtime-session] device binding drop could not release its \
+                         allocation through the exact artifact observation context: {error}"
+                    );
+                }
             } else {
                 // `DeviceBuffer` has no freeing Drop. Retaining the allocation
                 // is safer than releasing storage that in-flight work or an
@@ -1094,6 +1374,17 @@ impl Drop for DeviceIoBinding {
                 );
                 drop(buffer);
             }
+        }
+        if let Some(rollback) = self.publication_rollback.take()
+            && let Err(error) = with_artifact_observation_ptr(artifact_observation, || {
+                self.allocator.deallocate(rollback)?;
+                Ok(())
+            })
+        {
+            eprintln!(
+                "[onnx-runtime-session] device binding drop could not release its publication \
+                 rollback allocation: {error}"
+            );
         }
         if let Some(registration) = self.validation_registration.as_mut() {
             let owner = registration.owner();
@@ -1655,6 +1946,7 @@ mod tests {
         let element_count = usize::MAX / 4;
         let error = DeviceIoBinding::allocate(
             shared_cpu_ep(),
+            None,
             DeviceBindingSpec {
                 input_name: "huge".into(),
                 bind_input: true,
@@ -1738,6 +2030,7 @@ mod tests {
         // logical == physical (the state at decode construction time).
         let mut logical_mask = DeviceIoBinding::allocate(
             shared_cpu_ep(),
+            None,
             DeviceBindingSpec {
                 input_name: "attention_mask".into(),
                 bind_input: true,
@@ -1768,6 +2061,7 @@ mod tests {
         // the current logical shape, so kernels always see the padded width.
         let mut physical_mask = DeviceIoBinding::allocate(
             shared_cpu_ep(),
+            None,
             DeviceBindingSpec {
                 input_name: "attention_mask".into(),
                 bind_input: true,
@@ -1794,6 +2088,7 @@ mod tests {
     fn fixed_stride_binding_keeps_logical_shape_without_capture_decline() {
         let binding = DeviceIoBinding::allocate(
             shared_cpu_ep(),
+            None,
             DeviceBindingSpec {
                 input_name: "past_records".into(),
                 bind_input: true,
