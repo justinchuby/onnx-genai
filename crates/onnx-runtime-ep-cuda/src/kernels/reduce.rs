@@ -524,25 +524,89 @@ pub(crate) struct ReductionPlan {
     pub out_shape: Vec<usize>,
 }
 
-/// Row-major contiguous strides for `shape`.
-fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
-    let mut strides = vec![0i64; shape.len()];
-    let mut acc = 1i64;
-    for d in (0..shape.len()).rev() {
-        strides[d] = acc;
-        acc *= shape[d] as i64;
-    }
-    strides
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReductionGeometry {
+    input_count: usize,
+    out_count: usize,
+    reduce_count: usize,
 }
 
-fn contiguous_strides_usize(shape: &[usize]) -> Vec<usize> {
+fn checked_shape_product(
+    op: &str,
+    shape: &[usize],
+    axes: impl Iterator<Item = usize>,
+    purpose: &str,
+) -> Result<usize> {
+    let axes = axes.collect::<Vec<_>>();
+    if axes.iter().any(|&axis| shape[axis] == 0) {
+        return Ok(0);
+    }
+    let mut product = 1usize;
+    for axis in axes {
+        let dimension = shape[axis];
+        product = product.checked_mul(dimension).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep {op}: shape-product overflow while planning {purpose} for input shape \
+                 {shape:?}: axis {axis} has dimension {dimension}, which cannot multiply the \
+                 partial product {product} within usize. HOW: reduce the tensor dimensions before \
+                 workspace planning/admission."
+            ))
+        })?;
+    }
+    Ok(product)
+}
+
+impl ReductionGeometry {
+    fn checked(op: &str, shape: &[usize], reduce: &[bool]) -> Result<Self> {
+        if shape.len() != reduce.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: reduction geometry has rank {} for input shape {shape:?}, but the \
+                 reduce mask has length {}",
+                shape.len(),
+                reduce.len()
+            )));
+        }
+        let out_count = checked_shape_product(
+            op,
+            shape,
+            (0..shape.len()).filter(|&axis| !reduce[axis]),
+            "output elements from kept axes",
+        )?;
+        let reduce_count = checked_shape_product(
+            op,
+            shape,
+            (0..shape.len()).filter(|&axis| reduce[axis]),
+            "elements per reduction group",
+        )?;
+        let input_count = checked_shape_product(op, shape, 0..shape.len(), "input elements")?;
+        Ok(Self {
+            input_count,
+            out_count,
+            reduce_count,
+        })
+    }
+}
+
+fn block_reduction_parallel(geometry: &ReductionGeometry, sm_count: usize) -> bool {
+    geometry.out_count >= sm_count || geometry.reduce_count <= REDUCE_BLOCK as usize
+}
+
+/// Checked row-major contiguous strides for `shape`.
+fn contiguous_strides_usize(op: &str, shape: &[usize]) -> Result<Vec<usize>> {
     let mut strides = vec![0usize; shape.len()];
     let mut acc = 1usize;
     for d in (0..shape.len()).rev() {
         strides[d] = acc;
-        acc *= shape[d];
+        acc = acc.checked_mul(shape[d]).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep {op}: stride-product overflow for input shape {shape:?} at axis {d}: \
+                 dimension {} cannot multiply the trailing stride {} within usize. HOW: reduce \
+                 the tensor dimensions before workspace planning/admission.",
+                shape[d], strides[d]
+            ))
+        })?;
     }
-    strides
+    Ok(strides)
 }
 
 fn reduced_output_shape(in_shape: &[usize], reduce: &[bool], keepdims: bool) -> Vec<usize> {
@@ -562,6 +626,7 @@ fn reduced_output_shape(in_shape: &[usize], reduce: &[bool], keepdims: bool) -> 
 /// Build same-rank input/output descriptors; squeezed ONNX output dimensions
 /// remain size-one in cuDNN because this preserves the same contiguous storage.
 pub(crate) fn cudnn_reduce_specs(
+    op: &str,
     dtype: DataType,
     in_shape: &[usize],
     reduce: &[bool],
@@ -571,21 +636,37 @@ pub(crate) fn cudnn_reduce_specs(
         .zip(reduce)
         .map(|(&dim, &is_reduced)| if is_reduced { 1 } else { dim })
         .collect();
-    let input = TensorDescriptorSpec::new(dtype, in_shape, &contiguous_strides_usize(in_shape))?;
-    let output = TensorDescriptorSpec::new(
-        dtype,
-        &cudnn_out_shape,
-        &contiguous_strides_usize(&cudnn_out_shape),
-    )?;
+    let input_strides = contiguous_strides_usize(op, in_shape)?;
+    let output_strides = contiguous_strides_usize(op, &cudnn_out_shape)?;
+    let input = TensorDescriptorSpec::new(dtype, in_shape, &input_strides)?;
+    let output = TensorDescriptorSpec::new(dtype, &cudnn_out_shape, &output_strides)?;
     Ok((input, output))
 }
 
 /// Build the [`ReductionPlan`] for `in_shape`, a `reduce[d]` mask, and
 /// `keepdims`. The `base`/`delta` split is exact because row-major strides are
 /// independent per axis (see the module docs).
-pub(crate) fn build_plan(in_shape: &[usize], reduce: &[bool], keepdims: bool) -> ReductionPlan {
+fn build_plan(
+    op: &str,
+    in_shape: &[usize],
+    reduce: &[bool],
+    keepdims: bool,
+    geometry: &ReductionGeometry,
+) -> Result<ReductionPlan> {
     let rank = in_shape.len();
-    let strides = contiguous_strides(in_shape);
+    let strides = contiguous_strides_usize(op, in_shape)?
+        .into_iter()
+        .enumerate()
+        .map(|(axis, stride)| {
+            i64::try_from(stride).map_err(|_| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep {op}: offset-geometry overflow for input shape {in_shape:?} at axis \
+                     {axis}: contiguous stride {stride} exceeds i64. HOW: reduce the tensor \
+                     dimensions before workspace planning/admission."
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let kept_axes: Vec<usize> = (0..rank).filter(|&d| !reduce[d]).collect();
     let red_axes: Vec<usize> = (0..rank).filter(|&d| reduce[d]).collect();
@@ -593,38 +674,89 @@ pub(crate) fn build_plan(in_shape: &[usize], reduce: &[bool], keepdims: bool) ->
     let kept_dims: Vec<usize> = kept_axes.iter().map(|&d| in_shape[d]).collect();
     let red_dims: Vec<usize> = red_axes.iter().map(|&d| in_shape[d]).collect();
 
-    let base = enumerate_offsets(&kept_dims, &kept_axes, &strides);
-    let delta = enumerate_offsets(&red_dims, &red_axes, &strides);
+    let base = enumerate_offsets(
+        op,
+        in_shape,
+        &kept_dims,
+        &kept_axes,
+        &strides,
+        geometry.out_count.max(1),
+        "kept-axis offsets",
+    )?;
+    let delta = enumerate_offsets(
+        op,
+        in_shape,
+        &red_dims,
+        &red_axes,
+        &strides,
+        geometry.reduce_count.max(1),
+        "reduced-axis offsets",
+    )?;
 
     // Output shape: kept dims in order; reduced dims become size-1 (keepdims) or
     // are squeezed out.
     let out_shape = reduced_output_shape(in_shape, reduce, keepdims);
 
-    ReductionPlan {
+    Ok(ReductionPlan {
         base,
         delta,
         out_shape,
-    }
+    })
 }
 
 /// Enumerate the input offsets for every multi-index over `dims` (row-major),
 /// where `axes[k]` is the input axis of `dims[k]` and `strides` are the input
 /// strides. Returns `[0]` for an empty dim set (a single all-zero coordinate).
-fn enumerate_offsets(dims: &[usize], axes: &[usize], strides: &[i64]) -> Vec<i64> {
-    let total: usize = dims.iter().product::<usize>().max(1);
-    let mut out = Vec::with_capacity(total);
+fn enumerate_offsets(
+    op: &str,
+    in_shape: &[usize],
+    dims: &[usize],
+    axes: &[usize],
+    strides: &[i64],
+    total: usize,
+    purpose: &str,
+) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(total).map_err(|error| {
+        EpError::KernelFailed(format!(
+            "cuda_ep {op}: could not reserve {total} {purpose} entries for input shape \
+             {in_shape:?}: {error}. HOW: reduce the tensor dimensions before execution."
+        ))
+    })?;
     let mut idx = vec![0usize; dims.len()];
     loop {
         let mut off = 0i64;
         for k in 0..dims.len() {
-            off += idx[k] as i64 * strides[axes[k]];
+            let axis = axes[k];
+            let coord = i64::try_from(idx[k]).map_err(|_| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep {op}: offset-geometry overflow while planning {purpose} for input \
+                     shape {in_shape:?}: coordinate {} on axis {axis} exceeds i64",
+                    idx[k]
+                ))
+            })?;
+            let term = coord.checked_mul(strides[axis]).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep {op}: offset-geometry overflow while planning {purpose} for input \
+                     shape {in_shape:?}: coordinate {coord} times stride {} on axis {axis} \
+                     exceeds i64",
+                    strides[axis]
+                ))
+            })?;
+            off = off.checked_add(term).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep {op}: offset-geometry overflow while planning {purpose} for input \
+                     shape {in_shape:?}: adding axis {axis} contribution {term} to partial offset \
+                     {off} exceeds i64"
+                ))
+            })?;
         }
         out.push(off);
         if !next_index(dims, &mut idx) {
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Increment a row-major multi-index `idx` within `dims`; returns `false` on
@@ -794,6 +926,7 @@ struct PreparedReductionExecution {
     capturing: bool,
     axes_raw: Option<Vec<i64>>,
     reduce: Vec<bool>,
+    geometry: ReductionGeometry,
     route: ReductionCaptureRoute,
     cudnn: Option<Arc<Mutex<CudnnReduceCache>>>,
     workspace: WorkspaceRequirement,
@@ -810,6 +943,7 @@ impl std::fmt::Debug for PreparedReductionExecution {
             .field("capturing", &self.capturing)
             .field("axes_raw", &self.axes_raw)
             .field("reduce", &self.reduce)
+            .field("geometry", &self.geometry)
             .field("route", &self.route)
             .field("has_cudnn_plan", &self.cudnn.is_some())
             .field("workspace", &self.workspace)
@@ -1090,6 +1224,7 @@ impl ReduceKernel {
         dtype: DataType,
         shape: &[usize],
         reduce: &[bool],
+        geometry: &ReductionGeometry,
     ) -> ReductionCaptureRoute {
         if dtype != DataType::Float32
             || self.op.cudnn_op().is_none()
@@ -1099,22 +1234,8 @@ impl ReduceKernel {
         {
             return ReductionCaptureRoute::Nvrtc;
         }
-        let reduce_count_hint: usize = shape
-            .iter()
-            .zip(reduce.iter())
-            .filter(|&(_, &r)| r)
-            .map(|(&d, _)| d)
-            .product();
-        let out_count_hint: usize = shape
-            .iter()
-            .zip(reduce.iter())
-            .filter(|&(_, &r)| !r)
-            .map(|(&d, _)| d)
-            .product();
         let sm_count = self.runtime.capabilities().multiprocessor_count() as usize;
-        let block_reduction_parallel =
-            out_count_hint >= sm_count || reduce_count_hint <= REDUCE_BLOCK as usize;
-        if block_reduction_parallel {
+        if block_reduction_parallel(geometry, sm_count) {
             ReductionCaptureRoute::Nvrtc
         } else {
             ReductionCaptureRoute::Cudnn
@@ -1176,7 +1297,8 @@ impl ReduceKernel {
             x.shape.len(),
             self.noop_with_empty_axes,
         )?;
-        let route = self.route_for(x.dtype, x.shape, &reduce);
+        let geometry = ReductionGeometry::checked(self.op.name(), x.shape, &reduce)?;
+        let route = self.route_for(x.dtype, x.shape, &reduce, &geometry);
         let ready = self
             .capture_ready
             .lock()
@@ -1229,7 +1351,8 @@ impl ReduceKernel {
                 ));
             } else {
                 let cudnn_op = self.op.cudnn_op().expect("cuDNN route has an operation");
-                let (input_spec, output_spec) = cudnn_reduce_specs(x.dtype, x.shape, &reduce)?;
+                let (input_spec, output_spec) =
+                    cudnn_reduce_specs(self.op.name(), x.dtype, x.shape, &reduce)?;
                 let plan = self.runtime.cudnn().with_handle(|handle| {
                     handle.prepare_reduce(&input_spec, &output_spec, cudnn_op)
                 })?;
@@ -1261,6 +1384,7 @@ impl ReduceKernel {
             capturing,
             axes_raw,
             reduce,
+            geometry,
             route,
             cudnn,
             workspace,
@@ -1304,10 +1428,11 @@ impl ReduceKernel {
             x.shape.len(),
             self.noop_with_empty_axes,
         )?;
+        let geometry = ReductionGeometry::checked(self.op.name(), x.shape, &reduce)?;
         if x.shape.is_empty() || !reduce.iter().any(|&axis| axis) {
             return Ok(WorkspaceRequirement::NONE);
         }
-        let route = self.route_for(x.dtype, x.shape, &reduce);
+        let route = self.route_for(x.dtype, x.shape, &reduce, &geometry);
         if route != ReductionCaptureRoute::Cudnn {
             return Ok(WorkspaceRequirement::NONE);
         }
@@ -1339,7 +1464,8 @@ impl ReduceKernel {
             ));
         } else {
             let cudnn_op = self.op.cudnn_op().expect("cuDNN route has an operation");
-            let (input_spec, output_spec) = cudnn_reduce_specs(x.dtype, x.shape, &reduce)?;
+            let (input_spec, output_spec) =
+                cudnn_reduce_specs(self.op.name(), x.dtype, x.shape, &reduce)?;
             Arc::new(Mutex::new(self.runtime.cudnn().with_handle(|handle| {
                 handle.prepare_reduce(&input_spec, &output_spec, cudnn_op)
             })?))
@@ -1431,7 +1557,7 @@ impl ReduceKernel {
             )));
         }
 
-        if x.numel() == 0 || outputs[0].numel() == 0 {
+        if prepared.geometry.input_count == 0 || prepared.geometry.out_count == 0 {
             if capturing {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep {op}: an empty reduction cannot replace the successful warmed \
@@ -1491,7 +1617,7 @@ impl ReduceKernel {
         // (`CUDNN_STATUS_NOT_SUPPORTED`, cuDNN 9.10/9.20). Both take the single
         // fused fp16/bf16-IO f32-accumulation block reduction below instead.
         //
-        // `out_count_hint`/`reduce_count_hint` mirror `build_plan`'s
+        // The checked prepared geometry mirrors `build_plan`'s
         // `base.len()`/`delta.len()` (product of kept / reduced dims); the
         // identity (no-axis) case already returned above.
         if prepared.route == ReductionCaptureRoute::Cudnn {
@@ -1511,7 +1637,8 @@ impl ReduceKernel {
             if let Some(captured) = &captured {
                 self.validate_captured_resources(captured, &[])?;
             }
-            let (input_spec, output_spec) = cudnn_reduce_specs(x.dtype, x.shape, &reduce)?;
+            let (input_spec, output_spec) =
+                cudnn_reduce_specs(self.op.name(), x.dtype, x.shape, &reduce)?;
             let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
             let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
             let plan = captured
@@ -1536,8 +1663,8 @@ impl ReduceKernel {
                     CudnnBufferPair {
                         input: x_ptr,
                         output: y_ptr,
-                        input_numel: x.numel(),
-                        output_numel: outputs[0].numel(),
+                        input_numel: prepared.geometry.input_count,
+                        output_numel: prepared.geometry.out_count,
                     },
                     workspace,
                 )
@@ -1556,13 +1683,9 @@ impl ReduceKernel {
             return Ok(());
         }
 
-        let plan = build_plan(x.shape, &reduce, self.keepdims);
-        let out_count = plan.base.len();
-        let reduce_count = plan.delta.len();
-        if out_count == 0 || reduce_count == 0 {
-            // Empty input (a zero dim) — nothing to compute.
-            return Ok(());
-        }
+        let plan = build_plan(op, x.shape, &reduce, self.keepdims, &prepared.geometry)?;
+        let out_count = prepared.geometry.out_count;
+        let reduce_count = prepared.geometry.reduce_count;
 
         // NVRTC block-reduction path (Int64 DATA reduce; f16 and bf16 sum/mean,
         // which take the single-kernel fused fp16/bf16-IO f32-accumulation path
@@ -1785,9 +1908,6 @@ impl Kernel for ReduceKernel {
         _metadata: &[TensorMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
         let capturing = self.runtime.is_capturing()?;
-        *self.prepared_execution.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep ReduceSum: prepared-execution lock was poisoned".into())
-        })? = None;
         let prepared = self.prepare_execution(inputs, capturing)?;
         let requirement = prepared.workspace;
         *self.prepared_execution.lock().map_err(|_| {
@@ -1854,14 +1974,18 @@ mod tests {
 
     #[test]
     fn strides_are_row_major() {
-        assert_eq!(contiguous_strides(&[2, 3, 4]), vec![12, 4, 1]);
+        assert_eq!(
+            contiguous_strides_usize("ReduceSum", &[2, 3, 4]).unwrap(),
+            vec![12, 4, 1]
+        );
     }
 
     #[test]
     fn plan_reduce_last_axis_keepdims() {
         // [2,3] reduce axis 1, keepdims → out [2,1]; 2 groups of 3.
         let reduce = [false, true];
-        let plan = build_plan(&[2, 3], &reduce, true);
+        let geometry = ReductionGeometry::checked("ReduceSum", &[2, 3], &reduce).unwrap();
+        let plan = build_plan("ReduceSum", &[2, 3], &reduce, true, &geometry).unwrap();
         assert_eq!(plan.out_shape, vec![2, 1]);
         assert_eq!(plan.base, vec![0, 3]); // row starts
         assert_eq!(plan.delta, vec![0, 1, 2]); // within-row offsets
@@ -1871,7 +1995,8 @@ mod tests {
     fn plan_reduce_axis0_no_keepdims() {
         // [2,3] reduce axis 0, keepdims=false → out [3]; 3 groups of 2.
         let reduce = [true, false];
-        let plan = build_plan(&[2, 3], &reduce, false);
+        let geometry = ReductionGeometry::checked("ReduceSum", &[2, 3], &reduce).unwrap();
+        let plan = build_plan("ReduceSum", &[2, 3], &reduce, false, &geometry).unwrap();
         assert_eq!(plan.out_shape, vec![3]);
         assert_eq!(plan.base, vec![0, 1, 2]); // column starts
         assert_eq!(plan.delta, vec![0, 3]); // stride down the column
@@ -1880,10 +2005,99 @@ mod tests {
     #[test]
     fn plan_reduce_all_axes() {
         let reduce = [true, true];
-        let plan = build_plan(&[2, 3], &reduce, true);
+        let geometry = ReductionGeometry::checked("ReduceSum", &[2, 3], &reduce).unwrap();
+        let plan = build_plan("ReduceSum", &[2, 3], &reduce, true, &geometry).unwrap();
         assert_eq!(plan.out_shape, vec![1, 1]);
         assert_eq!(plan.base, vec![0]);
         assert_eq!(plan.delta, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn reduction_geometry_rejects_input_product_overflow_without_allocating() {
+        let shape = [usize::MAX, 2];
+        let reduce = [false, true];
+        let error = ReductionGeometry::checked("ReduceMean", &shape, &reduce).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cuda_ep ReduceMean"), "{message}");
+        assert!(message.contains(&format!("{shape:?}")), "{message}");
+        assert!(message.contains("axis 1"), "{message}");
+        assert!(message.contains("shape-product overflow"), "{message}");
+        assert!(message.contains("input elements"), "{message}");
+        assert!(
+            message.contains("workspace planning/admission"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reduction_geometry_rejects_reduction_extent_overflow_without_allocating() {
+        let shape = [usize::MAX, 2];
+        let reduce = [true, true];
+        let error = ReductionGeometry::checked("ReduceSum", &shape, &reduce).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cuda_ep ReduceSum"), "{message}");
+        assert!(message.contains(&format!("{shape:?}")), "{message}");
+        assert!(message.contains("axis 1"), "{message}");
+        assert!(
+            message.contains("elements per reduction group"),
+            "{message}"
+        );
+        assert!(
+            message.contains("workspace planning/admission"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reduction_geometry_rejects_output_extent_overflow_without_allocating() {
+        let shape = [usize::MAX, 2];
+        let reduce = [false, false];
+        let error = ReductionGeometry::checked("ReduceMax", &shape, &reduce).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cuda_ep ReduceMax"), "{message}");
+        assert!(message.contains(&format!("{shape:?}")), "{message}");
+        assert!(message.contains("axis 1"), "{message}");
+        assert!(
+            message.contains("output elements from kept axes"),
+            "{message}"
+        );
+        assert!(
+            message.contains("workspace planning/admission"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reduction_geometry_boundary_and_zero_dimension_are_stable() {
+        let boundary_shape = [usize::MAX, 1];
+        let boundary_reduce = [false, true];
+        let boundary =
+            ReductionGeometry::checked("ReduceSum", &boundary_shape, &boundary_reduce).unwrap();
+        assert_eq!(boundary.input_count, usize::MAX);
+        assert_eq!(boundary.out_count, usize::MAX);
+        assert_eq!(boundary.reduce_count, 1);
+
+        let zero_shape = [usize::MAX, 2, 0];
+        let zero_reduce = [true, true, true];
+        let zero = ReductionGeometry::checked("ReduceSum", &zero_shape, &zero_reduce).unwrap();
+        assert_eq!(zero.input_count, 0);
+        assert_eq!(zero.out_count, 1);
+        assert_eq!(zero.reduce_count, 0);
+    }
+
+    #[test]
+    fn reduction_route_geometry_boundaries_match_the_documented_heuristic() {
+        let below_sm_large_group =
+            ReductionGeometry::checked("ReduceSum", &[127, 257], &[false, true]).unwrap();
+        assert!(!block_reduction_parallel(&below_sm_large_group, 128));
+
+        let fills_sms =
+            ReductionGeometry::checked("ReduceSum", &[128, 257], &[false, true]).unwrap();
+        assert!(block_reduction_parallel(&fills_sms, 128));
+
+        let small_group =
+            ReductionGeometry::checked("ReduceSum", &[127, 256], &[false, true]).unwrap();
+        assert!(block_reduction_parallel(&small_group, 128));
     }
 
     #[test]
@@ -1965,12 +2179,29 @@ mod tests {
 
     #[test]
     fn cudnn_specs_keep_reduced_axes_as_size_one() {
-        let (input, output) =
-            cudnn_reduce_specs(DataType::BFloat16, &[2, 3, 4], &[true, false, true]).unwrap();
+        let (input, output) = cudnn_reduce_specs(
+            "ReduceSum",
+            DataType::BFloat16,
+            &[2, 3, 4],
+            &[true, false, true],
+        )
+        .unwrap();
         assert_eq!(input.dims(), &[1, 2, 3, 4]);
         assert_eq!(input.strides(), &[24, 12, 4, 1]);
         assert_eq!(output.dims(), &[1, 1, 3, 1]);
         assert_eq!(output.strides(), &[3, 3, 1, 1]);
+    }
+
+    #[test]
+    fn cudnn_stride_overflow_is_an_error_not_a_debug_only_panic() {
+        let shape = [usize::MAX, 2];
+        let error =
+            cudnn_reduce_specs("ReduceSum", DataType::Float32, &shape, &[false, true]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cuda_ep ReduceSum"), "{message}");
+        assert!(message.contains(&format!("{shape:?}")), "{message}");
+        assert!(message.contains("axis 0"), "{message}");
+        assert!(message.contains("stride-product overflow"), "{message}");
     }
 }
 

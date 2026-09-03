@@ -422,6 +422,17 @@ struct MatMulPlan {
     n: usize,
 }
 
+/// One structural dispatch decision shared by execution and workspace planning.
+///
+/// Both single-matrix routes own any cuBLASLt scratch in their cached private
+/// plan. Only the batched/broadcast route consumes executor-prepared workspace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatMulExecutionRoute {
+    DenseGemv,
+    DensePrivateGemm,
+    ExecutorWorkspaceGemm,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct BatchRun {
     a_matrix: usize,
@@ -482,6 +493,22 @@ fn matmul_plan(a: &[usize], b: &[usize]) -> Result<MatMulPlan> {
 }
 
 impl MatMulPlan {
+    fn execution_route(&self, dtype: GemmDtype) -> MatMulExecutionRoute {
+        let single_matrix = self.batch_shape.iter().all(|&dim| dim == 1);
+        if single_matrix
+            && self.m == 1
+            && self.k > 0
+            && self.n > 0
+            && matches!(dtype, GemmDtype::F16 | GemmDtype::F32)
+        {
+            MatMulExecutionRoute::DenseGemv
+        } else if single_matrix {
+            MatMulExecutionRoute::DensePrivateGemm
+        } else {
+            MatMulExecutionRoute::ExecutorWorkspaceGemm
+        }
+    }
+
     fn output_shape(&self) -> Vec<usize> {
         let mut shape = self.batch_shape.clone();
         shape.extend([self.m, self.n]);
@@ -533,14 +560,6 @@ fn inner_mismatch(a: &[usize], b: &[usize]) -> EpError {
     EpError::KernelFailed(format!(
         "cuda_ep MatMul: inner dimensions disagree between A {a:?} and B {b:?}"
     ))
-}
-
-fn uses_dense_gemv(plan: &MatMulPlan, dtype: GemmDtype) -> bool {
-    plan.m == 1
-        && plan.k > 0
-        && plan.n > 0
-        && plan.batch_shape.iter().product::<usize>() == 1
-        && matches!(dtype, GemmDtype::F16 | GemmDtype::F32)
 }
 
 /// Whether the M==1 fp16 `lm_head` decode MatMul takes the capturable cuBLASLt
@@ -639,6 +658,7 @@ impl MatMulKernel {
                 outputs[0].shape
             )));
         }
+        let execution_route = plan.execution_route(dtype);
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             crate::trace::product(plan.batch_shape.iter().copied())
                 .saturating_mul(plan.m as u64)
@@ -675,7 +695,7 @@ impl MatMulKernel {
         // workspace selected once at warmup. Neither path allocates, queries a
         // heuristic, or synchronizes while capturing. The gate is purely
         // structural, never tied to a model dimension.
-        if uses_dense_gemv(&plan, dtype) {
+        if execution_route == MatMulExecutionRoute::DenseGemv {
             let route = match dtype {
                 GemmDtype::F16 if lmhead_cublaslt_enabled() => MatMulCaptureRoute::CublasLt,
                 GemmDtype::F16 => MatMulCaptureRoute::F16HandGemv,
@@ -733,15 +753,13 @@ impl MatMulKernel {
         let b_matrix_bytes = plan.k * plan.n * elem_bytes;
         let c_matrix_bytes = plan.m * plan.n * elem_bytes;
 
-        let runs = plan.batch_runs();
-
         // M>1 capture-safe fast path: a plain 2-D (`batch == 1`) dense GEMM
         // reuses a cuBLASLt plan + persistent workspace selected once at warmup,
         // so replays perform no heuristic query, allocation, or synchronization
         // (its own workspace is never shared, so no post-GEMM sync is needed).
         // This closes the last CUDA-graph capture seam at a speculative M=K
         // verify width — the logits projection (`lm_head`).
-        if runs.len() == 1 && runs[0].batch == 1 {
+        if execution_route == MatMulExecutionRoute::DensePrivateGemm {
             let signature = capture_signature(MatMulCaptureRoute::CublasLt);
             if capturing {
                 Self::validate_capture_signature(&warm_state, &signature)?;
@@ -762,6 +780,7 @@ impl MatMulKernel {
             return Ok(());
         }
 
+        debug_assert_eq!(execution_route, MatMulExecutionRoute::ExecutorWorkspaceGemm);
         if capturing {
             return Err(EpError::KernelFailed(
                 "cuda_ep MatMul: batched/broadcast MatMul is not capture-safe. HOW: abort capture \
@@ -769,6 +788,7 @@ impl MatMulKernel {
                     .into(),
             ));
         }
+        let runs = plan.batch_runs();
         runs.into_iter()
             .try_for_each(|run| {
                 let params = GemmParams {
@@ -813,7 +833,7 @@ impl MatMulKernel {
         }
         let dtype = gemm_dtype(a.dtype)?;
         let plan = matmul_plan(a.shape, b.shape)?;
-        if uses_dense_gemv(&plan, dtype) {
+        if plan.execution_route(dtype) != MatMulExecutionRoute::ExecutorWorkspaceGemm {
             return Ok(WorkspaceRequirement::NONE);
         }
         let mut peak = 0usize;
@@ -1072,6 +1092,10 @@ mod tests {
         assert_eq!((p.m, p.k, p.n), (2, 3, 4));
         assert_eq!(p.output_shape(), [2, 4]);
         assert_eq!(p.batch_runs()[0].batch, 1);
+        assert_eq!(
+            p.execution_route(GemmDtype::F32),
+            MatMulExecutionRoute::DensePrivateGemm
+        );
     }
 
     #[test]
@@ -1079,6 +1103,31 @@ mod tests {
         let p = matmul_plan(&[5, 2, 3], &[5, 3, 4]).unwrap();
         assert_eq!(p.output_shape(), [5, 2, 4]);
         assert_eq!(p.batch_runs()[0].batch, 5);
+        assert_eq!(
+            p.execution_route(GemmDtype::F32),
+            MatMulExecutionRoute::ExecutorWorkspaceGemm
+        );
+    }
+
+    #[test]
+    fn route_uses_one_single_matrix_predicate_for_dynamic_shapes() {
+        let decode = matmul_plan(&[1, 17], &[17, 23]).unwrap();
+        assert_eq!(
+            decode.execution_route(GemmDtype::F32),
+            MatMulExecutionRoute::DenseGemv
+        );
+
+        let singleton_batch = matmul_plan(&[1, 4, 17], &[1, 17, 23]).unwrap();
+        assert_eq!(
+            singleton_batch.execution_route(GemmDtype::Bf16),
+            MatMulExecutionRoute::DensePrivateGemm
+        );
+
+        let batched = matmul_plan(&[2, 4, 17], &[2, 17, 23]).unwrap();
+        assert_eq!(
+            batched.execution_route(GemmDtype::F32),
+            MatMulExecutionRoute::ExecutorWorkspaceGemm
+        );
     }
 
     #[test]

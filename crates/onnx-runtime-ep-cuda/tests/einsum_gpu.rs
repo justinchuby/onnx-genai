@@ -223,9 +223,9 @@ fn registry_reachability_and_claim_declines_are_intentional() {
     );
     let cpu = CpuExecutionProvider::new();
     assert!(
-        !cpu.supports_op(model.graph.node(node), 12, &shapes, &dtypes, &[])
+        cpu.supports_op(model.graph.node(node), 12, &shapes, &dtypes, &[])
             .is_supported(),
-        "CPU/CUDA registration difference is deliberate in this CUDA-only change"
+        "CPU and CUDA must both consume the shared canonical Einsum plan after CPU support landed"
     );
 
     reset_einsum_execution_stats();
