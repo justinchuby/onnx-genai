@@ -840,9 +840,6 @@ pub enum EinsumClassification {
     /// Compatibility-only value constructed by older downstream code.
     ///
     /// Canonical planning never returns this variant for a legal equation.
-    #[deprecated(
-        note = "canonical Einsum planning is universal; use planning_classification() and semantic_plan()"
-    )]
     Unsupported(EinsumUnsupportedReason),
 }
 

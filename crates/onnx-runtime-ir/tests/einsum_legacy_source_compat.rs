@@ -1,5 +1,4 @@
 #![deny(warnings)]
-#![allow(deprecated)]
 
 use onnx_runtime_ir::{
     DataType, EinsumClassification, EinsumInput, EinsumPlan, EinsumPlanErrorKind,

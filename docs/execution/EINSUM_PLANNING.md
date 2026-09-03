@@ -66,12 +66,14 @@ schema-illegal dtypes are errors.
 `Unsupported(EinsumUnsupportedReason)`. The type is not `#[non_exhaustive]`, so
 existing downstream exhaustive matches continue to compile.
 
-`Unsupported` is deprecated and compatibility-only. Canonical planning never
-constructs it for a legal equation. A general legal contraction that does not
-fit one of the original fast-path variants is represented in the legacy
-classification as its universal `ReductionOrElementwise` product/reduction
-program. Invalid equations and schema-illegal dtypes still return errors rather
-than a classification.
+`Unsupported` is compatibility-only. Canonical planning never constructs it
+for a legal equation. A general legal contraction that does not fit one of the
+original fast-path variants is represented in the legacy classification as its
+universal `ReductionOrElementwise` product/reduction program. Invalid equations
+and schema-illegal dtypes still return errors rather than a classification.
+New code should use the planning classification described below; retaining the
+legacy variant without a deprecation lint keeps unchanged exhaustive consumers
+warning-clean.
 
 New code that needs to distinguish bounded tree planning uses
 `EinsumPlan::planning_classification()` or

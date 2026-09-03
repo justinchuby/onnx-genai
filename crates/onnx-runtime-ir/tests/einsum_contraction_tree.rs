@@ -140,7 +140,6 @@ fn precision_policy_is_explicit_and_backend_neutral() {
 }
 
 #[test]
-#[allow(deprecated)]
 fn every_required_legal_equation_has_generic_native_semantics() {
     let cases: Vec<LegalCase<'_>> = vec![
         ("i,i,i->", vec![&[2], &[2], &[2]], vec![]),
