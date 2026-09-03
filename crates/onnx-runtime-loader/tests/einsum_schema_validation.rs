@@ -1,7 +1,7 @@
 use prost::Message;
 
 use onnx_runtime_einsum_conformance::{
-    ConformanceDType, DeclaredDType, MalformedCase, malformed_cases,
+    ConformanceDType, DeclaredDType, MalformedCase, malformed_cases, named_cases,
 };
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, static_shape};
 use onnx_runtime_loader::{LoaderError, load_model_bytes, proto::onnx, validate_model};
@@ -397,6 +397,36 @@ fn malformed_graph(case: &MalformedCase) -> Graph {
     );
     graph.insert_node(node);
     graph
+}
+
+#[test]
+fn loader_accepts_the_independent_64_operand_legal_case() {
+    let case = named_cases()
+        .into_iter()
+        .find(|case| case.id == "scalar-product-64-operands")
+        .expect("high-arity conformance case");
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), case.opset);
+    let mut inputs = Vec::new();
+    for (index, shape) in case.input_shapes.iter().enumerate() {
+        let value = graph.create_named_value(
+            format!("input_{index}"),
+            malformed_dtype(DeclaredDType::Numeric(case.dtype)),
+            static_shape(shape.iter().copied()),
+        );
+        graph.add_input(value);
+        inputs.push(Some(value));
+    }
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([]));
+    graph.add_output(output);
+    let mut node = Node::new(NodeId(0), "Einsum", inputs, vec![output]);
+    node.name = case.id;
+    node.attributes.insert(
+        "equation".into(),
+        Attribute::String(case.equation.into_bytes()),
+    );
+    graph.insert_node(node);
+    validate_model(&graph).unwrap();
 }
 
 #[test]

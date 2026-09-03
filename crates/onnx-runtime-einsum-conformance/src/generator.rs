@@ -10,6 +10,10 @@ use crate::{
 };
 
 const LABELS: &[u8; 52] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/// Maximum retained/transient generator metadata admitted in one call.
+///
+/// This is an implementation resource guard, not an ONNX operand-arity limit.
+pub const GENERATOR_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
 /// Seeded bounded generator configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,10 +22,18 @@ pub struct GeneratorConfig {
     pub seed: u64,
     /// Number of random legal records after the named corpus.
     pub random_cases: usize,
-    /// Maximum semantic operand arity.
+    /// Minimum sampled operand arity. ONNX requires at least one input.
+    pub min_operands: usize,
+    /// Maximum sampled operand arity. ONNX itself imposes no maximum.
     pub max_operands: usize,
     /// Maximum physical rank of one generated operand.
     pub max_rank: usize,
+    /// Maximum generated dimension extent.
+    pub max_dimension: usize,
+    /// Maximum element count of any generated input or output tensor.
+    pub max_tensor_elements: usize,
+    /// Maximum aggregate input/output element count of one generated case.
+    pub max_total_elements: usize,
     /// Resource ceilings.
     pub limits: CaseLimits,
 }
@@ -30,8 +42,12 @@ pub struct GeneratorConfig {
 pub const DEFAULT_GENERATOR: GeneratorConfig = GeneratorConfig {
     seed: 0x0E15_2A28_5EED_C0DE,
     random_cases: 128,
+    min_operands: 1,
     max_operands: 16,
     max_rank: 8,
+    max_dimension: 3,
+    max_tensor_elements: 2_000_000,
+    max_total_elements: 4_000_000,
     limits: CaseLimits {
         unit_tensor_bytes: UNIT_TENSOR_BYTES,
         cpu_working_set_bytes: CPU_WORKING_SET_BYTES,
@@ -330,6 +346,22 @@ pub fn named_cases() -> Vec<CaseRecord> {
         ValueProfile::Finite,
         false,
     );
+    let high_arity = 64;
+    let high_arity_equation = format!("{}->", ",".repeat(high_arity - 1));
+    let high_arity_shapes = vec![Vec::new(); high_arity];
+    let high_arity_refs = high_arity_shapes
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    push(
+        "scalar-product-64-operands",
+        &high_arity_equation,
+        &high_arity_refs,
+        ConformanceDType::Float32,
+        12,
+        ValueProfile::Finite,
+        false,
+    );
 
     for arity in [4usize, 8, 16] {
         let (equation, shapes) = chain(arity);
@@ -354,19 +386,63 @@ pub fn named_cases() -> Vec<CaseRecord> {
 
 /// Generate bounded legal expressions from a deterministic seed.
 pub fn generated_cases(config: GeneratorConfig) -> Result<Vec<CaseRecord>, GeneratorError> {
-    if !(1..=32).contains(&config.max_operands) {
-        return Err(GeneratorError::MaxOperands(config.max_operands));
+    if config.min_operands == 0 {
+        return Err(GeneratorError::MinOperands);
     }
-    if config.max_rank == 0 {
-        return Err(GeneratorError::MaxRank);
+    if config.min_operands > config.max_operands {
+        return Err(GeneratorError::OperandRange {
+            min: config.min_operands,
+            max: config.max_operands,
+        });
+    }
+    let attempt_limit = config
+        .random_cases
+        .checked_mul(500)
+        .map(|attempts| attempts.max(500))
+        .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
+    let metadata_limit = config
+        .limits
+        .cpu_working_set_bytes
+        .min(GENERATOR_METADATA_BYTES);
+    let minimum_corpus_metadata = config
+        .random_cases
+        .checked_mul(std::mem::size_of::<CaseRecord>())
+        .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
+    if minimum_corpus_metadata > metadata_limit {
+        return Err(GeneratorError::CorpusMetadata {
+            requested: config.random_cases,
+            bytes: minimum_corpus_metadata,
+            limit: metadata_limit,
+        });
+    }
+    if config.random_cases == 0 {
+        return Ok(Vec::new());
+    }
+    let per_operand_metadata = std::mem::size_of::<String>()
+        + 2 * std::mem::size_of::<Vec<usize>>()
+        + 6 * std::mem::size_of::<usize>()
+        + 8;
+    let metadata_base = std::mem::size_of::<CaseRecord>() + 2;
+    let practical_max_operands =
+        metadata_limit.saturating_sub(metadata_base) / per_operand_metadata;
+    let sampled_max_operands = config.max_operands.min(practical_max_operands);
+    if config.min_operands > sampled_max_operands {
+        return Err(GeneratorError::Unsatisfiable {
+            field: "min_operands",
+            value: config.min_operands,
+            reason: "the checked metadata budget cannot hold the equation and operand metadata",
+        });
     }
     let mut rng = SplitMix64::new(config.seed);
     let required_arities = [1usize, 2, 3, 4, 8, 16];
-    let mut cases = Vec::with_capacity(config.random_cases);
+    let mut cases = Vec::new();
+    let mut retained_metadata = 0usize;
     let mut attempts = 0usize;
     while cases.len() < config.random_cases {
-        attempts += 1;
-        if attempts > config.random_cases.saturating_mul(500).max(500) {
+        attempts = attempts
+            .checked_add(1)
+            .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
+        if attempts > attempt_limit {
             return Err(GeneratorError::Exhausted {
                 generated: cases.len(),
                 requested: config.random_cases,
@@ -376,8 +452,8 @@ pub fn generated_cases(config: GeneratorConfig) -> Result<Vec<CaseRecord>, Gener
         let arity = required_arities
             .get(index)
             .copied()
-            .map(|arity| arity.min(config.max_operands))
-            .unwrap_or_else(|| rng.range_inclusive(1, config.max_operands));
+            .map(|arity| arity.clamp(config.min_operands, sampled_max_operands))
+            .unwrap_or_else(|| rng.range_inclusive(config.min_operands, sampled_max_operands));
         let dtype = match index % 29 {
             3 => ConformanceDType::Float16,
             7 => ConformanceDType::BFloat16,
@@ -399,7 +475,20 @@ pub fn generated_cases(config: GeneratorConfig) -> Result<Vec<CaseRecord>, Gener
             ValueProfile::Finite
         };
         let candidate = random_case(&mut rng, index, arity, dtype, opset, profile, config);
-        if candidate.validate().is_ok() {
+        if generated_case_is_within_config(&candidate, config) {
+            let candidate_metadata = generated_case_metadata_bytes(&candidate)
+                .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
+            let next_metadata = retained_metadata
+                .checked_add(candidate_metadata)
+                .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
+            if next_metadata > metadata_limit {
+                return Err(GeneratorError::CorpusMetadata {
+                    requested: config.random_cases,
+                    bytes: next_metadata,
+                    limit: metadata_limit,
+                });
+            }
+            retained_metadata = next_metadata;
             cases.push(candidate);
         }
     }
@@ -676,6 +765,7 @@ fn random_case(
     profile: ValueProfile,
     config: GeneratorConfig,
 ) -> CaseRecord {
+    let max_dimension = practical_dimension_limit(config, dtype);
     let label_count = rng.range_inclusive(1, 8.min(LABELS.len()));
     let mut labels = LABELS.to_vec();
     for i in (1..labels.len()).rev() {
@@ -685,23 +775,23 @@ fn random_case(
     labels.truncate(label_count);
     let label_extents = labels
         .iter()
-        .map(|&label| (label, random_extent(rng)))
+        .map(|&label| (label, random_extent(rng, max_dimension)))
         .collect::<BTreeMap<_, _>>();
-    let use_ellipsis = rng.next().is_multiple_of(2);
+    let use_ellipsis = config.max_rank > 0 && rng.next().is_multiple_of(2);
     let ellipsis_rank = if use_ellipsis {
-        rng.range_inclusive(0, 2)
+        rng.range_inclusive(0, config.max_rank.min(2))
     } else {
         0
     };
     let ellipsis_extents = (0..ellipsis_rank)
-        .map(|_| random_extent(rng))
+        .map(|_| random_extent(rng, max_dimension))
         .collect::<Vec<_>>();
     let mut terms = Vec::with_capacity(arity);
     let mut shapes = Vec::with_capacity(arity);
     let mut occurrences = BTreeMap::<u8, usize>::new();
     let mut any_ellipsis = false;
     for input in 0..arity {
-        let scalar = arity > 1 && rng.next().is_multiple_of(11);
+        let scalar = config.max_rank == 0 || (arity > 1 && rng.next().is_multiple_of(11));
         let has_ellipsis = use_ellipsis && !scalar && (input == 0 || rng.next().is_multiple_of(2));
         any_ellipsis |= has_ellipsis;
         let max_named = config
@@ -747,6 +837,7 @@ fn random_case(
                 shape.push(label_extents[&label]);
             }
         }
+
         terms.push(term);
         shapes.push(shape);
     }
@@ -779,6 +870,78 @@ fn random_case(
         limits: config.limits,
         route_probes: generic_route_probes(),
     }
+}
+
+fn generated_case_is_within_config(case: &CaseRecord, config: GeneratorConfig) -> bool {
+    if !(config.min_operands..=config.max_operands).contains(&case.input_shapes.len()) {
+        return false;
+    }
+    let mut total_elements = 0usize;
+    for shape in &case.input_shapes {
+        if shape.len() > config.max_rank
+            || shape
+                .iter()
+                .any(|&dimension| dimension > config.max_dimension)
+        {
+            return false;
+        }
+        let Some(elements) = checked_product(shape.iter().copied()) else {
+            return false;
+        };
+        if elements > config.max_tensor_elements {
+            return false;
+        }
+        let Some(updated) = total_elements.checked_add(elements) else {
+            return false;
+        };
+        total_elements = updated;
+    }
+    let Ok(analysis) = crate::analyze_equation(&case.equation, &case.input_shapes) else {
+        return false;
+    };
+    let Some(output_elements) = checked_product(analysis.output_shape().iter().copied()) else {
+        return false;
+    };
+    if output_elements > config.max_tensor_elements {
+        return false;
+    }
+    let Some(total_elements) = total_elements.checked_add(output_elements) else {
+        return false;
+    };
+    total_elements <= config.max_total_elements && case.validate().is_ok()
+}
+
+fn generated_case_metadata_bytes(case: &CaseRecord) -> Option<usize> {
+    let shape_bytes = case.input_shapes.iter().try_fold(
+        case.input_shapes
+            .len()
+            .checked_mul(std::mem::size_of::<Vec<usize>>())?,
+        |bytes, shape| {
+            shape
+                .len()
+                .checked_mul(std::mem::size_of::<usize>())
+                .and_then(|shape_bytes| bytes.checked_add(shape_bytes))
+        },
+    )?;
+    let route_bytes = case
+        .route_probes
+        .len()
+        .checked_mul(std::mem::size_of::<RouteProbe>())?;
+    std::mem::size_of::<CaseRecord>()
+        .checked_add(case.id.len())?
+        .checked_add(case.equation.len())?
+        .checked_add(shape_bytes)?
+        .checked_add(route_bytes)
+}
+
+fn practical_dimension_limit(config: GeneratorConfig, dtype: ConformanceDType) -> usize {
+    config
+        .max_dimension
+        .min(config.max_tensor_elements)
+        .min(config.max_total_elements)
+        .min(config.limits.unit_tensor_bytes / dtype.byte_size())
+        .min(config.limits.gpu_case_bytes / dtype.byte_size())
+        .min(config.limits.cpu_working_set_bytes / std::mem::size_of::<u64>())
 }
 
 fn generic_route_probes() -> Vec<RouteProbe> {
@@ -908,13 +1071,20 @@ fn malformed(
     }
 }
 
-fn random_extent(rng: &mut SplitMix64) -> usize {
+fn random_extent(rng: &mut SplitMix64, max_dimension: usize) -> usize {
     match rng.next() % 10 {
         0 => 0,
-        1..=3 => 1,
-        4..=7 => 2,
-        _ => 3,
+        1..=3 => max_dimension.min(1),
+        4..=7 => max_dimension.min(2),
+        _ if max_dimension <= 3 => max_dimension,
+        _ => rng.range_inclusive(3, max_dimension),
     }
+}
+
+fn checked_product(values: impl IntoIterator<Item = usize>) -> Option<usize> {
+    values
+        .into_iter()
+        .try_fold(1usize, |product, value| product.checked_mul(value))
 }
 
 fn stable_id_seed(id: &str) -> u64 {
@@ -930,12 +1100,46 @@ struct SplitMix64 {
 /// Invalid or unsatisfiable seeded generator configuration.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum GeneratorError {
-    /// Semantic arity bound is outside the implemented bounded range.
-    #[error("Einsum generator max_operands must be in 1..=32, found {0}")]
-    MaxOperands(usize),
-    /// Physical rank bound is zero.
-    #[error("Einsum generator max_rank must be at least 1")]
-    MaxRank,
+    /// ONNX Einsum requires at least one input.
+    #[error("Einsum generator min_operands must be at least 1")]
+    MinOperands,
+    /// Sampled operand bounds are reversed.
+    #[error(
+        "Einsum generator min_operands {min} exceeds max_operands {max}; ONNX imposes no maximum, but the configured sampling interval must be nonempty"
+    )]
+    OperandRange {
+        /// Inclusive lower bound.
+        min: usize,
+        /// Inclusive upper bound.
+        max: usize,
+    },
+    /// Requested case arithmetic overflowed before allocation.
+    #[error(
+        "Einsum generator random_cases {0} overflows the checked retry or metadata budget calculation"
+    )]
+    CaseCountOverflow(usize),
+    /// The retained corpus cannot fit its configured generation budget.
+    #[error(
+        "Einsum generator needs at least {bytes} bytes of retained metadata for {requested} random cases, exceeding the {limit}-byte checked metadata budget"
+    )]
+    CorpusMetadata {
+        /// Requested random records.
+        requested: usize,
+        /// Minimum retained bytes.
+        bytes: usize,
+        /// Configured budget.
+        limit: usize,
+    },
+    /// A requested lower bound cannot fit the configured resource ceilings.
+    #[error("Einsum generator {field}={value} is unsatisfiable: {reason}")]
+    Unsatisfiable {
+        /// Rejected configuration field.
+        field: &'static str,
+        /// Rejected value.
+        value: usize,
+        /// Actionable reason.
+        reason: &'static str,
+    },
     /// Resource ceilings prevented enough legal cases from being generated.
     #[error(
         "Einsum generator produced {generated} of {requested} requested cases before exhausting bounded retries; raise the element/work ceilings or reduce the requested corpus"
@@ -963,6 +1167,8 @@ impl SplitMix64 {
 
     fn range_inclusive(&mut self, low: usize, high: usize) -> usize {
         debug_assert!(low <= high);
-        low + (self.next() as usize % (high - low + 1))
+        let span = (high as u128) - (low as u128) + 1;
+        let offset = (u128::from(self.next()) % span) as usize;
+        low + offset
     }
 }

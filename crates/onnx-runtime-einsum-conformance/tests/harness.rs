@@ -2,10 +2,11 @@ use std::collections::BTreeSet;
 
 use onnx_runtime_einsum_conformance::{
     BackendKind, BackendObservation, CanonicalTensor, CaptureExpectation, CaseRecord,
-    ComparisonMode, ConformanceDType, CorpusSnapshot, DEFAULT_GENERATOR, ForcedRoute,
-    GeneratorConfig, PlannerQuality, RouteProbe, SchemaAuthority, ValueProfile, ValueSpec,
-    WorkspaceClass, compare, corpus_digest, default_corpus, evaluate, generated_cases,
-    malformed_cases, materialize_inputs, named_cases, verify_observation,
+    CaseValidationError, ComparisonMode, ConformanceDType, CorpusSnapshot, DEFAULT_GENERATOR,
+    ForcedRoute, GeneratorConfig, GeneratorError, PlannerQuality, RouteProbe, SchemaAuthority,
+    ValueProfile, ValueSpec, WorkspaceClass, compare, corpus_digest, default_corpus, evaluate,
+    generated_cases, infer_output_shape, malformed_cases, materialize_inputs, named_cases,
+    verify_observation,
 };
 
 fn case(
@@ -27,6 +28,50 @@ fn case(
         values: ValueSpec { seed: 1, profile },
         limits: DEFAULT_GENERATOR.limits,
         route_probes: vec![],
+    }
+}
+
+fn checked_numel(shape: &[usize]) -> usize {
+    shape
+        .iter()
+        .try_fold(1usize, |elements, &dimension| {
+            elements.checked_mul(dimension)
+        })
+        .expect("generated shapes must have checked element counts")
+}
+
+fn assert_generator_bounds(config: GeneratorConfig, cases: &[CaseRecord]) {
+    assert_eq!(cases.len(), config.random_cases);
+    for case in cases {
+        assert!(
+            (config.min_operands..=config.max_operands).contains(&case.input_shapes.len()),
+            "{} has arity {} outside {}..={}",
+            case.id,
+            case.input_shapes.len(),
+            config.min_operands,
+            config.max_operands
+        );
+        let mut total_elements = 0usize;
+        for shape in &case.input_shapes {
+            assert!(shape.len() <= config.max_rank, "{}: {shape:?}", case.id);
+            assert!(
+                shape
+                    .iter()
+                    .all(|&dimension| dimension <= config.max_dimension),
+                "{}: {shape:?}",
+                case.id
+            );
+            let elements = checked_numel(shape);
+            assert!(elements <= config.max_tensor_elements, "{}", case.id);
+            total_elements = total_elements.checked_add(elements).unwrap();
+        }
+        let output_shape = infer_output_shape(&case.equation, &case.input_shapes).unwrap();
+        let output_elements = checked_numel(&output_shape);
+        assert!(output_elements <= config.max_tensor_elements, "{}", case.id);
+        total_elements = total_elements.checked_add(output_elements).unwrap();
+        assert!(total_elements <= config.max_total_elements, "{}", case.id);
+        assert_eq!(case.limits, config.limits);
+        case.validate().unwrap();
     }
 }
 
@@ -76,6 +121,7 @@ fn named_and_seeded_corpus_cover_required_semantics_with_bounded_resources() {
         "one-extent-broadcast",
         "integer-wrapping-i8",
         "integer-matmul-i32",
+        "scalar-product-64-operands",
     ] {
         assert!(ids.contains(required), "missing required case {required}");
     }
@@ -83,7 +129,7 @@ fn named_and_seeded_corpus_cover_required_semantics_with_bounded_resources() {
         .iter()
         .map(|case| case.input_shapes.len())
         .collect::<BTreeSet<_>>();
-    for arity in [1usize, 2, 3, 4, 8, 16] {
+    for arity in [1usize, 2, 3, 4, 8, 16, 64] {
         assert!(arities.contains(&arity), "missing arity {arity}");
     }
     assert!(cases.iter().any(|case| !case.equation.contains("->")));
@@ -144,11 +190,218 @@ fn generator_is_seed_deterministic_and_seed_sensitive() {
     .unwrap();
     assert_ne!(corpus_digest(&first), corpus_digest(&changed));
     let error = generated_cases(GeneratorConfig {
-        max_operands: 0,
+        min_operands: 0,
         ..DEFAULT_GENERATOR
     })
     .unwrap_err();
-    assert!(error.to_string().contains("1..=32"));
+    assert_eq!(error, GeneratorError::MinOperands);
+}
+
+#[test]
+fn generator_supports_high_arity_without_an_onnx_semantic_cap() {
+    let config = GeneratorConfig {
+        random_cases: 2,
+        min_operands: 128,
+        max_operands: 128,
+        max_rank: 0,
+        max_dimension: usize::MAX,
+        max_tensor_elements: 1,
+        max_total_elements: 129,
+        ..DEFAULT_GENERATOR
+    };
+    let cases = generated_cases(config).unwrap();
+    assert_generator_bounds(config, &cases);
+    for case in cases {
+        assert_eq!(case.input_shapes, vec![Vec::<usize>::new(); 128]);
+        assert_eq!(case.equation.split(',').count(), 128);
+        let inputs = materialize_inputs(&case).unwrap();
+        assert_eq!(inputs.len(), 128);
+        assert_eq!(evaluate(&case, &inputs).unwrap().factor_count(), 128);
+    }
+}
+
+#[test]
+fn generator_enforces_zero_one_and_two_rank_bounds_deterministically() {
+    for max_rank in [0usize, 1, 2] {
+        let config = GeneratorConfig {
+            seed: DEFAULT_GENERATOR.seed ^ max_rank as u64,
+            random_cases: 32,
+            min_operands: 1,
+            max_operands: 8,
+            max_rank,
+            max_dimension: 2,
+            max_tensor_elements: 64,
+            max_total_elements: 256,
+            ..DEFAULT_GENERATOR
+        };
+        let first = generated_cases(config).unwrap();
+        let second = generated_cases(config).unwrap();
+        assert_eq!(first, second);
+        assert_generator_bounds(config, &first);
+        if max_rank == 0 {
+            assert!(
+                first
+                    .iter()
+                    .flat_map(|case| &case.input_shapes)
+                    .all(Vec::is_empty)
+            );
+        } else {
+            assert!(
+                first
+                    .iter()
+                    .flat_map(|case| &case.input_shapes)
+                    .any(|shape| shape.len() == max_rank),
+                "rank-{max_rank} configuration never exercised its bound"
+            );
+        }
+    }
+}
+
+#[test]
+fn generator_enforces_dimension_element_working_set_and_oracle_budgets() {
+    let zero_extent = GeneratorConfig {
+        random_cases: 1,
+        min_operands: 1,
+        max_operands: 1,
+        max_rank: 1,
+        max_dimension: 0,
+        max_tensor_elements: 0,
+        max_total_elements: 0,
+        limits: onnx_runtime_einsum_conformance::CaseLimits {
+            unit_tensor_bytes: 0,
+            cpu_working_set_bytes: 4096,
+            gpu_case_bytes: 0,
+            oracle_work_items: 0,
+        },
+        ..DEFAULT_GENERATOR
+    };
+    let cases = generated_cases(zero_extent).unwrap();
+    assert_generator_bounds(zero_extent, &cases);
+
+    for seed in [0, u64::MAX] {
+        let bounded_extreme = GeneratorConfig {
+            seed,
+            random_cases: 8,
+            min_operands: 1,
+            max_operands: 4,
+            max_rank: 2,
+            max_dimension: usize::MAX,
+            max_tensor_elements: 4,
+            max_total_elements: 32,
+            ..DEFAULT_GENERATOR
+        };
+        let first = generated_cases(bounded_extreme).unwrap();
+        let second = generated_cases(bounded_extreme).unwrap();
+        assert_eq!(first, second);
+        assert_generator_bounds(bounded_extreme, &first);
+    }
+
+    let extreme = GeneratorConfig {
+        seed: u64::MAX,
+        random_cases: 0,
+        min_operands: 1,
+        max_operands: usize::MAX,
+        max_rank: usize::MAX,
+        max_dimension: usize::MAX,
+        max_tensor_elements: usize::MAX,
+        max_total_elements: usize::MAX,
+        limits: onnx_runtime_einsum_conformance::CaseLimits {
+            unit_tensor_bytes: usize::MAX,
+            cpu_working_set_bytes: usize::MAX,
+            gpu_case_bytes: usize::MAX,
+            oracle_work_items: usize::MAX,
+        },
+    };
+    assert!(generated_cases(extreme).unwrap().is_empty());
+
+    let overflow = generated_cases(GeneratorConfig {
+        random_cases: usize::MAX,
+        ..extreme
+    })
+    .unwrap_err();
+    assert_eq!(overflow, GeneratorError::CaseCountOverflow(usize::MAX));
+
+    let impossible_arity = generated_cases(GeneratorConfig {
+        random_cases: 1,
+        min_operands: usize::MAX,
+        ..extreme
+    })
+    .unwrap_err();
+    assert!(matches!(
+        impossible_arity,
+        GeneratorError::Unsatisfiable {
+            field: "min_operands",
+            ..
+        }
+    ));
+
+    let reversed = generated_cases(GeneratorConfig {
+        random_cases: 1,
+        min_operands: 2,
+        max_operands: 1,
+        ..DEFAULT_GENERATOR
+    })
+    .unwrap_err();
+    assert!(matches!(reversed, GeneratorError::OperandRange { .. }));
+
+    let metadata = generated_cases(GeneratorConfig {
+        random_cases: 1,
+        limits: onnx_runtime_einsum_conformance::CaseLimits {
+            cpu_working_set_bytes: 0,
+            ..DEFAULT_GENERATOR.limits
+        },
+        ..DEFAULT_GENERATOR
+    })
+    .unwrap_err();
+    assert!(matches!(metadata, GeneratorError::CorpusMetadata { .. }));
+}
+
+#[test]
+fn case_validation_checks_every_resource_limit_and_size_overflow() {
+    let scalar = case(
+        "->",
+        ConformanceDType::Float64,
+        &[&[]],
+        ValueProfile::Finite,
+    );
+    let mut limited = scalar.clone();
+    limited.limits.unit_tensor_bytes = 0;
+    assert!(matches!(
+        limited.validate().unwrap_err(),
+        CaseValidationError::UnitTensor { .. }
+    ));
+
+    limited = scalar.clone();
+    limited.limits.cpu_working_set_bytes = 0;
+    assert!(matches!(
+        limited.validate().unwrap_err(),
+        CaseValidationError::CpuWorkingSet { .. }
+    ));
+
+    limited = scalar.clone();
+    limited.limits.gpu_case_bytes = 0;
+    assert!(matches!(
+        limited.validate().unwrap_err(),
+        CaseValidationError::GpuCase { .. }
+    ));
+
+    limited = scalar;
+    limited.limits.oracle_work_items = 0;
+    assert!(matches!(
+        limited.validate().unwrap_err(),
+        CaseValidationError::OracleWork { .. }
+    ));
+
+    let overflow = case(
+        "i->i",
+        ConformanceDType::Float64,
+        &[&[usize::MAX]],
+        ValueProfile::Finite,
+    );
+    assert!(matches!(
+        overflow.validate().unwrap_err(),
+        CaseValidationError::SizeOverflow { .. }
+    ));
 }
 
 #[test]

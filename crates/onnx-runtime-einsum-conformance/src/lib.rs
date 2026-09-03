@@ -26,8 +26,8 @@ pub use equation::{
     EquationAnalysis, EquationError, OperandLayout, analyze_equation, infer_output_shape,
 };
 pub use generator::{
-    DEFAULT_GENERATOR, GeneratorConfig, GeneratorError, default_corpus, generated_cases,
-    malformed_cases, named_cases,
+    DEFAULT_GENERATOR, GENERATOR_METADATA_BYTES, GeneratorConfig, GeneratorError, default_corpus,
+    generated_cases, malformed_cases, named_cases,
 };
 pub use oracle::{
     CanonicalTensor, ComparisonFailure, ComparisonMode, ComparisonReport, Evaluation, OracleError,

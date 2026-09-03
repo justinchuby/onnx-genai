@@ -25,8 +25,9 @@ The checked-in `corpus-v1.json` stores only the generator configuration, case
 counts, and canonical JSON digest. Tensor payloads are regenerated from per-case
 seeds. The corpus contains:
 
-- 31 named cases and 128 seeded generated cases;
-- operand arities 1, 2, 3, 4, 8, and 16;
+- 32 named cases and 128 seeded generated cases;
+- operand arities 1, 2, 3, 4, 8, 16, and a 64-scalar proof that legal
+  variadic Einsum has no ONNX semantic maximum;
 - all 52 case-sensitive ASCII labels, diagonals, scalar terms, explicit and
   implicit output, fixed-rank retained/reduced ellipsis, and terms without
   ellipsis;
@@ -37,11 +38,17 @@ seeds. The corpus contains:
 - 24 malformed records covering grammar, arrows, output labels, ellipses,
   whitespace/Unicode, node arity, rank/dimensions, dtypes, and BF16 before
   opset 28.
-- 346 forced-route probes split evenly between CPU and CUDA handoff records.
+- 348 forced-route probes split evenly between CPU and CUDA handoff records.
 
 Each tensor is capped at 8 MiB, aggregate CPU working set at 32 MiB, and GPU
-case/workspace at 64 MiB. The generator caps materialized elements and direct
-oracle work, not semantic operand arity.
+case/workspace at 64 MiB. `GeneratorConfig` independently bounds sampled
+minimum/maximum arity, physical rank, dimension extent, per-tensor elements,
+aggregate elements, and direct-oracle work. Generator equation/shape metadata
+is additionally checked against the smaller of the configured CPU working-set
+limit and a 16 MiB allocation guard. Rank zero is a supported scalar-only
+configuration. The configured maximum arity is a sampling bound, not an ONNX
+semantic limit; checked metadata and resource budgets determine which practical
+arities can be materialized.
 
 ## Oracle and tolerance
 
