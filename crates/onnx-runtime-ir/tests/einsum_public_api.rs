@@ -1,6 +1,6 @@
 use onnx_runtime_ir::{
     DataType, EinsumAxis, EinsumClassification, EinsumContractionTreeStep, EinsumCostBound,
-    EinsumInput, EinsumPlan, EinsumShapePlan,
+    EinsumInput, EinsumPlan, EinsumPlannerQuality, EinsumSchema, EinsumShapePlan,
 };
 
 #[test]
@@ -12,6 +12,31 @@ fn typed_einsum_plan_public_api_preserves_exact_dtype() {
         let plan = EinsumPlan::build("ij->ji", &inputs).unwrap();
         assert_eq!(plan.dtype(), dtype);
     }
+}
+
+#[test]
+fn schema_aware_build_and_generic_fallback_are_public() {
+    let shape = [2usize];
+    let inputs = [EinsumInput::new(DataType::BFloat16, &shape)];
+    assert!(EinsumPlan::build("i->i", &inputs).is_err());
+    let plan = EinsumPlan::build_for_schema("i->i", &inputs, EinsumSchema::V28).unwrap();
+    assert_eq!(plan.schema(), EinsumSchema::V28);
+    assert_eq!(
+        plan.precision_policy().intermediate_dtype(),
+        DataType::Float32
+    );
+    assert_eq!(
+        plan.generic_native().index_program().operands()[0].physical_axis_to_iteration_axis(),
+        &[0]
+    );
+
+    assert!(EinsumShapePlan::build_for_opset("i->i", &[&shape], 11).is_err());
+    assert_eq!(
+        EinsumShapePlan::build_for_opset("i->i", &[&shape], 28)
+            .unwrap()
+            .schema(),
+        EinsumSchema::V28
+    );
 }
 
 #[test]
@@ -57,6 +82,7 @@ fn contraction_tree_public_api_is_source_compatible_and_runtime_resolvable() {
         EinsumClassification::ContractionTree(tree) => tree,
         _ => panic!("expected a contraction tree"),
     };
+    assert_eq!(tree.quality(), EinsumPlannerQuality::ExactSubsetDp);
     let selected = tree.preferred_candidate().unwrap().supported().unwrap();
     assert!(
         selected
@@ -65,7 +91,7 @@ fn contraction_tree_public_api_is_source_compatible_and_runtime_resolvable() {
             .any(|step| matches!(step, EinsumContractionTreeStep::BinaryContraction(_)))
     );
     assert!(matches!(selected.cost().flops(), EinsumCostBound::Exact(_)));
-    assert!(selected.cost().intermediate_bytes(2).is_some());
+    assert!(selected.cost().intermediate_bytes(4).is_some());
 
     let resolved = plan
         .resolve_concrete_contraction_tree(&[&vector, &matrix, &right])
@@ -77,7 +103,7 @@ fn contraction_tree_public_api_is_source_compatible_and_runtime_resolvable() {
         EinsumShapePlan::build("i,ij,j->", &[&vector[..], &matrix[..], &right[..]]).unwrap();
     assert!(
         shape_plan
-            .resolve_concrete_contraction_tree(&[&vector, &matrix, &right], 2)
+            .resolve_concrete_contraction_tree(&[&vector, &matrix, &right], 4)
             .unwrap()
             .unwrap()
             .preferred_candidate()

@@ -77,7 +77,7 @@ plugin EPs (via C ABI bridge) handle them.
 | DequantizeLinear | 10 | INT4/INT8 weight dequantization. |
 | QuantizeLinear | 10 | Activation quantization. |
 | QLinearMatMul | 10 | Quantized matmul. |
-| Einsum | 12 | Shared validated planning contract, including deterministic ordered contraction-tree candidates for coupled 2/3-input expressions. Native CPU executes canonical view/diagonal, reduction/elementwise, and flat binary GEMM/BMM plan classes; native CUDA lowers capture-safe flat GEMM/BMM plans and zero-copy permutation/diagonal views (`f32`/`f16`). Both EPs defensively decline the new tree class until its temporary schedule is implemented. BFloat16 is outside the canonical opset-12 type constraint; reduced ellipses, >3-input coupled trees, and reduced axes spanning three operands decline with structured reasons. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md) and [CUDA_COVERAGE.md](CUDA_COVERAGE.md). |
+| Einsum | 12, 28 | Schema-aware universal semantic/index plan for every legal expression, with `Einsum-12` selected for imported opsets 12..27 and `Einsum-28` for opset 28+ (adding BF16). General 1..N expressions, reduced ellipses, diagonals, three-way reductions, outer/Hadamard products, and broadcasts always receive `GenericNative`; bounded exact-DP/greedy contraction planning is an optimization. Existing CPU/CUDA kernels retain their current `f32`/`f16` fast paths and may temporarily decline generic/tree/BF16 execution pending the staged kernel handoff; these are coverage gaps, not permanent semantic refusals. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md) and [CUDA_COVERAGE.md](CUDA_COVERAGE.md). |
 | Tile | 6 | Repeat for broadcasting. |
 | Range | 11 | Position IDs generation. |
 | CumSum | 11 | Position computation. |

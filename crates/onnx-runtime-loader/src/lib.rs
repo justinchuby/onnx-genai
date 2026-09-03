@@ -398,12 +398,14 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 /// protobuf-only fields. This IR-level phase then runs:
 ///
 /// 1. [`validate_opset_imports`] — every node's domain must declare an opset.
-/// 2. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
+/// 2. [`validate_einsum_nodes`] — resolve `Einsum-12`/`Einsum-28` from the
+///    imported opset and validate every statically known equation/type/shape.
+/// 3. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
 ///    (`If`/`Loop`/`Scan`) and reject any other op carrying a `GraphProto`
 ///    attribute the executor cannot run.
-/// 3. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
+/// 4. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
 ///    (graph input, initializer, or an upstream node output).
-/// 4. [`validate_no_initializer_producer`] — an initializer must be a constant
+/// 5. [`validate_no_initializer_producer`] — an initializer must be a constant
 ///    source; reject any initializer value that is also a node output (shares a
 ///    `ValueId` with a producer), which the IR structural check does not cover.
 ///
@@ -417,10 +419,98 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 /// this function adds the checks that path does not cover.
 pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
     validate_opset_imports(graph)?;
+    validate_einsum_nodes(graph)?;
     validate_no_control_flow(graph)?;
     validate_no_dangling_refs(graph)?;
     validate_no_initializer_producer(graph)?;
     Ok(())
+}
+
+/// Resolve and validate every default-domain `Einsum` against the model's
+/// effective imported opset before shape inference or placement.
+pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
+    use onnx_runtime_ir::{Attribute, EinsumInput, EinsumPlan};
+
+    fn check_graph(
+        graph: &Graph,
+        imports: &std::collections::HashMap<String, u64>,
+    ) -> Result<(), LoaderError> {
+        for (_, node) in graph.nodes.iter() {
+            if !node.is_default_domain() || node.op_type != "Einsum" {
+                continue;
+            }
+            let imported_opset = node
+                .local_opset()
+                .or_else(|| imports.get("").copied())
+                .unwrap_or(1);
+            let equation = match node.attr("equation") {
+                Some(Attribute::String(bytes)) => {
+                    std::str::from_utf8(bytes).map_err(|error| LoaderError::InvalidEinsum {
+                        node: node_label(node),
+                        detail: format!(
+                            "attribute `equation` is not valid UTF-8 at byte offset {}",
+                            error.valid_up_to()
+                        ),
+                    })?
+                }
+                _ => {
+                    return Err(LoaderError::InvalidEinsum {
+                        node: node_label(node),
+                        detail: "missing required STRING attribute `equation`".to_string(),
+                    });
+                }
+            };
+            let mut metadata = Vec::with_capacity(node.inputs.len());
+            for (input, slot) in node.inputs.iter().enumerate() {
+                let value_id = slot.ok_or_else(|| LoaderError::InvalidEinsum {
+                    node: node_label(node),
+                    detail: format!("input #{input} is omitted from a variadic required operand"),
+                })?;
+                let value =
+                    graph
+                        .values
+                        .get(value_id)
+                        .ok_or_else(|| LoaderError::InvalidEinsum {
+                            node: node_label(node),
+                            detail: format!("input #{input} references missing value {value_id:?}"),
+                        })?;
+                metadata.push(EinsumInput::from_optional(
+                    (value.dtype != onnx_runtime_ir::DataType::Undefined).then_some(value.dtype),
+                    Some(value.shape.as_slice()),
+                ));
+            }
+            let plan = match EinsumPlan::build_for_opset(equation, &metadata, imported_opset) {
+                Ok(plan) => plan,
+                Err(error) if error.is_incomplete_metadata() => continue,
+                Err(error) => {
+                    return Err(LoaderError::InvalidEinsum {
+                        node: node_label(node),
+                        detail: error.to_string(),
+                    });
+                }
+            };
+            if let Some(&output_id) = node.outputs.first()
+                && let Some(output) = graph.values.get(output_id)
+                && output.dtype != onnx_runtime_ir::DataType::Undefined
+                && output.dtype != plan.dtype()
+            {
+                return Err(LoaderError::InvalidEinsum {
+                    node: node_label(node),
+                    detail: format!(
+                        "output dtype {:?} does not match homogeneous input dtype {:?}",
+                        output.dtype,
+                        plan.dtype()
+                    ),
+                });
+            }
+        }
+        for subgraph in graph.subgraphs.values() {
+            check_graph(subgraph, imports)?;
+        }
+        Ok(())
+    }
+
+    check_graph(graph, &graph.opset_imports)
 }
 
 /// Validate ONNX model metadata and protobuf-level graph invariants that are

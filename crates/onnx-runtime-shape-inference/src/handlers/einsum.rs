@@ -1,4 +1,4 @@
-//! `Einsum` (opset 12) shape inference through the shared canonical planner.
+//! Schema-aware `Einsum` shape inference through the shared canonical planner.
 //!
 //! Parsing, validation, ellipsis expansion, diagonals, reductions, and output
 //! ordering live in `onnx-runtime-ir::EinsumPlan`. This handler only supplies
@@ -53,7 +53,8 @@ fn einsum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
             )
         })
         .collect();
-    let plan = match EinsumPlan::build(equation, &inputs) {
+    let imported_opset = ctx.opset("");
+    let plan = match EinsumPlan::build_for_opset(equation, &inputs, imported_opset) {
         Ok(plan) => plan,
         Err(error) if error.is_incomplete_metadata() => return Ok(()),
         Err(error) => {

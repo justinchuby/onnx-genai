@@ -1,12 +1,13 @@
-//! Canonical, execution-provider-neutral planning for ONNX `Einsum` (opset 12).
+//! Canonical, execution-provider-neutral planning for ONNX `Einsum`.
 //!
 //! [`EinsumPlan`] is the typed, parsed, and validated representation used by
 //! shape inference and typed execution-provider admission. [`EinsumShapePlan`]
 //! carries the same structural contract for factories that receive shapes but
-//! no dtype. Both record logical axes, diagonal groups, equality/broadcast
-//! constraints, output order, reductions, and structural lowering data, so
-//! consumers never need to reparse an equation or infer contraction roles from
-//! concrete dimension values.
+//! no dtype. Both carry an explicit resolved schema proof, record logical axes,
+//! diagonal groups, equality/broadcast constraints, output order, reductions,
+//! a universal generic index program, and bounded contraction-planner output.
+//! Consumers never need to reparse an equation, infer schema from a dtype, or
+//! treat GEMM compatibility as the semantic boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -16,14 +17,85 @@ use crate::{DataType, Dim};
 mod tree;
 
 pub use tree::{
-    EinsumBinaryContractionPlan, EinsumConcreteContractionTreeCandidate,
+    EinsumBinaryContractionPlan, EinsumBinaryLowering, EinsumConcreteContractionTreeCandidate,
     EinsumConcreteContractionTreePlan, EinsumContractionCost, EinsumContractionTreeCandidate,
     EinsumContractionTreeCandidateId, EinsumContractionTreeCandidatePlan,
     EinsumContractionTreeCandidateUnsupportedReason, EinsumContractionTreePlan,
-    EinsumContractionTreeStep, EinsumCostBound, EinsumCostMetric, EinsumResolvedContractionCost,
-    EinsumSupportedContractionTreeCandidate, EinsumTemporaryValuePlan, EinsumUnaryReductionPlan,
-    EinsumValueId,
+    EinsumContractionTreeStep, EinsumCostBound, EinsumCostMetric, EinsumPlannerBudget,
+    EinsumPlannerQuality, EinsumPlannerUsage, EinsumResolvedContractionCost,
+    EinsumSupportedContractionTreeCandidate, EinsumTemporaryStoragePolicy,
+    EinsumTemporaryValuePlan, EinsumUnaryReductionPlan, EinsumValueId,
 };
+
+/// The ONNX `Einsum` schema selected by the imported `ai.onnx` opset.
+///
+/// This is a proof value: model-facing code resolves it from the effective
+/// imported opset once, then passes it through validation, shape inference, and
+/// execution-provider planning. Dtype legality is never inferred from the
+/// dtype itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EinsumSchema {
+    /// `Einsum-12`, selected by imported opsets 12 through 27.
+    V12,
+    /// `Einsum-28`, selected by imported opset 28 and later.
+    V28,
+}
+
+impl EinsumSchema {
+    /// Resolve the applicable schema from the effective imported `ai.onnx`
+    /// opset.
+    pub fn resolve(imported_opset: u64) -> Result<Self, EinsumSchemaError> {
+        match imported_opset {
+            0..=11 => Err(EinsumSchemaError { imported_opset }),
+            12..=27 => Ok(Self::V12),
+            28.. => Ok(Self::V28),
+        }
+    }
+
+    /// The schema's ONNX `since_version`.
+    pub const fn since_version(self) -> u64 {
+        match self {
+            Self::V12 => 12,
+            Self::V28 => 28,
+        }
+    }
+
+    /// Whether `dtype` is admitted by this schema's `T` constraint.
+    pub const fn supports_dtype(self, dtype: DataType) -> bool {
+        is_base_numeric_dtype(dtype) || matches!((self, dtype), (Self::V28, DataType::BFloat16))
+    }
+}
+
+impl fmt::Display for EinsumSchema {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Einsum-{}", self.since_version())
+    }
+}
+
+/// An imported opset that cannot select an ONNX `Einsum` schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EinsumSchemaError {
+    imported_opset: u64,
+}
+
+impl EinsumSchemaError {
+    /// Rejected effective `ai.onnx` opset.
+    pub const fn imported_opset(self) -> u64 {
+        self.imported_opset
+    }
+}
+
+impl fmt::Display for EinsumSchemaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ai.onnx opset {} cannot select Einsum: the operator was introduced in opset 12",
+            self.imported_opset
+        )
+    }
+}
+
+impl std::error::Error for EinsumSchemaError {}
 
 /// A dimension value that can expose a statically known extent to the planner.
 ///
@@ -102,7 +174,7 @@ impl fmt::Display for EinsumLabel {
 /// A canonical logical axis in an einsum expression.
 ///
 /// Ellipsis axes are numbered left-to-right after expanding every explicit
-/// ellipsis to the common rank required by ONNX opset 12. Operands without an
+/// ellipsis to the common rank required by the ONNX Einsum schema. Operands without an
 /// ellipsis simply do not contain those axes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EinsumAxis {
@@ -364,6 +436,196 @@ impl EinsumReductionPlan {
     }
 }
 
+/// Overflow semantics for integer Einsum arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EinsumIntegerOverflowSemantics {
+    /// Every multiply/add is defined modulo `2^width`, matching the homogeneous
+    /// fixed-width tensor dtype without invoking host-language signed-overflow
+    /// undefined behavior.
+    WrappingModuloPowerOfTwo,
+}
+
+/// Backend-neutral accumulation and intermediate-storage policy.
+///
+/// Fast-path selection is intentionally absent. An EP may choose scalar,
+/// vector, GEMM, or tiled execution, but it must preserve these precision and
+/// final-rounding boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EinsumPrecisionPolicy {
+    input_output_dtype: DataType,
+    accumulator_dtype: DataType,
+    intermediate_dtype: DataType,
+    narrow_once_at_output: bool,
+    integer_overflow: Option<EinsumIntegerOverflowSemantics>,
+}
+
+impl EinsumPrecisionPolicy {
+    fn for_dtype(dtype: DataType) -> Self {
+        match dtype {
+            DataType::Float16 | DataType::BFloat16 => Self {
+                input_output_dtype: dtype,
+                accumulator_dtype: DataType::Float32,
+                intermediate_dtype: DataType::Float32,
+                narrow_once_at_output: true,
+                integer_overflow: None,
+            },
+            DataType::Float32 | DataType::Float64 => Self {
+                input_output_dtype: dtype,
+                accumulator_dtype: dtype,
+                intermediate_dtype: dtype,
+                narrow_once_at_output: false,
+                integer_overflow: None,
+            },
+            DataType::Uint8
+            | DataType::Uint16
+            | DataType::Uint32
+            | DataType::Uint64
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64 => Self {
+                input_output_dtype: dtype,
+                accumulator_dtype: dtype,
+                intermediate_dtype: dtype,
+                narrow_once_at_output: false,
+                integer_overflow: Some(EinsumIntegerOverflowSemantics::WrappingModuloPowerOfTwo),
+            },
+            _ => unreachable!("schema validation admits only Einsum numeric dtypes"),
+        }
+    }
+
+    /// Homogeneous ONNX input/output dtype.
+    pub const fn input_output_dtype(self) -> DataType {
+        self.input_output_dtype
+    }
+
+    /// Dtype used for multiplication and accumulation.
+    pub const fn accumulator_dtype(self) -> DataType {
+        self.accumulator_dtype
+    }
+
+    /// Dtype used for every non-final materialized intermediate.
+    pub const fn intermediate_dtype(self) -> DataType {
+        self.intermediate_dtype
+    }
+
+    /// Whether the accumulator/intermediate is narrowed exactly once, when the
+    /// final output tensor is written.
+    pub const fn narrow_once_at_output(self) -> bool {
+        self.narrow_once_at_output
+    }
+
+    /// Defined fixed-width integer overflow behavior, when applicable.
+    pub const fn integer_overflow(self) -> Option<EinsumIntegerOverflowSemantics> {
+        self.integer_overflow
+    }
+
+    /// Fixed byte width charged for materialized intermediates.
+    pub fn intermediate_element_size(self) -> usize {
+        self.intermediate_dtype.byte_size()
+    }
+}
+
+/// Index mapping for one source operand in the universal generic program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EinsumOperandIndexProgram {
+    input: usize,
+    physical_axis_to_iteration_axis: Vec<usize>,
+    physical_axis_broadcasts_when_one: Vec<bool>,
+}
+
+impl EinsumOperandIndexProgram {
+    /// Source operand index.
+    pub const fn input(&self) -> usize {
+        self.input
+    }
+
+    /// For every physical source axis, the generic iteration-axis index.
+    ///
+    /// Repeated labels map multiple physical axes to the same index, which is
+    /// the diagonal constraint. Missing axes are implicit broadcast axes.
+    pub fn physical_axis_to_iteration_axis(&self) -> &[usize] {
+        &self.physical_axis_to_iteration_axis
+    }
+
+    /// Per physical axis, whether extent `1` means use source index zero while
+    /// the logical ellipsis iteration axis expands to a larger extent.
+    pub fn physical_axis_broadcasts_when_one(&self) -> &[bool] {
+        &self.physical_axis_broadcasts_when_one
+    }
+}
+
+/// Universal, backend-neutral loop/index program for a legal equation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EinsumIndexProgram {
+    iteration_axes: Vec<EinsumAxis>,
+    output_rank: usize,
+    operands: Vec<EinsumOperandIndexProgram>,
+}
+
+impl EinsumIndexProgram {
+    /// Iteration order: requested output axes first, followed by every reduced
+    /// axis in canonical order.
+    pub fn iteration_axes(&self) -> &[EinsumAxis] {
+        &self.iteration_axes
+    }
+
+    /// Number of leading iteration axes retained in the output.
+    pub const fn output_rank(&self) -> usize {
+        self.output_rank
+    }
+
+    /// Physical-to-logical index maps for every operand.
+    pub fn operands(&self) -> &[EinsumOperandIndexProgram] {
+        &self.operands
+    }
+}
+
+/// Mandatory generic-native fallback for every schema-valid equation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EinsumGenericNativePlan {
+    index_program: EinsumIndexProgram,
+}
+
+impl EinsumGenericNativePlan {
+    /// Generic loop/index program. EPs may tile it to obey a memory ceiling.
+    pub const fn index_program(&self) -> &EinsumIndexProgram {
+        &self.index_program
+    }
+}
+
+/// Complete semantic plan independent of any one fast-path family.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EinsumSemanticPlan {
+    generic_native: EinsumGenericNativePlan,
+    contraction_tree: Option<EinsumContractionTreePlan>,
+}
+
+impl EinsumSemanticPlan {
+    /// Universal fallback that exists for every legal equation.
+    pub const fn generic_native(&self) -> &EinsumGenericNativePlan {
+        &self.generic_native
+    }
+
+    /// Bounded binary contraction plan for multi-operand equations.
+    ///
+    /// This is available even when a simpler classification (for example an
+    /// outer product) is also present, so GEMM is an optimization subtype
+    /// rather than the semantic boundary.
+    pub const fn contraction_tree(&self) -> Option<&EinsumContractionTreePlan> {
+        self.contraction_tree.as_ref()
+    }
+}
+
+/// Memory-aware semantic execution choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EinsumExecutionSelection {
+    /// Execute the named bounded contraction-tree candidate.
+    ContractionTree(EinsumContractionTreeCandidateId),
+    /// Execute/tile the mandatory universal index program.
+    GenericNative,
+}
+
 /// Flattened GEMM/BMM geometry known at planning time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EinsumGemmGeometry {
@@ -498,89 +760,6 @@ impl EinsumContractionPlan {
     }
 }
 
-/// Why a legal einsum is not one of the native lowering classes implemented by
-/// the shared foundation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum EinsumUnsupportedReason {
-    /// A reduced label couples three or more operands.
-    NaryContraction {
-        /// Number of inputs.
-        input_count: usize,
-        /// Shared reduced axes.
-        axes: Vec<EinsumAxis>,
-    },
-    /// A binary GEMM contraction also requires operand-local pre-reductions.
-    MixedContractionAndOperandReduction {
-        /// Shared GEMM contraction axes.
-        contract_axes: Vec<EinsumAxis>,
-        /// Additional input-local reduction axes.
-        local_reduction_axes: Vec<EinsumAxis>,
-    },
-    /// Expanded ellipsis axes are reduced instead of retained as BMM batch
-    /// axes, requiring a general broadcast contraction.
-    ReducedEllipsis {
-        /// Reduced ellipsis axes.
-        axes: Vec<EinsumAxis>,
-    },
-    /// A coupled contraction has more operands than the initial tree planner
-    /// can enumerate.
-    InputCountExceedsContractionTreeLimit {
-        /// Number of operands in the equation.
-        input_count: usize,
-        /// Maximum supported coupled-contraction arity.
-        maximum: usize,
-    },
-    /// One reduced axis occurs in more than two distinct operands and therefore
-    /// requires a Hadamard/outer intermediate rather than pairwise elimination.
-    ReducedAxisSpansTooManyOperands {
-        /// Maximum distinct operand count supported per reduced axis.
-        maximum: usize,
-        /// Rejected axes.
-        axes: Vec<EinsumAxis>,
-    },
-}
-
-impl fmt::Display for EinsumUnsupportedReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NaryContraction { input_count, axes } => {
-                write!(
-                    f,
-                    "{input_count}-input contraction over {} is not a binary GEMM/BMM lowering",
-                    display_axes(axes)
-                )
-            }
-            Self::MixedContractionAndOperandReduction {
-                contract_axes,
-                local_reduction_axes,
-            } => write!(
-                f,
-                "binary contraction over {} also requires operand-local reduction over {}",
-                display_axes(contract_axes),
-                display_axes(local_reduction_axes)
-            ),
-            Self::ReducedEllipsis { axes } => write!(
-                f,
-                "broadcast {} is reduced instead of retained as batch output",
-                display_axes(axes)
-            ),
-            Self::InputCountExceedsContractionTreeLimit {
-                input_count,
-                maximum,
-            } => write!(
-                f,
-                "{input_count}-input coupled contraction exceeds the initial ordered-tree limit of {maximum} operands"
-            ),
-            Self::ReducedAxisSpansTooManyOperands { maximum, axes } => write!(
-                f,
-                "{} occurs in more than {maximum} operands and would require a Hadamard/outer intermediate before reduction",
-                display_axes(axes)
-            ),
-        }
-    }
-}
-
 /// Structural semantics of a validated equation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -593,11 +772,8 @@ pub enum EinsumClassification {
     ReductionOrElementwise(EinsumReductionPlan),
     /// Binary GEMM/BMM-compatible contraction.
     Gemm(EinsumContractionPlan),
-    /// Ordered binary-tree candidates for coupled two- or three-input
-    /// contractions that need leaf-local reductions and/or two binary nodes.
+    /// Bounded ordered binary-tree planning for a general coupled contraction.
     ContractionTree(EinsumContractionTreePlan),
-    /// Legal ONNX semantics, but not one of the native lowering classes above.
-    Unsupported(EinsumUnsupportedReason),
 }
 
 /// Which checked static product overflowed.
@@ -677,6 +853,11 @@ pub enum EinsumPlanErrorKind {
         /// Input or output term.
         side: EinsumEquationSide,
     },
+    /// The effective imported `ai.onnx` opset predates `Einsum-12`.
+    UnsupportedOpset {
+        /// Effective imported opset.
+        imported_opset: u64,
+    },
     /// An input has no dtype metadata.
     MissingInputDtype {
         /// Input index.
@@ -687,12 +868,14 @@ pub enum EinsumPlanErrorKind {
         /// Input index.
         input: usize,
     },
-    /// An input uses a dtype outside the opset-12 type constraint.
+    /// An input uses a dtype outside the resolved schema's type constraint.
     UnsupportedInputDtype {
         /// Input index.
         input: usize,
         /// Rejected dtype.
         dtype: DataType,
+        /// Resolved schema proof.
+        schema: EinsumSchema,
     },
     /// Inputs do not share the single variadic type parameter `T`.
     InputDtypeMismatch {
@@ -867,19 +1050,31 @@ impl fmt::Display for EinsumPlanError {
             EinsumPlanErrorKind::MultipleEllipses { side } => {
                 write!(f, "{side} contains more than one ellipsis")
             }
+            EinsumPlanErrorKind::UnsupportedOpset { imported_opset } => write!(
+                f,
+                "effective ai.onnx opset {imported_opset} predates Einsum-12; HOW: export this node with ai.onnx opset >= 12"
+            ),
             EinsumPlanErrorKind::MissingInputDtype { input } => {
                 write!(f, "input #{input} has no available tensor dtype")
             }
             EinsumPlanErrorKind::MissingInputShape { input } => {
                 write!(f, "input #{input} has no available tensor shape/rank")
             }
-            EinsumPlanErrorKind::UnsupportedInputDtype { input, dtype } => write!(
+            EinsumPlanErrorKind::UnsupportedInputDtype {
+                input,
+                dtype,
+                schema,
+            } => write!(
                 f,
-                "input #{input} has unsupported opset-12 dtype {dtype:?}; expected Uint8, Uint16, \
-                 Uint32, Uint64, Int8, Int16, Int32, Int64, Float16, Float32, or Float64. \
-                 BFloat16 is not part of the canonical Einsum contract. HOW: cast the operands \
-                 to a schema-supported dtype or use an operator/schema version that explicitly \
-                 permits their dtype"
+                "input #{input} has dtype {dtype:?}, which is not admitted by {schema}; expected \
+                 Uint8, Uint16, Uint32, Uint64, Int8, Int16, Int32, Int64, Float16, Float32, or \
+                 Float64{}. HOW: cast every operand to a schema-supported homogeneous dtype or \
+                 import ai.onnx opset 28+ when BFloat16 is required",
+                if *schema == EinsumSchema::V28 {
+                    ", or BFloat16"
+                } else {
+                    ""
+                }
             ),
             EinsumPlanErrorKind::InputDtypeMismatch {
                 input,
@@ -914,7 +1109,7 @@ impl fmt::Display for EinsumPlanError {
                 rank,
             } => write!(
                 f,
-                "input term #{input} explicit ellipsis has expansion rank {rank}, but input term #{first_input} explicit ellipsis has expansion rank {first_rank}; ONNX opset 12 requires every explicit ellipsis to represent the same number of dimensions"
+                "input term #{input} explicit ellipsis has expansion rank {rank}, but input term #{first_input} explicit ellipsis has expansion rank {first_rank}; ONNX Einsum requires every explicit ellipsis to represent the same number of dimensions"
             ),
             EinsumPlanErrorKind::ResolvedInputCountMismatch { expected, found } => write!(
                 f,
@@ -1015,26 +1210,89 @@ pub enum EinsumResolveError<E> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EinsumPlan {
     dtype: DataType,
+    precision: EinsumPrecisionPolicy,
     shape: EinsumShapePlan,
 }
 
 impl EinsumPlan {
-    /// Parse and validate an opset-12 equation against input dtype/shape
-    /// metadata, then classify its lowering structurally.
+    /// Parse and validate using the `Einsum-12` contract.
+    ///
+    /// This source-compatible entry point remains explicitly v12-compatible.
+    /// Model-facing paths must resolve the imported opset and call
+    /// [`Self::build_for_schema`] or [`Self::build_for_opset`] instead.
     pub fn build<D: EinsumDimensionValue>(
         equation: &str,
         inputs: &[EinsumInput<'_, D>],
     ) -> Result<Self, EinsumPlanError> {
+        Self::build_for_schema(equation, inputs, EinsumSchema::V12)
+    }
+
+    /// Resolve the applicable schema from `imported_opset`, then build.
+    pub fn build_for_opset<D: EinsumDimensionValue>(
+        equation: &str,
+        inputs: &[EinsumInput<'_, D>],
+        imported_opset: u64,
+    ) -> Result<Self, EinsumPlanError> {
+        let schema = EinsumSchema::resolve(imported_opset).map_err(|_| {
+            EinsumPlanError::new(
+                equation,
+                EinsumPlanErrorKind::UnsupportedOpset { imported_opset },
+            )
+        })?;
+        Self::build_for_schema(equation, inputs, schema)
+    }
+
+    /// Parse and validate against an already-resolved schema proof.
+    pub fn build_for_schema<D: EinsumDimensionValue>(
+        equation: &str,
+        inputs: &[EinsumInput<'_, D>],
+        schema: EinsumSchema,
+    ) -> Result<Self, EinsumPlanError> {
+        Self::build_for_schema_with_budget(equation, inputs, schema, EinsumPlannerBudget::default())
+    }
+
+    /// Build with explicit bounded-planner budgets.
+    pub fn build_for_schema_with_budget<D: EinsumDimensionValue>(
+        equation: &str,
+        inputs: &[EinsumInput<'_, D>],
+        schema: EinsumSchema,
+        planner_budget: EinsumPlannerBudget,
+    ) -> Result<Self, EinsumPlanError> {
         let normalized = normalize_equation(equation);
         let parsed = ParsedEquation::parse(&normalized, inputs.len())?;
-        let (dtype, input_meta) = validate_inputs(&normalized, inputs)?;
-        let shape = build_shape_plan(normalized, parsed, input_meta)?;
-        Ok(Self { dtype, shape })
+        let (dtype, input_meta) = validate_inputs(&normalized, inputs, schema)?;
+        let precision = EinsumPrecisionPolicy::for_dtype(dtype);
+        let shape = build_shape_plan(normalized, parsed, input_meta, schema, planner_budget)?;
+        Ok(Self {
+            dtype,
+            precision,
+            shape,
+        })
     }
 
     /// Shared input/output dtype.
     pub const fn dtype(&self) -> DataType {
         self.dtype
+    }
+
+    /// Resolved ONNX schema proof.
+    pub const fn schema(&self) -> EinsumSchema {
+        self.shape.schema()
+    }
+
+    /// Explicit accumulator/intermediate/final-rounding policy.
+    pub const fn precision_policy(&self) -> EinsumPrecisionPolicy {
+        self.precision
+    }
+
+    /// Complete semantic plan, including the mandatory generic fallback.
+    pub const fn semantic_plan(&self) -> &EinsumSemanticPlan {
+        self.shape.semantic_plan()
+    }
+
+    /// Mandatory generic-native fallback.
+    pub const fn generic_native(&self) -> &EinsumGenericNativePlan {
+        self.shape.generic_native()
     }
 
     /// The structural plan, which carries no dtype claim.
@@ -1115,16 +1373,32 @@ impl EinsumPlan {
         self.shape.resolve_concrete_gemm_geometry(input_shapes)
     }
 
-    /// Re-score every ordered contraction-tree candidate for concrete runtime
-    /// shapes. Intermediate values are stored in the Einsum node's common
-    /// dtype; accumulation precision inside each unary/binary step remains an
-    /// execution-provider policy.
+    /// Re-score/replan bounded contraction-tree candidates for concrete
+    /// runtime shapes using the semantic intermediate dtype.
     pub fn resolve_concrete_contraction_tree(
         &self,
         input_shapes: &[&[usize]],
     ) -> Result<Option<EinsumConcreteContractionTreePlan>, EinsumPlanError> {
-        self.shape
-            .resolve_concrete_contraction_tree(input_shapes, self.dtype.byte_size())
+        self.shape.resolve_concrete_contraction_tree(
+            input_shapes,
+            self.precision.intermediate_element_size(),
+        )
+    }
+
+    /// Select a concrete contraction tree under `memory_ceiling_bytes`, or the
+    /// mandatory generic/tiled program when no candidate fits.
+    pub fn select_concrete_execution(
+        &self,
+        input_shapes: &[&[usize]],
+        memory_ceiling_bytes: u128,
+    ) -> Result<EinsumExecutionSelection, EinsumPlanError> {
+        let Some(tree) = self.resolve_concrete_contraction_tree(input_shapes)? else {
+            return Ok(EinsumExecutionSelection::GenericNative);
+        };
+        Ok(tree
+            .preferred_candidate_with_memory_ceiling(memory_ceiling_bytes)
+            .map(|candidate| EinsumExecutionSelection::ContractionTree(candidate.id().clone()))
+            .unwrap_or(EinsumExecutionSelection::GenericNative))
     }
 }
 
@@ -1135,6 +1409,7 @@ impl EinsumPlan {
 /// [`EinsumPlan`] and therefore cannot claim a fabricated runtime dtype.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EinsumShapePlan {
+    schema: EinsumSchema,
     equation: String,
     explicit_output: bool,
     operands: Vec<EinsumOperandPlan>,
@@ -1143,12 +1418,12 @@ pub struct EinsumShapePlan {
     output_shape: Vec<EinsumDimension>,
     reduction_axes: Vec<EinsumAxis>,
     classification: EinsumClassification,
+    semantic: EinsumSemanticPlan,
     static_output_numel: Option<usize>,
 }
 
 impl EinsumShapePlan {
-    /// Parse and validate an opset-12 equation against input shapes, then
-    /// classify its lowering structurally.
+    /// Parse and validate shapes using the `Einsum-12` contract.
     ///
     /// This entry point intentionally performs no dtype validation. It is for
     /// kernel factories whose API receives concrete shapes but not tensor
@@ -1158,6 +1433,45 @@ impl EinsumShapePlan {
     pub fn build<D: EinsumDimensionValue>(
         equation: &str,
         input_shapes: &[&[D]],
+    ) -> Result<Self, EinsumPlanError> {
+        Self::build_for_schema(equation, input_shapes, EinsumSchema::V12)
+    }
+
+    /// Resolve the applicable schema from `imported_opset`, then build.
+    pub fn build_for_opset<D: EinsumDimensionValue>(
+        equation: &str,
+        input_shapes: &[&[D]],
+        imported_opset: u64,
+    ) -> Result<Self, EinsumPlanError> {
+        let schema = EinsumSchema::resolve(imported_opset).map_err(|_| {
+            EinsumPlanError::new(
+                equation,
+                EinsumPlanErrorKind::UnsupportedOpset { imported_opset },
+            )
+        })?;
+        Self::build_for_schema(equation, input_shapes, schema)
+    }
+
+    /// Parse and validate shapes against an already-resolved schema proof.
+    pub fn build_for_schema<D: EinsumDimensionValue>(
+        equation: &str,
+        input_shapes: &[&[D]],
+        schema: EinsumSchema,
+    ) -> Result<Self, EinsumPlanError> {
+        Self::build_for_schema_with_budget(
+            equation,
+            input_shapes,
+            schema,
+            EinsumPlannerBudget::default(),
+        )
+    }
+
+    /// Shape-only build with explicit bounded-planner budgets.
+    pub fn build_for_schema_with_budget<D: EinsumDimensionValue>(
+        equation: &str,
+        input_shapes: &[&[D]],
+        schema: EinsumSchema,
+        planner_budget: EinsumPlannerBudget,
     ) -> Result<Self, EinsumPlanError> {
         let normalized = normalize_equation(equation);
         let parsed = ParsedEquation::parse(&normalized, input_shapes.len())?;
@@ -1174,7 +1488,22 @@ impl EinsumShapePlan {
                     .collect(),
             })
             .collect();
-        build_shape_plan(normalized, parsed, input_meta)
+        build_shape_plan(normalized, parsed, input_meta, schema, planner_budget)
+    }
+
+    /// Resolved ONNX schema proof.
+    pub const fn schema(&self) -> EinsumSchema {
+        self.schema
+    }
+
+    /// Complete semantic plan, including the mandatory generic fallback.
+    pub const fn semantic_plan(&self) -> &EinsumSemanticPlan {
+        &self.semantic
+    }
+
+    /// Mandatory generic-native fallback.
+    pub const fn generic_native(&self) -> &EinsumGenericNativePlan {
+        self.semantic.generic_native()
     }
 
     /// Whitespace-free canonical equation.
@@ -1392,17 +1721,18 @@ impl EinsumShapePlan {
         }))
     }
 
-    /// Re-score every ordered contraction-tree candidate for concrete runtime
-    /// shapes and a caller-supplied common element width.
+    /// Re-score/replan the semantic contraction tree for concrete runtime
+    /// shapes and a caller-supplied intermediate-storage element width.
     ///
-    /// Shape-only consumers must pass the real runtime dtype's fixed byte
-    /// width; this API never fabricates one.
+    /// Shape-only consumers must pass the width required by their typed
+    /// precision policy (for example 4 for f16/bf16 f32 intermediates); this
+    /// API never fabricates one.
     pub fn resolve_concrete_contraction_tree(
         &self,
         input_shapes: &[&[usize]],
         element_size: usize,
     ) -> Result<Option<EinsumConcreteContractionTreePlan>, EinsumPlanError> {
-        let EinsumClassification::ContractionTree(tree) = &self.classification else {
+        let Some(tree) = self.semantic.contraction_tree() else {
             return Ok(None);
         };
         if element_size == 0 {
@@ -1650,6 +1980,7 @@ struct InputMeta {
 fn validate_inputs<D: EinsumDimensionValue>(
     equation: &str,
     inputs: &[EinsumInput<'_, D>],
+    schema: EinsumSchema,
 ) -> Result<(DataType, Vec<InputMeta>), EinsumPlanError> {
     let mut result = Vec::with_capacity(inputs.len());
     let mut expected_dtype = None;
@@ -1657,10 +1988,14 @@ fn validate_inputs<D: EinsumDimensionValue>(
         let dtype = metadata.dtype.ok_or_else(|| {
             EinsumPlanError::new(equation, EinsumPlanErrorKind::MissingInputDtype { input })
         })?;
-        if !is_opset12_dtype(dtype) {
+        if !schema.supports_dtype(dtype) {
             return Err(EinsumPlanError::new(
                 equation,
-                EinsumPlanErrorKind::UnsupportedInputDtype { input, dtype },
+                EinsumPlanErrorKind::UnsupportedInputDtype {
+                    input,
+                    dtype,
+                    schema,
+                },
             ));
         }
         if let Some(expected) = expected_dtype {
@@ -1703,7 +2038,7 @@ fn normalize_equation(equation: &str) -> String {
         .collect()
 }
 
-fn is_opset12_dtype(dtype: DataType) -> bool {
+const fn is_base_numeric_dtype(dtype: DataType) -> bool {
     matches!(
         dtype,
         DataType::Uint8
@@ -1724,6 +2059,8 @@ fn build_shape_plan(
     equation: String,
     parsed: ParsedEquation,
     input_meta: Vec<InputMeta>,
+    schema: EinsumSchema,
+    planner_budget: EinsumPlannerBudget,
 ) -> Result<EinsumShapePlan, EinsumPlanError> {
     let mut ellipsis_ranks = Vec::with_capacity(input_meta.len());
     let mut explicit_ellipsis = None;
@@ -1951,15 +2288,56 @@ fn build_shape_plan(
         .iter()
         .filter_map(|logical| logical.output_position.is_none().then_some(logical.axis))
         .collect();
+    let contraction_tree = (operand_axes.len() > 1).then(|| {
+        tree::build_contraction_tree(
+            &operand_axes,
+            &logical_axes,
+            &output_axes,
+            &reduction_axes,
+            planner_budget,
+        )
+    });
     let classification = classify(
         &equation,
         &operand_axes,
         &logical_axes,
         &output_axes,
         &reduction_axes,
+        contraction_tree.as_ref(),
     )?;
+    let mut iteration_axes = output_axes.clone();
+    iteration_axes.extend_from_slice(&reduction_axes);
+    let iteration_positions: BTreeMap<_, _> = iteration_axes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, axis)| (axis, index))
+        .collect();
+    let generic_native = EinsumGenericNativePlan {
+        index_program: EinsumIndexProgram {
+            iteration_axes,
+            output_rank: output_axes.len(),
+            operands: operand_axes
+                .iter()
+                .map(|operand| EinsumOperandIndexProgram {
+                    input: operand.input,
+                    physical_axis_to_iteration_axis: operand
+                        .axes
+                        .iter()
+                        .map(|axis| iteration_positions[axis])
+                        .collect(),
+                    physical_axis_broadcasts_when_one: operand
+                        .axes
+                        .iter()
+                        .map(|axis| matches!(axis, EinsumAxis::Ellipsis(_)))
+                        .collect(),
+                })
+                .collect(),
+        },
+    };
 
     Ok(EinsumShapePlan {
+        schema,
         equation,
         explicit_output,
         operands: operand_axes,
@@ -1968,6 +2346,10 @@ fn build_shape_plan(
         output_shape,
         reduction_axes,
         classification,
+        semantic: EinsumSemanticPlan {
+            generic_native,
+            contraction_tree,
+        },
         static_output_numel,
     })
 }
@@ -2175,6 +2557,7 @@ fn classify(
     logical_axes: &[EinsumLogicalAxis],
     output_axes: &[EinsumAxis],
     reduction_axes: &[EinsumAxis],
+    contraction_tree: Option<&EinsumContractionTreePlan>,
 ) -> Result<EinsumClassification, EinsumPlanError> {
     if operands.len() == 1 && reduction_axes.is_empty() {
         let permutation = permutation_plan(&operands[0], output_axes);
@@ -2232,51 +2615,20 @@ fn classify(
         ));
     }
 
-    let reduced_ellipsis: Vec<_> = cross_reduction_axes
-        .iter()
-        .copied()
-        .filter(|axis| matches!(axis, EinsumAxis::Ellipsis(_)))
-        .collect();
-    if !reduced_ellipsis.is_empty() {
-        return Ok(EinsumClassification::Unsupported(
-            EinsumUnsupportedReason::ReducedEllipsis {
-                axes: reduced_ellipsis,
-            },
-        ));
-    }
-
-    if operands.len() > 3 {
-        return Ok(EinsumClassification::Unsupported(
-            EinsumUnsupportedReason::InputCountExceedsContractionTreeLimit {
-                input_count: operands.len(),
-                maximum: 3,
-            },
-        ));
-    }
-
-    let too_wide_axes: Vec<_> = cross_reduction_axes
-        .iter()
-        .copied()
-        .filter(|axis| distinct_input_count(*axis) > 2)
-        .collect();
-    if !too_wide_axes.is_empty() {
-        return Ok(EinsumClassification::Unsupported(
-            EinsumUnsupportedReason::ReducedAxisSpansTooManyOperands {
-                maximum: 2,
-                axes: too_wide_axes,
-            },
-        ));
-    }
-
     if operands.len() == 2 {
         let local_reduction_axes: Vec<_> = reduction_axes
             .iter()
             .copied()
             .filter(|axis| distinct_input_count(*axis) == 1)
             .collect();
-        if !local_reduction_axes.is_empty() {
+        let reduced_ellipsis = cross_reduction_axes
+            .iter()
+            .any(|axis| matches!(axis, EinsumAxis::Ellipsis(_)));
+        if !local_reduction_axes.is_empty() || reduced_ellipsis {
             return Ok(EinsumClassification::ContractionTree(
-                tree::build_contraction_tree(operands, logical_axes, output_axes, reduction_axes),
+                contraction_tree
+                    .expect("multi-operand semantic plans always include a tree")
+                    .clone(),
             ));
         }
         return build_contraction(
@@ -2290,7 +2642,9 @@ fn classify(
     }
 
     Ok(EinsumClassification::ContractionTree(
-        tree::build_contraction_tree(operands, logical_axes, output_axes, reduction_axes),
+        contraction_tree
+            .expect("multi-operand semantic plans always include a tree")
+            .clone(),
     ))
 }
 
@@ -2422,13 +2776,6 @@ fn build_contraction(
     })
 }
 
-fn display_axes(axes: &[EinsumAxis]) -> String {
-    axes.iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2491,7 +2838,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("ONNX opset 12 requires every explicit ellipsis")
+                .contains("ONNX Einsum requires every explicit ellipsis")
         );
     }
 
@@ -2805,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn general_contractions_have_structured_unsupported_reasons() {
+    fn general_contractions_and_reduced_ellipsis_have_bounded_trees() {
         let nary = plan("ij,jk,kl->il", &[&[2, 3], &[3, 4], &[4, 5]]);
         assert!(matches!(
             nary.classification(),
@@ -2823,10 +3170,10 @@ mod tests {
         let ellipsis = plan("...i,...i->i", &[&[5, 3], &[1, 3]]);
         assert!(matches!(
             ellipsis.classification(),
-            EinsumClassification::Unsupported(EinsumUnsupportedReason::ReducedEllipsis {
-                axes,
-            }) if axes == &[EinsumAxis::Ellipsis(0)]
+            EinsumClassification::ContractionTree(tree)
+                if tree.arity() == 2 && tree.preferred_candidate().is_some()
         ));
+        assert!(ellipsis.generic_native().index_program().output_rank() == 1);
     }
 
     #[test]
@@ -2961,7 +3308,8 @@ mod tests {
             error_kind("i->i", &unsupported),
             EinsumPlanErrorKind::UnsupportedInputDtype {
                 input: 0,
-                dtype: DataType::Bool
+                dtype: DataType::Bool,
+                schema: EinsumSchema::V12,
             }
         ));
 
@@ -2971,14 +3319,12 @@ mod tests {
             error.kind(),
             EinsumPlanErrorKind::UnsupportedInputDtype {
                 input: 0,
-                dtype: DataType::BFloat16
+                dtype: DataType::BFloat16,
+                schema: EinsumSchema::V12,
             }
         ));
-        assert!(
-            error
-                .to_string()
-                .contains("BFloat16 is not part of the canonical Einsum contract")
-        );
+        assert!(error.to_string().contains("not admitted by Einsum-12"));
+        assert!(EinsumPlan::build_for_schema("i->i", &bfloat16, EinsumSchema::V28).is_ok());
 
         let integer = [3usize];
         let mismatch = [

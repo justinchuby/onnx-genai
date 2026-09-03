@@ -1,578 +1,839 @@
-use onnx_runtime_ir::{
-    DataType, Dim, EinsumAxis, EinsumClassification, EinsumContractionTreeCandidate,
-    EinsumContractionTreeStep, EinsumCostBound, EinsumInput, EinsumPlan, EinsumUnsupportedReason,
-    SymbolId,
-};
-#[cfg(target_pointer_width = "64")]
-use onnx_runtime_ir::{EinsumContractionTreeCandidateUnsupportedReason, EinsumCostMetric};
+use std::collections::{BTreeMap, BTreeSet};
 
-fn plan(equation: &str, shapes: &[&[usize]]) -> EinsumPlan {
+use onnx_runtime_ir::{
+    DataType, EinsumAxis, EinsumBinaryLowering, EinsumContractionCost, EinsumContractionTreeStep,
+    EinsumCostBound, EinsumExecutionSelection, EinsumInput, EinsumIntegerOverflowSemantics,
+    EinsumPlan, EinsumPlanErrorKind, EinsumPlannerBudget, EinsumPlannerQuality, EinsumSchema,
+    EinsumTemporaryStoragePolicy,
+};
+
+type LegalCase<'a> = (&'a str, Vec<&'a [usize]>, Vec<usize>);
+
+fn plan(schema: EinsumSchema, equation: &str, dtype: DataType, shapes: &[&[usize]]) -> EinsumPlan {
     let inputs = shapes
         .iter()
-        .map(|shape| EinsumInput::new(DataType::Float32, shape))
+        .map(|shape| EinsumInput::new(dtype, shape))
         .collect::<Vec<_>>();
-    EinsumPlan::build(equation, &inputs).unwrap()
+    EinsumPlan::build_for_schema(equation, &inputs, schema).unwrap()
 }
 
 fn tree(plan: &EinsumPlan) -> &onnx_runtime_ir::EinsumContractionTreePlan {
-    match plan.classification() {
-        EinsumClassification::ContractionTree(tree) => tree,
-        other => panic!("expected contraction tree, found {other:?}"),
+    plan.semantic_plan()
+        .contraction_tree()
+        .expect("multi-operand equation has a semantic tree")
+}
+
+fn label(axis: EinsumAxis) -> char {
+    match axis {
+        EinsumAxis::Label(label) => label.as_char(),
+        EinsumAxis::Ellipsis(_) => '.',
     }
 }
 
-fn candidate<'a>(
-    tree: &'a onnx_runtime_ir::EinsumContractionTreePlan,
-    id: &str,
-) -> &'a EinsumContractionTreeCandidate {
-    tree.candidates()
-        .iter()
-        .find(|candidate| candidate.id().as_str() == id)
-        .unwrap_or_else(|| panic!("missing candidate {id}"))
-}
+#[test]
+fn schema_resolution_and_authoritative_numeric_type_matrix() {
+    assert!(EinsumSchema::resolve(11).is_err());
+    assert_eq!(EinsumSchema::resolve(12).unwrap(), EinsumSchema::V12);
+    assert_eq!(EinsumSchema::resolve(27).unwrap(), EinsumSchema::V12);
+    assert_eq!(EinsumSchema::resolve(28).unwrap(), EinsumSchema::V28);
+    assert_eq!(EinsumSchema::resolve(10_000).unwrap(), EinsumSchema::V28);
 
-fn unordered_pair(mut pair: [usize; 2]) -> [usize; 2] {
-    pair.sort_unstable();
-    pair
-}
+    let numeric_v12 = [
+        DataType::Uint8,
+        DataType::Uint16,
+        DataType::Uint32,
+        DataType::Uint64,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::Float16,
+        DataType::Float32,
+        DataType::Float64,
+    ];
+    let scalar: [usize; 0] = [];
+    for dtype in numeric_v12 {
+        let input = [EinsumInput::new(dtype, &scalar)];
+        assert!(EinsumPlan::build_for_opset("->", &input, 12).is_ok());
+        assert!(EinsumPlan::build_for_opset("->", &input, 27).is_ok());
+        assert!(EinsumPlan::build_for_opset("->", &input, 28).is_ok());
+    }
 
-fn first_binary(
-    candidate: &EinsumContractionTreeCandidate,
-) -> &onnx_runtime_ir::EinsumBinaryContractionPlan {
-    candidate
-        .supported()
-        .unwrap()
-        .steps()
-        .iter()
-        .find_map(|step| match step {
-            EinsumContractionTreeStep::BinaryContraction(binary) => Some(binary),
-            EinsumContractionTreeStep::UnaryReduction(_) => None,
-            _ => None,
-        })
-        .unwrap()
+    let bf16 = [EinsumInput::new(DataType::BFloat16, &scalar)];
+    for opset in [12, 27] {
+        let error = EinsumPlan::build_for_opset("->", &bf16, opset).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            EinsumPlanErrorKind::UnsupportedInputDtype {
+                dtype: DataType::BFloat16,
+                schema: EinsumSchema::V12,
+                ..
+            }
+        ));
+    }
+    assert!(EinsumPlan::build_for_opset("->", &bf16, 28).is_ok());
+    assert!(matches!(
+        EinsumPlan::build_for_opset("->", &bf16, 11)
+            .unwrap_err()
+            .kind(),
+        EinsumPlanErrorKind::UnsupportedOpset { imported_opset: 11 }
+    ));
+
+    for rejected in [
+        DataType::Undefined,
+        DataType::String,
+        DataType::Bool,
+        DataType::Complex64,
+        DataType::Complex128,
+        DataType::Float8E4M3FN,
+        DataType::Int4,
+    ] {
+        let input = [EinsumInput::new(rejected, &scalar)];
+        assert!(EinsumPlan::build_for_opset("->", &input, 28).is_err());
+    }
 }
 
 #[test]
-fn scalar_vector_matrix_vector_enumerates_and_eliminates_at_lowest_nodes() {
-    let plan = plan("i,ij,j->", &[&[3], &[3, 5], &[5]]);
-    let tree = tree(&plan);
-    assert_eq!(tree.arity(), 3);
-    assert_eq!(tree.leaf_values().len(), 3);
-    assert_eq!(tree.candidates().len(), 12);
+fn precision_policy_is_explicit_and_backend_neutral() {
+    let scalar: [usize; 0] = [];
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        let schema = if dtype == DataType::BFloat16 {
+            EinsumSchema::V28
+        } else {
+            EinsumSchema::V12
+        };
+        let plan = plan(schema, "->", dtype, &[&scalar]);
+        let policy = plan.precision_policy();
+        assert_eq!(policy.input_output_dtype(), dtype);
+        assert_eq!(policy.accumulator_dtype(), DataType::Float32);
+        assert_eq!(policy.intermediate_dtype(), DataType::Float32);
+        assert!(policy.narrow_once_at_output());
+        assert_eq!(policy.integer_overflow(), None);
+    }
+    for dtype in [DataType::Float32, DataType::Float64] {
+        let policy = plan(EinsumSchema::V12, "->", dtype, &[&scalar]).precision_policy();
+        assert_eq!(policy.accumulator_dtype(), dtype);
+        assert_eq!(policy.intermediate_dtype(), dtype);
+        assert!(!policy.narrow_once_at_output());
+    }
+    for dtype in [
+        DataType::Uint8,
+        DataType::Uint16,
+        DataType::Uint32,
+        DataType::Uint64,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+    ] {
+        let policy = plan(EinsumSchema::V12, "->", dtype, &[&scalar]).precision_policy();
+        assert_eq!(policy.accumulator_dtype(), dtype);
+        assert_eq!(policy.intermediate_dtype(), dtype);
+        assert_eq!(
+            policy.integer_overflow(),
+            Some(EinsumIntegerOverflowSemantics::WrappingModuloPowerOfTwo)
+        );
+    }
+}
 
-    let candidate = candidate(tree, "((0,1),2)").supported().unwrap();
-    let binaries = candidate
+#[test]
+fn every_required_legal_equation_has_generic_native_semantics() {
+    let cases: Vec<LegalCase<'_>> = vec![
+        ("i,i,i->", vec![&[2], &[2], &[2]], vec![]),
+        ("i,j,k->ijk", vec![&[2], &[3], &[4]], vec![2, 3, 4]),
+        ("...i,...i->", vec![&[1, 3], &[5, 3]], vec![]),
+        (",->", vec![&[], &[]], vec![]),
+        ("Za,aB->BZ", vec![&[2, 3], &[3, 4]], vec![4, 2]),
+        ("ii->i", vec![&[3, 3]], vec![3]),
+        ("...i,...i->...i", vec![&[1, 3], &[5, 3]], vec![5, 3]),
+        ("i,i->", vec![&[0], &[0]], vec![]),
+    ];
+    for (equation, shapes, expected) in cases {
+        let plan = plan(EinsumSchema::V12, equation, DataType::Float32, &shapes);
+        assert_eq!(
+            plan.output_shape()
+                .iter()
+                .map(|dimension| dimension.as_static().unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+            "{equation}"
+        );
+        assert_eq!(
+            plan.generic_native().index_program().operands().len(),
+            shapes.len(),
+            "{equation}"
+        );
+    }
+}
+
+#[test]
+fn arbitrary_four_eight_and_sixteen_operand_equations_are_bounded() {
+    for arity in [4usize, 8, 16] {
+        let equation = format!(
+            "{}->",
+            std::iter::repeat_n("i", arity)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let shapes = vec![vec![1usize]; arity];
+        let refs = shapes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let plan = plan(EinsumSchema::V12, &equation, DataType::Float32, &refs);
+        let tree = tree(&plan);
+        assert_eq!(tree.arity(), arity);
+        assert!(tree.preferred_candidate().is_some());
+        assert!(
+            tree.usage().candidates()
+                <= tree
+                    .usage()
+                    .budget()
+                    .max_candidates
+                    .max(tree.usage().budget().max_heuristic_candidates)
+        );
+        assert_eq!(
+            tree.quality(),
+            if arity <= 5 {
+                EinsumPlannerQuality::ExactSubsetDp
+            } else {
+                EinsumPlannerQuality::DeterministicGreedy
+            }
+        );
+    }
+}
+
+#[test]
+fn invalid_syntax_output_ellipsis_dtype_and_shapes_are_rejected() {
+    let vector = [2usize];
+    let matrix = [2usize, 3];
+    let square = [2usize, 2];
+    let one = [EinsumInput::new(DataType::Float32, &vector)];
+    for equation in ["i\t->i", "i\u{00a0}->i", "λ->λ", "i$->i", "i->i->i"] {
+        assert!(EinsumPlan::build(equation, &one).is_err(), "{equation:?}");
+    }
+    for equation in ["i->ii", "i->j", "......i->i", "i->......i"] {
+        assert!(EinsumPlan::build(equation, &one).is_err(), "{equation}");
+    }
+
+    let mixed = [
+        EinsumInput::new(DataType::Float32, &vector),
+        EinsumInput::new(DataType::Float16, &vector),
+    ];
+    assert!(matches!(
+        EinsumPlan::build("i,i->i", &mixed).unwrap_err().kind(),
+        EinsumPlanErrorKind::InputDtypeMismatch { .. }
+    ));
+
+    let diagonal = [EinsumInput::new(DataType::Float32, &matrix)];
+    assert!(matches!(
+        EinsumPlan::build("ii->i", &diagonal).unwrap_err().kind(),
+        EinsumPlanErrorKind::LabelDimensionMismatch { .. }
+    ));
+    let nonbroadcast = [
+        EinsumInput::new(DataType::Float32, &vector),
+        EinsumInput::new(DataType::Float32, &[1usize]),
+    ];
+    assert!(matches!(
+        EinsumPlan::build("i,i->i", &nonbroadcast)
+            .unwrap_err()
+            .kind(),
+        EinsumPlanErrorKind::LabelDimensionMismatch { .. }
+    ));
+    let rank = [EinsumInput::new(DataType::Float32, &square)];
+    assert!(matches!(
+        EinsumPlan::build("i->i", &rank).unwrap_err().kind(),
+        EinsumPlanErrorKind::InputRankMismatch { .. }
+    ));
+}
+
+#[test]
+fn reductions_wait_until_every_axis_occurrence_is_inside_the_subtree() {
+    let shapes = [&[2usize][..], &[2usize][..], &[2usize][..]];
+    let plan = plan(EinsumSchema::V12, "i,i,i->", DataType::Float32, &shapes);
+    let occurrences = plan
+        .logical_axes()
+        .iter()
+        .map(|axis| {
+            (
+                axis.axis(),
+                axis.occurrences()
+                    .iter()
+                    .map(|occurrence| occurrence.input())
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let output = plan.output_axes().iter().copied().collect::<BTreeSet<_>>();
+    for candidate in tree(&plan).candidates() {
+        let Some(candidate) = candidate.supported() else {
+            continue;
+        };
+        for step in candidate.steps() {
+            let EinsumContractionTreeStep::BinaryContraction(binary) = step else {
+                continue;
+            };
+            let left = binary
+                .left_leaf_inputs()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let right = binary
+                .right_leaf_inputs()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let subtree = left.union(&right).copied().collect::<BTreeSet<_>>();
+            for axis in binary.contract_axes() {
+                assert!(!output.contains(axis));
+                assert!(occurrences[axis].is_subset(&subtree));
+                assert!(
+                    !occurrences[axis].is_subset(&left) && !occurrences[axis].is_subset(&right),
+                    "{axis} was reducible below this merge"
+                );
+            }
+        }
+    }
+    let selected = tree(&plan)
+        .preferred_candidate()
+        .unwrap()
+        .supported()
+        .unwrap();
+    let binary_steps = selected
         .steps()
         .iter()
         .filter_map(|step| match step {
-            EinsumContractionTreeStep::BinaryContraction(binary) => Some(binary),
-            EinsumContractionTreeStep::UnaryReduction(_) => None,
+            EinsumContractionTreeStep::BinaryContraction(binary) => Some(binary.as_ref()),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(binaries.len(), 2);
     assert_eq!(
-        binaries[0]
-            .contract_axes()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["label `i`"]
+        binary_steps[0].lowering(),
+        EinsumBinaryLowering::GenericNative
     );
     assert_eq!(
-        binaries[1]
-            .contract_axes()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["label `j`"]
+        binary_steps.last().unwrap().lowering(),
+        EinsumBinaryLowering::GemmCompatible
     );
-    assert!(plan.output_axes().is_empty());
+    let root = selected
+        .steps()
+        .iter()
+        .rev()
+        .find_map(|step| match step {
+            EinsumContractionTreeStep::BinaryContraction(binary) => Some(binary),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        root.contract_axes()
+            .iter()
+            .copied()
+            .map(label)
+            .collect::<String>(),
+        "i"
+    );
+}
+
+fn brute_tree_ids(leaves: &[usize]) -> BTreeSet<String> {
+    if let [leaf] = leaves {
+        return BTreeSet::from([leaf.to_string()]);
+    }
+    let mut result = BTreeSet::new();
+    let full = (1usize << leaves.len()) - 1;
+    for left_mask in 1..full {
+        let left = leaves
+            .iter()
+            .enumerate()
+            .filter_map(|(index, leaf)| ((left_mask >> index) & 1 == 1).then_some(*leaf))
+            .collect::<Vec<_>>();
+        let right = leaves
+            .iter()
+            .enumerate()
+            .filter_map(|(index, leaf)| ((left_mask >> index) & 1 == 0).then_some(*leaf))
+            .collect::<Vec<_>>();
+        for left_id in brute_tree_ids(&left) {
+            for right_id in brute_tree_ids(&right) {
+                result.insert(format!("({left_id},{right_id})"));
+            }
+        }
+    }
+    result
+}
+
+fn compare_cost_bound(left: EinsumCostBound, right: EinsumCostBound) -> std::cmp::Ordering {
+    match (left, right) {
+        (EinsumCostBound::Exact(left), EinsumCostBound::Exact(right)) => left.cmp(&right),
+        (EinsumCostBound::Exact(_), EinsumCostBound::UnknownUpperBound) => std::cmp::Ordering::Less,
+        (EinsumCostBound::UnknownUpperBound, EinsumCostBound::Exact(_)) => {
+            std::cmp::Ordering::Greater
+        }
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_cost(left: &EinsumContractionCost, right: &EinsumContractionCost) -> std::cmp::Ordering {
+    [
+        (left.flops(), right.flops()),
+        (left.unary_or_product_work(), right.unary_or_product_work()),
+        (left.intermediate_elements(), right.intermediate_elements()),
+        (
+            left.peak_live_temporary_elements(),
+            right.peak_live_temporary_elements(),
+        ),
+        (
+            left.total_intermediate_traffic_elements(),
+            right.total_intermediate_traffic_elements(),
+        ),
+        (
+            left.layout_or_packing_traffic_elements(),
+            right.layout_or_packing_traffic_elements(),
+        ),
+        (
+            left.broadcast_amplification_elements(),
+            right.broadcast_amplification_elements(),
+        ),
+    ]
+    .into_iter()
+    .map(|(left, right)| compare_cost_bound(left, right))
+    .find(|ordering| !ordering.is_eq())
+    .unwrap_or_else(|| left.slot_count().cmp(&right.slot_count()))
 }
 
 #[test]
-fn x_transpose_a_y_order_flips_from_independent_operation_counts() {
-    for (i, j) in (1usize..=8).flat_map(|i| (1usize..=8).map(move |j| (i, j))) {
-        let plan = plan("i,ij,j->", &[&[i], &[i, j], &[j]]);
-        let selected = tree(&plan).preferred_candidate().unwrap();
-
-        // Independent scalar-operation model:
-        // (x^T A)y = J(2I-1) + (2J-1)
-        // x^T(Ay) = I(2J-1) + (2I-1)
-        let left_first = j * (2 * i - 1) + (2 * j - 1);
-        let right_first = i * (2 * j - 1) + (2 * i - 1);
-        if left_first != right_first {
-            let expected_pair = if left_first < right_first {
-                [0, 1]
-            } else {
-                [1, 2]
-            };
-            assert_eq!(unordered_pair(selected.first_pair()), expected_pair);
+fn exact_subset_dp_matches_independent_brute_force_tree_enumerator() {
+    for arity in 2..=4 {
+        let equation = format!(
+            "{}->",
+            std::iter::repeat_n("i", arity)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let owned = vec![vec![2usize]; arity];
+        let shapes = owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let plan = plan(EinsumSchema::V12, &equation, DataType::Float32, &shapes);
+        let actual = tree(&plan)
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.id().as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, brute_tree_ids(&(0..arity).collect::<Vec<_>>()));
+        assert_eq!(tree(&plan).quality(), EinsumPlannerQuality::ExactSubsetDp);
+        if arity == 4 {
+            assert_eq!(
+                tree(&plan).preferred_candidate().unwrap().id().as_str(),
+                actual.first().unwrap(),
+                "symmetric equal-cost trees use the stable lexicographic tie-break"
+            );
         }
     }
 }
 
 #[test]
-fn batched_and_ellipsis_trilinear_plans_record_batch_and_virtual_axes() {
-    let batched = plan("bi,bij,bj->b", &[&[7, 3], &[7, 3, 5], &[7, 5]]);
-    let first = first_binary(candidate(tree(&batched), "((0,1),2)"));
-    assert_eq!(first.batch_axes().len(), 1);
-    assert!(first.left_virtual_singleton_axes().is_empty());
-    assert!(first.right_virtual_singleton_axes().is_empty());
-
-    let ellipsis = plan("i,...ij,...j->...", &[&[3], &[2, 7, 3, 5], &[2, 7, 5]]);
-    let first = first_binary(candidate(tree(&ellipsis), "((0,1),2)"));
-    assert_eq!(first.batch_axes().len(), 2);
-    assert_eq!(first.left_virtual_singleton_axes().len(), 2);
-    assert!(first.right_virtual_singleton_axes().is_empty());
-    assert_eq!(
-        first.geometry().batch_shape(),
-        &[
-            onnx_runtime_ir::EinsumDimension::Static(2),
-            onnx_runtime_ir::EinsumDimension::Static(7),
-        ]
-    );
-    let structural = candidate(tree(&ellipsis), "((0,1),2)").supported().unwrap();
-    assert_eq!(
-        structural.cost().broadcast_amplification_elements(),
-        EinsumCostBound::Exact(39)
-    );
-    let concrete = ellipsis
-        .resolve_concrete_contraction_tree(&[&[3], &[2, 7, 3, 5], &[2, 7, 5]])
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        concrete
+fn exact_dp_preference_matches_independent_generated_brute_force_comparator() {
+    let labels = ['a', 'b', 'c', 'd'];
+    let extents = BTreeMap::from([('a', 2usize), ('b', 3), ('c', 2), ('d', 3)]);
+    let mut seed = 0x2349_u64;
+    for _ in 0..24 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let arity = 2 + seed as usize % 3;
+        let mut terms = Vec::new();
+        let mut shapes = Vec::new();
+        for input in 0..arity {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let first = labels[(seed as usize + input) % labels.len()];
+            let second = labels[((seed >> 11) as usize + input + 1) % labels.len()];
+            let term = if first == second {
+                vec![first]
+            } else {
+                vec![first, second]
+            };
+            shapes.push(term.iter().map(|label| extents[label]).collect::<Vec<_>>());
+            terms.push(term);
+        }
+        let equation = format!(
+            "{}->",
+            terms
+                .iter()
+                .map(|term| term.iter().collect::<String>())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let refs = shapes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let plan = plan(EinsumSchema::V12, &equation, DataType::Float32, &refs);
+        let tree = tree(&plan);
+        let expected = tree
             .candidates()
             .iter()
-            .find(|candidate| candidate.id().as_str() == "((0,1),2)")
+            .filter_map(|candidate| candidate.supported().map(|plan| (candidate, plan.cost())))
+            .min_by(|(left_candidate, left), (right_candidate, right)| {
+                compare_cost(left, right)
+                    .then_with(|| left_candidate.id().cmp(right_candidate.id()))
+            })
             .unwrap()
-            .cost()
-            .unwrap()
-            .broadcast_amplification_elements(),
-        39
-    );
-
-    let singleton = plan("...i,...ij,...j->...", &[&[1, 3], &[7, 3, 5], &[7, 5]]);
-    assert_eq!(
-        candidate(tree(&singleton), "((0,1),2)")
-            .supported()
-            .unwrap()
-            .cost()
-            .broadcast_amplification_elements(),
-        EinsumCostBound::Exact(18)
-    );
-}
-
-#[test]
-fn chain_order_flips_for_opposite_asymmetry() {
-    for (shape, expected_pair) in [
-        ((2usize, 100usize, 3usize, 2usize), [0, 1]),
-        ((100usize, 2usize, 3usize, 100usize), [1, 2]),
-    ] {
-        let (a, b, c, d) = shape;
-        let plan = plan("ab,bc,cd->ad", &[&[a, b], &[b, c], &[c, d]]);
-        let selected = tree(&plan).preferred_candidate().unwrap();
-
-        // Independent direct-loop operation counts for the two conventional
-        // chain orders. This intentionally does not call the production
-        // comparator or reconstruct its metric tuple.
-        let left_first = a * c * (2 * b - 1) + a * d * (2 * c - 1);
-        let right_first = b * d * (2 * c - 1) + a * d * (2 * b - 1);
-        let independent_choice = if left_first < right_first {
-            [0, 1]
-        } else {
-            [1, 2]
-        };
-        assert_eq!(independent_choice, expected_pair);
-        assert_eq!(unordered_pair(selected.first_pair()), expected_pair);
+            .0
+            .id();
+        assert_eq!(
+            tree.preferred_candidate().unwrap().id(),
+            expected,
+            "{equation}"
+        );
     }
 }
 
 #[test]
-fn tensor_vector_vector_tree_preserves_only_requested_k() {
-    let plan = plan("ijk,i,j->k", &[&[3, 5, 7], &[3], &[5]]);
-    let selected = tree(&plan).preferred_candidate().unwrap();
-    // Forming i⊗j once (15 multiplies) and contracting both axes for each k
-    // costs less here than separately materializing jk or ik.
-    assert_eq!(unordered_pair(selected.first_pair()), [1, 2]);
-    assert_eq!(plan.output_shape()[0].as_static(), Some(7));
-}
+fn large_planning_is_deterministic_budgeted_and_stably_tied() {
+    let arity = 16;
+    let equation = format!(
+        "{}->",
+        std::iter::repeat_n("i", arity)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let owned = vec![vec![1usize]; arity];
+    let shapes = owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let first = plan(EinsumSchema::V12, &equation, DataType::Float32, &shapes);
+    let second = plan(EinsumSchema::V12, &equation, DataType::Float32, &shapes);
+    let first_tree = tree(&first);
+    let second_tree = tree(&second);
+    assert_eq!(
+        first_tree.quality(),
+        EinsumPlannerQuality::DeterministicGreedy
+    );
+    assert_eq!(first_tree.usage(), second_tree.usage());
+    assert_eq!(
+        first_tree.preferred_candidate().unwrap().id(),
+        second_tree.preferred_candidate().unwrap().id()
+    );
+    assert!(
+        first_tree.usage().candidates() <= first_tree.usage().budget().max_heuristic_candidates
+    );
 
-#[test]
-fn diagonal_local_reduction_mixed_case_and_implicit_output_are_preserved() {
-    let diagonal = plan("iik,ij,j->k", &[&[3, 3, 7], &[3, 5], &[5]]);
-    assert_eq!(diagonal.operands()[0].diagonal_axis_indices(), &[0]);
-    assert!(matches!(
-        diagonal.classification(),
-        EinsumClassification::ContractionTree(_)
-    ));
-
-    let local = plan("xAi,Aij,j->", &[&[2, 3, 5], &[3, 5, 7], &[7]]);
-    let tree = tree(&local);
-    let candidate = candidate(tree, "((0,1),2)").supported().unwrap();
-    let unary = candidate
-        .steps()
+    let forced = EinsumPlannerBudget {
+        exact_operand_limit: 16,
+        max_states: 2,
+        max_candidates: 2,
+        max_exact_axes: 64,
+        max_heuristic_candidates: 8,
+    };
+    let inputs = shapes
         .iter()
-        .find_map(|step| match step {
-            EinsumContractionTreeStep::UnaryReduction(unary) => Some(unary),
-            EinsumContractionTreeStep::BinaryContraction(_) => None,
-            _ => None,
-        })
-        .unwrap();
+        .map(|shape| EinsumInput::new(DataType::Float32, shape))
+        .collect::<Vec<_>>();
+    let forced =
+        EinsumPlan::build_for_schema_with_budget(&equation, &inputs, EinsumSchema::V12, forced)
+            .unwrap();
     assert_eq!(
-        unary
-            .reduction_axes()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["label `x`"]
+        tree(&forced).quality(),
+        EinsumPlannerQuality::DeterministicGreedy
     );
-    assert_eq!(
-        local
-            .output_axes()
-            .iter()
-            .map(|axis| match axis {
-                EinsumAxis::Label(label) => label.as_char(),
-                EinsumAxis::Ellipsis(_) => '.',
-            })
-            .collect::<String>(),
-        ""
-    );
-
-    let implicit = plan("Ai,ij,j", &[&[3, 5], &[5, 7], &[7]]);
-    assert_eq!(
-        implicit
-            .output_axes()
-            .iter()
-            .map(|axis| match axis {
-                EinsumAxis::Label(label) => label.as_char(),
-                EinsumAxis::Ellipsis(_) => '.',
-            })
-            .collect::<String>(),
-        "A"
-    );
+    assert!(tree(&forced).usage().candidates() <= 8);
 }
 
 #[test]
-fn three_input_four_input_and_three_way_reductions_have_distinct_reasons() {
-    let three = plan("ab,bc,cd->ad", &[&[2, 3], &[3, 4], &[4, 5]]);
-    assert!(matches!(
-        three.classification(),
-        EinsumClassification::ContractionTree(_)
-    ));
-
-    let four = plan("ab,bc,cd,de->ae", &[&[2, 3], &[3, 4], &[4, 5], &[5, 6]]);
-    assert!(matches!(
-        four.classification(),
-        EinsumClassification::Unsupported(
-            EinsumUnsupportedReason::InputCountExceedsContractionTreeLimit {
-                input_count: 4,
-                maximum: 3,
-            }
-        )
-    ));
-
-    let three_way = plan("i,i,i->", &[&[5], &[5], &[5]]);
-    assert!(matches!(
-        three_way.classification(),
-        EinsumClassification::Unsupported(
-            EinsumUnsupportedReason::ReducedAxisSpansTooManyOperands {
-                maximum: 2,
-                axes,
-            }
-        ) if axes.len() == 1
-    ));
-
-    let reduced_ellipsis = plan("...i,...ij,j->", &[&[2, 3], &[2, 3, 5], &[5]]);
-    assert!(matches!(
-        reduced_ellipsis.classification(),
-        EinsumClassification::Unsupported(EinsumUnsupportedReason::ReducedEllipsis {
-            axes,
-        }) if axes == &[EinsumAxis::Ellipsis(0)]
-    ));
-}
-
-#[test]
-fn zero_and_symbolic_costs_are_exact_or_unbounded_without_fabrication() {
-    let zero = plan("i,ij,j->", &[&[0], &[0, 5], &[5]]);
-    let selected = tree(&zero)
+fn costs_are_checked_u128_zero_annihilates_and_memory_can_fall_back() {
+    let maximum = [usize::MAX];
+    let wide = plan(
+        EinsumSchema::V12,
+        "i,i->",
+        DataType::Float32,
+        &[&maximum, &maximum],
+    );
+    let flops = tree(&wide)
         .preferred_candidate()
         .unwrap()
         .supported()
+        .unwrap()
+        .cost()
+        .flops()
+        .exact()
         .unwrap();
-    assert_eq!(selected.cost().flops(), EinsumCostBound::Exact(0));
+    assert!(flops > u64::MAX as u128);
 
-    let i = Dim::Symbolic(SymbolId(1));
-    let j = Dim::Symbolic(SymbolId(2));
-    let left = [i];
-    let matrix = [i, j];
-    let right = [j];
-    let symbolic_inputs = [
-        EinsumInput::new(DataType::Float16, &left),
-        EinsumInput::new(DataType::Float16, &matrix),
-        EinsumInput::new(DataType::Float16, &right),
-    ];
-    let symbolic = EinsumPlan::build("i,ij,j->", &symbolic_inputs).unwrap();
-    let symbolic_tree = tree(&symbolic);
-    assert!(symbolic_tree.requires_concrete_rescore());
+    let zero_max = [0usize, usize::MAX];
+    let zero = plan(
+        EinsumSchema::V12,
+        "ij,ij->",
+        DataType::Float32,
+        &[&zero_max, &zero_max],
+    );
     assert_eq!(
-        symbolic_tree
+        tree(&zero)
             .preferred_candidate()
             .unwrap()
             .supported()
             .unwrap()
             .cost()
             .flops(),
-        EinsumCostBound::UnknownUpperBound
+        EinsumCostBound::Exact(0)
     );
 
-    let concrete = symbolic
-        .resolve_concrete_contraction_tree(&[&[2], &[2, 64], &[64]])
+    let chain = plan(
+        EinsumSchema::V12,
+        "ij,jk,kl->il",
+        DataType::Float16,
+        &[&[2, 3], &[3, 4], &[4, 5]],
+    );
+    let concrete = chain
+        .resolve_concrete_contraction_tree(&[&[2, 3], &[3, 4], &[4, 5]])
         .unwrap()
         .unwrap();
-    assert_eq!(
-        unordered_pair(
-            concrete
-                .preferred_candidate()
-                .unwrap()
-                .id_pair(symbolic_tree)
-        ),
-        [1, 2]
-    );
-    assert_eq!(
+    assert!(concrete.preferred_candidate().is_some());
+    assert!(
         concrete
-            .preferred_candidate()
-            .unwrap()
-            .cost()
-            .unwrap()
-            .intermediate_bytes()
-            % 2,
-        0
+            .preferred_candidate_with_memory_ceiling(0)
+            .is_none()
     );
+    assert_eq!(
+        chain
+            .select_concrete_execution(&[&[2, 3], &[3, 4], &[4, 5]], 0)
+            .unwrap(),
+        EinsumExecutionSelection::GenericNative
+    );
+    assert!(!chain.generic_native().index_program().operands().is_empty());
 }
 
 #[test]
-fn zero_output_candidate_short_circuits_huge_contraction_costs() {
-    let maximum = usize::MAX;
-    let plan = plan("ik,kj,jl->il", &[&[0, maximum], &[maximum, 1], &[1, 1]]);
-    let tree = tree(&plan);
-
-    let zero_candidate = candidate(tree, "((0,1),2)").supported().unwrap();
-    let zero_cost = zero_candidate.cost();
-    assert_eq!(zero_cost.flops(), EinsumCostBound::Exact(0));
-    assert_eq!(zero_cost.unary_or_product_work(), EinsumCostBound::Exact(0));
-    assert_eq!(zero_cost.intermediate_elements(), EinsumCostBound::Exact(0));
-    assert_eq!(
-        zero_cost.peak_live_temporary_elements(),
-        EinsumCostBound::Exact(0)
-    );
-    assert_eq!(
-        zero_cost.total_intermediate_traffic_elements(),
-        EinsumCostBound::Exact(0)
-    );
-    assert_eq!(
-        zero_cost.intermediate_bytes(usize::MAX),
-        Some(EinsumCostBound::Exact(0))
-    );
-
-    let concrete = plan
-        .resolve_concrete_contraction_tree(&[&[0, maximum], &[maximum, 1], &[1, 1]])
-        .unwrap()
-        .unwrap();
-    let zero_resolved = concrete
-        .candidates()
-        .iter()
-        .find(|candidate| candidate.id().as_str() == "((0,1),2)")
-        .unwrap()
-        .cost()
-        .unwrap();
-    assert_eq!(zero_resolved.flops(), 0);
-    assert_eq!(zero_resolved.intermediate_elements(), 0);
-    assert_eq!(zero_resolved.intermediate_bytes(), 0);
-    assert_eq!(zero_resolved.peak_live_temporary_bytes(), 0);
-    assert_eq!(zero_resolved.total_intermediate_traffic_bytes(), 0);
-
-    let alternate = candidate(tree, "((1,2),0)");
-    #[cfg(target_pointer_width = "64")]
-    assert!(
-        matches!(
-            alternate.unsupported_reason(),
-            Some(
-                EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
-                    metric: EinsumCostMetric::LayoutOrPackingTraffic,
-                }
-            )
-        ),
-        "{:?}",
-        alternate.unsupported_reason()
-    );
-    #[cfg(target_pointer_width = "32")]
-    {
-        let alternate = alternate.supported().unwrap().cost();
-        let maximum = u64::try_from(maximum).unwrap();
-        assert_eq!(alternate.flops(), EinsumCostBound::Exact(maximum));
-        assert_eq!(
-            alternate.intermediate_elements(),
-            EinsumCostBound::Exact(maximum)
-        );
-        assert_eq!(
-            alternate.total_intermediate_traffic_elements(),
-            EinsumCostBound::Exact(maximum * 2)
-        );
-        assert_eq!(
-            alternate.intermediate_bytes(4),
-            Some(EinsumCostBound::Exact(maximum * 4))
-        );
-    }
-}
-
-#[test]
-fn zero_axes_annihilate_packing_traffic_and_broadcast_before_overflow() {
-    let maximum = usize::MAX;
+fn liveness_layout_and_accumulator_storage_are_published() {
     let plan = plan(
-        "mkb,bkn,bnl->bml",
-        &[&[maximum, 0, maximum], &[maximum, 0, 0], &[maximum, 0, 0]],
+        EinsumSchema::V12,
+        "ij,jk,kl,lm->im",
+        DataType::Float16,
+        &[&[2, 3], &[3, 4], &[4, 5], &[5, 6]],
     );
-    let supported = candidate(tree(&plan), "((0,1),2)").supported().unwrap();
-    let cost = supported.cost();
-
-    for (name, bound) in [
-        ("FLOPs", cost.flops()),
-        ("unary/product work", cost.unary_or_product_work()),
-        ("intermediate elements", cost.intermediate_elements()),
-        (
-            "peak live temporary elements",
-            cost.peak_live_temporary_elements(),
-        ),
-        (
-            "total intermediate traffic",
-            cost.total_intermediate_traffic_elements(),
-        ),
-        (
-            "layout/packing traffic",
-            cost.layout_or_packing_traffic_elements(),
-        ),
-        (
-            "broadcast amplification",
-            cost.broadcast_amplification_elements(),
-        ),
-    ] {
-        assert_eq!(bound, EinsumCostBound::Exact(0), "{name}");
-    }
-    for (name, bytes) in [
-        ("intermediate bytes", cost.intermediate_bytes(usize::MAX)),
-        (
-            "peak live temporary bytes",
-            cost.peak_live_temporary_bytes(usize::MAX),
-        ),
-        (
-            "total intermediate traffic bytes",
-            cost.total_intermediate_traffic_bytes(usize::MAX),
-        ),
-        (
-            "layout/packing traffic bytes",
-            cost.layout_or_packing_traffic_bytes(usize::MAX),
-        ),
-    ] {
-        assert_eq!(bytes, Some(EinsumCostBound::Exact(0)), "{name}");
-    }
-}
-
-trait ConcreteCandidateExt {
-    fn id_pair(&self, tree: &onnx_runtime_ir::EinsumContractionTreePlan) -> [usize; 2];
-}
-
-impl ConcreteCandidateExt for onnx_runtime_ir::EinsumConcreteContractionTreeCandidate {
-    fn id_pair(&self, tree: &onnx_runtime_ir::EinsumContractionTreePlan) -> [usize; 2] {
-        tree.candidates()
-            .iter()
-            .find(|candidate| candidate.id() == self.id())
-            .unwrap()
-            .first_pair()
-    }
-}
-
-#[cfg(target_pointer_width = "64")]
-#[test]
-fn static_cost_overflow_declines_candidates_without_wrapping() {
-    let i = usize::MAX / 2 + 1;
-    let plan = plan("i,ij,j->", &[&[i], &[i, 1], &[1]]);
-    let tree = tree(&plan);
-    assert!(tree.preferred_candidate().is_none());
-    assert!(
-        tree.candidates()
-            .iter()
-            .all(|candidate| candidate.unsupported_reason().is_some())
-    );
-}
-
-#[test]
-fn candidate_order_ties_and_peak_liveness_are_stable() {
-    let first = plan("i,ij,j->", &[&[4], &[4, 4], &[4]]);
-    let second = plan("i,ij,j->", &[&[4], &[4, 4], &[4]]);
-    let first_tree = tree(&first);
-    let second_tree = tree(&second);
-    let ids = first_tree
-        .candidates()
-        .iter()
-        .map(|candidate| candidate.id().as_str())
-        .collect::<Vec<_>>();
-    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
-    assert_eq!(
-        ids,
-        second_tree
-            .candidates()
-            .iter()
-            .map(|candidate| candidate.id().as_str())
-            .collect::<Vec<_>>()
-    );
-    let preferred = first_tree.preferred_candidate().unwrap();
-    let tied_minimum_id = first_tree
-        .candidates()
-        .iter()
-        .filter(|candidate| {
-            candidate
-                .supported()
-                .zip(preferred.supported())
-                .is_some_and(|(left, right)| left.cost() == right.cost())
-        })
-        .map(|candidate| candidate.id())
-        .min()
-        .unwrap();
-    assert_eq!(preferred.id(), tied_minimum_id);
-
-    let liveness = plan("xi,yij,zj->", &[&[2, 3], &[5, 3, 7], &[11, 7]]);
-    let candidate = candidate(tree(&liveness), "((0,1),2)").supported().unwrap();
-    assert_eq!(candidate.cost().slot_count(), 3);
-    assert_eq!(
-        candidate.cost().peak_live_temporary_elements(),
-        EinsumCostBound::Exact(31)
-    );
-    assert_eq!(
-        candidate.cost().intermediate_elements(),
-        EinsumCostBound::Exact(38)
-    );
-}
-
-#[test]
-fn final_output_permutation_and_concrete_geometry_are_public() {
-    let plan = plan("ab,bc,cd->da", &[&[2, 3], &[3, 5], &[5, 7]]);
-    let tree = tree(&plan);
-    let candidate = candidate(tree, "((0,1),2)").supported().unwrap();
-    assert_eq!(candidate.final_output_permutation(), &[1, 0]);
-
-    let concrete = plan
-        .resolve_concrete_contraction_tree(&[&[2, 3], &[3, 5], &[5, 7]])
+    let candidate = tree(&plan)
+        .preferred_candidate()
         .unwrap()
+        .supported()
         .unwrap();
-    let resolved = concrete
-        .candidates()
+    for temporary in candidate.temporaries() {
+        assert!(temporary.birth_step() <= temporary.last_use_step());
+        assert_eq!(
+            temporary.axes().len(),
+            temporary.global_iteration_axis_indices().len()
+        );
+        assert_eq!(
+            temporary.storage_policy(),
+            EinsumTemporaryStoragePolicy::Accumulator
+        );
+        assert_eq!(
+            plan.precision_policy().intermediate_dtype(),
+            DataType::Float32
+        );
+    }
+    assert!(matches!(
+        candidate.cost().peak_live_temporary_elements(),
+        EinsumCostBound::Exact(_)
+    ));
+}
+
+fn row_major_offset(indices: &[usize], shape: &[usize]) -> usize {
+    indices
         .iter()
-        .find(|candidate| candidate.id().as_str() == "((0,1),2)")
-        .unwrap();
-    assert_eq!(resolved.binary_geometries().len(), 2);
-    assert_eq!(resolved.binary_geometries()[0].m(), 2);
-    assert_eq!(resolved.binary_geometries()[0].k(), 3);
-    assert_eq!(resolved.binary_geometries()[0].n(), 5);
+        .zip(shape)
+        .fold(0usize, |offset, (&index, &extent)| offset * extent + index)
+}
+
+fn for_each_index(shape: &[usize], mut visit: impl FnMut(&[usize])) {
+    if shape.contains(&0) {
+        return;
+    }
+    let mut index = vec![0usize; shape.len()];
+    loop {
+        visit(&index);
+        let Some(axis) = (0..shape.len())
+            .rev()
+            .find(|&axis| index[axis] + 1 < shape[axis])
+        else {
+            break;
+        };
+        index[axis] += 1;
+        for later in index.iter_mut().take(shape.len()).skip(axis + 1) {
+            *later = 0;
+        }
+    }
+}
+
+fn independent_reference(
+    operand_labels: &[Vec<char>],
+    output_labels: &[char],
+    extents: &BTreeMap<char, usize>,
+    operands: &[Vec<f64>],
+) -> Vec<f64> {
+    let all_labels = operand_labels
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let reductions = all_labels
+        .iter()
+        .copied()
+        .filter(|label| !output_labels.contains(label))
+        .collect::<Vec<_>>();
+    let mut iteration_labels = output_labels.to_vec();
+    iteration_labels.extend(&reductions);
+    let iteration_shape = iteration_labels
+        .iter()
+        .map(|label| extents[label])
+        .collect::<Vec<_>>();
+    let output_shape = output_labels
+        .iter()
+        .map(|label| extents[label])
+        .collect::<Vec<_>>();
+    let mut output = vec![0.0; output_shape.iter().product()];
+    for_each_index(&iteration_shape, |index| {
+        let by_label = iteration_labels
+            .iter()
+            .copied()
+            .zip(index.iter().copied())
+            .collect::<BTreeMap<_, _>>();
+        let product = operand_labels
+            .iter()
+            .zip(operands)
+            .map(|(labels, data)| {
+                let operand_index = labels
+                    .iter()
+                    .map(|label| by_label[label])
+                    .collect::<Vec<_>>();
+                let shape = labels
+                    .iter()
+                    .map(|label| extents[label])
+                    .collect::<Vec<_>>();
+                data[row_major_offset(&operand_index, &shape)]
+            })
+            .product::<f64>();
+        let output_offset = row_major_offset(&index[..output_labels.len()], &output_shape);
+        output[output_offset] += product;
+    });
+    output
+}
+
+fn evaluate_index_program(plan: &EinsumPlan, operands: &[Vec<f64>]) -> Vec<f64> {
+    let program = plan.generic_native().index_program();
+    let dimensions = plan
+        .logical_axes()
+        .iter()
+        .map(|axis| (axis.axis(), axis.dimension().as_static().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    let iteration_shape = program
+        .iteration_axes()
+        .iter()
+        .map(|axis| dimensions[axis])
+        .collect::<Vec<_>>();
+    let output_shape = &iteration_shape[..program.output_rank()];
+    let mut output = vec![0.0; output_shape.iter().product()];
+    for_each_index(&iteration_shape, |index| {
+        let product = program
+            .operands()
+            .iter()
+            .zip(operands)
+            .map(|(operand, data)| {
+                let shape = plan.operands()[operand.input()]
+                    .shape()
+                    .iter()
+                    .map(|dimension| dimension.as_static().unwrap())
+                    .collect::<Vec<_>>();
+                let operand_index = operand
+                    .physical_axis_to_iteration_axis()
+                    .iter()
+                    .zip(operand.physical_axis_broadcasts_when_one())
+                    .zip(&shape)
+                    .map(|((&axis, &broadcasts), &extent)| {
+                        if broadcasts && extent == 1 {
+                            0
+                        } else {
+                            index[axis]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                data[row_major_offset(&operand_index, &shape)]
+            })
+            .product::<f64>();
+        let output_offset = row_major_offset(&index[..program.output_rank()], output_shape);
+        output[output_offset] += product;
+    });
+    output
+}
+
+#[test]
+fn generated_generic_index_program_matches_independent_reference_model() {
+    let mut seed = 0x5eed_u64;
+    for case in 0..32 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let arity = 1 + (seed as usize % 4);
+        let labels = ['a', 'b', 'c', 'd'];
+        let extents = BTreeMap::from([('a', 2), ('b', 2), ('c', 3), ('d', 2)]);
+        let mut operand_labels = Vec::new();
+        for input in 0..arity {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let first = labels[(seed as usize + input) % labels.len()];
+            let second = labels[((seed >> 8) as usize + input + 1) % labels.len()];
+            operand_labels.push(if case % 7 == 0 && input == 0 {
+                vec![first, first]
+            } else if first == second {
+                vec![first]
+            } else {
+                vec![first, second]
+            });
+        }
+        let all = operand_labels
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let output_labels = all
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, label)| (index % 2 == case % 2).then_some(label))
+            .collect::<Vec<_>>();
+        let equation = format!(
+            "{}->{}",
+            operand_labels
+                .iter()
+                .map(|labels| labels.iter().collect::<String>())
+                .collect::<Vec<_>>()
+                .join(","),
+            output_labels.iter().collect::<String>()
+        );
+        let shapes = operand_labels
+            .iter()
+            .map(|labels| {
+                labels
+                    .iter()
+                    .map(|label| extents[label])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let shape_refs = shapes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let plan = plan(EinsumSchema::V12, &equation, DataType::Float64, &shape_refs);
+        let operands = shapes
+            .iter()
+            .enumerate()
+            .map(|(input, shape)| {
+                (0..shape.iter().product())
+                    .map(|index| 1.0 + ((input + index) % 5) as f64)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            evaluate_index_program(&plan, &operands),
+            independent_reference(&operand_labels, &output_labels, &extents, &operands),
+            "{equation}"
+        );
+    }
+}
+
+#[test]
+fn generic_index_program_encodes_ellipsis_broadcast_indexing() {
+    let plan = plan(
+        EinsumSchema::V12,
+        "...i,...i->...",
+        DataType::Float64,
+        &[&[1, 2], &[3, 2]],
+    );
+    assert_eq!(
+        plan.generic_native().index_program().operands()[0].physical_axis_broadcasts_when_one(),
+        &[true, false]
+    );
+    assert_eq!(
+        evaluate_index_program(&plan, &[vec![2.0, 3.0], vec![1.0, 4.0, 5.0, 2.0, 3.0, 6.0]]),
+        vec![14.0, 16.0, 24.0]
+    );
 }

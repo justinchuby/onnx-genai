@@ -50,6 +50,14 @@ pub enum LoaderError {
     },
 
     #[error(
+        "illegal ONNX Einsum at node {node}: {detail}. RULES #1: Einsum syntax, schema version, \
+         homogeneous dtype, rank, diagonal, and broadcast constraints must be valid at model \
+         load. Expected: fix the equation/input metadata or export with the applicable ai.onnx \
+         opset (Einsum-12 for opsets 12..27; Einsum-28 for opset 28+)"
+    )]
+    InvalidEinsum { node: String, detail: String },
+
+    #[error(
         "unsupported ONNX model: operator {domain}::{op_type} at node {node} carries a \
          subgraph attribute '{attr}' (control-flow / nested-graph op) that this runtime cannot \
          execute. RULES #1: ep-cpu recursively executes the standard control-flow ops \

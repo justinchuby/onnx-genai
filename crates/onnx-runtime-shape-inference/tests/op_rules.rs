@@ -5121,6 +5121,24 @@ fn einsum_shape_inference_preserves_supported_float_dtype() {
         assert_eq!(type_info.dtype, dtype);
         assert_eq!(type_info.shape, vec![c(3), c(2)]);
     }
+
+    let rejected = try_run(
+        &einsum_node("ij->ji", 1),
+        vec![tin(DataType::BFloat16, vec![c(2), c(3)])],
+        27,
+    )
+    .unwrap_err();
+    assert_invalid(rejected, "Einsum", "not admitted by Einsum-12");
+
+    let accepted = run(
+        &einsum_node("ij->ji", 1),
+        vec![tin(DataType::BFloat16, vec![c(2), c(3)])],
+        28,
+    );
+    assert_eq!(
+        accepted[0].type_info.as_ref().unwrap(),
+        &TypeInfo::new(DataType::BFloat16, vec![c(3), c(2)])
+    );
 }
 
 #[test]
@@ -5298,7 +5316,11 @@ fn einsum_invalid_equations_dimensions_and_dtypes_are_actionable() {
         12,
     )
     .unwrap_err();
-    assert_invalid(unsupported, "Einsum", "unsupported opset-12 dtype Bool");
+    assert_invalid(
+        unsupported,
+        "Einsum",
+        "dtype Bool, which is not admitted by Einsum-12",
+    );
 
     // Missing type/shape metadata remains best-effort and leaves the output
     // unresolved, preserving the crate-wide permissive inference contract.

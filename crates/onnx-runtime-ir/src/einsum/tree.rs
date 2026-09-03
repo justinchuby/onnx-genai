@@ -1,5 +1,4 @@
-//! Ordered binary contraction-tree planning for coupled two- and three-input
-//! einsums.
+//! Bounded deterministic binary contraction-tree planning for general Einsum.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,14 +54,14 @@ impl fmt::Display for EinsumContractionTreeCandidateId {
 #[non_exhaustive]
 pub enum EinsumCostBound {
     /// Exact checked value.
-    Exact(u64),
+    Exact(u128),
     /// Unknown value with an unbounded/infinite upper bound.
     UnknownUpperBound,
 }
 
 impl EinsumCostBound {
     /// Exact value, when statically known.
-    pub const fn exact(self) -> Option<u64> {
+    pub const fn exact(self) -> Option<u128> {
         match self {
             Self::Exact(value) => Some(value),
             Self::UnknownUpperBound => None,
@@ -78,9 +77,9 @@ impl EinsumCostBound {
     pub fn checked_scale(self, multiplier: usize) -> Option<Self> {
         match (self, multiplier) {
             (_, 0) | (Self::Exact(0), _) => Some(Self::Exact(0)),
-            (Self::Exact(value), multiplier) => Some(Self::Exact(
-                value.checked_mul(u64::try_from(multiplier).ok()?)?,
-            )),
+            (Self::Exact(value), multiplier) => {
+                Some(Self::Exact(value.checked_mul(multiplier as u128)?))
+            }
             (Self::UnknownUpperBound, _) => Some(Self::UnknownUpperBound),
         }
     }
@@ -117,6 +116,73 @@ pub enum EinsumCostMetric {
     Geometry,
     /// A byte-scaled cost component.
     Bytes,
+}
+
+/// Explicit deterministic bounds for contraction planning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EinsumPlannerBudget {
+    /// Largest arity eligible for exact subset-DP enumeration.
+    pub exact_operand_limit: usize,
+    /// Maximum subset states retained by exact planning.
+    pub max_states: usize,
+    /// Maximum candidate trees constructed by one planning pass.
+    pub max_candidates: usize,
+    /// Maximum logical axes eligible for exact planning.
+    pub max_exact_axes: usize,
+    /// Maximum pair evaluations performed by deterministic greedy planning.
+    pub max_heuristic_candidates: usize,
+}
+
+impl Default for EinsumPlannerBudget {
+    fn default() -> Self {
+        Self {
+            exact_operand_limit: 5,
+            max_states: 64,
+            max_candidates: 4096,
+            max_exact_axes: 64,
+            max_heuristic_candidates: 4096,
+        }
+    }
+}
+
+/// Quality of the bounded planner result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EinsumPlannerQuality {
+    /// Every ordered binary tree was enumerated through subset DP.
+    ExactSubsetDp,
+    /// A deterministic bounded greedy tree was selected.
+    DeterministicGreedy,
+}
+
+/// Actual state/candidate/axis consumption for one planning pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EinsumPlannerUsage {
+    states: usize,
+    candidates: usize,
+    axes: usize,
+    budget: EinsumPlannerBudget,
+}
+
+impl EinsumPlannerUsage {
+    /// Subset or forest states considered.
+    pub const fn states(self) -> usize {
+        self.states
+    }
+
+    /// Candidate trees or pair merges considered.
+    pub const fn candidates(self) -> usize {
+        self.candidates
+    }
+
+    /// Logical axes in the equation.
+    pub const fn axes(self) -> usize {
+        self.axes
+    }
+
+    /// Configured deterministic bounds.
+    pub const fn budget(self) -> EinsumPlannerBudget {
+        self.budget
+    }
 }
 
 impl fmt::Display for EinsumCostMetric {
@@ -157,7 +223,7 @@ impl fmt::Display for EinsumContractionTreeCandidateUnsupportedReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CostOverflow { metric } => {
-                write!(f, "{metric} exceeds the checked u64 planning bound")
+                write!(f, "{metric} exceeds the checked u128 planning bound")
             }
             Self::UnloweredLocalReduction { axis } => write!(
                 f,
@@ -291,55 +357,55 @@ impl EinsumContractionCost {
 /// Exact cost after resolving concrete runtime shapes and an element width.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EinsumResolvedContractionCost {
-    flops: u64,
-    unary_or_product_work: u64,
-    intermediate_elements: u64,
-    intermediate_bytes: u64,
-    peak_live_temporary_bytes: u64,
-    total_intermediate_traffic_bytes: u64,
-    layout_or_packing_traffic_bytes: u64,
-    broadcast_amplification_elements: u64,
+    flops: u128,
+    unary_or_product_work: u128,
+    intermediate_elements: u128,
+    intermediate_bytes: u128,
+    peak_live_temporary_bytes: u128,
+    total_intermediate_traffic_bytes: u128,
+    layout_or_packing_traffic_bytes: u128,
+    broadcast_amplification_elements: u128,
     slot_count: usize,
 }
 
 impl EinsumResolvedContractionCost {
     /// Total scalar arithmetic operations.
-    pub const fn flops(&self) -> u64 {
+    pub const fn flops(&self) -> u128 {
         self.flops
     }
 
     /// Leaf-local reduction and K-free product work.
-    pub const fn unary_or_product_work(&self) -> u64 {
+    pub const fn unary_or_product_work(&self) -> u128 {
         self.unary_or_product_work
     }
 
     /// Sum of temporary element counts.
-    pub const fn intermediate_elements(&self) -> u64 {
+    pub const fn intermediate_elements(&self) -> u128 {
         self.intermediate_elements
     }
 
     /// Sum of temporary value bytes.
-    pub const fn intermediate_bytes(&self) -> u64 {
+    pub const fn intermediate_bytes(&self) -> u128 {
         self.intermediate_bytes
     }
 
     /// Maximum simultaneously live temporary bytes.
-    pub const fn peak_live_temporary_bytes(&self) -> u64 {
+    pub const fn peak_live_temporary_bytes(&self) -> u128 {
         self.peak_live_temporary_bytes
     }
 
     /// Temporary writes plus reads.
-    pub const fn total_intermediate_traffic_bytes(&self) -> u64 {
+    pub const fn total_intermediate_traffic_bytes(&self) -> u128 {
         self.total_intermediate_traffic_bytes
     }
 
     /// Estimated permutation/diagonal materialization traffic.
-    pub const fn layout_or_packing_traffic_bytes(&self) -> u64 {
+    pub const fn layout_or_packing_traffic_bytes(&self) -> u128 {
         self.layout_or_packing_traffic_bytes
     }
 
     /// Extra logical elements caused by batch broadcasting.
-    pub const fn broadcast_amplification_elements(&self) -> u64 {
+    pub const fn broadcast_amplification_elements(&self) -> u128 {
         self.broadcast_amplification_elements
     }
 
@@ -427,6 +493,15 @@ impl EinsumUnaryReductionPlan {
 }
 
 /// One ordered binary contraction/product node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EinsumBinaryLowering {
+    /// General index-program product/contraction.
+    GenericNative,
+    /// Named-axis contraction that may be optimized as GEMM/BMM.
+    GemmCompatible,
+}
+
+/// One ordered binary contraction/product node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EinsumBinaryContractionPlan {
     left: EinsumValueId,
@@ -449,6 +524,7 @@ pub struct EinsumBinaryContractionPlan {
     geometry: EinsumGemmGeometry,
     left_requires_packing: bool,
     right_requires_packing: bool,
+    lowering: EinsumBinaryLowering,
     left_elements: EinsumCostBound,
     right_elements: EinsumCostBound,
     output_elements: EinsumCostBound,
@@ -556,6 +632,11 @@ impl EinsumBinaryContractionPlan {
         self.right_requires_packing
     }
 
+    /// Semantic generic lowering or optional GEMM-compatible subtype.
+    pub const fn lowering(&self) -> EinsumBinaryLowering {
+        self.lowering
+    }
+
     /// Left value elements before virtual broadcast.
     pub const fn left_elements(&self) -> EinsumCostBound {
         self.left_elements
@@ -599,6 +680,15 @@ impl EinsumContractionTreeStep {
     }
 }
 
+/// Storage policy for a non-final contraction value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EinsumTemporaryStoragePolicy {
+    /// Store in the typed plan's accumulator/intermediate dtype. In
+    /// particular, f16/bf16 inputs use f32 intermediates and narrow only once
+    /// at the final output.
+    Accumulator,
+}
+
 /// One temporary value and its reusable-slot liveness interval.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EinsumTemporaryValuePlan {
@@ -608,6 +698,8 @@ pub struct EinsumTemporaryValuePlan {
     last_use_step: usize,
     axes: Vec<EinsumAxis>,
     leaf_inputs: Vec<usize>,
+    global_iteration_axis_indices: Vec<usize>,
+    storage_policy: EinsumTemporaryStoragePolicy,
     elements: EinsumCostBound,
 }
 
@@ -640,6 +732,16 @@ impl EinsumTemporaryValuePlan {
     /// Original leaves represented by this temporary.
     pub fn leaf_inputs(&self) -> &[usize] {
         &self.leaf_inputs
+    }
+
+    /// Map each live axis to its canonical global iteration-axis index.
+    pub fn global_iteration_axis_indices(&self) -> &[usize] {
+        &self.global_iteration_axis_indices
+    }
+
+    /// Backend-neutral intermediate storage policy.
+    pub const fn storage_policy(&self) -> EinsumTemporaryStoragePolicy {
+        self.storage_policy
     }
 
     /// Statically known element count.
@@ -690,7 +792,7 @@ impl EinsumSupportedContractionTreeCandidate {
 #[non_exhaustive]
 pub enum EinsumContractionTreeCandidatePlan {
     /// Candidate is structurally lowerable and has checked cost bounds.
-    Supported(EinsumSupportedContractionTreeCandidate),
+    Supported(Box<EinsumSupportedContractionTreeCandidate>),
     /// Candidate is semantically legal but cannot be represented safely.
     Unsupported(EinsumContractionTreeCandidateUnsupportedReason),
 }
@@ -699,8 +801,6 @@ pub enum EinsumContractionTreeCandidatePlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EinsumContractionTreeCandidate {
     id: EinsumContractionTreeCandidateId,
-    first_pair: [usize; 2],
-    root_intermediate_on_left: bool,
     plan: EinsumContractionTreeCandidatePlan,
 }
 
@@ -710,25 +810,15 @@ impl EinsumContractionTreeCandidate {
         &self.id
     }
 
-    /// Ordered original-input pair combined by the first binary node.
-    pub const fn first_pair(&self) -> [usize; 2] {
-        self.first_pair
-    }
-
-    /// Whether the first intermediate is the left operand of the root node.
-    pub const fn root_intermediate_on_left(&self) -> bool {
-        self.root_intermediate_on_left
-    }
-
     /// Supported or fail-closed candidate plan.
     pub const fn plan(&self) -> &EinsumContractionTreeCandidatePlan {
         &self.plan
     }
 
     /// Supported candidate details.
-    pub const fn supported(&self) -> Option<&EinsumSupportedContractionTreeCandidate> {
+    pub fn supported(&self) -> Option<&EinsumSupportedContractionTreeCandidate> {
         match &self.plan {
-            EinsumContractionTreeCandidatePlan::Supported(plan) => Some(plan),
+            EinsumContractionTreeCandidatePlan::Supported(plan) => Some(plan.as_ref()),
             EinsumContractionTreeCandidatePlan::Unsupported(_) => None,
         }
     }
@@ -744,7 +834,7 @@ impl EinsumContractionTreeCandidate {
     }
 }
 
-/// Canonical ordered-tree plan for a coupled two- or three-input einsum.
+/// Canonical bounded ordered-tree plan for a multi-input einsum.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EinsumContractionTreePlan {
     arity: usize,
@@ -752,6 +842,12 @@ pub struct EinsumContractionTreePlan {
     candidates: Vec<EinsumContractionTreeCandidate>,
     preferred_candidate: Option<usize>,
     requires_concrete_rescore: bool,
+    quality: EinsumPlannerQuality,
+    usage: EinsumPlannerUsage,
+    logical_order: Vec<EinsumAxis>,
+    output_axes: Vec<EinsumAxis>,
+    reduction_axes: BTreeSet<EinsumAxis>,
+    occurrence_inputs: BTreeMap<EinsumAxis, BTreeSet<usize>>,
 }
 
 impl EinsumContractionTreePlan {
@@ -781,6 +877,16 @@ impl EinsumContractionTreePlan {
         self.requires_concrete_rescore
     }
 
+    /// Whether planning was exact subset DP or bounded deterministic greedy.
+    pub const fn quality(&self) -> EinsumPlannerQuality {
+        self.quality
+    }
+
+    /// Actual bounded-planner resource use.
+    pub const fn usage(&self) -> EinsumPlannerUsage {
+        self.usage
+    }
+
     pub(super) fn resolve(
         &self,
         dimensions: &BTreeMap<EinsumAxis, usize>,
@@ -788,8 +894,48 @@ impl EinsumContractionTreePlan {
         operands: &[EinsumOperandPlan],
         element_size: usize,
     ) -> EinsumConcreteContractionTreePlan {
-        let mut candidates = Vec::with_capacity(self.candidates.len());
-        for candidate in &self.candidates {
+        let replanned;
+        let structural_candidates = if self.quality == EinsumPlannerQuality::DeterministicGreedy {
+            let concrete_dimensions = dimensions
+                .iter()
+                .map(|(&axis, &size)| (axis, EinsumDimension::Static(size)))
+                .collect::<BTreeMap<_, _>>();
+            let planned = greedy_tree(
+                self.arity,
+                &self.logical_order,
+                &concrete_dimensions,
+                &self.occurrence_inputs,
+                &self.reduction_axes,
+                self.usage.budget,
+            );
+            let output_axis_set = self.output_axes.iter().copied().collect();
+            replanned = planned
+                .trees
+                .into_iter()
+                .map(|tree| {
+                    let id = EinsumContractionTreeCandidateId(tree.id());
+                    let plan = match build_candidate(
+                        &tree,
+                        operands,
+                        &self.logical_order,
+                        &concrete_dimensions,
+                        &self.occurrence_inputs,
+                        &output_axis_set,
+                        &self.reduction_axes,
+                        &self.output_axes,
+                    ) {
+                        Ok(plan) => EinsumContractionTreeCandidatePlan::Supported(Box::new(plan)),
+                        Err(reason) => EinsumContractionTreeCandidatePlan::Unsupported(reason),
+                    };
+                    EinsumContractionTreeCandidate { id, plan }
+                })
+                .collect::<Vec<_>>();
+            &replanned
+        } else {
+            &self.candidates
+        };
+        let mut candidates = Vec::with_capacity(structural_candidates.len());
+        for candidate in structural_candidates {
             let concrete = match candidate.supported() {
                 Some(supported) => {
                     match concretize_candidate(supported, dimensions, input_shapes, operands)
@@ -912,6 +1058,29 @@ impl EinsumConcreteContractionTreePlan {
         self.preferred_candidate
             .and_then(|index| self.candidates.get(index))
     }
+
+    /// Lowest-cost candidate whose peak live temporary bytes fit `ceiling`.
+    ///
+    /// `None` is not a semantic rejection: the caller must select the
+    /// mandatory generic-native/tiled plan instead.
+    pub fn preferred_candidate_with_memory_ceiling(
+        &self,
+        ceiling: u128,
+    ) -> Option<&EinsumConcreteContractionTreeCandidate> {
+        self.candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .cost()
+                    .is_some_and(|cost| cost.peak_live_temporary_bytes() <= ceiling)
+            })
+            .min_by(|left, right| {
+                left.cost()
+                    .expect("filtered")
+                    .compare(right.cost().expect("filtered"))
+                    .then_with(|| left.id().cmp(right.id()))
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -924,11 +1093,33 @@ struct ValueDescriptor {
     requires_materialization: bool,
 }
 
-#[derive(Clone, Copy)]
-struct CandidateShape {
-    first_pair: [usize; 2],
-    remaining: Option<usize>,
-    root_intermediate_on_left: bool,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TreeExpr {
+    Leaf(usize),
+    Merge(Box<TreeExpr>, Box<TreeExpr>),
+}
+
+impl TreeExpr {
+    fn id(&self) -> String {
+        match self {
+            Self::Leaf(input) => input.to_string(),
+            Self::Merge(left, right) => format!("({},{})", left.id(), right.id()),
+        }
+    }
+
+    fn leaves(&self) -> BTreeSet<usize> {
+        match self {
+            Self::Leaf(input) => BTreeSet::from([*input]),
+            Self::Merge(left, right) => left.leaves().union(&right.leaves()).copied().collect(),
+        }
+    }
+}
+
+struct PlannedTrees {
+    trees: Vec<TreeExpr>,
+    quality: EinsumPlannerQuality,
+    states: usize,
+    candidates: usize,
 }
 
 pub(super) fn build_contraction_tree(
@@ -936,8 +1127,9 @@ pub(super) fn build_contraction_tree(
     logical_axes: &[EinsumLogicalAxis],
     output_axes: &[EinsumAxis],
     reduction_axes: &[EinsumAxis],
+    budget: EinsumPlannerBudget,
 ) -> EinsumContractionTreePlan {
-    debug_assert!((2..=3).contains(&operands.len()));
+    debug_assert!(operands.len() >= 2);
     let dimensions: BTreeMap<_, _> = logical_axes
         .iter()
         .map(|logical| (logical.axis(), logical.dimension()))
@@ -958,24 +1150,22 @@ pub(super) fn build_contraction_tree(
     let logical_order: Vec<_> = logical_axes.iter().map(EinsumLogicalAxis::axis).collect();
     let reduction_axes: BTreeSet<_> = reduction_axes.iter().copied().collect();
     let output_axis_set: BTreeSet<_> = output_axes.iter().copied().collect();
-    let local_reductions: Vec<BTreeSet<_>> = (0..operands.len())
-        .map(|input| {
-            reduction_axes
-                .iter()
-                .copied()
-                .filter(|axis| occurrence_inputs[axis].len() == 1)
-                .filter(|axis| occurrence_inputs[axis].contains(&input))
-                .collect()
-        })
-        .collect();
 
-    let shapes = enumerate_shapes(operands.len());
-    let mut candidates = shapes
+    let planned = plan_trees(
+        operands.len(),
+        &logical_order,
+        &dimensions,
+        &occurrence_inputs,
+        &reduction_axes,
+        budget,
+    );
+    let mut candidates = planned
+        .trees
         .into_iter()
-        .map(|shape| {
-            let id = candidate_id(shape);
+        .map(|tree| {
+            let id = EinsumContractionTreeCandidateId(tree.id());
             let plan = match build_candidate(
-                shape,
+                &tree,
                 operands,
                 &logical_order,
                 &dimensions,
@@ -983,17 +1173,11 @@ pub(super) fn build_contraction_tree(
                 &output_axis_set,
                 &reduction_axes,
                 output_axes,
-                &local_reductions,
             ) {
-                Ok(plan) => EinsumContractionTreeCandidatePlan::Supported(plan),
+                Ok(plan) => EinsumContractionTreeCandidatePlan::Supported(Box::new(plan)),
                 Err(reason) => EinsumContractionTreeCandidatePlan::Unsupported(reason),
             };
-            EinsumContractionTreeCandidate {
-                id,
-                first_pair: shape.first_pair,
-                root_intermediate_on_left: shape.root_intermediate_on_left,
-                plan,
-            }
+            EinsumContractionTreeCandidate { id, plan }
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1022,62 +1206,230 @@ pub(super) fn build_contraction_tree(
         candidates,
         preferred_candidate,
         requires_concrete_rescore,
+        quality: planned.quality,
+        usage: EinsumPlannerUsage {
+            states: planned.states,
+            candidates: planned.candidates,
+            axes: logical_order.len(),
+            budget,
+        },
+        logical_order,
+        output_axes: output_axes.to_vec(),
+        reduction_axes,
+        occurrence_inputs,
     }
 }
 
-fn enumerate_shapes(arity: usize) -> Vec<CandidateShape> {
-    if arity == 2 {
-        return vec![
-            CandidateShape {
-                first_pair: [0, 1],
-                remaining: None,
-                root_intermediate_on_left: true,
-            },
-            CandidateShape {
-                first_pair: [1, 0],
-                remaining: None,
-                root_intermediate_on_left: true,
-            },
-        ];
+fn plan_trees(
+    arity: usize,
+    logical_order: &[EinsumAxis],
+    dimensions: &BTreeMap<EinsumAxis, EinsumDimension>,
+    occurrence_inputs: &BTreeMap<EinsumAxis, BTreeSet<usize>>,
+    reduction_axes: &BTreeSet<EinsumAxis>,
+    budget: EinsumPlannerBudget,
+) -> PlannedTrees {
+    let exact_state_count = 1usize
+        .checked_shl(arity as u32)
+        .and_then(|n| n.checked_sub(1));
+    if arity <= budget.exact_operand_limit
+        && logical_order.len() <= budget.max_exact_axes
+        && exact_state_count.is_some_and(|states| states <= budget.max_states)
+        && let Some(exact) = enumerate_exact_trees(arity, budget)
+    {
+        return exact;
     }
-    let mut shapes = Vec::with_capacity(12);
-    for left in 0..3 {
-        for right in 0..3 {
-            if left == right {
+
+    greedy_tree(
+        arity,
+        logical_order,
+        dimensions,
+        occurrence_inputs,
+        reduction_axes,
+        budget,
+    )
+}
+
+fn enumerate_exact_trees(arity: usize, budget: EinsumPlannerBudget) -> Option<PlannedTrees> {
+    let full = (1u64 << arity) - 1;
+    let mut states = BTreeMap::<u64, Vec<TreeExpr>>::new();
+    for input in 0..arity {
+        states.insert(1u64 << input, vec![TreeExpr::Leaf(input)]);
+    }
+    let mut candidate_count = 0usize;
+    for size in 2..=arity {
+        for subset in 1..=full {
+            if subset.count_ones() as usize != size {
                 continue;
             }
-            let remaining = (0..3)
-                .find(|input| *input != left && *input != right)
-                .expect("three inputs leave one remaining input");
-            for root_intermediate_on_left in [true, false] {
-                shapes.push(CandidateShape {
-                    first_pair: [left, right],
-                    remaining: Some(remaining),
-                    root_intermediate_on_left,
-                });
+            if states.len() >= budget.max_states {
+                return None;
             }
+            let mut trees = Vec::new();
+            let mut left = (subset - 1) & subset;
+            while left != 0 {
+                let right = subset ^ left;
+                if right != 0
+                    && let (Some(left_trees), Some(right_trees)) =
+                        (states.get(&left), states.get(&right))
+                {
+                    for left_tree in left_trees {
+                        for right_tree in right_trees {
+                            candidate_count = candidate_count.checked_add(1)?;
+                            if candidate_count > budget.max_candidates {
+                                return None;
+                            }
+                            trees.push(TreeExpr::Merge(
+                                Box::new(left_tree.clone()),
+                                Box::new(right_tree.clone()),
+                            ));
+                        }
+                    }
+                }
+                left = (left - 1) & subset;
+            }
+            trees.sort_by_key(TreeExpr::id);
+            trees.dedup_by(|left, right| left == right);
+            states.insert(subset, trees);
         }
     }
-    shapes
+    Some(PlannedTrees {
+        trees: states.remove(&full).unwrap_or_default(),
+        quality: EinsumPlannerQuality::ExactSubsetDp,
+        states: states.len() + 1,
+        candidates: candidate_count,
+    })
 }
 
-fn candidate_id(shape: CandidateShape) -> EinsumContractionTreeCandidateId {
-    let [left, right] = shape.first_pair;
-    let text = if let Some(remaining) = shape.remaining {
-        if shape.root_intermediate_on_left {
-            format!("(({left},{right}),{remaining})")
-        } else {
-            format!("({remaining},({left},{right}))")
+fn greedy_tree(
+    arity: usize,
+    logical_order: &[EinsumAxis],
+    dimensions: &BTreeMap<EinsumAxis, EinsumDimension>,
+    occurrence_inputs: &BTreeMap<EinsumAxis, BTreeSet<usize>>,
+    reduction_axes: &BTreeSet<EinsumAxis>,
+    budget: EinsumPlannerBudget,
+) -> PlannedTrees {
+    let mut forest = (0..arity).map(TreeExpr::Leaf).collect::<Vec<_>>();
+    let mut candidates = 0usize;
+    let mut states = 1usize;
+    while forest.len() > 1 {
+        forest.sort_by_key(TreeExpr::id);
+        let mut best: Option<((EinsumCostBound, EinsumCostBound, String), usize, usize)> = None;
+        'pairs: for left in 0..forest.len() {
+            for right in 0..forest.len() {
+                if left == right {
+                    continue;
+                }
+                if candidates >= budget.max_heuristic_candidates {
+                    break 'pairs;
+                }
+                candidates += 1;
+                let merged = TreeExpr::Merge(
+                    Box::new(forest[left].clone()),
+                    Box::new(forest[right].clone()),
+                );
+                let score = greedy_merge_score(
+                    &merged,
+                    logical_order,
+                    dimensions,
+                    occurrence_inputs,
+                    reduction_axes,
+                );
+                if best
+                    .as_ref()
+                    .is_none_or(|(current, _, _)| compare_greedy_score(&score, current).is_lt())
+                {
+                    best = Some((score, left, right));
+                }
+            }
         }
-    } else {
-        format!("({left},{right})")
-    };
-    EinsumContractionTreeCandidateId(text)
+        let (_, left, right) = best.unwrap_or_else(|| {
+            let fallback =
+                TreeExpr::Merge(Box::new(forest[0].clone()), Box::new(forest[1].clone()));
+            (
+                greedy_merge_score(
+                    &fallback,
+                    logical_order,
+                    dimensions,
+                    occurrence_inputs,
+                    reduction_axes,
+                ),
+                0,
+                1,
+            )
+        });
+        let (high, low) = if left > right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        let right_tree = forest.remove(high);
+        let left_tree = forest.remove(low);
+        let merged = if low == left {
+            TreeExpr::Merge(Box::new(left_tree), Box::new(right_tree))
+        } else {
+            TreeExpr::Merge(Box::new(right_tree), Box::new(left_tree))
+        };
+        forest.push(merged);
+        states += 1;
+    }
+    PlannedTrees {
+        trees: forest,
+        quality: EinsumPlannerQuality::DeterministicGreedy,
+        states,
+        candidates,
+    }
+}
+
+fn greedy_merge_score(
+    tree: &TreeExpr,
+    logical_order: &[EinsumAxis],
+    dimensions: &BTreeMap<EinsumAxis, EinsumDimension>,
+    occurrence_inputs: &BTreeMap<EinsumAxis, BTreeSet<usize>>,
+    reduction_axes: &BTreeSet<EinsumAxis>,
+) -> (EinsumCostBound, EinsumCostBound, String) {
+    let leaves = tree.leaves();
+    let live_axes = logical_order
+        .iter()
+        .copied()
+        .filter(|axis| {
+            !occurrence_inputs[axis].is_disjoint(&leaves)
+                && !(reduction_axes.contains(axis) && occurrence_inputs[axis].is_subset(&leaves))
+        })
+        .collect::<Vec<_>>();
+    let reduced_axes = logical_order
+        .iter()
+        .copied()
+        .filter(|axis| reduction_axes.contains(axis) && occurrence_inputs[axis].is_subset(&leaves))
+        .collect::<Vec<_>>();
+    let output = dimension_values_product(
+        &live_axes
+            .iter()
+            .map(|axis| dimensions[axis])
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(EinsumCostBound::UnknownUpperBound);
+    let reduction = dimension_values_product(
+        &reduced_axes
+            .iter()
+            .map(|axis| dimensions[axis])
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(EinsumCostBound::UnknownUpperBound);
+    (output, reduction, tree.id())
+}
+
+fn compare_greedy_score(
+    left: &(EinsumCostBound, EinsumCostBound, String),
+    right: &(EinsumCostBound, EinsumCostBound, String),
+) -> Ordering {
+    compare_bound(left.0, right.0)
+        .then_with(|| compare_bound(left.1, right.1))
+        .then_with(|| left.2.cmp(&right.2))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_candidate(
-    shape: CandidateShape,
+    tree: &TreeExpr,
     operands: &[EinsumOperandPlan],
     logical_order: &[EinsumAxis],
     dimensions: &BTreeMap<EinsumAxis, EinsumDimension>,
@@ -1085,7 +1437,6 @@ fn build_candidate(
     output_axis_set: &BTreeSet<EinsumAxis>,
     reduction_axis_set: &BTreeSet<EinsumAxis>,
     output_axes: &[EinsumAxis],
-    local_reductions: &[BTreeSet<EinsumAxis>],
 ) -> Result<EinsumSupportedContractionTreeCandidate, EinsumContractionTreeCandidateUnsupportedReason>
 {
     let arity = operands.len();
@@ -1115,29 +1466,79 @@ fn build_candidate(
         );
     }
     let mut steps = Vec::new();
+    let mut next_value = arity;
+    let final_value = build_tree_expr(
+        tree,
+        arity,
+        &mut next_value,
+        &mut steps,
+        &mut descriptors,
+        logical_order,
+        dimensions,
+        occurrence_inputs,
+        output_axis_set,
+        reduction_axis_set,
+        output_axes,
+    )?;
+    let final_output_permutation = match steps.last() {
+        Some(EinsumContractionTreeStep::BinaryContraction(binary)) => {
+            binary.output_permutation.clone()
+        }
+        _ => Vec::new(),
+    };
+    let temporaries = schedule_temporaries(&steps, final_value.id, &descriptors, logical_order);
+    let (cost, _) = score_candidate(&steps, &temporaries, 1)?;
+    Ok(EinsumSupportedContractionTreeCandidate {
+        steps,
+        temporaries,
+        final_output: final_value.id,
+        final_output_permutation,
+        cost,
+    })
+}
 
-    let prepare_leaf =
-        |input: usize,
-         steps: &mut Vec<EinsumContractionTreeStep>,
-         descriptors: &mut BTreeMap<EinsumValueId, ValueDescriptor>|
-         -> Result<ValueDescriptor, EinsumContractionTreeCandidateUnsupportedReason> {
-            let leaf = descriptors[&EinsumValueId(input)].clone();
-            if local_reductions[input].is_empty() {
+#[allow(clippy::too_many_arguments)]
+fn build_tree_expr(
+    tree: &TreeExpr,
+    arity: usize,
+    next_value: &mut usize,
+    steps: &mut Vec<EinsumContractionTreeStep>,
+    descriptors: &mut BTreeMap<EinsumValueId, ValueDescriptor>,
+    logical_order: &[EinsumAxis],
+    dimensions: &BTreeMap<EinsumAxis, EinsumDimension>,
+    occurrence_inputs: &BTreeMap<EinsumAxis, BTreeSet<usize>>,
+    output_axis_set: &BTreeSet<EinsumAxis>,
+    reduction_axis_set: &BTreeSet<EinsumAxis>,
+    requested_output_axes: &[EinsumAxis],
+) -> Result<ValueDescriptor, EinsumContractionTreeCandidateUnsupportedReason> {
+    match tree {
+        TreeExpr::Leaf(input) => {
+            let leaf = descriptors[&EinsumValueId(*input)].clone();
+            let local_reductions = logical_order
+                .iter()
+                .copied()
+                .filter(|axis| {
+                    reduction_axis_set.contains(axis)
+                        && occurrence_inputs[axis].is_subset(&leaf.leaves)
+                })
+                .collect::<BTreeSet<_>>();
+            if local_reductions.is_empty() {
                 return Ok(leaf);
             }
-            let output_id = EinsumValueId(arity + input);
+            let output_id = EinsumValueId(*next_value);
+            *next_value += 1;
             let output_axes = leaf
                 .axes
                 .iter()
                 .copied()
-                .filter(|axis| !local_reductions[input].contains(axis))
+                .filter(|axis| !local_reductions.contains(axis))
                 .collect::<Vec<_>>();
             let output_axis_dimensions = leaf
                 .axes
                 .iter()
                 .zip(&leaf.axis_dimensions)
                 .filter_map(|(axis, dimension)| {
-                    (!local_reductions[input].contains(axis)).then_some(*dimension)
+                    (!local_reductions.contains(axis)).then_some(*dimension)
                 })
                 .collect::<Vec<_>>();
             let reduction_dimensions = leaf
@@ -1145,26 +1546,27 @@ fn build_candidate(
                 .iter()
                 .zip(&leaf.axis_dimensions)
                 .filter_map(|(axis, dimension)| {
-                    local_reductions[input].contains(axis).then_some(*dimension)
+                    local_reductions.contains(axis).then_some(*dimension)
                 })
                 .collect::<Vec<_>>();
             let output_elements = dimension_values_product(&output_axis_dimensions)?;
             let reduction_elements = dimension_values_product(&reduction_dimensions)?;
-            let plan = EinsumUnaryReductionPlan {
-                input: leaf.id,
-                output: output_id,
-                reduction_axes: logical_order
-                    .iter()
-                    .copied()
-                    .filter(|axis| local_reductions[input].contains(axis))
-                    .collect(),
-                input_axes: leaf.axes.clone(),
-                output_axes: output_axes.clone(),
-                input_elements: leaf.elements,
-                output_elements,
-                reduction_elements,
-            };
-            steps.push(EinsumContractionTreeStep::UnaryReduction(plan));
+            steps.push(EinsumContractionTreeStep::UnaryReduction(
+                EinsumUnaryReductionPlan {
+                    input: leaf.id,
+                    output: output_id,
+                    reduction_axes: logical_order
+                        .iter()
+                        .copied()
+                        .filter(|axis| local_reductions.contains(axis))
+                        .collect(),
+                    input_axes: leaf.axes.clone(),
+                    output_axes: output_axes.clone(),
+                    input_elements: leaf.elements,
+                    output_elements,
+                    reduction_elements,
+                },
+            ));
             let output = ValueDescriptor {
                 id: output_id,
                 leaves: leaf.leaves,
@@ -1175,71 +1577,56 @@ fn build_candidate(
             };
             descriptors.insert(output_id, output.clone());
             Ok(output)
-        };
-
-    let first_left = prepare_leaf(shape.first_pair[0], &mut steps, &mut descriptors)?;
-    let first_right = prepare_leaf(shape.first_pair[1], &mut steps, &mut descriptors)?;
-    let first_output_id = EinsumValueId(arity * 2);
-    let first_is_final = shape.remaining.is_none();
-    let (first_binary, first_output) = build_binary(
-        first_left,
-        first_right,
-        first_output_id,
-        first_is_final,
-        logical_order,
-        dimensions,
-        occurrence_inputs,
-        output_axis_set,
-        reduction_axis_set,
-        output_axes,
-    )?;
-    let final_output_permutation = if first_is_final {
-        first_binary.output_permutation.clone()
-    } else {
-        Vec::new()
-    };
-    steps.push(EinsumContractionTreeStep::BinaryContraction(Box::new(
-        first_binary,
-    )));
-    descriptors.insert(first_output_id, first_output.clone());
-
-    let final_output = if let Some(remaining) = shape.remaining {
-        let remaining = prepare_leaf(remaining, &mut steps, &mut descriptors)?;
-        let final_output_id = EinsumValueId(arity * 2 + 1);
-        let (left, right) = if shape.root_intermediate_on_left {
-            (first_output, remaining)
-        } else {
-            (remaining, first_output)
-        };
-        let (root, output) = build_binary(
-            left,
-            right,
-            final_output_id,
-            true,
-            logical_order,
-            dimensions,
-            occurrence_inputs,
-            output_axis_set,
-            reduction_axis_set,
-            output_axes,
-        )?;
-        let final_output_permutation = root.output_permutation.clone();
-        steps.push(EinsumContractionTreeStep::BinaryContraction(Box::new(root)));
-        descriptors.insert(final_output_id, output);
-        (final_output_id, final_output_permutation)
-    } else {
-        (first_output_id, final_output_permutation)
-    };
-
-    let temporaries = schedule_temporaries(&steps, final_output.0, &descriptors);
-    let (cost, _) = score_candidate(&steps, &temporaries, 1)?;
-    Ok(EinsumSupportedContractionTreeCandidate {
-        steps,
-        temporaries,
-        final_output: final_output.0,
-        final_output_permutation: final_output.1,
-        cost,
-    })
+        }
+        TreeExpr::Merge(left, right) => {
+            let left = build_tree_expr(
+                left,
+                arity,
+                next_value,
+                steps,
+                descriptors,
+                logical_order,
+                dimensions,
+                occurrence_inputs,
+                output_axis_set,
+                reduction_axis_set,
+                requested_output_axes,
+            )?;
+            let right = build_tree_expr(
+                right,
+                arity,
+                next_value,
+                steps,
+                descriptors,
+                logical_order,
+                dimensions,
+                occurrence_inputs,
+                output_axis_set,
+                reduction_axis_set,
+                requested_output_axes,
+            )?;
+            let output_id = EinsumValueId(*next_value);
+            *next_value += 1;
+            let final_node = left.leaves.len() + right.leaves.len() == arity;
+            let (binary, output) = build_binary(
+                left,
+                right,
+                output_id,
+                final_node,
+                logical_order,
+                dimensions,
+                occurrence_inputs,
+                output_axis_set,
+                reduction_axis_set,
+                requested_output_axes,
+            )?;
+            steps.push(EinsumContractionTreeStep::BinaryContraction(Box::new(
+                binary,
+            )));
+            descriptors.insert(output_id, output.clone());
+            Ok(output)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1379,6 +1766,15 @@ fn build_binary(
     let mut right_leaf_inputs = right.leaves.iter().copied().collect::<Vec<_>>();
     left_leaf_inputs.sort_unstable();
     right_leaf_inputs.sort_unstable();
+    let lowering = if !contract_axes.is_empty()
+        && contract_axes
+            .iter()
+            .all(|axis| matches!(axis, EinsumAxis::Label(_)))
+    {
+        EinsumBinaryLowering::GemmCompatible
+    } else {
+        EinsumBinaryLowering::GenericNative
+    };
     Ok((
         EinsumBinaryContractionPlan {
             left: left.id,
@@ -1401,6 +1797,7 @@ fn build_binary(
             geometry,
             left_requires_packing,
             right_requires_packing,
+            lowering,
             left_elements: left.elements,
             right_elements: right.elements,
             output_elements,
@@ -1439,31 +1836,23 @@ fn dimension_values_product(
     if dimensions.contains(&EinsumDimension::Static(0)) {
         return Ok(EinsumCostBound::Exact(0));
     }
-    let mut product = 1u64;
+    let mut product = 1u128;
     for dimension in dimensions {
         let EinsumDimension::Static(value) = dimension else {
             return Ok(EinsumCostBound::UnknownUpperBound);
         };
-        product = product
-            .checked_mul(u64::try_from(*value).map_err(|_| {
-                EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
-                    metric: EinsumCostMetric::Geometry,
-                }
-            })?)
-            .ok_or(
-                EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
-                    metric: EinsumCostMetric::Geometry,
-                },
-            )?;
+        product = product.checked_mul(*value as u128).ok_or(
+            EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
+                metric: EinsumCostMetric::Geometry,
+            },
+        )?;
     }
     Ok(EinsumCostBound::Exact(product))
 }
 
 fn dimension_bound(dimension: EinsumDimension) -> EinsumCostBound {
     match dimension {
-        EinsumDimension::Static(value) => u64::try_from(value)
-            .map(EinsumCostBound::Exact)
-            .unwrap_or(EinsumCostBound::UnknownUpperBound),
+        EinsumDimension::Static(value) => EinsumCostBound::Exact(value as u128),
         EinsumDimension::Dynamic => EinsumCostBound::UnknownUpperBound,
     }
 }
@@ -1479,6 +1868,7 @@ fn schedule_temporaries(
     steps: &[EinsumContractionTreeStep],
     final_output: EinsumValueId,
     descriptors: &BTreeMap<EinsumValueId, ValueDescriptor>,
+    logical_order: &[EinsumAxis],
 ) -> Vec<EinsumTemporaryValuePlan> {
     let mut last_use = BTreeMap::new();
     for (step_index, step) in steps.iter().enumerate() {
@@ -1507,6 +1897,17 @@ fn schedule_temporaries(
                 last_use_step: last_use.get(&output).copied().unwrap_or(step_index),
                 axes: descriptor.axes.clone(),
                 leaf_inputs: descriptor.leaves.iter().copied().collect(),
+                global_iteration_axis_indices: descriptor
+                    .axes
+                    .iter()
+                    .map(|axis| {
+                        logical_order
+                            .iter()
+                            .position(|candidate| candidate == axis)
+                            .expect("temporary axis belongs to global logical order")
+                    })
+                    .collect(),
+                storage_policy: EinsumTemporaryStoragePolicy::Accumulator,
                 elements: descriptor.elements,
             });
         }
@@ -1949,18 +2350,12 @@ fn concrete_product(
     }
     values
         .iter()
-        .try_fold(1u64, |product, value| {
-            product
-                .checked_mul(u64::try_from(*value).map_err(|_| {
-                    EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
-                        metric: EinsumCostMetric::Geometry,
-                    }
-                })?)
-                .ok_or(
-                    EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
-                        metric: EinsumCostMetric::Geometry,
-                    },
-                )
+        .try_fold(1u128, |product, value| {
+            product.checked_mul(*value as u128).ok_or(
+                EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
+                    metric: EinsumCostMetric::Geometry,
+                },
+            )
         })
         .map(EinsumCostBound::Exact)
 }
@@ -2002,7 +2397,7 @@ mod cost_tests {
     #[test]
     fn exact_zero_annihilates_work_before_irrelevant_boundary_arithmetic() {
         let zero = EinsumCostBound::Exact(0);
-        let maximum = EinsumCostBound::Exact(u64::MAX);
+        let maximum = EinsumCostBound::Exact(u128::MAX);
         let unknown = EinsumCostBound::UnknownUpperBound;
 
         for (name, result) in [
@@ -2033,10 +2428,10 @@ mod cost_tests {
 
             for zero_index in 0..4 {
                 let mut factors = [
-                    EinsumCostBound::Exact(u64::MAX),
+                    EinsumCostBound::Exact(u128::MAX),
                     EinsumCostBound::Exact(2),
                     EinsumCostBound::UnknownUpperBound,
-                    EinsumCostBound::Exact(u64::MAX),
+                    EinsumCostBound::Exact(u128::MAX),
                 ];
                 factors[zero_index] = EinsumCostBound::Exact(0);
                 assert_eq!(
@@ -2066,7 +2461,7 @@ mod cost_tests {
                 usize::MAX,
                 Some(EinsumCostBound::UnknownUpperBound),
             ),
-            (EinsumCostBound::Exact(u64::MAX), 2, None),
+            (EinsumCostBound::Exact(u128::MAX), 2, None),
         ] {
             assert_eq!(bound.checked_scale(multiplier), expected);
         }

@@ -18,7 +18,7 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{
     DataType, EinsumClassification, EinsumContractionPlan, EinsumInput, EinsumOperandPlan,
-    EinsumPermutationPlan, EinsumPlan, EinsumShapePlan, Node, Shape, TensorLayout,
+    EinsumPermutationPlan, EinsumPlan, EinsumSchema, EinsumShapePlan, Node, Shape, TensorLayout,
 };
 
 use super::movement::{PersistentMetadata, launch_persistent_metadata};
@@ -133,7 +133,7 @@ fn einsum_dtype(dtype: DataType) -> Result<GemmDtype> {
         DataType::Float32 => Ok(GemmDtype::F32),
         DataType::Float16 => Ok(GemmDtype::F16),
         other => Err(not_implemented(format!(
-            "Einsum opset-12 dtype {other:?}; the ONNX schema and native CUDA lowering support Float32 and Float16 (BFloat16 is not an opset-12 Einsum type)"
+            "Einsum dtype {other:?}; the staged native CUDA executor currently supports only Float32 and Float16. Einsum-28 admits BFloat16 semantically, but its CUDA execution handoff is not implemented yet"
         ))),
     }
 }
@@ -276,6 +276,7 @@ fn layout_is_contiguous(layout: &TensorLayout, shape: &Shape) -> bool {
 /// cannot execute without an unsupported materialization.
 fn unsupported_reason_impl(
     node: &Node,
+    opset: u64,
     shapes: &[Shape],
     input_dtypes: &[DataType],
     layouts: &[TensorLayout],
@@ -298,20 +299,18 @@ fn unsupported_reason_impl(
             shapes.len()
         ));
     }
-    if let Some(dtype) = input_dtypes.first().copied()
-        && let Err(error) = einsum_dtype(dtype)
-    {
-        return Some(error.to_string());
-    }
     let inputs = shapes
         .iter()
         .zip(input_dtypes)
         .map(|(shape, &dtype)| EinsumInput::new(dtype, shape.as_slice()))
         .collect::<Vec<_>>();
-    let plan = match EinsumPlan::build(equation, &inputs) {
+    let plan = match EinsumPlan::build_for_opset(equation, &inputs, opset) {
         Ok(plan) => plan,
         Err(error) => return Some(format!("cuda_ep Einsum `{equation}`: {error}")),
     };
+    if let Err(error) = einsum_dtype(plan.dtype()) {
+        return Some(error.to_string());
+    }
 
     match plan.classification() {
         EinsumClassification::ViewOnlyPermutation(_) | EinsumClassification::DiagonalView(_) => {
@@ -357,9 +356,6 @@ fn unsupported_reason_impl(
         EinsumClassification::ReductionOrElementwise(_) => Some(format!(
             "cuda_ep Einsum `{equation}`: uncoupled reductions/elementwise products are not yet lowered; use native Reduce*/Mul nodes or CPU fallback"
         )),
-        EinsumClassification::Unsupported(reason) => Some(format!(
-            "cuda_ep Einsum `{equation}`: canonical planner classified this contraction as unsupported: {reason}"
-        )),
         _ => Some(format!(
             "cuda_ep Einsum `{equation}`: canonical planner returned a newer classification that \
              this CUDA EP does not recognize; update claim, execution, and capture paths before \
@@ -370,11 +366,12 @@ fn unsupported_reason_impl(
 
 pub fn unsupported_reason(
     node: &Node,
+    opset: u64,
     shapes: &[Shape],
     input_dtypes: &[DataType],
     layouts: &[TensorLayout],
 ) -> Option<String> {
-    let reason = unsupported_reason_impl(node, shapes, input_dtypes, layouts);
+    let reason = unsupported_reason_impl(node, opset, shapes, input_dtypes, layouts);
     if let Some(reason) = &reason {
         CLAIM_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         *LAST_FALLBACK_REASON
@@ -392,9 +389,12 @@ impl KernelFactory for EinsumFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let equation = equation(node)?.to_owned();
         let input_shape_refs = input_shapes.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let plan = EinsumShapePlan::build(&equation, &input_shape_refs).map_err(|error| {
-            EpError::KernelFailed(format!("cuda_ep Einsum `{equation}`: {error}"))
-        })?;
+        let schema = EinsumSchema::resolve(node.local_opset().unwrap_or(12))
+            .map_err(|error| EpError::KernelFailed(format!("cuda_ep Einsum: {error}")))?;
+        let plan = EinsumShapePlan::build_for_schema(&equation, &input_shape_refs, schema)
+            .map_err(|error| {
+                EpError::KernelFailed(format!("cuda_ep Einsum `{equation}`: {error}"))
+            })?;
         match plan.classification() {
             EinsumClassification::ViewOnlyPermutation(_)
             | EinsumClassification::DiagonalView(_)
@@ -411,11 +411,6 @@ impl KernelFactory for EinsumFactory {
             EinsumClassification::ReductionOrElementwise(_) => {
                 return Err(not_implemented(format!(
                     "cuda_ep Einsum `{equation}` reduction/elementwise canonical plan"
-                )));
-            }
-            EinsumClassification::Unsupported(reason) => {
-                return Err(not_implemented(format!(
-                    "cuda_ep Einsum `{equation}` canonical plan: {reason}"
                 )));
             }
             _ => {
@@ -1172,10 +1167,6 @@ impl Kernel for EinsumKernel {
                 "Einsum `{}` reduction/elementwise canonical plan",
                 self.plan.equation()
             ))),
-            EinsumClassification::Unsupported(reason) => Err(not_implemented(format!(
-                "Einsum `{}` canonical plan: {reason}",
-                self.plan.equation()
-            ))),
             _ => Err(not_implemented(format!(
                 "Einsum `{}` newer unrecognized canonical classification; update CUDA claim, \
                  execution, and capture paths before running it",
@@ -1296,9 +1287,6 @@ impl Kernel for EinsumKernel {
             EinsumClassification::ReductionOrElementwise(_) => CaptureSupport::unsupported(
                 "CUDA Einsum reduction/elementwise lowering is not implemented",
             ),
-            EinsumClassification::Unsupported(reason) => {
-                CaptureSupport::unsupported(format!("unsupported canonical Einsum plan: {reason}"))
-            }
             _ => CaptureSupport::unsupported(
                 "CUDA Einsum received a newer unrecognized canonical classification",
             ),
@@ -1332,6 +1320,7 @@ mod tests {
         ];
         let reason = unsupported_reason_impl(
             &node,
+            12,
             &shapes,
             &[DataType::Float32; 3],
             &[
@@ -1343,6 +1332,29 @@ mod tests {
         .unwrap();
         assert!(reason.contains("3-input contraction tree"));
         assert!(reason.contains("temporary scheduling"));
+    }
+
+    #[test]
+    fn cuda_claim_resolves_schema_before_staged_backend_dtype_support() {
+        let mut node = Node::new(onnx_runtime_ir::NodeId(0), "Einsum", vec![], vec![]);
+        node.attributes.insert(
+            "equation".into(),
+            onnx_runtime_ir::Attribute::String(b"i->i".to_vec()),
+        );
+        let shapes = [onnx_runtime_ir::static_shape([2])];
+        let layouts = [TensorLayout::contiguous()];
+
+        let opset11 =
+            unsupported_reason_impl(&node, 11, &shapes, &[DataType::Float32], &layouts).unwrap();
+        assert!(opset11.contains("predates Einsum-12"), "{opset11}");
+
+        let opset27 =
+            unsupported_reason_impl(&node, 27, &shapes, &[DataType::BFloat16], &layouts).unwrap();
+        assert!(opset27.contains("not admitted by Einsum-12"), "{opset27}");
+
+        let opset28 =
+            unsupported_reason_impl(&node, 28, &shapes, &[DataType::BFloat16], &layouts).unwrap();
+        assert!(opset28.contains("Einsum-28 admits BFloat16 semantically"));
     }
 
     #[test]
