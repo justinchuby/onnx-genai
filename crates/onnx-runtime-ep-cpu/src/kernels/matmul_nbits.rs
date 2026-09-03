@@ -3740,26 +3740,37 @@ fn configured_decode_threads() -> Option<usize> {
 ///
 /// It honors `ONNX_GENAI_CPU_DECODE_THREADS` when set (`0` opts out), but when
 /// the variable is unset it uses a *different, higher* default than the flat
-/// pool: [`default_persistent_threads`] (one worker per allowed physical core)
-/// instead of the flat pool's eight-worker ceiling. The flat Rayon pool caps at eight
-/// because its per-op fork/join regresses beyond that; the persistent pool
-/// replaces that fork/join with one hot broadcast barrier, so it keeps scaling
-/// with cores until it hits the memory-bandwidth knee (measured plateau ~half
-/// the logical CPUs on a 2-socket Xeon 8480C). Sizing it from the flat default
-/// would leave the out-of-box path at the flat pool's throughput and defeat the
-/// point of making it the default.
+/// pool: [`default_persistent_threads`] instead of the flat pool's eight-worker
+/// ceiling. Compact placement budgets the dispatcher and spawned workers
+/// together so at least half the process's logical CPU capacity stays available
+/// even in a one-CPU-per-core cpuset; explicit spread may use one worker per
+/// allowed physical core. The flat Rayon pool caps at eight because its per-op
+/// fork/join regresses beyond that; the persistent pool replaces that fork/join
+/// with one hot broadcast barrier.
 pub fn configured_persistent_decode_threads() -> Option<usize> {
+    let allowed = crate::decode_affinity::allowed_cpus();
+    configured_persistent_decode_threads_with_allowed(allowed.as_deref())
+}
+
+pub(crate) fn configured_persistent_decode_threads_with_allowed(
+    allowed: Option<&[usize]>,
+) -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
-    let uses_default = decode_threads_override().is_none()
-        && value
-            .as_deref()
-            .is_none_or(|v| v.is_empty() || v.parse::<usize>().is_err());
+    let uses_default = persistent_decode_threads_are_automatic_for(value.as_deref());
+    let allowed_physical_cores = crate::core_topology::host()
+        .map(|topology| {
+            allowed.map_or_else(
+                || topology.core_count(),
+                |cpus| topology.physical_cores_within(cpus),
+            )
+        })
+        .filter(|&cores| cores > 0);
     let threads = resolve_persistent_decode_threads_with_override(
         decode_threads_override(),
         value.as_deref(),
         available,
-        crate::core_topology::allowed_physical_cores(),
+        allowed_physical_cores,
     );
     if !uses_default {
         return threads;
@@ -3776,22 +3787,32 @@ pub fn configured_persistent_decode_threads() -> Option<usize> {
         return Some(override_threads);
     }
 
-    let allowed = crate::decode_affinity::allowed_cpus();
     let cores = crate::core_topology::host();
     let numa = crate::decode_affinity::NumaTopology::detect();
     crate::persistent_pool_width::resolve_default_pool_width(
         crate::persistent_pool_width::DefaultPoolWidthInputs {
-            allowed_cpus: allowed.as_deref(),
+            allowed_cpus: allowed,
             core_topology: cores,
             numa_topology: numa.as_ref(),
             available_parallelism: available,
             architecture_cap: default_persistent_architecture_cap(),
             service_cpus_per_numa_node:
                 crate::persistent_pool_width::DEFAULT_SERVICE_CPUS_PER_NUMA_NODE,
+            placement: crate::decode_affinity::CorePlacement::from_env(),
         },
     )
     .map(|plan| plan.global_workers)
     .or(threads)
+}
+
+pub(crate) fn persistent_decode_threads_are_automatic() -> bool {
+    let value = std::env::var(DECODE_THREADS_ENV).ok();
+    persistent_decode_threads_are_automatic_for(value.as_deref())
+}
+
+fn persistent_decode_threads_are_automatic_for(raw: Option<&str>) -> bool {
+    decode_threads_override().is_none()
+        && raw.is_none_or(|value| value.is_empty() || value.parse::<usize>().is_err())
 }
 
 /// Process-wide architecture ceiling for the automatic persistent-pool width.
@@ -4369,9 +4390,12 @@ fn report_budget_beyond_physical_cores(threads: usize) {
 ///    must run before the first Rayon use; if the pool was already built we log
 ///    once and leave it (a no-op with warning).
 /// 2. **(Linux) process CPU affinity.** The calling (main) thread is confined to
-///    `N` CPUs packed on a single NUMA node where possible; threads spawned
-///    afterwards (the Rayon pool, the SPMD decode pool) inherit the mask, so the
-///    process stays on `N` CPUs without an external `taskset`. This composes
+///    `N` CPUs packed on a single NUMA node where possible and compact across
+///    SMT siblings by default; explicit
+///    `ONNX_GENAI_CPU_DECODE_PLACEMENT=spread` selects the dedicated-host
+///    one-worker-per-core mask. Threads spawned afterwards (the Rayon pool, the
+///    SPMD decode pool) inherit the mask, so the process stays on `N` CPUs
+///    without an external `taskset`. This composes
 ///    with the existing decode-affinity control: if the user set an explicit
 ///    `ONNX_GENAI_CPU_DECODE_AFFINITY`, their choice wins and the auto-mask
 ///    stands down. Non-Linux hosts skip affinity (the Rayon-count bound still
@@ -4379,15 +4403,23 @@ fn report_budget_beyond_physical_cores(threads: usize) {
 ///
 /// A no-op when no explicit budget is set, so the default sizing is unchanged.
 pub fn bound_process_to_decode_budget() {
+    try_bound_process_to_decode_budget()
+        .unwrap_or_else(|message| panic!("invalid CPU scheduler configuration: {message}"));
+}
+
+/// Fallible implementation used by CPU EP initialization so invalid scheduler
+/// selectors surface as an initialization error before any affinity is changed.
+pub(crate) fn try_bound_process_to_decode_budget() -> std::result::Result<(), String> {
+    crate::decode_affinity::validate_scheduler_configuration()?;
     if PROCESS_BUDGET_BOUND.set(()).is_err() {
-        return;
+        return Ok(());
     }
     let raw = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
     let Some(threads) =
         resolve_rayon_global_threads(decode_threads_override(), raw.as_deref(), available)
     else {
-        return;
+        return Ok(());
     };
 
     // Before the affinity mask narrows the allowed set, so the request is judged
@@ -4431,6 +4463,7 @@ pub fn bound_process_to_decode_budget() {
              prefill/MLAS parallelism"
         ),
     }
+    Ok(())
 }
 
 /// Name for a worker in the process-wide prefill/MLAS Rayon pool.
@@ -4452,62 +4485,20 @@ fn prefill_worker_name(index: usize) -> String {
     format!("nxgn-prefill-{index}")
 }
 
-/// Default persistent-pool worker count for `available` logical CPUs: half of
-/// them (at least one), derived purely from topology (Rule 2).
+/// Conservative pre-topology fallback for the persistent pool.
 ///
-/// Half leaves a full set of hardware threads free for the dispatcher (which
-/// runs the forward inline and spins on the completion counters), the prefill
-/// global Rayon pool, and co-tenants on a shared box. Because the SPMD workers
-/// *spin* before parking, a fully-subscribed pool starves the dispatcher and
-/// collapses throughput (measured 1.4 tok/s at 96 workers vs 28.7 at 48 on a
-/// 96-logical-CPU host); half sits at the measured plateau while avoiding that
-/// cliff.
-///
-/// # Why `available / 2` is only a proxy
-///
-/// The rule the measurements actually support is *one worker per physical
-/// core*. Halving the CPU count is a stand-in that agrees with it only when the
-/// process can see every logical CPU on an SMT host. It disagrees badly the
-/// moment the allowed set is already one CPU per core: `taskset -c 0,2,...,30`
-/// on a 16-core/32-thread host leaves `available == 16`, all of them distinct
-/// cores, and halving builds an **8**-worker pool on 16 reserved cores. The
-/// operator asked for the machine and got half of it, silently, because the
-/// proxy cannot tell a 16-CPU SMT-free set from half of a 32-CPU SMT set.
-///
-/// So take the real answer when the topology is discoverable and the allowed
-/// set is known ([`crate::core_topology::allowed_physical_cores`]), and fall
-/// back to the halving proxy only when it is not. `None` from the topology
-/// means "unknown", never "one" — capping on a guess is how a 32-thread host
-/// silently becomes a 1-thread host.
-///
-/// # What this is *not* evidenced by
-///
-/// Both measurements behind the old rule — the plateau at "~half the logical
-/// CPUs" on a 2-socket Xeon 8480C, and the 1.4 tok/s at 96 workers against 28.7
-/// at 48 on a 96-logical-CPU host — were taken on SMT hosts, where half the
-/// logical CPUs *is* the physical-core count. Neither one distinguishes the two
-/// rules, so neither one supports this change on a **non-SMT** host, where
-/// `cores == available` and the default moves from half the machine to all of
-/// it. That case is an inference, not a measurement, and no non-SMT host was
-/// available to check it.
-///
-/// What makes the inference safe rather than merely plausible is that the
-/// consuming path reserves dispatcher headroom:
-/// `decode_spmd`'s `reserve_single_group_headroom` turns a request for `n`
-/// on `n` cores into `n - 1` spawned workers plus the inline dispatcher's own
-/// shard, so the fully-subscribed spinning layout that produced the 1.4 tok/s
-/// cliff is not reachable through this default. Verified on a 16-core host
-/// pinned to one CPU per core: 15 threads named `onnx-genai-spmd` on 15 leader
-/// CPUs, with the sixteenth core left free for the dispatcher.
+/// The dispatcher publishes every operation and spin-waits for completion, so
+/// it is an active decode thread even when it owns no output shard. The fallback
+/// therefore assigns workers from the capacity left after the dispatcher and
+/// keeps at least half the logical CPUs available to co-tenants. The
+/// policy-aware resolver later replaces this value with the same shared-host
+/// rule for `compact`, or with the physical-core width for explicit `spread`.
 fn default_persistent_threads(
     available: usize,
-    allowed_physical_cores: Option<usize>,
+    _allowed_physical_cores: Option<usize>,
 ) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
-    let default = match allowed_physical_cores {
-        Some(cores) if cores > 0 => cores,
-        _ => available / 2,
-    };
+    let default = available.saturating_sub(1) / 2;
     Some(default.clamp(1, available))
 }
 
@@ -5490,6 +5481,7 @@ pub fn with_decode_pool_scope<R: Send>(
 /// flag routes each projection's row-sharding through the persistent pool, and
 /// the decode-residency flag makes inner `with_decode_pool` calls run inline.
 fn with_spmd_decode_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    let _dispatcher_pin = crate::decode_spmd::pools().map(|pool| pool.enter_dispatcher_scope());
     let _spmd_guard = SpmdScopeGuard::enter();
     let _decode_guard = DecodeResidencyGuard::enter();
     f()
@@ -17131,17 +17123,16 @@ mod tests {
     }
 
     #[test]
-    fn persistent_decode_thread_default_is_half_the_logical_cpus_when_topology_is_unknown() {
+    fn persistent_decode_thread_fallback_accounts_for_the_dispatcher() {
         // The persistent pool scales past the flat pool's 8-worker ceiling: unset
-        // -> half the logical CPUs (topology-derived, rule 2), not the flat cap.
-        // With no discoverable core count the halving proxy still applies.
-        assert_eq!(default_persistent_threads(96, None), Some(48));
-        assert_eq!(default_persistent_threads(8, None), Some(4));
-        assert_eq!(default_persistent_threads(4, None), Some(2));
+        // -> a dispatcher-inclusive half-logical budget, not the flat cap.
+        assert_eq!(default_persistent_threads(96, None), Some(47));
+        assert_eq!(default_persistent_threads(8, None), Some(3));
+        assert_eq!(default_persistent_threads(4, None), Some(1));
         assert_eq!(default_persistent_threads(2, None), Some(1));
         assert_eq!(default_persistent_threads(1, None), Some(1));
         assert_eq!(default_persistent_threads(0, None), None);
-        // Distinct from the flat default on a big host (48 vs 8) -- proving the
+        // Distinct from the flat default on a big host (47 vs 8) -- proving the
         // persistent path does not inherit the fork/join-bound cap.
         assert_ne!(
             default_persistent_threads(96, None),
@@ -17149,33 +17140,25 @@ mod tests {
         );
     }
 
-    /// The halving proxy is wrong whenever the allowed set is *already* one CPU
-    /// per physical core, which is what `taskset -c 0,2,...` produces on an SMT
-    /// host and what every careful benchmark on such a host uses.
     #[test]
-    fn persistent_decode_default_uses_physical_cores_not_half_the_cpuset() {
-        // 16 CPUs that are 16 distinct cores: the whole point of the pin is to
-        // get 16 workers. Halving would build 8 and report nothing.
-        assert_eq!(default_persistent_threads(16, Some(16)), Some(16));
-        // The unpinned SMT case must be unchanged: 32 CPUs, 16 cores -> 16,
-        // which is exactly what the halving proxy used to produce.
-        assert_eq!(default_persistent_threads(32, Some(16)), Some(16));
-        assert_eq!(default_persistent_threads(96, Some(48)), Some(48));
-        // A core count can never exceed the CPUs actually available, and can
-        // never round down to zero.
-        assert_eq!(default_persistent_threads(4, Some(9)), Some(4));
-        // `Some(0)` is nonsense from the topology layer; treat it as unknown
-        // rather than building a zero-worker pool.
-        assert_eq!(default_persistent_threads(8, Some(0)), Some(4));
-        // Unknown topology keeps the historical behaviour exactly.
-        assert_eq!(default_persistent_threads(16, None), Some(8));
+    fn pre_topology_fallback_never_assumes_a_dedicated_host() {
+        // Physical-core discovery cannot widen this fallback. The later
+        // policy-aware resolver is the only place explicit `spread` may select
+        // the dedicated-host width.
+        assert_eq!(default_persistent_threads(16, Some(16)), Some(7));
+        assert_eq!(default_persistent_threads(32, Some(16)), Some(15));
+        assert_eq!(default_persistent_threads(96, Some(48)), Some(47));
+        assert_eq!(default_persistent_threads(4, Some(9)), Some(1));
+        assert_eq!(default_persistent_threads(8, Some(0)), Some(3));
+        assert_eq!(default_persistent_threads(16, None), Some(7));
     }
 
     #[test]
     fn persistent_decode_threads_honor_env_and_opt_out() {
-        // Unset -> the persistent default (half cores), not the flat cap.
-        assert_eq!(resolve_persistent_decode_threads(None, 96), Some(48));
-        assert_eq!(resolve_persistent_decode_threads(Some(""), 96), Some(48));
+        // Unset -> the dispatcher-inclusive shared-host fallback, not the flat
+        // cap. Production then applies the placement-aware resolver.
+        assert_eq!(resolve_persistent_decode_threads(None, 96), Some(47));
+        assert_eq!(resolve_persistent_decode_threads(Some(""), 96), Some(47));
         // Explicit `0` opts out of the bounded pool (flat legacy path).
         assert_eq!(resolve_persistent_decode_threads(Some("0"), 96), None);
         // An explicit positive count is honored and clamped to the host.
@@ -17186,8 +17169,8 @@ mod tests {
             Some(96)
         );
         // Unparseable/negative values fall back to the persistent default.
-        assert_eq!(resolve_persistent_decode_threads(Some("abc"), 96), Some(48));
-        assert_eq!(resolve_persistent_decode_threads(Some("-4"), 8), Some(4));
+        assert_eq!(resolve_persistent_decode_threads(Some("abc"), 96), Some(47));
+        assert_eq!(resolve_persistent_decode_threads(Some("-4"), 8), Some(3));
         assert_eq!(resolve_persistent_decode_threads(Some("8"), 0), None);
     }
 
@@ -17261,8 +17244,8 @@ mod tests {
         );
         assert_eq!(
             resolve_persistent_decode_threads_with_override(None, None, 96, None),
-            Some(48),
-            "the uncapped automatic default must remain unchanged"
+            Some(47),
+            "the automatic fallback must reserve scheduler capacity for the dispatcher"
         );
     }
 
@@ -20078,7 +20061,18 @@ mod tests {
         available: usize,
         allowed: usize,
         nodes: usize,
+        /// Compute participants reported by the pool. This includes the
+        /// dispatcher only when it owns an inline shard.
         workers: usize,
+        /// Resident worker threads spawned by the pool.
+        spawned_workers: usize,
+        /// Threads consuming CPU while an op is in flight: every spawned
+        /// worker plus the inline dispatcher, whether or not it owns a shard.
+        active_threads: usize,
+        /// Physical cores covered by the worker and dispatcher affinity masks
+        /// while a real pool dispatch is in flight.
+        #[cfg(target_os = "linux")]
+        active_physical_cores: Option<usize>,
         pool_built: bool,
         /// Physical cores covered by the child's allowed cpuset.
         cores: usize,
@@ -20437,31 +20431,59 @@ mod tests {
             .map_or(allowed, |topology| {
                 topology.physical_cores_within(&allowed_cpus)
             });
-        let (pool_built, workers, nodes, placement, honest, fully_pinned, realized, observed_ok) =
-            match crate::decode_spmd::pools() {
-                Some(pool) => {
-                    // Reported separately from `placement`, because
-                    // `planned_placement_is_one_worker_per_physical_core` answers
-                    // `Some(false)` for a *partially* pinned pool and so cannot
-                    // distinguish "every worker pinned, sharing cores" from
-                    // "some worker's pin failed". Only the latter makes the
-                    // `/proc` cross-check unanswerable, and the sweep's
-                    // anti-vacuity guard has to key off exactly that.
-                    let cpus = pool.worker_cpus();
-                    let fully_pinned = !cpus.is_empty() && cpus.iter().all(Option::is_some);
-                    (
-                        true,
-                        pool.total_workers(),
-                        pool.node_count(),
-                        pool.planned_placement_is_one_worker_per_physical_core(),
-                        placement_is_honest(pool),
-                        fully_pinned,
-                        realized_placement_code(&pool.realized_placement()),
-                        pool_observed_affinities(pool).is_some(),
-                    )
-                }
-                None => (false, 0, 0, None, None, false, "nopool", false),
-            };
+        let (
+            pool_built,
+            workers,
+            spawned_workers,
+            active_threads,
+            active_physical_cores,
+            nodes,
+            placement,
+            honest,
+            fully_pinned,
+            realized,
+            observed_ok,
+        ) = match crate::decode_spmd::pools() {
+            Some(pool) => {
+                let _dispatcher_pin = pool.enter_dispatcher_scope();
+                pool.dispatch_index_tasks(pool.total_workers(), &|_| {});
+                // Reported separately from `placement`, because
+                // `planned_placement_is_one_worker_per_physical_core` answers
+                // `Some(false)` for a *partially* pinned pool and so cannot
+                // distinguish "every worker pinned, sharing cores" from
+                // "some worker's pin failed". Only the latter makes the
+                // `/proc` cross-check unanswerable, and the sweep's
+                // anti-vacuity guard has to key off exactly that.
+                let cpus = pool.worker_cpus();
+                let fully_pinned = !cpus.is_empty() && cpus.iter().all(Option::is_some);
+                #[cfg(target_os = "linux")]
+                let active_physical_cores = active_decode_physical_cores(pool);
+                #[cfg(not(target_os = "linux"))]
+                let active_physical_cores: Option<usize> = None;
+                (
+                    true,
+                    pool.total_workers(),
+                    pool.spawned_workers(),
+                    pool.spawned_workers() + 1,
+                    active_physical_cores,
+                    pool.node_count(),
+                    pool.planned_placement_is_one_worker_per_physical_core(),
+                    placement_is_honest(pool),
+                    fully_pinned,
+                    realized_placement_code(&pool.realized_placement()),
+                    pool_observed_affinities(pool).is_some(),
+                )
+            }
+            None => (false, 0, 0, 0, None, 0, None, None, false, "nopool", false),
+        };
+        #[cfg(target_os = "linux")]
+        if affinity_mask_applied {
+            assert_eq!(
+                crate::decode_affinity::allowed_cpus().as_deref(),
+                Some(allowed_cpus.as_slice()),
+                "the decode-scope dispatcher pin leaked into subsequent work"
+            );
+        }
         let tri = |value: Option<bool>| match value {
             Some(true) => "1",
             Some(false) => "0",
@@ -20469,9 +20491,12 @@ mod tests {
         };
         println!(
             "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
-             nodes={nodes} workers={workers} pool={} cores={cores} placement={} honest={} \
-             pinned={} proc={} realized={realized} policy={} masked={} cpulist={cpulist}",
+             nodes={nodes} workers={workers} spawned={spawned_workers} active={active_threads} \
+             occupied={} \
+             pool={} cores={cores} placement={} honest={} pinned={} proc={} \
+             realized={realized} policy={} masked={} cpulist={cpulist}",
             available_parallelism(),
+            active_physical_cores.map_or_else(|| "na".to_string(), |count| count.to_string()),
             u8::from(pool_built),
             tri(placement),
             tri(honest),
@@ -20481,6 +20506,25 @@ mod tests {
             u8::from(affinity_mask_applied)
         );
         quiesce_pools_for_child_exit("spmd_realized_width");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn active_decode_physical_cores(pool: &crate::decode_spmd::SpmdDecodePools) -> Option<usize> {
+        let topology = crate::core_topology::require_host_for_placement().ok()?;
+        let mut cpus = Vec::new();
+        for placement in pool.worker_placements() {
+            cpus.extend_from_slice(placement.observed.cpus()?);
+        }
+        let tid = pool.dispatcher_thread_id()?;
+        let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).ok()?;
+        let dispatcher = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+            .and_then(onnx_runtime_hostmon::parse_cpu_list)?;
+        cpus.extend(dispatcher);
+        cpus.sort_unstable();
+        cpus.dedup();
+        Some(topology.physical_cores_within(&cpus))
     }
 
     #[cfg(target_os = "linux")]
@@ -20671,7 +20715,15 @@ mod tests {
     /// CPU mask.
     #[cfg(target_os = "linux")]
     fn realized_default_width_report(mask: &[usize]) -> RealizedWidth {
-        realized_width_report_inner(SPMD_WIDTH_CHILD_DEFAULT, None, false, None, Some(mask))
+        realized_default_width_report_with(mask, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn realized_default_width_report_with(
+        mask: &[usize],
+        placement: Option<crate::decode_affinity::CorePlacement>,
+    ) -> RealizedWidth {
+        realized_width_report_inner(SPMD_WIDTH_CHILD_DEFAULT, None, false, placement, Some(mask))
     }
 
     /// The sweep's child, with the placement policy named rather than inherited.
@@ -20843,6 +20895,15 @@ mod tests {
             allowed: field("allowed"),
             nodes: field("nodes"),
             workers: field("workers"),
+            spawned_workers: field("spawned"),
+            active_threads: field("active"),
+            #[cfg(target_os = "linux")]
+            active_physical_cores: match text("occupied") {
+                "na" => None,
+                count => Some(count.parse().unwrap_or_else(|_| {
+                    panic!("`occupied` is not a physical-core count: {report}")
+                })),
+            },
             pool_built: field("pool") == 1,
             cores: field("cores"),
             planned_distinct_cores: tri("placement"),
@@ -20864,6 +20925,17 @@ mod tests {
             affinity_mask_applied: field("masked") == 1,
             attempts: attempts_used,
         };
+
+        assert_eq!(
+            report.active_threads,
+            if report.pool_built {
+                report.spawned_workers + 1
+            } else {
+                0
+            },
+            "the child report must count every resident worker plus its inline dispatcher \
+             on every target ({report:?})"
+        );
 
         // A retry is only ever consumed for an exit code of exactly
         // `STATUS_ACCESS_VIOLATION` (`0xC0000005`). A Linux exit status is
@@ -21012,6 +21084,15 @@ mod tests {
         numa: Option<&crate::decode_affinity::NumaTopology>,
     ) {
         let report = realized_default_width_report(mask);
+        eprintln!(
+            "default-width-live case={case} mask={mask:?} workers={} spawned={} \
+             active={} realized={} policy={}",
+            report.workers,
+            report.spawned_workers,
+            report.active_threads,
+            report.realized,
+            report.placement_policy
+        );
         assert_eq!(
             report.requested, 0,
             "{case}: an explicit width leaked into the default-width child ({report:?})"
@@ -21038,6 +21119,7 @@ mod tests {
                 architecture_cap: default_persistent_architecture_cap(),
                 service_cpus_per_numa_node:
                     crate::persistent_pool_width::DEFAULT_SERVICE_CPUS_PER_NUMA_NODE,
+                placement: crate::decode_affinity::CorePlacement::Compact,
             },
         )
         .expect("the applied non-empty mask must resolve a default pool width");
@@ -21069,25 +21151,60 @@ mod tests {
                     expectation.global_workers
                 );
                 assert_eq!(
-                    report.planned_distinct_cores,
-                    Some(true),
-                    "{case}: the selected default mask must plan at most one worker per core \
+                    report.active_threads,
+                    report.spawned_workers + 1,
+                    "{case}: the dispatcher was not included in the live scheduling-capacity \
+                     measurement ({report:?})"
+                );
+                assert_eq!(
+                    report.placement_policy, "compact",
+                    "{case}: the unset selector must report the shared-host policy \
                      ({report:?})"
                 );
+                if report.spawned_workers == 0 {
+                    assert_eq!(
+                        (report.workers, report.active_threads),
+                        (1, 1),
+                        "{case}: a dispatcher-only pool must retain one compute lane on one \
+                         active thread ({report:?})"
+                    );
+                    assert_eq!(
+                        (
+                            report.planned_distinct_cores,
+                            report.placement_honest,
+                            report.fully_pinned,
+                            report.worker_masks_readable,
+                        ),
+                        (None, None, false, false),
+                        "{case}: a dispatcher-only pool must not invent worker-placement \
+                         evidence ({report:?})"
+                    );
+                } else {
+                    assert!(
+                        report.planned_distinct_cores.is_some(),
+                        "{case}: the planner did not classify the selected placement \
+                         ({report:?})"
+                    );
+                    assert!(
+                        report.fully_pinned && report.worker_masks_readable,
+                        "{case}: every worker must be pinned and read back its own mask \
+                         ({report:?})"
+                    );
+                    assert_eq!(
+                        report.placement_honest,
+                        Some(true),
+                        "{case}: worker-observed masks must exactly match the requested \
+                         placement ({report:?})"
+                    );
+                }
+                let logical_headroom = report.allowed.saturating_sub(report.active_threads);
                 assert!(
-                    report.fully_pinned && report.worker_masks_readable,
-                    "{case}: every worker must be pinned and read back its own mask ({report:?})"
-                );
-                assert_eq!(
-                    report.placement_honest,
-                    Some(true),
-                    "{case}: worker-observed masks must exactly match the requested placement \
-                     ({report:?})"
-                );
-                assert_eq!(
-                    report.realized, "one-per-core",
-                    "{case}: selected workers must realize one worker per physical core \
-                     ({report:?})"
+                    logical_headroom >= report.allowed / 2,
+                    "{case}: {} spawned workers plus the dispatcher consume {} of {} allowed \
+                     CPUs, leaving only {logical_headroom} for co-tenants ({report:?})",
+                    report.spawned_workers,
+                    report.active_threads,
+                    report.allowed
                 );
             }
         }
@@ -21095,12 +21212,11 @@ mod tests {
 
     /// Exercise the production default width on runtime-derived masks.
     ///
-    /// The full leader mask reproduces the original four-node observation:
-    /// 96 requested physical cores realize 92 workers because production
-    /// intentionally reserves one service CPU on each node. The bounded
-    /// contiguous and sparse cases prevent that expectation from being fitted
-    /// only to the current host. A one-CPU case covers the flat fallback
-    /// separately.
+    /// The full leader mask is the one-CPU-per-core cpuset case that a logical
+    /// half-cap alone gets wrong. The contiguous SMT mask exercises the compact
+    /// ordering on the same live cores, and the sparse case prevents the
+    /// expectation from being fitted only to contiguous CPU ids. A one-CPU case
+    /// covers the flat fallback separately.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_default_width_pool_obeys_runtime_masks_and_reservations() {
@@ -21148,6 +21264,114 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn four_thread_two_core_default_occupies_only_one_physical_core() {
+        let allowed = crate::decode_affinity::allowed_cpus()
+            .expect("Linux must report the CPU set used to derive the SMT fixture");
+        let topology = crate::core_topology::require_host_for_placement()
+            .expect("Linux topology detection must succeed for a physical-occupancy test");
+        let mut mask = Vec::new();
+        for siblings in topology.cores() {
+            let available: Vec<usize> = siblings
+                .iter()
+                .copied()
+                .filter(|cpu| allowed.contains(cpu))
+                .take(2)
+                .collect();
+            if available.len() == 2 {
+                mask.extend(available);
+                if mask.len() == 4 {
+                    break;
+                }
+            }
+        }
+        if mask.len() != 4 {
+            eprintln!(
+                "skipping 2c/4t occupancy regression: the allowed mask exposes fewer than two \
+                 physical cores with both SMT siblings"
+            );
+            return;
+        }
+        mask.sort_unstable();
+        assert_eq!(topology.physical_cores_within(&mask), 2);
+
+        let report = realized_default_width_report(&mask);
+        assert_eq!(
+            (
+                report.workers,
+                report.spawned_workers,
+                report.active_threads
+            ),
+            (1, 1, 2),
+            "the exact 2c/4t default must retain one worker plus the inline dispatcher \
+             ({report:?})"
+        );
+        assert_eq!(report.cores, 2, "{report:?}");
+        assert_eq!(
+            report.active_physical_cores,
+            Some(1),
+            "worker and dispatcher kernel affinity masks must cover one physical core, leaving \
+             the other core wholly available to a co-tenant ({report:?})"
+        );
+        assert_eq!(report.placement_honest, Some(true), "{report:?}");
+    }
+
+    /// The explicit dedicated-host selector restores the wider automatic pool
+    /// on a one-CPU-per-core cpuset; the unset selector keeps shared-host
+    /// headroom. This exercises the env-to-width wiring, not only the pure width
+    /// resolver or the explicit-width placement path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_spread_restores_the_dedicated_default_width() {
+        let allowed = crate::decode_affinity::allowed_cpus()
+            .expect("Linux must report the CPU set used to derive the fixture");
+        let topology = crate::core_topology::require_host_for_placement()
+            .expect("Linux topology detection must succeed for an exact placement test");
+        let leaders = topology.leaders_within(&allowed);
+        if leaders.len() < 2 {
+            eprintln!(
+                "skipping dedicated-width comparison: the cpuset exposes only {} physical cores",
+                leaders.len()
+            );
+            return;
+        }
+
+        let compact = realized_default_width_report(&leaders);
+        let spread = realized_default_width_report_with(
+            &leaders,
+            Some(crate::decode_affinity::CorePlacement::Spread),
+        );
+        eprintln!(
+            "default-width-live mask={leaders:?} compact(workers={},spawned={},active={}) \
+             spread(workers={},spawned={},active={})",
+            compact.workers,
+            compact.spawned_workers,
+            compact.active_threads,
+            spread.workers,
+            spread.spawned_workers,
+            spread.active_threads
+        );
+        assert_eq!(compact.placement_policy, "compact", "{compact:?}");
+        assert_eq!(spread.placement_policy, "spread", "{spread:?}");
+        assert!(
+            compact.workers < compact.cores,
+            "the shared-host default did not leave headroom in a one-CPU-per-core cpuset \
+             ({compact:?})"
+        );
+        assert!(
+            spread.workers > compact.workers,
+            "the explicit dedicated-host selector did not restore a wider automatic pool \
+             ({compact:?} vs {spread:?})"
+        );
+        assert!(
+            spread.fully_pinned
+                && spread.worker_masks_readable
+                && spread.placement_honest == Some(true),
+            "the wider spread pool must be backed by real worker masks ({spread:?})"
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -21515,8 +21739,7 @@ mod tests {
         (width >= 2).then_some((width, cores))
     }
 
-    /// A misspelled placement must fall back to the default, say so, and still
-    /// decode.
+    /// A misspelled placement must fail before a pool is accepted.
     ///
     /// End-to-end rather than a unit test of the parser, because the two ways
     /// this knob can be inert are both outside the parser: reading the wrong
@@ -21525,7 +21748,7 @@ mod tests {
     /// the failure `verify_documented_env_vars.py` exists to catch statically.
     #[test]
     #[cfg_attr(miri, ignore = "spawns a child process")]
-    fn a_misspelled_placement_falls_back_loudly_and_still_builds_a_pool() {
+    fn a_misspelled_placement_fails_loudly_instead_of_falling_back() {
         let width = "2";
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
@@ -21546,28 +21769,68 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // Not fatal: this knob ranks a set already chosen, so refusing to
-        // decode over a misspelled tuning value would be the worse failure.
         assert!(
-            output.status.success(),
-            "a misspelled placement aborted the child instead of falling back \
+            !output.status.success(),
+            "a misspelled placement silently selected a fallback \
              (status={}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
             child_status_detail(&output.status)
         );
         assert!(
-            stdout.contains(&format!(
-                "policy={}",
-                crate::decode_affinity::CorePlacement::default().as_str()
-            )),
-            "the child did not fall back to the default placement:\n{stdout}"
+            !stdout.contains(SPMD_WIDTH_MARKER),
+            "the child reported a usable pool after rejecting its selector:\n{stdout}"
         );
-        // ...and never silent. A fallback nobody is told about is how a user
-        // ends up believing a knob is in force for the life of a deployment.
         assert!(
             stderr.contains(crate::decode_affinity::DECODE_PLACEMENT_ENV)
-                && stderr.contains("one-per-core"),
-            "the fallback was silent -- stderr must name the variable and the value it \
-             rejected:\nstderr:\n{stderr}"
+                && stderr.contains("one-per-core")
+                && stderr.contains("compact")
+                && stderr.contains("spread"),
+            "the fatal diagnostic must name the variable, rejected value, and complete menu:\
+             \nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "spawns a child process")]
+    fn a_misspelled_affinity_fails_loudly_instead_of_falling_back() {
+        let width = "2";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("kernels::matmul_nbits::tests::spmd_realized_width_subprocess")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(SPMD_WIDTH_CHILD_ENV, width)
+            .env(DECODE_THREADS_ENV, width)
+            .env("RAYON_NUM_THREADS", width)
+            .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
+            .env(crate::decode_affinity::DECODE_AFFINITY_ENV, "sideways")
+            .env_remove(crate::decode_affinity::DECODE_PLACEMENT_ENV)
+            .env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV)
+            .env_remove(SPMD_PARITY_CHILD_ENV)
+            .env_remove(PLACEMENT_DISHONEST_ENV)
+            .output()
+            .expect("run the misspelled-affinity child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !output.status.success(),
+            "a misspelled affinity silently selected a fallback \
+             (status={}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            child_status_detail(&output.status)
+        );
+        assert!(
+            !stdout.contains(SPMD_WIDTH_MARKER),
+            "the child reported a usable pool after rejecting its selector:\n{stdout}"
+        );
+        assert!(
+            stderr.contains(crate::decode_affinity::DECODE_AFFINITY_ENV)
+                && stderr.contains("sideways")
+                && stderr.contains("off")
+                && stderr.contains("compact")
+                && stderr.contains("node:<index>")
+                && stderr.contains("numa-split"),
+            "the fatal diagnostic must name the variable, rejected value, and complete menu:\
+             \nstderr:\n{stderr}"
         );
     }
 
@@ -21643,6 +21906,77 @@ mod tests {
             return None;
         }
         Some((allowed, topology))
+    }
+
+    /// With the selector unset, the real worker masks must realize the compact
+    /// shared-host policy rather than the dedicated-host spread.
+    #[test]
+    #[cfg_attr(miri, ignore = "spawns a child process")]
+    fn the_default_placement_is_shared_host_compact() {
+        let Some((width, _cores)) = placement_probe_width() else {
+            eprintln!(
+                "skipping default-placement check: this target cannot pin, cannot read a \
+                 mask back, or has fewer than 3 allowed physical cores"
+            );
+            return;
+        };
+        let report = realized_width_report(width);
+        assert_eq!(
+            report.placement_policy, "compact",
+            "the unset selector did not choose the shared-host default ({report:?})"
+        );
+        assert_ne!(
+            report.placement_honest,
+            Some(false),
+            "the default pool reports CPUs the kernel did not enforce ({report:?})"
+        );
+        assert!(
+            report.fully_pinned,
+            "the default check needs real pinned-worker masks, not planner intent ({report:?})"
+        );
+        if report.nodes > 1 {
+            eprintln!(
+                "the default used a NUMA-split pool; compact ordering is applied per node, \
+                 so the single-group prediction is not the layout that ran ({report:?})"
+            );
+            return;
+        }
+        let Some((allowed, topology)) = parent_cpuset_matching(&report) else {
+            return;
+        };
+        let predicted = predicted_placement_code(
+            &allowed,
+            topology,
+            crate::decode_affinity::CorePlacement::Compact,
+            report.workers,
+        );
+        assert_eq!(
+            report.realized, predicted,
+            "the unset selector did not realize the compact ordering in the workers' \
+             kernel-backed masks ({report:?})"
+        );
+
+        if predicted == "shared-core" {
+            let spread = realized_width_report_with(
+                width,
+                false,
+                Some(crate::decode_affinity::CorePlacement::Spread),
+            );
+            assert_eq!(
+                spread.realized, "one-per-core",
+                "the explicit spread mutation did not produce the dedicated-host layout, \
+                 so the default comparison is not discriminating ({spread:?})"
+            );
+            assert_ne!(
+                report.realized, spread.realized,
+                "restoring unconditional spread would not fail this default-policy test"
+            );
+        } else {
+            eprintln!(
+                "the current cpuset has no compact-vs-spread distinction at width {width}; \
+                 the synthetic ordering test carries the policy discrimination ({report:?})"
+            );
+        }
     }
 
     /// With the spread policy **selected**, the workers must land one per
@@ -23196,9 +23530,9 @@ mod tests {
         let hw = std::thread::available_parallelism()
             .map(|c| c.get())
             .unwrap_or(1);
-        // Mirror the persistent-pool default worker count (~half the logical
-        // CPUs) that production shards the weight to.
-        let workers = (hw / 2).max(1);
+        // Mirror the dispatcher-inclusive shared-host fallback used before the
+        // policy-aware topology resolver.
+        let workers = (hw.saturating_sub(1) / 2).max(1);
 
         let weights_nk = pseudo(n * k, 0.3);
         let (packed_bytes, scales, _zps, _dq) = quantize(&weights_nk, n, k, block_size, false);

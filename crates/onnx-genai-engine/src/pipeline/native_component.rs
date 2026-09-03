@@ -218,10 +218,12 @@ impl NativeComponentSet {
     pub(crate) fn load(
         model_paths: &BTreeMap<String, PathBuf>,
         device: &NativeDecodeDevice,
+        einsum_scratch_retention: onnx_runtime_ep_cpu::EinsumScratchRetention,
     ) -> anyhow::Result<Self> {
         let mut components = HashMap::with_capacity(model_paths.len());
         for (component, path) in model_paths {
-            let session = load_native_component(component, path, device)?;
+            let session =
+                load_native_component(component, path, device, einsum_scratch_retention.clone())?;
             let output_names = session.outputs().iter().map(|io| io.name.clone()).collect();
             components.insert(
                 component.clone(),
@@ -754,13 +756,18 @@ fn load_native_component(
     component: &str,
     path: &Path,
     device: &NativeDecodeDevice,
+    einsum_scratch_retention: onnx_runtime_ep_cpu::EinsumScratchRetention,
 ) -> anyhow::Result<InferenceSession> {
     let mut builder = InferenceSession::builder().model(path);
     match device {
         NativeDecodeDevice::Cpu => {
             builder = builder
                 .device(DevicePreference::Cpu)
-                .execution_provider(Arc::new(onnx_runtime_ep_cpu::CpuExecutionProvider::new()));
+                .execution_provider(Arc::new(
+                    onnx_runtime_ep_cpu::CpuExecutionProvider::with_einsum_scratch_retention(
+                        einsum_scratch_retention,
+                    ),
+                ));
         }
         #[cfg(feature = "native-cuda")]
         NativeDecodeDevice::Cuda { index } => {

@@ -16,15 +16,17 @@ use onnx_runtime_shape_inference::{
 pub(crate) enum SharedNativeShapeRule {
     ConstantOfShape,
     Dft,
+    Einsum,
     Expand,
     Stft,
     Tile,
 }
 
 impl SharedNativeShapeRule {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::ConstantOfShape,
         Self::Dft,
+        Self::Einsum,
         Self::Expand,
         Self::Stft,
         Self::Tile,
@@ -41,6 +43,7 @@ impl SharedNativeShapeRule {
         match self {
             Self::ConstantOfShape => "ConstantOfShape",
             Self::Dft => "DFT",
+            Self::Einsum => "Einsum",
             Self::Expand => "Expand",
             Self::Stft => "STFT",
             Self::Tile => "Tile",

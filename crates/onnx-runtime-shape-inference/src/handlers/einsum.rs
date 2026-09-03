@@ -79,6 +79,7 @@ fn einsum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                 .map(|type_info| type_info.shape.as_slice())
         })
         .collect::<Result<_, _>>()?;
+    let output_dtype = plan.dtype();
     let output_shape = match plan
         .resolve_output_shape(&input_shapes, |left, right| ctx.broadcast_dim(left, right))
     {
@@ -106,7 +107,7 @@ fn einsum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         }
     };
 
-    ctx.set_output(0, plan.dtype(), output_shape);
+    ctx.set_output(0, output_dtype, output_shape);
     Ok(())
 }
 

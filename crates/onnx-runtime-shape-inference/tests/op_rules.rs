@@ -5091,13 +5091,36 @@ fn einsum_matmul_transpose_and_implicit() {
     let out = run(&einsum_node("ij->ji", 1), vec![f32in(vec![c(2), c(3)])], 12);
     assert_eq!(out_shape(&out), vec![c(3), c(2)]);
 
-    // Implicit output: once-only labels, alphabetical (i, k).
+    // Implicit output: once-only labels in ASCII order (i, k).
     let out = run(
         &einsum_node("ij,jk", 2),
         vec![f32in(vec![c(2), c(3)]), f32in(vec![c(3), c(4)])],
         12,
     );
     assert_eq!(out_shape(&out), vec![c(2), c(4)]);
+
+    // Mixed-case labels are distinct. Implicit output follows byte/ASCII
+    // ordering, so `B` precedes `Z` and both precede lower-case labels.
+    let out = run(
+        &einsum_node("Za,aB", 2),
+        vec![f32in(vec![c(2), c(3)]), f32in(vec![c(3), c(4)])],
+        12,
+    );
+    assert_eq!(out_shape(&out), vec![c(4), c(2)]);
+}
+
+#[test]
+fn einsum_shape_inference_preserves_supported_float_dtype() {
+    for dtype in [DataType::Float16, DataType::Float32] {
+        let out = run(
+            &einsum_node("ij->ji", 1),
+            vec![tin(dtype, vec![c(2), c(3)])],
+            12,
+        );
+        let type_info = out[0].type_info.as_ref().unwrap();
+        assert_eq!(type_info.dtype, dtype);
+        assert_eq!(type_info.shape, vec![c(3), c(2)]);
+    }
 }
 
 #[test]
@@ -5219,21 +5242,6 @@ fn einsum_rejects_unequal_explicit_ellipsis_ranks_and_non_space_whitespace() {
             "Einsum",
             &format!("invalid character `{invalid}` at normalized byte offset 1"),
         );
-    }
-
-    for (equation, detail) in [
-        (
-            "iJ->i",
-            "input term #0 has invalid character `J` at normalized byte offset 1",
-        ),
-        (
-            "ij->iJ",
-            "output term has invalid character `J` at normalized byte offset 1",
-        ),
-    ] {
-        let error =
-            try_run(&einsum_node(equation, 1), vec![f32in(vec![c(2), c(3)])], 12).unwrap_err();
-        assert_invalid(error, "Einsum", detail);
     }
 }
 

@@ -1,15 +1,18 @@
 # Native Einsum planning contract
 
-`onnx-runtime-ir::EinsumPlan` is the execution-provider-neutral contract for
-ONNX `Einsum` opset 12. Shape inference and every native EP consume this plan;
-they must not reparse `equation` or classify an equation by matching its string.
+`onnx-runtime-ir::EinsumPlan` is the typed execution-provider-neutral contract
+for ONNX `Einsum` opset 12 and preserves the exact validated input/output dtype.
+`EinsumShapePlan` carries the same structural contract for kernel factories
+that receive shapes but no dtype; it cannot claim a fabricated dtype. Shape
+inference and native EPs consume the appropriate representation and must not
+reparse `equation` or classify an equation by matching its string.
 
 ## Guarantees
 
-- Only lowercase ASCII letters are labels. U+0020 ASCII spaces are stripped
-  from the equation; every other whitespace or non-syntax character is
-  rejected. The normalized equation is parsed once and validated against every
-  input dtype, rank, and dimension.
+- ASCII `A-Z` and `a-z` are case-sensitive labels (`A` and `a` are distinct).
+  U+0020 ASCII spaces are stripped from the equation; every other whitespace or
+  non-syntax character is rejected. The normalized equation is parsed once and
+  validated against every input dtype, rank, and dimension.
 - Every explicit ellipsis expands to the same fixed number of dimensions, as
   required by opset 12. Terms without ellipsis do not acquire synthetic axes.
   Input axes map to canonical named or ellipsis axes. Repeated
@@ -61,4 +64,11 @@ logical axis marked `requires_runtime_check` against concrete runtime shapes.
 reparsing, and `resolve_concrete_gemm_geometry` returns overflow-checked concrete
 batch/M/K/N geometry for `Gemm` plans.
 
-No execution kernel is defined by this contract.
+The native CPU EP implements the four executable classes for
+`Float32`/`Float16`: zero-copy view/diagonal outputs where the executor permits
+aliases, canonical reduction/elementwise loops, and binary GEMM/BMM lowering
+through the existing MatMul kernel. BFloat16 is not in the canonical ONNX
+Einsum opset-12 type constraint and is declined before kernel creation; this
+implementation does not expand the schema. `Unsupported` remains a claim-time
+refusal with the plan's structured reason. Other EPs may implement different
+schema-valid subsets without changing this shared contract.

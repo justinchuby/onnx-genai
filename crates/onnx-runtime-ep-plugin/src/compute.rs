@@ -348,6 +348,13 @@ impl ShapeInference {
                         .and_then(onnx_runtime_ir::Attribute::as_int),
                     default_axis: if opset >= 20 { -2 } else { 1 },
                 },
+                SharedNativeShapeRule::Einsum => Self::Declined {
+                    op_type: "Einsum".into(),
+                    domain: node.domain.clone(),
+                    reason: DeclineReason::NodeNotShapeable(
+                        "the shared native Einsum rule did not resolve concrete extents",
+                    ),
+                },
                 SharedNativeShapeRule::Expand => Self::Expand,
                 SharedNativeShapeRule::Stft => Self::Declined {
                     op_type: "STFT".into(),

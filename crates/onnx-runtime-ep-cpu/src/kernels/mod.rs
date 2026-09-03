@@ -156,6 +156,12 @@ static MATMUL_NBITS_DTYPES: &[DataType] = &[
 static FLOAT_COMPUTE_DTYPES: &[DataType] =
     &[DataType::Float32, DataType::Float16, DataType::BFloat16];
 
+/// Canonical ONNX opset-12 dtypes implemented by the native CPU Einsum kernel.
+///
+/// BFloat16 is intentionally absent: it is not in the standard Einsum
+/// type-constraint, even though other CPU kernels can compute it.
+static EINSUM_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16];
+
 /// The two quantized storage dtypes `QLinearMatMul` operands may use.
 static QUANTIZED_STORAGE_DTYPES: &[DataType] = &[DataType::Uint8, DataType::Int8];
 
@@ -381,8 +387,13 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // a real KV-cache node with an f16 cache and Int64 indices passes.
         ("TensorScatter", "") => ARITH_DTYPES,
 
-        // MatMul supports f32 natively + f16/bf16 via half_gemm.
+        // MatMul/Gemm support f64 as well as the three native compute dtypes.
         ("MatMul", "") | ("Gemm", "") => FLOAT_DTYPES,
+
+        // Intersection of the canonical opset-12 schema and the native kernel:
+        // f32/f16 only. BFloat16 support in other CPU kernels must not widen the
+        // standard Einsum contract.
+        ("Einsum", "") => EINSUM_DTYPES,
 
         // Float-only ops (dispatch_float! or explicit float handling).
         ("Sqrt", "")
@@ -588,6 +599,7 @@ pub mod dense_elementwise;
 pub mod dft;
 pub mod dropout;
 pub mod dsa_index_select;
+pub mod einsum;
 pub mod elementwise;
 pub mod expand;
 pub mod eye_like;
@@ -698,6 +710,7 @@ pub mod nchwc;
 /// The set of ops the CPU EP implements for the Phase-1 BERT-on-CPU milestone.
 pub const PHASE1_OPS: &[&str] = &[
     "MatMul",
+    "Einsum",
     "Add",
     "Relu",
     "Reshape",
@@ -954,8 +967,10 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
 /// `lookup` picks the highest applicable version, so future opset-specialized
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
-    let (reg, _keys) =
-        build_cpu_registry_recorded_inner(qmoe::default_weight_offload_host_cache().clone());
+    let (reg, _keys) = build_cpu_registry_recorded_inner(
+        qmoe::default_weight_offload_host_cache().clone(),
+        einsum::EinsumScratchRetention::default(),
+    );
     reg
 }
 
@@ -963,8 +978,10 @@ pub fn build_cpu_registry() -> OpRegistry {
 /// type-constraint advertisement). The keys are derived from the exact same
 /// registration calls — not hand-maintained.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, _) =
-        build_cpu_registry_recorded_inner(qmoe::default_weight_offload_host_cache().clone());
+    let (reg, _) = build_cpu_registry_recorded_inner(
+        qmoe::default_weight_offload_host_cache().clone(),
+        einsum::EinsumScratchRetention::default(),
+    );
     let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
@@ -1007,7 +1024,8 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
 pub fn build_cpu_registry_with_descriptors_and_cache(
     host_cache: qmoe::WeightOffloadHostCache,
 ) -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, _) = build_cpu_registry_recorded_inner(host_cache);
+    let (reg, _) =
+        build_cpu_registry_recorded_inner(host_cache, einsum::EinsumScratchRetention::default());
     let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
@@ -1015,12 +1033,22 @@ pub fn build_cpu_registry_with_descriptors_and_cache(
 pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     host_cache: qmoe::WeightOffloadHostCache,
 ) -> OpRegistry {
-    let (reg, _keys) = build_cpu_registry_recorded_inner(host_cache);
+    let (reg, _keys) =
+        build_cpu_registry_recorded_inner(host_cache, einsum::EinsumScratchRetention::default());
+    reg
+}
+
+pub(crate) fn build_cpu_registry_with_weight_offload_cache_and_einsum_retention(
+    host_cache: qmoe::WeightOffloadHostCache,
+    einsum_scratch_retention: einsum::EinsumScratchRetention,
+) -> OpRegistry {
+    let (reg, _keys) = build_cpu_registry_recorded_inner(host_cache, einsum_scratch_retention);
     reg
 }
 
 fn build_cpu_registry_recorded_inner(
     host_cache: qmoe::WeightOffloadHostCache,
+    einsum_scratch_retention: einsum::EinsumScratchRetention,
 ) -> (OpRegistry, Vec<(String, String, u64)>) {
     let mut rec = RecordingOpRegistry::new();
     // CNN ops go directly into the inner registry (they use &mut OpRegistry).
@@ -1031,6 +1059,10 @@ fn build_cpu_registry_recorded_inner(
     //
     // All subsequent registrations go through the recording wrapper.
     rec.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
+    rec.register(
+        OpKey::new("Einsum", "", 12),
+        Box::new(einsum::EinsumFactory::new(einsum_scratch_retention)),
+    );
     rec.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
         Box::new(matmul_nbits::MatMulNBitsFactory),
@@ -2957,6 +2989,16 @@ mod tests {
         for want in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
             assert!(dtypes.contains(&want), "Conv must still advertise {want:?}");
         }
+    }
+
+    #[test]
+    fn einsum_descriptor_matches_the_canonical_kernel_dtype_contract() {
+        let dtypes = supported_dtypes_for_op("Einsum", "");
+        assert_eq!(dtypes, &[DataType::Float32, DataType::Float16]);
+        assert!(
+            !dtypes.contains(&DataType::BFloat16),
+            "BFloat16 is not permitted by the canonical ONNX opset-12 Einsum schema"
+        );
     }
 
     /// The descriptor order is leaked into a `'static` slice handed to ORT, so

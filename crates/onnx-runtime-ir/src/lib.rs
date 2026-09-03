@@ -18,7 +18,7 @@
 //! | Element type | [`DataType`] |
 //! | Symbolic / static shapes | [`Shape`], [`Dim`], [`SymbolConstraints`] |
 //! | Physical strided layout | [`TensorLayout`], [`MemoryFormat`] |
-//! | Canonical Einsum planning | [`EinsumPlan`], [`EinsumClassification`] |
+//! | Canonical Einsum planning | [`EinsumPlan`], [`EinsumShapePlan`], [`EinsumClassification`] |
 //! | Device placement | [`DeviceType`], [`DeviceId`] |
 //! | Graph values (SSA edges) | [`Value`], [`ValueId`] |
 //! | Graph operations | [`Node`], [`NodeId`], [`Attribute`] |
@@ -38,8 +38,8 @@
 //!
 //! Per-op graph shape inference remains in `onnx-runtime-shape-inference`.
 //! Shared semantic contracts needed by both inference and execution providers,
-//! such as [`EinsumPlan`], live here so every consumer validates and classifies
-//! an operator exactly once. The `Graph` operations that are cheap and
+//! such as [`EinsumPlan`] and [`EinsumShapePlan`], live here so every consumer
+//! validates and classifies an operator exactly once. The `Graph` operations that are cheap and
 //! foundational (topological ordering, validation, edge rewiring, broadcasting,
 //! stride arithmetic) are likewise fully implemented and unit-tested.
 
@@ -69,7 +69,7 @@ pub use einsum::{
     EinsumContractionPlan, EinsumDimension, EinsumDimensionRule, EinsumDimensionValue,
     EinsumEquationSide, EinsumGemmGeometry, EinsumInput, EinsumLabel, EinsumLogicalAxis,
     EinsumOperandAxis, EinsumOperandPlan, EinsumOverflowTarget, EinsumPermutationPlan, EinsumPlan,
-    EinsumPlanError, EinsumPlanErrorKind, EinsumReductionPlan, EinsumResolveError,
+    EinsumPlanError, EinsumPlanErrorKind, EinsumReductionPlan, EinsumResolveError, EinsumShapePlan,
     EinsumUnsupportedReason,
 };
 pub use error::{GraphError, IrError, Result};
