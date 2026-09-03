@@ -587,6 +587,249 @@ fn f32_low_parallelism_reduce_prepared_workspace_uses_the_injected_allocator() {
     );
 }
 
+#[cfg(feature = "gpu-tests")]
+#[derive(Clone, Copy, Debug)]
+enum CudnnRewarmFailure {
+    WorkspaceQuery,
+    WorkspaceAllocation,
+    Execution,
+}
+
+#[cfg(feature = "gpu-tests")]
+fn cudnn_rewarm_failure_preserves_a(mode: CudnnRewarmFailure) {
+    let injected = Arc::new(common::ExternalEagerAllocator::new(
+        common::require_context("transactional cuDNN Reduce rewarm"),
+    ));
+    let ep =
+        require_cuda()
+            .with_memory(
+                Arc::clone(&injected) as Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>
+            )
+            .expect("the injected allocator must be accepted for the visible CUDA device");
+    let runtime = ep.runtime();
+    let dtype = DataType::Float32;
+    let a_in = [1usize, 4096];
+    let a_out = [1usize, 1];
+    let b_in = [16usize, 65_536];
+    let b_out = [16usize, 1];
+    let kernel = reduce_kernel(&ep, "ReduceSum", dtype, &a_in, 1, true, &a_out);
+    let axes_values = [1i64];
+    let axes = ep
+        .allocate(std::mem::size_of_val(&axes_values), 256)
+        .expect("allocate reduction axes");
+    let a_values = varied(a_in.iter().product(), 0.25);
+    let b_values = varied(b_in.iter().product(), -0.75);
+    let a_data = ep
+        .allocate(a_values.len() * std::mem::size_of::<f32>(), 256)
+        .expect("allocate signature-A input");
+    let b_data = ep
+        .allocate(b_values.len() * std::mem::size_of::<f32>(), 256)
+        .expect("allocate signature-B input");
+    let mut a_output = ep
+        .allocate(
+            a_out.iter().product::<usize>() * std::mem::size_of::<f32>(),
+            256,
+        )
+        .expect("allocate signature-A output");
+    let mut b_output = ep
+        .allocate(
+            b_out.iter().product::<usize>() * std::mem::size_of::<f32>(),
+            256,
+        )
+        .expect("allocate signature-B output");
+    unsafe {
+        runtime
+            .htod(&bytes(&axes_values), cuptr(axes.as_ptr()))
+            .expect("upload reduction axes");
+        runtime
+            .htod(&encode(&a_values, dtype), cuptr(a_data.as_ptr()))
+            .expect("upload signature-A input");
+        runtime
+            .htod(&encode(&b_values, dtype), cuptr(b_data.as_ptr()))
+            .expect("upload signature-B input");
+    }
+
+    let mut workspace_a = None;
+    execute_reduce(
+        &ep,
+        kernel.as_ref(),
+        dtype,
+        &a_data,
+        &a_in,
+        &axes,
+        1,
+        &mut a_output,
+        &a_out,
+        &mut workspace_a,
+    );
+    let expected_a = read(&ep, &a_output, std::mem::size_of::<f32>());
+    assert!(
+        kernel.cuda_graph_compatible(),
+        "successful cuDNN signature A must publish a capture snapshot"
+    );
+
+    let b_strides = compute_contiguous_strides(&b_in);
+    let axes_shape = [1usize];
+    let axes_strides = compute_contiguous_strides(&axes_shape);
+    let b_inputs = [
+        TensorView::new(
+            DevicePtr(b_data.as_ptr()),
+            dtype,
+            &b_in,
+            &b_strides,
+            b_data.device(),
+        ),
+        TensorView::new(
+            DevicePtr(axes.as_ptr()),
+            DataType::Int64,
+            &axes_shape,
+            &axes_strides,
+            axes.device(),
+        ),
+    ];
+    let mut workspace_b = None;
+    match mode {
+        CudnnRewarmFailure::WorkspaceQuery => {
+            runtime.fail_warm_transaction_at_for_test(1);
+            let error = common::runtime_workspace_requirement(kernel.as_ref(), &b_inputs)
+                .expect_err("signature-B cuDNN workspace query must hit the injected failure");
+            assert!(
+                error.to_string().contains(
+                    "injected staged warm-cache failure after Reduce cuDNN workspace query"
+                ),
+                "{error}"
+            );
+        }
+        CudnnRewarmFailure::WorkspaceAllocation => {
+            let requirement = common::runtime_workspace_requirement(kernel.as_ref(), &b_inputs)
+                .expect("query signature-B cuDNN workspace");
+            assert!(
+                requirement.bytes > 0,
+                "the allocation-failure arm must select an actual non-zero cuDNN workspace"
+            );
+            injected.fail_next_allocation();
+            let error = common::prepare_workspace(&ep, requirement, &mut workspace_b)
+                .expect_err("signature-B governed workspace allocation must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected workspace allocation failure"),
+                "{error}"
+            );
+        }
+        CudnnRewarmFailure::Execution => {
+            runtime.fail_warm_transaction_at_for_test(2);
+            let error = try_execute_reduce(
+                &ep,
+                kernel.as_ref(),
+                dtype,
+                &b_data,
+                &b_in,
+                &axes,
+                1,
+                &mut b_output,
+                &b_out,
+                &mut workspace_b,
+            )
+            .expect_err("signature-B cuDNN execution must hit the injected post-sync failure");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected staged warm-cache failure after Reduce cuDNN execution"),
+                "{error}"
+            );
+        }
+    }
+
+    let kernels: [&dyn Kernel; 1] = [kernel.as_ref()];
+    runtime
+        .begin_graph_capture(&kernels)
+        .expect("failed signature-B rewarm must leave signature A capturable");
+    execute_reduce(
+        &ep,
+        kernel.as_ref(),
+        dtype,
+        &a_data,
+        &a_in,
+        &axes,
+        1,
+        &mut a_output,
+        &a_out,
+        &mut workspace_a,
+    );
+    runtime
+        .end_graph_capture()
+        .expect("install signature-A reduction graph");
+
+    execute_reduce(
+        &ep,
+        kernel.as_ref(),
+        dtype,
+        &b_data,
+        &b_in,
+        &axes,
+        1,
+        &mut b_output,
+        &b_out,
+        &mut workspace_b,
+    );
+    unsafe {
+        runtime
+            .htod(&bytes(&[f32::NAN]), cuptr(a_output.as_ptr()))
+            .expect("overwrite signature-A output before replay");
+    }
+    runtime
+        .replay_graph()
+        .expect("installed signature-A graph must survive successful signature-B publication");
+    assert_eq!(
+        read(&ep, &a_output, std::mem::size_of::<f32>()),
+        expected_a,
+        "signature-A replay changed after {mode:?} failure and successful signature-B publication"
+    );
+    assert!(runtime.reset_graph().unwrap(), "reset signature-A graph");
+
+    for workspace in [workspace_b.take(), workspace_a.take()]
+        .into_iter()
+        .flatten()
+    {
+        ep.deallocate_workspace(workspace)
+            .expect("free prepared reduction workspace");
+    }
+    for buffer in [b_output, a_output, b_data, a_data, axes] {
+        ep.deallocate(buffer).expect("free CUDA test buffer");
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn cudnn_rewarm_workspace_query_failure_preserves_a_capture_snapshot() {
+    #[cfg(feature = "gpu-tests")]
+    cudnn_rewarm_failure_preserves_a(CudnnRewarmFailure::WorkspaceQuery);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn cudnn_rewarm_workspace_allocation_failure_preserves_a_capture_snapshot() {
+    #[cfg(feature = "gpu-tests")]
+    cudnn_rewarm_failure_preserves_a(CudnnRewarmFailure::WorkspaceAllocation);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn cudnn_rewarm_execution_failure_preserves_a_capture_snapshot() {
+    #[cfg(feature = "gpu-tests")]
+    cudnn_rewarm_failure_preserves_a(CudnnRewarmFailure::Execution);
+}
+
 /// A failed replacement call must not split capture eligibility from the
 /// private resources belonging to the last successful warm.
 ///

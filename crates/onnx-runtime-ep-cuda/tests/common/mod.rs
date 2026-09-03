@@ -19,6 +19,8 @@
 
 use std::ptr::NonNull;
 use std::sync::Arc;
+#[cfg(feature = "gpu-tests")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cudarc::driver::CudaContext;
@@ -514,6 +516,8 @@ pub struct ExternalEagerAllocator {
     device: DeviceKey,
     cumemalloc_calls: AtomicU64,
     frees: AtomicU64,
+    #[cfg(feature = "gpu-tests")]
+    fail_next_allocation: AtomicBool,
 }
 
 impl ExternalEagerAllocator {
@@ -524,6 +528,8 @@ impl ExternalEagerAllocator {
             device: DeviceKey::device(ordinal),
             cumemalloc_calls: AtomicU64::new(0),
             frees: AtomicU64::new(0),
+            #[cfg(feature = "gpu-tests")]
+            fail_next_allocation: AtomicBool::new(false),
         }
     }
 
@@ -534,10 +540,23 @@ impl ExternalEagerAllocator {
     pub fn frees(&self) -> u64 {
         self.frees.load(Ordering::Relaxed)
     }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn fail_next_allocation(&self) {
+        self.fail_next_allocation.store(true, Ordering::Relaxed);
+    }
 }
 
 impl DeviceAllocator for ExternalEagerAllocator {
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+        #[cfg(feature = "gpu-tests")]
+        if self.fail_next_allocation.swap(false, Ordering::Relaxed) {
+            return Err(MemoryError::AllocationFailed {
+                tier: Tier::Device.name(),
+                requested: bytes as u64,
+                reason: String::from("injected workspace allocation failure"),
+            });
+        }
         if align == 0 || !align.is_power_of_two() || align > 256 {
             return Err(MemoryError::InvalidRequest {
                 tier: Tier::Device.name(),

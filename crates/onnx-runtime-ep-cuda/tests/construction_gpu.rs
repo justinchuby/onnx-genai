@@ -1416,6 +1416,12 @@ fn transpose_warmed_metadata_captures_and_matches_eager() {
 )]
 #[test]
 fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop() {
+    #[cfg(feature = "gpu-tests")]
+    transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu();
+}
+
+#[cfg(feature = "gpu-tests")]
+fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
     let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();

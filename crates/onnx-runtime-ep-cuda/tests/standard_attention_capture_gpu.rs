@@ -12,6 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
+#![cfg_attr(not(feature = "gpu-tests"), allow(unused_imports, dead_code))]
 //! CUDA-graph regression coverage for aliased default-domain Attention KV growth.
 
 use onnx_runtime_ep_api::{
@@ -213,6 +214,12 @@ fn read(ep: &CudaExecutionProvider, buffer: &DeviceBuffer, bytes: usize) -> Vec<
 )]
 #[test]
 fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager() {
+    #[cfg(feature = "gpu-tests")]
+    default_attention_aliased_dense_kv_growth_captures_and_matches_eager_gpu();
+}
+
+#[cfg(feature = "gpu-tests")]
+fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager_gpu() {
     let ep = require_cuda();
     let runtime = ep.runtime();
     let kernel = standard_attention_kernel(&ep);

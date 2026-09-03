@@ -990,6 +990,12 @@ fn captured_private_resources_outlive_dropped_einsum_kernels() {
 )]
 #[test]
 fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot() {
+    #[cfg(feature = "gpu-tests")]
+    materialized_view_failed_rewarm_preserves_capture_ready_snapshot_gpu();
+}
+
+#[cfg(feature = "gpu-tests")]
+fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot_gpu() {
     let _lock = suite_lock();
     let ep = require_cuda();
     let runtime = ep.runtime();

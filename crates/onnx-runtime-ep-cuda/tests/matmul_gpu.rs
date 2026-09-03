@@ -348,6 +348,12 @@ fn matmul_f32_gemv_matches_cublaslt_bitwise() {
 )]
 #[test]
 fn matmul_f32_gemv_is_capture_safe_after_warmup() {
+    #[cfg(feature = "gpu-tests")]
+    matmul_f32_gemv_is_capture_safe_after_warmup_gpu();
+}
+
+#[cfg(feature = "gpu-tests")]
+fn matmul_f32_gemv_is_capture_safe_after_warmup_gpu() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {

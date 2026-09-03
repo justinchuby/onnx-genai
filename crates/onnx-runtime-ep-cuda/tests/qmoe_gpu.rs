@@ -3313,6 +3313,12 @@ fn qmoe_grouped_capture_support_denied_before_warmup_with_reason() {
 )]
 #[test]
 fn qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel() {
+    #[cfg(feature = "gpu-tests")]
+    qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel_gpu();
+}
+
+#[cfg(feature = "gpu-tests")]
+fn qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel_gpu() {
     // Production never hands one kernel instance two different shapes mid-
     // capture (the executor's per-shape `KernelKey` cache guarantees a
     // captured instance only ever sees the exact shape it was warmed at --
