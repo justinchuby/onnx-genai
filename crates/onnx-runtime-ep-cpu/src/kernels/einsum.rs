@@ -1,4 +1,4 @@
-//! Native CPU execution for ONNX `Einsum` (opset 12).
+//! Native CPU execution for schema-resolved ONNX `Einsum`.
 //!
 //! The equation is parsed exactly once, by [`EinsumShapePlan`], when the
 //! shape-specialized kernel is built. Execution consumes only the plan's
@@ -13,9 +13,10 @@ use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{
-    DataType, EinsumAxis, EinsumClassification, EinsumContractionPlan, EinsumInput,
-    EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumReductionPlan, EinsumShapePlan,
-    Node, Shape, compute_contiguous_strides,
+    DataType, EinsumAxis, EinsumContractionPlan, EinsumContractionTreePlan, EinsumInput,
+    EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality,
+    EinsumPlanningClassification, EinsumReductionPlan, EinsumSchema, EinsumShapePlan, Node, Shape,
+    compute_contiguous_strides,
 };
 use rayon::prelude::*;
 
@@ -448,34 +449,68 @@ impl Default for EinsumFactory {
     }
 }
 
+fn contraction_tree_summary(tree: &EinsumContractionTreePlan) -> String {
+    if tree.quality() == EinsumPlannerQuality::GenericNativeFallback {
+        let reason = tree
+            .fallback_reason()
+            .expect("GenericNative planner fallback records its reason");
+        format!(
+            "the bounded planner selected GenericNative fallback because {reason} (work={}, \
+             metadata_units={}, max_depth={})",
+            tree.usage().work(),
+            tree.usage().metadata_units(),
+            tree.usage().max_depth()
+        )
+    } else {
+        format!(
+            "{} ordered candidate(s), quality {:?}",
+            tree.candidates().len(),
+            tree.quality()
+        )
+    }
+}
+
 impl KernelFactory for EinsumFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let equation = equation(node)?;
-        if input_shapes.is_empty() {
-            return Err(EpError::KernelFailed(
-                "Einsum: expected at least one input shape; the canonical planner cannot build an \
-                 execution plan without operand ranks. HOW: provide inferred input shapes before \
-                 kernel construction."
-                    .into(),
-            ));
-        }
         let input_shape_refs: Vec<_> = input_shapes.iter().map(Vec::as_slice).collect();
-        let plan = EinsumShapePlan::build(equation, &input_shape_refs).map_err(|error| {
-            EpError::KernelFailed(format!(
-                "Einsum: canonical planning failed for `{equation}`: {error}"
-            ))
-        })?;
-        if let EinsumClassification::Unsupported(reason) = plan.classification() {
-            return Err(EpError::KernelFailed(format!(
-                "Einsum equation `{}` is valid but unsupported by the native CPU EP: {reason}. \
-                 Supported native classes are view/diagonal, reduction or elementwise product, \
-                 and binary GEMM/BMM-compatible contractions.",
-                plan.equation()
-            )));
+        let schema = EinsumSchema::resolve(node.local_opset().unwrap_or(12))
+            .map_err(|error| EpError::KernelFailed(format!("Einsum: {error}")))?;
+        let plan = EinsumShapePlan::build_for_schema(equation, &input_shape_refs, schema).map_err(
+            |error| {
+                EpError::KernelFailed(format!(
+                    "Einsum: canonical planning failed for `{equation}`: {error}"
+                ))
+            },
+        )?;
+        match plan.planning_classification() {
+            EinsumPlanningClassification::ContractionTree(tree) => {
+                return Err(EpError::KernelFailed(format!(
+                    "Einsum equation `{}` has a canonical {}-input contraction plan where {}, but \
+                     the staged native CPU GenericNative/tree executor is not implemented yet. \
+                     The semantic plan is valid; use another provider until the exhaustive \
+                     execution handoff lands.",
+                    plan.equation(),
+                    tree.arity(),
+                    contraction_tree_summary(tree)
+                )));
+            }
+            EinsumPlanningClassification::ViewOnlyPermutation(_)
+            | EinsumPlanningClassification::DiagonalView(_)
+            | EinsumPlanningClassification::ReductionOrElementwise(_)
+            | EinsumPlanningClassification::Gemm(_) => {}
+            _ => {
+                return Err(EpError::KernelFailed(format!(
+                    "Einsum equation `{}` uses a newer canonical classification that this native \
+                     CPU factory does not recognize; update the claim and execution paths before \
+                     constructing the kernel",
+                    plan.equation()
+                )));
+            }
         }
         let mode = execution_mode()?;
-        let flops = match plan.classification() {
-            EinsumClassification::Gemm(gemm) => gemm_flops(gemm),
+        let flops = match plan.planning_classification() {
+            EinsumPlanningClassification::Gemm(gemm) => gemm_flops(gemm),
             _ => None,
         };
         Ok(Box::new(EinsumKernel {
@@ -493,7 +528,7 @@ impl KernelFactory for EinsumFactory {
 fn equation(node: &Node) -> Result<&str> {
     let attribute = node.attr("equation").ok_or_else(|| {
         EpError::KernelFailed(
-            "Einsum: missing required string attribute `equation`. HOW: export the opset-12 node \
+            "Einsum: missing required string attribute `equation`. HOW: export the node \
              with its ONNX equation attribute."
                 .into(),
         )
@@ -501,7 +536,7 @@ fn equation(node: &Node) -> Result<&str> {
     attribute.as_str().ok_or_else(|| {
         EpError::KernelFailed(
             "Einsum: attribute `equation` must be valid UTF-8 STRING data. HOW: encode an ASCII \
-             opset-12 einsum equation such as `ik,kj->ij`."
+             einsum equation such as `ik,kj->ij`."
                 .into(),
         )
     })
@@ -525,13 +560,27 @@ fn execution_mode() -> Result<ExecutionMode> {
     }
 }
 
+/// Claim-time capability check using the original Einsum-12 contract.
+///
+/// This compatibility wrapper intentionally does not inspect node metadata or
+/// infer a schema from the operand dtypes. Model/provider paths that have an
+/// effective opset must call [`unsupported_reason_for_opset`] instead.
+pub fn unsupported_reason(
+    node: &Node,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Option<String> {
+    unsupported_reason_for_opset(node, 12, shapes, input_dtypes)
+}
+
 /// Claim-time capability check shared with [`crate::CpuExecutionProvider`].
 ///
 /// Returning the planner's structured rejection before ORT compiles the node
 /// lets another CPU provider take legal but not-yet-native general
 /// contractions instead of failing session creation after assignment.
-pub fn unsupported_reason(
+pub fn unsupported_reason_for_opset(
     node: &Node,
+    opset: u64,
     shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Option<String> {
@@ -547,17 +596,12 @@ pub fn unsupported_reason(
             input_dtypes.len()
         ));
     }
-    if shapes.is_empty() {
-        return Some(format!(
-            "Einsum `{equation}` has no inputs; ONNX Einsum requires at least one operand"
-        ));
-    }
     let inputs: Vec<_> = shapes
         .iter()
         .zip(input_dtypes)
         .map(|(shape, &dtype)| EinsumInput::new(dtype, shape))
         .collect();
-    match EinsumPlan::build(equation, &inputs) {
+    match EinsumPlan::build_for_opset(equation, &inputs, opset) {
         Ok(plan) => {
             if let Some((index, dtype)) = input_dtypes
                 .iter()
@@ -571,14 +615,25 @@ pub fn unsupported_reason(
                      to Float32 or Float16, or use another execution provider."
                 ));
             }
-            match plan.classification() {
-                EinsumClassification::Unsupported(reason) => Some(format!(
-                    "Einsum `{}` is valid but not a native CPU lowering: {reason}. Supported \
-                     native classes are view/diagonal, reduction or elementwise product, and \
-                     binary GEMM/BMM-compatible contractions.",
+            match plan.planning_classification() {
+                EinsumPlanningClassification::ContractionTree(tree) => Some(format!(
+                    "Einsum `{}` has a canonical {}-input contraction plan where {}, but the \
+                     native CPU EP has not implemented the staged GenericNative temporary \
+                     scheduling and multi-node execution handoff; the expression is schema-valid, \
+                     so use another provider until it lands",
+                    plan.equation(),
+                    tree.arity(),
+                    contraction_tree_summary(tree)
+                )),
+                EinsumPlanningClassification::ViewOnlyPermutation(_)
+                | EinsumPlanningClassification::DiagonalView(_)
+                | EinsumPlanningClassification::ReductionOrElementwise(_)
+                | EinsumPlanningClassification::Gemm(_) => None,
+                _ => Some(format!(
+                    "Einsum `{}` uses a newer canonical classification that this native CPU EP \
+                     does not recognize; update the CPU EP before assigning this node",
                     plan.equation()
                 )),
-                _ => None,
             }
         }
         Err(error) => Some(format!(
@@ -602,8 +657,9 @@ impl Kernel for EinsumKernel {
 
     fn may_produce_views(&self) -> bool {
         matches!(
-            self.plan.classification(),
-            EinsumClassification::ViewOnlyPermutation(_) | EinsumClassification::DiagonalView(_)
+            self.plan.planning_classification(),
+            EinsumPlanningClassification::ViewOnlyPermutation(_)
+                | EinsumPlanningClassification::DiagonalView(_)
         )
     }
 
@@ -622,9 +678,9 @@ impl Kernel for EinsumKernel {
         {
             return None;
         }
-        let permutation = match self.plan.classification() {
-            EinsumClassification::ViewOnlyPermutation(permutation)
-            | EinsumClassification::DiagonalView(permutation) => permutation,
+        let permutation = match self.plan.planning_classification() {
+            EinsumPlanningClassification::ViewOnlyPermutation(permutation)
+            | EinsumPlanningClassification::DiagonalView(permutation) => permutation,
             _ => return None,
         };
         let input = inputs.get(permutation.input())?;
@@ -670,15 +726,15 @@ impl EinsumKernel {
         outputs: &mut [TensorMut],
     ) -> Result<EinsumRoute> {
         self.validate_execution(inputs, outputs)?;
-        match self.plan.classification() {
-            EinsumClassification::ViewOnlyPermutation(permutation)
-            | EinsumClassification::DiagonalView(permutation) => {
+        match self.plan.planning_classification() {
+            EinsumPlanningClassification::ViewOnlyPermutation(permutation)
+            | EinsumPlanningClassification::DiagonalView(permutation) => {
                 self.record_route(1);
                 let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_VIEW);
                 self.execute_view_copy(inputs, outputs, permutation)?;
                 Ok(EinsumRoute::ViewCopy)
             }
-            EinsumClassification::ReductionOrElementwise(reduction) => {
+            EinsumPlanningClassification::ReductionOrElementwise(reduction) => {
                 self.record_route(if self.mode == ExecutionMode::Oracle {
                     4
                 } else {
@@ -692,17 +748,27 @@ impl EinsumKernel {
                     EinsumRoute::Reduction
                 })
             }
-            EinsumClassification::Gemm(gemm) if self.mode == ExecutionMode::Optimized => {
+            EinsumPlanningClassification::Gemm(gemm) if self.mode == ExecutionMode::Optimized => {
                 self.execute_gemm(inputs, outputs, gemm)
             }
-            EinsumClassification::Gemm(_) => {
+            EinsumPlanningClassification::Gemm(_) => {
                 self.record_route(4);
                 self.execute_oracle(inputs, outputs)?;
                 Ok(EinsumRoute::Oracle)
             }
-            EinsumClassification::Unsupported(reason) => Err(EpError::KernelFailed(format!(
-                "Einsum equation `{}` reached execution with an unsupported canonical plan: \
-                 {reason}",
+            EinsumPlanningClassification::ContractionTree(tree) => {
+                Err(EpError::KernelFailed(format!(
+                    "Einsum equation `{}` reached CPU execution with an unimplemented {}-input \
+                 contraction plan where {}; EP placement must decline it until the staged \
+                 GenericNative/contraction-tree executor is implemented",
+                    self.plan.equation(),
+                    tree.arity(),
+                    contraction_tree_summary(tree)
+                )))
+            }
+            _ => Err(EpError::KernelFailed(format!(
+                "Einsum equation `{}` reached CPU execution with a newer unrecognized canonical \
+                 classification; update the CPU EP and its claim gate before executing it",
                 self.plan.equation()
             ))),
         }
@@ -729,8 +795,9 @@ impl EinsumKernel {
             if !matches!(input.dtype, DataType::Float32 | DataType::Float16) {
                 return Err(EpError::KernelFailed(format!(
                     "Einsum `{}` input #{index} has unsupported dtype {:?}; expected Float32 or \
-                     Float16. BFloat16 is not in the canonical ONNX opset-12 Einsum contract. \
-                     HOW: cast every operand to Float32 or Float16 before this node.",
+                     Float16 in the staged native CPU executor. Einsum-28 admits BFloat16 \
+                     semantically, but its CPU execution handoff is not implemented yet. HOW: \
+                     cast every operand to Float32 or Float16 or use another provider.",
                     self.plan.equation(),
                     input.dtype
                 )));
@@ -2468,13 +2535,10 @@ mod tests {
         assert!(!support.is_supported());
         let reason = support.reason().expect("BFloat16 decline must explain why");
         assert!(
-            reason.contains("unsupported opset-12 dtype BFloat16"),
+            reason.contains("dtype BFloat16, which is not admitted by Einsum-12"),
             "{reason}"
         );
-        assert!(
-            reason.contains("not part of the canonical Einsum contract"),
-            "{reason}"
-        );
+        assert!(reason.contains("import ai.onnx opset 28+"), "{reason}");
         assert!(reason.contains("HOW:"), "{reason}");
         assert!(
             OrtGraphView::new(&view)
@@ -2587,7 +2651,7 @@ mod tests {
             static_shape([4, 5]),
         ];
         let dtypes = [DataType::Float32; 3];
-        let reason = unsupported_reason(&node, &shapes, &dtypes).unwrap();
+        let reason = unsupported_reason_for_opset(&node, 12, &shapes, &dtypes).unwrap();
         assert!(reason.contains("3-input contraction"));
 
         let provider = crate::CpuExecutionProvider::new();
@@ -2604,6 +2668,69 @@ mod tests {
         );
         assert!(!support.is_supported());
         assert!(support.reason().unwrap().contains("3-input contraction"));
+
+        let mut mixed = Node::new(NodeId(1), "Einsum", vec![], vec![]);
+        mixed
+            .attributes
+            .insert("equation".into(), Attribute::String(b"aik,kj->ij".to_vec()));
+        let mixed_shapes = [static_shape([7, 2, 3]), static_shape([3, 4])];
+        let mixed_dtypes = [DataType::Float16; 2];
+        let reason =
+            unsupported_reason_for_opset(&mixed, 12, &mixed_shapes, &mixed_dtypes).unwrap();
+        assert!(reason.contains("2-input contraction plan"));
+        let error = EinsumFactory::default()
+            .create(&mixed, &[vec![7, 2, 3], vec![3, 4]])
+            .err()
+            .expect("direct factory construction must also decline");
+        assert!(error.to_string().contains("2-input contraction plan"));
+
+        let arity = 256;
+        let equation = format!(
+            "{}->",
+            std::iter::repeat_n("i", arity)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut large = Node::new(NodeId(2), "Einsum", vec![], vec![]);
+        large
+            .attributes
+            .insert("equation".into(), Attribute::String(equation.into_bytes()));
+        let shapes = vec![static_shape([1]); arity];
+        let dtypes = vec![DataType::Float32; arity];
+        let reason = unsupported_reason_for_opset(&large, 12, &shapes, &dtypes).unwrap();
+        assert!(reason.contains("GenericNative fallback"), "{reason}");
+        assert!(
+            reason.contains("work/metadata budget was exceeded"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn claim_and_factory_resolve_einsum_schema_before_backend_dtype_support() {
+        let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
+        node.attributes
+            .insert("equation".into(), Attribute::String(b"i->i".to_vec()));
+        let shape = [static_shape([2])];
+
+        let opset11 = unsupported_reason_for_opset(&node, 11, &shape, &[DataType::Float32])
+            .expect("must reject");
+        assert!(opset11.contains("predates Einsum-12"), "{opset11}");
+
+        let opset27 = unsupported_reason_for_opset(&node, 27, &shape, &[DataType::BFloat16])
+            .expect("must reject");
+        assert!(opset27.contains("not admitted by Einsum-12"), "{opset27}");
+
+        let opset28 = unsupported_reason_for_opset(&node, 28, &shape, &[DataType::BFloat16])
+            .expect("must decline");
+        assert!(
+            opset28.contains("supports only Float32 and Float16"),
+            "{opset28}"
+        );
+
+        node.version = Some(28);
+        EinsumFactory::default()
+            .create(&node, &[vec![2]])
+            .expect("shape-only factory accepts an Einsum-28 semantic plan");
     }
 
     #[test]
@@ -2651,7 +2778,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("BFloat16 is not in the canonical ONNX opset-12 Einsum contract"),
+            error.contains("Einsum-28 admits BFloat16 semantically"),
             "{error}"
         );
         assert!(error.contains("HOW:"), "{error}");

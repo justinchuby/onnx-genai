@@ -519,8 +519,12 @@ impl ExecutionProvider for CpuExecutionProvider {
         }
         if op.op_type == "Einsum"
             && op.domain.is_empty()
-            && let Some(reason) =
-                crate::kernels::einsum::unsupported_reason(op, shapes, input_dtypes)
+            && let Some(reason) = crate::kernels::einsum::unsupported_reason_for_opset(
+                op,
+                opset,
+                shapes,
+                input_dtypes,
+            )
         {
             return KernelMatch::unsupported(reason);
         }

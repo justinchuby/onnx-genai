@@ -5078,6 +5078,24 @@ fn einsum_requires_a_decodable_string_equation_attribute() {
 }
 
 #[test]
+fn einsum_rejects_invalid_operator_arity() {
+    for (inputs, outputs, expected) in [
+        (0, 1, "expected at least one input"),
+        (1, 0, "requires exactly 1 output"),
+        (1, 2, "requires exactly 1 output"),
+    ] {
+        let n = with_attr(
+            node("Einsum", inputs, outputs),
+            "equation",
+            Attribute::String(b"i->i".to_vec()),
+        );
+        let input_metadata = (0..inputs).map(|_| f32in(vec![c(2)])).collect();
+        let error = try_run(&n, input_metadata, 12).unwrap_err();
+        assert_invalid(error, "Einsum", expected);
+    }
+}
+
+#[test]
 fn einsum_matmul_transpose_and_implicit() {
     // Explicit matmul.
     let out = run(
@@ -5121,6 +5139,24 @@ fn einsum_shape_inference_preserves_supported_float_dtype() {
         assert_eq!(type_info.dtype, dtype);
         assert_eq!(type_info.shape, vec![c(3), c(2)]);
     }
+
+    let rejected = try_run(
+        &einsum_node("ij->ji", 1),
+        vec![tin(DataType::BFloat16, vec![c(2), c(3)])],
+        27,
+    )
+    .unwrap_err();
+    assert_invalid(rejected, "Einsum", "not admitted by Einsum-12");
+
+    let accepted = run(
+        &einsum_node("ij->ji", 1),
+        vec![tin(DataType::BFloat16, vec![c(2), c(3)])],
+        28,
+    );
+    assert_eq!(
+        accepted[0].type_info.as_ref().unwrap(),
+        &TypeInfo::new(DataType::BFloat16, vec![c(3), c(2)])
+    );
 }
 
 #[test]
@@ -5298,7 +5334,11 @@ fn einsum_invalid_equations_dimensions_and_dtypes_are_actionable() {
         12,
     )
     .unwrap_err();
-    assert_invalid(unsupported, "Einsum", "unsupported opset-12 dtype Bool");
+    assert_invalid(
+        unsupported,
+        "Einsum",
+        "dtype Bool, which is not admitted by Einsum-12",
+    );
 
     // Missing type/shape metadata remains best-effort and leaves the output
     // unresolved, preserving the crate-wide permissive inference contract.

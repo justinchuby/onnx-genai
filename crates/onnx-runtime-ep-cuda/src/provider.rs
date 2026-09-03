@@ -4087,8 +4087,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         }
         if op.op_type == "Einsum"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
-            && let Some(reason) =
-                crate::kernels::einsum::unsupported_reason(op, shapes, input_dtypes, layouts)
+            && let Some(reason) = crate::kernels::einsum::unsupported_reason_for_opset(
+                op,
+                opset,
+                shapes,
+                input_dtypes,
+                layouts,
+            )
         {
             return KernelMatch::unsupported(reason);
         }
