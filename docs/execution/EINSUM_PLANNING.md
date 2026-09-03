@@ -170,16 +170,29 @@ Precision is IR data, not a backend fast-path choice:
   wrapping modulo `2^width` so signed overflow never relies on host-language
   undefined behavior.
 
-## Staged CPU/CUDA execution
+## CPU execution and staged CUDA execution
 
-The final native CPU/CUDA goal is exhaustive execution of every expression and
-dtype legal under the resolved schema.
+The native CPU EP consumes the semantic plan directly and executes every legal
+equation through one of these observable routes:
 
-This PR establishes the semantic/index/planning API only; it does **not** add
-new execution kernels. Current CPU continues executing its existing
-float32/float16 view, diagonal, generic reduction/elementwise, and flat
-GEMM/BMM paths. Current CUDA continues executing its existing float32/float16
-view/diagonal and flat GEMM/BMM paths. They may temporarily decline
-`GenericNative`, general contraction-tree execution, and bfloat16 execution
-with an actionable staged-implementation message. Those declines describe
-current kernel coverage, not a permanent semantic limitation.
+- zero-copy view/diagonal when the executor can preserve the view;
+- reduction/elementwise and scalar MatMul fallbacks with fixed-width arithmetic;
+- native MatMul/BMM when its layout and precision contract is compatible;
+- exact-DP or deterministic-greedy contraction candidates under the declared
+  temporary-memory ceiling;
+- the universal `GenericNative` index program when forced, when no candidate
+  fits, or when bounded planning intentionally returns
+  `GenericNativeFallback`.
+
+Generic and tree execution read arbitrary strided inputs, compute into
+execution-local typed scratch, and publish the output only after successful
+completion. Output tiles may run in parallel, but each output retains the same
+canonical input-product and reduction order. Float16/BFloat16 use Float32
+accumulators and narrow once; Float32 and Float64 retain their widths; integers
+use wrapping arithmetic at their declared width. BFloat16 remains gated to
+Einsum-28.
+
+Current CUDA continues executing its existing float32/float16 view/diagonal and
+flat GEMM/BMM paths and may temporarily decline GenericNative, general
+contraction-tree execution, and bfloat16 execution with an actionable
+staged-implementation message.

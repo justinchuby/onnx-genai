@@ -76,10 +76,10 @@ pub use weight_offload::{
 pub use kernels::selection::non_max_suppression;
 pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};
 
-// Einsum Float32 workspace is parked per execution thread, so a per-buffer cap
-// alone would multiply by the pool width. Each provider/session owns an
-// immutable retention verdict; all admitted sessions share only the governed
-// process byte ceiling and live-byte accounting.
+// Einsum accumulator workspace is typed to its precision policy and parked per
+// execution thread, so a per-buffer cap alone would multiply by the pool width.
+// Each provider/session owns an immutable retention verdict; all admitted
+// sessions share only the governed process byte ceiling and live-byte accounting.
 pub use kernels::einsum::{
     EinsumScratchRetention, einsum_scratch_budget_predicted_bytes, einsum_scratch_live_bytes,
     einsum_scratch_process_cap_bytes,

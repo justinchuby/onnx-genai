@@ -1,5 +1,12 @@
 # Native CPU Einsum — synthetic benchmark handoff
 
+> **Historical baseline.** This document records the pre-universal
+> Float32/Float16 implementation and its 12-selector harness. The universal CPU
+> executor supersedes its dtype/coverage statements and expands the governed
+> harness to optimized-versus-GenericNative bilinear, trilinear, and N-ary
+> comparisons. Keep the measurements below as baseline evidence rather than
+> rewriting them as current results.
+
 ## Scope
 
 `crates/onnx-runtime-ep-cpu/benches/einsum.rs` exercises the canonical CPU

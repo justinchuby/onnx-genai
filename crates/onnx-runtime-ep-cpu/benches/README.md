@@ -60,12 +60,12 @@ crates/onnx-runtime-ep-cpu/benches/run_einsum.sh \
 ```
 
 The governed target has exactly one committed direct invocation. Keep the
-outer lock around the Cargo child so compilation, warmup, all 12 selectors,
+outer lock around the Cargo child so compilation, warmup, all 26 selectors,
 and both controls remain in one custody interval:
 
 ```bash
 scripts/hostlock.sh run --owner cpu-bench \
-  --reason "CPU Einsum evidence sweep (12 selectors)" \
+  --reason "CPU Einsum evidence sweep (26 selectors)" \
   --wait --gate 3 --strict-reap -- \
   cargo bench -p onnx-runtime-ep-cpu --bench einsum -- --noplot
 ```
@@ -88,12 +88,15 @@ The target emits:
 
 - exact commit/tree/branch, host-lock provenance, CPU model, realized
   logical-to-package/core mapping, and frequency samples;
-- setup/planning time, warmed allocation counts/bytes, reusable workspace,
-  shared-input hashes, nonzero oracle counts, numeric error, and the native
-  route that actually fired;
+- setup/planning time for optimized, forced GenericNative, and oracle modes;
+  warmed allocation counts/bytes, reusable workspace, shared-input hashes,
+  nonzero oracle counts, numeric error, and the native route that actually
+  fired;
 - three independent absolute repetitions per synthetic case, plus six
   deterministic ABBA/BAAB repetitions per arm for the equivalent
-  `ik,kj->ij` Einsum/MatMul comparison and the MatMul A/A null;
+  `ik,kj->ij` Einsum/MatMul comparison and the MatMul A/A null. Criterion
+  records optimized and forced GenericNative arms for every bilinear,
+  trilinear, and N-ary case;
 - per-window wall/CPU efficiency, `foreign_pct`, `sibling_peak_pct`, frequency,
   and two-ended host-lock attribution;
 - Criterion's ten-sample raw JSON under
