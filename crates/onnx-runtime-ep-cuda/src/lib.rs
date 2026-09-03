@@ -165,7 +165,8 @@ pub use kernels::unique::{
 };
 pub use kernels::{
     CUDA_COVERED_OPS, CudaOpDescriptor, build_cuda_registry, build_cuda_registry_descriptors,
-    build_cuda_registry_with_metrics, cuda_supported_dtypes_for_op,
+    build_cuda_registry_with_metrics, cuda_input_dtype_constraints_for_op,
+    cuda_output_dtype_constraints_for_op, cuda_supported_dtypes_for_op,
 };
 pub use pinned_pool::{PinnedStagingPool, global_pinned_alloc_calls, global_pinned_reuses};
 #[doc(hidden)]

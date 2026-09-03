@@ -3654,6 +3654,96 @@ fn conformance_matmul_initializer_weights() {
 // on `CPUExecutionProvider`, if a claimed node arrives fragmented rather than
 // whole, or if the resulting partition produces wrong numbers.
 
+/// The factory-attached canonical four-slot `pkg.nxrt` schema must let real ORT
+/// import, assign, compile, and execute v1 MatMul without a second custom-op
+/// registration or any CPU fallback. Planar execution is covered through the
+/// native CPU/CUDA paths because this vendored ORT rejects Float8E8M0 custom-op
+/// inputs before plugin capability discovery.
+#[test]
+fn block_quantized_matmul_canonical_schema_assigns_and_runs() {
+    let _lock = lock_ort_ep();
+    let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/block_quantized_matmul_planar/model.onnx.textproto");
+    let ep_path = skip_if_missing!(
+        find_ep_cdylib(),
+        "block_quantized_matmul_canonical_schema_assigns_and_runs: EP cdylib not found"
+    );
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+    unsafe {
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_get_capability_call_count");
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_compiled_node_count");
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_executed_node_count");
+    }
+
+    let Some((_lib, api, env, opts, session, domain, custom_op, status)) = (unsafe {
+        conformance_setup_with_session_status("cpu_ep_bqmm_canonical_v1", &model_path, false, None)
+    }) else {
+        eprintln!(
+            "*** SKIPPED: block_quantized_matmul_canonical_schema_assigns_and_runs — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+    assert!(domain.is_null());
+    assert!(custom_op.is_none());
+
+    unsafe {
+        check_status(
+            api,
+            status,
+            "CreateSession(BlockQuantizedMatMul canonical v1)",
+        );
+        assert!(
+            read_ep_counter(&ep_lib, b"nxrt_ep_get_capability_call_count") > 0,
+            "real ORT session creation must enter plugin GetCapability"
+        );
+        let info = query_ep_assignment(api, session);
+        assert_eq!(
+            info.ops_on_our_ep(),
+            vec!["BlockQuantizedMatMul"],
+            "canonical pkg.nxrt schema must assign the production op; got {:?}",
+            info.assignments
+        );
+        assert_eq!(
+            read_ep_counter(&ep_lib, b"nxrt_ep_compiled_node_count"),
+            1,
+            "ORT must compile the production node exactly once"
+        );
+
+        let mut activation = [1.0f32; 32];
+        let input = make_float_tensor(api, &mut activation, &[1, 32]);
+        let input_names = [c"A".as_ptr()];
+        let inputs: [*const ort::OrtValue; 1] = [input];
+        let output_names = [c"Y".as_ptr()];
+        let mut output = ptr::null_mut();
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(BlockQuantizedMatMul canonical v1)");
+        assert_output_shape(api, output, &[1, 1], "bqmm_canonical_Y");
+        let mut data_ptr = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(bqmm_canonical_Y)");
+        assert_eq!(*data_ptr.cast::<f32>(), 16.0);
+        assert_eq!(
+            read_ep_counter(&ep_lib, b"nxrt_ep_executed_node_count"),
+            1,
+            "the production BlockQuantizedMatMul execute path must run exactly once"
+        );
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(input);
+        conformance_teardown(api, env, opts, session, "cpu_ep_bqmm_canonical_v1");
+    }
+}
+
 /// Importing `pkg.nxrt` at opset 2 must resolve the sole since-version-1
 /// `DsaIndexSelect` implementation through ORT's model import, plugin
 /// `GetCapability`, assignment, Compile, and Compute paths.

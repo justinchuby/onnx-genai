@@ -1,0 +1,57 @@
+ir_version: 11
+graph {
+  node {
+    input: "A"
+    input: "packed_B"
+    input: ""
+    input: "bias"
+    output: "Y"
+    op_type: "BlockQuantizedMatMul"
+    attribute { name: "K" i: 32 type: INT }
+    attribute { name: "N" i: 1 type: INT }
+    attribute { name: "format" s: "mxfp4" type: STRING }
+    attribute { name: "block_layout_version" i: 1 type: INT }
+    domain: "pkg.nxrt"
+  }
+  name: "block_quantized_matmul_canonical_v1"
+  initializer {
+    dims: 1
+    dims: 1
+    dims: 17
+    data_type: 2
+    name: "packed_B"
+    raw_data: "\177\021\021\021\021\021\021\021\021\021\021\021\021\021\021\021\021"
+  }
+  initializer {
+    dims: 1
+    data_type: 1
+    name: "bias"
+    float_data: 0
+  }
+  input {
+    name: "A"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 32 }
+        }
+      }
+    }
+  }
+  output {
+    name: "Y"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 1 }
+        }
+      }
+    }
+  }
+}
+opset_import { domain: "" version: 24 }
+opset_import { domain: "pkg.nxrt" version: 1 }

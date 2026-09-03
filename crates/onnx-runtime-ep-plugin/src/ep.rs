@@ -360,7 +360,6 @@ fn ep_get_capability_inner(
     };
     let view = onnx_runtime_ir::GraphView::new(ir_graph, &cache);
     let ort_view = onnx_runtime_ep_api::abi::OrtGraphView::new(&view);
-
     // Is this a non-CPU (GPU) EP? Two capability-time gates below are specific to
     // the GPU plugin and must not disturb the CPU plugin, whose paths already
     // work. Determined from the EP's own device type.
@@ -1697,7 +1696,12 @@ fn dtype_to_onnx_tensor_elem(dtype: DataType) -> ort::ONNXTensorElementDataType 
         DataType::Uint32 => 12,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32
         DataType::Uint64 => 13,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64
         DataType::BFloat16 => 16, // ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
-        _ => 0,                   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
+        DataType::Float8E4M3FN => 17,
+        DataType::Float8E4M3FNUZ => 18,
+        DataType::Float8E5M2 => 19,
+        DataType::Float8E5M2FNUZ => 20,
+        DataType::Float8E8M0 => 24,
+        _ => 0, // ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
     }
 }
 
@@ -1949,6 +1953,8 @@ mod tests {
         assert_eq!(dtype_to_onnx_tensor_elem(DataType::Float16), 10);
         assert_eq!(dtype_to_onnx_tensor_elem(DataType::BFloat16), 16);
         assert_eq!(dtype_to_onnx_tensor_elem(DataType::Float32), 1);
+        assert_eq!(dtype_to_onnx_tensor_elem(DataType::Float8E4M3FN), 17);
+        assert_eq!(dtype_to_onnx_tensor_elem(DataType::Float8E8M0), 24);
     }
 
     /// KernelRegistryEntry can be constructed with static data.

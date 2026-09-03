@@ -213,9 +213,11 @@ schema revision with an agreed default zero point and packing; a private
 interpretation would not be portable.
 
 For performance, use ORT/MLAS packing and kernels as the reference. In our CPU
-EP, the f32 dequant path remains the correctness oracle and fallback for
-unsupported configurations. Standard linear int2 now uses direct packed GEMV
-and GEMM kernels because materializing f32 weights is memory-bandwidth hostile.
+EP, the f32 dequant path remains the explicit correctness oracle for admitted
+configurations; unsupported configurations fail closed rather than falling
+back through dense materialization. Standard linear int2 now uses direct packed
+GEMV and GEMM kernels because materializing f32 weights is memory-bandwidth
+hostile.
 
 ### 4.2 Native path: `BlockQuantizedMatMul`
 
@@ -223,7 +225,7 @@ Incubate a private op, then propose it upstream:
 
 ```text
 pkg.nxrt::BlockQuantizedMatMul(
-    A, packed_B, optional_bias
+    A, packed_B, optional_aux_scale_B, optional_bias
 ) -> Y
 
 attributes:
@@ -231,10 +233,15 @@ attributes:
     N: int
     format: string
       # iq1_s, iq1_m, iq2_xxs, iq2_xs, iq2_s,
-      # iq3_xxs, iq3_s, iq4_nl, iq4_xs, mxfp4
+      # iq3_xxs, iq3_s, iq4_nl, iq4_xs, mxfp4,
+      # block_fp8, fp4_planar
+    block_size_out: int  # required for planar formats
+    block_size_in: int   # required for planar formats
     block_layout_version: int = 1
 ```
 
+The four positional slots are canonical even when an optional tensor is
+omitted. For the self-describing IQ/MXFP4 formats, `aux_scale_B` is absent and
 `packed_B` is an opaque `uint8` tensor shaped
 `[N, ceil(K/QK), block_bytes]`, where `(QK, block_bytes)` is fixed by `format`.
 For IQ1/IQ2/IQ3 and IQ4_XS, `QK=256`; implemented super-block sizes are
@@ -249,6 +256,13 @@ baseline: it dequantizes `packed_B` to a dense f32 matrix and runs dense GEMM
 (caching the dense f32 expansion only for constant weights). It does **not**
 provide quantized-domain compute; `dispatch_manifest.toml` claims this CPU path
 as tier3 so tests can prove the actual dense-f32 dispatch.
+
+For `block_fp8`, `packed_B` is `Float8E4M3FN[N,K]` and `aux_scale_B` is
+`Float8E8M0[ceil(N/block_size_out),ceil(K/block_size_in)]`. For
+`fp4_planar`, `packed_B` is nibble-packed `Int8[N,K/2]`,
+`aux_scale_B` is `Float8E8M0[N,K/32]`, and the only legal block geometry is
+`[1,32]`. Missing scales, reserved encodings, decoded overflow, wrong
+dtype/rank/grid, and incompatible format/geometry combinations fail closed.
 
 The op name intentionally says “block quantized”, not “NBits”: MXFP4 and IQ
 indices are semantic formats, not merely bit widths. A future schema can add
@@ -300,9 +314,13 @@ expanding hundreds of expert `BlockQuantizedMatMul` nodes:
 ```text
 BlockQuantizedMoE(
     hidden, selection_scores,
-    fc1_packed, fc2_packed, optional_fc3_packed,
+    fc1_packed, optional_fc1_bias,
+    fc2_packed, optional_fc2_bias,
+    optional_fc3_packed, optional_fc3_bias,
     optional_aggregation_weights,
-    optional_biases
+    optional_fc1_aux_scale,
+    optional_fc2_aux_scale,
+    optional_fc3_aux_scale
 ) -> output
 
 attributes:
@@ -313,8 +331,11 @@ attributes:
     block_layout_version
 ```
 
-Weights are expert-major:
-`[experts, output_features, ceil(input_features/QK), block_bytes]`.
+All 12 positional slots are canonical. Self-describing weights are expert-major
+`[experts, output_features, ceil(input_features/QK), block_bytes]` and omit the
+corresponding auxiliary scale. Planar weights use `[E,N,K]` for `block_fp8` or
+`[E,N,K/2]` for `fp4_planar`, with per-projection `Float8E8M0` scale banks and
+per-projection block geometry attributes.
 Selection and aggregation remain separate tensors so DeepSeek-style
 bias-corrected/noaux routing does not accidentally change combine weights.
 

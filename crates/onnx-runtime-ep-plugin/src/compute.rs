@@ -83,6 +83,14 @@ pub enum ShapeInference {
         /// The `N` attribute: the dequantized weight's column count.
         n: usize,
     },
+    /// `pkg.nxrt::BlockQuantizedMatMul`: `A[.., K] x B[N, K]`.
+    ///
+    /// The packed weight's physical shape is format-specific, so the output
+    /// width comes from the required logical `N` attribute.
+    BlockQuantizedMatMul {
+        /// The logical output column count.
+        n: usize,
+    },
     /// `pkg.nxrt::DsaIndexSelect` v1: `[B,S,H,D]` query plus indexer inputs
     /// produces fixed-width indices `[B,1,S,top_k]`.
     DsaIndexSelect {
@@ -452,6 +460,7 @@ impl ShapeInference {
             // to ORT's CPU EP.
             | "MoE"
             | "QMoE"
+            | "BlockQuantizedMoE"
             | "ScatterND"
             | "ScatterElements"
             | "TensorScatter"
@@ -505,6 +514,18 @@ impl ShapeInference {
                     reason: DeclineReason::NodeNotShapeable("MatMulNBits without a usable N attribute"),
                 },
             },
+            "BlockQuantizedMatMul" if domain == "pkg.nxrt" => {
+                match int_attr("N").and_then(|n| usize::try_from(n).ok()) {
+                    Some(n) if n > 0 => Self::BlockQuantizedMatMul { n },
+                    _ => Self::Declined {
+                        op_type: op.to_string(),
+                        domain: domain.to_string(),
+                        reason: DeclineReason::NodeNotShapeable(
+                            "BlockQuantizedMatMul without a usable N attribute",
+                        ),
+                    },
+                }
+            }
             "DsaIndexSelect" if domain == "pkg.nxrt" => {
                 let Some(build) = resolve_shape_schema(opset, DSA_INDEX_SELECT_SCHEMAS) else {
                     return Self::Declined {
@@ -5192,6 +5213,19 @@ fn infer_shapes(
             Ok(vec![shape])
         }
 
+        ShapeInference::BlockQuantizedMatMul { n } => {
+            let a = inputs
+                .first()
+                .ok_or_else(|| "BlockQuantizedMatMul: expected >=1 input, got 0".to_string())?
+                .shape;
+            if a.is_empty() {
+                return Err("BlockQuantizedMatMul: activation must have rank >= 1".to_string());
+            }
+            let mut shape = a.to_vec();
+            *shape.last_mut().expect("rank checked above") = *n;
+            Ok(vec![shape])
+        }
+
         ShapeInference::QLinearMatMul => {
             if inputs.len() < 4 {
                 return Err(format!(
@@ -6606,6 +6640,18 @@ fn after() {}
     }
 
     #[test]
+    fn block_quantized_matmul_shape_uses_logical_n_and_preserves_leading_dims() {
+        let a = view(&[2, 3, 32], &[96, 32, 1]);
+        let packed_b = u8_view(&[7, 16], &[16, 1]);
+        let shapes = infer(
+            &ShapeInference::BlockQuantizedMatMul { n: 7 },
+            &[a, packed_b],
+        )
+        .expect("BlockQuantizedMatMul shape inference");
+        assert_eq!(shapes, vec![vec![2, 3, 7]]);
+    }
+
+    #[test]
     fn qlinear_matmul_shape_uses_inputs_zero_and_three() {
         // a, a_scale, a_zero_point, b, b_scale, b_zero_point, y_scale, y_zp.
         // Input 1 is a scalar, so a rule that read operands 0 and 1 — the
@@ -6642,6 +6688,17 @@ fn after() {}
         assert!(matches!(
             ShapeInference::for_node(&node("MatMulNBits", "com.microsoft"), &[], 1),
             ShapeInference::Declined { .. }
+        ));
+
+        let mut bqmm = node("BlockQuantizedMatMul", "pkg.nxrt");
+        bqmm.attributes.insert("N".into(), Attribute::Int(7));
+        assert!(matches!(
+            ShapeInference::for_node(&bqmm, &[], 1),
+            ShapeInference::BlockQuantizedMatMul { n: 7 }
+        ));
+        assert!(matches!(
+            ShapeInference::for_node(&node("BlockQuantizedMoE", "pkg.nxrt"), &[], 1),
+            ShapeInference::SameAsInput(0)
         ));
     }
 

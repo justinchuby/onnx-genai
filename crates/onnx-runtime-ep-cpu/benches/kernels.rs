@@ -5,7 +5,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use onnx_runtime_ep_api::{ExecutionProvider, Kernel};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::kernels::block_dequant::{decode_e2m1, decode_e8m0_scale};
-use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 const FLOAT_DTYPES: [FloatDType; 3] = [FloatDType::F32, FloatDType::F16, FloatDType::Bf16];
@@ -227,7 +227,12 @@ fn bench_matmul(c: &mut Criterion) {
 }
 
 fn block_quantized_matmul_kernel(k: usize, n: usize) -> Box<dyn Kernel> {
-    let mut node = Node::new(NodeId(0), "BlockQuantizedMatMul", vec![], vec![]);
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMatMul",
+        vec![Some(ValueId(0)), Some(ValueId(1)), None, None],
+        vec![],
+    );
     node.domain = "pkg.nxrt".into();
     node.attributes.insert("K".into(), Attribute::Int(k as i64));
     node.attributes.insert("N".into(), Attribute::Int(n as i64));
@@ -294,6 +299,8 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
     let packed = packed_mxfp4(n, k);
     let a = Tensor::floats(FloatDType::F32, &[m, k], &float_values(m * k));
     let b = Tensor::u8(&[n, blocks, 17], &packed);
+    let absent_scale = onnx_runtime_ep_api::TensorView::absent(DataType::Float8E8M0);
+    let absent_bias = onnx_runtime_ep_api::TensorView::absent(DataType::Float32);
     group.throughput(Throughput::Elements((m * n) as u64));
 
     // Forced-cold payload path: setup is outside Criterion, but every measured
@@ -306,7 +313,7 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
             bencher.iter(|| {
                 uncached_kernel
                     .execute(
-                        black_box(&[a.view(), b.view()]),
+                        black_box(&[a.view(), b.view(), absent_scale, absent_bias]),
                         black_box(&mut [uncached_output.view_mut()]),
                     )
                     .unwrap()
@@ -347,11 +354,14 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
 
     let mut cached_output = Tensor::zeros(FloatDType::F32, &[m, n]);
     let mut cached_kernel = block_quantized_matmul_kernel(k, n);
-    cached_kernel.set_constant_inputs(&[false, true]);
+    cached_kernel.set_constant_inputs(&[false, true, false, false]);
     // Warm boundary: the first hash/dequant/cache insertion completes before
     // Criterion starts; every measured iteration is a stable-identity LRU hit.
     cached_kernel
-        .execute(&[a.view(), b.view()], &mut [cached_output.view_mut()])
+        .execute(
+            &[a.view(), b.view(), absent_scale, absent_bias],
+            &mut [cached_output.view_mut()],
+        )
         .expect("prewarm cached dense weight");
     group.bench_function(
         BenchmarkId::new("mxfp4_cached_dense_repeated_call", format!("{m}x{k}x{n}")),
@@ -359,7 +369,7 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
             bencher.iter(|| {
                 cached_kernel
                     .execute(
-                        black_box(&[a.view(), b.view()]),
+                        black_box(&[a.view(), b.view(), absent_scale, absent_bias]),
                         black_box(&mut [cached_output.view_mut()]),
                     )
                     .unwrap()
@@ -370,7 +380,11 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
 }
 
 fn block_quantized_moe_kernel(top_k: usize) -> Box<dyn Kernel> {
-    let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", vec![], vec![]);
+    let mut inputs = vec![None; 12];
+    for index in [0usize, 1, 2, 4] {
+        inputs[index] = Some(ValueId(index as u32));
+    }
+    let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", inputs, vec![]);
     node.domain = "pkg.nxrt".into();
     node.attributes
         .insert("k".into(), Attribute::Int(top_k as i64));
@@ -409,6 +423,9 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
     let fc2_values = packed_mxfp4_experts(experts, hidden, inter);
     let fc1 = Tensor::u8(&[experts, inter, hidden_blocks, 17], &fc1_values);
     let fc2 = Tensor::u8(&[experts, hidden, inter_blocks, 17], &fc2_values);
+    let absent_f32 = onnx_runtime_ep_api::TensorView::absent(DataType::Float32);
+    let absent_u8 = onnx_runtime_ep_api::TensorView::absent(DataType::Uint8);
+    let absent_scale = onnx_runtime_ep_api::TensorView::absent(DataType::Float8E8M0);
     group.throughput(Throughput::Elements((rows * hidden) as u64));
 
     // Every measured iteration re-expands the routed expert projections.
@@ -427,8 +444,15 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
                             input.view(),
                             logits.view(),
                             fc1.view(),
-                            onnx_runtime_ep_api::TensorView::absent(DataType::Float32),
+                            absent_f32,
                             fc2.view(),
+                            absent_f32,
+                            absent_u8,
+                            absent_f32,
+                            absent_f32,
+                            absent_scale,
+                            absent_scale,
+                            absent_scale,
                         ]),
                         black_box(&mut [uncached_output.view_mut()]),
                     )
@@ -439,7 +463,9 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
 
     let mut cached_output = Tensor::zeros(FloatDType::F32, &[rows, hidden]);
     let mut cached_kernel = block_quantized_moe_kernel(top_k);
-    cached_kernel.set_constant_inputs(&[false, false, true, false, true]);
+    cached_kernel.set_constant_inputs(&[
+        false, false, true, false, true, false, false, false, false, false, false, false,
+    ]);
     // Prewarm the routed expert before Criterion; measured calls are cache hits.
     cached_kernel
         .execute(
@@ -447,8 +473,15 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
                 input.view(),
                 logits.view(),
                 fc1.view(),
-                onnx_runtime_ep_api::TensorView::absent(DataType::Float32),
+                absent_f32,
                 fc2.view(),
+                absent_f32,
+                absent_u8,
+                absent_f32,
+                absent_f32,
+                absent_scale,
+                absent_scale,
+                absent_scale,
             ],
             &mut [cached_output.view_mut()],
         )
@@ -466,8 +499,15 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
                             input.view(),
                             logits.view(),
                             fc1.view(),
-                            onnx_runtime_ep_api::TensorView::absent(DataType::Float32),
+                            absent_f32,
                             fc2.view(),
+                            absent_f32,
+                            absent_u8,
+                            absent_f32,
+                            absent_f32,
+                            absent_scale,
+                            absent_scale,
+                            absent_scale,
                         ]),
                         black_box(&mut [cached_output.view_mut()]),
                     )

@@ -428,6 +428,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "BlockQuantizedMatMul"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::block_quantized_matmul::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "IndexShare"
             && op.domain == "pkg.nxrt"
             && let Some(reason) =

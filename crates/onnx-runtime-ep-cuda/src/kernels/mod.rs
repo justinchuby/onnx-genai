@@ -404,6 +404,8 @@ pub struct CudaOpDescriptor {
     /// integer auxiliary inputs (`Int32` seqlens for `GroupQueryAttention`).
     /// Fail closed to the float compute set for unknown ops.
     pub supported_dtypes: &'static [DataType],
+    pub input_dtype_constraints: &'static [(usize, &'static [DataType])],
+    pub output_dtype_constraints: &'static [(usize, &'static [DataType])],
 }
 
 /// Float compute types the CUDA kernels handle (cuBLASLt + custom kernels).
@@ -478,7 +480,16 @@ static CUDA_QUANT_MATMUL_DTYPES: &[DataType] = &[
     DataType::Uint8,
     DataType::Int8,
     DataType::Int32,
+    DataType::Float8E4M3FN,
+    DataType::Float8E8M0,
 ];
+
+static CUDA_F32_ONLY: &[DataType] = &[DataType::Float32];
+static CUDA_FLOAT_COMPUTE_DTYPES: &[DataType] =
+    &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+static CUDA_BLOCK_QUANT_WEIGHT_DTYPES: &[DataType] =
+    &[DataType::Uint8, DataType::Int8, DataType::Float8E4M3FN];
+static CUDA_F8_E8M0_ONLY: &[DataType] = &[DataType::Float8E8M0];
 
 /// Float activations plus the integer index/scale types a
 /// `GatherBlockQuantized` receives: `Uint8` packed data, `Int64`/`Int32`
@@ -645,6 +656,50 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
     }
 }
 
+pub fn cuda_input_dtype_constraints_for_op(
+    op_type: &str,
+    domain: &str,
+) -> &'static [(usize, &'static [DataType])] {
+    static BLOCK_QUANT_MATMUL_SLOTS: &[(usize, &[DataType])] = &[
+        (0, CUDA_FLOAT_COMPUTE_DTYPES),
+        (1, CUDA_BLOCK_QUANT_WEIGHT_DTYPES),
+        (2, CUDA_F8_E8M0_ONLY),
+        (3, CUDA_FLOAT_COMPUTE_DTYPES),
+    ];
+    static BLOCK_QUANT_MOE_SLOTS: &[(usize, &[DataType])] = &[
+        (0, CUDA_F32_ONLY),
+        (1, CUDA_F32_ONLY),
+        (2, CUDA_BLOCK_QUANT_WEIGHT_DTYPES),
+        (3, CUDA_F32_ONLY),
+        (4, CUDA_BLOCK_QUANT_WEIGHT_DTYPES),
+        (5, CUDA_F32_ONLY),
+        (6, CUDA_BLOCK_QUANT_WEIGHT_DTYPES),
+        (7, CUDA_F32_ONLY),
+        (8, CUDA_F32_ONLY),
+        (9, CUDA_F8_E8M0_ONLY),
+        (10, CUDA_F8_E8M0_ONLY),
+        (11, CUDA_F8_E8M0_ONLY),
+    ];
+    match (op_type, domain) {
+        ("BlockQuantizedMatMul", "pkg.nxrt") => BLOCK_QUANT_MATMUL_SLOTS,
+        ("BlockQuantizedMoE", "pkg.nxrt") => BLOCK_QUANT_MOE_SLOTS,
+        _ => &[],
+    }
+}
+
+pub fn cuda_output_dtype_constraints_for_op(
+    op_type: &str,
+    domain: &str,
+) -> &'static [(usize, &'static [DataType])] {
+    static BLOCK_QUANT_MATMUL_OUTPUTS: &[(usize, &[DataType])] = &[(0, CUDA_FLOAT_COMPUTE_DTYPES)];
+    static BLOCK_QUANT_MOE_OUTPUTS: &[(usize, &[DataType])] = &[(0, CUDA_F32_ONLY)];
+    match (op_type, domain) {
+        ("BlockQuantizedMatMul", "pkg.nxrt") => BLOCK_QUANT_MATMUL_OUTPUTS,
+        ("BlockQuantizedMoE", "pkg.nxrt") => BLOCK_QUANT_MOE_OUTPUTS,
+        _ => &[],
+    }
+}
+
 /// Derive plugin kernel-registry descriptors from the real CUDA [`OpRegistry`].
 ///
 /// One descriptor per registered `(op_type, domain, since_version)` key, with
@@ -662,6 +717,11 @@ pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpD
             domain: key.domain.clone(),
             since_version: key.since_version,
             supported_dtypes: cuda_supported_dtypes_for_op(&key.op_type, &key.domain),
+            input_dtype_constraints: cuda_input_dtype_constraints_for_op(&key.op_type, &key.domain),
+            output_dtype_constraints: cuda_output_dtype_constraints_for_op(
+                &key.op_type,
+                &key.domain,
+            ),
         })
         .collect();
     // Deterministic order so the advertisement is stable across runs.

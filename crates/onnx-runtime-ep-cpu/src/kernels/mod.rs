@@ -160,6 +160,25 @@ static FLOAT_COMPUTE_DTYPES: &[DataType] =
 static QUANTIZED_STORAGE_DTYPES: &[DataType] = &[DataType::Uint8, DataType::Int8];
 
 static U8_ONLY: &[DataType] = &[DataType::Uint8];
+static F8_E8M0_ONLY: &[DataType] = &[DataType::Float8E8M0];
+static BLOCK_QUANT_WEIGHT_DTYPES: &[DataType] =
+    &[DataType::Uint8, DataType::Int8, DataType::Float8E4M3FN];
+static BLOCK_QUANT_MATMUL_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Uint8,
+    DataType::Int8,
+    DataType::Float8E4M3FN,
+    DataType::Float8E8M0,
+];
+static BLOCK_QUANT_MOE_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Uint8,
+    DataType::Int8,
+    DataType::Float8E4M3FN,
+    DataType::Float8E8M0,
+];
 
 static I32_ONLY: &[DataType] = &[DataType::Int32];
 static I64_ONLY: &[DataType] = &[DataType::Int64];
@@ -297,6 +316,26 @@ pub fn input_dtype_constraints_for_op(
         (2, FLOAT_COMPUTE_DTYPES),
         (3, F32_ONLY),
     ];
+    static BLOCK_QUANT_MATMUL_SLOTS: &[(usize, &[DataType])] = &[
+        (0, FLOAT_COMPUTE_DTYPES),
+        (1, BLOCK_QUANT_WEIGHT_DTYPES),
+        (2, F8_E8M0_ONLY),
+        (3, FLOAT_COMPUTE_DTYPES),
+    ];
+    static BLOCK_QUANT_MOE_SLOTS: &[(usize, &[DataType])] = &[
+        (0, F32_ONLY),
+        (1, F32_ONLY),
+        (2, BLOCK_QUANT_WEIGHT_DTYPES),
+        (3, F32_ONLY),
+        (4, BLOCK_QUANT_WEIGHT_DTYPES),
+        (5, F32_ONLY),
+        (6, BLOCK_QUANT_WEIGHT_DTYPES),
+        (7, F32_ONLY),
+        (8, F32_ONLY),
+        (9, F8_E8M0_ONLY),
+        (10, F8_E8M0_ONLY),
+        (11, F8_E8M0_ONLY),
+    ];
     match (op_type, domain) {
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
@@ -310,6 +349,8 @@ pub fn input_dtype_constraints_for_op(
         ("STFT", "") => STFT_SLOTS,
         ("NonMaxSuppression", "") => NMS_SLOTS,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_SLOTS,
+        ("BlockQuantizedMatMul", "pkg.nxrt") => BLOCK_QUANT_MATMUL_SLOTS,
+        ("BlockQuantizedMoE", "pkg.nxrt") => BLOCK_QUANT_MOE_SLOTS,
         _ => &[],
     }
 }
@@ -323,8 +364,12 @@ pub fn output_dtype_constraints_for_op(
     domain: &str,
 ) -> &'static [(usize, &'static [DataType])] {
     static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
+    static BLOCK_QUANT_MATMUL_OUTPUTS: &[(usize, &[DataType])] = &[(0, FLOAT_COMPUTE_DTYPES)];
+    static BLOCK_QUANT_MOE_OUTPUTS: &[(usize, &[DataType])] = &[(0, F32_ONLY)];
     match (op_type, domain) {
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
+        ("BlockQuantizedMatMul", "pkg.nxrt") => BLOCK_QUANT_MATMUL_OUTPUTS,
+        ("BlockQuantizedMoE", "pkg.nxrt") => BLOCK_QUANT_MOE_OUTPUTS,
         _ => &[],
     }
 }
@@ -532,6 +577,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("QMoE", "com.microsoft") => F32_ONLY,
 
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_DTYPES,
+        ("BlockQuantizedMatMul", "pkg.nxrt") => BLOCK_QUANT_MATMUL_DTYPES,
+        ("BlockQuantizedMoE", "pkg.nxrt") => BLOCK_QUANT_MOE_DTYPES,
 
         // Remaining pkg.nxrt custom ops: f32-only (fail closed).
         (_, "pkg.nxrt") => F32_ONLY,

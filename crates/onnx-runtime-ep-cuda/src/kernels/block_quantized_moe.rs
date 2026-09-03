@@ -30,7 +30,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwapOption;
 use cudarc::driver::LaunchConfig;
@@ -43,9 +43,19 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
 };
+use onnx_runtime_ir::block_quant_schema::{
+    BLOCK_QUANTIZED_MOE_INPUT_COUNT as INPUT_COUNT, BLOCK_QUANTIZED_MOE_INPUT_NAMES as INPUT_NAMES,
+    BQMOE_FC1_SCALE, BQMOE_FC1_WEIGHT, BQMOE_FC2_SCALE, BQMOE_FC2_WEIGHT, BQMOE_FC3_SCALE,
+    BQMOE_FC3_WEIGHT, PlanarBlockGeometry, planar_geometry_from_node, require_layout_v1,
+};
 use onnx_runtime_ir::{DataType, Node, Shape};
 use onnx_runtime_memory_governor::{MemoryRole, ProviderContextIdentity};
 
+use super::planar_block_decode::{PlanarLinearDims, validate_planar_bank_device};
+use super::planar_block_moe::{
+    BorrowedPlanarMoeProjection, BorrowedPlanarMoePtrs, PlanarMoeDims, PlanarMoeProjection,
+    launch_planar_moe_borrowed, warm_planar_moe,
+};
 use crate::error::driver_err;
 use crate::kernels::block_quantized_matmul::{BlockFormat, decoder_prelude};
 use crate::kernels::expert_route_telemetry::{
@@ -62,7 +72,6 @@ pub use onnx_runtime_ep_api::BlockQuantizedMoeTraffic;
 
 const OP: &str = "BlockQuantizedMoE";
 const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
-const LAYOUT_VERSION: i64 = 1;
 
 const MODULE: &str = "block_quantized_moe_v2";
 const ROUTE_ENTRY: &str = "bqmoe_route";
@@ -118,36 +127,6 @@ pub(crate) const MOE_ROUTE_ENTRY: &str = ROUTE_ENTRY;
 pub(crate) const MOE_ACTIVATE_ENTRY: &str = ACTIVATE_ENTRY;
 /// `bqmoe_combine_f32` entry point, reused by [`super::planar_block_moe`].
 pub(crate) const MOE_COMBINE_ENTRY: &str = COMBINE_ENTRY;
-
-const INPUT_NAMES: [&str; 9] = [
-    "input",
-    "router_logits",
-    "fc1_experts_weights",
-    "fc1_experts_bias",
-    "fc2_experts_weights",
-    "fc2_experts_bias",
-    "fc3_experts_weights",
-    "fc3_experts_bias",
-    "router_weights",
-];
-
-/// Planar block-scaled B2 formats (DeepSeek-V4): the packed weight carries its
-/// UE8M0 block scales in a *separate* aux tensor, so they are not part of the
-/// interleaved single-tensor [`BlockFormat`] family the CUDA device kernel
-/// decodes. Device-proven **primitives** for both formats now exist — a matmul
-/// (`onnx_runtime_ep_cuda::launch_planar_linear`, advertised by
-/// [`crate::planar_matmul_capable_formats`]) and a routed top-k MoE
-/// (`onnx_runtime_ep_cuda::launch_planar_moe`, advertised by
-/// [`crate::planar_moe_capable_formats`]). What remains is the op-node wiring:
-/// the 9-input `BlockQuantizedMoE` schema has no per-projection aux-scale input
-/// to carry the planar UE8M0 banks, so this claim gate still typed-rejects a
-/// planar MoE node until the co-designed Mobius #602 / Deckard #593 node ABI
-/// lands. The onnx-runtime-ep-cpu `planar_block_quant` oracle owns the routed
-/// path at op level today. These strings are the stable runtime capability names
-/// emitted by the planar emitters — recognised here purely to produce an
-/// accurate typed rejection (never an "re-export as mxfp4" message, which would
-/// be wrong: the checkpoint genuinely is these formats).
-const PLANAR_B2_FORMAT_NAMES: [&str; 2] = ["block_fp8", "fp4_planar"];
 
 // Kernels appended after the shared `decode_weight`/`block_sum` prelude. The
 // routing, activation, and combine kernels match the CPU oracle's arithmetic
@@ -459,6 +438,12 @@ impl MoeAttributes {
                     | "fc2_format"
                     | "fc3_format"
                     | "block_layout_version"
+                    | "fc1_block_size_out"
+                    | "fc1_block_size_in"
+                    | "fc2_block_size_out"
+                    | "fc2_block_size_in"
+                    | "fc3_block_size_out"
+                    | "fc3_block_size_in"
             ) {
                 return Err(error(format!(
                     "attribute '{name}' is not part of the BlockQuantizedMoE ABI"
@@ -516,13 +501,7 @@ impl MoeAttributes {
 }
 
 fn parse_layout_version(node: &Node) -> Result<()> {
-    let layout_version = int_attr(node, "block_layout_version", LAYOUT_VERSION)?;
-    if layout_version != LAYOUT_VERSION {
-        return Err(error(format!(
-            "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
-        )));
-    }
-    Ok(())
+    require_layout_v1(node, OP).map_err(error)
 }
 
 /// Per-projection native formats for CUDA validation and dispatch.
@@ -531,6 +510,80 @@ struct ProjectionFormats {
     fc1: BlockFormat,
     fc2: BlockFormat,
     fc3: Option<BlockFormat>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlanarProjectionFormats {
+    fc1: PlanarBlockGeometry,
+    fc2: PlanarBlockGeometry,
+    fc3: Option<PlanarBlockGeometry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanarBankIdentity {
+    packed: CUdeviceptr,
+    scale: CUdeviceptr,
+}
+
+struct PlanarKernelState {
+    formats: PlanarProjectionFormats,
+    constant_inputs: [bool; INPUT_COUNT],
+    validation_scratch: CUdeviceptr,
+    validated_banks: Mutex<[Option<PlanarBankIdentity>; 3]>,
+}
+
+fn parse_planar_projection_formats(node: &Node) -> Result<Option<PlanarProjectionFormats>> {
+    let fc1 = planar_geometry_from_node(
+        node,
+        OP,
+        "fc1_format",
+        "fc1_block_size_out",
+        "fc1_block_size_in",
+    )
+    .map_err(error)?;
+    let fc2 = planar_geometry_from_node(
+        node,
+        OP,
+        "fc2_format",
+        "fc2_block_size_out",
+        "fc2_block_size_in",
+    )
+    .map_err(error)?;
+    let fc3_wired = node
+        .inputs
+        .get(BQMOE_FC3_WEIGHT)
+        .is_some_and(Option::is_some);
+    let fc3 = if fc3_wired {
+        planar_geometry_from_node(
+            node,
+            OP,
+            "fc3_format",
+            "fc3_block_size_out",
+            "fc3_block_size_in",
+        )
+        .map_err(error)?
+    } else {
+        None
+    };
+    let any_planar = fc1.is_some() || fc2.is_some() || fc3.is_some();
+    if !any_planar {
+        return Ok(None);
+    }
+    match (fc1, fc2, fc3_wired, fc3) {
+        (Some(fc1), Some(fc2), false, None) => Ok(Some(PlanarProjectionFormats {
+            fc1,
+            fc2,
+            fc3: None,
+        })),
+        (Some(fc1), Some(fc2), true, Some(fc3)) => Ok(Some(PlanarProjectionFormats {
+            fc1,
+            fc2,
+            fc3: Some(fc3),
+        })),
+        _ => Err(error(
+            "CUDA planar MoE requires every wired projection to use block_fp8 or fp4_planar; mixing planar and interleaved projections is unsupported",
+        )),
+    }
 }
 
 /// Immutable host description of one expert-major interleaved GGUF projection.
@@ -1016,17 +1069,75 @@ fn claim_format_attr(
             "BlockQuantizedMoE: attribute '{name}' must be a string naming a CUDA-supported block format"
         )));
     };
-    if PLANAR_B2_FORMAT_NAMES.contains(&text) {
-        return Err(Cow::Owned(format!(
-            "BlockQuantizedMoE: planar B2 format '{text}' at '{name}' (DeepSeek-V4) has device-proven planar primitives (matmul via onnx_runtime_ep_cuda::launch_planar_linear / planar_matmul_capable_formats, routed top-k MoE via launch_planar_moe / planar_moe_capable_formats), but the 9-input BlockQuantizedMoE node ABI cannot carry the per-projection UE8M0 aux-scale banks these formats require; the op-node claim stays typed-reject until the co-designed aux-scale node inputs land, and the onnx-runtime-ep-cpu planar_block_quant oracle owns the op-level routed path"
-        )));
-    }
     match BlockFormat::parse(text) {
         Ok(format) => Ok(Some(format)),
         Err(_) => Err(Cow::Owned(format!(
             "BlockQuantizedMoE: CUDA does not support format '{text}' for '{name}'"
         ))),
     }
+}
+
+fn validate_planar_claim(
+    node: &Node,
+    shapes: &[Shape],
+    dtypes: &[DataType],
+    formats: PlanarProjectionFormats,
+) -> std::result::Result<(), String> {
+    for &index in &[0usize, 1, BQMOE_FC1_WEIGHT, BQMOE_FC2_WEIGHT] {
+        if node.inputs[index].is_none() {
+            return Err(format!(
+                "required input {index} ('{}') is omitted",
+                INPUT_NAMES[index]
+            ));
+        }
+    }
+    for index in [0usize, 1, 3, 5, 7, 8] {
+        if node.inputs[index].is_some() && dtypes[index] != DataType::Float32 {
+            return Err(format!(
+                "input {index} ('{}') must be Float32, got {:?}",
+                INPUT_NAMES[index], dtypes[index]
+            ));
+        }
+    }
+    for (weight, scale, format) in [
+        (BQMOE_FC1_WEIGHT, BQMOE_FC1_SCALE, Some(formats.fc1)),
+        (BQMOE_FC2_WEIGHT, BQMOE_FC2_SCALE, Some(formats.fc2)),
+        (BQMOE_FC3_WEIGHT, BQMOE_FC3_SCALE, formats.fc3),
+    ] {
+        let Some(format) = format else {
+            if node.inputs[scale].is_some() {
+                return Err(format!("{} requires fc3 weights", INPUT_NAMES[scale]));
+            }
+            continue;
+        };
+        if node.inputs[weight].is_none() || node.inputs[scale].is_none() {
+            return Err(format!(
+                "{} and {} are both required for planar format",
+                INPUT_NAMES[weight], INPUT_NAMES[scale]
+            ));
+        }
+        if dtypes[weight] != format.format.weight_dtype()
+            || dtypes[scale] != format.format.scale_dtype()
+        {
+            return Err(format!(
+                "{} / {} must have dtypes {:?} / {:?}",
+                INPUT_NAMES[weight],
+                INPUT_NAMES[scale],
+                format.format.weight_dtype(),
+                format.format.scale_dtype()
+            ));
+        }
+        if shapes[weight].len() != 3 || shapes[scale].len() != 3 {
+            return Err(format!(
+                "{} and {} must both have rank 3",
+                INPUT_NAMES[weight], INPUT_NAMES[scale]
+            ));
+        }
+    }
+    if !matches!(shapes[0].len(), 2 | 3) || shapes[1].len() != 2 {
+        return Err("input/router ranks must be 2-or-3/2".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1049,12 +1160,20 @@ impl PreparedMoeGeometry {
         attributes: MoeAttributes,
         formats: ProjectionFormats,
     ) -> Result<Self> {
-        if !(5..=9).contains(&input_shapes.len()) || input_shapes.len() != node.inputs.len() {
+        if input_shapes.len() != INPUT_COUNT || input_shapes.len() != node.inputs.len() {
             return Err(error(format!(
-                "expected 5 to 9 positional input shapes, got {} shapes for {} node inputs",
+                "expected exactly {INPUT_COUNT} positional input shapes, got {} shapes for {} node inputs",
                 input_shapes.len(),
                 node.inputs.len()
             )));
+        }
+        for index in [BQMOE_FC1_SCALE, BQMOE_FC2_SCALE, BQMOE_FC3_SCALE] {
+            if node.inputs[index].is_some() || !input_shapes[index].is_empty() {
+                return Err(error(format!(
+                    "{} must be absent for interleaved projection formats",
+                    INPUT_NAMES[index]
+                )));
+            }
         }
         for &index in &[0usize, 1, 2, 4] {
             if node.inputs[index].is_none() || input_shapes[index].is_empty() {
@@ -1362,21 +1481,48 @@ impl BlockQuantizedMoEFactory {
         node: &Node,
         input_shapes: &[Vec<usize>],
     ) -> Result<BlockQuantizedMoEKernel> {
+        if node.inputs.len() != INPUT_COUNT {
+            return Err(error(format!(
+                "expected exactly {INPUT_COUNT} positional inputs, got {}",
+                node.inputs.len()
+            )));
+        }
         parse_layout_version(node)?;
         let attributes = MoeAttributes::from_node(node)?;
+        if let Some(formats) = parse_planar_projection_formats(node)? {
+            warm_planar_moe(&self.runtime)?;
+            return Ok(BlockQuantizedMoEKernel {
+                runtime: self.runtime.clone(),
+                attributes,
+                interleaved_formats: None,
+                interleaved_geometry: None,
+                interleaved_launches: None,
+                shared: None,
+                uploaded_whole_bank_bytes: 0,
+                committed_whole_bank_bytes: 0,
+                bytes_per_expert: 0,
+                planar: Some(PlanarKernelState {
+                    formats,
+                    constant_inputs: [false; INPUT_COUNT],
+                    validation_scratch: self.runtime.alloc_raw(std::mem::size_of::<u32>())?,
+                    validated_banks: Mutex::new([None; 3]),
+                }),
+            });
+        }
         let formats = parse_projection_formats(node)?;
         let geometry = PreparedMoeGeometry::new(node, input_shapes, attributes, formats)?;
         let launches = PreparedMoeLaunches::new(&self.runtime, &geometry)?;
         Ok(BlockQuantizedMoEKernel {
             runtime: self.runtime.clone(),
             attributes,
-            formats,
-            geometry,
-            launches,
+            interleaved_formats: Some(formats),
+            interleaved_geometry: Some(geometry),
+            interleaved_launches: Some(launches),
             shared: None,
             uploaded_whole_bank_bytes: 0,
             committed_whole_bank_bytes: 0,
             bytes_per_expert: 0,
+            planar: None,
         })
     }
 
@@ -1408,6 +1554,30 @@ pub(crate) fn unsupported_reason(
     shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Option<Cow<'static, str>> {
+    if node.inputs.len() != INPUT_COUNT
+        || shapes.len() != INPUT_COUNT
+        || input_dtypes.len() != INPUT_COUNT
+    {
+        return Some(Cow::Owned(format!(
+            "BlockQuantizedMoE: expected exactly {INPUT_COUNT} positional inputs and matching metadata"
+        )));
+    }
+    if let Err(error) = parse_layout_version(node) {
+        return Some(Cow::Owned(error.to_string()));
+    }
+    match parse_planar_projection_formats(node) {
+        Ok(Some(formats)) => {
+            if let Err(reason) = validate_planar_claim(node, shapes, input_dtypes, formats) {
+                return Some(Cow::Owned(format!("BlockQuantizedMoE: {reason}")));
+            }
+            if let Err(error) = MoeAttributes::from_node(node) {
+                return Some(Cow::Owned(error.to_string()));
+            }
+            return None;
+        }
+        Ok(None) => {}
+        Err(error) => return Some(Cow::Owned(error.to_string())),
+    }
     let formats = match claim_projection_formats(node) {
         Ok(formats) => formats,
         Err(reason) => return Some(reason),
@@ -1416,21 +1586,6 @@ pub(crate) fn unsupported_reason(
         Ok(attributes) => attributes,
         Err(reason) => return Some(Cow::Owned(reason.to_string())),
     };
-    if let Some(attribute) = node.attr("block_layout_version") {
-        match attribute.as_int() {
-            Some(version) if version == LAYOUT_VERSION => {}
-            Some(version) => {
-                return Some(Cow::Owned(format!(
-                    "BlockQuantizedMoE: CUDA requires block_layout_version={LAYOUT_VERSION}, got {version} — re-export the packed weights with the current layout"
-                )));
-            }
-            None => {
-                return Some(Cow::Borrowed(
-                    "BlockQuantizedMoE: block_layout_version must be an integer — re-export the packed weights with the current layout",
-                ));
-            }
-        }
-    }
     // The CUDA kernel is Phase-2 all-f32: activations, router logits/weights, and
     // the output are Float32; packed weights and the optional FC3 weights are
     // Uint8. Decline anything else so the CPU oracle keeps ownership.
@@ -1510,26 +1665,28 @@ pub(crate) fn unsupported_reason(
 pub struct BlockQuantizedMoEKernel {
     runtime: Arc<CudaRuntime>,
     attributes: MoeAttributes,
-    formats: ProjectionFormats,
-    geometry: PreparedMoeGeometry,
-    launches: PreparedMoeLaunches,
+    interleaved_formats: Option<ProjectionFormats>,
+    interleaved_geometry: Option<PreparedMoeGeometry>,
+    interleaved_launches: Option<PreparedMoeLaunches>,
     shared: Option<Arc<BlockQuantizedMoeSharedState>>,
     uploaded_whole_bank_bytes: u64,
     committed_whole_bank_bytes: u64,
     bytes_per_expert: u64,
+    planar: Option<PlanarKernelState>,
 }
 
 #[cfg(not(feature = "gpu-tests"))]
 pub(crate) struct BlockQuantizedMoEKernel {
     runtime: Arc<CudaRuntime>,
     attributes: MoeAttributes,
-    formats: ProjectionFormats,
-    geometry: PreparedMoeGeometry,
-    launches: PreparedMoeLaunches,
+    interleaved_formats: Option<ProjectionFormats>,
+    interleaved_geometry: Option<PreparedMoeGeometry>,
+    interleaved_launches: Option<PreparedMoeLaunches>,
     shared: Option<Arc<BlockQuantizedMoeSharedState>>,
     uploaded_whole_bank_bytes: u64,
     committed_whole_bank_bytes: u64,
     bytes_per_expert: u64,
+    planar: Option<PlanarKernelState>,
 }
 
 struct BlockQuantizedMoeSharedState {
@@ -1575,6 +1732,24 @@ fn checked_logical_traffic_bytes(
 }
 
 impl BlockQuantizedMoEKernel {
+    fn formats(&self) -> &ProjectionFormats {
+        self.interleaved_formats
+            .as_ref()
+            .expect("interleaved BlockQuantizedMoE formats are absent")
+    }
+
+    fn geometry(&self) -> &PreparedMoeGeometry {
+        self.interleaved_geometry
+            .as_ref()
+            .expect("interleaved BlockQuantizedMoE geometry is absent")
+    }
+
+    fn launches(&self) -> &PreparedMoeLaunches {
+        self.interleaved_launches
+            .as_ref()
+            .expect("interleaved BlockQuantizedMoE launches are absent")
+    }
+
     fn install_banks(&mut self, banks: Arc<AdmittedBlockQuantizedMoeBankSet>) -> Result<()> {
         self.validate_admitted_bank_set(&banks)?;
         let total = banks
@@ -1806,39 +1981,39 @@ impl BlockQuantizedMoEKernel {
             (
                 "fc1",
                 Some(&banks.fc1),
-                self.formats.fc1,
-                self.geometry.fc1_out,
-                self.geometry.hidden,
+                self.formats().fc1,
+                self.geometry().fc1_out,
+                self.geometry().hidden,
             ),
             (
                 "fc2",
                 Some(&banks.fc2),
-                self.formats.fc2,
-                self.geometry.hidden,
-                self.geometry.inter,
+                self.formats().fc2,
+                self.geometry().hidden,
+                self.geometry().inter,
             ),
             (
                 "fc3",
                 banks.fc3.as_ref(),
-                self.formats.fc3.unwrap_or(self.formats.fc1),
-                self.geometry.inter,
-                self.geometry.hidden,
+                self.formats().fc3.unwrap_or(self.formats().fc1),
+                self.geometry().inter,
+                self.geometry().hidden,
             ),
         ];
         for (label, bank, format, out_features, in_features) in expected {
-            if label == "fc3" && bank.is_some() != self.geometry.has_fc3 {
+            if label == "fc3" && bank.is_some() != self.geometry().has_fc3 {
                 return Err(error(
                     "sealed FC3 presence does not match prepared geometry",
                 ));
             }
             let Some(bank) = bank else {
-                if label == "fc3" && !self.geometry.has_fc3 {
+                if label == "fc3" && !self.geometry().has_fc3 {
                     continue;
                 }
                 return Err(error(format!("sealed {label} projection is absent")));
             };
             if bank.format != format
-                || bank.experts != self.geometry.experts
+                || bank.experts != self.geometry().experts
                 || bank.out_features != out_features
                 || bank.in_features != in_features
                 || bank.allocation.runtime_identity() != runtime_identity
@@ -1962,9 +2137,9 @@ fn qmoe_workspace_layout(
             "router_logits must be rank 2, got {router_shape:?}"
         )));
     }
-    if fc1_shape.len() != 4 {
+    if !matches!(fc1_shape.len(), 3 | 4) {
         return Err(error(format!(
-            "fc1_experts_weights must be rank 4, got {fc1_shape:?}"
+            "fc1_experts_weights must be rank 3 (planar) or 4 (interleaved), got {fc1_shape:?}"
         )));
     }
     let hidden = *input_shape
@@ -2080,12 +2255,138 @@ fn block_format_name(format: BlockFormat) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_planar_projection(
+    inputs: &[TensorView],
+    weight_index: usize,
+    scale_index: usize,
+    bias_index: usize,
+    geometry: PlanarBlockGeometry,
+    experts: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Result<BorrowedPlanarMoeProjection> {
+    let weight = &inputs[weight_index];
+    let scale = optional_input(inputs, scale_index).ok_or_else(|| {
+        error(format!(
+            "{} is required for {}",
+            INPUT_NAMES[scale_index],
+            geometry.format.capability_str()
+        ))
+    })?;
+    require_dtype(
+        INPUT_NAMES[weight_index],
+        weight.dtype,
+        geometry.format.weight_dtype(),
+    )?;
+    require_dtype(
+        INPUT_NAMES[scale_index],
+        scale.dtype,
+        geometry.format.scale_dtype(),
+    )?;
+    let projection = PlanarMoeProjection {
+        format: geometry.format.kernel_id(),
+        in_features,
+        out_features,
+        bs0: geometry.block_out,
+        bs1: geometry.block_in,
+    };
+    let (packed_bytes, scale_bytes) = projection.per_expert_bytes()?;
+    require_shape(
+        INPUT_NAMES[weight_index],
+        weight.shape,
+        &[
+            experts,
+            out_features,
+            in_features / geometry.format.pack_factor(),
+        ],
+    )?;
+    require_shape(
+        INPUT_NAMES[scale_index],
+        scale.shape,
+        &[
+            experts,
+            out_features.div_ceil(geometry.block_out),
+            in_features.div_ceil(geometry.block_in),
+        ],
+    )?;
+    if weight.byte_size()
+        != experts
+            .checked_mul(packed_bytes)
+            .ok_or_else(|| error("planar packed bank byte count overflow"))?
+        || scale.byte_size()
+            != experts
+                .checked_mul(scale_bytes)
+                .ok_or_else(|| error("planar scale bank byte count overflow"))?
+    {
+        return Err(error("planar expert bank byte extent mismatch"));
+    }
+    if !weight.is_contiguous() || !scale.is_contiguous() {
+        return Err(error("planar expert weight and scale must be contiguous"));
+    }
+    let bias = optional_input(inputs, bias_index);
+    if let Some(bias) = bias {
+        require_dtype(INPUT_NAMES[bias_index], bias.dtype, DataType::Float32)?;
+        require_shape(
+            INPUT_NAMES[bias_index],
+            bias.shape,
+            &[experts, out_features],
+        )?;
+        if !bias.is_contiguous() {
+            return Err(error(format!(
+                "{} must be contiguous",
+                INPUT_NAMES[bias_index]
+            )));
+        }
+    }
+    Ok(BorrowedPlanarMoeProjection {
+        projection,
+        packed: tensor_ptr(weight),
+        scale: tensor_ptr(scale),
+        bias: bias.map(tensor_ptr).unwrap_or(0),
+    })
+}
+
 impl Kernel for BlockQuantizedMoEKernel {
     fn prepare_constant_inputs(
         &mut self,
         constants: &[Option<KernelConstantInput<'_>>],
         provider: &dyn ExecutionProvider,
     ) -> Result<()> {
+        if let Some(planar) = self.planar.as_mut() {
+            if provider.device_id() != onnx_runtime_ir::DeviceId::cuda(self.runtime.ordinal())
+                || provider.runtime_identity() != Some(Arc::as_ptr(&self.runtime) as usize)
+            {
+                return Err(error(
+                    "BlockQuantizedMoE constants were offered by the wrong provider runtime/device",
+                ));
+            }
+            for (index, value) in planar.constant_inputs.iter_mut().enumerate() {
+                *value = constants.get(index).is_some_and(Option::is_some);
+            }
+            for index in [
+                BQMOE_FC1_WEIGHT,
+                BQMOE_FC1_SCALE,
+                BQMOE_FC2_WEIGHT,
+                BQMOE_FC2_SCALE,
+            ] {
+                if !planar.constant_inputs[index] {
+                    return Err(error(format!(
+                        "{} must be an immutable graph initializer",
+                        INPUT_NAMES[index]
+                    )));
+                }
+            }
+            if planar.formats.fc3.is_some()
+                && (!planar.constant_inputs[BQMOE_FC3_WEIGHT]
+                    || !planar.constant_inputs[BQMOE_FC3_SCALE])
+            {
+                return Err(error(
+                    "fc3 planar weight and aux scale must be immutable graph initializers",
+                ));
+            }
+            return Ok(());
+        }
         if self.shared.is_some() {
             return Err(error("immutable projection banks were already admitted"));
         }
@@ -2107,7 +2408,7 @@ impl Kernel for BlockQuantizedMoEKernel {
                 .and_then(Option::as_ref)
                 .ok_or_else(|| error(format!("{label} must be an immutable graph initializer")))?;
             if constant.dtype != DataType::Uint8
-                || constant.shape != self.geometry.input_shapes[index]
+                || constant.shape != self.geometry().input_shapes[index]
             {
                 return Err(error(format!(
                     "{label} initializer metadata does not match the prepared projection"
@@ -2116,7 +2417,7 @@ impl Kernel for BlockQuantizedMoEKernel {
             Ok(BlockQuantizedMoeBank {
                 format: block_format_name(format),
                 packed: constant.bytes,
-                experts: self.geometry.experts,
+                experts: self.geometry().experts,
                 out_features,
                 in_features,
             })
@@ -2124,26 +2425,26 @@ impl Kernel for BlockQuantizedMoEKernel {
         let fc1 = projection(
             2,
             "fc1",
-            self.formats.fc1,
-            self.geometry.fc1_out,
-            self.geometry.hidden,
+            self.formats().fc1,
+            self.geometry().fc1_out,
+            self.geometry().hidden,
         )?;
         let fc2 = projection(
             4,
             "fc2",
-            self.formats.fc2,
-            self.geometry.hidden,
-            self.geometry.inter,
+            self.formats().fc2,
+            self.geometry().hidden,
+            self.geometry().inter,
         )?;
-        let fc3 = if self.geometry.has_fc3 {
+        let fc3 = if self.geometry().has_fc3 {
             Some(projection(
                 6,
                 "fc3",
-                self.formats
+                self.formats()
                     .fc3
                     .ok_or_else(|| error("prepared FC3 format is absent"))?,
-                self.geometry.inter,
-                self.geometry.hidden,
+                self.geometry().inter,
+                self.geometry().hidden,
             )?)
         } else {
             None
@@ -2162,6 +2463,9 @@ impl Kernel for BlockQuantizedMoEKernel {
         &mut self,
         state: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<bool> {
+        if self.planar.is_some() {
+            return Ok(false);
+        }
         let Ok(shared) = Arc::downcast::<BlockQuantizedMoeSharedState>(state) else {
             return Ok(false);
         };
@@ -2241,10 +2545,13 @@ impl Kernel for BlockQuantizedMoEKernel {
     }
 
     fn arm_block_quantized_moe_traffic(&mut self, request_id: u32) -> Result<bool> {
+        if self.planar.is_some() {
+            return Ok(false);
+        }
         self.arm_route_telemetry(RouteTelemetryConfig {
             request_id,
             device_id: self.runtime.ordinal(),
-            num_experts: self.geometry.experts,
+            num_experts: self.geometry().experts,
             routes_per_row: self.attributes.k,
         })
         .map_err(|error| EpError::KernelFailed(error.to_string()))?;
@@ -2252,10 +2559,16 @@ impl Kernel for BlockQuantizedMoEKernel {
     }
 
     fn reset_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        if self.planar.is_some() {
+            return Ok(());
+        }
         self.reset_route_telemetry_boundary()
     }
 
     fn snapshot_block_quantized_moe_traffic(&self) -> Result<Option<BlockQuantizedMoeTraffic>> {
+        if self.planar.is_some() {
+            return Ok(None);
+        }
         if self
             .shared
             .as_ref()
@@ -2268,6 +2581,9 @@ impl Kernel for BlockQuantizedMoEKernel {
     }
 
     fn disarm_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        if self.planar.is_some() {
+            return Ok(());
+        }
         self.disarm_route_telemetry()
     }
 
@@ -2279,16 +2595,39 @@ impl Kernel for BlockQuantizedMoEKernel {
     }
 
     fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
-        if inputs.len() != self.geometry.input_shapes.len() {
+        if self.planar.is_some() {
+            if inputs.len() != INPUT_COUNT {
+                return Err(error(format!(
+                    "expected exactly {INPUT_COUNT} input metadata entries, got {}",
+                    inputs.len()
+                )));
+            }
+            let layout = qmoe_workspace_layout(
+                inputs[0].shape,
+                inputs[1].shape,
+                inputs[BQMOE_FC1_WEIGHT].shape,
+                self.attributes.k,
+                self.attributes.swiglu_fusion,
+                inputs[BQMOE_FC3_WEIGHT].present,
+            )?;
+            return Ok(WorkspaceRequirement {
+                bytes: u64::try_from(layout.bytes)
+                    .map_err(|_| error("BlockQuantizedMoE workspace does not fit u64"))?,
+                alignment: WORKSPACE_ALIGNMENT,
+                lifetime: WorkspaceLifetime::SessionPersistent,
+                role: MemoryRole::Workspace { step_scoped: false },
+            });
+        }
+        if inputs.len() != self.geometry().input_shapes.len() {
             return Err(error(format!(
                 "expected {} input metadata entries, got {}",
-                self.geometry.input_shapes.len(),
+                self.geometry().input_shapes.len(),
                 inputs.len()
             )));
         }
         for (index, (input, expected)) in inputs
             .iter()
-            .zip(self.geometry.input_shapes.iter())
+            .zip(self.geometry().input_shapes.iter())
             .enumerate()
         {
             let expected_present = !expected.is_empty();
@@ -2301,7 +2640,7 @@ impl Kernel for BlockQuantizedMoEKernel {
             }
         }
         Ok(WorkspaceRequirement {
-            bytes: u64::try_from(self.geometry.layout.bytes)
+            bytes: u64::try_from(self.geometry().layout.bytes)
                 .map_err(|_| error("BlockQuantizedMoE workspace does not fit u64"))?,
             alignment: WORKSPACE_ALIGNMENT,
             lifetime: WorkspaceLifetime::SessionPersistent,
@@ -2315,10 +2654,13 @@ impl Kernel for BlockQuantizedMoEKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
-        if inputs.len() != self.geometry.input_shapes.len() || outputs.len() != 1 {
+        if let Some(planar) = self.planar.as_ref() {
+            return self.execute_planar_with_workspace(inputs, outputs, workspace, planar.formats);
+        }
+        if inputs.len() != self.geometry().input_shapes.len() || outputs.len() != 1 {
             return Err(error(format!(
                 "expected {} inputs and exactly 1 output, got {} inputs and {} outputs",
-                self.geometry.input_shapes.len(),
+                self.geometry().input_shapes.len(),
                 inputs.len(),
                 outputs.len()
             )));
@@ -2328,7 +2670,7 @@ impl Kernel for BlockQuantizedMoEKernel {
         self.validate_admitted_bank_set(banks)?;
         for (index, (input, expected)) in inputs
             .iter()
-            .zip(self.geometry.input_shapes.iter())
+            .zip(self.geometry().input_shapes.iter())
             .enumerate()
         {
             let expected_present = !expected.is_empty();
@@ -2353,7 +2695,7 @@ impl Kernel for BlockQuantizedMoEKernel {
             ));
         }
         if outputs[0].dtype != DataType::Float32
-            || outputs[0].shape != self.geometry.input_shapes[0]
+            || outputs[0].shape != self.geometry().input_shapes[0]
             || !outputs[0].is_contiguous()
             || outputs[0].device != banks.device
         {
@@ -2401,22 +2743,22 @@ impl Kernel for BlockQuantizedMoEKernel {
                 "router_weights must be the prepared contiguous Float32 CUDA tensor",
             ));
         }
-        if self.geometry.rows == 0 || self.geometry.hidden == 0 {
+        if self.geometry().rows == 0 || self.geometry().hidden == 0 {
             return Ok(());
         }
 
         let workspace = workspace.ok_or_else(|| {
             error("BlockQuantizedMoE execute reached compute without prepared workspace")
         })?;
-        if workspace.bytes() < self.geometry.layout.bytes {
+        if workspace.bytes() < self.geometry().layout.bytes {
             return Err(error(format!(
                 "BlockQuantizedMoE prepared-workspace invariant violated: execution requires {} bytes but only {} were prepared",
-                self.geometry.layout.bytes,
+                self.geometry().layout.bytes,
                 workspace.bytes()
             )));
         }
         let base = cuptr(workspace.ptr().0.cast_const());
-        let ptr = |index: usize| base + self.geometry.layout.offsets[index] as u64;
+        let ptr = |index: usize| base + self.geometry().layout.offsets[index] as u64;
         let route_indices = ptr(0);
         let route_weights_ptr = ptr(1);
         let fc1_output = ptr(2);
@@ -2427,7 +2769,7 @@ impl Kernel for BlockQuantizedMoEKernel {
         let telemetry = shared.telemetry.load();
         let (telemetry_bitmap, telemetry_header) = if telemetry
             .as_ref()
-            .is_some_and(|owner| owner.record.matches_experts(self.geometry.experts))
+            .is_some_and(|owner| owner.record.matches_experts(self.geometry().experts))
         {
             let owner = telemetry.as_ref().expect("checked above");
             (owner.record.bitmap_ptr(), owner.record.header_ptr())
@@ -2459,7 +2801,7 @@ impl Kernel for BlockQuantizedMoEKernel {
             fc1,
             fc1_output,
             false,
-            self.launches.fc1_config,
+            self.launches().fc1_config,
         )?;
         if let (Some(fc3), Some(fc3_output)) = (fc3, fc3_output) {
             self.launch_linear(
@@ -2468,7 +2810,7 @@ impl Kernel for BlockQuantizedMoEKernel {
                 fc3,
                 fc3_output,
                 false,
-                self.launches
+                self.launches()
                     .fc3_config
                     .ok_or_else(|| error("prepared FC3 launch is absent"))?,
             )?;
@@ -2480,7 +2822,7 @@ impl Kernel for BlockQuantizedMoEKernel {
             fc2,
             route_output,
             true,
-            self.launches.fc2_config,
+            self.launches().fc2_config,
         )?;
         self.launch_combine(route_output, route_weights_ptr, &mut outputs[0])?;
         Ok(())
@@ -2495,7 +2837,274 @@ impl Kernel for BlockQuantizedMoEKernel {
     }
 }
 
+impl Drop for BlockQuantizedMoEKernel {
+    fn drop(&mut self) {
+        if let Some(planar) = self.planar.take() {
+            // SAFETY: this kernel uniquely owns the planar validation word.
+            let _ = unsafe { self.runtime.free_raw(planar.validation_scratch) };
+        }
+    }
+}
+
 impl BlockQuantizedMoEKernel {
+    fn execute_planar_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+        formats: PlanarProjectionFormats,
+    ) -> Result<()> {
+        let planar = self
+            .planar
+            .as_ref()
+            .ok_or_else(|| error("planar BlockQuantizedMoE state is absent"))?;
+        for &index in &[0usize, 1, BQMOE_FC1_WEIGHT, BQMOE_FC2_WEIGHT] {
+            if inputs[index].is_absent() {
+                return Err(error(format!(
+                    "required input {index} ('{}') is absent",
+                    INPUT_NAMES[index]
+                )));
+            }
+        }
+        for &(weight, scale) in &[
+            (BQMOE_FC1_WEIGHT, BQMOE_FC1_SCALE),
+            (BQMOE_FC2_WEIGHT, BQMOE_FC2_SCALE),
+        ] {
+            if !planar.constant_inputs[weight] || !planar.constant_inputs[scale] {
+                return Err(error(format!(
+                    "{} and {} must be immutable session constants",
+                    INPUT_NAMES[weight], INPUT_NAMES[scale]
+                )));
+            }
+        }
+        if formats.fc3.is_some()
+            && (!planar.constant_inputs[BQMOE_FC3_WEIGHT]
+                || !planar.constant_inputs[BQMOE_FC3_SCALE])
+        {
+            return Err(error(
+                "fc3 planar weight and aux scale must be immutable session constants",
+            ));
+        }
+        require_dtype("input", inputs[0].dtype, DataType::Float32)?;
+        require_dtype("router_logits", inputs[1].dtype, DataType::Float32)?;
+        require_dtype("output", outputs[0].dtype, DataType::Float32)?;
+        let input_shape = inputs[0].shape;
+        if !matches!(input_shape.len(), 2 | 3) {
+            return Err(error(format!(
+                "input must be [rows,H] or [B,S,H], got {input_shape:?}"
+            )));
+        }
+        require_shape("output", outputs[0].shape, input_shape)?;
+        let hidden = *input_shape
+            .last()
+            .ok_or_else(|| error("input rank unexpectedly empty"))?;
+        let rows = checked_product(
+            &input_shape[..input_shape.len() - 1],
+            "flattened input row count",
+        )?;
+        require_rank("router_logits", inputs[1].shape, 2)?;
+        if inputs[1].shape[0] != rows {
+            return Err(error("router_logits row count must match input rows"));
+        }
+        let experts = inputs[1].shape[1];
+        if self.attributes.k > experts {
+            return Err(error(format!(
+                "k={} exceeds num_experts={experts}",
+                self.attributes.k
+            )));
+        }
+        require_rank("fc1_experts_weights", inputs[BQMOE_FC1_WEIGHT].shape, 3)?;
+        require_rank("fc2_experts_weights", inputs[BQMOE_FC2_WEIGHT].shape, 3)?;
+        let fc1_out = inputs[BQMOE_FC1_WEIGHT].shape[1];
+        let inter = if self.attributes.swiglu_fusion == 0 {
+            fc1_out
+        } else {
+            if !fc1_out.is_multiple_of(2) {
+                return Err(error("fused SwiGLU fc1 output width must be even"));
+            }
+            fc1_out / 2
+        };
+        if inter == 0 || self.attributes.fc1_size(inter)? != fc1_out {
+            return Err(error("invalid inferred planar MoE intermediate width"));
+        }
+
+        let fc1 = validate_planar_projection(
+            inputs,
+            BQMOE_FC1_WEIGHT,
+            BQMOE_FC1_SCALE,
+            3,
+            formats.fc1,
+            experts,
+            fc1_out,
+            hidden,
+        )?;
+        let fc2 = validate_planar_projection(
+            inputs,
+            BQMOE_FC2_WEIGHT,
+            BQMOE_FC2_SCALE,
+            5,
+            formats.fc2,
+            experts,
+            hidden,
+            inter,
+        )?;
+        let has_fc3 = optional_input(inputs, BQMOE_FC3_WEIGHT).is_some();
+        if has_fc3 != formats.fc3.is_some() {
+            return Err(error(
+                "fc3_format must be present exactly when fc3_experts_weights is wired",
+            ));
+        }
+        let fc3 = if self.attributes.uses_separate_gate(has_fc3) {
+            Some(validate_planar_projection(
+                inputs,
+                BQMOE_FC3_WEIGHT,
+                BQMOE_FC3_SCALE,
+                7,
+                formats
+                    .fc3
+                    .ok_or_else(|| error("fc3 planar format is missing"))?,
+                experts,
+                inter,
+                hidden,
+            )?)
+        } else {
+            if has_fc3
+                || optional_input(inputs, 7).is_some()
+                || optional_input(inputs, BQMOE_FC3_SCALE).is_some()
+            {
+                return Err(error(
+                    "fc3 inputs are valid only for an unfused gated activation",
+                ));
+            }
+            None
+        };
+        let router_weights = optional_input(inputs, 8);
+        if let Some(weights) = router_weights {
+            require_dtype("router_weights", weights.dtype, DataType::Float32)?;
+            require_shape("router_weights", weights.shape, &[rows, experts])?;
+            if !weights.is_contiguous() {
+                return Err(error("router_weights must be contiguous"));
+            }
+        }
+        for (name, tensor) in [("input", &inputs[0]), ("router_logits", &inputs[1])] {
+            checked_tensor_layout(name, tensor.shape, tensor.dtype)?;
+            if !tensor.is_contiguous() {
+                return Err(error(format!("{name} must be contiguous")));
+            }
+        }
+        if !outputs[0].is_contiguous() {
+            return Err(error("output must be contiguous"));
+        }
+        if rows == 0 || hidden == 0 {
+            return Ok(());
+        }
+
+        let dims = PlanarMoeDims {
+            rows,
+            hidden,
+            inter,
+            experts,
+            top_k: self.attributes.k,
+            activation: self.attributes.activation.kernel_id(),
+            swiglu_fusion: as_i32("swiglu_fusion", self.attributes.swiglu_fusion)?,
+            activation_alpha: self.attributes.activation_alpha,
+            activation_beta: self.attributes.activation_beta,
+            swiglu_limit: self.attributes.swiglu_limit,
+            normalize_routing_weights: self.attributes.normalize_routing_weights,
+            fc1: fc1.projection,
+            fc2: fc2.projection,
+            fc3: fc3.map(|bank| bank.projection),
+        };
+        self.admit_planar_banks(&dims, [Some(fc1), Some(fc2), fc3])?;
+
+        let layout = qmoe_workspace_layout(
+            input_shape,
+            inputs[1].shape,
+            inputs[BQMOE_FC1_WEIGHT].shape,
+            self.attributes.k,
+            self.attributes.swiglu_fusion,
+            fc3.is_some(),
+        )?;
+        let workspace = workspace.ok_or_else(|| error("prepared workspace is missing"))?;
+        if workspace.bytes() < layout.bytes {
+            return Err(error(format!(
+                "prepared workspace has {} bytes, requires {}",
+                workspace.bytes(),
+                layout.bytes
+            )));
+        }
+        let base = cuptr(workspace.ptr().0.cast_const());
+        let workspace_ptr = |index: usize| base + layout.offsets[index] as u64;
+        let ptrs = BorrowedPlanarMoePtrs {
+            input: tensor_ptr(&inputs[0]),
+            router_logits: tensor_ptr(&inputs[1]),
+            router_weights: router_weights.map(tensor_ptr).unwrap_or(0),
+            fc1,
+            fc2,
+            fc3,
+            route_indices: workspace_ptr(0),
+            route_weights: workspace_ptr(1),
+            fc1_output: workspace_ptr(2),
+            fc3_output: fc3.map_or(0, |_| workspace_ptr(3)),
+            activated: workspace_ptr(4),
+            route_output: workspace_ptr(5),
+            output: cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void),
+        };
+        launch_planar_moe_borrowed(&self.runtime, &dims, ptrs)
+    }
+
+    fn admit_planar_banks(
+        &self,
+        dims: &PlanarMoeDims,
+        banks: [Option<BorrowedPlanarMoeProjection>; 3],
+    ) -> Result<()> {
+        let planar = self
+            .planar
+            .as_ref()
+            .ok_or_else(|| error("planar BlockQuantizedMoE state is absent"))?;
+        let mut validated = planar
+            .validated_banks
+            .lock()
+            .map_err(|_| error("planar bank validation state is poisoned"))?;
+        let scratch = planar.validation_scratch;
+        for (index, (bank, projection)) in banks
+            .into_iter()
+            .zip([Some(dims.fc1), Some(dims.fc2), dims.fc3])
+            .enumerate()
+        {
+            let (Some(bank), Some(projection)) = (bank, projection) else {
+                validated[index] = None;
+                continue;
+            };
+            let identity = PlanarBankIdentity {
+                packed: bank.packed,
+                scale: bank.scale,
+            };
+            if validated[index] == Some(identity) {
+                continue;
+            }
+            let linear_dims = PlanarLinearDims {
+                format: projection.format,
+                m_rows: 1,
+                in_features: projection.in_features,
+                out_features: projection.out_features,
+                bs0: projection.bs0,
+                bs1: projection.bs1,
+            };
+            validate_planar_bank_device(
+                &self.runtime,
+                &linear_dims,
+                dims.experts,
+                bank.packed,
+                bank.scale,
+                scratch,
+            )?;
+            validated[index] = Some(identity);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn launch_route(
         &self,
         router_logits: &TensorView,
@@ -2507,8 +3116,8 @@ impl BlockQuantizedMoEKernel {
     ) -> Result<()> {
         let router_logits_ptr = tensor_ptr(router_logits);
         let router_weights_ptr = router_weights.map(tensor_ptr).unwrap_or(0);
-        let rows_u64 = self.geometry.rows as u64;
-        let experts_i32 = self.geometry.experts as i32;
+        let rows_u64 = self.geometry().rows as u64;
+        let experts_i32 = self.geometry().experts as i32;
         let top_k = as_i32("top-k", self.attributes.k)?;
         let normalize = i32::from(self.attributes.normalize_routing_weights);
         let mut params = [
@@ -2527,9 +3136,9 @@ impl BlockQuantizedMoEKernel {
         // matches `bqmoe_route`. Telemetry pointers are null when disarmed, which
         // the kernel treats as inert.
         unsafe {
-            self.launches.route.launch(
+            self.launches().route.launch(
                 self.runtime.stream(),
-                self.launches.route_config,
+                self.launches().route_config,
                 &mut params,
             )
         }
@@ -2547,7 +3156,7 @@ impl BlockQuantizedMoEKernel {
     ) -> Result<()> {
         let packed = cuptr(weights.bank.allocation.ptr().0);
         let bias = weights.bias;
-        let routes_u64 = self.geometry.routes as u64;
+        let routes_u64 = self.geometry().routes as u64;
         let input_rows_are_routes = i32::from(input_rows_are_routes);
         let top_k = self.attributes.k as i32;
         let out_features = weights.bank.out_features as i32;
@@ -2576,7 +3185,7 @@ impl BlockQuantizedMoEKernel {
         // scratch buffers cover routes*out_features, and the scalar ABI matches
         // `bqmoe_linear_f32`.
         unsafe {
-            self.launches
+            self.launches()
                 .linear
                 .launch(self.runtime.stream(), config, &mut params)
         }
@@ -2590,8 +3199,8 @@ impl BlockQuantizedMoEKernel {
         activated: CUdeviceptr,
     ) -> Result<()> {
         let fc3 = fc3.unwrap_or(0);
-        let routes_u64 = self.geometry.routes as u64;
-        let inter_i32 = self.geometry.inter as i32;
+        let routes_u64 = self.geometry().routes as u64;
+        let inter_i32 = self.geometry().inter as i32;
         let activation = self.attributes.activation.kernel_id();
         let swiglu_fusion = self.attributes.swiglu_fusion as i32;
         let alpha = self.attributes.activation_alpha;
@@ -2612,9 +3221,9 @@ impl BlockQuantizedMoEKernel {
         // SAFETY: scratch buffers cover every routed intermediate element and the
         // ABI matches `bqmoe_activate`.
         unsafe {
-            self.launches.activate.launch(
+            self.launches().activate.launch(
                 self.runtime.stream(),
-                self.launches.activate_config,
+                self.launches().activate_config,
                 &mut params,
             )
         }
@@ -2628,8 +3237,8 @@ impl BlockQuantizedMoEKernel {
         output: &mut TensorMut,
     ) -> Result<()> {
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-        let rows_u64 = self.geometry.rows as u64;
-        let hidden_i32 = self.geometry.hidden as i32;
+        let rows_u64 = self.geometry().rows as u64;
+        let hidden_i32 = self.geometry().hidden as i32;
         let top_k = self.attributes.k as i32;
         let mut params = [
             kernel_param(&route_output),
@@ -2642,9 +3251,9 @@ impl BlockQuantizedMoEKernel {
         // SAFETY: routed output and weights cover rows*top_k, output covers
         // rows*hidden, and the ABI matches `bqmoe_combine_f32`.
         unsafe {
-            self.launches.combine.launch(
+            self.launches().combine.launch(
                 self.runtime.stream(),
-                self.launches.combine_config,
+                self.launches().combine_config,
                 &mut params,
             )
         }
@@ -2695,6 +3304,31 @@ fn float_attr(node: &Node, name: &str, default: f32) -> Result<f32> {
     }
 }
 
+fn require_dtype(name: &str, got: DataType, expected: DataType) -> Result<()> {
+    if got != expected {
+        return Err(error(format!("{name} requires {expected:?}, got {got:?}")));
+    }
+    Ok(())
+}
+
+fn require_rank(name: &str, shape: &[usize], rank: usize) -> Result<()> {
+    if shape.len() != rank {
+        return Err(error(format!(
+            "{name} must be {rank}-D, got shape {shape:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
+    if got != expected {
+        return Err(error(format!(
+            "{name} must have shape {expected:?}, got {got:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn checked_product(factors: &[usize], context: &str) -> Result<usize> {
     let mut product = 1usize;
     let mut has_zero = false;
@@ -2720,6 +3354,12 @@ fn checked_bytes(elements: usize, element_size: usize, context: &str) -> Result<
         )));
     }
     Ok(bytes)
+}
+
+fn checked_tensor_layout(name: &str, shape: &[usize], dtype: DataType) -> Result<usize> {
+    let elements = checked_product(shape, &format!("{name} element count"))?;
+    checked_bytes(elements, dtype.byte_size(), name)?;
+    Ok(elements)
 }
 
 fn as_u64(name: &str, value: usize) -> Result<u64> {
@@ -2890,7 +3530,7 @@ mod sealed_bank_tests {
 #[cfg(test)]
 mod claim_gate_tests {
     use super::*;
-    use onnx_runtime_ir::{Attribute, NodeId, ValueId};
+    use onnx_runtime_ir::{Attribute, NodeId, ValueId, static_shape};
 
     /// Build a minimal `BlockQuantizedMoE` node carrying only the attributes the
     /// claim gate reads. `fc3` set means the `fc3_experts_weights` input (index
@@ -2899,12 +3539,19 @@ mod claim_gate_tests {
     /// `claim_projection_formats`, which are pure functions over node metadata
     /// and never touch a CUDA device, so this runs on a host without a GPU.
     fn claim_node(fc1: &str, fc2: &str, fc3: Option<&str>) -> Node {
-        let mut inputs: Vec<Option<ValueId>> = (0..6).map(|i| Some(ValueId(i as u32))).collect();
-        if fc3.is_some() {
-            // Indices 6..=8: fc3 weights wired, then two optional trailing slots.
-            inputs.push(Some(ValueId(6)));
+        let mut inputs = vec![None; INPUT_COUNT];
+        for index in [0usize, 1, 2, 4] {
+            inputs[index] = Some(ValueId(index as u32));
         }
-        let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", inputs, vec![ValueId(100)]);
+        if fc3.is_some() {
+            inputs[6] = Some(ValueId(6));
+        }
+        let mut node = Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            inputs.clone(),
+            vec![ValueId(100)],
+        );
         node.attributes.insert(
             "fc1_format".into(),
             Attribute::String(fc1.as_bytes().to_vec()),
@@ -2919,7 +3566,74 @@ mod claim_gate_tests {
                 Attribute::String(fc3.as_bytes().to_vec()),
             );
         }
+        for (prefix, format, scale_index) in [
+            ("fc1", fc1, BQMOE_FC1_SCALE),
+            ("fc2", fc2, BQMOE_FC2_SCALE),
+            ("fc3", fc3.unwrap_or(""), BQMOE_FC3_SCALE),
+        ] {
+            if matches!(format, "block_fp8" | "fp4_planar") {
+                inputs[scale_index] = Some(ValueId(scale_index as u32));
+                let (block_out, block_in) = if format == "fp4_planar" {
+                    (1, 32)
+                } else {
+                    (32, 32)
+                };
+                node.attributes.insert(
+                    format!("{prefix}_block_size_out"),
+                    Attribute::Int(block_out),
+                );
+                node.attributes
+                    .insert(format!("{prefix}_block_size_in"), Attribute::Int(block_in));
+            }
+        }
+        node.inputs = inputs;
+        node.attributes
+            .insert("block_layout_version".into(), Attribute::Int(1));
         node
+    }
+
+    fn claim_reason(node: &Node) -> Option<Cow<'static, str>> {
+        let mut shapes = vec![vec![]; INPUT_COUNT];
+        let mut dtypes = vec![DataType::Undefined; INPUT_COUNT];
+        shapes[0] = static_shape([1, 256]);
+        shapes[1] = static_shape([1, 2]);
+        dtypes[0] = DataType::Float32;
+        dtypes[1] = DataType::Float32;
+        for (weight, scale, attr) in [
+            (BQMOE_FC1_WEIGHT, BQMOE_FC1_SCALE, "fc1_format"),
+            (BQMOE_FC2_WEIGHT, BQMOE_FC2_SCALE, "fc2_format"),
+            (BQMOE_FC3_WEIGHT, BQMOE_FC3_SCALE, "fc3_format"),
+        ] {
+            if node.inputs[weight].is_none() {
+                continue;
+            }
+            let format = node
+                .attr(attr)
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            match format {
+                "block_fp8" => {
+                    shapes[weight] = static_shape([2, 256, 256]);
+                    shapes[scale] = static_shape([2, 8, 8]);
+                    dtypes[weight] = DataType::Float8E4M3FN;
+                    dtypes[scale] = DataType::Float8E8M0;
+                }
+                "fp4_planar" => {
+                    shapes[weight] = static_shape([2, 256, 128]);
+                    shapes[scale] = static_shape([2, 256, 8]);
+                    dtypes[weight] = DataType::Int8;
+                    dtypes[scale] = DataType::Float8E8M0;
+                }
+                _ => {
+                    if let Ok(format) = BlockFormat::parse(format) {
+                        shapes[weight] =
+                            static_shape([2, 256, 256 / format.qk(), format.block_bytes()]);
+                    }
+                    dtypes[weight] = DataType::Uint8;
+                }
+            }
+        }
+        unsupported_reason(node, &shapes, &dtypes)
     }
 
     #[test]
@@ -2927,18 +3641,18 @@ mod claim_gate_tests {
         // The real GLM-5.2 UD-IQ1_S combo: gate/up IQ1_S, down IQ3_XXS.
         let node = claim_node("iq1_s", "iq3_xxs", None);
         assert!(
-            unsupported_reason(&node, &[], &[]).is_none(),
+            claim_reason(&node).is_none(),
             "mixed per-projection formats must be claimed"
         );
         let final_layer = claim_node("q2_k", "q3_k", None);
-        assert!(unsupported_reason(&final_layer, &[], &[]).is_none());
+        assert!(claim_reason(&final_layer).is_none());
     }
 
     #[test]
     fn mixed_fc3_gate_format_is_claimable() {
         // Unfused gate carried at a different qtype than fc1/fc2.
         let node = claim_node("iq1_s", "iq1_s", Some("iq2_xxs"));
-        assert!(unsupported_reason(&node, &[], &[]).is_none());
+        assert!(claim_reason(&node).is_none());
     }
 
     #[test]
@@ -2947,12 +3661,12 @@ mod claim_gate_tests {
         // kernel — the mixed-rejection must not over-reject the supported case.
         let node = claim_node("iq1_s", "iq1_s", Some("iq1_s"));
         assert!(
-            unsupported_reason(&node, &[], &[]).is_none(),
+            claim_reason(&node).is_none(),
             "uniform-format node must not be declined by the CUDA claim gate"
         );
         let fused = claim_node("iq4_nl", "iq4_nl", None);
         assert!(
-            unsupported_reason(&fused, &[], &[]).is_none(),
+            claim_reason(&fused).is_none(),
             "uniform fused-projection node must not be declined by the CUDA claim gate"
         );
     }
@@ -2980,7 +3694,7 @@ mod claim_gate_tests {
             node.attributes
                 .insert("swiglu_fusion".into(), Attribute::Int(1));
             node.attributes.insert(name.into(), Attribute::Float(value));
-            let reason = unsupported_reason(&node, &[], &[])
+            let reason = claim_reason(&node)
                 .unwrap_or_else(|| panic!("{name}={value} must be declined at claim time"));
             assert!(reason.contains(name), "unexpected claim reason: {reason}");
             let error = MoeAttributes::from_node(&node)
@@ -2997,7 +3711,7 @@ mod claim_gate_tests {
         // A native GGUF qtype outside BlockFormat (Q4_K) is declined, not
         // dequantized or dense-fallback executed.
         let node = claim_node("q4_k", "q4_k", None);
-        let reason = unsupported_reason(&node, &[], &[])
+        let reason = claim_reason(&node)
             .expect("an unsupported native format must be declined by the CUDA claim gate");
         assert!(
             reason.contains("q4_k"),
@@ -3011,8 +3725,7 @@ mod claim_gate_tests {
         let mut node = claim_node("iq1_s", "iq1_s", None);
         node.attributes
             .insert("fc3_format".into(), Attribute::String(b"iq1_s".to_vec()));
-        let reason = unsupported_reason(&node, &[], &[])
-            .expect("fc3_format without a wired gate must be declined");
+        let reason = claim_reason(&node).expect("fc3_format without a wired gate must be declined");
         assert!(
             reason.contains("fc3_format is only valid when fc3_experts_weights is wired"),
             "unexpected rejection reason: {reason}"
@@ -3020,26 +3733,10 @@ mod claim_gate_tests {
     }
 
     #[test]
-    fn planar_b2_formats_are_typed_rejected_without_a_success_claim() {
-        // DeepSeek-V4 B2: block-FP8 shared/attention, planar-FP4 routed experts.
-        // Both now have device-proven planar primitives (matmul + routed top-k
-        // MoE), but the 9-input node ABI cannot carry their per-projection
-        // UE8M0 aux-scale banks, so the op-node claim gate must still decline
-        // them (CPU oracle owns the op-level path) rather than mis-executing or
-        // emitting misleading "re-export as mxfp4" advice.
+    fn planar_b2_formats_are_claimable_with_aux_scales() {
         for planar in ["block_fp8", "fp4_planar"] {
             let node = claim_node(planar, planar, None);
-            let reason = unsupported_reason(&node, &[], &[]).unwrap_or_else(|| {
-                panic!("planar B2 format '{planar}' must be declined by the CUDA claim gate")
-            });
-            assert!(
-                reason.contains(planar) && reason.contains("planar B2 format"),
-                "unexpected rejection reason for {planar}: {reason}"
-            );
-            assert!(
-                !reason.contains("re-export"),
-                "planar rejection must not advise a lossy re-export: {reason}"
-            );
+            assert!(claim_reason(&node).is_none(), "{planar} must be claimable");
         }
     }
 
@@ -3048,10 +3745,10 @@ mod claim_gate_tests {
         // A mixed node where only the routed (fc2) projection is planar-FP4 must
         // still be declined; the planar recognition fires per projection.
         let node = claim_node("iq1_s", "fp4_planar", None);
-        let reason = unsupported_reason(&node, &[], &[])
+        let reason = claim_reason(&node)
             .expect("a planar projection anywhere must be declined by the CUDA claim gate");
         assert!(
-            reason.contains("fp4_planar"),
+            reason.contains("mixing planar and interleaved"),
             "unexpected rejection reason: {reason}"
         );
     }

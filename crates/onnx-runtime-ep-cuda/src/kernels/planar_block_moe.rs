@@ -187,7 +187,7 @@ fn kernel_err(message: impl Into<String>) -> EpError {
 /// planar weight of logical `[out_features, in_features]` plus its UE8M0 block
 /// geometry. Every expert in the bank shares this geometry; the per-expert
 /// packed/scale byte strides are derived from it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanarMoeProjection {
     /// [`PLANAR_FORMAT_BLOCK_FP8`] or [`PLANAR_FORMAT_FP4_PLANAR`].
     pub format: i32,
@@ -861,6 +861,31 @@ struct PlanarMoeRawPtrs {
     output: CUdeviceptr,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct BorrowedPlanarMoeProjection {
+    pub projection: PlanarMoeProjection,
+    pub packed: CUdeviceptr,
+    pub scale: CUdeviceptr,
+    pub bias: CUdeviceptr,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BorrowedPlanarMoePtrs {
+    pub input: CUdeviceptr,
+    pub router_logits: CUdeviceptr,
+    pub router_weights: CUdeviceptr,
+    pub fc1: BorrowedPlanarMoeProjection,
+    pub fc2: BorrowedPlanarMoeProjection,
+    pub fc3: Option<BorrowedPlanarMoeProjection>,
+    pub route_indices: CUdeviceptr,
+    pub route_weights: CUdeviceptr,
+    pub fc1_output: CUdeviceptr,
+    pub fc3_output: CUdeviceptr,
+    pub activated: CUdeviceptr,
+    pub route_output: CUdeviceptr,
+    pub output: CUdeviceptr,
+}
+
 fn exact_f32_bytes(elements: usize, label: &str) -> Result<usize> {
     elements
         .checked_mul(std::mem::size_of::<f32>())
@@ -1188,6 +1213,64 @@ fn launch_planar_linear(
         .map_err(|err| driver_err("launch planar MoE expert GEMV", err))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn launch_borrowed_planar_linear(
+    runtime: &CudaRuntime,
+    bank: BorrowedPlanarMoeProjection,
+    input: CUdeviceptr,
+    route_indices: CUdeviceptr,
+    output: CUdeviceptr,
+    routes: usize,
+    top_k: usize,
+    input_rows_are_routes: bool,
+) -> Result<()> {
+    let projection = bank.projection;
+    let function = runtime.nvrtc_function(
+        PLANAR_MOE_MODULE,
+        planar_moe_module_source(),
+        PLANAR_MOE_LINEAR_ENTRY,
+    )?;
+    let tasks = (routes as u64)
+        .checked_mul(projection.out_features as u64)
+        .ok_or_else(|| kernel_err("linear task count overflow"))?;
+    let grid_x = saturating_grid(runtime, tasks);
+    let config =
+        runtime.reduction_launch_config(&function, grid_x, preferred_threads(runtime), 4)?;
+    let (packed_stride, scale_stride) = projection.per_expert_bytes()?;
+    let routes_u64 = routes as u64;
+    let input_rows_are_routes = i32::from(input_rows_are_routes);
+    let top_k = as_i32("top_k", top_k)?;
+    let out_features = as_i32("out_features", projection.out_features)?;
+    let in_features = as_i32("in_features", projection.in_features)?;
+    let bs0 = as_i32("bs0", projection.bs0)?;
+    let bs1 = as_i32("bs1", projection.bs1)?;
+    let packed_stride = packed_stride as u64;
+    let scale_stride = scale_stride as u64;
+    let mut builder = runtime.stream().launch_builder(&function);
+    builder
+        .arg(&input)
+        .arg(&route_indices)
+        .arg(&bank.packed)
+        .arg(&bank.scale)
+        .arg(&bank.bias)
+        .arg(&output)
+        .arg(&routes_u64)
+        .arg(&input_rows_are_routes)
+        .arg(&top_k)
+        .arg(&out_features)
+        .arg(&in_features)
+        .arg(&projection.format)
+        .arg(&bs0)
+        .arg(&bs1)
+        .arg(&packed_stride)
+        .arg(&scale_stride);
+    // SAFETY: the production operator establishes immutable constant bank
+    // identity and exact extents before entering this crate-private bridge.
+    unsafe { builder.launch(config) }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch borrowed planar MoE expert GEMV", err))
+}
+
 /// Launch the full planar routed top-k MoE pipeline on `runtime`'s EP stream:
 /// `route → fc1 (+ fc3) → activate → fc2 → combine`.
 ///
@@ -1344,6 +1427,148 @@ pub fn launch_planar_moe(
         unsafe { builder.launch(config) }
             .map(|_| ())
             .map_err(|err| driver_err("launch planar MoE weighted combine", err))?;
+    }
+    Ok(())
+}
+
+/// Launch the production operator over already-device-resident immutable
+/// planar banks. This crate-private bridge preserves the public sealed
+/// admission API: callers cannot obtain or mutate an admitted pointer, and the
+/// operator must validate constant identity and encoded values before calling.
+pub(crate) fn launch_planar_moe_borrowed(
+    runtime: &CudaRuntime,
+    dims: &PlanarMoeDims,
+    ptrs: BorrowedPlanarMoePtrs,
+) -> Result<()> {
+    let lengths = PlanarMoeBufferLengths::for_dims(dims, ptrs.router_weights != 0)?;
+    let routes = dims
+        .rows
+        .checked_mul(dims.top_k)
+        .ok_or_else(|| kernel_err("route count overflow"))?;
+    let fc1_out = dims.fc1_out()?;
+    if ptrs.fc1.projection.in_features != dims.hidden
+        || ptrs.fc1.projection.out_features != fc1_out
+        || ptrs.fc2.projection.in_features != dims.inter
+        || ptrs.fc2.projection.out_features != dims.hidden
+        || ptrs.fc3.map(|bank| bank.projection) != dims.fc3
+    {
+        return Err(kernel_err("borrowed projection geometry mismatch"));
+    }
+    if lengths.fc3_output_elems.is_some() != ptrs.fc3.is_some() {
+        return Err(kernel_err("borrowed fc3 workspace/pointer mismatch"));
+    }
+
+    let route_fn = runtime.nvrtc_function(MOE_MODULE, moe_module_source(), MOE_ROUTE_ENTRY)?;
+    {
+        let rows = dims.rows as u64;
+        let experts = as_i32("experts", dims.experts)?;
+        let top_k = as_i32("top_k", dims.top_k)?;
+        let normalize = i32::from(dims.normalize_routing_weights);
+        let telemetry_bitmap: CUdeviceptr = 0;
+        let telemetry_header: CUdeviceptr = 0;
+        let mut builder = runtime.stream().launch_builder(&route_fn);
+        builder
+            .arg(&ptrs.router_logits)
+            .arg(&ptrs.router_weights)
+            .arg(&ptrs.route_indices)
+            .arg(&ptrs.route_weights)
+            .arg(&rows)
+            .arg(&experts)
+            .arg(&top_k)
+            .arg(&normalize)
+            .arg(&telemetry_bitmap)
+            .arg(&telemetry_header);
+        // SAFETY: the operator workspace layout covers rows*top_k.
+        unsafe { builder.launch(pointwise_config(runtime, rows)) }
+            .map(|_| ())
+            .map_err(|err| driver_err("launch borrowed planar MoE routing", err))?;
+    }
+
+    launch_borrowed_planar_linear(
+        runtime,
+        ptrs.fc1,
+        ptrs.input,
+        ptrs.route_indices,
+        ptrs.fc1_output,
+        routes,
+        dims.top_k,
+        false,
+    )?;
+    if let Some(fc3) = ptrs.fc3 {
+        launch_borrowed_planar_linear(
+            runtime,
+            fc3,
+            ptrs.input,
+            ptrs.route_indices,
+            ptrs.fc3_output,
+            routes,
+            dims.top_k,
+            false,
+        )?;
+    }
+
+    let activate_fn =
+        runtime.nvrtc_function(MOE_MODULE, moe_module_source(), MOE_ACTIVATE_ENTRY)?;
+    {
+        let total = (routes as u64)
+            .checked_mul(dims.inter as u64)
+            .ok_or_else(|| kernel_err("activation element count overflow"))?;
+        let routes_u64 = routes as u64;
+        let inter = as_i32("inter", dims.inter)?;
+        let fc3_output = if ptrs.fc3.is_some() {
+            ptrs.fc3_output
+        } else {
+            0
+        };
+        let mut builder = runtime.stream().launch_builder(&activate_fn);
+        builder
+            .arg(&ptrs.fc1_output)
+            .arg(&fc3_output)
+            .arg(&ptrs.activated)
+            .arg(&routes_u64)
+            .arg(&inter)
+            .arg(&dims.activation)
+            .arg(&dims.swiglu_fusion)
+            .arg(&dims.activation_alpha)
+            .arg(&dims.activation_beta)
+            .arg(&dims.swiglu_limit);
+        // SAFETY: the operator workspace layout covers every route/inter value.
+        unsafe { builder.launch(pointwise_config(runtime, total)) }
+            .map(|_| ())
+            .map_err(|err| driver_err("launch borrowed planar MoE activation", err))?;
+    }
+
+    launch_borrowed_planar_linear(
+        runtime,
+        ptrs.fc2,
+        ptrs.activated,
+        ptrs.route_indices,
+        ptrs.route_output,
+        routes,
+        dims.top_k,
+        true,
+    )?;
+
+    let combine_fn = runtime.nvrtc_function(MOE_MODULE, moe_module_source(), MOE_COMBINE_ENTRY)?;
+    {
+        let total = (dims.rows as u64)
+            .checked_mul(dims.hidden as u64)
+            .ok_or_else(|| kernel_err("output element count overflow"))?;
+        let rows = dims.rows as u64;
+        let hidden = as_i32("hidden", dims.hidden)?;
+        let top_k = as_i32("top_k", dims.top_k)?;
+        let mut builder = runtime.stream().launch_builder(&combine_fn);
+        builder
+            .arg(&ptrs.route_output)
+            .arg(&ptrs.route_weights)
+            .arg(&ptrs.output)
+            .arg(&rows)
+            .arg(&hidden)
+            .arg(&top_k);
+        // SAFETY: the route/output extents were checked by the operator.
+        unsafe { builder.launch(pointwise_config(runtime, total)) }
+            .map(|_| ())
+            .map_err(|err| driver_err("launch borrowed planar MoE combine", err))?;
     }
     Ok(())
 }
