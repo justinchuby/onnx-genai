@@ -384,7 +384,22 @@ fn unsupported_reason_impl(
     }
 }
 
+/// Claim-time capability check using the original Einsum-12 contract.
+///
+/// This compatibility wrapper intentionally does not inspect node metadata or
+/// infer a schema from the operand dtypes. Model/provider paths that have an
+/// effective opset must call [`unsupported_reason_for_opset`] instead.
 pub fn unsupported_reason(
+    node: &Node,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+    layouts: &[TensorLayout],
+) -> Option<String> {
+    unsupported_reason_for_opset(node, 12, shapes, input_dtypes, layouts)
+}
+
+/// Claim-time capability check for a model's effective ONNX opset.
+pub fn unsupported_reason_for_opset(
     node: &Node,
     opset: u64,
     shapes: &[Shape],

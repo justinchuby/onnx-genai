@@ -560,12 +560,25 @@ fn execution_mode() -> Result<ExecutionMode> {
     }
 }
 
+/// Claim-time capability check using the original Einsum-12 contract.
+///
+/// This compatibility wrapper intentionally does not inspect node metadata or
+/// infer a schema from the operand dtypes. Model/provider paths that have an
+/// effective opset must call [`unsupported_reason_for_opset`] instead.
+pub fn unsupported_reason(
+    node: &Node,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Option<String> {
+    unsupported_reason_for_opset(node, 12, shapes, input_dtypes)
+}
+
 /// Claim-time capability check shared with [`crate::CpuExecutionProvider`].
 ///
 /// Returning the planner's structured rejection before ORT compiles the node
 /// lets another CPU provider take legal but not-yet-native general
 /// contractions instead of failing session creation after assignment.
-pub fn unsupported_reason(
+pub fn unsupported_reason_for_opset(
     node: &Node,
     opset: u64,
     shapes: &[Shape],
@@ -2638,7 +2651,7 @@ mod tests {
             static_shape([4, 5]),
         ];
         let dtypes = [DataType::Float32; 3];
-        let reason = unsupported_reason(&node, 12, &shapes, &dtypes).unwrap();
+        let reason = unsupported_reason_for_opset(&node, 12, &shapes, &dtypes).unwrap();
         assert!(reason.contains("3-input contraction"));
 
         let provider = crate::CpuExecutionProvider::new();
@@ -2662,7 +2675,8 @@ mod tests {
             .insert("equation".into(), Attribute::String(b"aik,kj->ij".to_vec()));
         let mixed_shapes = [static_shape([7, 2, 3]), static_shape([3, 4])];
         let mixed_dtypes = [DataType::Float16; 2];
-        let reason = unsupported_reason(&mixed, 12, &mixed_shapes, &mixed_dtypes).unwrap();
+        let reason =
+            unsupported_reason_for_opset(&mixed, 12, &mixed_shapes, &mixed_dtypes).unwrap();
         assert!(reason.contains("2-input contraction plan"));
         let error = EinsumFactory::default()
             .create(&mixed, &[vec![7, 2, 3], vec![3, 4]])
@@ -2683,7 +2697,7 @@ mod tests {
             .insert("equation".into(), Attribute::String(equation.into_bytes()));
         let shapes = vec![static_shape([1]); arity];
         let dtypes = vec![DataType::Float32; arity];
-        let reason = unsupported_reason(&large, 12, &shapes, &dtypes).unwrap();
+        let reason = unsupported_reason_for_opset(&large, 12, &shapes, &dtypes).unwrap();
         assert!(reason.contains("GenericNative fallback"), "{reason}");
         assert!(
             reason.contains("work/metadata budget was exceeded"),
@@ -2698,16 +2712,16 @@ mod tests {
             .insert("equation".into(), Attribute::String(b"i->i".to_vec()));
         let shape = [static_shape([2])];
 
-        let opset11 =
-            unsupported_reason(&node, 11, &shape, &[DataType::Float32]).expect("must reject");
+        let opset11 = unsupported_reason_for_opset(&node, 11, &shape, &[DataType::Float32])
+            .expect("must reject");
         assert!(opset11.contains("predates Einsum-12"), "{opset11}");
 
-        let opset27 =
-            unsupported_reason(&node, 27, &shape, &[DataType::BFloat16]).expect("must reject");
+        let opset27 = unsupported_reason_for_opset(&node, 27, &shape, &[DataType::BFloat16])
+            .expect("must reject");
         assert!(opset27.contains("not admitted by Einsum-12"), "{opset27}");
 
-        let opset28 =
-            unsupported_reason(&node, 28, &shape, &[DataType::BFloat16]).expect("must decline");
+        let opset28 = unsupported_reason_for_opset(&node, 28, &shape, &[DataType::BFloat16])
+            .expect("must decline");
         assert!(
             opset28.contains("supports only Float32 and Float16"),
             "{opset28}"
@@ -2747,7 +2761,7 @@ mod tests {
         node.attributes
             .insert("equation".into(), Attribute::String(b"i->i".to_vec()));
         let reason =
-            unsupported_reason(&node, 12, &[int_shape], &[DataType::Int32]).expect("must decline");
+            unsupported_reason(&node, &[int_shape], &[DataType::Int32]).expect("must decline");
         assert!(reason.contains("supports only Float32 and Float16"));
 
         let direct = kernel("i->i", &[vec![2]], ExecutionMode::Optimized);
