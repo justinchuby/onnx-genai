@@ -11,5 +11,8 @@ categories = ["science", "data-structures"]
 [dependencies]
 thiserror = { workspace = true }
 
+[dev-dependencies]
+onnx-runtime-einsum-conformance = { workspace = true }
+
 [lints]
 workspace = true

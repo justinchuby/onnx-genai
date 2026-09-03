@@ -2401,6 +2401,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-einsum-conformance"
+version = "0.1.0-dev.5"
+dependencies = [
+ "half",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "onnx-runtime-ep-api"
 version = "0.1.0-dev.5"
 dependencies = [
@@ -2425,6 +2436,7 @@ dependencies = [
  "libc",
  "libm",
  "mlas-sys",
+ "onnx-runtime-einsum-conformance",
  "onnx-runtime-ep-api",
  "onnx-runtime-hostmon",
  "onnx-runtime-ir",
@@ -2468,6 +2480,7 @@ dependencies = [
  "onnx-genai-cuda-version-guard",
  "onnx-genai-paged-attention",
  "onnx-runtime-cuda-memory",
+ "onnx-runtime-einsum-conformance",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
@@ -2566,6 +2579,7 @@ dependencies = [
 name = "onnx-runtime-ir"
 version = "0.1.0-dev.5"
 dependencies = [
+ "onnx-runtime-einsum-conformance",
  "thiserror 2.0.19",
 ]
 
@@ -2574,6 +2588,7 @@ name = "onnx-runtime-loader"
 version = "0.1.0-dev.5"
 dependencies = [
  "memmap2",
+ "onnx-runtime-einsum-conformance",
  "onnx-runtime-ir",
  "onnx-runtime-shape-inference",
  "onnx-runtime-tracer",
@@ -2705,6 +2720,7 @@ dependencies = [
 name = "onnx-runtime-shape-inference"
 version = "0.1.0-dev.5"
 dependencies = [
+ "onnx-runtime-einsum-conformance",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
  "thiserror 2.0.19",

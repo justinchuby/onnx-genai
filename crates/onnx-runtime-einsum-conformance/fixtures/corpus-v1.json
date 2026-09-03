@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "generator": {
+    "seed": 1014763643921613022,
+    "random_cases": 128,
+    "max_operands": 16,
+    "max_rank": 8,
+    "limits": {
+      "unit_tensor_bytes": 8388608,
+      "cpu_working_set_bytes": 33554432,
+      "gpu_case_bytes": 67108864,
+      "oracle_work_items": 2000000
+    }
+  },
+  "expected_case_count": 159,
+  "expected_malformed_count": 24,
+  "expected_route_probe_count": 346,
+  "generated_sha256": "c4a4f8ef7ac1b896fd83c4a705c20e1cc57d6289edb9df117f53f8b1787dbdff"
+}

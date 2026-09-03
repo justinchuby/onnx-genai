@@ -1,0 +1,18 @@
+[package]
+name = "onnx-runtime-einsum-conformance"
+description = "Independent deterministic ONNX Einsum conformance corpus and oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+half = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

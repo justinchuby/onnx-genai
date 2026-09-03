@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use onnx_runtime_einsum_conformance::{ConformanceDType, default_corpus, infer_output_shape};
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, SymbolId, TensorData, ValueId};
 use onnx_runtime_shape_inference::{
     DimExpr, InferenceRegistry, MergePolicy, NodeIo, ShapeData, ShapeInferError, SymbolInterner,
@@ -5157,6 +5158,53 @@ fn einsum_shape_inference_preserves_supported_float_dtype() {
         accepted[0].type_info.as_ref().unwrap(),
         &TypeInfo::new(DataType::BFloat16, vec![c(3), c(2)])
     );
+}
+
+#[test]
+fn einsum_shape_rule_matches_the_independent_generated_corpus() {
+    let cases = default_corpus();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let dtype = match case.dtype {
+            ConformanceDType::Uint8 => DataType::Uint8,
+            ConformanceDType::Uint16 => DataType::Uint16,
+            ConformanceDType::Uint32 => DataType::Uint32,
+            ConformanceDType::Uint64 => DataType::Uint64,
+            ConformanceDType::Int8 => DataType::Int8,
+            ConformanceDType::Int16 => DataType::Int16,
+            ConformanceDType::Int32 => DataType::Int32,
+            ConformanceDType::Int64 => DataType::Int64,
+            ConformanceDType::Float16 => DataType::Float16,
+            ConformanceDType::Float32 => DataType::Float32,
+            ConformanceDType::Float64 => DataType::Float64,
+            ConformanceDType::BFloat16 => DataType::BFloat16,
+        };
+        let inputs = case
+            .input_shapes
+            .iter()
+            .map(|shape| tin(dtype, shape.iter().map(|&dim| c(dim as i64)).collect()))
+            .collect();
+        let output = run(
+            &einsum_node(&case.equation, case.input_shapes.len()),
+            inputs,
+            case.opset,
+        );
+        let expected = infer_output_shape(&case.equation, &case.input_shapes).unwrap();
+        let type_info = output[0]
+            .type_info
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} did not infer output metadata", case.id));
+        assert_eq!(type_info.dtype, dtype, "{}", case.id);
+        assert_eq!(
+            type_info.shape,
+            expected
+                .into_iter()
+                .map(|dimension| c(dimension as i64))
+                .collect::<Vec<_>>(),
+            "{}",
+            case.id
+        );
+    }
 }
 
 #[test]

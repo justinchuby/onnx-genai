@@ -1,0 +1,50 @@
+ONNX_EINSUM_SCHEMA_AUTHORITY_V1
+repository=https://github.com/onnx/onnx
+commit=5732eb5de3e6b353e1a5aa49fe5d577f81bb58e0
+retrieved=2026-09-03
+
+source=onnx/defs/math/old.cc
+ONNX_OPERATOR_SET_SCHEMA(
+    Einsum,
+    12,
+    OpSchema().FillUsing(defs::math::utils::EinsumOpGenerator(OpSchema::all_numeric_types())));
+
+source=onnx/defs/math/defs.cc
+ONNX_OPERATOR_SET_SCHEMA(
+    Einsum,
+    28,
+    OpSchema().FillUsing(defs::math::utils::EinsumOpGenerator(OpSchema::all_numeric_types_ir4())));
+
+source=onnx/defs/schema.cc
+const std::vector<std::string>& OpSchema::all_numeric_types_ir4() {
+  static const auto v = types::Tensors(
+      {TensorProto::UINT8,
+       TensorProto::UINT16,
+       TensorProto::UINT32,
+       TensorProto::UINT64,
+       TensorProto::INT8,
+       TensorProto::INT16,
+       TensorProto::INT32,
+       TensorProto::INT64,
+       TensorProto::FLOAT16,
+       TensorProto::FLOAT,
+       TensorProto::DOUBLE,
+       TensorProto::BFLOAT16});
+  return v;
+}
+
+const std::vector<std::string>& OpSchema::all_numeric_types() {
+  static const auto v = types::Tensors(
+      {TensorProto::UINT8,
+       TensorProto::UINT16,
+       TensorProto::UINT32,
+       TensorProto::UINT64,
+       TensorProto::INT8,
+       TensorProto::INT16,
+       TensorProto::INT32,
+       TensorProto::INT64,
+       TensorProto::FLOAT16,
+       TensorProto::FLOAT,
+       TensorProto::DOUBLE});
+  return v;
+}
