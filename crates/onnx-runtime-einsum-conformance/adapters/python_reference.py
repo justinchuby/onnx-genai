@@ -12,35 +12,64 @@ def probe() -> dict[str, object]:
         "status": "unavailable",
         "onnx_version": None,
         "latest_einsum_schema": None,
+        "onnxruntime_status": "unavailable",
         "onnxruntime_version": None,
         "reason": None,
+        "onnxruntime_reason": None,
     }
     try:
         import onnx
 
-        result["onnx_version"] = onnx.__version__
+        onnx_version = getattr(onnx, "__version__", None)
+        if not isinstance(onnx_version, str) or not onnx_version:
+            raise RuntimeError("imported ONNX module has no non-empty __version__")
+        result["onnx_version"] = onnx_version
         result["latest_einsum_schema"] = onnx.defs.get_schema(
             "Einsum", max_inclusive_version=10_000
         ).since_version
-        from onnx.reference import ReferenceEvaluator  # noqa: F401
-
-        result["status"] = "available"
     except Exception as error:  # pragma: no cover - environment-dependent
         result["reason"] = f"ONNX ReferenceEvaluator unavailable: {error}"
-        return result
+    else:
+        try:
+            from onnx.reference import ReferenceEvaluator  # noqa: F401
+
+            result["status"] = "available"
+        except Exception as error:  # pragma: no cover - environment-dependent
+            result["reason"] = f"ONNX ReferenceEvaluator unavailable: {error}"
     try:
         import onnxruntime
 
-        result["onnxruntime_version"] = onnxruntime.__version__
-    except Exception:
-        pass
+        onnxruntime_version = getattr(onnxruntime, "__version__", None)
+        if not isinstance(onnxruntime_version, str) or not onnxruntime_version:
+            raise RuntimeError(
+                "imported ONNX Runtime module has no non-empty __version__"
+            )
+        result["onnxruntime_version"] = onnxruntime_version
+        if result["onnx_version"] is None:
+            result["onnxruntime_reason"] = (
+                "ONNX Runtime adapter unavailable: installed ONNX model-authoring "
+                "package is unavailable"
+            )
+        else:
+            result["onnxruntime_status"] = "available"
+    except Exception as error:  # pragma: no cover - environment-dependent
+        result["onnxruntime_reason"] = f"ONNX Runtime unavailable: {error}"
     return result
 
 
 def run(request: dict[str, object]) -> dict[str, object]:
     availability = probe()
-    if availability["status"] != "available":
-        return availability
+    engine = request["engine"]
+    if engine == "onnx_reference" and availability["status"] != "available":
+        return {
+            "status": availability["status"],
+            "reason": availability["reason"],
+        }
+    if engine == "onnx_runtime" and availability["onnxruntime_status"] != "available":
+        return {
+            "status": availability["onnxruntime_status"],
+            "reason": availability["onnxruntime_reason"],
+        }
 
     import numpy as np
     import onnx
@@ -96,7 +125,6 @@ def run(request: dict[str, object]) -> dict[str, object]:
     )
     model.ir_version = min(model.ir_version, 10)
 
-    engine = request["engine"]
     if engine == "onnx_reference":
         from onnx.reference import ReferenceEvaluator
 

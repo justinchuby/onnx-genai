@@ -1,6 +1,6 @@
 use onnx_runtime_einsum_conformance::{
-    ComparisonMode, PythonEngine, PythonReferenceAdapter, ReferenceAdapterError, SchemaAuthority,
-    compare, evaluate, materialize_inputs, named_cases,
+    AdapterStatus, ComparisonMode, PythonEngine, PythonReferenceAdapter, ReferenceAdapterError,
+    SchemaAuthority, compare, evaluate, materialize_inputs, named_cases,
 };
 
 #[test]
@@ -15,12 +15,17 @@ fn installed_onnx_reference_and_ort_adapters_match_the_direct_oracle_when_availa
         }
         Err(error) => panic!("adapter probe failed: {error}"),
     };
-    if probe.status != onnx_runtime_einsum_conformance::AdapterStatus::Available {
-        eprintln!("ONNX ReferenceEvaluator unavailable: {:?}", probe.reason);
-        return;
-    }
-    assert!(probe.latest_einsum_schema.is_some());
-    if probe.latest_einsum_schema.unwrap() < 28 {
+    let reference_available = availability(
+        "ONNX ReferenceEvaluator",
+        &probe.status,
+        probe.reason.as_deref(),
+    );
+    let ort_available = availability(
+        "ONNX Runtime",
+        &probe.onnxruntime_status,
+        probe.onnxruntime_reason.as_deref(),
+    );
+    if reference_available && probe.latest_einsum_schema.unwrap() < 28 {
         assert_eq!(SchemaAuthority::since_version(28).unwrap(), 28);
     }
 
@@ -31,11 +36,13 @@ fn installed_onnx_reference_and_ort_adapters_match_the_direct_oracle_when_availa
             .unwrap();
         let inputs = materialize_inputs(&case).unwrap();
         let expected = evaluate(&case, &inputs).unwrap();
-        let reference = adapter
-            .run(PythonEngine::OnnxReference, &case, &inputs)
-            .unwrap();
-        compare(&case, &expected, &reference, ComparisonMode::ConditionAware).unwrap();
-        if probe.onnxruntime_version.is_some() {
+        if reference_available {
+            let reference = adapter
+                .run(PythonEngine::OnnxReference, &case, &inputs)
+                .unwrap();
+            compare(&case, &expected, &reference, ComparisonMode::ConditionAware).unwrap();
+        }
+        if ort_available {
             let ort = adapter
                 .run(PythonEngine::OnnxRuntime, &case, &inputs)
                 .unwrap();
@@ -47,10 +54,22 @@ fn installed_onnx_reference_and_ort_adapters_match_the_direct_oracle_when_availa
 #[test]
 fn stale_installed_onnx_never_silently_reinterprets_bf16_as_einsum_12() {
     let adapter = PythonReferenceAdapter::default();
-    let Ok(probe) = adapter.probe() else {
-        return;
+    let probe = match adapter.probe() {
+        Ok(probe) => probe,
+        Err(ReferenceAdapterError::Spawn { .. }) => {
+            eprintln!("python3 is unavailable; optional reference adapter skipped");
+            return;
+        }
+        Err(error) => panic!("adapter probe failed: {error}"),
     };
-    if probe.latest_einsum_schema.unwrap_or(0) >= 28 {
+    if !availability(
+        "ONNX ReferenceEvaluator",
+        &probe.status,
+        probe.reason.as_deref(),
+    ) {
+        return;
+    }
+    if probe.latest_einsum_schema.unwrap() >= 28 {
         return;
     }
     let case = named_cases()
@@ -65,4 +84,25 @@ fn stale_installed_onnx_never_silently_reinterprets_bf16_as_einsum_12() {
         panic!("stale ONNX should be rejected by schema probe, got {error}");
     };
     assert!(reason.contains("refusing to reinterpret"), "{reason}");
+}
+
+fn availability(label: &str, status: &AdapterStatus, reason: Option<&str>) -> bool {
+    match status {
+        AdapterStatus::Available => true,
+        AdapterStatus::Unavailable => {
+            let reason = reason.expect("unavailable adapter probe must include a reason");
+            assert!(
+                !reason.is_empty(),
+                "unavailable {label} reason must not be empty"
+            );
+            eprintln!("{label} unavailable: {reason}");
+            false
+        }
+        AdapterStatus::Error => {
+            panic!(
+                "{label} probe failed: {}",
+                reason.unwrap_or("no reason returned")
+            )
+        }
+    }
 }

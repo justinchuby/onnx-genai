@@ -61,7 +61,11 @@ signed-zero cases are checked separately.
 
 The Python adapter runs ONNX `ReferenceEvaluator` and ONNX Runtime CPU when
 installed. It is a second oracle for finite portable lanes, not a replacement
-for the direct evaluator.
+for the direct evaluator. Availability is engine-specific: a missing Python
+interpreter, ONNX package, `ReferenceEvaluator`, ONNX Runtime library, or usable
+package version disables only that optional lane and reports a reason. In
+particular, ONNX Runtime remains usable when ONNX model authoring works but
+`ReferenceEvaluator` is absent.
 
 ## CPU/CUDA handoff
 
