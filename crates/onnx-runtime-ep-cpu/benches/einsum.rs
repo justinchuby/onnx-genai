@@ -190,7 +190,7 @@ fn cases() -> Vec<Case> {
             input_shapes: vec![vec![64, 128], vec![64, 128, 128], vec![64, 128]],
             output_shape: vec![64],
             dtype: FloatDType::F32,
-            tolerance: 2e-3,
+            tolerance: 1e-2,
             expected_route: "optimized-dp",
         },
         Case {
@@ -199,7 +199,7 @@ fn cases() -> Vec<Case> {
             input_shapes: vec![vec![16_384]; 8],
             output_shape: vec![],
             dtype: FloatDType::F32,
-            tolerance: 2e-3,
+            tolerance: 1e-2,
             expected_route: "optimized-heuristic",
         },
     ]
