@@ -59,10 +59,33 @@ labels, malformed ellipses/arrows, duplicate or missing output labels, rank
 mismatches, diagonal mismatches, non-broadcastable ellipses, mixed dtypes, and
 schema-illegal dtypes are errors.
 
-`EinsumClassification` remains an optimization summary:
-`ViewOnlyPermutation`, `DiagonalView`, `ReductionOrElementwise`, `Gemm`, or
-`ContractionTree`. It has no semantic `Unsupported` outcome. GEMM/BMM is one
-optimization subtype over the same semantic/index program.
+### Classification compatibility and migration
+
+`EinsumClassification` retains its original exhaustive public variant set:
+`ViewOnlyPermutation`, `DiagonalView`, `ReductionOrElementwise`, `Gemm`, and
+`Unsupported(EinsumUnsupportedReason)`. The type is not `#[non_exhaustive]`, so
+existing downstream exhaustive matches continue to compile.
+
+`Unsupported` is deprecated and compatibility-only. Canonical planning never
+constructs it for a legal equation. A general legal contraction that does not
+fit one of the original fast-path variants is represented in the legacy
+classification as its universal `ReductionOrElementwise` product/reduction
+program. Invalid equations and schema-illegal dtypes still return errors rather
+than a classification.
+
+New code that needs to distinguish bounded tree planning uses
+`EinsumPlan::planning_classification()` or
+`EinsumShapePlan::planning_classification()`. Their new
+`EinsumPlanningClassification` result contains `ContractionTree` and is
+`#[non_exhaustive]` from its first release. CPU and CUDA placement/execution use
+this planning classification, so the legacy compatibility mapping cannot cause
+an unimplemented general contraction to be assigned to an old fast path.
+
+The pre-existing exhaustive `EinsumPlanErrorKind` variant set is also
+unchanged. New opset-resolution failures use `EinsumOpsetPlanError`, and the
+shape-only zero-element-width check uses `EinsumConcretePlanError`; this avoids
+retroactively adding variants or fields to the established error enum.
+GEMM/BMM remains one optimization subtype over the same semantic/index program.
 
 ## General contraction trees
 

@@ -13,9 +13,10 @@ use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{
-    DataType, EinsumAxis, EinsumClassification, EinsumContractionPlan, EinsumContractionTreePlan,
-    EinsumInput, EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality,
-    EinsumReductionPlan, EinsumSchema, EinsumShapePlan, Node, Shape, compute_contiguous_strides,
+    DataType, EinsumAxis, EinsumContractionPlan, EinsumContractionTreePlan, EinsumInput,
+    EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality,
+    EinsumPlanningClassification, EinsumReductionPlan, EinsumSchema, EinsumShapePlan, Node, Shape,
+    compute_contiguous_strides,
 };
 use rayon::prelude::*;
 
@@ -482,8 +483,8 @@ impl KernelFactory for EinsumFactory {
                 ))
             },
         )?;
-        match plan.classification() {
-            EinsumClassification::ContractionTree(tree) => {
+        match plan.planning_classification() {
+            EinsumPlanningClassification::ContractionTree(tree) => {
                 return Err(EpError::KernelFailed(format!(
                     "Einsum equation `{}` has a canonical {}-input contraction plan where {}, but \
                      the staged native CPU GenericNative/tree executor is not implemented yet. \
@@ -494,10 +495,10 @@ impl KernelFactory for EinsumFactory {
                     contraction_tree_summary(tree)
                 )));
             }
-            EinsumClassification::ViewOnlyPermutation(_)
-            | EinsumClassification::DiagonalView(_)
-            | EinsumClassification::ReductionOrElementwise(_)
-            | EinsumClassification::Gemm(_) => {}
+            EinsumPlanningClassification::ViewOnlyPermutation(_)
+            | EinsumPlanningClassification::DiagonalView(_)
+            | EinsumPlanningClassification::ReductionOrElementwise(_)
+            | EinsumPlanningClassification::Gemm(_) => {}
             _ => {
                 return Err(EpError::KernelFailed(format!(
                     "Einsum equation `{}` uses a newer canonical classification that this native \
@@ -508,8 +509,8 @@ impl KernelFactory for EinsumFactory {
             }
         }
         let mode = execution_mode()?;
-        let flops = match plan.classification() {
-            EinsumClassification::Gemm(gemm) => gemm_flops(gemm),
+        let flops = match plan.planning_classification() {
+            EinsumPlanningClassification::Gemm(gemm) => gemm_flops(gemm),
             _ => None,
         };
         Ok(Box::new(EinsumKernel {
@@ -601,8 +602,8 @@ pub fn unsupported_reason(
                      to Float32 or Float16, or use another execution provider."
                 ));
             }
-            match plan.classification() {
-                EinsumClassification::ContractionTree(tree) => Some(format!(
+            match plan.planning_classification() {
+                EinsumPlanningClassification::ContractionTree(tree) => Some(format!(
                     "Einsum `{}` has a canonical {}-input contraction plan where {}, but the \
                      native CPU EP has not implemented the staged GenericNative temporary \
                      scheduling and multi-node execution handoff; the expression is schema-valid, \
@@ -611,10 +612,10 @@ pub fn unsupported_reason(
                     tree.arity(),
                     contraction_tree_summary(tree)
                 )),
-                EinsumClassification::ViewOnlyPermutation(_)
-                | EinsumClassification::DiagonalView(_)
-                | EinsumClassification::ReductionOrElementwise(_)
-                | EinsumClassification::Gemm(_) => None,
+                EinsumPlanningClassification::ViewOnlyPermutation(_)
+                | EinsumPlanningClassification::DiagonalView(_)
+                | EinsumPlanningClassification::ReductionOrElementwise(_)
+                | EinsumPlanningClassification::Gemm(_) => None,
                 _ => Some(format!(
                     "Einsum `{}` uses a newer canonical classification that this native CPU EP \
                      does not recognize; update the CPU EP before assigning this node",
@@ -643,8 +644,9 @@ impl Kernel for EinsumKernel {
 
     fn may_produce_views(&self) -> bool {
         matches!(
-            self.plan.classification(),
-            EinsumClassification::ViewOnlyPermutation(_) | EinsumClassification::DiagonalView(_)
+            self.plan.planning_classification(),
+            EinsumPlanningClassification::ViewOnlyPermutation(_)
+                | EinsumPlanningClassification::DiagonalView(_)
         )
     }
 
@@ -663,9 +665,9 @@ impl Kernel for EinsumKernel {
         {
             return None;
         }
-        let permutation = match self.plan.classification() {
-            EinsumClassification::ViewOnlyPermutation(permutation)
-            | EinsumClassification::DiagonalView(permutation) => permutation,
+        let permutation = match self.plan.planning_classification() {
+            EinsumPlanningClassification::ViewOnlyPermutation(permutation)
+            | EinsumPlanningClassification::DiagonalView(permutation) => permutation,
             _ => return None,
         };
         let input = inputs.get(permutation.input())?;
@@ -711,15 +713,15 @@ impl EinsumKernel {
         outputs: &mut [TensorMut],
     ) -> Result<EinsumRoute> {
         self.validate_execution(inputs, outputs)?;
-        match self.plan.classification() {
-            EinsumClassification::ViewOnlyPermutation(permutation)
-            | EinsumClassification::DiagonalView(permutation) => {
+        match self.plan.planning_classification() {
+            EinsumPlanningClassification::ViewOnlyPermutation(permutation)
+            | EinsumPlanningClassification::DiagonalView(permutation) => {
                 self.record_route(1);
                 let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_VIEW);
                 self.execute_view_copy(inputs, outputs, permutation)?;
                 Ok(EinsumRoute::ViewCopy)
             }
-            EinsumClassification::ReductionOrElementwise(reduction) => {
+            EinsumPlanningClassification::ReductionOrElementwise(reduction) => {
                 self.record_route(if self.mode == ExecutionMode::Oracle {
                     4
                 } else {
@@ -733,22 +735,24 @@ impl EinsumKernel {
                     EinsumRoute::Reduction
                 })
             }
-            EinsumClassification::Gemm(gemm) if self.mode == ExecutionMode::Optimized => {
+            EinsumPlanningClassification::Gemm(gemm) if self.mode == ExecutionMode::Optimized => {
                 self.execute_gemm(inputs, outputs, gemm)
             }
-            EinsumClassification::Gemm(_) => {
+            EinsumPlanningClassification::Gemm(_) => {
                 self.record_route(4);
                 self.execute_oracle(inputs, outputs)?;
                 Ok(EinsumRoute::Oracle)
             }
-            EinsumClassification::ContractionTree(tree) => Err(EpError::KernelFailed(format!(
-                "Einsum equation `{}` reached CPU execution with an unimplemented {}-input \
+            EinsumPlanningClassification::ContractionTree(tree) => {
+                Err(EpError::KernelFailed(format!(
+                    "Einsum equation `{}` reached CPU execution with an unimplemented {}-input \
                  contraction plan where {}; EP placement must decline it until the staged \
                  GenericNative/contraction-tree executor is implemented",
-                self.plan.equation(),
-                tree.arity(),
-                contraction_tree_summary(tree)
-            ))),
+                    self.plan.equation(),
+                    tree.arity(),
+                    contraction_tree_summary(tree)
+                )))
+            }
             _ => Err(EpError::KernelFailed(format!(
                 "Einsum equation `{}` reached CPU execution with a newer unrecognized canonical \
                  classification; update the CPU EP and its claim gate before executing it",

@@ -17,9 +17,9 @@ use onnx_runtime_ep_api::{
     TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{
-    DataType, EinsumClassification, EinsumContractionPlan, EinsumContractionTreePlan, EinsumInput,
-    EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality, EinsumSchema,
-    EinsumShapePlan, Node, Shape, TensorLayout,
+    DataType, EinsumContractionPlan, EinsumContractionTreePlan, EinsumInput, EinsumOperandPlan,
+    EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality, EinsumPlanningClassification,
+    EinsumSchema, EinsumShapePlan, Node, Shape, TensorLayout,
 };
 
 use super::movement::{PersistentMetadata, launch_persistent_metadata};
@@ -334,11 +334,10 @@ fn unsupported_reason_impl(
         return Some(error.to_string());
     }
 
-    match plan.classification() {
-        EinsumClassification::ViewOnlyPermutation(_) | EinsumClassification::DiagonalView(_) => {
-            None
-        }
-        EinsumClassification::Gemm(contraction) => {
+    match plan.planning_classification() {
+        EinsumPlanningClassification::ViewOnlyPermutation(_)
+        | EinsumPlanningClassification::DiagonalView(_) => None,
+        EinsumPlanningClassification::Gemm(contraction) => {
             if let Some(reason) = contraction_structure_reason(plan.shape_plan(), contraction) {
                 return Some(reason);
             }
@@ -368,13 +367,13 @@ fn unsupported_reason_impl(
             }
             None
         }
-        EinsumClassification::ContractionTree(tree) => Some(format!(
+        EinsumPlanningClassification::ContractionTree(tree) => Some(format!(
             "cuda_ep Einsum `{equation}`: canonical {}-input contraction plan has {}, but CUDA \
              temporary scheduling and multi-node capture execution are not implemented",
             tree.arity(),
             contraction_tree_summary(tree)
         )),
-        EinsumClassification::ReductionOrElementwise(_) => Some(format!(
+        EinsumPlanningClassification::ReductionOrElementwise(_) => Some(format!(
             "cuda_ep Einsum `{equation}`: uncoupled reductions/elementwise products are not yet lowered; use native Reduce*/Mul nodes or CPU fallback"
         )),
         _ => Some(format!(
@@ -416,11 +415,11 @@ impl KernelFactory for EinsumFactory {
             .map_err(|error| {
                 EpError::KernelFailed(format!("cuda_ep Einsum `{equation}`: {error}"))
             })?;
-        match plan.classification() {
-            EinsumClassification::ViewOnlyPermutation(_)
-            | EinsumClassification::DiagonalView(_)
-            | EinsumClassification::Gemm(_) => {}
-            EinsumClassification::ContractionTree(tree) => {
+        match plan.planning_classification() {
+            EinsumPlanningClassification::ViewOnlyPermutation(_)
+            | EinsumPlanningClassification::DiagonalView(_)
+            | EinsumPlanningClassification::Gemm(_) => {}
+            EinsumPlanningClassification::ContractionTree(tree) => {
                 return Err(not_implemented(format!(
                     "cuda_ep Einsum `{equation}` {}-input contraction plan with {}; implement \
                      GenericNative/temporary scheduling and multi-node capture before constructing \
@@ -429,7 +428,7 @@ impl KernelFactory for EinsumFactory {
                     contraction_tree_summary(tree)
                 )));
             }
-            EinsumClassification::ReductionOrElementwise(_) => {
+            EinsumPlanningClassification::ReductionOrElementwise(_) => {
                 return Err(not_implemented(format!(
                     "cuda_ep Einsum `{equation}` reduction/elementwise canonical plan"
                 )));
@@ -825,7 +824,8 @@ impl EinsumKernel {
 
     fn compile_contraction(&self, dtype: DataType) -> Result<CachedExecution> {
         let start = Instant::now();
-        let EinsumClassification::Gemm(contraction) = self.plan.classification() else {
+        let EinsumPlanningClassification::Gemm(contraction) = self.plan.planning_classification()
+        else {
             unreachable!("compile_contraction is called only for GEMM plans");
         };
         if let Some(reason) = contraction_structure_reason(&self.plan, contraction) {
@@ -1043,9 +1043,9 @@ impl EinsumKernel {
 
     fn run_view(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.validate_common(inputs, outputs)?;
-        let permutation = match self.plan.classification() {
-            EinsumClassification::ViewOnlyPermutation(permutation)
-            | EinsumClassification::DiagonalView(permutation) => permutation,
+        let permutation = match self.plan.planning_classification() {
+            EinsumPlanningClassification::ViewOnlyPermutation(permutation)
+            | EinsumPlanningClassification::DiagonalView(permutation) => permutation,
             _ => unreachable!("run_view is called only for view plans"),
         };
         let view = self
@@ -1173,21 +1173,23 @@ impl EinsumKernel {
 
 impl Kernel for EinsumKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        match self.plan.classification() {
-            EinsumClassification::ViewOnlyPermutation(_)
-            | EinsumClassification::DiagonalView(_) => self.run_view(inputs, outputs),
-            EinsumClassification::Gemm(_) => self.run_contraction(inputs, outputs),
-            EinsumClassification::ContractionTree(tree) => Err(not_implemented(format!(
+        match self.plan.planning_classification() {
+            EinsumPlanningClassification::ViewOnlyPermutation(_)
+            | EinsumPlanningClassification::DiagonalView(_) => self.run_view(inputs, outputs),
+            EinsumPlanningClassification::Gemm(_) => self.run_contraction(inputs, outputs),
+            EinsumPlanningClassification::ContractionTree(tree) => Err(not_implemented(format!(
                 "Einsum `{}` {}-input contraction plan execution with {}; CUDA must implement \
                  GenericNative and the planner's temporary schedule before executing this class",
                 self.plan.equation(),
                 tree.arity(),
                 contraction_tree_summary(tree)
             ))),
-            EinsumClassification::ReductionOrElementwise(_) => Err(not_implemented(format!(
-                "Einsum `{}` reduction/elementwise canonical plan",
-                self.plan.equation()
-            ))),
+            EinsumPlanningClassification::ReductionOrElementwise(_) => {
+                Err(not_implemented(format!(
+                    "Einsum `{}` reduction/elementwise canonical plan",
+                    self.plan.equation()
+                )))
+            }
             _ => Err(not_implemented(format!(
                 "Einsum `{}` newer unrecognized canonical classification; update CUDA claim, \
                  execution, and capture paths before running it",
@@ -1209,9 +1211,9 @@ impl Kernel for EinsumKernel {
         if inputs[0].shape != self.input_shapes[0] {
             return None;
         }
-        let permutation = match self.plan.classification() {
-            EinsumClassification::ViewOnlyPermutation(permutation)
-            | EinsumClassification::DiagonalView(permutation) => permutation,
+        let permutation = match self.plan.planning_classification() {
+            EinsumPlanningClassification::ViewOnlyPermutation(permutation)
+            | EinsumPlanningClassification::DiagonalView(permutation) => permutation,
             _ => return None,
         };
         let view = self.view_spec(&inputs[0], &output_shapes[0], permutation)?;
@@ -1223,17 +1225,18 @@ impl Kernel for EinsumKernel {
 
     fn may_produce_views(&self) -> bool {
         matches!(
-            self.plan.classification(),
-            EinsumClassification::ViewOnlyPermutation(_) | EinsumClassification::DiagonalView(_)
+            self.plan.planning_classification(),
+            EinsumPlanningClassification::ViewOnlyPermutation(_)
+                | EinsumPlanningClassification::DiagonalView(_)
         )
     }
 
     fn supports_strided_input(&self, input_idx: usize) -> bool {
         input_idx == 0
             && matches!(
-                self.plan.classification(),
-                EinsumClassification::ViewOnlyPermutation(_)
-                    | EinsumClassification::DiagonalView(_)
+                self.plan.planning_classification(),
+                EinsumPlanningClassification::ViewOnlyPermutation(_)
+                    | EinsumPlanningClassification::DiagonalView(_)
             )
     }
 
@@ -1257,36 +1260,39 @@ impl Kernel for EinsumKernel {
     }
 
     fn capture_support(&self) -> CaptureSupport {
-        match self.plan.classification() {
-            EinsumClassification::ViewOnlyPermutation(_)
-            | EinsumClassification::DiagonalView(_) => match self.view_materialization.lock() {
-                Ok(signature) => {
-                    let materialization_warmed = signature.is_some();
-                    let metadata_required = signature
-                        .as_ref()
-                        .is_some_and(|signature| !signature.output_shape.contains(&0));
-                    let metadata_ready = !metadata_required
-                        || self
-                            .view_metadata
-                            .lock()
-                            .is_ok_and(|metadata| metadata.device_graph_resource().is_some());
-                    if (self.view_alias_warmed.load(Ordering::Relaxed) || materialization_warmed)
-                        && metadata_ready
-                    {
-                        CaptureSupport::Supported
-                    } else {
-                        CaptureSupport::unsupported(format!(
-                            "Einsum `{}` must establish its zero-copy view or exact materialization signature and persistent metadata before capture",
-                            self.plan.equation()
-                        ))
+        match self.plan.planning_classification() {
+            EinsumPlanningClassification::ViewOnlyPermutation(_)
+            | EinsumPlanningClassification::DiagonalView(_) => {
+                match self.view_materialization.lock() {
+                    Ok(signature) => {
+                        let materialization_warmed = signature.is_some();
+                        let metadata_required = signature
+                            .as_ref()
+                            .is_some_and(|signature| !signature.output_shape.contains(&0));
+                        let metadata_ready = !metadata_required
+                            || self
+                                .view_metadata
+                                .lock()
+                                .is_ok_and(|metadata| metadata.device_graph_resource().is_some());
+                        if (self.view_alias_warmed.load(Ordering::Relaxed)
+                            || materialization_warmed)
+                            && metadata_ready
+                        {
+                            CaptureSupport::Supported
+                        } else {
+                            CaptureSupport::unsupported(format!(
+                                "Einsum `{}` must establish its zero-copy view or exact materialization signature and persistent metadata before capture",
+                                self.plan.equation()
+                            ))
+                        }
                     }
+                    Err(_) => CaptureSupport::unsupported(format!(
+                        "Einsum `{}` view-materialization lock was poisoned",
+                        self.plan.equation()
+                    )),
                 }
-                Err(_) => CaptureSupport::unsupported(format!(
-                    "Einsum `{}` view-materialization lock was poisoned",
-                    self.plan.equation()
-                )),
-            },
-            EinsumClassification::Gemm(_) => match self.execution.lock() {
+            }
+            EinsumPlanningClassification::Gemm(_) => match self.execution.lock() {
                 Ok(execution)
                     if execution.is_some()
                         && self.last_call_capture_safe.load(Ordering::Relaxed) =>
@@ -1302,10 +1308,10 @@ impl Kernel for EinsumKernel {
                     self.plan.equation()
                 )),
             },
-            EinsumClassification::ContractionTree(_) => CaptureSupport::unsupported(
+            EinsumPlanningClassification::ContractionTree(_) => CaptureSupport::unsupported(
                 "CUDA Einsum contraction-tree temporary scheduling and multi-node capture are not implemented",
             ),
-            EinsumClassification::ReductionOrElementwise(_) => CaptureSupport::unsupported(
+            EinsumPlanningClassification::ReductionOrElementwise(_) => CaptureSupport::unsupported(
                 "CUDA Einsum reduction/elementwise lowering is not implemented",
             ),
             _ => CaptureSupport::unsupported(
@@ -1412,7 +1418,8 @@ mod tests {
             ("ki,jk->ij", [&[3, 2][..], &[4, 3][..]], true, true),
         ] {
             let plan = plan(equation, &shapes);
-            let EinsumClassification::Gemm(contraction) = plan.classification() else {
+            let EinsumPlanningClassification::Gemm(contraction) = plan.planning_classification()
+            else {
                 panic!("{equation} was not GEMM");
             };
             let concrete = shapes
@@ -1442,7 +1449,8 @@ mod tests {
     #[test]
     fn layout_admits_whole_batch_stride_zero_and_rejects_partial_broadcast() {
         let broadcast = plan("mk,...kn->...mn", &[&[2, 3], &[6, 5, 3, 4]]);
-        let EinsumClassification::Gemm(contraction) = broadcast.classification() else {
+        let EinsumPlanningClassification::Gemm(contraction) = broadcast.planning_classification()
+        else {
             panic!("expected GEMM");
         };
         let layout = concrete_contraction_layout(
@@ -1456,7 +1464,8 @@ mod tests {
         assert_eq!(layout.right_batch_stride, 12);
 
         let partial = plan("...mk,...kn->...mn", &[&[2, 1, 3, 4], &[2, 5, 4, 6]]);
-        let EinsumClassification::Gemm(contraction) = partial.classification() else {
+        let EinsumPlanningClassification::Gemm(contraction) = partial.planning_classification()
+        else {
             panic!("expected GEMM");
         };
         let error = concrete_contraction_layout(

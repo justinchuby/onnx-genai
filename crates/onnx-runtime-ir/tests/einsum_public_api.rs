@@ -1,6 +1,6 @@
 use onnx_runtime_ir::{
-    DataType, EinsumAxis, EinsumClassification, EinsumContractionTreeStep, EinsumCostBound,
-    EinsumInput, EinsumPlan, EinsumPlannerQuality, EinsumSchema, EinsumShapePlan,
+    DataType, EinsumAxis, EinsumContractionTreeStep, EinsumCostBound, EinsumInput, EinsumPlan,
+    EinsumPlannerQuality, EinsumPlanningClassification, EinsumSchema, EinsumShapePlan,
 };
 
 #[test]
@@ -68,7 +68,7 @@ fn typed_einsum_plan_accepts_case_sensitive_ascii_labels() {
 }
 
 #[test]
-fn contraction_tree_public_api_is_source_compatible_and_runtime_resolvable() {
+fn contraction_tree_planning_api_is_runtime_resolvable() {
     let vector = [2usize];
     let matrix = [2usize, 8];
     let right = [8usize];
@@ -78,8 +78,8 @@ fn contraction_tree_public_api_is_source_compatible_and_runtime_resolvable() {
         EinsumInput::new(DataType::Float16, &right),
     ];
     let plan = EinsumPlan::build("i,ij,j->", &inputs).unwrap();
-    let tree = match plan.classification() {
-        EinsumClassification::ContractionTree(tree) => tree,
+    let tree = match plan.planning_classification() {
+        EinsumPlanningClassification::ContractionTree(tree) => tree,
         _ => panic!("expected a contraction tree"),
     };
     assert_eq!(tree.quality(), EinsumPlannerQuality::ExactSubsetDp);

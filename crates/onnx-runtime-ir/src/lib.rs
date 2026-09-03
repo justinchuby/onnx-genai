@@ -18,7 +18,7 @@
 //! | Element type | [`DataType`] |
 //! | Symbolic / static shapes | [`Shape`], [`Dim`], [`SymbolConstraints`] |
 //! | Physical strided layout | [`TensorLayout`], [`MemoryFormat`] |
-//! | Canonical Einsum planning | [`EinsumPlan`], [`EinsumShapePlan`], [`EinsumClassification`] |
+//! | Canonical Einsum planning | [`EinsumPlan`], [`EinsumShapePlan`], [`EinsumPlanningClassification`] |
 //! | Device placement | [`DeviceType`], [`DeviceId`] |
 //! | Graph values (SSA edges) | [`Value`], [`ValueId`] |
 //! | Graph operations | [`Node`], [`NodeId`], [`Attribute`] |
@@ -67,20 +67,21 @@ pub use dtype::DataType;
 pub use einsum::{
     EinsumAxis, EinsumAxisRef, EinsumBinaryContractionPlan, EinsumBinaryLowering,
     EinsumClassification, EinsumConcreteContractionTreeCandidate,
-    EinsumConcreteContractionTreePlan, EinsumConcreteGemmGeometry, EinsumContractionCost,
-    EinsumContractionPlan, EinsumContractionTreeCandidate, EinsumContractionTreeCandidateId,
-    EinsumContractionTreeCandidatePlan, EinsumContractionTreeCandidateUnsupportedReason,
-    EinsumContractionTreePlan, EinsumContractionTreeStep, EinsumCostBound, EinsumCostMetric,
-    EinsumDimension, EinsumDimensionRule, EinsumDimensionValue, EinsumEquationSide,
-    EinsumExecutionSelection, EinsumGemmGeometry, EinsumGenericNativePlan, EinsumIndexProgram,
-    EinsumInput, EinsumIntegerOverflowSemantics, EinsumLabel, EinsumLogicalAxis, EinsumOperandAxis,
-    EinsumOperandIndexProgram, EinsumOperandPlan, EinsumOverflowTarget, EinsumPermutationPlan,
-    EinsumPlan, EinsumPlanError, EinsumPlanErrorKind, EinsumPlannerBudget,
-    EinsumPlannerFallbackReason, EinsumPlannerQuality, EinsumPlannerUsage, EinsumPrecisionPolicy,
-    EinsumReductionPlan, EinsumResolveError, EinsumResolvedContractionCost, EinsumSchema,
-    EinsumSchemaError, EinsumSemanticPlan, EinsumShapePlan,
-    EinsumSupportedContractionTreeCandidate, EinsumTemporaryStoragePolicy,
-    EinsumTemporaryValuePlan, EinsumUnaryReductionPlan, EinsumValueId,
+    EinsumConcreteContractionTreePlan, EinsumConcreteGemmGeometry, EinsumConcretePlanError,
+    EinsumContractionCost, EinsumContractionPlan, EinsumContractionTreeCandidate,
+    EinsumContractionTreeCandidateId, EinsumContractionTreeCandidatePlan,
+    EinsumContractionTreeCandidateUnsupportedReason, EinsumContractionTreePlan,
+    EinsumContractionTreeStep, EinsumCostBound, EinsumCostMetric, EinsumDimension,
+    EinsumDimensionRule, EinsumDimensionValue, EinsumEquationSide, EinsumExecutionSelection,
+    EinsumGemmGeometry, EinsumGenericNativePlan, EinsumIndexProgram, EinsumInput,
+    EinsumIntegerOverflowSemantics, EinsumLabel, EinsumLogicalAxis, EinsumOperandAxis,
+    EinsumOperandIndexProgram, EinsumOperandPlan, EinsumOpsetPlanError, EinsumOverflowTarget,
+    EinsumPermutationPlan, EinsumPlan, EinsumPlanError, EinsumPlanErrorKind, EinsumPlannerBudget,
+    EinsumPlannerFallbackReason, EinsumPlannerQuality, EinsumPlannerUsage,
+    EinsumPlanningClassification, EinsumPrecisionPolicy, EinsumReductionPlan, EinsumResolveError,
+    EinsumResolvedContractionCost, EinsumSchema, EinsumSchemaError, EinsumSemanticPlan,
+    EinsumShapePlan, EinsumSupportedContractionTreeCandidate, EinsumTemporaryStoragePolicy,
+    EinsumTemporaryValuePlan, EinsumUnaryReductionPlan, EinsumUnsupportedReason, EinsumValueId,
 };
 pub use error::{GraphError, IrError, Result};
 pub use graph::{Graph, ModelFunction, ModelFunctionKey};

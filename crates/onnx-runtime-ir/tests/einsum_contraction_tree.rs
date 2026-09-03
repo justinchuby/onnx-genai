@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use onnx_runtime_ir::{
-    DataType, EinsumAxis, EinsumBinaryLowering, EinsumContractionCost, EinsumContractionTreeStep,
-    EinsumCostBound, EinsumExecutionSelection, EinsumInput, EinsumIntegerOverflowSemantics,
-    EinsumPlan, EinsumPlanErrorKind, EinsumPlannerBudget, EinsumPlannerFallbackReason,
-    EinsumPlannerQuality, EinsumSchema, EinsumTemporaryStoragePolicy,
+    DataType, EinsumAxis, EinsumBinaryLowering, EinsumClassification, EinsumConcretePlanError,
+    EinsumContractionCost, EinsumContractionTreeStep, EinsumCostBound, EinsumExecutionSelection,
+    EinsumInput, EinsumIntegerOverflowSemantics, EinsumOpsetPlanError, EinsumPlan,
+    EinsumPlanErrorKind, EinsumPlannerBudget, EinsumPlannerFallbackReason, EinsumPlannerQuality,
+    EinsumSchema, EinsumShapePlan, EinsumTemporaryStoragePolicy,
 };
 
 type LegalCase<'a> = (&'a str, Vec<&'a [usize]>, Vec<usize>);
@@ -62,21 +63,23 @@ fn schema_resolution_and_authoritative_numeric_type_matrix() {
     let bf16 = [EinsumInput::new(DataType::BFloat16, &scalar)];
     for opset in [12, 27] {
         let error = EinsumPlan::build_for_opset("->", &bf16, opset).unwrap_err();
+        let plan_error = error.plan_error().unwrap();
         assert!(matches!(
-            error.kind(),
+            plan_error.kind(),
             EinsumPlanErrorKind::UnsupportedInputDtype {
                 dtype: DataType::BFloat16,
-                schema: EinsumSchema::V12,
                 ..
             }
         ));
+        assert_eq!(plan_error.schema(), Some(EinsumSchema::V12));
     }
     assert!(EinsumPlan::build_for_opset("->", &bf16, 28).is_ok());
     assert!(matches!(
-        EinsumPlan::build_for_opset("->", &bf16, 11)
-            .unwrap_err()
-            .kind(),
-        EinsumPlanErrorKind::UnsupportedOpset { imported_opset: 11 }
+        EinsumPlan::build_for_opset("->", &bf16, 11).unwrap_err(),
+        EinsumOpsetPlanError::UnsupportedOpset {
+            imported_opset: 11,
+            ..
+        }
     ));
 
     for rejected in [
@@ -137,6 +140,7 @@ fn precision_policy_is_explicit_and_backend_neutral() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn every_required_legal_equation_has_generic_native_semantics() {
     let cases: Vec<LegalCase<'_>> = vec![
         ("i,i,i->", vec![&[2], &[2], &[2]], vec![]),
@@ -161,6 +165,10 @@ fn every_required_legal_equation_has_generic_native_semantics() {
         assert_eq!(
             plan.generic_native().index_program().operands().len(),
             shapes.len(),
+            "{equation}"
+        );
+        assert!(
+            !matches!(plan.classification(), EinsumClassification::Unsupported(_)),
             "{equation}"
         );
     }
@@ -701,6 +709,16 @@ fn costs_are_checked_u128_zero_annihilates_and_memory_can_fall_back() {
         EinsumExecutionSelection::GenericNative
     );
     assert!(!chain.generic_native().index_program().operands().is_empty());
+
+    let shape_plan =
+        EinsumShapePlan::build("ij,jk,kl->il", &[&[2, 3][..], &[3, 4][..], &[4, 5][..]]).unwrap();
+    assert!(matches!(
+        shape_plan.resolve_concrete_contraction_tree(&[&[2, 3], &[3, 4], &[4, 5]], 0),
+        Err(EinsumConcretePlanError::InvalidElementSize {
+            element_size: 0,
+            ..
+        })
+    ));
 }
 
 #[test]
