@@ -460,6 +460,30 @@ pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
                     });
                 }
             };
+            if node.outputs.len() != 1 {
+                return Err(LoaderError::InvalidEinsum {
+                    node: node_label(node),
+                    detail: format!(
+                        "equation `{equation}` requires exactly 1 output, but the node declares {} outputs",
+                        node.outputs.len()
+                    ),
+                });
+            }
+            let output_id = node.outputs[0];
+            let output = graph.values.get(output_id).ok_or_else(|| LoaderError::InvalidEinsum {
+                node: node_label(node),
+                detail: format!(
+                    "equation `{equation}` declares 1 output, but output #0 references missing value {output_id:?}"
+                ),
+            })?;
+            if output.name.as_deref().is_none_or(str::is_empty) {
+                return Err(LoaderError::InvalidEinsum {
+                    node: node_label(node),
+                    detail: format!(
+                        "equation `{equation}` declares 1 output, but required output #0 has an empty or omitted name"
+                    ),
+                });
+            }
             let mut metadata = Vec::with_capacity(node.inputs.len());
             for (input, slot) in node.inputs.iter().enumerate() {
                 let value_id = slot.ok_or_else(|| LoaderError::InvalidEinsum {
@@ -504,10 +528,7 @@ pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
                     });
                 }
             };
-            if let Some(&output_id) = node.outputs.first()
-                && graph.value_type_is_known(output_id)
-                && let Some(output) = graph.values.get(output_id)
-            {
+            if graph.value_type_is_known(output_id) {
                 let schema = EinsumSchema::resolve(imported_opset).map_err(|error| {
                     LoaderError::InvalidEinsum {
                         node: node_label(node),

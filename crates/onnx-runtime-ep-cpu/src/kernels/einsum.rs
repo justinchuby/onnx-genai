@@ -472,14 +472,6 @@ fn contraction_tree_summary(tree: &EinsumContractionTreePlan) -> String {
 impl KernelFactory for EinsumFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let equation = equation(node)?;
-        if input_shapes.is_empty() {
-            return Err(EpError::KernelFailed(
-                "Einsum: expected at least one input shape; the canonical planner cannot build an \
-                 execution plan without operand ranks. HOW: provide inferred input shapes before \
-                 kernel construction."
-                    .into(),
-            ));
-        }
         let input_shape_refs: Vec<_> = input_shapes.iter().map(Vec::as_slice).collect();
         let schema = EinsumSchema::resolve(node.local_opset().unwrap_or(12))
             .map_err(|error| EpError::KernelFailed(format!("Einsum: {error}")))?;
@@ -588,11 +580,6 @@ pub fn unsupported_reason(
              HOW: finish graph type/shape inference before EP placement",
             shapes.len(),
             input_dtypes.len()
-        ));
-    }
-    if shapes.is_empty() {
-        return Some(format!(
-            "Einsum `{equation}` has no inputs; ONNX Einsum requires at least one operand"
         ));
     }
     let inputs: Vec<_> = shapes

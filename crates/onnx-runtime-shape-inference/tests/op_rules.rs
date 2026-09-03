@@ -5078,6 +5078,24 @@ fn einsum_requires_a_decodable_string_equation_attribute() {
 }
 
 #[test]
+fn einsum_rejects_invalid_operator_arity() {
+    for (inputs, outputs, expected) in [
+        (0, 1, "expected at least one input"),
+        (1, 0, "requires exactly 1 output"),
+        (1, 2, "requires exactly 1 output"),
+    ] {
+        let n = with_attr(
+            node("Einsum", inputs, outputs),
+            "equation",
+            Attribute::String(b"i->i".to_vec()),
+        );
+        let input_metadata = (0..inputs).map(|_| f32in(vec![c(2)])).collect();
+        let error = try_run(&n, input_metadata, 12).unwrap_err();
+        assert_invalid(error, "Einsum", expected);
+    }
+}
+
+#[test]
 fn einsum_matmul_transpose_and_implicit() {
     // Explicit matmul.
     let out = run(

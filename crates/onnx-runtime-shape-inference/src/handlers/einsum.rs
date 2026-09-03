@@ -38,6 +38,15 @@ fn einsum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
             detail,
         }
     })?;
+    if ctx.num_outputs() != 1 {
+        return Err(ShapeInferError::Invalid {
+            op: ctx.op().to_owned(),
+            detail: format!(
+                "equation `{equation}` requires exactly 1 output, but the node declares {} outputs",
+                ctx.num_outputs()
+            ),
+        });
+    }
 
     // Clone before planning so output resolution can mutably use the context's
     // broadcast chokepoint without retaining immutable borrows into `ctx`.

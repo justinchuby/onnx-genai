@@ -48,6 +48,13 @@ fn einsum_node(input: &str, output: &str, equation: &str) -> onnx::NodeProto {
     }
 }
 
+fn einsum_node_with_io(inputs: &[&str], outputs: &[&str], equation: &str) -> onnx::NodeProto {
+    let mut node = einsum_node("", "", equation);
+    node.input = inputs.iter().map(|name| (*name).to_string()).collect();
+    node.output = outputs.iter().map(|name| (*name).to_string()).collect();
+    node
+}
+
 fn model(
     opset: i64,
     input: onnx::ValueInfoProto,
@@ -107,6 +114,85 @@ fn loader_resolves_einsum_schema_from_imported_opset() {
     }
 
     validate_model(&einsum_graph(28, DataType::BFloat16)).unwrap();
+}
+
+#[test]
+fn loader_rejects_einsum_invalid_input_and_output_arity_before_metadata() {
+    let zero_inputs = load_model_bytes(&model(
+        12,
+        value_info("X", None, None),
+        value_info("Y", None, None),
+        vec![einsum_node_with_io(&[], &["Y"], "i->i")],
+    ))
+    .unwrap_err();
+    assert!(matches!(zero_inputs, LoaderError::InvalidEinsum { .. }));
+    let zero_inputs = zero_inputs.to_string();
+    assert!(zero_inputs.contains("<unnamed node #0>"), "{zero_inputs}");
+    assert!(zero_inputs.contains("equation `i->i`"), "{zero_inputs}");
+    assert!(
+        zero_inputs.contains("expected at least one input"),
+        "{zero_inputs}"
+    );
+    assert!(zero_inputs.contains("found none"), "{zero_inputs}");
+
+    for output_count in [0, 2, 3] {
+        let outputs = ["Y", "extra_1", "extra_2"];
+        let invalid = load_model_bytes(&model(
+            12,
+            value_info("X", None, None),
+            value_info("X", None, None),
+            vec![einsum_node_with_io(
+                &["X"],
+                &outputs[..output_count],
+                "i->i",
+            )],
+        ))
+        .unwrap_err();
+        assert!(matches!(invalid, LoaderError::InvalidEinsum { .. }));
+        let invalid = invalid.to_string();
+        assert!(invalid.contains("<unnamed node #0>"), "{invalid}");
+        assert!(invalid.contains("equation `i->i`"), "{invalid}");
+        assert!(
+            invalid.contains(&format!("declares {output_count} outputs")),
+            "{invalid}"
+        );
+        assert!(invalid.contains("requires exactly 1 output"), "{invalid}");
+    }
+}
+
+#[test]
+fn loader_rejects_einsum_empty_required_output_name() {
+    let invalid = load_model_bytes(&model(
+        12,
+        value_info("X", None, None),
+        value_info("X", None, None),
+        vec![einsum_node_with_io(&["X"], &[""], "i->i")],
+    ))
+    .unwrap_err();
+    assert!(matches!(invalid, LoaderError::InvalidEinsum { .. }));
+    let invalid = invalid.to_string();
+    assert!(invalid.contains("<unnamed node #0>"), "{invalid}");
+    assert!(invalid.contains("equation `i->i`"), "{invalid}");
+    assert!(invalid.contains("declares 1 output"), "{invalid}");
+    assert!(invalid.contains("required output #0"), "{invalid}");
+    assert!(invalid.contains("empty or omitted name"), "{invalid}");
+}
+
+#[test]
+fn loader_accepts_single_named_einsum_output_with_unknown_metadata() {
+    let graph = load_model_bytes(&model(
+        12,
+        value_info("X", Some(1), Some(&[2])),
+        value_info("Y", None, None),
+        vec![einsum_node("X", "Y", "i->i")],
+    ))
+    .unwrap();
+
+    let output = find(&graph, "Y");
+    assert!(!graph.value_type_is_known(output));
+    assert!(!graph.value_shape_is_known(output));
+    assert_eq!(graph.value(output).dtype, DataType::Float32);
+    assert_eq!(graph.value(output).shape, static_shape([2]));
 }
 
 #[test]
