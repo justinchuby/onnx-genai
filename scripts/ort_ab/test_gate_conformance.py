@@ -37,12 +37,11 @@ That root is also read in shell. It was not, for as long as this file has
 existed, because the enumeration globbed `*.py` -- and the one shell harness
 there claimed the lock in its own header comment while calling nothing. The
 shell rule is categorical rather than behavioural (every `*.sh` gates or is
-recorded), for the reason written at `EP_SHELL_LEDGER`. The thirteen Rust
-`[[bench]]` targets in the same directory are still uncovered, deliberately
-and with the reason written down in the same place (#2129), because what must
-hold the lock for those is the `cargo bench` invocation rather than the
-source. Their *names* are pinned, so a fourteenth cannot arrive silently
-while none of the thirteen gates.
+recorded), for the reason written at `EP_SHELL_LEDGER`. Rust `[[bench]]`
+targets are governed at the invocation boundary: `einsum` has an exact
+lock-wrapped command, while the thirteen older targets remain in the deferred
+#2129 inventory. Their union is pinned, so another target cannot arrive
+silently.
 
 Both lock idioms in the tree count as held: `hostlock_gate.require` in
 `scripts/ort_ab/`, and the `HostLock` context manager in `acc0_gap_matrix.py`
@@ -87,6 +86,7 @@ import functools
 import io
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -1092,19 +1092,20 @@ def stale_shell_records(
     return out
 
 
-# The third language in that directory, and the one this file does not yet
-# check: thirteen `[[bench]]` targets in `crates/onnx-runtime-ep-cpu/`.
+# The third language in that directory: Rust `[[bench]]` targets in
+# `crates/onnx-runtime-ep-cpu/`.
 # Deferred to #2129 rather than bodged, because what must hold the lock for a
 # Rust bench is the `cargo bench` *invocation* -- the source has no process
 # boundary to wrap, and `cargo bench -p onnx-runtime-ep-cpu` (the headline
 # line in that directory's README) runs all thirteen back to back.
 #
-# Pinning the name set is not a substitute for gating them. It is the cheap
-# half: while #2129 is open, adding a Rust bench fails here, so the decision
-# to leave it uncovered is taken consciously by whoever adds it instead of
-# defaulting to silence -- which is the exact way `decode_gap_park_ab` came to
-# be one of the three processes in the collision that motivated #1803.
-EP_RUST_UNCOVERED = frozenset(
+# Most existing targets remain pinned as the deferred #2129 inventory. New
+# targets may instead enter `EP_RUST_GOVERNED`, but only when the benches README
+# contains an exact, executable `hostlock.sh run -- ... cargo bench --bench X`
+# command. Reading the lock from inside the benchmark is not custody: cargo can
+# compile on every core before the binary starts, so the invocation is the
+# boundary that must be wrapped.
+EP_RUST_DEFERRED = frozenset(
     {
         "activation_bench",
         "decode_gap_park_ab",
@@ -1122,7 +1123,10 @@ EP_RUST_UNCOVERED = frozenset(
     }
 )
 
+EP_RUST_GOVERNED = frozenset({"einsum"})
+
 _BENCH_NAME = re.compile(r"""^\s*name\s*=\s*['"]([^'"]+)['"]""")
+_SHELL_FENCE = re.compile(r"```(?:bash|sh)\s*\n(.*?)```", re.DOTALL)
 
 
 @functools.lru_cache(maxsize=1)
@@ -1142,6 +1146,37 @@ def ep_rust_benches() -> frozenset[str]:
             if found:
                 names.add(found.group(1))
     return frozenset(names)
+
+
+def locked_rust_bench_commands(
+    document: str | None = None,
+) -> dict[str, list[str]]:
+    """Exact Rust bench selectors whose executable invocation holds the lock."""
+    if document is None:
+        document = (EP_BENCHES / "README.md").read_text(encoding="utf-8")
+    found: dict[str, list[str]] = {}
+    for block in _SHELL_FENCE.findall(document):
+        try:
+            tokens = shlex.split(block.replace("\\\n", " "), comments=True, posix=True)
+        except ValueError:
+            continue
+        if tokens[:2] != ["scripts/hostlock.sh", "run"]:
+            continue
+        try:
+            child = tokens[tokens.index("--") + 1 :]
+        except ValueError:
+            continue
+        if child[:2] != ["cargo", "bench"]:
+            continue
+        try:
+            package = child[child.index("-p") + 1]
+            selector = child[child.index("--bench") + 1]
+        except (ValueError, IndexError):
+            continue
+        if package != "onnx-runtime-ep-cpu" or not selector:
+            continue
+        found.setdefault(selector, []).append(block.strip())
+    return found
 
 
 def declared_roles(
@@ -2362,19 +2397,15 @@ class EpShellHarnesses(unittest.TestCase):
 
 
 class EpRustBenches(unittest.TestCase):
-    """The third language, pinned rather than gated, while #2129 is open."""
+    """Exact Rust target census plus invocation-level host-lock governance."""
 
-    def test_the_rust_bench_set_is_the_one_that_was_deferred(self):
-        # The whole value is in the failure: this cell exists so that adding
-        # a fourteenth `[[bench]]` cannot happen silently while none of the
-        # thirteen takes the lock.
+    def test_the_rust_bench_set_is_exactly_governed_or_deferred(self):
         found = ep_rust_benches()
         self.assertEqual(
             found,
-            EP_RUST_UNCOVERED,
-            "the EP crate's [[bench]] set moved -- gate the new target's "
-            "`cargo bench` invocation under scripts/hostlock.sh, or add it "
-            "here and say why on #2129",
+            EP_RUST_DEFERRED | EP_RUST_GOVERNED,
+            "the EP crate's [[bench]] set moved -- add a new target to the "
+            "governed exact-command census, or record it in the deferred #2129 set",
         )
 
     def test_the_pin_is_not_vacuous(self):
@@ -2384,10 +2415,46 @@ class EpRustBenches(unittest.TestCase):
         # the two targets named in the incident reports, and a negative --
         # the crate's `[package] name` must not leak in.
         found = ep_rust_benches()
-        self.assertGreaterEqual(len(found), 13)
+        self.assertGreaterEqual(len(found), 14)
         self.assertIn("decode_gap_park_ab", found)
         self.assertIn("native_vs_mlas", found)
+        self.assertIn("einsum", found)
         self.assertNotIn("onnx-runtime-ep-cpu", found)
+
+    def test_governed_benches_have_one_exact_locked_invocation(self):
+        commands = locked_rust_bench_commands()
+        self.assertEqual(
+            set(commands),
+            set(EP_RUST_GOVERNED),
+            "the README's locked Rust bench commands must match the governed census exactly",
+        )
+        for target in EP_RUST_GOVERNED:
+            self.assertEqual(
+                len(commands[target]),
+                1,
+                f"{target} must have exactly one executable locked invocation",
+            )
+            self.assertIn(f"--bench {target}", commands[target][0])
+
+    def test_locked_selector_parser_is_exact_and_non_vacuous(self):
+        document = """
+```bash
+scripts/hostlock.sh run --owner tester --reason "exact" -- \
+  cargo bench -p onnx-runtime-ep-cpu --bench einsum -- --noplot
+```
+```bash
+scripts/hostlock.sh run --owner tester --reason "different target" -- \
+  cargo bench -p onnx-runtime-ep-cpu --bench gqa_decode
+```
+```bash
+cargo bench -p onnx-runtime-ep-cpu --bench sdpa_simd
+scripts/hostlock.sh provenance
+```
+"""
+        commands = locked_rust_bench_commands(document)
+        self.assertEqual(set(commands), {"einsum", "gqa_decode"})
+        self.assertEqual(len(commands["einsum"]), 1)
+        self.assertNotIn("sdpa_simd", commands)
 
     def test_every_pinned_bench_has_a_source_file(self):
         # A stale pin is the shell ledger's dead record in another form: a

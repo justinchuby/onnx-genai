@@ -130,6 +130,10 @@ name = "gqa_decode"
 harness = false
 
 [[bench]]
+name = "einsum"
+harness = false
+
+[[bench]]
 name = "sdpa_simd"
 harness = false
 

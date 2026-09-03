@@ -1069,6 +1069,9 @@ impl Engine {
                     .saturating_add(
                         onnx_runtime_ep_cpu::qlinear_accumulator_budget_predicted_bytes(&graph),
                     )
+                    .saturating_add(onnx_runtime_ep_cpu::einsum_scratch_budget_predicted_bytes(
+                        &graph,
+                    ))
                     .saturating_add(onnx_runtime_ep_cpu::qlinear_packed_b_predicted_bytes(
                         &graph,
                     )),
@@ -1169,6 +1172,14 @@ impl Engine {
         onnx_runtime_ep_cpu::set_qlinear_accumulator_budget_admitted(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
+        // Einsum's reusable Float32 output workspace is the seventh governed
+        // CPU buffer folded into `resident_f32_cache_bytes`. Capture this
+        // engine's verdict in an immutable handle that the CPU provider clones
+        // into its factory and compiled kernels. The process-wide byte counter
+        // remains shared, but loading another engine cannot change this one.
+        let einsum_scratch_retention = onnx_runtime_ep_cpu::EinsumScratchRetention::new(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
         onnx_runtime_ep_cpu::set_qlinear_packed_b_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
@@ -1247,6 +1258,7 @@ impl Engine {
                 native_device.clone(),
                 crate::native_decode::NativeDecodeLoadOptions {
                     host_cache: governor.weight_offload_host_cache(),
+                    einsum_scratch_retention,
                     #[cfg(feature = "native-cuda")]
                     cuda_offload_policy,
                     #[cfg(feature = "native-cuda")]
