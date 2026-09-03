@@ -116,7 +116,7 @@ pub trait NumericElem: Copy {
     /// The tensor dtype whose storage layout is exactly `Self`.
     const DTYPE: DataType;
     /// The domain this element's arithmetic is evaluated in.
-    type Acc: ComputeDomain + Send + Sync + 'static;
+    type Acc: ComputeDomain;
     fn to_acc(self) -> Self::Acc;
     fn from_acc(a: Self::Acc) -> Self;
     fn from_f32_scalar(f: f32) -> Self;

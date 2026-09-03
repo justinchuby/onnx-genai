@@ -7,6 +7,7 @@
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -31,7 +32,7 @@ use crate::kernels::governed_accumulator_budget::{
     DEFAULT_PER_THREAD_ACCUMULATOR_BYTES, DEFAULT_PROCESS_ACCUMULATOR_BYTES, GovernedAccumulator,
     GovernedAccumulatorBudget,
 };
-use crate::strided::next_index;
+use crate::strided::{elem_offset, next_index};
 
 /// Diagnostic execution switch used by `benches/einsum.rs` and conformance.
 ///
@@ -1089,14 +1090,10 @@ impl EinsumKernel {
         }
         let input_shapes = inputs.iter().map(|input| input.shape).collect::<Vec<_>>();
         let accumulator_size = accumulator_element_size(inputs[0].dtype);
-        let output_bytes = checked_numel("contraction-tree output", outputs[0].shape)?
-            .checked_mul(accumulator_size)
-            .ok_or_else(|| {
-                geometry_overflow(self.plan.equation(), "contraction-tree output bytes")
-            })?;
-        let temporary_ceiling =
-            u128::from(DEFAULT_PER_THREAD_ACCUMULATOR_BYTES).saturating_sub(output_bytes as u128);
-        let concrete = self
+        let output_shape = outputs[0].shape.to_vec();
+        let workspace_limit = usize::try_from(DEFAULT_PER_THREAD_ACCUMULATOR_BYTES)
+            .expect("the 32 MiB per-thread workspace ceiling fits usize");
+        let Some(concrete) = self
             .plan
             .resolve_concrete_contraction_tree(&input_shapes, accumulator_size)
             .map_err(|error| {
@@ -1104,31 +1101,59 @@ impl EinsumKernel {
                     "Einsum `{}` could not resolve its concrete contraction tree: {error}",
                     self.plan.equation()
                 ))
-            })?;
-        let Some(selected) = concrete
-            .as_ref()
-            .and_then(|tree| tree.preferred_candidate_with_memory_ceiling(temporary_ceiling))
+            })?
         else {
             self.execute_generic_native(inputs, outputs)?;
             return Ok(EinsumRoute::GenericNative);
         };
-        let peak_temporary_bytes = selected
-            .cost()
-            .map(|cost| cost.peak_live_temporary_bytes())
-            .unwrap_or(0);
-        let workspace_bytes = peak_temporary_bytes
-            .checked_add(output_bytes as u128)
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .ok_or_else(|| {
-                geometry_overflow(self.plan.equation(), "contraction-tree workspace bytes")
-            })?;
-        self.last_workspace_bytes
-            .store(workspace_bytes, Ordering::Relaxed);
-        let candidate = tree
+        let supported_candidates = tree
             .candidates()
             .iter()
-            .find(|candidate| candidate.id() == selected.id())
-            .and_then(|candidate| candidate.supported())
+            .filter_map(|candidate| {
+                candidate
+                    .supported()
+                    .map(|supported| (candidate.id().clone(), supported))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let candidate_workspaces = concrete
+            .candidates()
+            .iter()
+            .filter(|candidate| candidate.cost().is_some())
+            .try_fold(BTreeMap::new(), |mut workspaces, candidate| {
+                let supported = supported_candidates.get(candidate.id()).ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "Einsum `{}` concrete contraction candidate `{}` has no matching \
+                         supported structural plan",
+                        self.plan.equation(),
+                        candidate.id()
+                    ))
+                })?;
+                workspaces.insert(
+                    candidate.id().clone(),
+                    contraction_tree_workspace_bytes(
+                        self.plan.equation(),
+                        &self.plan,
+                        supported,
+                        &output_shape,
+                        accumulator_size,
+                    )?,
+                );
+                Ok::<_, EpError>(workspaces)
+            })?;
+        let Some(selected) = concrete.preferred_candidate_matching(|candidate| {
+            candidate_workspaces
+                .get(candidate.id())
+                .is_some_and(|&bytes| bytes <= workspace_limit)
+        }) else {
+            self.execute_generic_native(inputs, outputs)?;
+            return Ok(EinsumRoute::GenericNative);
+        };
+        let admitted_workspace_bytes = *candidate_workspaces
+            .get(selected.id())
+            .expect("selected candidate passed workspace admission");
+        let candidate = supported_candidates
+            .get(selected.id())
+            .copied()
             .ok_or_else(|| {
                 EpError::KernelFailed(format!(
                     "Einsum `{}` selected contraction candidate `{}` without a matching \
@@ -1137,9 +1162,17 @@ impl EinsumKernel {
                     selected.id()
                 ))
             })?;
-        crate::dispatch_arith!(inputs[0].dtype, "Einsum", T => {
-            self.execute_contraction_tree_typed::<T>(inputs, outputs, candidate)
+        let actual_workspace_bytes = crate::dispatch_arith!(inputs[0].dtype, "Einsum", T => {
+            self.execute_contraction_tree_typed::<T>(
+                inputs,
+                outputs,
+                candidate,
+                admitted_workspace_bytes,
+                workspace_limit,
+            )
         })?;
+        self.last_workspace_bytes
+            .store(actual_workspace_bytes, Ordering::Relaxed);
         Ok(match tree.quality() {
             EinsumPlannerQuality::ExactSubsetDp => EinsumRoute::OptimizedDp,
             EinsumPlannerQuality::DeterministicGreedy => EinsumRoute::OptimizedHeuristic,
@@ -1198,23 +1231,20 @@ impl EinsumKernel {
             shape: canonical_shape,
             data: canonical,
         };
-        let requested_len = checked_numel("scalar GEMM requested output", outputs[0].shape)?;
-        let workspace_bytes = canonical_len
-            .checked_add(requested_len)
-            .and_then(|elements| elements.checked_mul(std::mem::size_of::<T::Acc>()))
+        let workspace_bytes = final_value
+            .data
+            .capacity()
+            .checked_mul(std::mem::size_of::<T::Acc>())
             .ok_or_else(|| geometry_overflow(self.plan.equation(), "scalar GEMM workspace"))?;
         self.last_workspace_bytes
             .store(workspace_bytes, Ordering::Relaxed);
-        self.with_scratch::<T::Acc, _>(requested_len, |requested| {
-            permute_tree_output(
-                self.plan.equation(),
-                &self.plan,
-                &final_value,
-                gemm.output_permutation(),
-                requested,
-            )?;
-            T::write_accumulators(&mut outputs[0], requested)
-        })
+        write_tree_output::<T>(
+            self.plan.equation(),
+            &self.plan,
+            &final_value,
+            gemm.output_permutation(),
+            &mut outputs[0],
+        )
     }
 
     fn execute_contraction_tree_typed<T: EinsumElement>(
@@ -1222,7 +1252,9 @@ impl EinsumKernel {
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
         candidate: &EinsumSupportedContractionTreeCandidate,
-    ) -> Result<()> {
+        admitted_workspace_bytes: usize,
+        workspace_limit: usize,
+    ) -> Result<usize> {
         let max_value = candidate
             .steps()
             .iter()
@@ -1376,18 +1408,33 @@ impl EinsumKernel {
                 self.plan.equation()
             )));
         };
-        let output_shape = outputs[0].shape.to_vec();
-        let output_len = checked_numel("contraction-tree final output", &output_shape)?;
-        self.with_scratch::<T::Acc, _>(output_len, |requested| {
-            permute_tree_output(
-                self.plan.equation(),
-                &self.plan,
-                &final_value,
-                candidate.final_output_permutation(),
-                requested,
-            )?;
-            T::write_accumulators(&mut outputs[0], requested)
-        })
+        let actual_workspace_bytes = contraction_tree_capacity_bytes(
+            self.plan.equation(),
+            &final_value,
+            &values,
+            &temporary_slots,
+        )?;
+        if actual_workspace_bytes > admitted_workspace_bytes
+            || actual_workspace_bytes > workspace_limit
+        {
+            return Err(EpError::KernelFailed(format!(
+                "Einsum `{}` contraction-tree accumulator workspace retained \
+                 {actual_workspace_bytes} bytes after admitting {admitted_workspace_bytes} bytes \
+                 against the {workspace_limit}-byte limit. HOW: use the GenericNative route or \
+                 reduce the output/intermediate extents.",
+                self.plan.equation()
+            )));
+        }
+        drop(values);
+        drop(temporary_slots);
+        write_tree_output::<T>(
+            self.plan.equation(),
+            &self.plan,
+            &final_value,
+            candidate.final_output_permutation(),
+            &mut outputs[0],
+        )?;
+        Ok(actual_workspace_bytes)
     }
 
     fn execute_generic(
@@ -1750,10 +1797,7 @@ impl EinsumKernel {
     fn record_route(&self, _route: EinsumRoute) {}
 }
 
-trait EinsumElement: NumericElem + Send + Sync + 'static
-where
-    Self::Acc: Send + Sync + 'static,
-{
+trait EinsumElement: NumericElem<Acc: Send + Sync + 'static> + Send + Sync + 'static {
     fn one() -> Self::Acc {
         Self::from_f32_scalar(1.0).to_acc()
     }
@@ -1945,6 +1989,57 @@ fn value_at<'a, T: EinsumElement>(
                 "Einsum `{equation}` contraction candidate referenced unavailable value {id}"
             ))
         })
+}
+
+fn contraction_tree_workspace_bytes(
+    equation: &str,
+    plan: &EinsumShapePlan,
+    candidate: &EinsumSupportedContractionTreeCandidate,
+    output_shape: &[usize],
+    accumulator_size: usize,
+) -> Result<usize> {
+    let output_elements = checked_numel("contraction-tree output", output_shape)?;
+    let mut slot_elements = vec![0usize; candidate.cost().slot_count()];
+    for temporary in candidate.temporaries() {
+        let shape = axes_shape(plan, temporary.axes())?;
+        let elements = checked_numel("contraction-tree retained temporary slot", &shape)?;
+        let slot = slot_elements.get_mut(temporary.slot()).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "Einsum `{equation}` contraction candidate references missing retained slot {}",
+                temporary.slot()
+            ))
+        })?;
+        *slot = (*slot).max(elements);
+    }
+    slot_elements
+        .into_iter()
+        .try_fold(output_elements, usize::checked_add)
+        .and_then(|elements| elements.checked_mul(accumulator_size))
+        .ok_or_else(|| geometry_overflow(equation, "contraction-tree retained workspace"))
+}
+
+fn contraction_tree_capacity_bytes<T: EinsumElement>(
+    equation: &str,
+    final_value: &DenseTreeValue<T::Acc>,
+    values: &[Option<TreeValue<T>>],
+    slots: &[Option<Vec<T::Acc>>],
+) -> Result<usize> {
+    let mut elements = final_value.data.capacity();
+    for value in values.iter().flatten() {
+        if let TreeValue::Dense(value) = value {
+            elements = elements.checked_add(value.data.capacity()).ok_or_else(|| {
+                geometry_overflow(equation, "contraction-tree live value capacity")
+            })?;
+        }
+    }
+    for slot in slots.iter().flatten() {
+        elements = elements.checked_add(slot.capacity()).ok_or_else(|| {
+            geometry_overflow(equation, "contraction-tree retained slot capacity")
+        })?;
+    }
+    elements
+        .checked_mul(std::mem::size_of::<T::Acc>())
+        .ok_or_else(|| geometry_overflow(equation, "contraction-tree accumulator capacity"))
 }
 
 fn take_tree_output_buffer<A: Default>(
@@ -2161,31 +2256,26 @@ fn evaluate_tree_product<T: EinsumElement>(
     Ok(())
 }
 
-fn permute_tree_output<A: Copy>(
+fn write_tree_output<T: EinsumElement>(
     equation: &str,
     plan: &EinsumShapePlan,
-    final_value: &DenseTreeValue<A>,
+    final_value: &DenseTreeValue<T::Acc>,
     permutation: &[usize],
-    requested: &mut [A],
+    output: &mut TensorMut,
 ) -> Result<()> {
     let requested_shape = axes_shape(plan, plan.output_axes())?;
     let requested_len = checked_numel("contraction-tree requested output", &requested_shape)?;
-    if requested.len() != requested_len || final_value.data.len() != requested_len {
+    if final_value.data.len() != requested_len {
         return Err(EpError::KernelFailed(format!(
             "Einsum `{equation}` contraction final element count mismatch: canonical={}, \
-             requested={}, output={requested_len}",
-            final_value.data.len(),
-            requested.len()
+             output={requested_len}",
+            final_value.data.len()
         )));
-    }
-    if requested_len == 0 {
-        return Ok(());
     }
     if final_value.axes == plan.output_axes()
         && (permutation.is_empty() || permutation.iter().copied().eq(0..permutation.len()))
     {
-        requested.copy_from_slice(&final_value.data);
-        return Ok(());
+        return T::write_accumulators(output, &final_value.data);
     }
     if permutation.len() != requested_shape.len() || permutation.len() != final_value.shape.len() {
         return Err(EpError::KernelFailed(format!(
@@ -2196,9 +2286,31 @@ fn permute_tree_output<A: Copy>(
             final_value.shape.len()
         )));
     }
+    output.validate()?;
+    if output.dtype != T::DTYPE {
+        return Err(EpError::InvalidTensorView {
+            reason: format!(
+                "Einsum `{equation}` expected {:?} output, got {:?}",
+                T::DTYPE,
+                output.dtype
+            ),
+        });
+    }
+    if output.shape != requested_shape {
+        return Err(EpError::InvalidTensorView {
+            reason: format!(
+                "Einsum `{equation}` expected output shape {requested_shape:?}, got {:?}",
+                output.shape
+            ),
+        });
+    }
+    if requested_len == 0 {
+        return Ok(());
+    }
     let canonical_strides = compute_contiguous_strides(&final_value.shape);
     let mut requested_index = vec![0usize; requested_shape.len()];
-    for (linear, destination) in requested.iter_mut().enumerate() {
+    let output_origin = output.data_ptr_mut::<T>();
+    for linear in 0..requested_len {
         decode_row_major(linear, &requested_shape, &mut requested_index);
         let mut canonical_offset = 0usize;
         for (requested_axis, &canonical_axis) in permutation.iter().enumerate() {
@@ -2217,13 +2329,22 @@ fn permute_tree_output<A: Copy>(
                 )
                 .ok_or_else(|| geometry_overflow(equation, "contraction final output offset"))?;
         }
-        *destination = *final_value.data.get(canonical_offset).ok_or_else(|| {
+        let value = *final_value.data.get(canonical_offset).ok_or_else(|| {
             EpError::KernelFailed(format!(
                 "Einsum `{equation}` contraction final offset {canonical_offset} exceeds {} \
                  canonical element(s)",
                 final_value.data.len()
             ))
         })?;
+        let output_offset = elem_offset(output.strides, &requested_index);
+        // SAFETY: `output` is validated, `requested_index` is in shape, and the
+        // row-major walk visits each logical output once. The final accumulator
+        // is an independent allocation, so no source element aliases output.
+        unsafe {
+            output_origin
+                .offset(output_offset)
+                .write_unaligned(T::from_acc(value));
+        }
     }
     Ok(())
 }
@@ -4000,6 +4121,58 @@ mod tests {
             .expect("128-input GenericNative fallback executes");
         assert_eq!(output.to_f32(), [1.0]);
         assert_eq!(route(&*kernel), 3);
+    }
+
+    #[test]
+    fn contraction_tree_boundary_counts_slots_without_publication_scratch() {
+        const ROWS: usize = 4094;
+        const COLUMNS: usize = 2048;
+        const OUTPUT_BYTES: usize = ROWS * COLUMNS * std::mem::size_of::<f32>();
+        const RETAINED_SLOT_BYTES: usize = COLUMNS * std::mem::size_of::<f32>();
+        const EXPECTED_WORKSPACE_BYTES: usize = OUTPUT_BYTES + RETAINED_SLOT_BYTES;
+
+        assert_eq!(
+            EXPECTED_WORKSPACE_BYTES,
+            usize::try_from(DEFAULT_PER_THREAD_ACCUMULATOR_BYTES).unwrap() - 8192
+        );
+
+        let retention = EinsumScratchRetention::default();
+        let kernel = kernel_with_retention(
+            "ab,bc,cd->ad",
+            &[vec![ROWS, 1], vec![1, 1], vec![1, COLUMNS]],
+            ExecutionMode::Optimized,
+            retention.clone(),
+        );
+        let left = Owned::f32(&[ROWS, 1], &vec![1.0; ROWS]);
+        let middle = Owned::f32(&[1, 1], &[1.0]);
+        let right = Owned::f32(&[1, COLUMNS], &vec![1.0; COLUMNS]);
+        let mut output = Owned::zeros_f32(&[ROWS, COLUMNS]);
+        kernel
+            .execute(
+                &[left.view(), middle.view(), right.view()],
+                &mut [output.view_mut()],
+            )
+            .expect("the admitted near-limit contraction tree executes");
+
+        assert_eq!(route(&*kernel), 4);
+        assert_eq!(
+            benchmark_last_workspace_bytes(&*kernel),
+            Some(EXPECTED_WORKSPACE_BYTES),
+            "telemetry must count the final accumulator plus the retained temporary-slot capacity"
+        );
+        assert_eq!(
+            retention.current_thread_capacity_bytes(),
+            0,
+            "tree publication must not check out and park a second output-sized accumulator"
+        );
+        assert_eq!(
+            f32::from_ne_bytes(output.bytes[..4].try_into().unwrap()),
+            1.0
+        );
+        assert_eq!(
+            f32::from_ne_bytes(output.bytes[output.bytes.len() - 4..].try_into().unwrap()),
+            1.0
+        );
     }
 
     #[test]
