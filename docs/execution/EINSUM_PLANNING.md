@@ -181,8 +181,16 @@ space on device, so arbitrary-N expressions require no exponential
 intermediate. Bounded exact-DP/greedy trees reuse device temporary slots and may
 use cuBLASLt for f32 binary steps only when storage, accumulation, broadcast,
 and output-layout contracts match; otherwise that step remains generic.
-F16/BF16 inputs and intermediates accumulate in f32 and narrow once at the
-final output. Integer arithmetic wraps at the declared width.
+cuBLASLt selection receives the alignment proven by each actual tensor origin
+(base pointer plus byte offset), and the cached plan records the selected
+algorithm's minimum A/B/C/D alignment so later launches cannot silently weaken
+that proof. F16/BF16 cuBLASLt selection excludes in-place and output-type
+split-K reductions, then verifies the selected split-K/reduction configuration;
+unsupported alignment or precision contracts fall back to `GenericNative`.
+F16/BF16 inputs and intermediates accumulate in f32 and narrow once at the final
+output. Integer arithmetic uses explicit unsigned intermediates and narrows
+after each operation, implementing exact declared-width modular arithmetic
+without signed-overflow behavior.
 
 The CPU EP still has its earlier staged execution coverage and may decline
 general contraction trees or dtypes that its native kernel has not implemented.

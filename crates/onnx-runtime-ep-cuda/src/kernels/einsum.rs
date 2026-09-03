@@ -28,7 +28,8 @@ use onnx_runtime_ir::{
 
 use super::movement::{PersistentMetadata, launch_persistent_metadata};
 use crate::blas::{
-    self, CaptureStridedBatchedGemmPlan, GemmDtype, StridedBatchedGemmParams, WORKSPACE_BYTES,
+    self, CaptureStridedBatchedGemmPlan, GemmDtype, RowMajorGemmAlgorithmContract,
+    StridedBatchedGemmParams, WORKSPACE_BYTES,
 };
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
@@ -61,6 +62,7 @@ pub struct EinsumExecutionStats {
     pub optimized_step_launches: u64,
     pub optimized_cublas_launches: u64,
     pub plan_rewarms: u64,
+    pub cublas_algorithm_contract: Option<RowMajorGemmAlgorithmContract>,
     pub last_route: Option<CudaEinsumRoute>,
 }
 
@@ -85,6 +87,8 @@ static OPTIMIZED_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 static OPTIMIZED_STEP_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 static OPTIMIZED_CUBLAS_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 static PLAN_REWARMS: AtomicU64 = AtomicU64::new(0);
+static LAST_CUBLAS_ALGORITHM_CONTRACT: Mutex<Option<RowMajorGemmAlgorithmContract>> =
+    Mutex::new(None);
 static LAST_ROUTE: Mutex<Option<CudaEinsumRoute>> = Mutex::new(None);
 
 pub fn einsum_execution_stats() -> EinsumExecutionStats {
@@ -115,6 +119,9 @@ pub fn einsum_execution_stats() -> EinsumExecutionStats {
         optimized_step_launches: OPTIMIZED_STEP_LAUNCHES.load(Ordering::Relaxed),
         optimized_cublas_launches: OPTIMIZED_CUBLAS_LAUNCHES.load(Ordering::Relaxed),
         plan_rewarms: PLAN_REWARMS.load(Ordering::Relaxed),
+        cublas_algorithm_contract: *LAST_CUBLAS_ALGORITHM_CONTRACT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
         last_route: *LAST_ROUTE.lock().unwrap_or_else(|error| error.into_inner()),
     }
 }
@@ -143,6 +150,9 @@ pub fn reset_einsum_execution_stats() {
     OPTIMIZED_STEP_LAUNCHES.store(0, Ordering::Relaxed);
     OPTIMIZED_CUBLAS_LAUNCHES.store(0, Ordering::Relaxed);
     PLAN_REWARMS.store(0, Ordering::Relaxed);
+    *LAST_CUBLAS_ALGORITHM_CONTRACT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
     *LAST_ROUTE.lock().unwrap_or_else(|error| error.into_inner()) = None;
 }
 
@@ -572,7 +582,7 @@ struct CachedExecution {
 }
 
 impl CachedExecution {
-    fn matches(&self, inputs: &[TensorView], output: &TensorMut) -> bool {
+    fn matches_metadata(&self, inputs: &[TensorView], output: &TensorMut) -> bool {
         self.dtype == inputs[0].dtype
             && self.input_shapes.len() == inputs.len()
             && self
@@ -590,15 +600,14 @@ struct CachedGemm {
 }
 
 impl CachedGemm {
-    fn launch(
+    fn params(
         &self,
         layout: &ContractionLayout,
-        runtime: &CudaRuntime,
         a: CUdeviceptr,
         b: CUdeviceptr,
         c: CUdeviceptr,
-    ) -> Result<()> {
-        let params = StridedBatchedGemmParams {
+    ) -> Result<StridedBatchedGemmParams> {
+        Ok(StridedBatchedGemmParams {
             dtype: einsum_dtype(layout.dtype)?,
             a,
             b,
@@ -611,7 +620,28 @@ impl CachedGemm {
             transpose_b: layout.right_order == StorageOrder::Transposed,
             a_batch_stride: layout.left_batch_stride,
             b_batch_stride: layout.right_batch_stride,
-        };
+        })
+    }
+
+    fn supports(
+        &self,
+        layout: &ContractionLayout,
+        a: CUdeviceptr,
+        b: CUdeviceptr,
+        c: CUdeviceptr,
+    ) -> Result<bool> {
+        Ok(self.plan.supports(&self.params(layout, a, b, c)?))
+    }
+
+    fn launch(
+        &self,
+        layout: &ContractionLayout,
+        runtime: &CudaRuntime,
+        a: CUdeviceptr,
+        b: CUdeviceptr,
+        c: CUdeviceptr,
+    ) -> Result<()> {
+        let params = self.params(layout, a, b, c)?;
         // SAFETY: the cached layout was admitted against these exact contiguous
         // input/output shapes; aliasing was rejected by the caller; workspace
         // is the exact persistent allocation selected during warmup.
@@ -625,6 +655,10 @@ impl CachedGemm {
                     .map_or(0, |workspace| workspace.ptr()),
             )
         }
+    }
+
+    fn algorithm_contract(&self) -> RowMajorGemmAlgorithmContract {
+        self.plan.algorithm_contract()
     }
 }
 
@@ -845,6 +879,11 @@ fn checked_strided_byte_range(
 
 impl EinsumKernel {
     fn record_route(&self, route: CudaEinsumRoute) {
+        if route != CudaEinsumRoute::CudaCublas {
+            *LAST_CUBLAS_ALGORITHM_CONTRACT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+        }
         *self
             .last_route
             .lock()
@@ -919,7 +958,13 @@ impl EinsumKernel {
         Ok(dtype)
     }
 
-    fn compile_contraction(&self, dtype: DataType) -> Result<CachedExecution> {
+    fn compile_contraction(
+        &self,
+        dtype: DataType,
+        a: CUdeviceptr,
+        b: CUdeviceptr,
+        c: CUdeviceptr,
+    ) -> Result<CachedExecution> {
         let start = Instant::now();
         let EinsumPlanningClassification::Gemm(contraction) = self.plan.planning_classification()
         else {
@@ -938,9 +983,9 @@ impl EinsumKernel {
         } else {
             let params = StridedBatchedGemmParams {
                 dtype: einsum_dtype(dtype)?,
-                a: 0,
-                b: 0,
-                c: 0,
+                a,
+                b,
+                c,
                 m: layout.m,
                 k: layout.k,
                 n: layout.n,
@@ -1028,6 +1073,9 @@ impl EinsumKernel {
                 )));
             }
         }
+        let a_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
+        let b_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
+        let c_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let capturing = self.runtime.is_capturing()?;
         let mut execution = self.execution.lock().map_err(|_| {
             EpError::KernelFailed(format!(
@@ -1037,21 +1085,31 @@ impl EinsumKernel {
         })?;
         if execution
             .as_ref()
-            .is_some_and(|cached| !cached.matches(inputs, &outputs[0]))
+            .is_some_and(|cached| !cached.matches_metadata(inputs, &outputs[0]))
         {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Einsum `{}`: runtime dtype/shape/output changed after the immutable CUDA plan was built",
                 self.plan.equation()
             )));
         }
-        let compiled = if execution.is_none() {
+        let alignment_matches = match execution.as_ref() {
+            Some(cached) => match &cached.kind {
+                ExecutionKind::Gemm(gemm) => gemm.supports(&cached.layout, a_ptr, b_ptr, c_ptr)?,
+                ExecutionKind::NoOp | ExecutionKind::ZeroFill => true,
+            },
+            None => false,
+        };
+        let needs_compile = execution.is_none() || !alignment_matches;
+        let replacing = execution.is_some();
+        let compiled = if needs_compile {
             if capturing {
                 return Err(EpError::KernelFailed(format!(
-                    "cuda_ep Einsum `{}`: exact dtype/shape/layout was not warmed before CUDA graph capture",
-                    self.plan.equation()
+                    "cuda_ep Einsum `{}`: exact dtype/shape/layout and cuBLASLt pointer-alignment \
+                     contract were not warmed before CUDA graph capture",
+                    self.plan.equation(),
                 )));
             }
-            match self.compile_contraction(dtype) {
+            match self.compile_contraction(dtype, a_ptr, b_ptr, c_ptr) {
                 Ok(compiled) => Some(compiled),
                 Err(_) if fallback_to_generic => {
                     drop(execution);
@@ -1081,10 +1139,6 @@ impl EinsumKernel {
             )));
         }
 
-        let a_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
-        let b_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
-        let c_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-
         match &cached.kind {
             ExecutionKind::NoOp => {}
             ExecutionKind::ZeroFill => {
@@ -1113,11 +1167,20 @@ impl EinsumKernel {
                     CANONICAL_GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
                 }
             }
-        }
+        };
+        *LAST_CUBLAS_ALGORITHM_CONTRACT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = match &cached.kind {
+            ExecutionKind::Gemm(gemm) => Some(gemm.algorithm_contract()),
+            ExecutionKind::NoOp | ExecutionKind::ZeroFill => None,
+        };
         if capturing {
             CAPTURE_RECORDINGS.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(compiled) = compiled {
+            if replacing {
+                PLAN_REWARMS.fetch_add(1, Ordering::Relaxed);
+            }
             *execution = Some(compiled);
         }
         self.last_call_capture_safe.store(true, Ordering::Relaxed);

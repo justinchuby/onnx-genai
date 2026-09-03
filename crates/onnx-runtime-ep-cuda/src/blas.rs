@@ -48,6 +48,7 @@
 
 use core::ffi::c_int;
 use std::ffi::c_void;
+use std::mem::MaybeUninit;
 
 use cudarc::cublaslt::{result, sys};
 use cudarc::driver::sys::CUdeviceptr;
@@ -84,6 +85,17 @@ impl GemmDtype {
     /// (NOT TF32 — see the module docs for why that matters).
     fn compute_type(self) -> sys::cublasComputeType_t {
         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+    }
+
+    const fn byte_size(self) -> u32 {
+        match self {
+            GemmDtype::F32 => 4,
+            GemmDtype::F16 | GemmDtype::Bf16 => 2,
+        }
+    }
+
+    const fn requires_f32_reduction_storage(self) -> bool {
+        matches!(self, GemmDtype::F16 | GemmDtype::Bf16)
     }
 }
 
@@ -220,10 +232,16 @@ impl Drop for MatmulDesc {
 struct MatmulPref(sys::cublasLtMatmulPreference_t);
 
 impl MatmulPref {
-    fn new(workspace_bytes: usize) -> Result<Self> {
+    fn new(
+        workspace_bytes: usize,
+        alignments: MatmulPointerAlignments,
+        dtype: GemmDtype,
+    ) -> Result<Self> {
         let h = result::create_matmul_pref()
             .map_err(|e| cublas_err("cublasLtMatmulPreferenceCreate", e))?;
-        // SAFETY: `h` is live; the attribute buffer is a local `usize`.
+        let pref = Self(h);
+        // SAFETY: `h` is live; every attribute buffer has the documented type
+        // and remains live for the complete call.
         unsafe {
             result::set_matmul_pref_attribute(
                 h,
@@ -232,8 +250,49 @@ impl MatmulPref {
                 std::mem::size_of::<usize>(),
             )
             .map_err(|e| cublas_err("set MAX_WORKSPACE_BYTES", e))?;
+            for (attribute, alignment, name) in [
+                (
+                    sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
+                    alignments.a,
+                    "MIN_ALIGNMENT_A_BYTES",
+                ),
+                (
+                    sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
+                    alignments.b,
+                    "MIN_ALIGNMENT_B_BYTES",
+                ),
+                (
+                    sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,
+                    alignments.c,
+                    "MIN_ALIGNMENT_C_BYTES",
+                ),
+                (
+                    sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
+                    alignments.d,
+                    "MIN_ALIGNMENT_D_BYTES",
+                ),
+            ] {
+                result::set_matmul_pref_attribute(
+                    h,
+                    attribute,
+                    (&alignment) as *const u32 as *const c_void,
+                    std::mem::size_of::<u32>(),
+                )
+                .map_err(|e| cublas_err(&format!("set {name}"), e))?;
+            }
+            if dtype.requires_f32_reduction_storage() {
+                let mask =
+                    sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
+                result::set_matmul_pref_attribute(
+                    h,
+                    sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                    (&mask) as *const u32 as *const c_void,
+                    std::mem::size_of::<u32>(),
+                )
+                .map_err(|e| cublas_err("set REDUCTION_SCHEME_MASK", e))?;
+            }
         }
-        Ok(Self(h))
+        Ok(pref)
     }
 }
 
@@ -325,6 +384,316 @@ pub struct GemmEpilogue {
 /// Phase 2b: pool this per-stream instead of allocating it per call.
 pub const WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 pub const WORKSPACE_ALIGNMENT: usize = 256;
+const MAX_REPORTED_POINTER_ALIGNMENT: u32 = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MatmulPointers {
+    a: CUdeviceptr,
+    b: CUdeviceptr,
+    c: CUdeviceptr,
+    d: CUdeviceptr,
+}
+
+impl MatmulPointers {
+    fn row_major(a: CUdeviceptr, b: CUdeviceptr, c: CUdeviceptr) -> Self {
+        Self {
+            a: b,
+            b: a,
+            c,
+            d: c,
+        }
+    }
+
+    fn column_major(a: CUdeviceptr, b: CUdeviceptr, c: CUdeviceptr) -> Self {
+        Self { a, b, c, d: c }
+    }
+
+    fn alignments(
+        self,
+        dtype: GemmDtype,
+        authority: PointerAlignmentAuthority,
+    ) -> MatmulPointerAlignments {
+        MatmulPointerAlignments {
+            a: pointer_alignment(self.a, dtype, authority),
+            b: pointer_alignment(self.b, dtype, authority),
+            c: pointer_alignment(self.c, dtype, authority),
+            d: pointer_alignment(self.d, dtype, authority),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PointerAlignmentAuthority {
+    ActualAddress,
+    TypedMinimum,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MatmulPointerAlignments {
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+}
+
+impl MatmulPointerAlignments {
+    fn proves(self, required: Self) -> bool {
+        self.a >= required.a && self.b >= required.b && self.c >= required.c && self.d >= required.d
+    }
+}
+
+fn pointer_alignment(
+    pointer: CUdeviceptr,
+    dtype: GemmDtype,
+    authority: PointerAlignmentAuthority,
+) -> u32 {
+    if matches!(authority, PointerAlignmentAuthority::TypedMinimum) {
+        return dtype.byte_size();
+    }
+    if pointer == 0 {
+        return 1;
+    }
+    let power = pointer
+        .trailing_zeros()
+        .min(MAX_REPORTED_POINTER_ALIGNMENT.trailing_zeros());
+    1u32 << power
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CublasLtReductionScheme {
+    None,
+    InPlace,
+    ComputeType,
+    OutputType,
+    Unknown(u32),
+}
+
+impl CublasLtReductionScheme {
+    fn from_raw(value: u32) -> Self {
+        match value {
+            value
+                if value
+                    == sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_NONE as u32 =>
+            {
+                Self::None
+            }
+            value
+                if value
+                    == sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_INPLACE as u32 =>
+            {
+                Self::InPlace
+            }
+            value
+                if value
+                    == sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE
+                        as u32 =>
+            {
+                Self::ComputeType
+            }
+            value
+                if value
+                    == sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE
+                        as u32 =>
+            {
+                Self::OutputType
+            }
+            value => Self::Unknown(value),
+        }
+    }
+
+    #[must_use]
+    pub const fn preserves_f32_intermediates(self) -> bool {
+        matches!(self, Self::None | Self::ComputeType)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowMajorGemmAlgorithmContract {
+    pub a_min_alignment_bytes: u32,
+    pub b_min_alignment_bytes: u32,
+    pub c_min_alignment_bytes: u32,
+    pub split_k: i32,
+    pub reduction_scheme: CublasLtReductionScheme,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MatmulAlgorithmContract {
+    required_alignments: MatmulPointerAlignments,
+    split_k: i32,
+    reduction_scheme: CublasLtReductionScheme,
+}
+
+impl MatmulAlgorithmContract {
+    fn query(
+        algo: &sys::cublasLtMatmulAlgo_t,
+        dtype: GemmDtype,
+        available_alignments: MatmulPointerAlignments,
+    ) -> Result<Self> {
+        let required_alignments = MatmulPointerAlignments {
+            a: algo_cap_u32(
+                algo,
+                sys::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_A_BYTES,
+                "MIN_ALIGNMENT_A_BYTES",
+            )?
+            .max(1),
+            b: algo_cap_u32(
+                algo,
+                sys::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_B_BYTES,
+                "MIN_ALIGNMENT_B_BYTES",
+            )?
+            .max(1),
+            c: algo_cap_u32(
+                algo,
+                sys::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_C_BYTES,
+                "MIN_ALIGNMENT_C_BYTES",
+            )?
+            .max(1),
+            d: algo_cap_u32(
+                algo,
+                sys::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_D_BYTES,
+                "MIN_ALIGNMENT_D_BYTES",
+            )?
+            .max(1),
+        };
+        if !available_alignments.proves(required_alignments) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: cuBLASLt selected pointer alignments {required_alignments:?}, but the \
+                 actual typed pointers prove only {available_alignments:?}"
+            )));
+        }
+        let split_k = algo_config_i32(
+            algo,
+            sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+            "SPLITK_NUM",
+        )?;
+        if split_k < 1 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: cuBLASLt selected invalid split-K count {split_k}"
+            )));
+        }
+        let reduction_scheme = CublasLtReductionScheme::from_raw(algo_config_u32(
+            algo,
+            sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+            "REDUCTION_SCHEME",
+        )?);
+        if dtype.requires_f32_reduction_storage() && !reduction_scheme.preserves_f32_intermediates()
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: cuBLASLt selected {reduction_scheme:?} reduction for {dtype:?}; \
+                 f16/bf16 GEMM requires F32 reduction intermediates and one final narrowing store"
+            )));
+        }
+        Ok(Self {
+            required_alignments,
+            split_k,
+            reduction_scheme,
+        })
+    }
+
+    fn supports(self, dtype: GemmDtype, pointers: MatmulPointers) -> bool {
+        pointers
+            .alignments(dtype, PointerAlignmentAuthority::ActualAddress)
+            .proves(self.required_alignments)
+    }
+
+    fn row_major(self) -> RowMajorGemmAlgorithmContract {
+        RowMajorGemmAlgorithmContract {
+            a_min_alignment_bytes: self.required_alignments.b,
+            b_min_alignment_bytes: self.required_alignments.a,
+            c_min_alignment_bytes: self.required_alignments.c.max(self.required_alignments.d),
+            split_k: self.split_k,
+            reduction_scheme: self.reduction_scheme,
+        }
+    }
+}
+
+fn algo_cap_u32(
+    algo: &sys::cublasLtMatmulAlgo_t,
+    attribute: sys::cublasLtMatmulAlgoCapAttributes_t,
+    name: &str,
+) -> Result<u32> {
+    let mut value = MaybeUninit::<u32>::uninit();
+    let mut written = 0usize;
+    // SAFETY: `algo` is initialized by the heuristic; `value` has the
+    // documented attribute type and `written` is a valid output pointer.
+    unsafe {
+        sys::cublasLtMatmulAlgoCapGetAttribute(
+            algo,
+            attribute,
+            value.as_mut_ptr().cast::<c_void>(),
+            std::mem::size_of::<u32>(),
+            &mut written,
+        )
+    }
+    .result()
+    .map_err(|error| cublas_err(&format!("get ALGO_CAP_{name}"), error))?;
+    if written != std::mem::size_of::<u32>() {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep: cuBLASLt ALGO_CAP_{name} wrote {written} bytes, expected {}",
+            std::mem::size_of::<u32>()
+        )));
+    }
+    // SAFETY: cuBLASLt reported that it initialized exactly one `u32`.
+    Ok(unsafe { value.assume_init() })
+}
+
+fn algo_config_i32(
+    algo: &sys::cublasLtMatmulAlgo_t,
+    attribute: sys::cublasLtMatmulAlgoConfigAttributes_t,
+    name: &str,
+) -> Result<i32> {
+    let mut value = MaybeUninit::<i32>::uninit();
+    let mut written = 0usize;
+    // SAFETY: same attribute-buffer contract as [`algo_cap_u32`].
+    unsafe {
+        sys::cublasLtMatmulAlgoConfigGetAttribute(
+            algo,
+            attribute,
+            value.as_mut_ptr().cast::<c_void>(),
+            std::mem::size_of::<i32>(),
+            &mut written,
+        )
+    }
+    .result()
+    .map_err(|error| cublas_err(&format!("get ALGO_CONFIG_{name}"), error))?;
+    if written != std::mem::size_of::<i32>() {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep: cuBLASLt ALGO_CONFIG_{name} wrote {written} bytes, expected {}",
+            std::mem::size_of::<i32>()
+        )));
+    }
+    // SAFETY: cuBLASLt reported that it initialized exactly one `i32`.
+    Ok(unsafe { value.assume_init() })
+}
+
+fn algo_config_u32(
+    algo: &sys::cublasLtMatmulAlgo_t,
+    attribute: sys::cublasLtMatmulAlgoConfigAttributes_t,
+    name: &str,
+) -> Result<u32> {
+    let mut value = MaybeUninit::<u32>::uninit();
+    let mut written = 0usize;
+    // SAFETY: same attribute-buffer contract as [`algo_cap_u32`].
+    unsafe {
+        sys::cublasLtMatmulAlgoConfigGetAttribute(
+            algo,
+            attribute,
+            value.as_mut_ptr().cast::<c_void>(),
+            std::mem::size_of::<u32>(),
+            &mut written,
+        )
+    }
+    .result()
+    .map_err(|error| cublas_err(&format!("get ALGO_CONFIG_{name}"), error))?;
+    if written != std::mem::size_of::<u32>() {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep: cuBLASLt ALGO_CONFIG_{name} wrote {written} bytes, expected {}",
+            std::mem::size_of::<u32>()
+        )));
+    }
+    // SAFETY: cuBLASLt reported that it initialized exactly one `u32`.
+    Ok(unsafe { value.assume_init() })
+}
 
 /// Attribute exact cuBLASLt scratch to the one session-persistent shared slot.
 ///
@@ -350,9 +719,31 @@ struct PlannedMatmul {
     _desc: MatmulDesc,
     algo: sys::cublasLtMatmulAlgo_t,
     workspace_bytes: usize,
+    dtype: GemmDtype,
+    contract: MatmulAlgorithmContract,
 }
 
-fn plan_gemm(handle: &CublasLt, p: &GemmParams) -> Result<PlannedMatmul> {
+impl PlannedMatmul {
+    fn validate_pointers(&self, pointers: MatmulPointers, operation: &str) -> Result<()> {
+        if self.contract.supports(self.dtype, pointers) {
+            Ok(())
+        } else {
+            Err(EpError::KernelFailed(format!(
+                "cuda_ep {operation}: actual cuBLASLt pointer alignments {:?} do not satisfy \
+                 the selected algorithm contract {:?}; rebuild the plan for these tensor origins \
+                 or use the generic native route",
+                pointers.alignments(self.dtype, PointerAlignmentAuthority::ActualAddress),
+                self.contract.required_alignments
+            )))
+        }
+    }
+}
+
+fn plan_gemm(
+    handle: &CublasLt,
+    p: &GemmParams,
+    alignment_authority: PointerAlignmentAuthority,
+) -> Result<PlannedMatmul> {
     if p.m == 0 || p.n == 0 || p.k == 0 || p.batch == 0 {
         return Err(EpError::KernelFailed(format!(
             "cuda_ep MatMul: degenerate GEMM dims M={} K={} N={} batch={}",
@@ -380,7 +771,9 @@ fn plan_gemm(handle: &CublasLt, p: &GemmParams) -> Result<PlannedMatmul> {
     if let Some(epilogue) = p.epilogue {
         desc.set_epilogue(epilogue)?;
     }
-    let pref = MatmulPref::new(WORKSPACE_BYTES)?;
+    let pointers = MatmulPointers::row_major(p.a, p.b, p.c);
+    let available_alignments = pointers.alignments(p.dtype, alignment_authority);
+    let pref = MatmulPref::new(WORKSPACE_BYTES, available_alignments, p.dtype)?;
     // SAFETY: all descriptor/layout handles are live for the duration of the call.
     let heuristic = unsafe {
         result::get_matmul_algo_heuristic(
@@ -402,6 +795,7 @@ fn plan_gemm(handle: &CublasLt, p: &GemmParams) -> Result<PlannedMatmul> {
             e,
         )
     })?;
+    let contract = MatmulAlgorithmContract::query(&heuristic.algo, p.dtype, available_alignments)?;
     Ok(PlannedMatmul {
         a_layout,
         b_layout,
@@ -409,6 +803,8 @@ fn plan_gemm(handle: &CublasLt, p: &GemmParams) -> Result<PlannedMatmul> {
         _desc: desc,
         algo: heuristic.algo,
         workspace_bytes: heuristic.workspaceSize,
+        dtype: p.dtype,
+        contract,
     })
 }
 
@@ -418,7 +814,7 @@ fn plan_gemm(handle: &CublasLt, p: &GemmParams) -> Result<PlannedMatmul> {
 /// and governed execution both call this same planner, then execution refuses a
 /// short buffer before submitting the matmul.
 pub fn gemm_workspace_bytes(handle: &CublasLt, p: &GemmParams) -> Result<usize> {
-    Ok(plan_gemm(handle, p)?.workspace_bytes)
+    Ok(plan_gemm(handle, p, PointerAlignmentAuthority::TypedMinimum)?.workspace_bytes)
 }
 
 unsafe fn launch_planned_gemm(
@@ -428,6 +824,7 @@ unsafe fn launch_planned_gemm(
     plan: &PlannedMatmul,
     workspace: CUdeviceptr,
 ) -> Result<()> {
+    plan.validate_pointers(MatmulPointers::row_major(p.a, p.b, p.c), "MatMul")?;
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
     // SAFETY: layouts/desc/algo are live; a/b/c/workspace are caller-guaranteed
@@ -503,7 +900,7 @@ pub unsafe fn gemm(
     workspace: CUdeviceptr,
     workspace_bytes: usize,
 ) -> Result<()> {
-    let plan = plan_gemm(handle, p)?;
+    let plan = plan_gemm(handle, p, PointerAlignmentAuthority::TypedMinimum)?;
     if workspace_bytes < plan.workspace_bytes || (plan.workspace_bytes != 0 && workspace == 0) {
         return Err(EpError::KernelFailed(format!(
             "cuda_ep MatMul: cuBLASLt selected {} workspace bytes, supplied {workspace_bytes}",
@@ -527,7 +924,7 @@ pub unsafe fn governed_gemm(
     workspace: Option<WorkspaceView>,
     op: &str,
 ) -> Result<()> {
-    let plan = plan_gemm(handle, p)?;
+    let plan = plan_gemm(handle, p, PointerAlignmentAuthority::TypedMinimum)?;
     let ptr = governed_workspace_ptr(workspace, plan.workspace_bytes, op)?;
     // SAFETY: forwarded from the caller; `ptr` covers the exact selected bytes.
     unsafe { launch_planned_gemm(handle, stream, p, &plan, ptr) }
@@ -540,9 +937,10 @@ pub unsafe fn governed_gemm(
 /// and supplies a persistent workspace of at least [`Self::workspace_bytes`]
 /// (see the capture-safe dense path in `kernels::matmul`).
 ///
-/// For a given shape the plan reproduces [`governed_gemm`] exactly: both select
-/// the algorithm through the same [`plan_gemm`] heuristic, so caching changes
-/// only *when* the algorithm is chosen, never the arithmetic.
+/// Capture planning uses the same descriptor and precision policy as
+/// [`governed_gemm`], but may select a faster algorithm when the warm call's
+/// actual pointers prove stronger alignment than the type minimum. The selected
+/// alignment and reduction contracts are retained and checked on every launch.
 pub struct CaptureGemmPlan(PlannedMatmul);
 
 // SAFETY: cuBLASLt layout/descriptor handles are context-independent host
@@ -558,8 +956,23 @@ impl CaptureGemmPlan {
         self.0.workspace_bytes
     }
 
+    #[must_use]
+    pub fn supports(&self, p: &GemmParams) -> bool {
+        self.0.dtype == p.dtype
+            && self
+                .0
+                .contract
+                .supports(p.dtype, MatmulPointers::row_major(p.a, p.b, p.c))
+    }
+
+    #[must_use]
+    pub fn algorithm_contract(&self) -> RowMajorGemmAlgorithmContract {
+        self.0.contract.row_major()
+    }
+
     /// Launch the planned GEMM for `p` (which must have the same shape/dtype the
-    /// plan was selected for; only the `a`/`b`/`c` pointers may differ).
+    /// plan was selected for; only the `a`/`b`/`c` pointers may differ, and they
+    /// must satisfy the retained alignment contract).
     ///
     /// # Safety
     ///
@@ -579,10 +992,14 @@ impl CaptureGemmPlan {
     }
 }
 
-/// Select (once) a reusable [`CaptureGemmPlan`] for `p`'s shape via the same
-/// heuristic [`governed_gemm`] uses per call.
+/// Select a reusable [`CaptureGemmPlan`] for `p`'s shape and actual pointer
+/// alignments.
 pub fn plan_capture_gemm(handle: &CublasLt, p: &GemmParams) -> Result<CaptureGemmPlan> {
-    Ok(CaptureGemmPlan(plan_gemm(handle, p)?))
+    Ok(CaptureGemmPlan(plan_gemm(
+        handle,
+        p,
+        PointerAlignmentAuthority::ActualAddress,
+    )?))
 }
 
 fn checked_layout_dim(value: usize, name: &str) -> Result<u64> {
@@ -680,7 +1097,10 @@ fn plan_strided_batched_gemm(
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
         p.transpose_a,
     )?;
-    let pref = MatmulPref::new(WORKSPACE_BYTES)?;
+    let pointers = MatmulPointers::row_major(p.a, p.b, p.c);
+    let available_alignments =
+        pointers.alignments(p.dtype, PointerAlignmentAuthority::ActualAddress);
+    let pref = MatmulPref::new(WORKSPACE_BYTES, available_alignments, p.dtype)?;
     // SAFETY: all descriptor/layout handles are live for the query.
     let heuristic = unsafe {
         result::get_matmul_algo_heuristic(
@@ -703,6 +1123,7 @@ fn plan_strided_batched_gemm(
             e,
         )
     })?;
+    let contract = MatmulAlgorithmContract::query(&heuristic.algo, p.dtype, available_alignments)?;
     Ok(PlannedMatmul {
         a_layout: b_layout,
         b_layout: a_layout,
@@ -710,6 +1131,8 @@ fn plan_strided_batched_gemm(
         _desc: desc,
         algo: heuristic.algo,
         workspace_bytes: heuristic.workspaceSize,
+        dtype: p.dtype,
+        contract,
     })
 }
 
@@ -728,6 +1151,20 @@ impl CaptureStridedBatchedGemmPlan {
         self.0.workspace_bytes
     }
 
+    #[must_use]
+    pub fn supports(&self, p: &StridedBatchedGemmParams) -> bool {
+        self.0.dtype == p.dtype
+            && self
+                .0
+                .contract
+                .supports(p.dtype, MatmulPointers::row_major(p.a, p.b, p.c))
+    }
+
+    #[must_use]
+    pub fn algorithm_contract(&self) -> RowMajorGemmAlgorithmContract {
+        self.0.contract.row_major()
+    }
+
     /// Launch the warmed contraction. Only A/B/C addresses may differ from the
     /// request used to create this plan.
     ///
@@ -742,6 +1179,8 @@ impl CaptureStridedBatchedGemmPlan {
         p: &StridedBatchedGemmParams,
         workspace: CUdeviceptr,
     ) -> Result<()> {
+        self.0
+            .validate_pointers(MatmulPointers::row_major(p.a, p.b, p.c), "Einsum")?;
         let alpha = 1.0f32;
         let beta = 0.0f32;
         // SAFETY: forwarded from the caller; all plan objects remain live.
@@ -839,7 +1278,11 @@ impl MatmulDesc {
     }
 }
 
-fn plan_gemm_ex(handle: &CublasLt, p: &GemmEx) -> Result<PlannedMatmul> {
+fn plan_gemm_ex(
+    handle: &CublasLt,
+    p: &GemmEx,
+    alignment_authority: PointerAlignmentAuthority,
+) -> Result<PlannedMatmul> {
     if p.m == 0 || p.n == 0 || p.k == 0 {
         return Err(EpError::KernelFailed(format!(
             "cuda_ep attention GEMM: degenerate dims M={} N={} K={}",
@@ -873,7 +1316,9 @@ fn plan_gemm_ex(handle: &CublasLt, p: &GemmEx) -> Result<PlannedMatmul> {
     if let Some(epilogue) = p.epilogue {
         desc.set_epilogue(epilogue)?;
     }
-    let pref = MatmulPref::new(WORKSPACE_BYTES)?;
+    let pointers = MatmulPointers::column_major(p.a, p.b, p.c);
+    let available_alignments = pointers.alignments(p.dtype, alignment_authority);
+    let pref = MatmulPref::new(WORKSPACE_BYTES, available_alignments, p.dtype)?;
     // SAFETY: all descriptor/layout handles are live for the call.
     let heuristic = unsafe {
         result::get_matmul_algo_heuristic(
@@ -895,6 +1340,7 @@ fn plan_gemm_ex(handle: &CublasLt, p: &GemmEx) -> Result<PlannedMatmul> {
             e,
         )
     })?;
+    let contract = MatmulAlgorithmContract::query(&heuristic.algo, p.dtype, available_alignments)?;
     Ok(PlannedMatmul {
         a_layout,
         b_layout,
@@ -902,12 +1348,14 @@ fn plan_gemm_ex(handle: &CublasLt, p: &GemmEx) -> Result<PlannedMatmul> {
         _desc: desc,
         algo: heuristic.algo,
         workspace_bytes: heuristic.workspaceSize,
+        dtype: p.dtype,
+        contract,
     })
 }
 
 /// Exact scratch selected for a column-major GEMM under [`WORKSPACE_BYTES`].
 pub fn gemm_ex_workspace_bytes(handle: &CublasLt, p: &GemmEx) -> Result<usize> {
-    Ok(plan_gemm_ex(handle, p)?.workspace_bytes)
+    Ok(plan_gemm_ex(handle, p, PointerAlignmentAuthority::TypedMinimum)?.workspace_bytes)
 }
 
 unsafe fn launch_planned_gemm_ex(
@@ -917,6 +1365,10 @@ unsafe fn launch_planned_gemm_ex(
     plan: &PlannedMatmul,
     workspace: CUdeviceptr,
 ) -> Result<()> {
+    plan.validate_pointers(
+        MatmulPointers::column_major(p.a, p.b, p.c),
+        "attention/Gemm",
+    )?;
     let alpha = p.alpha;
     let beta = p.beta;
     // SAFETY: layouts/desc/algo live; a/b/c/workspace are caller-guaranteed
@@ -967,7 +1419,7 @@ pub unsafe fn gemm_ex(
     workspace: CUdeviceptr,
     workspace_bytes: usize,
 ) -> Result<()> {
-    let plan = plan_gemm_ex(handle, p)?;
+    let plan = plan_gemm_ex(handle, p, PointerAlignmentAuthority::TypedMinimum)?;
     if workspace_bytes < plan.workspace_bytes || (plan.workspace_bytes != 0 && workspace == 0) {
         return Err(EpError::KernelFailed(format!(
             "cuda_ep attention GEMM: cuBLASLt selected {} workspace bytes, supplied {workspace_bytes}",
@@ -991,7 +1443,7 @@ pub unsafe fn governed_gemm_ex(
     workspace: Option<WorkspaceView>,
     op: &str,
 ) -> Result<()> {
-    let plan = plan_gemm_ex(handle, p)?;
+    let plan = plan_gemm_ex(handle, p, PointerAlignmentAuthority::TypedMinimum)?;
     let ptr = governed_workspace_ptr(workspace, plan.workspace_bytes, op)?;
     // SAFETY: forwarded from the caller; `ptr` covers the exact selected bytes.
     unsafe { launch_planned_gemm_ex(handle, stream, p, &plan, ptr) }
@@ -1018,6 +1470,50 @@ mod raw_workspace_allocation_guard {
         let error = governed_workspace_ptr(Some(short), 96, "test")
             .expect_err("a short prepared slot must fail before cuBLASLt launch");
         assert!(format!("{error}").contains("requires 96 bytes, supplied 95"));
+    }
+
+    #[test]
+    fn pointer_alignment_uses_the_typed_origin_and_caps_only_the_reported_proof() {
+        assert_eq!(
+            pointer_alignment(0, GemmDtype::F16, PointerAlignmentAuthority::TypedMinimum),
+            2
+        );
+        assert_eq!(
+            pointer_alignment(0, GemmDtype::F32, PointerAlignmentAuthority::ActualAddress),
+            1
+        );
+        assert_eq!(
+            pointer_alignment(
+                0x104,
+                GemmDtype::F32,
+                PointerAlignmentAuthority::ActualAddress
+            ),
+            4
+        );
+        assert_eq!(
+            pointer_alignment(
+                0x180,
+                GemmDtype::F16,
+                PointerAlignmentAuthority::ActualAddress
+            ),
+            128
+        );
+        assert_eq!(
+            pointer_alignment(
+                0x400,
+                GemmDtype::F32,
+                PointerAlignmentAuthority::ActualAddress
+            ),
+            256
+        );
+    }
+
+    #[test]
+    fn reduced_precision_contract_rejects_output_storage_schemes() {
+        assert!(CublasLtReductionScheme::None.preserves_f32_intermediates());
+        assert!(CublasLtReductionScheme::ComputeType.preserves_f32_intermediates());
+        assert!(!CublasLtReductionScheme::InPlace.preserves_f32_intermediates());
+        assert!(!CublasLtReductionScheme::OutputType.preserves_f32_intermediates());
     }
 
     #[test]

@@ -20,6 +20,7 @@ use cudarc::driver::sys::CUevent_flags;
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
+use onnx_runtime_ep_cuda::blas::CublasLtReductionScheme;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
     CudaExecutionProvider, EinsumRouteOverride, build_cuda_registry_descriptors,
@@ -117,6 +118,36 @@ fn assert_close(got: &[f32], expected: &[f64], dtype: DataType, label: &str) {
              error {error} > {allowed} for {dtype:?}"
         );
     }
+}
+
+fn make_typed_einsum_kernel(
+    ep: &CudaExecutionProvider,
+    equation: &str,
+    opset: u64,
+    dtype: DataType,
+    input_shapes: &[Vec<usize>],
+    output_shape: &[usize],
+) -> Box<dyn onnx_runtime_ep_api::Kernel> {
+    let inputs = input_shapes
+        .iter()
+        .map(|shape| Tensor {
+            dtype,
+            shape: shape.clone(),
+            bytes: vec![0; dtype.storage_bytes(shape.iter().product())],
+            absent: false,
+        })
+        .collect::<Vec<_>>();
+    let (graph, node) = common::build_graph(
+        "Einsum",
+        "",
+        opset,
+        &inputs,
+        &[(dtype, output_shape.to_vec())],
+        &[("equation", Attribute::String(equation.as_bytes().to_vec()))],
+    );
+    let model = Model::new(&graph);
+    ep.get_kernel(model.graph.node(node), input_shapes, opset)
+        .unwrap()
 }
 
 fn values(count: usize, salt: usize) -> Vec<f32> {
@@ -592,6 +623,349 @@ fn generic_reduction_multilinear_and_integer_routes_execute_natively() {
         einsum_execution_stats().last_route,
         Some(onnx_runtime_ep_cuda::CudaEinsumRoute::OptimizedDp)
     );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn integer_generic_multiply_is_exact_width_without_signed_overflow() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+
+    let run = |equation: &str,
+               dtype: DataType,
+               input_shape: &[usize],
+               a_bytes: Vec<u8>,
+               b_bytes: Vec<u8>,
+               output_shape: &[usize]| {
+        let kernel = make_typed_einsum_kernel(
+            &ep,
+            equation,
+            12,
+            dtype,
+            &[input_shape.to_vec(), input_shape.to_vec()],
+            output_shape,
+        );
+        let a = ep.allocate(a_bytes.len(), 256).unwrap();
+        let b = ep.allocate(b_bytes.len(), 256).unwrap();
+        let mut output = ep
+            .allocate(
+                dtype.storage_bytes(output_shape.iter().product()).max(1),
+                256,
+            )
+            .unwrap();
+        unsafe {
+            runtime.htod(&a_bytes, cuptr(a.as_ptr())).unwrap();
+            runtime.htod(&b_bytes, cuptr(b.as_ptr())).unwrap();
+        }
+        let input_strides = compute_contiguous_strides(input_shape);
+        let output_strides = compute_contiguous_strides(output_shape);
+        execute_einsum_with_route(
+            kernel.as_ref(),
+            &[
+                TensorView::new(
+                    DevicePtr(a.as_ptr()),
+                    dtype,
+                    input_shape,
+                    &input_strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(b.as_ptr()),
+                    dtype,
+                    input_shape,
+                    &input_strides,
+                    ep.device_id(),
+                ),
+            ],
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                dtype,
+                output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+            EinsumRouteOverride::GenericNative,
+        )
+        .unwrap();
+        runtime.synchronize().unwrap();
+        let mut bytes = vec![0u8; dtype.storage_bytes(output_shape.iter().product())];
+        unsafe { runtime.dtoh(&mut bytes, cuptr(output.as_ptr())).unwrap() };
+        ep.deallocate(a).unwrap();
+        ep.deallocate(b).unwrap();
+        ep.deallocate(output).unwrap();
+        bytes
+    };
+
+    let u16_reduction = run(
+        "i,i->",
+        DataType::Uint16,
+        &[2],
+        common::raw(&[u16::MAX, u16::MAX]),
+        common::raw(&[u16::MAX, 1u16]),
+        &[],
+    );
+    assert_eq!(
+        u16_reduction,
+        common::raw(&[0u16]),
+        "0xffff*0xffff exceeds INT_MAX before narrowing, and 1+0xffff must wrap to zero"
+    );
+
+    let signed = run(
+        "i,i->i",
+        DataType::Int16,
+        &[3],
+        common::raw(&[-1i16, i16::MIN, i16::MAX]),
+        common::raw(&[-1i16, -1i16, i16::MAX]),
+        &[3],
+    );
+    assert_eq!(
+        signed,
+        common::raw(&[1i16, i16::MIN, 1i16]),
+        "negative signed inputs use their exact two's-complement modular products"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn misaligned_contiguous_subviews_use_a_proven_cublaslt_alignment_contract() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let a_shape = [2usize, 3];
+    let b_shape = [3usize, 2];
+    let output_shape = [2usize, 2];
+    let kernel = make_typed_einsum_kernel(
+        &ep,
+        "ik,kj->ij",
+        12,
+        DataType::Float32,
+        &[a_shape.to_vec(), b_shape.to_vec()],
+        &output_shape,
+    );
+    let a_values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b_values = [7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0];
+    let offset = std::mem::size_of::<f32>();
+    let mut a_payload = vec![0u8; offset];
+    a_payload.extend(common::raw(&a_values));
+    let mut b_payload = vec![0u8; offset];
+    b_payload.extend(common::raw(&b_values));
+    let a = ep.allocate(a_payload.len(), 256).unwrap();
+    let b = ep.allocate(b_payload.len(), 256).unwrap();
+    let mut output = ep
+        .allocate(offset + output_shape.iter().product::<usize>() * 4, 256)
+        .unwrap();
+    unsafe {
+        runtime.htod(&a_payload, cuptr(a.as_ptr())).unwrap();
+        runtime.htod(&b_payload, cuptr(b.as_ptr())).unwrap();
+    }
+    let a_strides = compute_contiguous_strides(&a_shape);
+    let b_strides = compute_contiguous_strides(&b_shape);
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let views = [
+        TensorView::new(
+            DevicePtr(a.as_ptr()),
+            DataType::Float32,
+            &a_shape,
+            &a_strides,
+            ep.device_id(),
+        )
+        .with_byte_offset(offset),
+        TensorView::new(
+            DevicePtr(b.as_ptr()),
+            DataType::Float32,
+            &b_shape,
+            &b_strides,
+            ep.device_id(),
+        )
+        .with_byte_offset(offset),
+    ];
+    let execute = |output: &mut onnx_runtime_ep_api::DeviceBuffer| {
+        execute_einsum_with_route(
+            kernel.as_ref(),
+            &views,
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )
+            .with_byte_offset(offset)],
+            EinsumRouteOverride::CudaCublas,
+        )
+        .unwrap();
+    };
+
+    reset_einsum_execution_stats();
+    execute(&mut output);
+    assert!(kernel.capture_support().is_supported());
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute(&mut output);
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+    runtime.synchronize().unwrap();
+
+    let stats = einsum_execution_stats();
+    assert_eq!(
+        stats.last_route,
+        Some(onnx_runtime_ep_cuda::CudaEinsumRoute::CudaCublas)
+    );
+    let contract = stats
+        .cublas_algorithm_contract
+        .expect("forced cuBLASLt route must report its algorithm contract");
+    assert!(
+        contract.a_min_alignment_bytes <= offset as u32
+            && contract.b_min_alignment_bytes <= offset as u32
+            && contract.c_min_alignment_bytes <= offset as u32,
+        "selected contract {contract:?} exceeds the actual 4-byte subview alignment"
+    );
+    eprintln!("CUDA_EINSUM_MISALIGNED_CONTRACT {contract:?}");
+
+    let mut bytes = vec![0u8; offset + output_shape.iter().product::<usize>() * 4];
+    unsafe { runtime.dtoh(&mut bytes, cuptr(output.as_ptr())).unwrap() };
+    assert_eq!(
+        decode_floats(&bytes[offset..], DataType::Float32),
+        [58.0, 64.0, 139.0, 154.0]
+    );
+    assert!(runtime.reset_graph().unwrap());
+    ep.deallocate(a).unwrap();
+    ep.deallocate(b).unwrap();
+    ep.deallocate(output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn forced_f16_cublaslt_narrows_once_after_f32_reduction() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let k = 4096usize;
+    let a_shape = [1usize, k];
+    let b_shape = [k, 1usize];
+    let output_shape = [1usize, 1];
+    let kernel = make_typed_einsum_kernel(
+        &ep,
+        "ik,kj->ij",
+        12,
+        DataType::Float16,
+        &[a_shape.to_vec(), b_shape.to_vec()],
+        &output_shape,
+    );
+    let mut a_values = vec![f16::from_f32(0.0); k];
+    a_values[0] = f16::from_f32(2048.0);
+    a_values[1] = f16::from_f32(1.0);
+    a_values[k / 2] = f16::from_f32(-2048.0);
+    a_values[k / 2 + 1] = f16::from_f32(1.0);
+    let b_values = vec![f16::from_f32(1.0); k];
+    let a_bytes = common::raw(&a_values);
+    let b_bytes = common::raw(&b_values);
+    let a = ep.allocate(a_bytes.len(), 256).unwrap();
+    let b = ep.allocate(b_bytes.len(), 256).unwrap();
+    let mut generic_output = ep.allocate(2, 256).unwrap();
+    let mut cublas_output = ep.allocate(2, 256).unwrap();
+    unsafe {
+        runtime.htod(&a_bytes, cuptr(a.as_ptr())).unwrap();
+        runtime.htod(&b_bytes, cuptr(b.as_ptr())).unwrap();
+    }
+    let a_strides = compute_contiguous_strides(&a_shape);
+    let b_strides = compute_contiguous_strides(&b_shape);
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let views = [
+        TensorView::new(
+            DevicePtr(a.as_ptr()),
+            DataType::Float16,
+            &a_shape,
+            &a_strides,
+            ep.device_id(),
+        ),
+        TensorView::new(
+            DevicePtr(b.as_ptr()),
+            DataType::Float16,
+            &b_shape,
+            &b_strides,
+            ep.device_id(),
+        ),
+    ];
+    let execute = |route: EinsumRouteOverride, output: &mut onnx_runtime_ep_api::DeviceBuffer| {
+        execute_einsum_with_route(
+            kernel.as_ref(),
+            &views,
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float16,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+            route,
+        )
+        .unwrap();
+    };
+
+    execute(EinsumRouteOverride::GenericNative, &mut generic_output);
+    reset_einsum_execution_stats();
+    execute(EinsumRouteOverride::CudaCublas, &mut cublas_output);
+    runtime.synchronize().unwrap();
+
+    let mut generic_bytes = vec![0u8; 2];
+    let mut cublas_bytes = vec![0u8; 2];
+    unsafe {
+        runtime
+            .dtoh(&mut generic_bytes, cuptr(generic_output.as_ptr()))
+            .unwrap();
+        runtime
+            .dtoh(&mut cublas_bytes, cuptr(cublas_output.as_ptr()))
+            .unwrap();
+    }
+    let narrow_once = f16::from_f32(2.0).to_bits();
+    let output_type_partials =
+        f16::from_f32(f16::from_f32(2049.0).to_f32() + f16::from_f32(-2047.0).to_f32()).to_bits();
+    assert_ne!(
+        narrow_once, output_type_partials,
+        "the fixture must distinguish F32 narrow-once from F16 partial storage"
+    );
+    assert_eq!(
+        u16::from_ne_bytes(generic_bytes.try_into().unwrap()),
+        narrow_once
+    );
+    assert_eq!(
+        u16::from_ne_bytes(cublas_bytes.try_into().unwrap()),
+        narrow_once
+    );
+
+    let contract = einsum_execution_stats()
+        .cublas_algorithm_contract
+        .expect("forced F16 cuBLASLt route must report its algorithm contract");
+    assert!(
+        contract.reduction_scheme.preserves_f32_intermediates(),
+        "unsafe F16 reduction contract selected: {contract:?}"
+    );
+    if contract.split_k > 1 {
+        assert_eq!(
+            contract.reduction_scheme,
+            CublasLtReductionScheme::ComputeType,
+            "split-K F16 must store partials in compute type"
+        );
+    }
+    eprintln!(
+        "CUDA_EINSUM_F16_CONTRACT {contract:?} narrow_once=0x{narrow_once:04x} \
+         output_type_partials=0x{output_type_partials:04x}"
+    );
+
+    ep.deallocate(a).unwrap();
+    ep.deallocate(b).unwrap();
+    ep.deallocate(generic_output).unwrap();
+    ep.deallocate(cublas_output).unwrap();
 }
 
 #[cfg_attr(

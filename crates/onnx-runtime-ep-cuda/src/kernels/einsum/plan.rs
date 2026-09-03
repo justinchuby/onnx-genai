@@ -187,7 +187,11 @@ extern "C" __global__ void einsum_f64(const unsigned long long* words) {
   }
 }
 
-#define DEFINE_INTEGER_EINSUM(BITS, NAME) \
+// Signed tensors use the same unsigned storage-width kernel: two's-complement
+// multiplication/addition modulo 2^N is exactly unsigned low-N-bit arithmetic.
+// WIDE is always unsigned, so every intermediate operation has defined modular
+// semantics; the explicit BITS cast applies the declared-width reduction.
+#define DEFINE_INTEGER_EINSUM(BITS, WIDE, NAME) \
 extern "C" __global__ void einsum_##NAME(const unsigned long long* words) { \
   const Step step = decode_step(words); \
   for (unsigned long long out = blockIdx.x * blockDim.x + threadIdx.x; \
@@ -206,9 +210,9 @@ extern "C" __global__ void einsum_##NAME(const unsigned long long* words) { \
             (const BITS*)step.operand_ptrs[operand]; \
         const BITS value = \
             pointer[operand_offset(step, operand, out, reduction)]; \
-        product = (BITS)(product * value); \
+        product = (BITS)((WIDE)product * (WIDE)value); \
       } \
-      if (have_sum) sum = (BITS)(sum + product); \
+      if (have_sum) sum = (BITS)((WIDE)sum + (WIDE)product); \
       else { \
         sum = product; \
         have_sum = true; \
@@ -218,10 +222,10 @@ extern "C" __global__ void einsum_##NAME(const unsigned long long* words) { \
   } \
 }
 
-DEFINE_INTEGER_EINSUM(unsigned char, u8)
-DEFINE_INTEGER_EINSUM(unsigned short, u16)
-DEFINE_INTEGER_EINSUM(unsigned int, u32)
-DEFINE_INTEGER_EINSUM(unsigned long long, u64)
+DEFINE_INTEGER_EINSUM(unsigned char, unsigned int, u8)
+DEFINE_INTEGER_EINSUM(unsigned short, unsigned int, u16)
+DEFINE_INTEGER_EINSUM(unsigned int, unsigned long long, u32)
+DEFINE_INTEGER_EINSUM(unsigned long long, unsigned long long, u64)
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -502,12 +506,12 @@ impl CudaEinsumPlan {
         let mut planned_cublas = Vec::with_capacity(step_specs.len());
         let mut cublas_workspace_bytes = 0usize;
         for spec in &step_specs {
-            let planned = spec.gemm.as_ref().and_then(|gemm| {
+            let planned = if let Some(gemm) = spec.gemm.as_ref() {
                 let params = StridedBatchedGemmParams {
                     dtype: GemmDtype::F32,
-                    a: 0,
-                    b: 0,
-                    c: 0,
+                    a: resolve_pointer(&gemm.left, workspace_ptr, &workspace_layout)?,
+                    b: resolve_pointer(&gemm.right, workspace_ptr, &workspace_layout)?,
+                    c: resolve_pointer(&gemm.output, workspace_ptr, &workspace_layout)?,
                     m: gemm.m,
                     k: gemm.k,
                     n: gemm.n,
@@ -517,9 +521,13 @@ impl CudaEinsumPlan {
                     a_batch_stride: gemm.left_batch_stride,
                     b_batch_stride: gemm.right_batch_stride,
                 };
-                blas::plan_capture_strided_batched_gemm(runtime.blas(), &params).ok()
-            });
-            if let Some(plan) = &planned {
+                blas::plan_capture_strided_batched_gemm(runtime.blas(), &params)
+                    .ok()
+                    .map(|plan| (plan, params))
+            } else {
+                None
+            };
+            if let Some((plan, _)) = &planned {
                 cublas_workspace_bytes = cublas_workspace_bytes.max(plan.workspace_bytes());
             }
             planned_cublas.push(planned);
@@ -542,23 +550,10 @@ impl CudaEinsumPlan {
         let mut metadata_words = Vec::new();
         let mut launches = Vec::new();
         for (spec, cublas) in step_specs.into_iter().zip(planned_cublas) {
-            if let (Some(gemm), Some(cublas)) = (spec.gemm.as_ref(), cublas) {
+            if let (Some(_), Some((cublas, params))) = (spec.gemm.as_ref(), cublas) {
                 launches.push(PreparedLaunch::Cublas {
                     plan: cublas,
-                    params: StridedBatchedGemmParams {
-                        dtype: GemmDtype::F32,
-                        a: resolve_pointer(&gemm.left, workspace_ptr, &workspace_layout)?,
-                        b: resolve_pointer(&gemm.right, workspace_ptr, &workspace_layout)?,
-                        c: resolve_pointer(&gemm.output, workspace_ptr, &workspace_layout)?,
-                        m: gemm.m,
-                        k: gemm.k,
-                        n: gemm.n,
-                        batch: gemm.batch,
-                        transpose_a: gemm.transpose_left,
-                        transpose_b: gemm.transpose_right,
-                        a_batch_stride: gemm.left_batch_stride,
-                        b_batch_stride: gemm.right_batch_stride,
-                    },
+                    params,
                 });
             } else {
                 let offset = metadata_words

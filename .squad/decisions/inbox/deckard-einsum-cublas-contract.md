@@ -1,0 +1,4 @@
+### 2026-09-03: CUDA GEMM plans retain pointer and reduction proofs
+**By:** Deckard
+**What:** cuBLASLt planning now derives A/B/C/D alignment from the typed tensor origins used by the launch, retains the selected algorithm's queried alignment/split-K/reduction contract, and reuses it only when later pointers satisfy that proof. F16/BF16 heuristics exclude in-place/output-type reductions; unsupported Einsum fast paths fall back to GenericNative. Integer generic kernels use explicitly unsigned intermediates and narrow at every declared-width operation.
+**Why:** Pointer alignment and intermediate precision are algorithm preconditions, not shape assumptions. Keeping them in the cached plan makes warmup, capture, rewarm, and fallback agree while preserving exact modular integer semantics and F32 narrow-once floating-point semantics.
