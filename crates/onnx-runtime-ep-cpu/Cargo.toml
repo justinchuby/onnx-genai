@@ -82,6 +82,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 criterion = "0.5"
+onnx-runtime-einsum-conformance = { workspace = true }
 onnx-runtime-hostmon = { workspace = true }
 onnx-runtime-operator-selection = { workspace = true }
 

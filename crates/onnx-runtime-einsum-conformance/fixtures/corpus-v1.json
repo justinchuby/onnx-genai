@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "generator": {
+    "seed": 1014763643921613022,
+    "random_cases": 128,
+    "min_operands": 1,
+    "max_operands": 16,
+    "max_rank": 8,
+    "max_dimension": 3,
+    "max_tensor_elements": 2000000,
+    "max_total_elements": 4000000,
+    "limits": {
+      "unit_tensor_bytes": 8388608,
+      "cpu_working_set_bytes": 33554432,
+      "gpu_case_bytes": 67108864,
+      "oracle_work_items": 2000000
+    }
+  },
+  "expected_case_count": 160,
+  "expected_malformed_count": 24,
+  "expected_route_probe_count": 348,
+  "generated_sha256": "733a01e6ca3397cff8761c00062fd7b603b9d3b23f6f599751ac1a5ddbd21bbd"
+}

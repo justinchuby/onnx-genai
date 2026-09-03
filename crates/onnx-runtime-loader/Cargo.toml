@@ -26,6 +26,7 @@ protox = "0.7"
 
 [dev-dependencies]
 prost = { workspace = true }
+onnx-runtime-einsum-conformance = { workspace = true }
 
 [lints]
 workspace = true

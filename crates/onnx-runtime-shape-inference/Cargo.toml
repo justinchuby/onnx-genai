@@ -14,6 +14,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 onnx-runtime-loader = { path = "../onnx-runtime-loader" }
+onnx-runtime-einsum-conformance = { workspace = true }
 
 [lints]
 workspace = true

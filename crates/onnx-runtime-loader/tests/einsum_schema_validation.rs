@@ -1,5 +1,8 @@
 use prost::Message;
 
+use onnx_runtime_einsum_conformance::{
+    ConformanceDType, DeclaredDType, MalformedCase, malformed_cases, named_cases,
+};
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, static_shape};
 use onnx_runtime_loader::{LoaderError, load_model_bytes, proto::onnx, validate_model};
 
@@ -337,4 +340,108 @@ fn partial_metadata_still_rejects_every_known_invalid_fact() {
             .to_string()
             .contains("input #0 rank 2 does not match")
     );
+}
+
+fn malformed_dtype(dtype: DeclaredDType) -> DataType {
+    match dtype {
+        DeclaredDType::Numeric(ConformanceDType::Uint8) => DataType::Uint8,
+        DeclaredDType::Numeric(ConformanceDType::Uint16) => DataType::Uint16,
+        DeclaredDType::Numeric(ConformanceDType::Uint32) => DataType::Uint32,
+        DeclaredDType::Numeric(ConformanceDType::Uint64) => DataType::Uint64,
+        DeclaredDType::Numeric(ConformanceDType::Int8) => DataType::Int8,
+        DeclaredDType::Numeric(ConformanceDType::Int16) => DataType::Int16,
+        DeclaredDType::Numeric(ConformanceDType::Int32) => DataType::Int32,
+        DeclaredDType::Numeric(ConformanceDType::Int64) => DataType::Int64,
+        DeclaredDType::Numeric(ConformanceDType::Float16) => DataType::Float16,
+        DeclaredDType::Numeric(ConformanceDType::Float32) => DataType::Float32,
+        DeclaredDType::Numeric(ConformanceDType::Float64) => DataType::Float64,
+        DeclaredDType::Numeric(ConformanceDType::BFloat16) => DataType::BFloat16,
+        DeclaredDType::Bool => DataType::Bool,
+        DeclaredDType::String => DataType::String,
+        DeclaredDType::Complex64 => DataType::Complex64,
+        DeclaredDType::Complex128 => DataType::Complex128,
+    }
+}
+
+fn malformed_graph(case: &MalformedCase) -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), case.opset);
+    let mut inputs = Vec::new();
+    for (index, (&dtype, shape)) in case.input_dtypes.iter().zip(&case.input_shapes).enumerate() {
+        let value = graph.create_named_value(
+            format!("input_{index}"),
+            malformed_dtype(dtype),
+            static_shape(shape.iter().copied()),
+        );
+        graph.add_input(value);
+        inputs.push(Some(value));
+    }
+    let output_dtype = case
+        .input_dtypes
+        .first()
+        .copied()
+        .map(malformed_dtype)
+        .unwrap_or(DataType::Float32);
+    let mut outputs = Vec::new();
+    for index in 0..case.output_count {
+        let value =
+            graph.create_named_value(format!("output_{index}"), output_dtype, static_shape([]));
+        graph.add_output(value);
+        outputs.push(value);
+    }
+    let mut node = Node::new(NodeId(0), "Einsum", inputs, outputs);
+    node.name = case.id.clone();
+    node.attributes.insert(
+        "equation".into(),
+        Attribute::String(case.equation.as_bytes().to_vec()),
+    );
+    graph.insert_node(node);
+    graph
+}
+
+#[test]
+fn loader_accepts_the_independent_64_operand_legal_case() {
+    let case = named_cases()
+        .into_iter()
+        .find(|case| case.id == "scalar-product-64-operands")
+        .expect("high-arity conformance case");
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), case.opset);
+    let mut inputs = Vec::new();
+    for (index, shape) in case.input_shapes.iter().enumerate() {
+        let value = graph.create_named_value(
+            format!("input_{index}"),
+            malformed_dtype(DeclaredDType::Numeric(case.dtype)),
+            static_shape(shape.iter().copied()),
+        );
+        graph.add_input(value);
+        inputs.push(Some(value));
+    }
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([]));
+    graph.add_output(output);
+    let mut node = Node::new(NodeId(0), "Einsum", inputs, vec![output]);
+    node.name = case.id;
+    node.attributes.insert(
+        "equation".into(),
+        Attribute::String(case.equation.into_bytes()),
+    );
+    graph.insert_node(node);
+    validate_model(&graph).unwrap();
+}
+
+#[test]
+fn loader_rejects_every_record_in_the_independent_malformed_corpus() {
+    let cases = malformed_cases();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let error = match validate_model(&malformed_graph(&case)) {
+            Ok(()) => panic!("{} unexpectedly passed loader validation", case.id),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, LoaderError::InvalidEinsum { .. }),
+            "{}: {error}",
+            case.id
+        );
+    }
 }
