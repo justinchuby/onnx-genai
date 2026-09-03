@@ -37,10 +37,7 @@ fn schema_aware_cuda_helper_uses_the_explicit_effective_opset() {
         unsupported_reason_for_opset(&node, 27, &shapes, &[DataType::BFloat16], &layouts).unwrap();
     assert!(opset27.contains("not admitted by Einsum-12"), "{opset27}");
 
-    let opset28 =
-        unsupported_reason_for_opset(&node, 28, &shapes, &[DataType::BFloat16], &layouts).unwrap();
     assert!(
-        opset28.contains("Einsum-28 admits BFloat16 semantically"),
-        "{opset28}"
+        unsupported_reason_for_opset(&node, 28, &shapes, &[DataType::BFloat16], &layouts).is_none()
     );
 }

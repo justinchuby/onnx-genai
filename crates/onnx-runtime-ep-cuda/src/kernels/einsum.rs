@@ -4,7 +4,11 @@
 //! shape-specialized kernel is created. Execution consumes only the plan's axis
 //! mappings. Binary contractions whose contiguous storage can be represented by
 //! cuBLASLt layouts run without materialized operand transposes; view-only
-//! permutations and diagonals use the executor's zero-copy view contract.
+//! permutations and diagonals use the executor's zero-copy view contract. Every
+//! other schema-valid expression executes through an immutable, device-resident
+//! index program built from the shared semantic plan.
+
+mod plan;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,9 +21,9 @@ use onnx_runtime_ep_api::{
     TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{
-    DataType, EinsumContractionPlan, EinsumContractionTreePlan, EinsumInput, EinsumOperandPlan,
-    EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality, EinsumPlanningClassification,
-    EinsumSchema, EinsumShapePlan, Node, Shape, TensorLayout,
+    DataType, EinsumContractionPlan, EinsumInput, EinsumOperandPlan, EinsumPermutationPlan,
+    EinsumPlan, EinsumPlanningClassification, EinsumSchema, EinsumShapePlan, Node, Shape,
+    TensorLayout,
 };
 
 use super::movement::{PersistentMetadata, launch_persistent_metadata};
@@ -28,6 +32,8 @@ use crate::blas::{
 };
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+pub use plan::CudaEinsumRoute;
+use plan::{CudaEinsumPlan, RequestedRoute};
 
 /// Counters proving which CUDA Einsum route executed and what persistent state
 /// it established. Values are process-global diagnostics, so GPU tests serialize
@@ -50,6 +56,12 @@ pub struct EinsumExecutionStats {
     pub setup_ns: u64,
     pub persistent_metadata_bytes: u64,
     pub materialization_bytes: u64,
+    pub generic_native_launches: u64,
+    pub optimized_launches: u64,
+    pub optimized_step_launches: u64,
+    pub optimized_cublas_launches: u64,
+    pub plan_rewarms: u64,
+    pub last_route: Option<CudaEinsumRoute>,
 }
 
 static PLAN_BUILDS: AtomicU64 = AtomicU64::new(0);
@@ -68,27 +80,12 @@ static WORKSPACE_PTR_LAST: AtomicU64 = AtomicU64::new(0);
 static SETUP_NS_LAST: AtomicU64 = AtomicU64::new(0);
 static PERSISTENT_METADATA_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZATION_BYTES: AtomicU64 = AtomicU64::new(0);
-
-fn contraction_tree_summary(tree: &EinsumContractionTreePlan) -> String {
-    if tree.quality() == EinsumPlannerQuality::GenericNativeFallback {
-        let reason = tree
-            .fallback_reason()
-            .expect("GenericNative planner fallback records its reason");
-        format!(
-            "the bounded planner selected GenericNative fallback because {reason} (work={}, \
-             metadata_units={}, max_depth={})",
-            tree.usage().work(),
-            tree.usage().metadata_units(),
-            tree.usage().max_depth()
-        )
-    } else {
-        format!(
-            "{} ordered candidate(s), quality {:?}",
-            tree.candidates().len(),
-            tree.quality()
-        )
-    }
-}
+static GENERIC_NATIVE_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static OPTIMIZED_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static OPTIMIZED_STEP_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static OPTIMIZED_CUBLAS_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static PLAN_REWARMS: AtomicU64 = AtomicU64::new(0);
+static LAST_ROUTE: Mutex<Option<CudaEinsumRoute>> = Mutex::new(None);
 
 pub fn einsum_execution_stats() -> EinsumExecutionStats {
     let last_fallback_reason = LAST_FALLBACK_REASON
@@ -113,6 +110,12 @@ pub fn einsum_execution_stats() -> EinsumExecutionStats {
         setup_ns: SETUP_NS_LAST.load(Ordering::Relaxed),
         persistent_metadata_bytes: PERSISTENT_METADATA_BYTES_LAST.load(Ordering::Relaxed),
         materialization_bytes: MATERIALIZATION_BYTES.load(Ordering::Relaxed),
+        generic_native_launches: GENERIC_NATIVE_LAUNCHES.load(Ordering::Relaxed),
+        optimized_launches: OPTIMIZED_LAUNCHES.load(Ordering::Relaxed),
+        optimized_step_launches: OPTIMIZED_STEP_LAUNCHES.load(Ordering::Relaxed),
+        optimized_cublas_launches: OPTIMIZED_CUBLAS_LAUNCHES.load(Ordering::Relaxed),
+        plan_rewarms: PLAN_REWARMS.load(Ordering::Relaxed),
+        last_route: *LAST_ROUTE.lock().unwrap_or_else(|error| error.into_inner()),
     }
 }
 
@@ -135,6 +138,12 @@ pub fn reset_einsum_execution_stats() {
     SETUP_NS_LAST.store(0, Ordering::Relaxed);
     PERSISTENT_METADATA_BYTES_LAST.store(0, Ordering::Relaxed);
     MATERIALIZATION_BYTES.store(0, Ordering::Relaxed);
+    GENERIC_NATIVE_LAUNCHES.store(0, Ordering::Relaxed);
+    OPTIMIZED_LAUNCHES.store(0, Ordering::Relaxed);
+    OPTIMIZED_STEP_LAUNCHES.store(0, Ordering::Relaxed);
+    OPTIMIZED_CUBLAS_LAUNCHES.store(0, Ordering::Relaxed);
+    PLAN_REWARMS.store(0, Ordering::Relaxed);
+    *LAST_ROUTE.lock().unwrap_or_else(|error| error.into_inner()) = None;
 }
 
 fn equation(node: &Node) -> Result<&str> {
@@ -154,9 +163,22 @@ fn einsum_dtype(dtype: DataType) -> Result<GemmDtype> {
     match dtype {
         DataType::Float32 => Ok(GemmDtype::F32),
         DataType::Float16 => Ok(GemmDtype::F16),
+        DataType::BFloat16 => Ok(GemmDtype::Bf16),
         other => Err(not_implemented(format!(
-            "Einsum dtype {other:?}; the staged native CUDA executor currently supports only Float32 and Float16. Einsum-28 admits BFloat16 semantically, but its CUDA execution handoff is not implemented yet"
+            "Einsum dtype {other:?} is not a cuBLASLt storage type; use the native generic CUDA route"
         ))),
+    }
+}
+
+fn validate_einsum_dtype(schema: EinsumSchema, dtype: DataType) -> Result<()> {
+    if schema.supports_dtype(dtype) {
+        Ok(())
+    } else {
+        Err(not_implemented(format!(
+            "Einsum dtype {dtype:?} is not admitted by {schema}; BFloat16 requires Einsum-28 \
+             (effective ai.onnx opset >= 28), while Einsum-12 admits f16/f32/f64 and \
+             u8/u16/u32/u64/i8/i16/i32/i64"
+        )))
     }
 }
 
@@ -284,18 +306,9 @@ fn contraction_structure_reason(
     None
 }
 
-fn layout_is_contiguous(layout: &TensorLayout, shape: &Shape) -> bool {
-    if layout.strides.is_none() {
-        return true;
-    }
-    let Some(shape) = onnx_runtime_ir::as_static_shape(shape) else {
-        return false;
-    };
-    layout.is_contiguous(&shape)
-}
-
-/// Return an actionable claim decline for an Einsum the current CUDA lowering
-/// cannot execute without an unsupported materialization.
+/// Return an actionable claim decline only when the ONNX schema or supplied
+/// metadata is invalid. Every schema-valid numeric expression has a native
+/// generic CUDA route; layout restrictions affect only optional fast paths.
 fn unsupported_reason_impl(
     node: &Node,
     opset: u64,
@@ -330,58 +343,9 @@ fn unsupported_reason_impl(
         Ok(plan) => plan,
         Err(error) => return Some(format!("cuda_ep Einsum `{equation}`: {error}")),
     };
-    if let Err(error) = einsum_dtype(plan.dtype()) {
-        return Some(error.to_string());
-    }
-
-    match plan.planning_classification() {
-        EinsumPlanningClassification::ViewOnlyPermutation(_)
-        | EinsumPlanningClassification::DiagonalView(_) => None,
-        EinsumPlanningClassification::Gemm(contraction) => {
-            if let Some(reason) = contraction_structure_reason(plan.shape_plan(), contraction) {
-                return Some(reason);
-            }
-            if layouts
-                .iter()
-                .zip(shapes)
-                .any(|(layout, shape)| !layout_is_contiguous(layout, shape))
-            {
-                return Some(format!(
-                    "cuda_ep Einsum `{equation}`: GEMM/BMM contractions require contiguous inputs; materialize the strided input before Einsum"
-                ));
-            }
-            // With fully static dimensions, reject partial multi-axis batch
-            // broadcasting at claim time rather than after output mutation.
-            if let Some(concrete) = shapes
-                .iter()
-                .map(|shape| onnx_runtime_ir::as_static_shape(shape))
-                .collect::<Option<Vec<_>>>()
-                && let Err(error) = concrete_contraction_layout(
-                    plan.shape_plan(),
-                    contraction,
-                    &concrete,
-                    plan.dtype(),
-                )
-            {
-                return Some(error.to_string());
-            }
-            None
-        }
-        EinsumPlanningClassification::ContractionTree(tree) => Some(format!(
-            "cuda_ep Einsum `{equation}`: canonical {}-input contraction plan has {}, but CUDA \
-             temporary scheduling and multi-node capture execution are not implemented",
-            tree.arity(),
-            contraction_tree_summary(tree)
-        )),
-        EinsumPlanningClassification::ReductionOrElementwise(_) => Some(format!(
-            "cuda_ep Einsum `{equation}`: uncoupled reductions/elementwise products are not yet lowered; use native Reduce*/Mul nodes or CPU fallback"
-        )),
-        _ => Some(format!(
-            "cuda_ep Einsum `{equation}`: canonical planner returned a newer classification that \
-             this CUDA EP does not recognize; update claim, execution, and capture paths before \
-             assigning the node"
-        )),
-    }
+    validate_einsum_dtype(plan.schema(), plan.dtype())
+        .err()
+        .map(|error| error.to_string())
 }
 
 /// Claim-time capability check using the original Einsum-12 contract.
@@ -420,6 +384,20 @@ pub struct EinsumFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 
+/// Route override used by conformance and benchmark harnesses.
+///
+/// Production execution uses [`Auto`](Self::Auto). The forced variants exist so
+/// tests can prove that both the universal and optimized native paths actually
+/// execute instead of inferring a route from the equation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EinsumRouteOverride {
+    #[default]
+    Auto,
+    GenericNative,
+    Optimized,
+    CudaCublas,
+}
+
 impl KernelFactory for EinsumFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let equation = equation(node)?.to_owned();
@@ -430,40 +408,17 @@ impl KernelFactory for EinsumFactory {
             .map_err(|error| {
                 EpError::KernelFailed(format!("cuda_ep Einsum `{equation}`: {error}"))
             })?;
-        match plan.planning_classification() {
-            EinsumPlanningClassification::ViewOnlyPermutation(_)
-            | EinsumPlanningClassification::DiagonalView(_)
-            | EinsumPlanningClassification::Gemm(_) => {}
-            EinsumPlanningClassification::ContractionTree(tree) => {
-                return Err(not_implemented(format!(
-                    "cuda_ep Einsum `{equation}` {}-input contraction plan with {}; implement \
-                     GenericNative/temporary scheduling and multi-node capture before constructing \
-                     this kernel",
-                    tree.arity(),
-                    contraction_tree_summary(tree)
-                )));
-            }
-            EinsumPlanningClassification::ReductionOrElementwise(_) => {
-                return Err(not_implemented(format!(
-                    "cuda_ep Einsum `{equation}` reduction/elementwise canonical plan"
-                )));
-            }
-            _ => {
-                return Err(not_implemented(format!(
-                    "cuda_ep Einsum `{equation}` newer unrecognized canonical classification; \
-                     update claim, factory, execution, and capture paths before constructing it"
-                )));
-            }
-        }
         Ok(Box::new(EinsumKernel {
             runtime: self.runtime.clone(),
             input_shapes: input_shapes.to_vec(),
             plan,
             execution: Mutex::new(None),
+            semantic_execution: Mutex::new(None),
             view_metadata: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
             view_materialization: Mutex::new(None),
             view_alias_warmed: AtomicBool::new(false),
             last_call_capture_safe: AtomicBool::new(false),
+            last_route: Mutex::new(None),
         }))
     }
 }
@@ -696,10 +651,12 @@ pub struct EinsumKernel {
     input_shapes: Vec<Vec<usize>>,
     plan: EinsumShapePlan,
     execution: Mutex<Option<CachedExecution>>,
+    semantic_execution: Mutex<Option<CudaEinsumPlan>>,
     view_metadata: Mutex<PersistentMetadata>,
     view_materialization: Mutex<Option<ViewMaterialization>>,
     view_alias_warmed: AtomicBool,
     last_call_capture_safe: AtomicBool,
+    last_route: Mutex<Option<CudaEinsumRoute>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -798,7 +755,103 @@ fn overlaps(left: Option<DeviceByteRange>, right: Option<DeviceByteRange>) -> bo
     matches!((left, right), (Some(left), Some(right)) if left.start < right.end && right.start < left.end)
 }
 
+fn checked_strided_byte_range(
+    base: CUdeviceptr,
+    byte_offset: usize,
+    dtype: DataType,
+    shape: &[usize],
+    strides: &[i64],
+    context: &str,
+) -> Result<Option<DeviceByteRange>> {
+    if shape.len() != strides.len() {
+        return Err(EpError::KernelFailed(format!(
+            "{context}: shape rank {} does not match stride rank {}",
+            shape.len(),
+            strides.len()
+        )));
+    }
+    if shape.contains(&0) {
+        return Ok(None);
+    }
+    let element_bytes = i128::try_from(dtype.byte_size()).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "{context}: element byte size does not fit checked device addressing"
+        ))
+    })?;
+    if element_bytes == 0 {
+        return Err(EpError::KernelFailed(format!(
+            "{context}: dtype {dtype:?} has no fixed-width addressable element size"
+        )));
+    }
+    let origin = i128::from(base)
+        .checked_add(i128::try_from(byte_offset).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "{context}: byte_offset {byte_offset} does not fit checked device addressing"
+            ))
+        })?)
+        .ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "{context}: address overflow while adding base and byte offset"
+            ))
+        })?;
+    let mut minimum = 0i128;
+    let mut maximum = 0i128;
+    for (axis, (&dimension, &stride)) in shape.iter().zip(strides).enumerate() {
+        let extent = i128::try_from(dimension - 1).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "{context}: axis {axis} extent does not fit checked device addressing"
+            ))
+        })?;
+        let contribution = extent.checked_mul(i128::from(stride)).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "{context}: address range overflow for shape {shape:?} and strides {strides:?}"
+            ))
+        })?;
+        if contribution < 0 {
+            minimum = minimum.checked_add(contribution).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "{context}: minimum address range overflow for shape {shape:?} and strides {strides:?}"
+                ))
+            })?;
+        } else {
+            maximum = maximum.checked_add(contribution).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "{context}: maximum address range overflow for shape {shape:?} and strides {strides:?}"
+                ))
+            })?;
+        }
+    }
+    let start = origin
+        .checked_add(minimum.checked_mul(element_bytes).ok_or_else(|| {
+            EpError::KernelFailed(format!("{context}: minimum byte address overflow"))
+        })?)
+        .ok_or_else(|| EpError::KernelFailed(format!("{context}: start address overflow")))?;
+    let end = origin
+        .checked_add(maximum.checked_mul(element_bytes).ok_or_else(|| {
+            EpError::KernelFailed(format!("{context}: maximum byte address overflow"))
+        })?)
+        .and_then(|address| address.checked_add(element_bytes))
+        .ok_or_else(|| EpError::KernelFailed(format!("{context}: end address overflow")))?;
+    let start = u64::try_from(start).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "{context}: negative addressed byte range; byte_offset does not cover the negative stride"
+        ))
+    })?;
+    let end = u64::try_from(end).map_err(|_| {
+        EpError::KernelFailed(format!("{context}: addressed byte range exceeds u64"))
+    })?;
+    Ok(Some(DeviceByteRange { start, end }))
+}
+
 impl EinsumKernel {
+    fn record_route(&self, route: CudaEinsumRoute) {
+        *self
+            .last_route
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(route);
+        *LAST_ROUTE.lock().unwrap_or_else(|error| error.into_inner()) = Some(route);
+    }
+
     fn validate_common(&self, inputs: &[TensorView], outputs: &[TensorMut]) -> Result<DataType> {
         if inputs.len() != self.input_shapes.len() || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -810,8 +863,14 @@ impl EinsumKernel {
             )));
         }
         let dtype = inputs[0].dtype;
-        einsum_dtype(dtype)?;
+        validate_einsum_dtype(self.plan.schema(), dtype)?;
         for (index, (input, expected_shape)) in inputs.iter().zip(&self.input_shapes).enumerate() {
+            input.validate().map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep Einsum `{}`: input #{index} is invalid: {error}",
+                    self.plan.equation()
+                ))
+            })?;
             if input.dtype != dtype {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep Einsum `{}`: input #{index} dtype {:?} differs from input #0 dtype {dtype:?}",
@@ -832,6 +891,29 @@ impl EinsumKernel {
                 "cuda_ep Einsum `{}`: output dtype {:?} must equal input dtype {dtype:?}",
                 self.plan.equation(),
                 outputs[0].dtype
+            )));
+        }
+        outputs[0].validate().map_err(|error| {
+            EpError::KernelFailed(format!(
+                "cuda_ep Einsum `{}`: output is invalid: {error}",
+                self.plan.equation()
+            ))
+        })?;
+        let shapes = inputs.iter().map(|input| input.shape).collect::<Vec<_>>();
+        let expected = self
+            .plan
+            .resolve_concrete_output_shape(&shapes)
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep Einsum `{}`: runtime shape validation failed: {error}",
+                    self.plan.equation()
+                ))
+            })?;
+        if outputs[0].shape != expected {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Einsum `{}`: output shape {:?} does not match canonical shape {expected:?}",
+                self.plan.equation(),
+                outputs[0].shape
             )));
         }
         Ok(dtype)
@@ -901,7 +983,12 @@ impl EinsumKernel {
         })
     }
 
-    fn run_contraction(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn run_contraction(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        fallback_to_generic: bool,
+    ) -> Result<()> {
         let dtype = self.validate_common(inputs, outputs)?;
         if inputs.iter().any(|input| !input.is_contiguous()) || !outputs[0].is_contiguous() {
             return Err(not_implemented(format!(
@@ -964,7 +1051,19 @@ impl EinsumKernel {
                     self.plan.equation()
                 )));
             }
-            Some(self.compile_contraction(dtype)?)
+            match self.compile_contraction(dtype) {
+                Ok(compiled) => Some(compiled),
+                Err(_) if fallback_to_generic => {
+                    drop(execution);
+                    return self.run_semantic(
+                        inputs,
+                        outputs,
+                        RequestedRoute::Auto,
+                        plan::DEFAULT_MEMORY_CEILING_BYTES,
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             PLAN_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             None
@@ -1022,7 +1121,158 @@ impl EinsumKernel {
             *execution = Some(compiled);
         }
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        self.record_route(CudaEinsumRoute::CudaCublas);
         Ok(())
+    }
+
+    fn validate_no_output_alias(
+        &self,
+        inputs: &[TensorView],
+        output: &mut TensorMut,
+    ) -> Result<()> {
+        let output_context = format!("cuda_ep Einsum `{}` generic output", self.plan.equation());
+        let output_range = checked_strided_byte_range(
+            cuptr(output.data.0 as *const c_void),
+            output.byte_offset,
+            output.dtype,
+            output.shape,
+            output.strides,
+            &output_context,
+        )?;
+        for (index, input) in inputs.iter().enumerate() {
+            let input_context = format!(
+                "cuda_ep Einsum `{}` generic input #{index}",
+                self.plan.equation()
+            );
+            let input_range = checked_strided_byte_range(
+                cuptr(input.data.0),
+                input.byte_offset,
+                input.dtype,
+                input.shape,
+                input.strides,
+                &input_context,
+            )?;
+            if overlaps(output_range, input_range) {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep Einsum `{}`: output byte range {output_range:?} overlaps input \
+                     #{index} byte range {input_range:?}; arithmetic Einsum requires \
+                     non-overlapping storage",
+                    self.plan.equation()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn run_semantic(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        requested: RequestedRoute,
+        memory_ceiling_bytes: u128,
+    ) -> Result<()> {
+        let dtype = self.validate_common(inputs, outputs)?;
+        self.validate_no_output_alias(inputs, &mut outputs[0])?;
+        let capturing = self.runtime.is_capturing()?;
+        let mut execution = self.semantic_execution.lock().map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep Einsum `{}`: semantic-plan lock was poisoned",
+                self.plan.equation()
+            ))
+        })?;
+        let cache_hit = execution.as_ref().is_some_and(|plan| {
+            plan.matches(requested, memory_ceiling_bytes, inputs, &mut outputs[0])
+        });
+        if !cache_hit && capturing {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Einsum `{}`: exact dtype/shape/stride/address/route signature was not \
+                 warmed before CUDA graph capture",
+                self.plan.equation()
+            )));
+        }
+
+        let start = Instant::now();
+        let candidate = if cache_hit {
+            PLAN_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            None
+        } else {
+            Some(CudaEinsumPlan::build(
+                &self.plan,
+                dtype,
+                inputs,
+                &mut outputs[0],
+                &self.runtime,
+                requested,
+                memory_ceiling_bytes,
+            )?)
+        };
+        let prepared = execution
+            .as_ref()
+            .or(candidate.as_ref())
+            .expect("a cached or staged CUDA Einsum plan is present");
+        if capturing {
+            prepared.require_capture_resources(&self.runtime)?;
+        }
+        prepared.launch(&self.runtime)?;
+        let summary = prepared.summary();
+        let workspace_ptr = prepared.workspace_ptr();
+        if let Some(candidate) = candidate {
+            if execution.is_some() {
+                PLAN_REWARMS.fetch_add(1, Ordering::Relaxed);
+            }
+            *execution = Some(candidate);
+            PLAN_BUILDS.fetch_add(1, Ordering::Relaxed);
+            SETUP_NS_LAST.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        match summary.route {
+            CudaEinsumRoute::GenericNative => {
+                GENERIC_NATIVE_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+            }
+            CudaEinsumRoute::OptimizedDp | CudaEinsumRoute::OptimizedHeuristic => {
+                OPTIMIZED_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                OPTIMIZED_STEP_LAUNCHES
+                    .fetch_add(summary.kernel_launches as u64, Ordering::Relaxed);
+                OPTIMIZED_CUBLAS_LAUNCHES
+                    .fetch_add(summary.cublas_launches as u64, Ordering::Relaxed);
+            }
+            CudaEinsumRoute::ViewAlias
+            | CudaEinsumRoute::ViewMaterialized
+            | CudaEinsumRoute::CudaCublas => {
+                unreachable!("semantic plan cannot report a view or direct cuBLAS route")
+            }
+        }
+        WORKSPACE_BYTES_LAST.store(summary.workspace_bytes as u64, Ordering::Relaxed);
+        WORKSPACE_PTR_LAST.store(workspace_ptr, Ordering::Relaxed);
+        PERSISTENT_METADATA_BYTES_LAST.store(summary.metadata_bytes as u64, Ordering::Relaxed);
+        self.record_route(summary.route);
+        if capturing {
+            CAPTURE_RECORDINGS.fetch_add(summary.kernel_launches as u64, Ordering::Relaxed);
+        }
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn fast_contraction_eligible(&self, inputs: &[TensorView], output: &TensorMut) -> bool {
+        if !matches!(
+            inputs.first().map(|input| input.dtype),
+            Some(DataType::Float32 | DataType::Float16)
+        ) || inputs.iter().any(|input| !input.is_contiguous())
+            || !output.is_contiguous()
+        {
+            return false;
+        }
+        let EinsumPlanningClassification::Gemm(contraction) = self.plan.planning_classification()
+        else {
+            return false;
+        };
+        contraction_structure_reason(&self.plan, contraction).is_none()
+            && concrete_contraction_layout(
+                &self.plan,
+                contraction,
+                &self.input_shapes,
+                inputs[0].dtype,
+            )
+            .is_ok()
     }
 
     fn view_spec(
@@ -1154,6 +1404,7 @@ impl EinsumKernel {
                 *warmed = Some(candidate);
             }
             self.last_call_capture_safe.store(true, Ordering::Relaxed);
+            self.record_route(CudaEinsumRoute::ViewMaterialized);
             return Ok(());
         }
         let mut metadata = self.view_metadata.lock().map_err(|_| {
@@ -1182,35 +1433,79 @@ impl EinsumKernel {
             *warmed = Some(candidate);
         }
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        self.record_route(CudaEinsumRoute::ViewMaterialized);
         Ok(())
+    }
+}
+
+impl EinsumKernel {
+    fn execute_with_override(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        route: EinsumRouteOverride,
+    ) -> Result<()> {
+        self.execute_with_override_and_ceiling(
+            inputs,
+            outputs,
+            route,
+            plan::DEFAULT_MEMORY_CEILING_BYTES,
+        )
+    }
+
+    fn execute_with_override_and_ceiling(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        route: EinsumRouteOverride,
+        memory_ceiling_bytes: u128,
+    ) -> Result<()> {
+        match route {
+            EinsumRouteOverride::GenericNative => self.run_semantic(
+                inputs,
+                outputs,
+                RequestedRoute::GenericNative,
+                memory_ceiling_bytes,
+            ),
+            EinsumRouteOverride::Optimized => self.run_semantic(
+                inputs,
+                outputs,
+                RequestedRoute::Optimized,
+                memory_ceiling_bytes,
+            ),
+            EinsumRouteOverride::CudaCublas => {
+                if !self.fast_contraction_eligible(inputs, &outputs[0]) {
+                    return Err(not_implemented(format!(
+                        "Einsum `{}` cannot take the forced cuBLASLt route because its dtype, \
+                         strides, broadcast, diagonal, or output permutation does not satisfy the \
+                         descriptor contract",
+                        self.plan.equation()
+                    )));
+                }
+                self.run_contraction(inputs, outputs, false)
+            }
+            EinsumRouteOverride::Auto => match self.plan.planning_classification() {
+                EinsumPlanningClassification::ViewOnlyPermutation(_)
+                | EinsumPlanningClassification::DiagonalView(_)
+                    if inputs[0].strides.iter().all(|&stride| stride >= 0)
+                        && outputs[0].is_contiguous() =>
+                {
+                    self.run_view(inputs, outputs)
+                }
+                EinsumPlanningClassification::Gemm(_)
+                    if self.fast_contraction_eligible(inputs, &outputs[0]) =>
+                {
+                    self.run_contraction(inputs, outputs, true)
+                }
+                _ => self.run_semantic(inputs, outputs, RequestedRoute::Auto, memory_ceiling_bytes),
+            },
+        }
     }
 }
 
 impl Kernel for EinsumKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        match self.plan.planning_classification() {
-            EinsumPlanningClassification::ViewOnlyPermutation(_)
-            | EinsumPlanningClassification::DiagonalView(_) => self.run_view(inputs, outputs),
-            EinsumPlanningClassification::Gemm(_) => self.run_contraction(inputs, outputs),
-            EinsumPlanningClassification::ContractionTree(tree) => Err(not_implemented(format!(
-                "Einsum `{}` {}-input contraction plan execution with {}; CUDA must implement \
-                 GenericNative and the planner's temporary schedule before executing this class",
-                self.plan.equation(),
-                tree.arity(),
-                contraction_tree_summary(tree)
-            ))),
-            EinsumPlanningClassification::ReductionOrElementwise(_) => {
-                Err(not_implemented(format!(
-                    "Einsum `{}` reduction/elementwise canonical plan",
-                    self.plan.equation()
-                )))
-            }
-            _ => Err(not_implemented(format!(
-                "Einsum `{}` newer unrecognized canonical classification; update CUDA claim, \
-                 execution, and capture paths before running it",
-                self.plan.equation()
-            ))),
-        }
+        self.execute_with_override(inputs, outputs, EinsumRouteOverride::Auto)
     }
 
     fn view_outputs(
@@ -1222,7 +1517,7 @@ impl Kernel for EinsumKernel {
         if inputs.len() != 1 || num_outputs != 1 || output_shapes.len() != 1 {
             return None;
         }
-        einsum_dtype(inputs[0].dtype).ok()?;
+        validate_einsum_dtype(self.plan.schema(), inputs[0].dtype).ok()?;
         if inputs[0].shape != self.input_shapes[0] {
             return None;
         }
@@ -1235,6 +1530,7 @@ impl Kernel for EinsumKernel {
         self.view_alias_warmed.store(true, Ordering::Relaxed);
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
         VIEW_ALIASES.fetch_add(1, Ordering::Relaxed);
+        self.record_route(CudaEinsumRoute::ViewAlias);
         Some(vec![view])
     }
 
@@ -1247,12 +1543,7 @@ impl Kernel for EinsumKernel {
     }
 
     fn supports_strided_input(&self, input_idx: usize) -> bool {
-        input_idx == 0
-            && matches!(
-                self.plan.planning_classification(),
-                EinsumPlanningClassification::ViewOnlyPermutation(_)
-                    | EinsumPlanningClassification::DiagonalView(_)
-            )
+        input_idx < self.input_shapes.len()
     }
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
@@ -1271,10 +1562,33 @@ impl Kernel for EinsumKernel {
         {
             resources.push(resource);
         }
+        if let Ok(execution) = self.semantic_execution.lock()
+            && let Some(execution) = execution.as_ref()
+        {
+            resources.extend(execution.resources());
+        }
         resources
     }
 
     fn capture_support(&self) -> CaptureSupport {
+        let semantic_warmed = self
+            .semantic_execution
+            .lock()
+            .is_ok_and(|execution| execution.is_some());
+        let last_route = self.last_route.lock().ok().and_then(|route| *route);
+        if semantic_warmed
+            && matches!(
+                last_route,
+                Some(
+                    CudaEinsumRoute::GenericNative
+                        | CudaEinsumRoute::OptimizedDp
+                        | CudaEinsumRoute::OptimizedHeuristic
+                )
+            )
+            && self.last_call_capture_safe.load(Ordering::Relaxed)
+        {
+            return CaptureSupport::Supported;
+        }
         match self.plan.planning_classification() {
             EinsumPlanningClassification::ViewOnlyPermutation(_)
             | EinsumPlanningClassification::DiagonalView(_) => {
@@ -1323,17 +1637,62 @@ impl Kernel for EinsumKernel {
                     self.plan.equation()
                 )),
             },
-            EinsumPlanningClassification::ContractionTree(_) => CaptureSupport::unsupported(
-                "CUDA Einsum contraction-tree temporary scheduling and multi-node capture are not implemented",
-            ),
-            EinsumPlanningClassification::ReductionOrElementwise(_) => CaptureSupport::unsupported(
-                "CUDA Einsum reduction/elementwise lowering is not implemented",
-            ),
+            EinsumPlanningClassification::ContractionTree(_)
+            | EinsumPlanningClassification::ReductionOrElementwise(_) => {
+                CaptureSupport::unsupported(format!(
+                    "Einsum `{}` must warm its exact GenericNative/optimized \
+                     dtype/shape/stride/address signature before capture",
+                    self.plan.equation()
+                ))
+            }
             _ => CaptureSupport::unsupported(
                 "CUDA Einsum received a newer unrecognized canonical classification",
             ),
         }
     }
+}
+
+/// Execute a concrete CUDA Einsum kernel through a required native route.
+///
+/// This is intentionally a narrow conformance/benchmark hook. It downcasts the
+/// real production kernel and uses the same validation, warm, launch, resource,
+/// and telemetry path as [`Kernel::execute`].
+#[doc(hidden)]
+pub fn execute_einsum_with_route(
+    kernel: &dyn Kernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+    route: EinsumRouteOverride,
+) -> Result<()> {
+    let kernel = kernel
+        .as_any()
+        .downcast_ref::<EinsumKernel>()
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep Einsum route override received a non-Einsum kernel".into(),
+            )
+        })?;
+    kernel.execute_with_override(inputs, outputs, route)
+}
+
+/// Execute with an explicit optimizer workspace ceiling.
+#[doc(hidden)]
+pub fn execute_einsum_with_route_and_memory_ceiling(
+    kernel: &dyn Kernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+    route: EinsumRouteOverride,
+    memory_ceiling_bytes: u128,
+) -> Result<()> {
+    let kernel = kernel
+        .as_any()
+        .downcast_ref::<EinsumKernel>()
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep Einsum route override received a non-Einsum kernel".into(),
+            )
+        })?;
+    kernel.execute_with_override_and_ceiling(inputs, outputs, route, memory_ceiling_bytes)
 }
 
 #[cfg(test)]
@@ -1349,7 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn multilinear_tree_is_declined_before_cuda_execution() {
+    fn multilinear_tree_is_claimed_for_native_execution() {
         let mut node = Node::new(onnx_runtime_ir::NodeId(0), "Einsum", vec![], vec![]);
         node.attributes.insert(
             "equation".into(),
@@ -1360,24 +1719,24 @@ mod tests {
             onnx_runtime_ir::static_shape([2, 8]),
             onnx_runtime_ir::static_shape([8]),
         ];
-        let reason = unsupported_reason_impl(
-            &node,
-            12,
-            &shapes,
-            &[DataType::Float32; 3],
-            &[
-                TensorLayout::contiguous(),
-                TensorLayout::contiguous(),
-                TensorLayout::contiguous(),
-            ],
-        )
-        .unwrap();
-        assert!(reason.contains("3-input contraction plan"));
-        assert!(reason.contains("temporary scheduling"));
+        assert_eq!(
+            unsupported_reason_impl(
+                &node,
+                12,
+                &shapes,
+                &[DataType::Float32; 3],
+                &[
+                    TensorLayout::contiguous(),
+                    TensorLayout::contiguous(),
+                    TensorLayout::contiguous(),
+                ],
+            ),
+            None
+        );
     }
 
     #[test]
-    fn large_arity_cuda_claim_reports_bounded_generic_fallback() {
+    fn large_arity_cuda_claim_accepts_bounded_generic_fallback() {
         let arity = 256;
         let equation = format!(
             "{}->",
@@ -1393,11 +1752,9 @@ mod tests {
         let shapes = vec![onnx_runtime_ir::static_shape([1]); arity];
         let dtypes = vec![DataType::Float32; arity];
         let layouts = vec![TensorLayout::contiguous(); arity];
-        let reason = unsupported_reason_impl(&node, 12, &shapes, &dtypes, &layouts).unwrap();
-        assert!(reason.contains("GenericNative fallback"), "{reason}");
-        assert!(
-            reason.contains("work/metadata budget was exceeded"),
-            "{reason}"
+        assert_eq!(
+            unsupported_reason_impl(&node, 12, &shapes, &dtypes, &layouts),
+            None
         );
     }
 
@@ -1419,9 +1776,10 @@ mod tests {
             unsupported_reason_impl(&node, 27, &shapes, &[DataType::BFloat16], &layouts).unwrap();
         assert!(opset27.contains("not admitted by Einsum-12"), "{opset27}");
 
-        let opset28 =
-            unsupported_reason_impl(&node, 28, &shapes, &[DataType::BFloat16], &layouts).unwrap();
-        assert!(opset28.contains("Einsum-28 admits BFloat16 semantically"));
+        assert_eq!(
+            unsupported_reason_impl(&node, 28, &shapes, &[DataType::BFloat16], &layouts),
+            None
+        );
     }
 
     #[test]

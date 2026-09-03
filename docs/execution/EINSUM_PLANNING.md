@@ -170,16 +170,19 @@ Precision is IR data, not a backend fast-path choice:
   wrapping modulo `2^width` so signed overflow never relies on host-language
   undefined behavior.
 
-## Staged CPU/CUDA execution
+## Native CPU/CUDA execution
 
-The final native CPU/CUDA goal is exhaustive execution of every expression and
-dtype legal under the resolved schema.
+The CUDA EP executes every expression and homogeneous numeric dtype legal under
+the resolved schema. Its immutable, shape-specialized `CudaEinsumPlan` consumes
+the canonical index program directly, uploads metadata and selects algorithms
+during warmup, and records only exact warmed signatures into CUDA graphs.
+`GenericNative` assigns output tiles directly and loops the canonical reduction
+space on device, so arbitrary-N expressions require no exponential
+intermediate. Bounded exact-DP/greedy trees reuse device temporary slots and may
+use cuBLASLt for f32 binary steps only when storage, accumulation, broadcast,
+and output-layout contracts match; otherwise that step remains generic.
+F16/BF16 inputs and intermediates accumulate in f32 and narrow once at the
+final output. Integer arithmetic wraps at the declared width.
 
-This PR establishes the semantic/index/planning API only; it does **not** add
-new execution kernels. Current CPU continues executing its existing
-float32/float16 view, diagonal, generic reduction/elementwise, and flat
-GEMM/BMM paths. Current CUDA continues executing its existing float32/float16
-view/diagonal and flat GEMM/BMM paths. They may temporarily decline
-`GenericNative`, general contraction-tree execution, and bfloat16 execution
-with an actionable staged-implementation message. Those declines describe
-current kernel coverage, not a permanent semantic limitation.
+The CPU EP still has its earlier staged execution coverage and may decline
+general contraction trees or dtypes that its native kernel has not implemented.

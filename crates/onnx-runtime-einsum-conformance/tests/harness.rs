@@ -122,6 +122,7 @@ fn named_and_seeded_corpus_cover_required_semantics_with_bounded_resources() {
         "integer-wrapping-i8",
         "integer-matmul-i32",
         "scalar-product-64-operands",
+        "scalar-product-128-operands",
     ] {
         assert!(ids.contains(required), "missing required case {required}");
     }
@@ -129,7 +130,7 @@ fn named_and_seeded_corpus_cover_required_semantics_with_bounded_resources() {
         .iter()
         .map(|case| case.input_shapes.len())
         .collect::<BTreeSet<_>>();
-    for arity in [1usize, 2, 3, 4, 8, 16, 64] {
+    for arity in [1usize, 2, 3, 4, 8, 16, 64, 128] {
         assert!(arities.contains(&arity), "missing arity {arity}");
     }
     assert!(cases.iter().any(|case| !case.equation.contains("->")));
@@ -176,6 +177,18 @@ fn named_and_seeded_corpus_cover_required_semantics_with_bounded_resources() {
         let result = evaluate(case, &inputs).unwrap();
         assert_eq!(result.output().dtype(), case.dtype, "{}", case.id);
     }
+    let integer_matmul = cases
+        .iter()
+        .find(|case| case.id == "integer-matmul-i32")
+        .unwrap();
+    assert!(
+        integer_matmul
+            .route_probes
+            .iter()
+            .all(|probe| !matches!(probe.route, ForcedRoute::MatMul | ForcedRoute::CudaCublas)),
+        "integer MatMul syntax must use exact modular GenericNative arithmetic; \
+         float-only BLAS routes are not a valid forced probe"
+    );
 }
 
 #[test]
