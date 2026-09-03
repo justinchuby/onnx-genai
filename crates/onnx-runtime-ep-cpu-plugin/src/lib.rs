@@ -280,6 +280,24 @@ pub extern "C" fn nxrt_ep_reset_executed_node_count() {
     onnx_runtime_ep_plugin::compute::reset_executed_node_count()
 }
 
+/// Enable and reset route-scoped CPU Einsum concurrency observation.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_einsum_concurrency_probe() {
+    onnx_runtime_ep_cpu::kernels::einsum::reset_concurrency_probe()
+}
+
+/// Disable observation and return the maximum overlap for `route`.
+///
+/// Routes are `0=view-copy`, `1=reduction/oracle`, and
+/// `2=materialized-GEMM`. An unknown route returns zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_finish_einsum_concurrency_probe(route: usize) -> usize {
+    onnx_runtime_ep_cpu::kernels::einsum::finish_concurrency_probe()
+        .get(route)
+        .copied()
+        .unwrap_or(0)
+}
+
 // ─── Build identity ─────────────────────────────────────────────────────────
 
 /// The optional build features compiled into this cdylib, as a NUL-terminated

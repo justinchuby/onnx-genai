@@ -934,6 +934,8 @@ fn l1_no_symbol_leakage() {
                 && *name != "nxrt_ep_reset_constant_weight_inputs"
                 && *name != "nxrt_ep_executed_node_count"
                 && *name != "nxrt_ep_reset_executed_node_count"
+                && *name != "nxrt_ep_reset_einsum_concurrency_probe"
+                && *name != "nxrt_ep_finish_einsum_concurrency_probe"
                 && *name != "nxrt_ep_build_features"
                 && *name != "nxrt_ep_persistent_decode_pool_built"
                 // The dispatch probe is a research build. Its four exports

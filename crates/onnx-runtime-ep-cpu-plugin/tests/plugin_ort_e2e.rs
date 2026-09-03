@@ -35,9 +35,10 @@ mod cdylib_resolve;
 use onnx_runtime_ort_testkit as ort_path;
 
 use std::ffi::{CStr, CString};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
 use onnx_genai_ort_sys as ort;
 
@@ -1093,6 +1094,20 @@ unsafe fn reset_ep_counter(lib: &libloading::Library, symbol: &[u8]) {
     unsafe { reset() };
 }
 
+unsafe fn reset_einsum_concurrency_probe(lib: &libloading::Library) {
+    let reset: libloading::Symbol<'_, unsafe extern "C" fn()> =
+        unsafe { lib.get(b"nxrt_ep_reset_einsum_concurrency_probe") }
+            .expect("CPU plugin must export the Einsum concurrency reset");
+    unsafe { reset() };
+}
+
+unsafe fn finish_einsum_concurrency_probe(lib: &libloading::Library, route: usize) -> usize {
+    let finish: libloading::Symbol<'_, unsafe extern "C" fn(usize) -> usize> =
+        unsafe { lib.get(b"nxrt_ep_finish_einsum_concurrency_probe") }
+            .expect("CPU plugin must export the Einsum concurrency result");
+    unsafe { finish(route) }
+}
+
 // ─── Helper: query EP graph assignment ────────────────────────────────────────
 
 /// Result of querying which nodes are assigned to which EP.
@@ -1652,6 +1667,363 @@ fn conformance_matmul_2d() {
 }
 
 // ─── Conformance: Einsum ─────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum ConcurrentEinsumRoute {
+    View,
+    Reduction,
+    MaterializedGemm,
+}
+
+struct ConcurrentEinsumModel {
+    equation: &'static str,
+    inputs: Vec<(&'static str, Vec<i64>)>,
+    output: (&'static str, Vec<i64>),
+}
+
+impl ConcurrentEinsumRoute {
+    fn label(self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Reduction => "reduction",
+            Self::MaterializedGemm => "materialized_gemm",
+        }
+    }
+
+    fn probe_index(self) -> usize {
+        match self {
+            Self::View => 0,
+            Self::Reduction => 1,
+            Self::MaterializedGemm => 2,
+        }
+    }
+}
+
+fn einsum_model_text(
+    name: &str,
+    equation: &str,
+    inputs: &[(&str, &[i64])],
+    output: (&str, &[i64]),
+) -> String {
+    let mut text = String::new();
+    writeln!(text, "ir_version: 11").unwrap();
+    writeln!(text, "graph {{").unwrap();
+    writeln!(text, "  node {{").unwrap();
+    for (input, _) in inputs {
+        writeln!(text, "    input: \"{input}\"").unwrap();
+    }
+    writeln!(text, "    output: \"{}\"", output.0).unwrap();
+    writeln!(text, "    op_type: \"Einsum\"").unwrap();
+    writeln!(
+        text,
+        "    attribute {{ name: \"equation\" type: STRING s: \"{equation}\" }}"
+    )
+    .unwrap();
+    writeln!(text, "  }}").unwrap();
+    writeln!(text, "  name: \"{name}\"").unwrap();
+    for (input, shape) in inputs {
+        writeln!(
+            text,
+            "  input {{ name: \"{input}\" type {{ tensor_type {{ elem_type: 1 shape {{"
+        )
+        .unwrap();
+        for dim in *shape {
+            writeln!(text, "    dim {{ dim_value: {dim} }}").unwrap();
+        }
+        writeln!(text, "  }} }} }} }}").unwrap();
+    }
+    writeln!(
+        text,
+        "  output {{ name: \"{}\" type {{ tensor_type {{ elem_type: 1 shape {{",
+        output.0
+    )
+    .unwrap();
+    for dim in output.1 {
+        writeln!(text, "    dim {{ dim_value: {dim} }}").unwrap();
+    }
+    writeln!(text, "  }} }} }} }}").unwrap();
+    writeln!(text, "}}").unwrap();
+    writeln!(text, "opset_import {{ version: 24 }}").unwrap();
+    text
+}
+
+unsafe fn run_concurrent_einsum_once(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    route: ConcurrentEinsumRoute,
+    seed: usize,
+) {
+    let input_names = [c"A".as_ptr(), c"B".as_ptr()];
+    let output_names = [c"C".as_ptr()];
+    let mut output: *mut ort::OrtValue = ptr::null_mut();
+    match route {
+        ConcurrentEinsumRoute::View => {
+            const ROWS: usize = 1536;
+            const COLS: usize = 1536;
+            let mut input = (0..ROWS * COLS)
+                .map(|index| ((index + seed * 17) % 61) as f32 * 0.03125 - 0.75)
+                .collect::<Vec<_>>();
+            let input_value =
+                unsafe { make_float_tensor(api, &mut input, &[ROWS as i64, COLS as i64]) };
+            let inputs = [input_value as *const ort::OrtValue];
+            let status = unsafe {
+                ((*api).Run.unwrap())(
+                    session,
+                    ptr::null(),
+                    input_names.as_ptr(),
+                    inputs.as_ptr(),
+                    1,
+                    output_names.as_ptr(),
+                    1,
+                    &mut output,
+                )
+            };
+            unsafe { check_status(api, status, "concurrent view Einsum Run") };
+            let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+            unsafe {
+                check_status(
+                    api,
+                    ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr),
+                    "concurrent view Einsum output",
+                )
+            };
+            let actual = unsafe { std::slice::from_raw_parts(data_ptr.cast::<f32>(), ROWS * COLS) };
+            for row in [0, 1, ROWS / 2, ROWS - 1] {
+                for column in [0, 1, COLS / 2, COLS - 1] {
+                    assert_eq!(
+                        actual[column * ROWS + row],
+                        input[row * COLS + column],
+                        "view output mismatch at ({row}, {column})"
+                    );
+                }
+            }
+            unsafe { ((*api).ReleaseValue.unwrap())(input_value) };
+        }
+        ConcurrentEinsumRoute::Reduction => {
+            const ROWS: usize = 128;
+            const COLS: usize = 32_768;
+            let mut input = (0..ROWS * COLS)
+                .map(|index| ((index + seed * 13) % 29) as f32 * 0.0625 - 0.875)
+                .collect::<Vec<_>>();
+            let expected = input
+                .chunks_exact(COLS)
+                .map(|row| row.iter().copied().sum::<f32>())
+                .collect::<Vec<_>>();
+            let input_value =
+                unsafe { make_float_tensor(api, &mut input, &[ROWS as i64, COLS as i64]) };
+            let inputs = [input_value as *const ort::OrtValue];
+            let status = unsafe {
+                ((*api).Run.unwrap())(
+                    session,
+                    ptr::null(),
+                    input_names.as_ptr(),
+                    inputs.as_ptr(),
+                    1,
+                    output_names.as_ptr(),
+                    1,
+                    &mut output,
+                )
+            };
+            unsafe { check_status(api, status, "concurrent reduction Einsum Run") };
+            let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+            unsafe {
+                check_status(
+                    api,
+                    ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr),
+                    "concurrent reduction Einsum output",
+                )
+            };
+            let actual = unsafe { std::slice::from_raw_parts(data_ptr.cast::<f32>(), ROWS) };
+            assert_eq!(actual, expected);
+            unsafe { ((*api).ReleaseValue.unwrap())(input_value) };
+        }
+        ConcurrentEinsumRoute::MaterializedGemm => {
+            const A: usize = 8;
+            const B: usize = 1;
+            const E: usize = 4;
+            const X: usize = 32;
+            const Y: usize = 32;
+            const C: usize = 16;
+            const D: usize = 16;
+            let mut left = (0..A * B * X * Y)
+                .map(|index| ((index + seed * 7) % 17) as f32 * 0.03125 - 0.25)
+                .collect::<Vec<_>>();
+            let mut right = (0..E * X * Y * C * D)
+                .map(|index| ((index + seed * 11) % 19) as f32 * 0.03125 - 0.28125)
+                .collect::<Vec<_>>();
+            let left_value = unsafe {
+                make_float_tensor(api, &mut left, &[A as i64, B as i64, X as i64, Y as i64])
+            };
+            let right_value = unsafe {
+                make_float_tensor(
+                    api,
+                    &mut right,
+                    &[E as i64, X as i64, Y as i64, C as i64, D as i64],
+                )
+            };
+            let inputs = [
+                left_value as *const ort::OrtValue,
+                right_value as *const ort::OrtValue,
+            ];
+            let status = unsafe {
+                ((*api).Run.unwrap())(
+                    session,
+                    ptr::null(),
+                    input_names.as_ptr(),
+                    inputs.as_ptr(),
+                    2,
+                    output_names.as_ptr(),
+                    1,
+                    &mut output,
+                )
+            };
+            unsafe { check_status(api, status, "concurrent materialized GEMM Einsum Run") };
+            let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+            unsafe {
+                check_status(
+                    api,
+                    ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr),
+                    "concurrent materialized GEMM Einsum output",
+                )
+            };
+            let actual =
+                unsafe { std::slice::from_raw_parts(data_ptr.cast::<f32>(), D * E * C * A * B) };
+            for (d, e, c, a, b) in [
+                (0, 0, 0, 0, 0),
+                (1, 2, 7, 3, 0),
+                (D / 2, E / 2, C / 2, A / 2, 0),
+                (D - 1, E - 1, C - 1, A - 1, 0),
+            ] {
+                let mut expected = 0.0f32;
+                for x in 0..X {
+                    for y in 0..Y {
+                        expected += left[((a * B + b) * X + x) * Y + y]
+                            * right[((((e * X + x) * Y + y) * C + c) * D) + d];
+                    }
+                }
+                let output_offset = ((((d * E + e) * C + c) * A + a) * B) + b;
+                assert!(
+                    (actual[output_offset] - expected).abs() <= 2e-3,
+                    "materialized GEMM output mismatch at ({d}, {e}, {c}, {a}, {b}): got {}, expected {expected}",
+                    actual[output_offset]
+                );
+            }
+            unsafe {
+                ((*api).ReleaseValue.unwrap())(left_value);
+                ((*api).ReleaseValue.unwrap())(right_value);
+            }
+        }
+    }
+    assert!(!output.is_null());
+    unsafe { ((*api).ReleaseValue.unwrap())(output) };
+}
+
+/// One ORT session shares one compiled CPU Einsum kernel across simultaneous
+/// `Run` callbacks. Exercise every scratch contract directly: reduction and
+/// output-permuted GEMM both need f32 workspace, while the view-copy route must
+/// remain lock-free and overlap too.
+#[test]
+fn concurrent_same_session_einsum_runs_are_isolated() {
+    let _lock = lock_ort_ep();
+    const THREADS: usize = 4;
+    const REPEATS: usize = 4;
+    let ep_path = skip_if_missing!(
+        find_ep_cdylib(),
+        "concurrent_same_session_einsum_runs_are_isolated: EP cdylib not found"
+    );
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+
+    for route in [
+        ConcurrentEinsumRoute::Reduction,
+        ConcurrentEinsumRoute::MaterializedGemm,
+        ConcurrentEinsumRoute::View,
+    ] {
+        let model = match route {
+            ConcurrentEinsumRoute::View => ConcurrentEinsumModel {
+                equation: "ij->ji",
+                inputs: vec![("A", vec![1536, 1536])],
+                output: ("C", vec![1536, 1536]),
+            },
+            ConcurrentEinsumRoute::Reduction => ConcurrentEinsumModel {
+                equation: "ij->i",
+                inputs: vec![("A", vec![128, 32_768])],
+                output: ("C", vec![128]),
+            },
+            ConcurrentEinsumRoute::MaterializedGemm => ConcurrentEinsumModel {
+                equation: "abxy,...xycd->d...cab",
+                inputs: vec![("A", vec![8, 1, 32, 32]), ("B", vec![4, 32, 32, 16, 16])],
+                output: ("C", vec![16, 4, 16, 8, 1]),
+            },
+        };
+        let input_refs = model
+            .inputs
+            .iter()
+            .map(|(name, shape)| (*name, shape.as_slice()))
+            .collect::<Vec<_>>();
+        let model_text = einsum_model_text(
+            &format!("einsum_concurrent_{}", route.label()),
+            model.equation,
+            &input_refs,
+            (model.output.0, model.output.1.as_slice()),
+        );
+        let model_path =
+            write_generated_model(&format!("einsum_concurrent_{}", route.label()), &model_text);
+        let registration = format!("cpu_ep_einsum_concurrent_{}", route.label());
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(&registration, &model_path, true) })
+        else {
+            eprintln!(
+                "*** SKIPPED: concurrent_same_session_einsum_runs_are_isolated — \
+                 ORT or EP cdylib not found ***"
+            );
+            return;
+        };
+
+        unsafe {
+            assert_ops_assigned_to_our_ep(api, session, &["Einsum"], &registration);
+            reset_ep_counter(&ep_lib, b"nxrt_ep_reset_executed_node_count");
+            reset_einsum_concurrency_probe(&ep_lib);
+        }
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let api_address = api as usize;
+        let session_address = session as usize;
+        std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(THREADS);
+            for worker in 0..THREADS {
+                let barrier = Arc::clone(&barrier);
+                workers.push(scope.spawn(move || {
+                    for repetition in 0..REPEATS {
+                        barrier.wait();
+                        unsafe {
+                            run_concurrent_einsum_once(
+                                api_address as *const ort::OrtApi,
+                                session_address as *mut ort::OrtSession,
+                                route,
+                                worker * REPEATS + repetition,
+                            )
+                        };
+                    }
+                }));
+            }
+            for worker in workers {
+                worker.join().expect("concurrent Einsum worker panicked");
+            }
+        });
+        let max_overlap = unsafe { finish_einsum_concurrency_probe(&ep_lib, route.probe_index()) };
+        assert!(
+            max_overlap >= 2,
+            "{} route never overlapped inside the shared compiled kernel; max={max_overlap}",
+            route.label()
+        );
+        assert_eq!(
+            unsafe { read_ep_counter(&ep_lib, b"nxrt_ep_executed_node_count") },
+            THREADS * REPEATS,
+            "{} route did not execute every synchronized Run through this EP",
+            route.label()
+        );
+        unsafe { conformance_teardown(api, env, opts, session, &registration) };
+    }
+}
 
 /// Canonical Float32 and Float16 `ik,kj->ij` must travel through real ORT
 /// loading, plugin capability, assignment, compile, and compute. CPU fallback

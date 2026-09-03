@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
@@ -61,11 +62,84 @@ struct EinsumScratch {
     f32_output: Vec<f32>,
 }
 
+thread_local! {
+    /// Per-dispatch-thread reusable storage. Compiled kernels are shared by the
+    /// ORT plugin across concurrent `Run` callbacks, so scratch cannot live in
+    /// the kernel instance. A thread-local pool preserves allocation reuse and
+    /// parallel `Run`s without putting a lock around scratch-free view routes.
+    static EINSUM_SCRATCH: RefCell<EinsumScratch> = RefCell::new(EinsumScratch::default());
+}
+
+const CONCURRENCY_ROUTES: usize = 3;
+const CONCURRENCY_VIEW: usize = 0;
+const CONCURRENCY_REDUCTION: usize = 1;
+const CONCURRENCY_MATERIALIZED_GEMM: usize = 2;
+static CONCURRENCY_PROBE_ENABLED: AtomicBool = AtomicBool::new(false);
+static CONCURRENCY_ACTIVE: [AtomicUsize; CONCURRENCY_ROUTES] =
+    [const { AtomicUsize::new(0) }; CONCURRENCY_ROUTES];
+static CONCURRENCY_MAX: [AtomicUsize; CONCURRENCY_ROUTES] =
+    [const { AtomicUsize::new(0) }; CONCURRENCY_ROUTES];
+
+struct ConcurrencyProbeGuard {
+    route: usize,
+}
+
+impl ConcurrencyProbeGuard {
+    fn enter(route: usize) -> Option<Self> {
+        if !CONCURRENCY_PROBE_ENABLED.load(Ordering::Relaxed) {
+            return None;
+        }
+        let active = CONCURRENCY_ACTIVE[route].fetch_add(1, Ordering::AcqRel) + 1;
+        CONCURRENCY_MAX[route].fetch_max(active, Ordering::Relaxed);
+        Some(Self { route })
+    }
+}
+
+impl Drop for ConcurrencyProbeGuard {
+    fn drop(&mut self) {
+        CONCURRENCY_ACTIVE[self.route].fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[doc(hidden)]
+pub fn reset_concurrency_probe() {
+    for route in 0..CONCURRENCY_ROUTES {
+        CONCURRENCY_ACTIVE[route].store(0, Ordering::Relaxed);
+        CONCURRENCY_MAX[route].store(0, Ordering::Relaxed);
+    }
+    CONCURRENCY_PROBE_ENABLED.store(true, Ordering::Release);
+}
+
+#[doc(hidden)]
+pub fn finish_concurrency_probe() -> [usize; CONCURRENCY_ROUTES] {
+    CONCURRENCY_PROBE_ENABLED.store(false, Ordering::Release);
+    std::array::from_fn(|route| CONCURRENCY_MAX[route].load(Ordering::Acquire))
+}
+
+fn with_f32_scratch<T>(len: usize, execute: impl FnOnce(&mut Vec<f32>) -> Result<T>) -> Result<T> {
+    EINSUM_SCRATCH
+        .try_with(|scratch| {
+            let mut scratch = scratch.try_borrow_mut().map_err(|_| {
+                EpError::KernelFailed(
+                    "Einsum: the per-thread scratch pool was re-entered by a nested execution. \
+                     HOW: avoid recursively invoking the same CPU execution thread."
+                        .into(),
+                )
+            })?;
+            resize_f32(&mut scratch.f32_output, len)?;
+            execute(&mut scratch.f32_output)
+        })
+        .map_err(|_| {
+            EpError::KernelFailed(
+                "Einsum: the per-thread scratch pool is unavailable during thread teardown".into(),
+            )
+        })?
+}
+
 /// Shape-specialized CPU Einsum kernel.
 pub struct EinsumKernel {
     plan: EinsumShapePlan,
     matmul: MatMulKernel,
-    scratch: RefCell<EinsumScratch>,
     mode: ExecutionMode,
     flops: Option<u64>,
     #[cfg(test)]
@@ -108,7 +182,6 @@ impl KernelFactory for EinsumFactory {
         Ok(Box::new(EinsumKernel {
             plan,
             matmul: MatMulKernel::default(),
-            scratch: RefCell::new(EinsumScratch::default()),
             mode,
             flops,
             #[cfg(test)]
@@ -293,6 +366,7 @@ impl EinsumKernel {
             EinsumClassification::ViewOnlyPermutation(permutation)
             | EinsumClassification::DiagonalView(permutation) => {
                 self.record_route(1);
+                let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_VIEW);
                 self.execute_view_copy(inputs, outputs, permutation)?;
                 Ok(EinsumRoute::ViewCopy)
             }
@@ -302,6 +376,7 @@ impl EinsumKernel {
                 } else {
                     2
                 });
+                let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_REDUCTION);
                 self.execute_reduction(inputs, outputs, reduction)?;
                 Ok(if self.mode == ExecutionMode::Oracle {
                     EinsumRoute::Oracle
@@ -534,128 +609,129 @@ impl EinsumKernel {
             })
             .collect::<Result<_>>()?;
 
-        let mut scratch = self.scratch.borrow_mut();
-        resize_f32(&mut scratch.f32_output, output_len)?;
-        scratch.f32_output.fill(0.0);
-        let identity_mappings = mappings
-            .iter()
-            .all(|mapping| mapping.iter().copied().eq(0..iteration_axes.len()));
-        let aligned_dense = layouts
-            .iter()
-            .zip(&dense)
-            .all(|(layout, data)| layout.shape == iteration_shape && data.len() == output_len);
-        if !high_precision && reduction_len == 1 && identity_mappings && aligned_dense {
-            const PARALLEL_ELEMENTWISE_MIN_ELEMS: usize = 64 * 1024;
-            let evaluate = |index: usize| {
-                dense
-                    .iter()
-                    .fold(1.0f32, |product, operand| product * operand[index])
-            };
-            if output_len >= PARALLEL_ELEMENTWISE_MIN_ELEMS {
-                scratch
-                    .f32_output
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(index, output)| *output = evaluate(index));
-            } else {
-                scratch
-                    .f32_output
-                    .iter_mut()
-                    .enumerate()
-                    .for_each(|(index, output)| *output = evaluate(index));
-            }
-            return write_dense_f32_narrow("Einsum", &mut outputs[0], &scratch.f32_output);
-        }
-        if !high_precision
-            && dense.len() == 1
-            && reduction_len != 0
-            && identity_mappings
-            && layouts[0].shape == iteration_shape
-            && dense[0].len() == output_len.saturating_mul(reduction_len)
-        {
-            const PARALLEL_REDUCTION_MIN_ELEMS: usize = 64 * 1024;
-            let data = dense[0].as_ref();
-            let reduce_one = |(output, values): (&mut f32, &[f32])| {
-                *output = values.iter().copied().sum();
-            };
-            if data.len() >= PARALLEL_REDUCTION_MIN_ELEMS && output_len > 1 {
-                scratch
-                    .f32_output
-                    .par_iter_mut()
-                    .zip(data.par_chunks(reduction_len))
-                    .for_each(reduce_one);
-            } else {
-                scratch
-                    .f32_output
-                    .iter_mut()
-                    .zip(data.chunks(reduction_len))
-                    .for_each(reduce_one);
-            }
-            return write_dense_f32_narrow("Einsum", &mut outputs[0], &scratch.f32_output);
-        }
-        if output_len != 0 && reduction_len != 0 {
-            let mut output_index = vec![0usize; output_rank];
-            for output_offset in 0..output_len {
-                let mut reduction_index = vec![0usize; reduction_shape.len()];
-                let mut first = true;
-                let mut sum_f32 = 0.0f32;
-                let mut sum_f64 = 0.0f64;
-                while first || next_index(reduction_shape, &mut reduction_index) {
-                    first = false;
-                    let mut product_f32 = 1.0f32;
-                    let mut product_f64 = 1.0f64;
-                    for ((data, strides), _operand) in dense
+        with_f32_scratch(output_len, |f32_output| {
+            f32_output.fill(0.0);
+            let identity_mappings = mappings
+                .iter()
+                .all(|mapping| mapping.iter().copied().eq(0..iteration_axes.len()));
+            let aligned_dense = layouts
+                .iter()
+                .zip(&dense)
+                .all(|(layout, data)| layout.shape == iteration_shape && data.len() == output_len);
+            if !high_precision && reduction_len == 1 && identity_mappings && aligned_dense {
+                const PARALLEL_ELEMENTWISE_MIN_ELEMS: usize = 64 * 1024;
+                let evaluate = |index: usize| {
+                    dense
                         .iter()
-                        .zip(&operand_iteration_strides)
-                        .zip(self.plan.operands())
-                    {
-                        let mut offset = 0usize;
-                        for axis in 0..iteration_axes.len() {
-                            let index = if axis < output_rank {
-                                output_index[axis]
-                            } else {
-                                reduction_index[axis - output_rank]
-                            };
-                            offset = offset
-                                .checked_add(index.checked_mul(strides[axis]).ok_or_else(|| {
-                                    geometry_overflow(self.plan.equation(), "operand offset")
-                                })?)
-                                .ok_or_else(|| {
-                                    geometry_overflow(self.plan.equation(), "operand offset")
-                                })?;
-                        }
-                        let value = *data.get(offset).ok_or_else(|| {
-                            EpError::KernelFailed(format!(
-                                "Einsum `{}` canonical operand offset {offset} exceeded a dense \
-                                 operand with {} element(s)",
-                                self.plan.equation(),
-                                data.len()
-                            ))
-                        })?;
-                        product_f32 *= value;
-                        product_f64 *= f64::from(value);
-                    }
-                    if high_precision {
-                        sum_f64 += product_f64;
-                    } else {
-                        sum_f32 += product_f32;
-                    }
-                    if reduction_shape.is_empty() {
-                        break;
-                    }
-                }
-                scratch.f32_output[output_offset] = if high_precision {
-                    sum_f64 as f32
-                } else {
-                    sum_f32
+                        .fold(1.0f32, |product, operand| product * operand[index])
                 };
-                if output_offset + 1 < output_len {
-                    let advanced = next_index(output_shape, &mut output_index);
-                    debug_assert!(advanced);
+                if output_len >= PARALLEL_ELEMENTWISE_MIN_ELEMS {
+                    f32_output
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(index, output)| *output = evaluate(index));
+                } else {
+                    f32_output
+                        .iter_mut()
+                        .enumerate()
+                        .for_each(|(index, output)| *output = evaluate(index));
+                }
+                return write_dense_f32_narrow("Einsum", &mut outputs[0], f32_output);
+            }
+            if !high_precision
+                && dense.len() == 1
+                && reduction_len != 0
+                && identity_mappings
+                && layouts[0].shape == iteration_shape
+                && dense[0].len() == output_len.saturating_mul(reduction_len)
+            {
+                const PARALLEL_REDUCTION_MIN_ELEMS: usize = 64 * 1024;
+                let data = dense[0].as_ref();
+                let reduce_one = |(output, values): (&mut f32, &[f32])| {
+                    *output = values.iter().copied().sum();
+                };
+                if data.len() >= PARALLEL_REDUCTION_MIN_ELEMS && output_len > 1 {
+                    f32_output
+                        .par_iter_mut()
+                        .zip(data.par_chunks(reduction_len))
+                        .for_each(reduce_one);
+                } else {
+                    f32_output
+                        .iter_mut()
+                        .zip(data.chunks(reduction_len))
+                        .for_each(reduce_one);
+                }
+                return write_dense_f32_narrow("Einsum", &mut outputs[0], f32_output);
+            }
+            if output_len != 0 && reduction_len != 0 {
+                let mut output_index = vec![0usize; output_rank];
+                for (output_offset, output) in f32_output.iter_mut().enumerate().take(output_len) {
+                    let mut reduction_index = vec![0usize; reduction_shape.len()];
+                    let mut first = true;
+                    let mut sum_f32 = 0.0f32;
+                    let mut sum_f64 = 0.0f64;
+                    while first || next_index(reduction_shape, &mut reduction_index) {
+                        first = false;
+                        let mut product_f32 = 1.0f32;
+                        let mut product_f64 = 1.0f64;
+                        for ((data, strides), _operand) in dense
+                            .iter()
+                            .zip(&operand_iteration_strides)
+                            .zip(self.plan.operands())
+                        {
+                            let mut offset = 0usize;
+                            for axis in 0..iteration_axes.len() {
+                                let index = if axis < output_rank {
+                                    output_index[axis]
+                                } else {
+                                    reduction_index[axis - output_rank]
+                                };
+                                offset = offset
+                                    .checked_add(index.checked_mul(strides[axis]).ok_or_else(
+                                        || {
+                                            geometry_overflow(
+                                                self.plan.equation(),
+                                                "operand offset",
+                                            )
+                                        },
+                                    )?)
+                                    .ok_or_else(|| {
+                                        geometry_overflow(self.plan.equation(), "operand offset")
+                                    })?;
+                            }
+                            let value = *data.get(offset).ok_or_else(|| {
+                                EpError::KernelFailed(format!(
+                                    "Einsum `{}` canonical operand offset {offset} exceeded a \
+                                     dense operand with {} element(s)",
+                                    self.plan.equation(),
+                                    data.len()
+                                ))
+                            })?;
+                            product_f32 *= value;
+                            product_f64 *= f64::from(value);
+                        }
+                        if high_precision {
+                            sum_f64 += product_f64;
+                        } else {
+                            sum_f32 += product_f32;
+                        }
+                        if reduction_shape.is_empty() {
+                            break;
+                        }
+                    }
+                    *output = if high_precision {
+                        sum_f64 as f32
+                    } else {
+                        sum_f32
+                    };
+                    if output_offset + 1 < output_len {
+                        let advanced = next_index(output_shape, &mut output_index);
+                        debug_assert!(advanced);
+                    }
                 }
             }
-        }
-        write_dense_f32_narrow("Einsum", &mut outputs[0], &scratch.f32_output)
+            write_dense_f32_narrow("Einsum", &mut outputs[0], f32_output)
+        })
     }
 
     fn execute_gemm(
@@ -788,18 +864,19 @@ impl EinsumKernel {
             flattened_gemm_shape(geometry.batch_shape(), geometry.m(), geometry.n());
         let canonical_strides = compute_contiguous_strides(&canonical_shape);
         let canonical_len = checked_numel("GEMM output", &canonical_shape)?;
-        let mut scratch = self.scratch.borrow_mut();
-        resize_f32(&mut scratch.f32_output, canonical_len)?;
-        let canonical_output = TensorMut::new(
-            onnx_runtime_ep_api::DevicePtrMut(scratch.f32_output.as_mut_ptr().cast()),
-            DataType::Float32,
-            &canonical_shape,
-            &canonical_strides,
-            onnx_runtime_ir::DeviceId::cpu(),
-        );
-        self.matmul
-            .execute(&[left_f32, right_f32], &mut [canonical_output])?;
-        write_canonical_output(&self.plan, gemm, &scratch.f32_output, &mut outputs[0])?;
+        let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_MATERIALIZED_GEMM);
+        with_f32_scratch(canonical_len, |f32_output| {
+            let canonical_output = TensorMut::new(
+                onnx_runtime_ep_api::DevicePtrMut(f32_output.as_mut_ptr().cast()),
+                DataType::Float32,
+                &canonical_shape,
+                &canonical_strides,
+                onnx_runtime_ir::DeviceId::cpu(),
+            );
+            self.matmul
+                .execute(&[left_f32, right_f32], &mut [canonical_output])?;
+            write_canonical_output(&self.plan, gemm, f32_output, &mut outputs[0])
+        })?;
         Ok(EinsumRoute::MatMulMaterialized)
     }
 
@@ -1145,17 +1222,18 @@ fn views_may_overlap(input: &TensorView, output: &TensorMut) -> bool {
 /// from tensor shapes.
 #[doc(hidden)]
 pub fn benchmark_scratch_capacity_bytes(kernel: &dyn Kernel) -> Option<usize> {
-    kernel
-        .as_any()
-        .downcast_ref::<EinsumKernel>()
-        .map(|kernel| {
-            kernel
-                .scratch
-                .borrow()
-                .f32_output
-                .capacity()
-                .saturating_mul(std::mem::size_of::<f32>())
+    kernel.as_any().downcast_ref::<EinsumKernel>()?;
+    EINSUM_SCRATCH
+        .try_with(|scratch| {
+            scratch.try_borrow().ok().map(|scratch| {
+                scratch
+                    .f32_output
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<f32>())
+            })
         })
+        .ok()
+        .flatten()
 }
 
 /// Execute one validation dispatch and return the native branch that fired.
@@ -1197,7 +1275,6 @@ mod tests {
             flops: None,
             plan,
             matmul: MatMulKernel::default(),
-            scratch: RefCell::new(EinsumScratch::default()),
             mode,
             last_route: std::sync::atomic::AtomicU8::new(0),
         })
@@ -1210,6 +1287,12 @@ mod tests {
             .unwrap()
             .last_route
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    fn compiled_kernel_is_naturally_sync_without_an_unsafe_assertion() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<EinsumKernel>();
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
