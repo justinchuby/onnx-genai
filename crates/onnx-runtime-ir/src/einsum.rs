@@ -617,7 +617,7 @@ pub enum EinsumPlanErrorKind {
     },
     /// More than one explicit-output arrow was present.
     MultipleOutputArrows,
-    /// A term contained a character outside ASCII lowercase letters and one `...`.
+    /// A term contained a character outside ASCII letters and one `...`.
     InvalidCharacter {
         /// Input or output term.
         side: EinsumEquationSide,
@@ -811,7 +811,7 @@ impl fmt::Display for EinsumPlanError {
                 found,
             } => write!(
                 f,
-                "{side} has invalid character `{found}` at normalized byte offset {offset}; expected ASCII lowercase letters or one `...`"
+                "{side} has invalid character `{found}` at normalized byte offset {offset}; expected case-sensitive ASCII letters or one `...`"
             ),
             EinsumPlanErrorKind::MultipleEllipses { side } => {
                 write!(f, "{side} contains more than one ellipsis")
@@ -1458,7 +1458,7 @@ impl ParsedTerm {
         let mut offset = 0;
         while offset < bytes.len() {
             let byte = bytes[offset];
-            if byte.is_ascii_lowercase() {
+            if byte.is_ascii_alphabetic() {
                 let label = EinsumLabel(byte);
                 if has_ellipsis {
                     after.push(label);
@@ -2397,30 +2397,23 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_labels_are_rejected_with_side_and_offset() {
-        let shape = [2usize, 3];
-        let inputs = [EinsumInput::new(DataType::Float32, &shape)];
-        for (equation, side, offset) in [
-            ("iJ->i", EinsumEquationSide::Input(0), 1),
-            ("ij->iJ", EinsumEquationSide::Output, 1),
-        ] {
-            let error = EinsumPlan::build(equation, &inputs).unwrap_err();
-            assert_eq!(error.equation(), equation);
-            assert_eq!(
-                error.kind(),
-                &EinsumPlanErrorKind::InvalidCharacter {
-                    side,
-                    offset,
-                    found: 'J',
-                }
-            );
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "Einsum equation `{equation}`: {side} has invalid character `J` at normalized byte offset {offset}; expected ASCII lowercase letters or one `...`"
-                )
-            );
-        }
+    fn mixed_case_labels_are_distinct_and_implicitly_sorted_by_ascii() {
+        let implicit = plan("Za,aB", &[&[2, 3], &[3, 4]]);
+        assert_eq!(output_labels(&implicit), "BZ");
+        assert_eq!(static_shape(&implicit), vec![Some(4), Some(2)]);
+
+        let explicit = plan("aA->Aa", &[&[2, 3]]);
+        assert_eq!(output_labels(&explicit), "Aa");
+        assert_eq!(static_shape(&explicit), vec![Some(3), Some(2)]);
+        assert_eq!(
+            explicit
+                .logical_axes()
+                .iter()
+                .filter(|axis| matches!(axis.axis(), EinsumAxis::Label(_)))
+                .count(),
+            2,
+            "upper- and lower-case labels are different logical axes"
+        );
     }
 
     #[test]

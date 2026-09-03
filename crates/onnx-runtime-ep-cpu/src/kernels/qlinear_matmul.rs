@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use super::{check_arity, qgemm_native, to_dense_bytes, write_dense_bytes};
 use crate::strided::numel;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Borrow a tensor's bytes when they are already dense, copy them when they are
 /// not.
@@ -79,17 +80,19 @@ const MAX_RETAINED_ACCUMULATOR_BYTES: usize =
 const MAX_PROCESS_ACCUMULATOR_BYTES: usize =
     crate::kernels::governed_accumulator_budget::DEFAULT_PROCESS_ACCUMULATOR_BYTES as usize;
 
-/// Process-wide, declinable budget governing the parked accumulator scratch
-/// across every worker thread (#1056). `live_bytes()` reports the sum actually
-/// parked, so a wrong ceiling is detectable in one run rather than argued from a
-/// formula -- and a single-thread test cannot move it past one buffer, which is
-/// why the test that defends it drives multiple threads.
+/// Process-wide byte budget governing the parked accumulator scratch across
+/// every worker thread (#1056). The adjacent admission flag decides whether
+/// this scratch family may retain at all. `live_bytes()` reports the sum
+/// actually parked, so a wrong ceiling is detectable in one run rather than
+/// argued from a formula -- and a single-thread test cannot move it past one
+/// buffer, which is why the test that defends it drives multiple threads.
 pub(crate) static ACCUMULATOR_BUDGET:
     crate::kernels::governed_accumulator_budget::GovernedAccumulatorBudget =
     crate::kernels::governed_accumulator_budget::GovernedAccumulatorBudget::new(
         MAX_RETAINED_ACCUMULATOR_BYTES as u64,
         MAX_PROCESS_ACCUMULATOR_BYTES as u64,
     );
+static ACCUMULATOR_RETENTION_ADMITTED: AtomicBool = AtomicBool::new(true);
 
 thread_local! {
     /// Per-thread scratch for the `i32` accumulator that the integer GEMM writes
@@ -119,7 +122,7 @@ thread_local! {
 /// slower -- instead of retaining up to [`MAX_PROCESS_ACCUMULATOR_BYTES`] across
 /// the worker pool for the life of the process.
 pub fn set_qlinear_accumulator_budget_admitted(admitted: bool) {
-    ACCUMULATOR_BUDGET.set_admitted(admitted);
+    ACCUMULATOR_RETENTION_ADMITTED.store(admitted, Ordering::Relaxed);
 }
 
 /// Bytes the parked accumulator scratch currently holds, summed across every
@@ -905,7 +908,10 @@ impl Kernel for QLinearMatMulKernel {
         // `MAX_PROCESS_ACCUMULATOR_BYTES`. A refused buffer is dropped and
         // recomputed next call (byte-identical), so the process footprint no
         // longer scales with the thread count.
-        if ACCUMULATOR_BUDGET.try_park((products.capacity() * std::mem::size_of::<i32>()) as u64) {
+        if ACCUMULATOR_RETENTION_ADMITTED.load(Ordering::Relaxed)
+            && ACCUMULATOR_BUDGET
+                .try_park((products.capacity() * std::mem::size_of::<i32>()) as u64)
+        {
             ACCUMULATOR.with(|cell| cell.replace(products));
         }
         match sink {
@@ -1721,7 +1727,7 @@ mod tests {
             &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
         ];
 
-        ACCUMULATOR_BUDGET.set_admitted(true);
+        ACCUMULATOR_RETENTION_ADMITTED.store(true, Ordering::Relaxed);
         ACCUMULATOR_BUDGET.reset_for_test();
 
         let kernel = QLinearMatMulKernel::default();

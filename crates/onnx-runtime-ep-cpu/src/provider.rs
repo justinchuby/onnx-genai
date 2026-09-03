@@ -29,7 +29,10 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
 use crate::WeightOffloadHostCache;
-use crate::kernels::{build_cpu_registry, build_cpu_registry_with_weight_offload_cache};
+use crate::kernels::{
+    build_cpu_registry, build_cpu_registry_with_weight_offload_cache,
+    build_cpu_registry_with_weight_offload_cache_and_einsum_retention,
+};
 use crate::optimizer::cpu_optimization_passes;
 
 /// CPU execution provider. Always available; the fallback EP for any op.
@@ -109,12 +112,39 @@ impl CpuExecutionProvider {
         }
     }
 
+    /// Construct a CPU EP with one immutable Einsum scratch-retention verdict.
+    pub fn with_einsum_scratch_retention(
+        einsum_scratch_retention: crate::kernels::einsum::EinsumScratchRetention,
+    ) -> Self {
+        Self::with_weight_offload_host_cache_and_einsum_retention(
+            crate::kernels::qmoe::default_weight_offload_host_cache().clone(),
+            einsum_scratch_retention,
+        )
+    }
+
     /// Construct a CPU EP whose QMoE kernels share one governor-owned host-cache partition.
     pub fn with_weight_offload_host_cache(host_cache: WeightOffloadHostCache) -> Self {
         Self {
             device: DeviceId::cpu(),
             initialized: false,
             registry: build_cpu_registry_with_weight_offload_cache(host_cache),
+            memory: default_cpu_memory(),
+        }
+    }
+
+    /// Construct a CPU EP whose compiled Einsum kernels retain scratch only
+    /// when this provider/session's immutable memory-plan verdict admitted it.
+    pub fn with_weight_offload_host_cache_and_einsum_retention(
+        host_cache: WeightOffloadHostCache,
+        einsum_scratch_retention: crate::kernels::einsum::EinsumScratchRetention,
+    ) -> Self {
+        Self {
+            device: DeviceId::cpu(),
+            initialized: false,
+            registry: build_cpu_registry_with_weight_offload_cache_and_einsum_retention(
+                host_cache,
+                einsum_scratch_retention,
+            ),
             memory: default_cpu_memory(),
         }
     }
@@ -137,6 +167,20 @@ impl CpuExecutionProvider {
         host_cache: WeightOffloadHostCache,
     ) -> Result<Self> {
         let mut ep = Self::with_weight_offload_host_cache(host_cache);
+        ep.initialize(&Default::default())?;
+        Ok(ep)
+    }
+
+    /// Construct and initialize a CPU EP with session-owned Einsum scratch
+    /// retention.
+    pub fn initialized_with_weight_offload_host_cache_and_einsum_retention(
+        host_cache: WeightOffloadHostCache,
+        einsum_scratch_retention: crate::kernels::einsum::EinsumScratchRetention,
+    ) -> Result<Self> {
+        let mut ep = Self::with_weight_offload_host_cache_and_einsum_retention(
+            host_cache,
+            einsum_scratch_retention,
+        );
         ep.initialize(&Default::default())?;
         Ok(ep)
     }

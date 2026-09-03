@@ -9,10 +9,10 @@ reparse `equation` or classify an equation by matching its string.
 
 ## Guarantees
 
-- Only lowercase ASCII letters are labels. U+0020 ASCII spaces are stripped
-  from the equation; every other whitespace or non-syntax character is
-  rejected. The normalized equation is parsed once and validated against every
-  input dtype, rank, and dimension.
+- ASCII `A-Z` and `a-z` are case-sensitive labels (`A` and `a` are distinct).
+  U+0020 ASCII spaces are stripped from the equation; every other whitespace or
+  non-syntax character is rejected. The normalized equation is parsed once and
+  validated against every input dtype, rank, and dimension.
 - Every explicit ellipsis expands to the same fixed number of dimensions, as
   required by opset 12. Terms without ellipsis do not acquire synthetic axes.
   Input axes map to canonical named or ellipsis axes. Repeated

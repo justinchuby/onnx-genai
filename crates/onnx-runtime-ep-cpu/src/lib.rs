@@ -77,12 +77,12 @@ pub use kernels::selection::non_max_suppression;
 pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};
 
 // Einsum Float32 workspace is parked per execution thread, so a per-buffer cap
-// alone would multiply by the pool width. The shared governed-accumulator
-// primitive enforces a process ceiling, reports live bytes, and lets the memory
-// plan decline retention while preserving temporary per-call execution.
+// alone would multiply by the pool width. Each provider/session owns an
+// immutable retention verdict; all admitted sessions share only the governed
+// process byte ceiling and live-byte accounting.
 pub use kernels::einsum::{
-    einsum_scratch_budget_predicted_bytes, einsum_scratch_live_bytes,
-    einsum_scratch_process_cap_bytes, set_einsum_scratch_budget_admitted,
+    EinsumScratchRetention, einsum_scratch_budget_predicted_bytes, einsum_scratch_live_bytes,
+    einsum_scratch_process_cap_bytes,
 };
 pub use kernels::matmul_nbits::bound_process_to_decode_budget;
 pub use kernels::matmul_nbits::set_decode_thread_budget;

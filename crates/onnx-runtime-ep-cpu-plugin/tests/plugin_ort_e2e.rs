@@ -1704,6 +1704,7 @@ fn einsum_model_text(
     equation: &str,
     inputs: &[(&str, &[i64])],
     output: (&str, &[i64]),
+    opset: i64,
 ) -> String {
     let mut text = String::new();
     writeln!(text, "ir_version: 11").unwrap();
@@ -1743,7 +1744,7 @@ fn einsum_model_text(
     }
     writeln!(text, "  }} }} }} }}").unwrap();
     writeln!(text, "}}").unwrap();
-    writeln!(text, "opset_import {{ version: 24 }}").unwrap();
+    writeln!(text, "opset_import {{ version: {opset} }}").unwrap();
     text
 }
 
@@ -1965,6 +1966,7 @@ fn concurrent_same_session_einsum_runs_are_isolated() {
             model.equation,
             &input_refs,
             (model.output.0, model.output.1.as_slice()),
+            24,
         );
         let model_path =
             write_generated_model(&format!("einsum_concurrent_{}", route.label()), &model_text);
@@ -2030,7 +2032,7 @@ fn concurrent_same_session_einsum_runs_are_isolated() {
 /// is disabled, and the exported callback counters prove each selector is
 /// neither empty nor satisfied by ORT's built-in CPU kernel.
 #[test]
-fn conformance_einsum_f32_f16_reach_native_cpu_kernel() {
+fn conformance_einsum_f32_f16_and_mixed_case_reach_native_cpu_kernel() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let f32_model =
@@ -2038,12 +2040,29 @@ fn conformance_einsum_f32_f16_reach_native_cpu_kernel() {
     let f16_text = include_str!("fixtures/einsum_gemm_2d/model.onnx.textproto")
         .replace("elem_type: 1", "elem_type: 10");
     let f16_model = write_generated_model("einsum_gemm_2d_f16", &f16_text);
+    let mixed_case_text = einsum_model_text(
+        "einsum_mixed_case_implicit",
+        "Za,aB",
+        &[("A", &[2, 3]), ("B", &[3, 2])],
+        ("C", &[2, 2]),
+        12,
+    );
+    let mixed_case_model = write_generated_model("einsum_mixed_case_implicit", &mixed_case_text);
     let ep_path = skip_if_missing!(
         find_ep_cdylib(),
-        "conformance_einsum_f32_f16_reach_native_cpu_kernel: EP cdylib not found"
+        "conformance_einsum_f32_f16_and_mixed_case_reach_native_cpu_kernel: EP cdylib not found"
     );
     let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
-    for (label, model_path, dtype) in [("f32", f32_model, ELEM_F32), ("f16", f16_model, ELEM_F16)] {
+    for (label, model_path, dtype, expected) in [
+        ("f32", f32_model, ELEM_F32, [4.0, 2.0, 10.0, 5.0]),
+        ("f16", f16_model, ELEM_F16, [4.0, 2.0, 10.0, 5.0]),
+        (
+            "mixed_case",
+            mixed_case_model,
+            ELEM_F32,
+            [4.0, 10.0, 2.0, 5.0],
+        ),
+    ] {
         unsafe {
             reset_ep_counter(&ep_lib, b"nxrt_ep_reset_get_capability_call_count");
             reset_ep_counter(&ep_lib, b"nxrt_ep_reset_compiled_node_count");
@@ -2120,12 +2139,12 @@ fn conformance_einsum_f32_f16_reach_native_cpu_kernel() {
             if dtype == ELEM_F32 {
                 assert_eq!(
                     std::slice::from_raw_parts(data_ptr.cast::<f32>(), 4),
-                    [4.0, 2.0, 10.0, 5.0]
+                    expected
                 );
             } else {
                 assert_eq!(
                     std::slice::from_raw_parts(data_ptr.cast::<u16>(), 4),
-                    [4.0f32, 2.0, 10.0, 5.0].map(f32_to_f16_bits)
+                    expected.map(f32_to_f16_bits)
                 );
             }
             assert_eq!(

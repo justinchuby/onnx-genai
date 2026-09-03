@@ -78,6 +78,7 @@ pub fn native_cuda_provider_construction_attempts() -> u64 {
 
 pub(crate) struct NativeDecodeLoadOptions<'a> {
     pub(crate) host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
+    pub(crate) einsum_scratch_retention: onnx_runtime_ep_cpu::EinsumScratchRetention,
     #[cfg(feature = "native-cuda")]
     pub(crate) cuda_offload_policy: Option<onnx_runtime_ep_cuda::DeviceOffloadPolicy>,
     #[cfg(feature = "native-cuda")]
@@ -287,9 +288,10 @@ impl NativeDecodeSession {
             // `onnx-runtime-optimizer::constant_folding` for the tradeoff.
             .option("optimization", "basic");
         if device == NativeDecodeDevice::Cpu {
-            let ep =
-                onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_weight_offload_host_cache(
+            let ep = onnx_runtime_ep_cpu::CpuExecutionProvider::
+                initialized_with_weight_offload_host_cache_and_einsum_retention(
                     options.host_cache,
+                    options.einsum_scratch_retention,
                 )
                 .context("initialize native CPU execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));

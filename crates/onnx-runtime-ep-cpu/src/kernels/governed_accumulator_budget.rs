@@ -20,11 +20,11 @@
 //!
 //! # The contract (mirrors #1056 / [`super::governed_weight_cache`])
 //!
-//! - **Declared before allocated / declinable.** The budget carries an
-//!   admit/decline flag set by the memory plan. When declined, [`Self::try_park`]
-//!   refuses every buffer, so the kernel keeps nothing and recomputes per call
-//!   (byte-identical, only slower) -- exactly the `GovernedWeightCache` decline
-//!   contract, applied to a scratch buffer instead of a weight-derived one.
+//! - **Declared before allocated / declinable.** The owning kernel decides
+//!   whether retention was admitted before calling [`Self::try_park`]. The
+//!   process budget deliberately carries no mutable admission verdict: that
+//!   decision belongs to the session, while this type answers only whether the
+//!   process-wide byte ceiling has room.
 //! - **Bytes, not entries.** [`Self::live_bytes`] reports the sum actually
 //!   parked across all threads, so a wrong ceiling is detectable in one run
 //!   rather than argued from a formula. A single-thread test cannot move this
@@ -37,14 +37,15 @@
 //!   `min(process_cap, per_thread_cap x threads)` -- a flat number that does not
 //!   grow with the vCPU count.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Established retention ceilings for CPU accumulator scratch.
 ///
 /// Scratch users share these defaults rather than choosing independent
 /// per-kernel policies: one thread may retain at most 32 MiB and one budget may
-/// retain at most 128 MiB process-wide. Each scratch family has its own budget
-/// so the memory plan can predict and decline it independently.
+/// retain at most 128 MiB process-wide. Each scratch family has its own byte
+/// budget; the owning kernel or session applies its own admission verdict
+/// before asking this process counter to reserve bytes.
 pub(crate) const DEFAULT_PER_THREAD_ACCUMULATOR_BYTES: u64 = 32 << 20;
 pub(crate) const DEFAULT_PROCESS_ACCUMULATOR_BYTES: u64 = 128 << 20;
 
@@ -54,9 +55,6 @@ pub(crate) const DEFAULT_PROCESS_ACCUMULATOR_BYTES: u64 = 128 << 20;
 /// thread that parks a buffer. `retained_bytes` is the figure the per-thread
 /// constant was silent about: the sum currently held across all threads.
 pub struct GovernedAccumulatorBudget {
-    /// The memory plan's verdict. `false` makes [`Self::try_park`] refuse every
-    /// buffer, so the kernel retains nothing and recomputes per call.
-    admitted: AtomicBool,
     /// Bytes parked across *all* threads right now. This is what
     /// [`Self::live_bytes`] reports and what the process cap bounds.
     retained_bytes: AtomicU64,
@@ -72,24 +70,12 @@ pub struct GovernedAccumulatorBudget {
 
 impl GovernedAccumulatorBudget {
     /// Create a budget. `const` so a shared instance can live in a `static`.
-    /// Admitted by default; the memory plan lowers it at load with
-    /// [`Self::set_admitted`] when the process footprint would not fit.
     pub const fn new(per_thread_cap_bytes: u64, process_cap_bytes: u64) -> Self {
         Self {
-            admitted: AtomicBool::new(true),
             retained_bytes: AtomicU64::new(0),
             per_thread_cap_bytes: AtomicU64::new(per_thread_cap_bytes),
             process_cap_bytes: AtomicU64::new(process_cap_bytes),
         }
-    }
-
-    /// Record the memory plan's admit/decline decision.
-    pub fn set_admitted(&self, admitted: bool) {
-        self.admitted.store(admitted, Ordering::Relaxed);
-    }
-
-    pub fn is_admitted(&self) -> bool {
-        self.admitted.load(Ordering::Relaxed)
     }
 
     /// Bytes currently parked across all threads -- the figure a predicted
@@ -117,10 +103,10 @@ impl GovernedAccumulatorBudget {
     /// Try to reserve `bytes` for a thread that wants to park its buffer.
     ///
     /// Succeeds (and adds `bytes` to the process-wide total) only when the
-    /// budget is admitted, the single buffer is within the per-thread cap, and
-    /// the new total stays within the process cap. On failure the caller must
-    /// drop its buffer and recompute next call -- a pure performance tradeoff,
-    /// never a numerical one.
+    /// single buffer is within the per-thread cap and the new total stays
+    /// within the process cap. On failure the caller must drop its buffer and
+    /// recompute next call -- a pure performance tradeoff, never a numerical
+    /// one.
     pub fn try_park(&self, bytes: u64) -> bool {
         self.try_reserve_bytes(bytes)
     }
@@ -141,7 +127,7 @@ impl GovernedAccumulatorBudget {
     }
 
     fn try_reserve_bytes(&self, bytes: u64) -> bool {
-        if bytes == 0 || !self.is_admitted() {
+        if bytes == 0 {
             return false;
         }
         if bytes > self.per_thread_cap_bytes() {
@@ -316,14 +302,12 @@ fn capacity_bytes<T>(buffer: &Vec<T>) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// A declined budget parks nothing, so its live figure stays at zero no
-    /// matter how many buffers ask to be parked.
+    /// Zero bytes never create a reservation.
     #[test]
-    fn a_declined_budget_parks_nothing() {
+    fn zero_bytes_are_not_parked() {
         let budget = GovernedAccumulatorBudget::new(1 << 20, 1 << 20);
-        budget.set_admitted(false);
         for _ in 0..8 {
-            assert!(!budget.try_park(4096), "declined must refuse every buffer");
+            assert!(!budget.try_park(0));
         }
         assert_eq!(budget.live_bytes(), 0);
     }

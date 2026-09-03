@@ -967,8 +967,10 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
 /// `lookup` picks the highest applicable version, so future opset-specialized
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
-    let (reg, _keys) =
-        build_cpu_registry_recorded_inner(qmoe::default_weight_offload_host_cache().clone());
+    let (reg, _keys) = build_cpu_registry_recorded_inner(
+        qmoe::default_weight_offload_host_cache().clone(),
+        einsum::EinsumScratchRetention::default(),
+    );
     reg
 }
 
@@ -976,8 +978,10 @@ pub fn build_cpu_registry() -> OpRegistry {
 /// type-constraint advertisement). The keys are derived from the exact same
 /// registration calls — not hand-maintained.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, _) =
-        build_cpu_registry_recorded_inner(qmoe::default_weight_offload_host_cache().clone());
+    let (reg, _) = build_cpu_registry_recorded_inner(
+        qmoe::default_weight_offload_host_cache().clone(),
+        einsum::EinsumScratchRetention::default(),
+    );
     let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
@@ -1020,7 +1024,8 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
 pub fn build_cpu_registry_with_descriptors_and_cache(
     host_cache: qmoe::WeightOffloadHostCache,
 ) -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, _) = build_cpu_registry_recorded_inner(host_cache);
+    let (reg, _) =
+        build_cpu_registry_recorded_inner(host_cache, einsum::EinsumScratchRetention::default());
     let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
@@ -1028,12 +1033,22 @@ pub fn build_cpu_registry_with_descriptors_and_cache(
 pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     host_cache: qmoe::WeightOffloadHostCache,
 ) -> OpRegistry {
-    let (reg, _keys) = build_cpu_registry_recorded_inner(host_cache);
+    let (reg, _keys) =
+        build_cpu_registry_recorded_inner(host_cache, einsum::EinsumScratchRetention::default());
+    reg
+}
+
+pub(crate) fn build_cpu_registry_with_weight_offload_cache_and_einsum_retention(
+    host_cache: qmoe::WeightOffloadHostCache,
+    einsum_scratch_retention: einsum::EinsumScratchRetention,
+) -> OpRegistry {
+    let (reg, _keys) = build_cpu_registry_recorded_inner(host_cache, einsum_scratch_retention);
     reg
 }
 
 fn build_cpu_registry_recorded_inner(
     host_cache: qmoe::WeightOffloadHostCache,
+    einsum_scratch_retention: einsum::EinsumScratchRetention,
 ) -> (OpRegistry, Vec<(String, String, u64)>) {
     let mut rec = RecordingOpRegistry::new();
     // CNN ops go directly into the inner registry (they use &mut OpRegistry).
@@ -1046,7 +1061,7 @@ fn build_cpu_registry_recorded_inner(
     rec.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
     rec.register(
         OpKey::new("Einsum", "", 12),
-        Box::new(einsum::EinsumFactory),
+        Box::new(einsum::EinsumFactory::new(einsum_scratch_retention)),
     );
     rec.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),

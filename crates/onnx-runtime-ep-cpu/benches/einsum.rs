@@ -207,7 +207,7 @@ fn kernel_with_mode(case: &Case, mode: &str) -> (Box<dyn Kernel>, Duration) {
         Attribute::String(case.equation.as_bytes().to_vec()),
     );
     let start = Instant::now();
-    let kernel = EinsumFactory
+    let kernel = EinsumFactory::default()
         .create(&node, &case.input_shapes)
         .expect("Einsum kernel construction must succeed");
     let elapsed = start.elapsed();

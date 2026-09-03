@@ -1173,11 +1173,11 @@ impl Engine {
             memory_strategy_plan.f32_weight_cache_admitted,
         );
         // Einsum's reusable Float32 output workspace is the seventh governed
-        // CPU buffer folded into `resident_f32_cache_bytes`. It has one fixed
-        // process pool rather than one allocation per graph node; when the plan
-        // declines it, executions allocate transient workspace as needed and
-        // discard it after the call instead of retaining it on worker threads.
-        onnx_runtime_ep_cpu::set_einsum_scratch_budget_admitted(
+        // CPU buffer folded into `resident_f32_cache_bytes`. Capture this
+        // engine's verdict in an immutable handle that the CPU provider clones
+        // into its factory and compiled kernels. The process-wide byte counter
+        // remains shared, but loading another engine cannot change this one.
+        let einsum_scratch_retention = onnx_runtime_ep_cpu::EinsumScratchRetention::new(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
         onnx_runtime_ep_cpu::set_qlinear_packed_b_enabled(
@@ -1258,6 +1258,7 @@ impl Engine {
                 native_device.clone(),
                 crate::native_decode::NativeDecodeLoadOptions {
                     host_cache: governor.weight_offload_host_cache(),
+                    einsum_scratch_retention,
                     #[cfg(feature = "native-cuda")]
                     cuda_offload_policy,
                     #[cfg(feature = "native-cuda")]
