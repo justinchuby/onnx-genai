@@ -3,6 +3,8 @@ use onnx_runtime_ir::{
     EinsumContractionTreeStep, EinsumCostBound, EinsumInput, EinsumPlan, EinsumUnsupportedReason,
     SymbolId,
 };
+#[cfg(target_pointer_width = "64")]
+use onnx_runtime_ir::{EinsumContractionTreeCandidateUnsupportedReason, EinsumCostMetric};
 
 fn plan(equation: &str, shapes: &[&[usize]]) -> EinsumPlan {
     let inputs = shapes
@@ -348,6 +350,133 @@ fn zero_and_symbolic_costs_are_exact_or_unbounded_without_fabrication() {
             % 2,
         0
     );
+}
+
+#[test]
+fn zero_output_candidate_short_circuits_huge_contraction_costs() {
+    let maximum = usize::MAX;
+    let plan = plan("ik,kj,jl->il", &[&[0, maximum], &[maximum, 1], &[1, 1]]);
+    let tree = tree(&plan);
+
+    let zero_candidate = candidate(tree, "((0,1),2)").supported().unwrap();
+    let zero_cost = zero_candidate.cost();
+    assert_eq!(zero_cost.flops(), EinsumCostBound::Exact(0));
+    assert_eq!(zero_cost.unary_or_product_work(), EinsumCostBound::Exact(0));
+    assert_eq!(zero_cost.intermediate_elements(), EinsumCostBound::Exact(0));
+    assert_eq!(
+        zero_cost.peak_live_temporary_elements(),
+        EinsumCostBound::Exact(0)
+    );
+    assert_eq!(
+        zero_cost.total_intermediate_traffic_elements(),
+        EinsumCostBound::Exact(0)
+    );
+    assert_eq!(
+        zero_cost.intermediate_bytes(usize::MAX),
+        Some(EinsumCostBound::Exact(0))
+    );
+
+    let concrete = plan
+        .resolve_concrete_contraction_tree(&[&[0, maximum], &[maximum, 1], &[1, 1]])
+        .unwrap()
+        .unwrap();
+    let zero_resolved = concrete
+        .candidates()
+        .iter()
+        .find(|candidate| candidate.id().as_str() == "((0,1),2)")
+        .unwrap()
+        .cost()
+        .unwrap();
+    assert_eq!(zero_resolved.flops(), 0);
+    assert_eq!(zero_resolved.intermediate_elements(), 0);
+    assert_eq!(zero_resolved.intermediate_bytes(), 0);
+    assert_eq!(zero_resolved.peak_live_temporary_bytes(), 0);
+    assert_eq!(zero_resolved.total_intermediate_traffic_bytes(), 0);
+
+    let alternate = candidate(tree, "((1,2),0)");
+    #[cfg(target_pointer_width = "64")]
+    assert!(
+        matches!(
+            alternate.unsupported_reason(),
+            Some(
+                EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
+                    metric: EinsumCostMetric::LayoutOrPackingTraffic,
+                }
+            )
+        ),
+        "{:?}",
+        alternate.unsupported_reason()
+    );
+    #[cfg(target_pointer_width = "32")]
+    {
+        let alternate = alternate.supported().unwrap().cost();
+        let maximum = u64::try_from(maximum).unwrap();
+        assert_eq!(alternate.flops(), EinsumCostBound::Exact(maximum));
+        assert_eq!(
+            alternate.intermediate_elements(),
+            EinsumCostBound::Exact(maximum)
+        );
+        assert_eq!(
+            alternate.total_intermediate_traffic_elements(),
+            EinsumCostBound::Exact(maximum * 2)
+        );
+        assert_eq!(
+            alternate.intermediate_bytes(4),
+            Some(EinsumCostBound::Exact(maximum * 4))
+        );
+    }
+}
+
+#[test]
+fn zero_axes_annihilate_packing_traffic_and_broadcast_before_overflow() {
+    let maximum = usize::MAX;
+    let plan = plan(
+        "mkb,bkn,bnl->bml",
+        &[&[maximum, 0, maximum], &[maximum, 0, 0], &[maximum, 0, 0]],
+    );
+    let supported = candidate(tree(&plan), "((0,1),2)").supported().unwrap();
+    let cost = supported.cost();
+
+    for (name, bound) in [
+        ("FLOPs", cost.flops()),
+        ("unary/product work", cost.unary_or_product_work()),
+        ("intermediate elements", cost.intermediate_elements()),
+        (
+            "peak live temporary elements",
+            cost.peak_live_temporary_elements(),
+        ),
+        (
+            "total intermediate traffic",
+            cost.total_intermediate_traffic_elements(),
+        ),
+        (
+            "layout/packing traffic",
+            cost.layout_or_packing_traffic_elements(),
+        ),
+        (
+            "broadcast amplification",
+            cost.broadcast_amplification_elements(),
+        ),
+    ] {
+        assert_eq!(bound, EinsumCostBound::Exact(0), "{name}");
+    }
+    for (name, bytes) in [
+        ("intermediate bytes", cost.intermediate_bytes(usize::MAX)),
+        (
+            "peak live temporary bytes",
+            cost.peak_live_temporary_bytes(usize::MAX),
+        ),
+        (
+            "total intermediate traffic bytes",
+            cost.total_intermediate_traffic_bytes(usize::MAX),
+        ),
+        (
+            "layout/packing traffic bytes",
+            cost.layout_or_packing_traffic_bytes(usize::MAX),
+        ),
+    ] {
+        assert_eq!(bytes, Some(EinsumCostBound::Exact(0)), "{name}");
+    }
 }
 
 trait ConcreteCandidateExt {

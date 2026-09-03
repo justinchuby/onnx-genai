@@ -76,11 +76,12 @@ impl EinsumCostBound {
 
     /// Scale an element count to bytes without wrapping.
     pub fn checked_scale(self, multiplier: usize) -> Option<Self> {
-        match self {
-            Self::Exact(value) => Some(Self::Exact(
+        match (self, multiplier) {
+            (_, 0) | (Self::Exact(0), _) => Some(Self::Exact(0)),
+            (Self::Exact(value), multiplier) => Some(Self::Exact(
                 value.checked_mul(u64::try_from(multiplier).ok()?)?,
             )),
-            Self::UnknownUpperBound => Some(Self::UnknownUpperBound),
+            (Self::UnknownUpperBound, _) => Some(Self::UnknownUpperBound),
         }
     }
 }
@@ -1642,38 +1643,26 @@ fn score_candidate(
             },
         ),
     };
-    let element_size = u64::try_from(element_size).map_err(|_| {
-        EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
-            metric: EinsumCostMetric::Bytes,
-        }
-    })?;
+    let bytes = |bound: EinsumCostBound| {
+        let value = exact(bound)?;
+        EinsumCostBound::Exact(value)
+            .checked_scale(element_size)
+            .and_then(EinsumCostBound::exact)
+            .ok_or(
+                EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
+                    metric: EinsumCostMetric::Bytes,
+                },
+            )
+    };
     let intermediate = exact(intermediate_elements)?;
     let resolved = EinsumResolvedContractionCost {
         flops: exact(flops)?,
         unary_or_product_work: exact(unary_or_product)?,
         intermediate_elements: intermediate,
-        intermediate_bytes: intermediate.checked_mul(element_size).ok_or(
-            EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
-                metric: EinsumCostMetric::Bytes,
-            },
-        )?,
-        peak_live_temporary_bytes: exact(peak_live)?.checked_mul(element_size).ok_or(
-            EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
-                metric: EinsumCostMetric::Bytes,
-            },
-        )?,
-        total_intermediate_traffic_bytes: exact(total_intermediate_traffic)?
-            .checked_mul(element_size)
-            .ok_or(
-                EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
-                    metric: EinsumCostMetric::Bytes,
-                },
-            )?,
-        layout_or_packing_traffic_bytes: exact(packing)?.checked_mul(element_size).ok_or(
-            EinsumContractionTreeCandidateUnsupportedReason::CostOverflow {
-                metric: EinsumCostMetric::Bytes,
-            },
-        )?,
+        intermediate_bytes: bytes(intermediate_elements)?,
+        peak_live_temporary_bytes: bytes(peak_live)?,
+        total_intermediate_traffic_bytes: bytes(total_intermediate_traffic)?,
+        layout_or_packing_traffic_bytes: bytes(packing)?,
         broadcast_amplification_elements: exact(broadcast)?,
         slot_count,
     };
@@ -1711,10 +1700,27 @@ fn mul_bound(
     }
 }
 
+fn product_bounds<const N: usize>(
+    factors: [EinsumCostBound; N],
+    metric: EinsumCostMetric,
+) -> Result<EinsumCostBound, EinsumContractionTreeCandidateUnsupportedReason> {
+    if factors.contains(&EinsumCostBound::Exact(0)) {
+        return Ok(EinsumCostBound::Exact(0));
+    }
+    factors
+        .into_iter()
+        .try_fold(EinsumCostBound::Exact(1), |product, factor| {
+            mul_bound(product, factor, metric)
+        })
+}
+
 fn reduction_work(
     output: EinsumCostBound,
     reduction: EinsumCostBound,
 ) -> Result<EinsumCostBound, EinsumContractionTreeCandidateUnsupportedReason> {
+    if output == EinsumCostBound::Exact(0) {
+        return Ok(EinsumCostBound::Exact(0));
+    }
     match reduction {
         EinsumCostBound::Exact(0 | 1) => Ok(EinsumCostBound::Exact(0)),
         EinsumCostBound::Exact(value) => mul_bound(
@@ -1737,6 +1743,9 @@ fn binary_work(
     k: EinsumCostBound,
     product_only: bool,
 ) -> Result<EinsumCostBound, EinsumContractionTreeCandidateUnsupportedReason> {
+    if output == EinsumCostBound::Exact(0) {
+        return Ok(EinsumCostBound::Exact(0));
+    }
     if product_only {
         return Ok(output);
     }
@@ -1783,19 +1792,11 @@ fn binary_broadcast_amplification(
     let k = dimension_bound(binary.geometry.k);
     let n = dimension_bound(binary.geometry.n);
     let left = difference(
-        mul_bound(
-            mul_bound(batch, m, EinsumCostMetric::BroadcastAmplification)?,
-            k,
-            EinsumCostMetric::BroadcastAmplification,
-        )?,
+        product_bounds([batch, m, k], EinsumCostMetric::BroadcastAmplification)?,
         binary.left_elements,
     );
     let right = difference(
-        mul_bound(
-            mul_bound(batch, k, EinsumCostMetric::BroadcastAmplification)?,
-            n,
-            EinsumCostMetric::BroadcastAmplification,
-        )?,
+        product_bounds([batch, k, n], EinsumCostMetric::BroadcastAmplification)?,
         binary.right_elements,
     );
     add_bound(left, right, EinsumCostMetric::BroadcastAmplification)
@@ -1992,4 +1993,82 @@ fn resolve_binary_geometry(
         k: product(&binary.contract_axes)?,
         n: product(&binary.right_free_axes)?,
     })
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+
+    #[test]
+    fn exact_zero_annihilates_work_before_irrelevant_boundary_arithmetic() {
+        let zero = EinsumCostBound::Exact(0);
+        let maximum = EinsumCostBound::Exact(u64::MAX);
+        let unknown = EinsumCostBound::UnknownUpperBound;
+
+        for (name, result) in [
+            ("contracted binary", binary_work(zero, maximum, false)),
+            ("symbolic binary", binary_work(zero, unknown, false)),
+            ("product binary", binary_work(zero, maximum, true)),
+            ("unary reduction", reduction_work(zero, maximum)),
+            ("symbolic unary reduction", reduction_work(zero, unknown)),
+        ] {
+            assert_eq!(result.unwrap(), zero, "{name}");
+        }
+    }
+
+    #[test]
+    fn exact_zero_annihilates_cost_products_in_every_factor_position() {
+        let metrics = [
+            EinsumCostMetric::UnaryOrProductWork,
+            EinsumCostMetric::TotalIntermediateTraffic,
+            EinsumCostMetric::LayoutOrPackingTraffic,
+            EinsumCostMetric::BroadcastAmplification,
+        ];
+        for metric in metrics {
+            assert_eq!(
+                mul_bound(EinsumCostBound::Exact(0), EinsumCostBound::Exact(2), metric,).unwrap(),
+                EinsumCostBound::Exact(0),
+                "{metric}"
+            );
+
+            for zero_index in 0..4 {
+                let mut factors = [
+                    EinsumCostBound::Exact(u64::MAX),
+                    EinsumCostBound::Exact(2),
+                    EinsumCostBound::UnknownUpperBound,
+                    EinsumCostBound::Exact(u64::MAX),
+                ];
+                factors[zero_index] = EinsumCostBound::Exact(0);
+                assert_eq!(
+                    product_bounds(factors, metric).unwrap(),
+                    EinsumCostBound::Exact(0),
+                    "{metric}, zero factor {zero_index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn byte_scaling_preserves_zero_and_unknown_bounds() {
+        for (bound, multiplier, expected) in [
+            (
+                EinsumCostBound::Exact(0),
+                usize::MAX,
+                Some(EinsumCostBound::Exact(0)),
+            ),
+            (
+                EinsumCostBound::UnknownUpperBound,
+                0,
+                Some(EinsumCostBound::Exact(0)),
+            ),
+            (
+                EinsumCostBound::UnknownUpperBound,
+                usize::MAX,
+                Some(EinsumCostBound::UnknownUpperBound),
+            ),
+            (EinsumCostBound::Exact(u64::MAX), 2, None),
+        ] {
+            assert_eq!(bound.checked_scale(multiplier), expected);
+        }
+    }
 }
