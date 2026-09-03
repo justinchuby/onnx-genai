@@ -195,14 +195,37 @@ jobs:
             exit 1
           fi
 
+          # `GovernedAccumulator<T>` is the sanctioned TLS form. Name it
+          # explicitly so the guard reports that it saw governance rather than
+          # passing because a wrapper hid `Vec<T>` from the regex.
+          governed=$(printf '%s\n' "$diff_out" \
+                  | grep -E '^\+' \
+                  | grep -vE '^\+\+\+' \
+                  | grep -E '(RefCell|Cell) *< *GovernedAccumulator' \
+                  || true)
+
+          # Direct owned buffers remain findings. Also flag wrapper names that
+          # advertise retained storage: `RefCell<EinsumScratch>` was the
+          # concrete bypass that prompted this rule, because the old matcher
+          # could only see `RefCell<Vec<_>>`.
           added=$(printf '%s\n' "$diff_out" \
                   | grep -E '^\+' \
                   | grep -vE '^\+\+\+' \
-                  | grep -E '(RefCell|Cell) *< *(Vec|Box|Arc)' \
+                  | grep -E '(RefCell|Cell) *< *(Vec|Box|Arc|[A-Za-z0-9_]*(Scratch|Pool|Cache))' \
                   || true)
 
-          if [ -z "$added" ]; then
+          if [ -n "$governed" ]; then
+            echo "Found governed per-thread retained buffer declarations:"
+            echo "$governed"
+            echo
+          fi
+
+          if [ -z "$added" ] && [ -z "$governed" ]; then
             echo "No new per-thread retained buffers."
+            exit 0
+          fi
+          if [ -z "$added" ]; then
+            echo "Every new per-thread retained buffer uses GovernedAccumulator."
             exit 0
           fi
 
@@ -229,6 +252,9 @@ jobs:
           echo "::error::A test for this MUST drive the buffer from more than one thread. A"
           echo "::error::single-instantiation test cannot observe an xN multiplier, which is"
           echo "::error::precisely how #1100 shipped with the factor unmeasured."
+          echo "::error::Use GovernedAccumulator<T> with GovernedAccumulatorBudget when this"
+          echo "::error::is reusable accumulator scratch; the guard recognizes that sanctioned"
+          echo "::error::form explicitly instead of relying on a wrapper to hide Vec<T>."
           echo "::error::If the buffer is fixed-size, or is not retained across calls, say so"
           echo "::error::in the PR and add the 'per-thread-bound-reviewed' label."
           exit 1

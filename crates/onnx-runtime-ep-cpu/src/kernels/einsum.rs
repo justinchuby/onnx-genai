@@ -20,6 +20,10 @@ use rayon::prelude::*;
 
 use super::{check_arity, matmul::MatMulKernel, to_dense_bytes, write_dense_bytes};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::kernels::governed_accumulator_budget::{
+    DEFAULT_PER_THREAD_ACCUMULATOR_BYTES, DEFAULT_PROCESS_ACCUMULATOR_BYTES, GovernedAccumulator,
+    GovernedAccumulatorBudget,
+};
 use crate::strided::next_index;
 
 /// Diagnostic execution switch used by `benches/einsum.rs`.
@@ -57,17 +61,26 @@ impl EinsumRoute {
     }
 }
 
-#[derive(Default)]
-struct EinsumScratch {
-    f32_output: Vec<f32>,
-}
+/// Process-wide, declinable budget for Float32 Einsum scratch retained between
+/// calls. These are the CPU accumulator policy's established ceilings rather
+/// than an Einsum-specific second policy: at most 32 MiB on one thread and
+/// 128 MiB summed across every persistent execution thread.
+static EINSUM_SCRATCH_BUDGET: GovernedAccumulatorBudget = GovernedAccumulatorBudget::new(
+    DEFAULT_PER_THREAD_ACCUMULATOR_BYTES,
+    DEFAULT_PROCESS_ACCUMULATOR_BYTES,
+);
 
 thread_local! {
     /// Per-dispatch-thread reusable storage. Compiled kernels are shared by the
     /// ORT plugin across concurrent `Run` callbacks, so scratch cannot live in
     /// the kernel instance. A thread-local pool preserves allocation reuse and
     /// parallel `Run`s without putting a lock around scratch-free view routes.
-    static EINSUM_SCRATCH: RefCell<EinsumScratch> = RefCell::new(EinsumScratch::default());
+    ///
+    /// `GovernedAccumulator` owns the process-budget reservation beside the
+    /// Vec, so checkout, replacement, decline, unwind, and thread exit all
+    /// release exactly the bytes they had parked.
+    static EINSUM_SCRATCH: RefCell<GovernedAccumulator<f32>> =
+        const { RefCell::new(GovernedAccumulator::new()) };
 }
 
 const CONCURRENCY_ROUTES: usize = 3;
@@ -117,23 +130,79 @@ pub fn finish_concurrency_probe() -> [usize; CONCURRENCY_ROUTES] {
 }
 
 fn with_f32_scratch<T>(len: usize, execute: impl FnOnce(&mut Vec<f32>) -> Result<T>) -> Result<T> {
-    EINSUM_SCRATCH
+    with_governed_f32_scratch(&EINSUM_SCRATCH, &EINSUM_SCRATCH_BUDGET, len, execute)
+}
+
+fn with_governed_f32_scratch<T>(
+    scratch: &'static std::thread::LocalKey<RefCell<GovernedAccumulator<f32>>>,
+    budget: &'static GovernedAccumulatorBudget,
+    len: usize,
+    execute: impl FnOnce(&mut Vec<f32>) -> Result<T>,
+) -> Result<T> {
+    let mut buffer = scratch
         .try_with(|scratch| {
             let mut scratch = scratch.try_borrow_mut().map_err(|_| {
                 EpError::KernelFailed(
-                    "Einsum: the per-thread scratch pool was re-entered by a nested execution. \
-                     HOW: avoid recursively invoking the same CPU execution thread."
+                    "Einsum: the per-thread scratch pool is already being checked out. \
+                     HOW: do not hold the scratch-pool container across kernel execution."
                         .into(),
                 )
             })?;
-            resize_f32(&mut scratch.f32_output, len)?;
-            execute(&mut scratch.f32_output)
+            Ok::<Vec<f32>, EpError>(scratch.take())
         })
         .map_err(|_| {
             EpError::KernelFailed(
                 "Einsum: the per-thread scratch pool is unavailable during thread teardown".into(),
             )
-        })?
+        })??;
+
+    resize_f32(&mut buffer, len)?;
+    let value = execute(&mut buffer)?;
+
+    // Parking is a best-effort optimization after successful computation.
+    // Failure to access the TLS slot, a declined budget, or either retention
+    // cap drops `buffer` here; the caller's result is already complete.
+    let _ = scratch.try_with(move |scratch| {
+        if let Ok(mut scratch) = scratch.try_borrow_mut() {
+            scratch.try_park(buffer, budget);
+        }
+    });
+    Ok(value)
+}
+
+/// Tell the CPU EP whether the memory plan admitted process-wide Einsum scratch
+/// retention. When declined, calls still allocate the temporary workspace they
+/// need, but discard it after use instead of parking it on persistent threads.
+pub fn set_einsum_scratch_budget_admitted(admitted: bool) {
+    EINSUM_SCRATCH_BUDGET.set_admitted(admitted);
+}
+
+/// Bytes currently parked between Einsum calls across all execution threads.
+pub fn einsum_scratch_live_bytes() -> u64 {
+    EINSUM_SCRATCH_BUDGET.live_bytes()
+}
+
+/// Current hard process-wide ceiling for retained Einsum scratch.
+pub fn einsum_scratch_process_cap_bytes() -> u64 {
+    EINSUM_SCRATCH_BUDGET.process_cap_bytes()
+}
+
+/// Predict the resident scratch budget to declare for a graph.
+///
+/// All Einsum kernels share one process-wide pool, so the prediction is one
+/// process cap when the graph contains any default-domain `Einsum`, not one cap
+/// per node. Reading the configured cap keeps admission aligned with the bytes
+/// the runtime may actually retain.
+pub fn einsum_scratch_budget_predicted_bytes(graph: &onnx_runtime_ir::Graph) -> u64 {
+    let has_einsum = graph
+        .nodes
+        .values()
+        .any(|node| node.is_default_domain() && node.op_type == "Einsum");
+    if has_einsum {
+        einsum_scratch_process_cap_bytes()
+    } else {
+        0
+    }
 }
 
 /// Shape-specialized CPU Einsum kernel.
@@ -1159,7 +1228,7 @@ fn resize_f32(buffer: &mut Vec<f32>, len: usize) -> Result<()> {
             .try_reserve_exact(len - buffer.len())
             .map_err(|error| {
                 EpError::KernelFailed(format!(
-                    "Einsum could not reserve {} bytes of bounded Float32 workspace: {error}",
+                    "Einsum could not reserve {} bytes of temporary Float32 workspace: {error}",
                     len.saturating_mul(std::mem::size_of::<f32>())
                 ))
             })?;
@@ -1225,12 +1294,10 @@ pub fn benchmark_scratch_capacity_bytes(kernel: &dyn Kernel) -> Option<usize> {
     kernel.as_any().downcast_ref::<EinsumKernel>()?;
     EINSUM_SCRATCH
         .try_with(|scratch| {
-            scratch.try_borrow().ok().map(|scratch| {
-                scratch
-                    .f32_output
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<f32>())
-            })
+            scratch
+                .try_borrow()
+                .ok()
+                .map(|scratch| scratch.capacity_bytes())
         })
         .ok()
         .flatten()
@@ -1262,6 +1329,55 @@ mod tests {
     use onnx_runtime_ep_api::abi::OrtGraphView;
     use onnx_runtime_ep_api::{DevicePtrMut, ExecutionProvider};
     use onnx_runtime_ir::{Attribute, DeviceId, Dim, FrozenGraph, Graph, NodeId, static_shape};
+    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+
+    static SCRATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static TEST_SCRATCH_BUDGET: GovernedAccumulatorBudget =
+        GovernedAccumulatorBudget::new(128, 256);
+
+    thread_local! {
+        static TEST_EINSUM_SCRATCH: RefCell<GovernedAccumulator<f32>> =
+            const { RefCell::new(GovernedAccumulator::new()) };
+    }
+
+    struct ScratchTestGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ScratchTestGuard {
+        fn drop(&mut self) {
+            TEST_EINSUM_SCRATCH.with(|scratch| scratch.borrow_mut().clear());
+            TEST_SCRATCH_BUDGET.set_admitted(true);
+            TEST_SCRATCH_BUDGET.set_caps_for_test(128, 256);
+            TEST_SCRATCH_BUDGET.reset_for_test();
+        }
+    }
+
+    fn begin_scratch_test(
+        per_thread_cap_bytes: u64,
+        process_cap_bytes: u64,
+        admitted: bool,
+    ) -> ScratchTestGuard {
+        let guard = SCRATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        TEST_EINSUM_SCRATCH.with(|scratch| scratch.borrow_mut().clear());
+        TEST_SCRATCH_BUDGET.reset_for_test();
+        TEST_SCRATCH_BUDGET.set_caps_for_test(per_thread_cap_bytes, process_cap_bytes);
+        TEST_SCRATCH_BUDGET.set_admitted(admitted);
+        ScratchTestGuard { _guard: guard }
+    }
+
+    fn with_test_scratch<T>(
+        len: usize,
+        execute: impl FnOnce(&mut Vec<f32>) -> Result<T>,
+    ) -> Result<T> {
+        with_governed_f32_scratch(&TEST_EINSUM_SCRATCH, &TEST_SCRATCH_BUDGET, len, execute)
+    }
+
+    fn test_scratch_capacity_bytes() -> usize {
+        TEST_EINSUM_SCRATCH.with(|scratch| scratch.borrow().capacity_bytes())
+    }
 
     fn kernel(equation: &str, shapes: &[Vec<usize>], mode: ExecutionMode) -> Box<dyn Kernel> {
         let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
@@ -1293,6 +1409,186 @@ mod tests {
     fn compiled_kernel_is_naturally_sync_without_an_unsafe_assertion() {
         fn assert_sync<T: Sync>() {}
         assert_sync::<EinsumKernel>();
+    }
+
+    #[test]
+    fn scratch_retention_is_bounded_by_the_process_aggregate_ceiling() {
+        let _guard = begin_scratch_test(64, 128, true);
+        const THREADS: usize = 4;
+        let parked = Arc::new(Barrier::new(THREADS + 1));
+        let release = Arc::new(Barrier::new(THREADS + 1));
+
+        let workers = (0..THREADS)
+            .map(|_| {
+                let parked = Arc::clone(&parked);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    with_test_scratch(16, |buffer| {
+                        buffer.fill(1.0);
+                        Ok(())
+                    })
+                    .expect("scratch call succeeds");
+                    parked.wait();
+                    release.wait();
+                })
+            })
+            .collect::<Vec<_>>();
+
+        parked.wait();
+        assert_eq!(
+            TEST_SCRATCH_BUDGET.live_bytes(),
+            128,
+            "two 64-byte buffers fit and the other workers must be declined"
+        );
+        release.wait();
+        for worker in workers {
+            worker.join().expect("scratch worker exits cleanly");
+        }
+
+        assert_eq!(
+            TEST_SCRATCH_BUDGET.live_bytes(),
+            0,
+            "worker thread exit must release every parked reservation"
+        );
+    }
+
+    #[test]
+    fn scratch_reuses_an_admitted_allocation_on_the_same_thread() {
+        let _guard = begin_scratch_test(128, 128, true);
+        let first = with_test_scratch(16, |buffer| {
+            Ok((buffer.as_ptr() as usize, buffer.capacity()))
+        })
+        .expect("first scratch call succeeds");
+        let retained = TEST_SCRATCH_BUDGET.live_bytes();
+        assert_eq!(retained, (first.1 * std::mem::size_of::<f32>()) as u64);
+        assert_eq!(test_scratch_capacity_bytes(), retained as usize);
+
+        let second = with_test_scratch(16, |buffer| {
+            Ok((buffer.as_ptr() as usize, buffer.capacity()))
+        })
+        .expect("second scratch call succeeds");
+        assert_eq!(
+            second, first,
+            "the parked allocation must be checked out again"
+        );
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), retained);
+    }
+
+    #[test]
+    fn oversized_and_declined_scratch_are_discarded_after_use() {
+        let _guard = begin_scratch_test(32, 128, true);
+        with_test_scratch(9, |buffer| {
+            buffer.fill(2.0);
+            Ok(())
+        })
+        .expect("oversized temporary scratch still computes");
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
+        assert_eq!(
+            test_scratch_capacity_bytes(),
+            0,
+            "a buffer over the per-thread cap must not remain in TLS"
+        );
+
+        with_test_scratch(8, |_| Ok(())).expect("prime an admitted buffer");
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 32);
+        TEST_SCRATCH_BUDGET.set_admitted(false);
+        with_test_scratch(8, |buffer| {
+            buffer.fill(3.0);
+            Ok(())
+        })
+        .expect("declined retention still permits temporary scratch");
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
+        assert_eq!(
+            test_scratch_capacity_bytes(),
+            0,
+            "a declined buffer must be dropped rather than parked"
+        );
+    }
+
+    #[test]
+    fn scratch_error_unwind_and_checkout_failure_leave_exact_accounting() {
+        let _guard = begin_scratch_test(128, 128, true);
+        with_test_scratch(16, |_| Ok(())).expect("prime retained scratch");
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 64);
+
+        let error = with_test_scratch(16, |_buffer| -> Result<()> {
+            Err(EpError::KernelFailed("injected scratch error".into()))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected scratch error"));
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
+        assert_eq!(test_scratch_capacity_bytes(), 0);
+
+        with_test_scratch(16, |_| Ok(())).expect("prime scratch before unwind");
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_test_scratch(16, |_buffer| -> Result<()> {
+                panic!("injected scratch unwind")
+            });
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
+        assert_eq!(test_scratch_capacity_bytes(), 0);
+
+        TEST_EINSUM_SCRATCH.with(|scratch| {
+            let _borrow = scratch.borrow_mut();
+            let error = with_test_scratch(1, |_| Ok(())).unwrap_err();
+            assert!(error.to_string().contains("already being checked out"));
+        });
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
+    }
+
+    #[test]
+    fn scratch_thread_exit_releases_its_reservation() {
+        let _guard = begin_scratch_test(64, 64, true);
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(Barrier::new(2));
+        let worker_release = Arc::clone(&release);
+        let worker = std::thread::spawn(move || {
+            with_test_scratch(16, |_| Ok(())).expect("worker parks scratch");
+            parked_tx
+                .send(TEST_SCRATCH_BUDGET.live_bytes())
+                .expect("report parked bytes");
+            worker_release.wait();
+        });
+
+        assert_eq!(parked_rx.recv().expect("worker reported"), 64);
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 64);
+        release.wait();
+        worker.join().expect("scratch worker exits cleanly");
+        assert_eq!(
+            TEST_SCRATCH_BUDGET.live_bytes(),
+            0,
+            "TLS destruction must release the worker's reservation"
+        );
+    }
+
+    #[test]
+    fn zero_size_scratch_retains_and_accounts_nothing() {
+        let _guard = begin_scratch_test(0, 0, true);
+        let len =
+            with_test_scratch(0, |buffer| Ok(buffer.len())).expect("zero-sized scratch succeeds");
+        assert_eq!(len, 0);
+        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
+        assert_eq!(test_scratch_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn scratch_prediction_is_one_configured_process_pool_per_graph() {
+        let empty = Graph::new();
+        assert_eq!(einsum_scratch_budget_predicted_bytes(&empty), 0);
+
+        let mut graph = Graph::new();
+        graph.insert_node(Node::new(NodeId(0), "Einsum", vec![], vec![]));
+        assert_eq!(
+            einsum_scratch_budget_predicted_bytes(&graph),
+            einsum_scratch_process_cap_bytes(),
+            "node count must not multiply the shared process pool"
+        );
+        graph.insert_node(Node::new(NodeId(1), "Einsum", vec![], vec![]));
+        assert_eq!(
+            einsum_scratch_budget_predicted_bytes(&graph),
+            einsum_scratch_process_cap_bytes()
+        );
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {

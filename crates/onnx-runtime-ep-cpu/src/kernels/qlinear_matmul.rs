@@ -56,7 +56,8 @@ fn dense_bytes<'a>(view: &TensorView<'a>) -> Result<Cow<'a, [u8]>> {
 /// on a 128-vCPU server. That multiplier (the thread count) is precisely the
 /// variable the reuse optimisation scales with, so it must not be left out of
 /// the ceiling. See [`MAX_PROCESS_ACCUMULATOR_BYTES`].
-const MAX_RETAINED_ACCUMULATOR_BYTES: usize = 32 << 20;
+const MAX_RETAINED_ACCUMULATOR_BYTES: usize =
+    crate::kernels::governed_accumulator_budget::DEFAULT_PER_THREAD_ACCUMULATOR_BYTES as usize;
 
 /// Hard ceiling on the accumulator scratch summed across **all** worker
 /// threads.
@@ -75,7 +76,8 @@ const MAX_RETAINED_ACCUMULATOR_BYTES: usize = 32 << 20;
 /// and recompute the buffer per call (byte-identical output, only slower). 128
 /// MiB of transient integer-GEMM scratch is defensible independent of model
 /// size and vCPU count, which is the property the per-thread-only bound lacked.
-const MAX_PROCESS_ACCUMULATOR_BYTES: usize = 128 << 20;
+const MAX_PROCESS_ACCUMULATOR_BYTES: usize =
+    crate::kernels::governed_accumulator_budget::DEFAULT_PROCESS_ACCUMULATOR_BYTES as usize;
 
 /// Process-wide, declinable budget governing the parked accumulator scratch
 /// across every worker thread (#1056). `live_bytes()` reports the sum actually
@@ -728,7 +730,8 @@ impl Kernel for QLinearMatMulKernel {
         // Taking it out of the thread-local returns its reservation to the
         // process-wide budget; it is re-reserved at the end iff it still fits.
         let mut products: Vec<i32> = ACCUMULATOR.with(|cell| cell.take());
-        ACCUMULATOR_BUDGET.release((products.capacity() * std::mem::size_of::<i32>()) as u64);
+        let _ =
+            ACCUMULATOR_BUDGET.release((products.capacity() * std::mem::size_of::<i32>()) as u64);
         let mut b_zero_points: Vec<i32> = Vec::new();
         let mut a_zero_points: Vec<i32> = Vec::new();
         let mut b_scales: Vec<f32> = Vec::new();

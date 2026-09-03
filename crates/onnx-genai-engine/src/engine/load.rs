@@ -1069,6 +1069,9 @@ impl Engine {
                     .saturating_add(
                         onnx_runtime_ep_cpu::qlinear_accumulator_budget_predicted_bytes(&graph),
                     )
+                    .saturating_add(onnx_runtime_ep_cpu::einsum_scratch_budget_predicted_bytes(
+                        &graph,
+                    ))
                     .saturating_add(onnx_runtime_ep_cpu::qlinear_packed_b_predicted_bytes(
                         &graph,
                     )),
@@ -1167,6 +1170,14 @@ impl Engine {
         // takes the unpacked GEMM (densifying `B` per call) -- byte-identical
         // output, only slower -- instead of retaining either buffer over budget.
         onnx_runtime_ep_cpu::set_qlinear_accumulator_budget_admitted(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        // Einsum's reusable Float32 output workspace is the seventh governed
+        // CPU buffer folded into `resident_f32_cache_bytes`. It has one fixed
+        // process pool rather than one allocation per graph node; when the plan
+        // declines it, executions allocate transient workspace as needed and
+        // discard it after the call instead of retaining it on worker threads.
+        onnx_runtime_ep_cpu::set_einsum_scratch_budget_admitted(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
         onnx_runtime_ep_cpu::set_qlinear_packed_b_enabled(

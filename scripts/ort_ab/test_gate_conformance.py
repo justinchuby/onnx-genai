@@ -2444,17 +2444,17 @@ scripts/hostlock.sh run --owner tester --reason "exact" -- \
 ```
 ```bash
 scripts/hostlock.sh run --owner tester --reason "different target" -- \
-  cargo bench -p onnx-runtime-ep-cpu --bench einsum_extra
+  cargo bench -p onnx-runtime-ep-cpu --bench gqa_decode
 ```
 ```bash
-cargo bench -p onnx-runtime-ep-cpu --bench observed_only
+cargo bench -p onnx-runtime-ep-cpu --bench sdpa_simd
 scripts/hostlock.sh provenance
 ```
 """
         commands = locked_rust_bench_commands(document)
-        self.assertEqual(set(commands), {"einsum", "einsum_extra"})
+        self.assertEqual(set(commands), {"einsum", "gqa_decode"})
         self.assertEqual(len(commands["einsum"]), 1)
-        self.assertNotIn("observed_only", commands)
+        self.assertNotIn("sdpa_simd", commands)
 
     def test_every_pinned_bench_has_a_source_file(self):
         # A stale pin is the shell ledger's dead record in another form: a

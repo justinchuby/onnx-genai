@@ -39,6 +39,15 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Established retention ceilings for CPU accumulator scratch.
+///
+/// Scratch users share these defaults rather than choosing independent
+/// per-kernel policies: one thread may retain at most 32 MiB and one budget may
+/// retain at most 128 MiB process-wide. Each scratch family has its own budget
+/// so the memory plan can predict and decline it independently.
+pub(crate) const DEFAULT_PER_THREAD_ACCUMULATOR_BYTES: u64 = 32 << 20;
+pub(crate) const DEFAULT_PROCESS_ACCUMULATOR_BYTES: u64 = 128 << 20;
+
 /// Process-wide accounting for a per-thread parked scratch buffer.
 ///
 /// A single instance is meant to live in a `static` and be shared by every
@@ -113,6 +122,25 @@ impl GovernedAccumulatorBudget {
     /// drop its buffer and recompute next call -- a pure performance tradeoff,
     /// never a numerical one.
     pub fn try_park(&self, bytes: u64) -> bool {
+        self.try_reserve_bytes(bytes)
+    }
+
+    /// Try to reserve `bytes` for a governed per-thread accumulator.
+    ///
+    /// The returned token owns exactly one successful accounting increment and
+    /// releases it on drop. Requiring a token for a retained buffer makes
+    /// normal return, unwind, replacement, and thread exit use the same release
+    /// path instead of relying on every caller to remember a matching
+    /// [`Self::release`].
+    pub(crate) fn try_reserve(&'static self, bytes: u64) -> Option<GovernedAccumulatorReservation> {
+        self.try_reserve_bytes(bytes)
+            .then(|| GovernedAccumulatorReservation {
+                budget: self,
+                bytes,
+            })
+    }
+
+    fn try_reserve_bytes(&self, bytes: u64) -> bool {
         if bytes == 0 || !self.is_admitted() {
             return false;
         }
@@ -140,24 +168,28 @@ impl GovernedAccumulatorBudget {
         }
     }
 
-    /// Release `bytes` a thread had parked, because it is taking that buffer
-    /// back out to reuse it (or dropping it). Must be paired with a prior
-    /// successful [`Self::try_park`] of the same size. Saturating, so a stray
-    /// release can never underflow the counter below zero.
-    pub fn release(&self, bytes: u64) {
+    /// Release exactly `bytes` previously reserved by [`Self::try_park`].
+    ///
+    /// Returns `false` and leaves the counter unchanged if the release was not
+    /// backed by enough retained bytes. This refuses an accounting underflow
+    /// rather than saturating it away and making a later leak indistinguishable
+    /// from correct accounting.
+    pub fn release(&self, bytes: u64) -> bool {
         if bytes == 0 {
-            return;
+            return true;
         }
         let mut current = self.retained_bytes.load(Ordering::Relaxed);
         loop {
-            let next = current.saturating_sub(bytes);
+            let Some(next) = current.checked_sub(bytes) else {
+                return false;
+            };
             match self.retained_bytes.compare_exchange_weak(
                 current,
                 next,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return,
+                Ok(_) => return true,
                 Err(observed) => current = observed,
             }
         }
@@ -178,6 +210,106 @@ impl GovernedAccumulatorBudget {
     pub fn reset_for_test(&self) {
         self.retained_bytes.store(0, Ordering::Relaxed);
     }
+}
+
+/// One successful process-budget reservation.
+///
+/// This type is intentionally not `Clone`: one accounting increment has one
+/// owner and therefore one release, including when a thread-local accumulator
+/// is destroyed at thread exit.
+pub(crate) struct GovernedAccumulatorReservation {
+    budget: &'static GovernedAccumulatorBudget,
+    bytes: u64,
+}
+
+impl Drop for GovernedAccumulatorReservation {
+    fn drop(&mut self) {
+        // Never panic from Drop. The token can only be constructed after one
+        // successful increment and is not Clone, so a failed release would
+        // indicate internal memory-accounting corruption rather than an input
+        // condition that can be recovered here.
+        let _ = self.budget.release(self.bytes);
+    }
+}
+
+/// A reusable per-thread accumulator whose retained allocation is governed by
+/// a [`GovernedAccumulatorBudget`].
+///
+/// The reservation lives beside the `Vec`, so taking the buffer for one call
+/// releases the parked-byte accounting, replacing or declining it drops the
+/// old reservation, and TLS destruction releases it automatically. Callers
+/// only park after successful work; an error or unwind drops the checked-out
+/// allocation without retaining it.
+pub(crate) struct GovernedAccumulator<T> {
+    reservation: Option<GovernedAccumulatorReservation>,
+    buffer: Vec<T>,
+}
+
+impl<T> GovernedAccumulator<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            reservation: None,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Check out the retained buffer for one call.
+    ///
+    /// Dropping the reservation before returning makes `live_bytes()` describe
+    /// only allocations currently parked between calls, never transient
+    /// workspace in active use.
+    pub(crate) fn take(&mut self) -> Vec<T> {
+        self.reservation.take();
+        std::mem::take(&mut self.buffer)
+    }
+
+    /// Park `buffer` for reuse when both retention ceilings admit its actual
+    /// allocation capacity.
+    ///
+    /// A refused, zero-capacity, or byte-count-overflowing buffer is dropped
+    /// here. The caller cannot accidentally retain it outside the governed
+    /// container after this method returns.
+    pub(crate) fn try_park(
+        &mut self,
+        buffer: Vec<T>,
+        budget: &'static GovernedAccumulatorBudget,
+    ) -> bool {
+        self.clear();
+        let Some(bytes) = capacity_bytes(&buffer) else {
+            return false;
+        };
+        let Some(reservation) = budget.try_reserve(bytes) else {
+            return false;
+        };
+        self.buffer = buffer;
+        self.reservation = Some(reservation);
+        true
+    }
+
+    /// Bytes currently retained by this thread's parked buffer.
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self.buffer
+            .capacity()
+            .saturating_mul(std::mem::size_of::<T>())
+    }
+
+    /// Drop any parked allocation and its reservation.
+    pub(crate) fn clear(&mut self) {
+        self.reservation = None;
+        self.buffer = Vec::new();
+    }
+}
+
+impl<T> Default for GovernedAccumulator<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn capacity_bytes<T>(buffer: &Vec<T>) -> Option<u64> {
+    u64::try_from(buffer.capacity())
+        .ok()?
+        .checked_mul(u64::try_from(std::mem::size_of::<T>()).ok()?)
 }
 
 #[cfg(test)]
@@ -227,18 +359,22 @@ mod tests {
         assert_eq!(budget.live_bytes(), 4000, "the sum is bounded by the cap");
     }
 
-    /// Releasing returns capacity to the pool so a later park can use it, and it
-    /// saturates rather than underflowing on an over-release.
+    /// Releasing returns capacity to the pool so a later park can use it, while
+    /// an unmatched release is refused without changing the live count.
     #[test]
-    fn release_returns_capacity_and_saturates() {
+    fn release_returns_capacity_and_refuses_underflow() {
         let budget = GovernedAccumulatorBudget::new(1 << 20, 4000);
         assert!(budget.try_park(4000));
         assert!(!budget.try_park(1), "full");
-        budget.release(4000);
+        assert!(budget.release(4000));
         assert_eq!(budget.live_bytes(), 0);
         assert!(budget.try_park(4000), "released capacity is reusable");
 
-        budget.release(1 << 30);
-        assert_eq!(budget.live_bytes(), 0, "over-release saturates at zero");
+        assert!(!budget.release(1 << 30));
+        assert_eq!(
+            budget.live_bytes(),
+            4000,
+            "an unmatched release must not corrupt the live-byte count"
+        );
     }
 }
