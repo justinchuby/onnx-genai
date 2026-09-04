@@ -20,6 +20,10 @@ crates/onnx-genai-engine/tests/fixtures/qwen4_exp_ple_reference.json text eol=lf
 docs/genai/METADATA_EXTENSION_REGISTRY.md text eol=lf
 crates/onnx-genai-engine/tests/fixtures/dflash-admission/*.onnx.textproto text eol=lf
 
+# The Einsum conformance crate hashes and embeds this pinned schema authority.
+# Keep its checkout bytes stable even when Git for Windows enables autocrlf.
+crates/onnx-runtime-einsum-conformance/fixtures/onnx-einsum-schema-authority.txt text eol=lf
+
 # Catalogue metadata examples are embedded with include_str! and matched line by
 # line in tests (e.g. crates/onnx-genai-metadata/tests/gemma4_e2b_workflow.rs
 # mutates specific `\n`-terminated lines). Force LF so autocrlf does not turn a

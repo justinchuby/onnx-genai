@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -19,46 +21,14 @@ impl SchemaAuthority {
         AUTHORITY_COMMIT
     }
 
-    /// SHA-256 of the complete vendored authority fixture.
+    /// SHA-256 of the complete vendored authority fixture in canonical LF form.
     pub const fn fixture_sha256() -> &'static str {
         AUTHORITY_SHA256
     }
 
     /// Verify that the fixture still proves the expected schema boundary.
     pub fn verify() -> Result<(), SchemaAuthorityError> {
-        let actual = format!("{:x}", Sha256::digest(AUTHORITY.as_bytes()));
-        if actual != AUTHORITY_SHA256 {
-            return Err(SchemaAuthorityError::Digest {
-                expected: AUTHORITY_SHA256,
-                actual,
-            });
-        }
-        for required in [
-            "commit=5732eb5de3e6b353e1a5aa49fe5d577f81bb58e0",
-            "Einsum,\n    12,\n    OpSchema().FillUsing(defs::math::utils::EinsumOpGenerator(OpSchema::all_numeric_types()))",
-            "Einsum,\n    28,\n    OpSchema().FillUsing(defs::math::utils::EinsumOpGenerator(OpSchema::all_numeric_types_ir4()))",
-            "TensorProto::BFLOAT16",
-        ] {
-            if !AUTHORITY.contains(required) {
-                return Err(SchemaAuthorityError::MissingEvidence(required));
-            }
-        }
-        let (v28_types, v12_types) = AUTHORITY
-            .split_once("const std::vector<std::string>& OpSchema::all_numeric_types()")
-            .ok_or(SchemaAuthorityError::MissingEvidence(
-                "separate all_numeric_types_ir4 and all_numeric_types definitions",
-            ))?;
-        if !v28_types.contains("TensorProto::BFLOAT16") {
-            return Err(SchemaAuthorityError::MissingEvidence(
-                "BFLOAT16 in all_numeric_types_ir4",
-            ));
-        }
-        if v12_types.contains("TensorProto::BFLOAT16") {
-            return Err(SchemaAuthorityError::UnexpectedEvidence(
-                "BFLOAT16 in legacy all_numeric_types",
-            ));
-        }
-        Ok(())
+        verify_authority(AUTHORITY)
     }
 
     /// ONNX `since_version` selected by an imported opset.
@@ -75,6 +45,75 @@ impl SchemaAuthority {
     pub fn supports(opset: u64, dtype: ConformanceDType) -> Result<bool, SchemaAuthorityError> {
         let since = Self::since_version(opset)?;
         Ok(dtype != ConformanceDType::BFloat16 || since == 28)
+    }
+}
+
+fn verify_authority(authority: &str) -> Result<(), SchemaAuthorityError> {
+    let authority = canonical_line_endings(authority);
+    let actual = format!("{:x}", Sha256::digest(authority.as_bytes()));
+    if actual != AUTHORITY_SHA256 {
+        return Err(SchemaAuthorityError::Digest {
+            expected: AUTHORITY_SHA256,
+            actual,
+        });
+    }
+    for required in [
+        "commit=5732eb5de3e6b353e1a5aa49fe5d577f81bb58e0",
+        "Einsum,\n    12,\n    OpSchema().FillUsing(defs::math::utils::EinsumOpGenerator(OpSchema::all_numeric_types()))",
+        "Einsum,\n    28,\n    OpSchema().FillUsing(defs::math::utils::EinsumOpGenerator(OpSchema::all_numeric_types_ir4()))",
+        "TensorProto::BFLOAT16",
+    ] {
+        if !authority.contains(required) {
+            return Err(SchemaAuthorityError::MissingEvidence(required));
+        }
+    }
+    let (v28_types, v12_types) = authority
+        .split_once("const std::vector<std::string>& OpSchema::all_numeric_types()")
+        .ok_or(SchemaAuthorityError::MissingEvidence(
+            "separate all_numeric_types_ir4 and all_numeric_types definitions",
+        ))?;
+    if !v28_types.contains("TensorProto::BFLOAT16") {
+        return Err(SchemaAuthorityError::MissingEvidence(
+            "BFLOAT16 in all_numeric_types_ir4",
+        ));
+    }
+    if v12_types.contains("TensorProto::BFLOAT16") {
+        return Err(SchemaAuthorityError::UnexpectedEvidence(
+            "BFLOAT16 in legacy all_numeric_types",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_line_endings(authority: &str) -> Cow<'_, str> {
+    if authority.contains("\r\n") {
+        Cow::Owned(authority.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(authority)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_crlf_checkout_preserves_schema_authority() {
+        let crlf = AUTHORITY.replace('\n', "\r\n");
+        verify_authority(&crlf).unwrap();
+        assert_eq!(
+            canonical_line_endings(AUTHORITY),
+            canonical_line_endings(&crlf)
+        );
+    }
+
+    #[test]
+    fn noncanonical_carriage_return_still_changes_authority() {
+        let changed = AUTHORITY.replacen("commit=", "commit=\r", 1);
+        assert!(matches!(
+            verify_authority(&changed),
+            Err(SchemaAuthorityError::Digest { .. })
+        ));
     }
 }
 
