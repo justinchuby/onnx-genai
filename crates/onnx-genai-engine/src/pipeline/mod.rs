@@ -353,9 +353,12 @@ mod dflash_constructor_admission_tests {
     #[test]
     fn supported_dflash_v1_reaches_component_model_admission() {
         let root = fixture();
+        let directory_error = PipelineModelDirectory::load(&root)
+            .expect_err("the deliberate missing_lm_head reference must fail model admission");
+        let message = directory_error.to_string();
         assert!(
-            PipelineModelDirectory::load(&root).is_err(),
-            "the empty ONNX files make this a loader spy: reaching component admission must fail"
+            message.contains("missing_lm_head") && message.contains("not an initializer"),
+            "the maintained fixture must reach exact shared-weight admission: {message}"
         );
 
         let error = WorkflowRuntime::from_dir_with_session_options(
