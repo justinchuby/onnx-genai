@@ -3,7 +3,7 @@ use std::path::Path;
 #[path = "support/dflash_admission_fixture.rs"]
 mod dflash_admission_fixture;
 
-use dflash_admission_fixture::{PROPOSER_FILE, TARGET_FILE, documents};
+use dflash_admission_fixture::{PROPOSER_FILE, TARGET_FILE, check, documents};
 use onnx_genai_ort::{DataType, Environment, Session, SessionOptions, Value};
 
 fn fixture_root() -> std::path::PathBuf {
@@ -15,6 +15,16 @@ fn dflash_admission_fixture_generation_is_deterministic() {
     let first = documents().expect("first DFlash fixture generation");
     let second = documents().expect("second DFlash fixture generation");
     assert_eq!(first, second);
+    for (file, document) in [(PROPOSER_FILE, first.proposer), (TARGET_FILE, first.target)] {
+        assert!(
+            std::str::from_utf8(&document).is_ok(),
+            "{file} must be canonical UTF-8"
+        );
+        assert!(
+            !document.contains(&b'\r'),
+            "{file} must use LF even on Windows"
+        );
+    }
 }
 
 #[test]
@@ -24,12 +34,12 @@ fn maintained_dflash_admission_fixtures_match_generator() {
     for (file, actual, expected) in [
         (
             PROPOSER_FILE,
-            std::fs::read_to_string(root.join(PROPOSER_FILE)),
+            std::fs::read(root.join(PROPOSER_FILE)),
             generated.proposer,
         ),
         (
             TARGET_FILE,
-            std::fs::read_to_string(root.join(TARGET_FILE)),
+            std::fs::read(root.join(TARGET_FILE)),
             generated.target,
         ),
     ] {
@@ -42,6 +52,7 @@ fn maintained_dflash_admission_fixtures_match_generator() {
              `cargo run -p onnx-genai-engine --example generate_dflash_admission_fixture`"
         );
     }
+    check(&root).expect("DFlash generator exact-byte check");
 }
 
 #[test]
