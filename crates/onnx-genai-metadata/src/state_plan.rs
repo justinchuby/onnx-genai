@@ -278,8 +278,8 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
             .and_then(|name| groups.and_then(|groups| groups.get(name)))
         {
             update = match group.update.as_ref() {
-                Some(StateUpdate::Append {}) | None => StateUpdateRelation::Append,
-                Some(StateUpdate::Replace {}) => StateUpdateRelation::Replace,
+                Some(StateUpdate::Append) | None => StateUpdateRelation::Append,
+                Some(StateUpdate::Replace) => StateUpdateRelation::Replace,
                 Some(StateUpdate::IndexedScatter { .. }) => StateUpdateRelation::Indexed,
             };
             snapshot = StateSnapshotParticipation {

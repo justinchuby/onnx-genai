@@ -1878,21 +1878,21 @@ pub enum CompressionRecurrence {
 /// strategy, a slot allocator, or a device: a runtime is free to back an
 /// `append` group with a fixed arena or an `indexed_scatter` group with paged
 /// storage, so long as the graph sees what it declared.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StateUpdate {
     /// Each step's positions extend the buffer along `sequence_axis`.
     ///
     /// The valid region is the whole tensor, so no write cursor is graph-visible
     /// and the buffer's shape carries the length.
-    Append {},
+    Append,
     /// Each step replaces the complete fixed-size state tensor.
     ///
     /// This is the common discipline for recurrent accumulators, state-space
     /// carries, and causal-convolution history. The algorithm does not need a
     /// distinct state kind: separate groups already declare each tensor's
     /// shape, ports, lifetime, and rollback behavior.
-    Replace {},
+    Replace,
     /// Each step's positions are scattered into a buffer of FIXED capacity at
     /// destinations the graph reads from `write_indices`.
     ///
@@ -1939,6 +1939,50 @@ pub enum StateUpdate {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         kv_length_ports: BTreeMap<String, String>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StateUpdateWire {
+    Append {},
+    Replace {},
+    IndexedScatter {
+        write_indices: String,
+        capacity: String,
+        #[serde(default)]
+        write_indices_ports: BTreeMap<String, String>,
+        #[serde(default)]
+        kv_length_ports: BTreeMap<String, String>,
+    },
+}
+
+impl From<StateUpdateWire> for StateUpdate {
+    fn from(update: StateUpdateWire) -> Self {
+        match update {
+            StateUpdateWire::Append {} => Self::Append,
+            StateUpdateWire::Replace {} => Self::Replace,
+            StateUpdateWire::IndexedScatter {
+                write_indices,
+                capacity,
+                write_indices_ports,
+                kv_length_ports,
+            } => Self::IndexedScatter {
+                write_indices,
+                capacity,
+                write_indices_ports,
+                kv_length_ports,
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StateUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        StateUpdateWire::deserialize(deserializer).map(Into::into)
+    }
 }
 
 /// Legality of aliasing a component's `present` output onto its `past` input.

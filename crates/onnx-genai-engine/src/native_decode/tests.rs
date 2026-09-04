@@ -2750,7 +2750,7 @@ fn native_cuda_refuses_noncanonical_record_axes_before_vmm_allocation() -> anyho
         .clone();
     for group in &mut io.state_groups {
         if group.kind == StateKind::CompressedAttention
-            && matches!(group.update, Some(StateUpdate::Append {}))
+            && matches!(group.update, Some(StateUpdate::Append))
         {
             group.sequence_axis = Some(0);
             for port in &mut group.ports {
@@ -4543,7 +4543,7 @@ fn low_rank_carry_plan(carry_shape: &[usize], aliasing: StateAliasing) -> csa::C
             sequence_axis: Some(2),
             layout: "batch_feature_record".to_string(),
             aliasing,
-            update: Some(StateUpdate::Append {}),
+            update: Some(StateUpdate::Append),
             reuse: Default::default(),
             capabilities: StateGroupCapabilities::default(),
             ports: vec![port(
@@ -4559,7 +4559,7 @@ fn low_rank_carry_plan(carry_shape: &[usize], aliasing: StateAliasing) -> csa::C
             sequence_axis: None,
             layout: "batch_carry".to_string(),
             aliasing,
-            update: Some(StateUpdate::Replace {}),
+            update: Some(StateUpdate::Replace),
             reuse: Default::default(),
             capabilities: StateGroupCapabilities::default(),
             ports: vec![port(

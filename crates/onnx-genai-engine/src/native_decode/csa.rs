@@ -688,7 +688,7 @@ pub(super) fn resolve_compressed_state(
                 CompressedStateLoadRefusal::InvalidRecordFormat(group.name.clone()),
             ));
         }
-        let update = group.update.as_ref().unwrap_or(&StateUpdate::Append {});
+        let update = group.update.as_ref().unwrap_or(&StateUpdate::Append);
         if matches!(update, StateUpdate::IndexedScatter { .. }) {
             return Err(anyhow::Error::new(
                 CompressedStateLoadRefusal::InvalidUpdate(group.name.clone()),
@@ -721,8 +721,8 @@ pub(super) fn resolve_compressed_state(
                 StatePortRole::CompressionCarry | StatePortRole::IndexCarry
             );
             if (!is_record && !is_carry)
-                || (is_record && !matches!(update, StateUpdate::Append {}))
-                || (is_carry && !matches!(update, StateUpdate::Replace {}))
+                || (is_record && !matches!(update, StateUpdate::Append))
+                || (is_carry && !matches!(update, StateUpdate::Replace))
                 || (is_carry && group.sequence_axis.is_some())
                 || (!ratio.has_index_state()
                     && matches!(role, StatePortRole::IndexKey | StatePortRole::IndexCarry))
@@ -1231,7 +1231,7 @@ pub(super) fn refuse_compressed_records_on_cuda(
         .filter(|group| group.kind == StateKind::CompressedAttention)
     {
         let sequence_axis = group.sequence_axis;
-        if !matches!(group.update, Some(StateUpdate::Replace {})) && sequence_axis != Some(1) {
+        if !matches!(group.update, Some(StateUpdate::Replace)) && sequence_axis != Some(1) {
             return Err(anyhow::Error::new(
                 CompressedStateLoadRefusal::InvalidRecordLayout(format!(
                     "CUDA compressed-attention record group '{}' requires the operator ABI \
@@ -1292,10 +1292,10 @@ mod tests {
                 record_format: format,
                 recurrence: CompressionRecurrence::Standard,
             }),
-            sequence_axis: matches!(update, StateUpdate::Append {}).then_some(1),
+            sequence_axis: matches!(update, StateUpdate::Append).then_some(1),
             layout: match &update {
-                StateUpdate::Append {} => "batch_record_feature",
-                StateUpdate::Replace {} => "batch_carry_slot_stream_feature",
+                StateUpdate::Append => "batch_record_feature",
+                StateUpdate::Replace => "batch_carry_slot_stream_feature",
                 StateUpdate::IndexedScatter { .. } => "batch_record_feature",
             }
             .to_string(),
@@ -1323,7 +1323,7 @@ mod tests {
                 "records",
                 CompressionRatio::Ratio4,
                 CompressedRecordFormat::Fp8E4m3Block64,
-                StateUpdate::Append {},
+                StateUpdate::Append,
                 vec![
                     (StatePortRole::CompressedKv, "past_kv", "present_kv"),
                     (StatePortRole::IndexKey, "past_index", "present_index"),
@@ -1333,7 +1333,7 @@ mod tests {
                 "carries",
                 CompressionRatio::Ratio4,
                 CompressedRecordFormat::Fp8E4m3Block64,
-                StateUpdate::Replace {},
+                StateUpdate::Replace,
                 vec![
                     (
                         StatePortRole::CompressionCarry,
@@ -1375,14 +1375,14 @@ mod tests {
                 "records",
                 CompressionRatio::Ratio128,
                 CompressedRecordFormat::F32,
-                StateUpdate::Append {},
+                StateUpdate::Append,
                 vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
             ),
             group(
                 "carries",
                 CompressionRatio::Ratio128,
                 CompressedRecordFormat::F32,
-                StateUpdate::Replace {},
+                StateUpdate::Replace,
                 vec![(
                     StatePortRole::CompressionCarry,
                     "past_carry",
@@ -1431,14 +1431,14 @@ mod tests {
                     "records",
                     CompressionRatio::Ratio128,
                     CompressedRecordFormat::F32,
-                    StateUpdate::Append {},
+                    StateUpdate::Append,
                     vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
                 ),
                 group(
                     "carries",
                     CompressionRatio::Ratio128,
                     CompressedRecordFormat::F32,
-                    StateUpdate::Replace {},
+                    StateUpdate::Replace,
                     vec![(
                         StatePortRole::CompressionCarry,
                         "past_carry",
@@ -1491,14 +1491,14 @@ mod tests {
                     "records",
                     CompressionRatio::Ratio128,
                     CompressedRecordFormat::F32,
-                    StateUpdate::Append {},
+                    StateUpdate::Append,
                     vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
                 ),
                 group(
                     "carries",
                     CompressionRatio::Ratio128,
                     CompressedRecordFormat::F32,
-                    StateUpdate::Replace {},
+                    StateUpdate::Replace,
                     vec![(
                         StatePortRole::CompressionCarry,
                         "past_carry",
@@ -1657,14 +1657,14 @@ mod tests {
                     "records",
                     CompressionRatio::Ratio128,
                     CompressedRecordFormat::F32,
-                    StateUpdate::Append {},
+                    StateUpdate::Append,
                     vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
                 ),
                 group(
                     "carries",
                     CompressionRatio::Ratio128,
                     CompressedRecordFormat::F32,
-                    StateUpdate::Replace {},
+                    StateUpdate::Replace,
                     vec![(
                         StatePortRole::CompressionCarry,
                         "past_carry",
@@ -1704,7 +1704,7 @@ mod tests {
             "carries",
             CompressionRatio::Ratio128,
             CompressedRecordFormat::F32,
-            StateUpdate::Replace {},
+            StateUpdate::Replace,
             vec![(
                 StatePortRole::CompressionCarry,
                 "past_carry",
@@ -1726,7 +1726,7 @@ mod tests {
                     "records",
                     CompressionRatio::Ratio128,
                     CompressedRecordFormat::F32,
-                    StateUpdate::Append {},
+                    StateUpdate::Append,
                     vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
                 ),
                 carries,
@@ -1762,14 +1762,14 @@ mod tests {
                         "records",
                         CompressionRatio::Ratio128,
                         CompressedRecordFormat::F32,
-                        StateUpdate::Append {},
+                        StateUpdate::Append,
                         vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
                     ),
                     group(
                         "carries",
                         CompressionRatio::Ratio128,
                         CompressedRecordFormat::F32,
-                        StateUpdate::Replace {},
+                        StateUpdate::Replace,
                         vec![(
                             StatePortRole::CompressionCarry,
                             "past_carry",
@@ -1798,7 +1798,7 @@ mod tests {
             "records",
             CompressionRatio::Ratio128,
             CompressedRecordFormat::F32,
-            StateUpdate::Append {},
+            StateUpdate::Append,
             vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
         );
         record_group.sequence_axis = Some(2);
@@ -1807,7 +1807,7 @@ mod tests {
             "carries",
             CompressionRatio::Ratio128,
             CompressedRecordFormat::F32,
-            StateUpdate::Replace {},
+            StateUpdate::Replace,
             vec![(
                 StatePortRole::CompressionCarry,
                 "past_carry",
@@ -1879,14 +1879,14 @@ mod tests {
                     "records",
                     CompressionRatio::Ratio128,
                     CompressedRecordFormat::F32,
-                    StateUpdate::Append {},
+                    StateUpdate::Append,
                     vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
                 ),
                 group(
                     "carries",
                     CompressionRatio::Ratio128,
                     CompressedRecordFormat::F32,
-                    StateUpdate::Replace {},
+                    StateUpdate::Replace,
                     vec![(
                         StatePortRole::CompressionCarry,
                         "past_carry",
@@ -1931,7 +1931,7 @@ mod tests {
                 "records",
                 CompressionRatio::Ratio128,
                 CompressedRecordFormat::F32,
-                StateUpdate::Append {},
+                StateUpdate::Append,
                 vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
             )],
         )
@@ -2114,7 +2114,7 @@ mod tests {
             "records",
             CompressionRatio::Ratio128,
             CompressedRecordFormat::F32,
-            StateUpdate::Append {},
+            StateUpdate::Append,
             vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
         )];
         let error = refuse_compressed_records_on_cuda(&groups, true).unwrap_err();
@@ -2132,7 +2132,7 @@ mod tests {
             "records",
             CompressionRatio::Ratio128,
             CompressedRecordFormat::F32,
-            StateUpdate::Append {},
+            StateUpdate::Append,
             vec![(StatePortRole::CompressedKv, "past_kv", "present_kv")],
         );
         refuse_compressed_records_on_cuda(&[records.clone()], true)

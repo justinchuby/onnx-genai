@@ -16,7 +16,7 @@ update:
     let group: StateGroupContract = serde_yaml::from_str(yaml).expect("state group parses");
     assert_eq!(group.kind, StateKind::Recurrent);
     assert_eq!(group.sequence_axis, None);
-    assert_eq!(group.update, Some(StateUpdate::Replace {}));
+    assert_eq!(group.update, Some(StateUpdate::Replace));
 
     let round_trip = serde_yaml::to_string(&group).expect("state group serializes");
     assert!(round_trip.contains("kind: recurrent"));
@@ -35,7 +35,7 @@ update:
 "#;
     let group: StateGroupContract = serde_yaml::from_str(yaml).expect("state group parses");
     assert_eq!(group.sequence_axis, Some(2));
-    assert_eq!(group.update, Some(StateUpdate::Append {}));
+    assert_eq!(group.update, Some(StateUpdate::Append));
 }
 
 #[test]

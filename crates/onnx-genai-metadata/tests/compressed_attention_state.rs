@@ -200,7 +200,7 @@ fn canonical_schedule_lowers_exact_21_20_properties() {
         .iter()
         .filter(|group| {
             group.kind == StateKind::CompressedAttention
-                && matches!(group.update, Some(StateUpdate::Append {}))
+                && matches!(group.update, Some(StateUpdate::Append))
         })
         .map(|group| group.properties.clone().expect("typed properties"))
         .collect::<Vec<_>>();
@@ -608,7 +608,7 @@ fn compressed_record_group_cannot_use_replace() {
         .groups
         .get_mut("compressed_records.0")
         .unwrap();
-    group.update = Some(StateUpdate::Replace {});
+    group.update = Some(StateUpdate::Replace);
     group.sequence_axis = None;
     let errors = validate_metadata(&metadata).unwrap_err();
     assert!(
