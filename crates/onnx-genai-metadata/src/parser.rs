@@ -233,23 +233,29 @@ pub fn parse_metadata(
 ) -> Result<InferenceMetadata, crate::MetadataError> {
     preparse(content)?;
     match extension {
-        Some("yaml" | "yml") => {
-            serde_yaml::from_str(content).map_err(|e| crate::MetadataError::Parse(e.to_string()))
-        }
-        Some("json") => {
-            serde_json::from_str(content).map_err(|e| crate::MetadataError::Parse(e.to_string()))
-        }
+        Some("yaml" | "yml") => deserialize_yaml(content),
+        Some("json") => deserialize_json(content),
         _ => {
             // YAML is a superset of JSON, but its error for a JSON document that
             // is wrong in a JSON way is worse, so fall back rather than insist.
-            if let Ok(metadata) = serde_yaml::from_str::<InferenceMetadata>(content) {
+            if let Ok(metadata) = deserialize_yaml(content) {
                 Ok(metadata)
             } else {
-                serde_json::from_str::<InferenceMetadata>(content)
-                    .map_err(|e| crate::MetadataError::Parse(e.to_string()))
+                deserialize_json(content)
             }
         }
     }
+}
+
+fn deserialize_yaml(content: &str) -> Result<InferenceMetadata, crate::MetadataError> {
+    serde_path_to_error::deserialize(serde_yaml::Deserializer::from_str(content))
+        .map_err(|error| crate::MetadataError::Parse(error.to_string()))
+}
+
+fn deserialize_json(content: &str) -> Result<InferenceMetadata, crate::MetadataError> {
+    let mut deserializer = serde_json::Deserializer::from_str(content);
+    serde_path_to_error::deserialize(&mut deserializer)
+        .map_err(|error| crate::MetadataError::Parse(error.to_string()))
 }
 
 /// Like [`parse_metadata`], for a document a caller already holds as JSON.
@@ -263,7 +269,7 @@ pub fn parse_metadata_json(
     let value = serde_yaml::to_value(document)
         .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
     gate_document(&value)?;
-    serde_json::from_value(document.clone())
+    serde_path_to_error::deserialize(document.clone())
         .map_err(|error| crate::MetadataError::Parse(error.to_string()))
 }
 
