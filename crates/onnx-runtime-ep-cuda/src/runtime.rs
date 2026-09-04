@@ -2877,6 +2877,11 @@ impl CudaRuntime {
             != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
     }
 
+    pub(crate) fn capture_active(&self) -> bool {
+        self.registered_capture_active.load(Ordering::Acquire)
+            || self.unregistered_capture_active.load(Ordering::Acquire)
+    }
+
     pub(crate) fn require_registered_address_capture(
         &self,
         identity: usize,
