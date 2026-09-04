@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -41,6 +42,123 @@ CUDA_TARGETS_WITHOUT_SUFFIX = frozenset({"matmul_nbits_marlin_numerics"})
 # CPU-only machine that believes it tested a GPU.
 #
 ALWAYS_RUN = frozenset({"suite_canary_gpu"})
+ALWAYS_RUN_EXPECTED_TESTS = {
+    "suite_canary_gpu": frozenset(
+        {
+            "cuda_is_usable_where_it_was_declared_to_be",
+            "the_nvrtc_headers_are_reachable_where_cuda_was_declared",
+        }
+    )
+}
+# The source scans used to prove only that each directory stayed non-empty.
+# That cannot detect one target being deleted or renamed while dozens remain.
+# Pin the names independently from the disk walk so every such change is
+# reviewed as an inventory change rather than disappearing silently.
+EXPECTED_CUDA_TARGETS_BY_DIR = {
+    TESTS: frozenset(
+        {
+            "activations_gpu",
+            "allocation_counts_gpu",
+            "attention_gpu",
+            "block_quantized_matmul_gpu",
+            "block_quantized_moe_gpu",
+            "bqmoe_prefetch_overlap_gpu",
+            "causal_conv_with_state_gpu",
+            "claim_gates_gpu",
+            "coarse_residency_plan_gpu",
+            "composable_vmm_production_gpu",
+            "compressed_sparse_attention_gpu",
+            "construction_gpu",
+            "content_preserving_transition_gpu",
+            "conv_gpu",
+            "cuda_conformance_gpu",
+            "cuda_parity_batch10_gpu",
+            "deferred_release_gpu",
+            "device_allocator_gpu",
+            "dft_gpu",
+            "dsa_index_select_gpu",
+            "einsum_conformance_gpu",
+            "einsum_gpu",
+            "expert_bank_remap_cost_gpu",
+            "expert_route_telemetry_probe_gpu",
+            "fused_epilogue_gpu",
+            "gather_block_quantized_gpu",
+            "gqa_fp16_gpu",
+            "gqa_seqmajor_parity_gpu",
+            "gqa_shared_prefix_parity_gpu",
+            "group_query_attention_gpu",
+            "index_share_gpu",
+            "indexing_gpu",
+            "kv_cache_capacity_append_gpu",
+            "linear_attention_gpu",
+            "matmul_gpu",
+            "matmul_nbits_gpu",
+            "matmul_nbits_marlin_numerics",
+            "megakernel_headroom_gpu",
+            "movement_gpu",
+            "multi_head_attention_gpu",
+            "nms_gpu",
+            "normalization_fp16_gpu",
+            "nvrtc_reduce_capture_gpu",
+            "op_coverage_batch_gpu",
+            "opset24_ops_gpu",
+            "packed_varlen_attention_gpu",
+            "paged_attention_latent_gpu",
+            "planar_block_decode_gpu",
+            "planar_block_moe_gpu",
+            "pointwise_gpu",
+            "pooling_gpu",
+            "prefill_double_buffer_gpu",
+            "qmoe_composable_vmm_host_numa_spike_gpu",
+            "qmoe_gpu",
+            "qmoe_zero_copy_cold_expert_spike_gpu",
+            "reduce_capture_gpu",
+            "reduce_comptype_fp16_gpu",
+            "rope_capture_gpu",
+            "rope_contrib_gpu",
+            "route_residency_boundary_gpu",
+            "route_residency_consume_gpu",
+            "route_residency_install_gpu",
+            "route_residency_reservation_lifecycle_gpu",
+            "simplified_layer_norm_gpu",
+            "skip_simplified_layer_norm_gpu",
+            "sparse_kv_gather_gpu",
+            "standard_attention_bf16_gpu",
+            "standard_attention_capture_gpu",
+            "standard_attention_fp16_gpu",
+            "standard_attention_gpu",
+            "stft_gpu",
+            "varlen_attention_gpu",
+            "weight_offload_churn_gpu",
+            "weight_offload_gpu",
+        }
+    ),
+    MEMORY_CRATE / "tests": frozenset(
+        {
+            "physical_pool_production_gpu",
+            "virtual_memory_gpu",
+            "vmm_allocator_gpu",
+            "vmm_commit_shared_prefix_gpu",
+            "vmm_dummy_page_gpu",
+            "vmm_dummy_page_ledger_gpu",
+            "vmm_dummy_write_protect_gpu",
+            "vmm_granularity_gpu",
+            "vmm_graph_remap_gpu",
+            "vmm_kv_contiguous_tail_gpu",
+            "vmm_kv_layout_residency_gpu",
+            "vmm_kv_token_major_floor_gpu",
+            "vmm_prefix_share_compose_gpu",
+            "vmm_prefix_share_gpu",
+            "vmm_prefix_share_ledger_gpu",
+            "vmm_prefix_share_write_protect_gpu",
+            "vmm_process_fault_isolation_gpu",
+            "vmm_refcount_gpu",
+            "vmm_release_quarantine_gpu",
+            "vmm_stable_va_weight_slot_gpu",
+            "vmm_stats_gpu",
+        }
+    ),
+}
 # Rust integration targets are separate processes, so no in-process mutex can
 # serialize one target against another. These locks intentionally serialize
 # only the libtest threads inside the named binary: that is where concurrent EP
@@ -126,17 +244,79 @@ GPU_CONFIG = FeatureConfig("with-gpu-tests", "cuda,gpu-tests")
 CUDA_PLUGIN_PACKAGE = "onnx-runtime-ep-cuda-plugin"
 CUDA_PLUGIN_TARGET = "cuda_unique_ort_e2e"
 CUDA_PLUGIN_FEATURES = "cuda"
-CUDA_PLUGIN_MIN_TESTS = 3
+CUDA_CANARY_FEATURES = "cuda,cuda-13000"
+CUDA_PLUGIN_EXPECTED_TESTS = frozenset(
+    {
+        "cuda_nms_dynamic_output_runs_through_real_ort_plugin",
+        "cuda_shape_value_ops_decline_before_device_scalar_host_reads",
+        "cuda_unique_is_claimed_and_materialized_through_real_ort_plugin",
+        "cuda_unique_optional_outputs_stay_positional_through_real_ort_plugin",
+    }
+)
 SESSION_PACKAGE = "onnx-runtime-session"
 SESSION_HETERO_TARGET = "hetero_cuda_gpu"
 SESSION_BASE_FEATURES = "cuda,cuda-13000"
 SESSION_GPU_FEATURES = "gpu-tests,cuda-13000"
-SESSION_HETERO_MIN_TESTS = 1
+SESSION_HETERO_EXPECTED_TESTS = frozenset(
+    {"cuda_cpu_cuda_chain_executes_on_both_real_providers"}
+)
 ENGINE_PACKAGE = "onnx-genai-engine"
 ENGINE_DEFAULT_OFF_TARGET = "native_cuda_default_off_state_capture_gpu"
 ENGINE_BASE_FEATURES = "native-cuda,cuda-13000"
 ENGINE_GPU_FEATURES = "gpu-tests,cuda-13000"
-ENGINE_DEFAULT_OFF_MIN_TESTS = 1
+ENGINE_DEFAULT_OFF_EXPECTED_TESTS = frozenset(
+    {"default_off_state_is_zero_work_during_real_cuda_capture_and_replay"}
+)
+# The universal Einsum work added a shared-corpus target (generic, optimized
+# DP/heuristic, and cuBLASLt route witnesses) and expanded the direct target's
+# route/capture/semantic-snapshot coverage. Pin both complete libtest
+# inventories so a test rename or deletion cannot preserve target-level counts
+# while dropping a required route witness.
+EXPECTED_EINSUM_TESTS_BY_TARGET = {
+    "einsum_conformance_gpu": frozenset(
+        {
+            "every_schema_numeric_dtype_executes_generic_cuda",
+            "shared_legal_corpus_executes_all_forced_cuda_routes",
+        }
+    ),
+    "einsum_gpu": frozenset(
+        {
+            "auto_fallback_snapshot_is_reused_for_capture_and_replay",
+            "captured_generic_resources_outlive_dropped_kernel",
+            "captured_optimized_plan_resources_outlive_dropped_kernel",
+            "captured_private_resources_outlive_dropped_einsum_kernels",
+            "contraction_rejects_output_alias_before_launch",
+            "descriptor_transpose_contractions_match_f64_reference",
+            "direct_snapshot_layout_mismatch_fails_closed_during_capture",
+            "direct_snapshot_reselects_semantic_for_output_layout_change",
+            "direct_snapshot_reselects_semantic_for_positive_and_negative_strides",
+            "direct_zero_fill_snapshot_reselects_semantic_for_output_layout_change",
+            "dot_and_zero_dimensions_have_exact_metadata_and_values",
+            "dtypes_bmm_stride_zero_and_flattened_groups_match_f64_reference",
+            "einsum_benchmark_arms_match_exact_f64_oracle",
+            "einsum_captured_descriptor_benchmark",
+            "explicit_transpose_reports_production_materialization_counters",
+            "failed_layout_rewarm_preserves_complete_direct_snapshot",
+            "failed_semantic_rewarm_preserves_complete_snapshot_for_both_routes",
+            "forced_f16_cublaslt_narrows_once_and_rejects_unregistered_workspace_capture",
+            "generic_failed_rewarm_preserves_capture_ready_snapshot",
+            "generic_native_consumes_strided_and_negative_stride_views",
+            "generic_reduction_multilinear_and_integer_routes_execute_natively",
+            "integer_generic_multiply_is_exact_width_without_signed_overflow",
+            "materialized_view_address_overflow_is_actionable_and_pre_mutation",
+            "materialized_view_failed_rewarm_preserves_capture_ready_snapshot",
+            "materialized_view_rejects_partial_offset_overlap_before_mutation",
+            "misaligned_contiguous_subviews_use_a_proven_cublaslt_alignment_contract",
+            "optimizer_memory_ceiling_selects_generic_native_without_intermediates",
+            "permutation_and_diagonal_use_zero_copy_views_and_materialize_correctly",
+            "registry_reachability_and_claim_declines_are_intentional",
+            "semantic_capture_mismatch_is_pre_mutation_and_preserves_snapshot",
+            "semantic_signatures_bind_raw_base_offset_and_rewarm_transactionally",
+            "semantic_signatures_reject_device_and_alias_mismatch_before_launch",
+            "warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay",
+        }
+    ),
+}
 
 
 def run(command: list[str | Path]) -> subprocess.CompletedProcess[str]:
@@ -935,6 +1115,43 @@ def census_errors(by_dir: Mapping[Path, Sequence[Path]]) -> list[str]:
     return errors
 
 
+def expected_cuda_target_errors(
+    by_dir: Mapping[Path, Sequence[Path]],
+    expected_by_dir: Mapping[Path, frozenset[str]] = EXPECTED_CUDA_TARGETS_BY_DIR,
+) -> list[str]:
+    """Require the complete named CUDA target census, not merely a non-empty one."""
+    errors: list[str] = []
+    for test_dir in sorted(set(by_dir) | set(expected_by_dir)):
+        actual = frozenset(path.stem for path in by_dir.get(test_dir, ()))
+        expected = expected_by_dir.get(test_dir, frozenset())
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        relative = test_dir.relative_to(ROOT)
+        if missing:
+            errors.append(
+                f"{relative}: expected CUDA test target(s) missing or renamed: {missing}"
+            )
+        if unexpected:
+            errors.append(
+                f"{relative}: CUDA test target(s) are not recorded in the inventory: "
+                f"{unexpected}"
+            )
+    return errors
+
+
+def expected_always_run_source_errors() -> list[str]:
+    """Keep the CUDA canary present even though it is exempt from ignore policing."""
+    errors: list[str] = []
+    for target, expected in ALWAYS_RUN_EXPECTED_TESTS.items():
+        path = TESTS / f"{target}.rs"
+        if not path.is_file():
+            errors.append(f"{path.relative_to(ROOT)}: required always-run CUDA target is missing")
+            continue
+        inventory = frozenset(item.name for item in test_items(path.read_text(encoding="utf-8")))
+        errors.extend(named_inventory_errors(str(path.relative_to(ROOT)), inventory, expected))
+    return errors
+
+
 def parse_test_binaries_from_json(stdout: str) -> list[TestBinary]:
     binaries: dict[str, Path] = {}
     for line in stdout.splitlines():
@@ -982,22 +1199,34 @@ def parse_named_test_binary_from_json(stdout: str, expected_target: str) -> Test
     return binary
 
 
-def feature_target_inventory_errors(
-    label: str,
-    binary: TestBinary | None,
-    inventory: frozenset[str],
-    minimum: int,
+def named_inventory_errors(
+    label: str, inventory: frozenset[str], expected: frozenset[str]
 ) -> list[str]:
     errors: list[str] = []
-    if binary is None:
+    missing = sorted(expected - inventory)
+    unexpected = sorted(inventory - expected)
+    if missing:
         errors.append(
-            f"{label}: Cargo emitted no executable for the requested feature-gated test target"
+            f"{label}: expected test(s) missing or renamed: {missing}"
         )
-    if len(inventory) < minimum:
+    if unexpected:
         errors.append(
-            f"{label}: feature-enabled inventory has {len(inventory)} test(s); "
-            f"expected at least {minimum}"
+            f"{label}: test(s) are not recorded in the expected inventory: {unexpected}"
         )
+    return errors
+
+
+def expected_test_inventory_errors(
+    inventories: Mapping[str, frozenset[str]],
+    expected_by_target: Mapping[str, frozenset[str]],
+) -> list[str]:
+    errors: list[str] = []
+    for target, expected in expected_by_target.items():
+        inventory = inventories.get(target)
+        if inventory is None:
+            errors.append(f"{target}: expected CUDA test target is absent from Cargo inventory")
+            continue
+        errors.extend(named_inventory_errors(target, inventory, expected))
     return errors
 
 
@@ -1027,42 +1256,93 @@ def build_named_test_binary(
             f"cargo test --no-run failed for {package}/{target} with {features}"
         )
     binary = parse_named_test_binary_from_json(result.stdout, target)
-    errors = feature_target_inventory_errors(
-        f"{package}/{target}", binary, frozenset(), 0
-    )
-    if errors:
-        raise RuntimeError(errors[0])
-    assert binary is not None
+    if binary is None:
+        raise RuntimeError(
+            f"{package}/{target}: Cargo emitted no executable for the requested "
+            "feature-gated test target"
+        )
     return binary
+
+
+def discard_consumed_binaries(binaries: Sequence[TestBinary]) -> None:
+    """Reclaim large libtest executables on GitHub runners after their last use."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    reclaimed = 0
+    for binary in binaries:
+        try:
+            reclaimed += binary.executable.stat().st_size
+            binary.executable.unlink()
+        except FileNotFoundError:
+            continue
+    if reclaimed:
+        print(f"Reclaimed {reclaimed / (1024 ** 3):.1f} GiB of consumed test binaries")
+
+
+def discard_stale_cached_binaries(targets: Sequence[str]) -> None:
+    """Remove restored hashes for the large integration binaries before relinking."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    metadata = run(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"])
+    if metadata.returncode != 0:
+        print(metadata.stderr, file=sys.stderr, end="")
+        raise RuntimeError("cargo metadata failed while locating stale CUDA test binaries")
+    target_dir = Path(json.loads(metadata.stdout)["target_directory"])
+    deps_dir = target_dir / "debug" / "deps"
+    reclaimed = 0
+    for target in targets:
+        executable_name = re.compile(rf"^{re.escape(target)}-[0-9a-f]+(?:\.exe)?$")
+        for candidate in deps_dir.glob(f"{target}-*"):
+            if (
+                candidate.is_file()
+                and executable_name.fullmatch(candidate.name)
+                and os.access(candidate, os.X_OK)
+            ):
+                reclaimed += candidate.stat().st_size
+                candidate.unlink()
+    if reclaimed:
+        print(f"Reclaimed {reclaimed / (1024 ** 3):.1f} GiB of stale cached test binaries")
 
 
 def verify_production_feature_targets() -> tuple[list[str], list[str]]:
     """Compile and census production GPU tests without executing GPU paths."""
     errors: list[str] = []
 
+    canary_binary = build_named_test_binary(
+        "onnx-runtime-ep-cuda", "suite_canary_gpu", CUDA_CANARY_FEATURES
+    )
+    canary_inventory = list_inventory(canary_binary)
+    errors.extend(
+        named_inventory_errors(
+            f"onnx-runtime-ep-cuda/suite_canary_gpu with {CUDA_CANARY_FEATURES}",
+            canary_inventory,
+            ALWAYS_RUN_EXPECTED_TESTS["suite_canary_gpu"],
+        )
+    )
+    discard_consumed_binaries([canary_binary])
+
     plugin_binary = build_named_test_binary(
         CUDA_PLUGIN_PACKAGE, CUDA_PLUGIN_TARGET, CUDA_PLUGIN_FEATURES
     )
     plugin_inventory = list_inventory(plugin_binary)
     errors.extend(
-        feature_target_inventory_errors(
+        named_inventory_errors(
             f"{CUDA_PLUGIN_PACKAGE}/{CUDA_PLUGIN_TARGET} with {CUDA_PLUGIN_FEATURES}",
-            plugin_binary,
             plugin_inventory,
-            CUDA_PLUGIN_MIN_TESTS,
+            CUDA_PLUGIN_EXPECTED_TESTS,
         )
     )
+    discard_consumed_binaries([plugin_binary])
 
     session_base_binary = build_named_test_binary(
         SESSION_PACKAGE, SESSION_HETERO_TARGET, SESSION_BASE_FEATURES
     )
     session_base_inventory = list_inventory(session_base_binary)
     errors.extend(
-        feature_target_inventory_errors(
+        named_inventory_errors(
             f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET} without gpu-tests",
-            session_base_binary,
             session_base_inventory,
-            SESSION_HETERO_MIN_TESTS,
+            SESSION_HETERO_EXPECTED_TESTS,
         )
     )
     _, passed, failed, ignored, names = run_libtest(session_base_binary)
@@ -1078,17 +1358,17 @@ def verify_production_feature_targets() -> tuple[list[str], list[str]]:
             )
         )
     )
+    discard_consumed_binaries([session_base_binary])
 
     session_gpu_binary = build_named_test_binary(
         SESSION_PACKAGE, SESSION_HETERO_TARGET, SESSION_GPU_FEATURES
     )
     session_gpu_inventory = list_inventory(session_gpu_binary)
     errors.extend(
-        feature_target_inventory_errors(
+        named_inventory_errors(
             f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET} with gpu-tests",
-            session_gpu_binary,
             session_gpu_inventory,
-            SESSION_HETERO_MIN_TESTS,
+            SESSION_HETERO_EXPECTED_TESTS,
         )
     )
     errors.extend(
@@ -1097,17 +1377,17 @@ def verify_production_feature_targets() -> tuple[list[str], list[str]]:
             {SESSION_HETERO_TARGET: session_gpu_inventory},
         )
     )
+    discard_consumed_binaries([session_gpu_binary])
 
     engine_base_binary = build_named_test_binary(
         ENGINE_PACKAGE, ENGINE_DEFAULT_OFF_TARGET, ENGINE_BASE_FEATURES
     )
     engine_base_inventory = list_inventory(engine_base_binary)
     errors.extend(
-        feature_target_inventory_errors(
+        named_inventory_errors(
             f"{ENGINE_PACKAGE}/{ENGINE_DEFAULT_OFF_TARGET} without gpu-tests",
-            engine_base_binary,
             engine_base_inventory,
-            ENGINE_DEFAULT_OFF_MIN_TESTS,
+            ENGINE_DEFAULT_OFF_EXPECTED_TESTS,
         )
     )
     _, passed, failed, ignored, names = run_libtest(engine_base_binary)
@@ -1123,17 +1403,17 @@ def verify_production_feature_targets() -> tuple[list[str], list[str]]:
             )
         )
     )
+    discard_consumed_binaries([engine_base_binary])
 
     engine_gpu_binary = build_named_test_binary(
         ENGINE_PACKAGE, ENGINE_DEFAULT_OFF_TARGET, ENGINE_GPU_FEATURES
     )
     engine_gpu_inventory = list_inventory(engine_gpu_binary)
     errors.extend(
-        feature_target_inventory_errors(
+        named_inventory_errors(
             f"{ENGINE_PACKAGE}/{ENGINE_DEFAULT_OFF_TARGET} with gpu-tests",
-            engine_gpu_binary,
             engine_gpu_inventory,
-            ENGINE_DEFAULT_OFF_MIN_TESTS,
+            ENGINE_DEFAULT_OFF_EXPECTED_TESTS,
         )
     )
     errors.extend(
@@ -1142,8 +1422,11 @@ def verify_production_feature_targets() -> tuple[list[str], list[str]]:
             {ENGINE_DEFAULT_OFF_TARGET: engine_gpu_inventory},
         )
     )
+    discard_consumed_binaries([engine_gpu_binary])
 
     summaries = [
+        "onnx-runtime-ep-cuda/suite_canary_gpu: "
+        f"{len(canary_inventory)} always-run test(s) compiled with {CUDA_CANARY_FEATURES}",
         f"{CUDA_PLUGIN_PACKAGE}/{CUDA_PLUGIN_TARGET}: "
         f"{len(plugin_inventory)} test(s) compiled with {CUDA_PLUGIN_FEATURES}",
         f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET}: "
@@ -1465,18 +1748,16 @@ def self_test() -> None:
     named_binary = parse_named_test_binary_from_json(fixture_stdout, "fixture_gpu")
     if named_binary != expected[0]:
         raise AssertionError(f"named feature target parser returned {named_binary!r}")
-    missing_target_errors = feature_target_inventory_errors(
-        "missing-feature-target", None, frozenset(), 1
+    missing_named = named_inventory_errors(
+        "feature-target", frozenset({"kept"}), frozenset({"kept", "deleted"})
     )
-    if not any("no executable" in error for error in missing_target_errors):
-        raise AssertionError(
-            "a missing feature-gated target must fail even before its inventory is read"
-        )
-    empty_feature_errors = feature_target_inventory_errors(
-        "empty-feature-target", expected[0], frozenset(), 1
+    if not any("deleted" in error and "missing or renamed" in error for error in missing_named):
+        raise AssertionError("a deleted or renamed feature test must fail by name")
+    unexpected_named = named_inventory_errors(
+        "feature-target", frozenset({"kept", "added"}), frozenset({"kept"})
     )
-    if not any("inventory has 0" in error for error in empty_feature_errors):
-        raise AssertionError("an empty feature-enabled target inventory must fail")
+    if not any("added" in error and "not recorded" in error for error in unexpected_named):
+        raise AssertionError("an added feature test must require an explicit inventory update")
 
     if compare_inventories({"target": frozenset({"a"})}, {"target": frozenset({"a"})}):
         raise AssertionError("matching inventories should pass")
@@ -1882,6 +2163,25 @@ def self_test() -> None:
         raise AssertionError(
             "one emptied directory must fail and must name itself, even while the other is full"
         )
+    expected_targets = {
+        ep_dir: frozenset({"einsum_gpu", "matmul_gpu"}),
+        memory_dir: frozenset({"pool_gpu"}),
+    }
+    healthy_targets = {
+        ep_dir: [ep_dir / "einsum_gpu.rs", ep_dir / "matmul_gpu.rs"],
+        memory_dir: [memory_dir / "pool_gpu.rs"],
+    }
+    if expected_cuda_target_errors(healthy_targets, expected_targets):
+        raise AssertionError("the exact CUDA target inventory rejected its healthy fixture")
+    renamed_targets = {
+        ep_dir: [ep_dir / "einsum_routes_gpu.rs", ep_dir / "matmul_gpu.rs"],
+        memory_dir: [memory_dir / "pool_gpu.rs"],
+    }
+    renamed_errors = expected_cuda_target_errors(renamed_targets, expected_targets)
+    if not any(
+        "einsum_gpu" in error and "missing or renamed" in error for error in renamed_errors
+    ) or not any("einsum_routes_gpu" in error and "not recorded" in error for error in renamed_errors):
+        raise AssertionError("renaming a CUDA target must fail both sides of the exact census")
 
 
 def main() -> int:
@@ -1907,6 +2207,8 @@ def main() -> int:
             + scan_source_for_inventory_drift()
             + scan_source_for_suite_isolation()
             + census_errors(by_dir)
+            + expected_cuda_target_errors(by_dir)
+            + expected_always_run_source_errors()
         )
         if source_errors:
             print("CUDA test source scan failed:", file=sys.stderr)
@@ -1931,23 +2233,42 @@ def main() -> int:
         + scan_source_for_inventory_drift()
         + scan_source_for_suite_isolation()
         + census_errors(policed_cuda_targets_by_dir())
+        + expected_cuda_target_errors(policed_cuda_targets_by_dir())
+        + expected_always_run_source_errors()
     )
     for crate in CUDA_CRATES:
         manifest = (crate / "Cargo.toml").read_text(encoding="utf-8")
         if not declares_gpu_tests_feature(manifest):
             errors.append(f"crates/{crate.name}/Cargo.toml must define a gpu-tests feature")
 
+    expected_targets = frozenset(
+        target
+        for targets in EXPECTED_CUDA_TARGETS_BY_DIR.values()
+        for target in targets
+    )
+    discard_stale_cached_binaries(
+        sorted(
+            expected_targets
+            | ALWAYS_RUN
+            | {
+                CUDA_PLUGIN_TARGET,
+                SESSION_HETERO_TARGET,
+                ENGINE_DEFAULT_OFF_TARGET,
+            }
+        )
+    )
+
     base_binaries = build_test_binaries(BASE_CONFIG)
-    gpu_binaries = build_test_binaries(GPU_CONFIG)
     base_inventory = collect_inventories(base_binaries)
-    gpu_inventory = collect_inventories(gpu_binaries)
-    errors.extend(compare_inventories(base_inventory, gpu_inventory))
-    production_summaries, production_errors = verify_production_feature_targets()
-    errors.extend(production_errors)
-
     base_by_target = {binary.target: binary for binary in base_binaries}
-    gpu_by_target = {binary.target: binary for binary in gpu_binaries}
-
+    errors.extend(
+        named_inventory_errors(
+            "CUDA Cargo targets without gpu-tests",
+            frozenset(base_inventory),
+            expected_targets,
+        )
+    )
+    errors.extend(expected_test_inventory_errors(base_inventory, EXPECTED_EINSUM_TESTS_BY_TARGET))
     ignored_results: list[IgnoredResult] = []
     for target, inventory in sorted(base_inventory.items()):
         _, passed, failed, ignored, names = run_libtest(base_by_target[target])
@@ -1961,7 +2282,20 @@ def main() -> int:
         )
         ignored_results.append(result)
         errors.extend(validate_ignored_result(result))
+    discard_consumed_binaries(base_binaries)
 
+    gpu_binaries = build_test_binaries(GPU_CONFIG)
+    gpu_inventory = collect_inventories(gpu_binaries)
+    gpu_by_target = {binary.target: binary for binary in gpu_binaries}
+    errors.extend(
+        named_inventory_errors(
+            "CUDA Cargo targets with gpu-tests",
+            frozenset(gpu_inventory),
+            expected_targets,
+        )
+    )
+    errors.extend(expected_test_inventory_errors(gpu_inventory, EXPECTED_EINSUM_TESTS_BY_TARGET))
+    errors.extend(compare_inventories(base_inventory, gpu_inventory))
     active_results: list[ActiveResult] = []
     for target, inventory in sorted(gpu_inventory.items()):
         _, passed, failed, ignored, names = run_libtest(gpu_by_target[target])
@@ -1975,6 +2309,10 @@ def main() -> int:
         )
         active_results.append(result)
         errors.extend(validate_active_no_cuda_result(result))
+    discard_consumed_binaries(gpu_binaries)
+
+    production_summaries, production_errors = verify_production_feature_targets()
+    errors.extend(production_errors)
 
     total_base_inventory = sum(len(inventory) for inventory in base_inventory.values())
     total_gpu_inventory = sum(len(inventory) for inventory in gpu_inventory.values())
