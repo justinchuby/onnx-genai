@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterable
@@ -1516,120 +1517,197 @@ def _integrity_failures(
     return failures
 
 
-def _probe_trigger_forms() -> int:
-    """Every spelling GitHub accepts for `on:` reads back the same trigger set.
-
-    A parser that silently returns the empty set for a form it does not know
-    would report a PR-triggered workflow as no longer triggering -- a false red
-    on the recorded files, and a false green on the unrecorded ones, from the
-    same bug. So the unknown-form case refuses instead.
-    """
-    problems: list[str] = []
-    both = {"push", "pull_request"}
-    forms = {
-        "block keys": "name: W\non:\n  push:\n  pull_request:\n    branches: [main]\njobs:\n",
-        "block items": "name: W\non:\n  - push\n  - pull_request\njobs:\n",
-        "inline list": "name: W\non: [push, pull_request]\njobs:\n",
-        "double-quoted key": 'name: W\n"on":\n  push:\n  pull_request:\njobs:\n',
-        "single-quoted key": "name: W\n'on':\n  push:\n  pull_request:\njobs:\n",
-        "trailing comment": "name: W\non:\n  push:  # main only\n  pull_request:\njobs:\n",
-        "comment inside block": "name: W\non:\n  push:\n  # why\n  pull_request:\njobs:\n",
-    }
-    for label, text in forms.items():
-        got = workflow_triggers(text, source=label)
-        if got != both:
-            problems.append(f"{label} read as {sorted(got)}, expected {sorted(both)}")
-    if (scalar := workflow_triggers("on: push\njobs:\n")) != {"push"}:
-        problems.append(f"scalar form read as {sorted(scalar)}")
-    # `on_failure:` and `one:` both begin with the letters of `on` and neither is
-    # the triggers block; matching either would read a workflow's triggers off an
-    # unrelated key.
-    for label, text in (
-        ("no `on:` block", "name: W\njobs:\n"),
-        ("empty `on:` block", "name: W\non:\njobs:\n"),
-        ("`one:` is not `on:`", "name: W\none: x\njobs:\n"),
-    ):
-        try:
-            got = workflow_triggers(text, source=label)
-        except SystemExit:
-            continue
-        problems.append(f"{label} accepted, read as {sorted(got)}; should refuse")
-    for problem in problems:
-        print(f"  on: parse: {problem}", file=sys.stderr)
-    return 1 if problems else 0
-
-
 def _inventory_entry(name: str, jobs: Iterable[str]) -> str:
     body = "".join(f'            "{job}",\n' for job in jobs)
     return f'        "{name}": (\n{body}        ),'
 
 
 # Hand-parsed for the reason the rest of this file is: `ubuntu-latest` ships no
-# PyYAML and PEP 668 blocks installing it. Text parsing also sidesteps the YAML
-# 1.1 rule that makes a bare `on:` key parse as the boolean `True` -- a live
-# footgun for every PyYAML-based reader of these files, and the reason the
-# quoted spellings below are accepted too.
+# YAML parser in the interpreter `python` resolves to, and adding one to the
+# required quality job would make this integrity check depend on a package
+# install before it can protect that job. PyYAML is also YAML 1.1 by default, so
+# it resolves bare `on` to boolean `True`, unlike GitHub Actions' YAML 1.2-ish
+# reader.
+#
+# This is deliberately a restricted parser, not an incomplete permissive one.
+# It accepts the ordinary scalar/list/mapping spellings used by workflows here,
+# and refuses every direct `on:` child it cannot classify. In particular,
+# aliases, tags, explicit/complex keys, and merge keys may resolve to an
+# automatic event in actionlint/GitHub; ignoring them would turn an unknown
+# syntax into a false green for a manual-only workflow.
 _ON_KEY = re.compile(r"""^(?:"on"|'on'|on)\s*:\s*(?P<inline>.*?)\s*$""")
+_TRIGGER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 _ON_CHILD = re.compile(
-    r"""^\ \ (?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|(?P<plain>[A-Za-z0-9_.-]+))\s*:"""
+    r"""^(?P<key>"[A-Za-z][A-Za-z0-9_-]*"|'[A-Za-z][A-Za-z0-9_-]*'|"""
+    r"""[A-Za-z][A-Za-z0-9_-]*)\s*:(?P<value>.*)$"""
 )
-_ON_ITEM = re.compile(r"^\ \ -\s*(?P<value>.+?)\s*$")
+_ON_ITEM = re.compile(r"^-\s+(?P<value>.+?)\s*$")
+
+
+def _trigger_scalar(value: str, source: str, line_number: int) -> str:
+    """One unambiguous event-name scalar, without aliases, tags, or escapes."""
+    value = _TRAILING_COMMENT.sub("", value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    if not _TRIGGER_NAME.fullmatch(value):
+        raise SystemExit(
+            f"{source}:{line_number}: unsupported or malformed trigger scalar "
+            f"{value!r}. The integrity guard accepts plain, single-quoted, or "
+            "double-quoted event names only; aliases, tags, explicit/complex "
+            "keys, merge keys, and escaped spellings are refused so they cannot "
+            "hide an automatic trigger."
+        )
+    return value
+
+
+def _add_trigger(
+    triggers: set[str],
+    trigger: str,
+    source: str,
+    line_number: int,
+) -> None:
+    if trigger in triggers:
+        raise SystemExit(
+            f"{source}:{line_number}: duplicate trigger {trigger!r} under `on:`. "
+            "Duplicate YAML keys are parser-dependent and therefore refused."
+        )
+    triggers.add(trigger)
+
+
+def _inline_triggers(value: str, source: str, line_number: int) -> set[str]:
+    value = _TRAILING_COMMENT.sub("", value).strip()
+    if value.startswith("[") or value.endswith("]"):
+        if not (value.startswith("[") and value.endswith("]")):
+            raise SystemExit(
+                f"{source}:{line_number}: malformed inline `on:` list {value!r}; "
+                "both `[` and `]` are required."
+            )
+        body = value[1:-1].strip()
+        if not body:
+            raise SystemExit(
+                f"{source}:{line_number}: inline `on:` list is empty, so the gate "
+                "cannot tell when this workflow runs."
+            )
+        parts = body.split(",")
+        if any(not part.strip() for part in parts):
+            raise SystemExit(
+                f"{source}:{line_number}: malformed inline `on:` list {value!r}; "
+                "empty entries and trailing commas are refused."
+            )
+    else:
+        parts = [value]
+
+    triggers: set[str] = set()
+    for part in parts:
+        trigger = _trigger_scalar(part, source, line_number)
+        _add_trigger(triggers, trigger, source, line_number)
+    return triggers
+
+
+def _block_triggers(
+    lines: list[str],
+    start: int,
+    source: str,
+) -> set[str]:
+    triggers: set[str] = set()
+    child_indent: int | None = None
+    form: str | None = None
+
+    for index in range(start, len(lines)):
+        line = lines[index]
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if line.startswith("\t"):
+            raise SystemExit(
+                f"{source}:{index + 1}: tab-indented content under `on:` is "
+                "refused; YAML indentation must be spaces."
+            )
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            break
+        if child_indent is None:
+            child_indent = indent
+        if indent < child_indent:
+            raise SystemExit(
+                f"{source}:{index + 1}: inconsistent indentation under `on:`; "
+                f"expected an immediate child at column {child_indent + 1}."
+            )
+        if indent > child_indent:
+            continue
+
+        direct = line[child_indent:]
+        item = _ON_ITEM.fullmatch(direct)
+        child = _ON_CHILD.fullmatch(direct)
+        if form is None:
+            form = "sequence" if item is not None else "mapping"
+
+        if form == "sequence" and item is not None:
+            trigger = _trigger_scalar(item.group("value"), source, index + 1)
+        elif form == "mapping" and child is not None:
+            trigger = _trigger_scalar(child.group("key"), source, index + 1)
+        else:
+            raise SystemExit(
+                f"{source}:{index + 1}: unsupported syntax directly under the "
+                f"top-level `on:` mapping: {direct.strip()!r}. Only plain, "
+                "single-quoted, or double-quoted event keys (or a sequence of "
+                "those scalars) are accepted. Aliases, tags, explicit/complex "
+                "keys, merge keys, and mixed mapping/sequence forms are refused "
+                "rather than ignored."
+            )
+        _add_trigger(triggers, trigger, source, index + 1)
+
+    if not triggers:
+        raise SystemExit(
+            f"{source}: `on:` block parsed to no triggers at all. Refusing to "
+            "guess -- an empty read here would report every workflow as no "
+            "longer running on pull requests, or none of them, depending on "
+            "which way the caller leans."
+        )
+    return triggers
 
 
 def workflow_triggers(text: str, source: str = "<workflow>") -> set[str]:
-    """The event names a workflow triggers on.
-
-    All three spellings GitHub accepts: `on: push`, `on: [push, pull_request]`,
-    and the block form with either `  push:` keys or `  - push` items.
-    """
+    """The event names a workflow triggers on, or a fail-closed refusal."""
     lines = text.splitlines()
+    matches: list[tuple[int, re.Match[str]]] = []
     for index, line in enumerate(lines):
-        if line.startswith(" ") or line.lstrip().startswith("#"):
+        if line.startswith((" ", "\t")) or line.lstrip().startswith("#"):
             continue
         match = _ON_KEY.match(line)
-        if match is None:
-            continue
-        inline = _TRAILING_COMMENT.sub("", match.group("inline")).strip()
-        if inline:
-            return {
-                _scalar(part)
-                for part in inline.strip("[]").split(",")
-                if part.strip()
-            }
-        triggers: set[str] = set()
-        for follow in lines[index + 1 :]:
-            if (
-                follow.strip()
-                and not follow.startswith(" ")
-                and not follow.lstrip().startswith("#")
-            ):
-                break
-            if follow.lstrip().startswith("#"):
-                continue
-            if item := _ON_ITEM.match(follow):
-                triggers.add(_scalar(item.group("value")))
-            elif child := _ON_CHILD.match(follow):
-                triggers.add(
-                    child.group("dq") or child.group("sq") or child.group("plain")
-                )
-        if not triggers:
-            raise SystemExit(
-                f"{source}: `on:` block parsed to no triggers at all. Refusing to "
-                f"guess -- an empty read here would report every workflow as no "
-                f"longer running on pull requests, or none of them, depending on "
-                f"which way the caller leans."
-            )
-        return triggers
-    raise SystemExit(
-        f"{source}: no top-level `on:` block, so the gate cannot tell when this "
-        f"workflow runs."
-    )
+        if match is not None:
+            matches.append((index, match))
+
+    if not matches:
+        raise SystemExit(
+            f"{source}: no top-level `on:` block, so the gate cannot tell when "
+            "this workflow runs. A tagged, aliased, explicit, or complex key is "
+            "not treated as `on:` because resolving it incompletely would be a "
+            "false-green risk."
+        )
+    if len(matches) != 1:
+        lines_found = [index + 1 for index, _ in matches]
+        raise SystemExit(
+            f"{source}: duplicate top-level `on:` keys at lines {lines_found}. "
+            "Duplicate YAML keys are parser-dependent and therefore refused."
+        )
+
+    index, match = matches[0]
+    inline = match.group("inline")
+    if inline.lstrip().startswith("#"):
+        inline = ""
+    else:
+        inline = _TRAILING_COMMENT.sub("", inline).strip()
+    if inline:
+        return _inline_triggers(inline, source, index + 1)
+    return _block_triggers(lines, index + 1, source)
 
 
 def verify_trigger_integrity(
     simulate_dropped_trigger: str | None = None,
     simulate_extra_trigger: str | None = None,
     simulate_gated_job: str | None = None,
+    workflow_texts: dict[str, str] | None = None,
 ) -> list[str]:
     """Recorded PR checks still fire, and manual diagnostics stay manual-only.
 
@@ -1645,13 +1723,20 @@ def verify_trigger_integrity(
             "workflow(s) cannot be both PR-triggered and manual-only: "
             f"{sorted(overlap)}"
         )
-    for path in workflow_files():
-        name = path.name
+    if workflow_texts is None:
+        workflows = [
+            (path.name, path.read_text(encoding="utf-8"), str(path))
+            for path in workflow_files()
+        ]
+    else:
+        workflows = [
+            (name, text, name) for name, text in sorted(workflow_texts.items())
+        ]
+    for name, text, source in workflows:
         if name not in WORKFLOW_JOB_INVENTORY:
             continue
-        text = path.read_text(encoding="utf-8")
         try:
-            triggers = workflow_triggers(text, source=str(path))
+            triggers = workflow_triggers(text, source=source)
         except SystemExit as refusal:
             failures.append(str(refusal))
             continue
@@ -1685,7 +1770,7 @@ def verify_trigger_integrity(
             continue
         allowed = PR_TRIGGERED_WORKFLOWS[name]
         try:
-            jobs = parse_jobs(text, source=str(path))
+            jobs = parse_jobs(text, source=source)
         except SystemExit:
             continue  # already reported by _integrity_failures
         for job, body in sorted(jobs.items()):
@@ -1700,6 +1785,227 @@ def verify_trigger_integrity(
                 f"is not a failure and does not appear as a red check -- so gating a "
                 f"PR check is indistinguishable from it passing. Allowed here: "
                 f"{sorted(allowed) or 'no condition at all'}."
+            )
+    return failures
+
+
+_TRIGGER_FORM_ARMS: tuple[
+    tuple[str, str, tuple[str, ...], bool | None],
+    ...,
+] = (
+    (
+        "manual-only block mapping is accepted",
+        "on:\n  workflow_dispatch:\n",
+        (),
+        True,
+    ),
+    (
+        "manual-only double-quoted keys are accepted",
+        '"on":\n  "workflow_dispatch":\n',
+        (),
+        True,
+    ),
+    (
+        "manual-only single-quoted keys are accepted",
+        "'on':\n  'workflow_dispatch':\n",
+        (),
+        True,
+    ),
+    (
+        "manual-only inline scalar is accepted",
+        "on: workflow_dispatch\n",
+        (),
+        True,
+    ),
+    (
+        "manual-only inline list is accepted",
+        "on: [workflow_dispatch]\n",
+        (),
+        True,
+    ),
+    (
+        "manual-only block sequence is accepted",
+        "on:\n  - workflow_dispatch\n",
+        (),
+        True,
+    ),
+    (
+        "manual-only comments are accepted",
+        "on:  # operator diagnostics\n  # no automatic events\n  workflow_dispatch:\n",
+        (),
+        True,
+    ),
+    (
+        "manual-only workflow_dispatch inputs are accepted",
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "    inputs:\n"
+        "      reason:\n"
+        "        required: false\n"
+        "        type: string\n",
+        (),
+        True,
+    ),
+    (
+        "plain push is refused",
+        "on:\n  workflow_dispatch:\n  push:\n",
+        ("manual-only", "push"),
+        True,
+    ),
+    (
+        "plain pull_request is refused",
+        "on:\n  workflow_dispatch:\n  pull_request:\n",
+        ("manual-only", "pull_request"),
+        True,
+    ),
+    (
+        "plain schedule is refused",
+        'on:\n  workflow_dispatch:\n  schedule:\n    - cron: "0 0 * * *"\n',
+        ("manual-only", "schedule"),
+        True,
+    ),
+    (
+        "plain release is refused",
+        "on:\n  workflow_dispatch:\n  release:\n    types: [published]\n",
+        ("manual-only", "release"),
+        True,
+    ),
+    (
+        "plain workflow_call is refused",
+        "on:\n  workflow_dispatch:\n  workflow_call:\n",
+        ("manual-only", "workflow_call"),
+        True,
+    ),
+    (
+        "alias resolving to push is refused closed",
+        "run-name: &automatic push\non:\n  *automatic:\n  workflow_dispatch:\n",
+        ("unsupported syntax", "*automatic"),
+        True,
+    ),
+    (
+        "tagged push key is refused closed",
+        "on:\n  !!str push:\n  workflow_dispatch:\n",
+        ("unsupported syntax", "!!str push"),
+        True,
+    ),
+    (
+        "explicit push key is refused closed",
+        "on:\n  ? push\n  :\n  workflow_dispatch:\n",
+        ("unsupported syntax", "? push"),
+        True,
+    ),
+    (
+        "complex explicit key is refused closed",
+        "on:\n  ? [push]\n  :\n  workflow_dispatch:\n",
+        ("unsupported syntax", "? [push]"),
+        False,
+    ),
+    (
+        "merge key is refused whether or not actionlint accepts it",
+        "env: &events\n  push:\non:\n  <<: *events\n  workflow_dispatch:\n",
+        ("unsupported syntax", "<<: *events"),
+        None,
+    ),
+    (
+        "duplicate event keys are refused",
+        "on:\n  workflow_dispatch:\n  workflow_dispatch:\n",
+        ("duplicate trigger", "workflow_dispatch"),
+        False,
+    ),
+    (
+        "duplicate top-level on keys are refused",
+        "on:\n  workflow_dispatch:\non:\n  push:\n",
+        ("duplicate top-level `on:`",),
+        False,
+    ),
+    (
+        "YAML boolean true is not mistaken for on",
+        "true:\n  workflow_dispatch:\n",
+        ("no top-level `on:`",),
+        False,
+    ),
+    (
+        "an on-like key is not mistaken for on",
+        "one:\n  workflow_dispatch:\n",
+        ("no top-level `on:`",),
+        False,
+    ),
+    (
+        "malformed inline YAML is refused",
+        "on: [workflow_dispatch\n",
+        ("malformed inline `on:`", "[workflow_dispatch"),
+        False,
+    ),
+    (
+        "unrecognized immediate child is refused",
+        "on:\n  workflow_dispatch\n",
+        ("unsupported syntax", "workflow_dispatch"),
+        True,
+    ),
+)
+
+_ACTIONLINT_TEST_JOB = """jobs:
+  trigger-integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo checked
+"""
+
+
+def _trigger_form_arms() -> int:
+    """Exercise the production trigger check and actionlint on adversarial YAML."""
+    failures = 0
+    actionlint = shutil.which("actionlint")
+    workflow = next(iter(MANUAL_ONLY_WORKFLOWS))
+
+    for label, trigger_text, expected, actionlint_accepts in _TRIGGER_FORM_ARMS:
+        found = verify_trigger_integrity(
+            workflow_texts={workflow: trigger_text},
+        )
+        report = "\n".join(found)
+        problems: list[str] = []
+        if expected:
+            if not found:
+                problems.append("the production integrity check accepted it")
+            if missing := [needle for needle in expected if needle not in report]:
+                problems.append(f"the refusal did not name {missing}")
+        elif found:
+            problems.append(f"the production integrity check refused it: {found}")
+
+        actionlint_result = "not installed"
+        if actionlint is not None:
+            try:
+                linted = subprocess.run(
+                    [actionlint, "-"],
+                    input=trigger_text + _ACTIONLINT_TEST_JOB,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                problems.append(f"actionlint could not run: {error}")
+                actionlint_result = "failed to run"
+            else:
+                accepted = linted.returncode == 0
+                actionlint_result = "accepted" if accepted else "rejected"
+                if actionlint_accepts is not None and accepted != actionlint_accepts:
+                    output = (linted.stdout + linted.stderr).strip()
+                    problems.append(
+                        "actionlint unexpectedly "
+                        f"{actionlint_result} it: {output[:300]!r}"
+                    )
+
+        if problems:
+            failures += 1
+            print(f"  FAIL  {label}", file=sys.stderr)
+            for problem in problems:
+                print(f"        {problem}", file=sys.stderr)
+        else:
+            verdict = "accepted" if not expected else "refused"
+            print(
+                f"  ok    {label} -> integrity {verdict}, "
+                f"actionlint {actionlint_result}"
             )
     return failures
 
@@ -2722,13 +3028,6 @@ def _self_test_arms() -> tuple[int, int]:
             ["ci.yml", "if: false"],
         ),
         (
-            "every `on:` spelling GitHub accepts reads back the same triggers",
-            _probe_trigger_forms,
-            {},
-            0,
-            [],
-        ),
-        (
             "verify-required-tier --simulate-dropped-lane ort-backed",
             verify_required_tier,
             {"simulate_dropped_lane": "ort-backed"},
@@ -2812,6 +3111,7 @@ def _self_test_arms() -> tuple[int, int]:
     failures += _job_condition_arms()
     failures += _clippy_block_arms()
     failures += _workflow_integrity_arms()
+    failures += _trigger_form_arms()
     total = (
         len(arms)
         + _PARSER_ARM_COUNT
@@ -2819,6 +3119,7 @@ def _self_test_arms() -> tuple[int, int]:
         + len(_JOB_CONDITION_ARMS)
         + len(_CLIPPY_BLOCK_ARMS)
         + len(_WORKFLOW_INTEGRITY_ARMS)
+        + len(_TRIGGER_FORM_ARMS)
     )
     return failures, total
 
