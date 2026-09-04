@@ -28,7 +28,7 @@ use onnx_runtime_ep_cuda::{
     execute_einsum_with_route_and_memory_ceiling, reset_einsum_execution_stats,
 };
 use onnx_runtime_ir::{
-    Attribute, DataType, TensorLayout, compute_contiguous_strides, static_shape,
+    Attribute, DataType, DeviceId, TensorLayout, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
 
@@ -148,6 +148,144 @@ fn make_typed_einsum_kernel(
     let model = Model::new(&graph);
     ep.get_kernel(model.graph.node(node), input_shapes, opset)
         .unwrap()
+}
+
+#[derive(Clone, Copy)]
+enum FirstInputIdentity {
+    BaseWithOffset,
+    ShiftedBase,
+}
+
+struct SemanticIdentityFixture {
+    kernel: Box<dyn onnx_runtime_ep_api::Kernel>,
+    inputs: Vec<Tensor>,
+    buffers: Vec<onnx_runtime_ep_api::DeviceBuffer>,
+    prefixed_first: onnx_runtime_ep_api::DeviceBuffer,
+    output: onnx_runtime_ep_api::DeviceBuffer,
+    input_strides: Vec<Vec<i64>>,
+    output_shape: Vec<usize>,
+    output_strides: Vec<i64>,
+    route: EinsumRouteOverride,
+    device: DeviceId,
+}
+
+impl SemanticIdentityFixture {
+    fn new(ep: &CudaExecutionProvider, route: EinsumRouteOverride) -> Self {
+        let (equation, input_shapes, output_shape) = match route {
+            EinsumRouteOverride::GenericNative => ("ij->i", vec![vec![2usize, 3]], vec![2usize]),
+            EinsumRouteOverride::Optimized => (
+                "i,ij,j->",
+                vec![vec![2usize], vec![2usize, 2], vec![2usize]],
+                Vec::new(),
+            ),
+            other => panic!("semantic identity fixture does not support {other:?}"),
+        };
+        let (kernel, inputs, buffers, output) =
+            make_direct_kernel(ep, equation, &input_shapes, &output_shape);
+        let prefix_bytes = std::mem::size_of::<f32>();
+        let mut payload = vec![0u8; prefix_bytes];
+        payload.extend_from_slice(&inputs[0].bytes);
+        let prefixed_first = ep.allocate(payload.len(), 256).unwrap();
+        unsafe {
+            ep.runtime()
+                .htod(&payload, cuptr(prefixed_first.as_ptr()))
+                .unwrap();
+        }
+        let input_strides = inputs
+            .iter()
+            .map(|input| compute_contiguous_strides(&input.shape))
+            .collect();
+        let output_strides = compute_contiguous_strides(&output_shape);
+        Self {
+            kernel,
+            inputs,
+            buffers,
+            prefixed_first,
+            output,
+            input_strides,
+            output_shape,
+            output_strides,
+            route,
+            device: ep.device_id(),
+        }
+    }
+
+    fn execute(
+        &mut self,
+        first_identity: FirstInputIdentity,
+        first_device: DeviceId,
+        output_device: DeviceId,
+        alias_output: bool,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let prefix_bytes = std::mem::size_of::<f32>();
+        let base = self.prefixed_first.as_ptr() as *const u8;
+        let (first_pointer, first_offset) = match first_identity {
+            FirstInputIdentity::BaseWithOffset => (base, prefix_bytes),
+            FirstInputIdentity::ShiftedBase => (base.wrapping_add(prefix_bytes), 0),
+        };
+        let mut views = Vec::with_capacity(self.inputs.len());
+        for (index, ((input, buffer), strides)) in self
+            .inputs
+            .iter()
+            .zip(&self.buffers)
+            .zip(&self.input_strides)
+            .enumerate()
+        {
+            if index == 0 {
+                views.push(
+                    TensorView::new(
+                        DevicePtr(first_pointer.cast()),
+                        input.dtype,
+                        &input.shape,
+                        strides,
+                        first_device,
+                    )
+                    .with_byte_offset(first_offset),
+                );
+            } else {
+                views.push(TensorView::new(
+                    DevicePtr(buffer.as_ptr()),
+                    input.dtype,
+                    &input.shape,
+                    strides,
+                    self.device,
+                ));
+            }
+        }
+        let output_pointer = if alias_output {
+            first_pointer.wrapping_add(first_offset).cast_mut().cast()
+        } else {
+            self.output.as_mut_ptr()
+        };
+        execute_einsum_with_route(
+            self.kernel.as_ref(),
+            &views,
+            &mut [TensorMut::new(
+                DevicePtrMut(output_pointer),
+                DataType::Float32,
+                &self.output_shape,
+                &self.output_strides,
+                output_device,
+            )],
+            self.route,
+        )
+    }
+
+    fn resources(&self) -> Vec<usize> {
+        self.kernel
+            .device_graph_resources()
+            .into_iter()
+            .map(|resource| resource.identity())
+            .collect()
+    }
+
+    fn deallocate(self, ep: &CudaExecutionProvider) {
+        for buffer in self.buffers {
+            ep.deallocate(buffer).unwrap();
+        }
+        ep.deallocate(self.prefixed_first).unwrap();
+        ep.deallocate(self.output).unwrap();
+    }
 }
 
 fn values(count: usize, salt: usize) -> Vec<f32> {
@@ -2611,6 +2749,287 @@ fn generic_failed_rewarm_preserves_capture_ready_snapshot() {
     ep.deallocate(a_output).unwrap();
     ep.deallocate(b_buffer).unwrap();
     ep.deallocate(b_output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn semantic_signatures_bind_raw_base_offset_and_rewarm_transactionally() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    for route in [
+        EinsumRouteOverride::GenericNative,
+        EinsumRouteOverride::Optimized,
+    ] {
+        let mut fixture = SemanticIdentityFixture::new(&ep, route);
+        reset_einsum_execution_stats();
+        fixture
+            .execute(
+                FirstInputIdentity::BaseWithOffset,
+                ep.device_id(),
+                ep.device_id(),
+                false,
+            )
+            .unwrap();
+        let warm_resources = fixture.resources();
+        let warm = einsum_execution_stats();
+        assert_eq!(warm.plan_builds, 1, "{route:?}");
+
+        fixture
+            .execute(
+                FirstInputIdentity::ShiftedBase,
+                ep.device_id(),
+                ep.device_id(),
+                false,
+            )
+            .unwrap();
+        let rewarm = einsum_execution_stats();
+        assert_eq!(
+            rewarm.plan_builds, 2,
+            "{route:?}: a different raw base plus byte_offset must not alias the warmed identity"
+        );
+        assert_eq!(rewarm.plan_rewarms, 1, "{route:?}");
+        assert_ne!(
+            fixture.resources(),
+            warm_resources,
+            "{route:?}: successful eager rewarm must atomically publish the new snapshot"
+        );
+        fixture.deallocate(&ep);
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn semantic_signatures_reject_device_and_alias_mismatch_before_launch() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    for route in [
+        EinsumRouteOverride::GenericNative,
+        EinsumRouteOverride::Optimized,
+    ] {
+        let mut fixture = SemanticIdentityFixture::new(&ep, route);
+        reset_einsum_execution_stats();
+        fixture
+            .execute(
+                FirstInputIdentity::BaseWithOffset,
+                ep.device_id(),
+                ep.device_id(),
+                false,
+            )
+            .unwrap();
+        let warm_resources = fixture.resources();
+        let warm = einsum_execution_stats();
+
+        let input_error = fixture
+            .execute(
+                FirstInputIdentity::BaseWithOffset,
+                DeviceId::cuda(ep.device_id().index + 1),
+                ep.device_id(),
+                false,
+            )
+            .expect_err("cross-device input must fail before CUDA address use");
+        let input_message = input_error.to_string();
+        assert!(input_message.contains("input #0"), "{input_message}");
+        assert!(
+            input_message.contains("active CUDA execution provider"),
+            "{input_message}"
+        );
+
+        let output_error = fixture
+            .execute(
+                FirstInputIdentity::BaseWithOffset,
+                ep.device_id(),
+                DeviceId::cpu(),
+                false,
+            )
+            .expect_err("host output must fail before CUDA address use");
+        let output_message = output_error.to_string();
+        assert!(output_message.contains("output is on"), "{output_message}");
+        assert!(
+            output_message.contains("active CUDA execution provider"),
+            "{output_message}"
+        );
+
+        let alias_error = fixture
+            .execute(
+                FirstInputIdentity::BaseWithOffset,
+                ep.device_id(),
+                ep.device_id(),
+                true,
+            )
+            .expect_err("changed alias assumption must fail before launch");
+        assert!(
+            alias_error.to_string().contains("overlaps input #0"),
+            "{alias_error}"
+        );
+        let rejected = einsum_execution_stats();
+        assert_eq!(rejected.plan_builds, warm.plan_builds, "{route:?}");
+        assert_eq!(
+            rejected.generic_native_launches + rejected.optimized_launches,
+            warm.generic_native_launches + warm.optimized_launches,
+            "{route:?}: rejected device/alias identities must not launch"
+        );
+        assert_eq!(
+            fixture.resources(),
+            warm_resources,
+            "{route:?}: rejected identities must preserve the warmed snapshot"
+        );
+        fixture.deallocate(&ep);
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn semantic_capture_mismatch_is_pre_mutation_and_preserves_snapshot() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    for route in [
+        EinsumRouteOverride::GenericNative,
+        EinsumRouteOverride::Optimized,
+    ] {
+        let mut fixture = SemanticIdentityFixture::new(&ep, route);
+        reset_einsum_execution_stats();
+        fixture
+            .execute(
+                FirstInputIdentity::BaseWithOffset,
+                ep.device_id(),
+                ep.device_id(),
+                false,
+            )
+            .unwrap();
+        let resources_before = fixture.resources();
+        runtime
+            .begin_graph_capture(&[fixture.kernel.as_ref()])
+            .unwrap();
+        let allocations_before = runtime.allocation_counts();
+        let transfers_before = runtime.transfer_counts();
+        let synchronizations_before = runtime.forced_synchronization_count();
+        let launches_before = einsum_execution_stats();
+
+        let error = fixture
+            .execute(
+                FirstInputIdentity::ShiftedBase,
+                ep.device_id(),
+                ep.device_id(),
+                false,
+            )
+            .expect_err("capture must reject a different raw base/offset identity");
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot reuse the warmed arithmetic snapshot"),
+            "{message}"
+        );
+        assert!(message.contains("raw base pointer changed"), "{message}");
+        assert_eq!(runtime.allocation_counts(), allocations_before, "{route:?}");
+        assert_eq!(runtime.transfer_counts(), transfers_before, "{route:?}");
+        assert_eq!(
+            runtime.forced_synchronization_count(),
+            synchronizations_before,
+            "{route:?}"
+        );
+        let rejected = einsum_execution_stats();
+        assert_eq!(
+            rejected.plan_builds, launches_before.plan_builds,
+            "{route:?}"
+        );
+        assert_eq!(
+            rejected.generic_native_launches + rejected.optimized_launches,
+            launches_before.generic_native_launches + launches_before.optimized_launches,
+            "{route:?}: capture mismatch must not launch"
+        );
+        assert_eq!(fixture.resources(), resources_before, "{route:?}");
+
+        fixture
+            .execute(
+                FirstInputIdentity::BaseWithOffset,
+                ep.device_id(),
+                ep.device_id(),
+                false,
+            )
+            .unwrap();
+        runtime.end_graph_capture().unwrap();
+        runtime.replay_graph().unwrap();
+        runtime.synchronize().unwrap();
+        assert!(runtime.reset_graph().unwrap());
+        assert_eq!(
+            einsum_execution_stats().plan_builds,
+            launches_before.plan_builds,
+            "{route:?}: matching capture must retain the prior complete snapshot"
+        );
+        fixture.deallocate(&ep);
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn failed_semantic_rewarm_preserves_complete_snapshot_for_both_routes() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    for route in [
+        EinsumRouteOverride::GenericNative,
+        EinsumRouteOverride::Optimized,
+    ] {
+        let mut fixture = SemanticIdentityFixture::new(&ep, route);
+        reset_einsum_execution_stats();
+        fixture
+            .execute(
+                FirstInputIdentity::BaseWithOffset,
+                ep.device_id(),
+                ep.device_id(),
+                false,
+            )
+            .unwrap();
+        let resources_before = fixture.resources();
+        #[cfg(feature = "gpu-tests")]
+        runtime.fail_warm_transaction_at_for_test(1);
+        let error = fixture
+            .execute(
+                FirstInputIdentity::ShiftedBase,
+                ep.device_id(),
+                ep.device_id(),
+                false,
+            )
+            .expect_err("injected semantic rewarm failure must be reported");
+        assert!(
+            error
+                .to_string()
+                .contains("injected staged warm-cache failure"),
+            "{error}"
+        );
+        assert_eq!(einsum_execution_stats().plan_builds, 1, "{route:?}");
+        assert_eq!(einsum_execution_stats().plan_rewarms, 0, "{route:?}");
+        assert_eq!(fixture.resources(), resources_before, "{route:?}");
+
+        runtime
+            .begin_graph_capture(&[fixture.kernel.as_ref()])
+            .unwrap();
+        fixture
+            .execute(
+                FirstInputIdentity::BaseWithOffset,
+                ep.device_id(),
+                ep.device_id(),
+                false,
+            )
+            .unwrap();
+        runtime.end_graph_capture().unwrap();
+        runtime.replay_graph().unwrap();
+        runtime.synchronize().unwrap();
+        assert!(runtime.reset_graph().unwrap());
+        fixture.deallocate(&ep);
+    }
 }
 
 #[cfg_attr(

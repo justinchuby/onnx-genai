@@ -574,36 +574,68 @@ enum ExecutionKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DirectTensorMetadata {
-    dtype: DataType,
-    shape: Vec<usize>,
-    strides: Vec<i64>,
-    byte_offset: usize,
-    device: DeviceId,
+pub(super) struct ArithmeticTensorSignature {
+    pub(super) device: DeviceId,
+    pub(super) raw_base_pointer: CUdeviceptr,
+    pub(super) byte_offset: usize,
+    pub(super) effective_pointer: CUdeviceptr,
+    pub(super) dtype: DataType,
+    pub(super) shape: Vec<usize>,
+    pub(super) strides: Vec<i64>,
 }
 
-impl DirectTensorMetadata {
+impl ArithmeticTensorSignature {
     fn input(input: &TensorView) -> Self {
         Self {
+            device: input.device,
+            raw_base_pointer: cuptr(input.data.0),
+            byte_offset: input.byte_offset,
+            effective_pointer: cuptr(input.data_ptr::<u8>() as *const c_void),
             dtype: input.dtype,
             shape: input.shape.to_vec(),
             strides: input.strides.to_vec(),
-            byte_offset: input.byte_offset,
-            device: input.device,
         }
     }
 
     fn output(output: &TensorMut) -> Self {
         Self {
+            device: output.device,
+            raw_base_pointer: cuptr(output.data.0 as *const c_void),
+            byte_offset: output.byte_offset,
+            effective_pointer: cuptr(
+                (output.data.0 as *const u8).wrapping_add(output.byte_offset) as *const c_void,
+            ),
             dtype: output.dtype,
             shape: output.shape.to_vec(),
             strides: output.strides.to_vec(),
-            byte_offset: output.byte_offset,
-            device: output.device,
         }
     }
 
     fn mismatch_reason(&self, current: &Self, label: &str) -> Option<String> {
+        if self.device != current.device {
+            return Some(format!(
+                "{label} device changed from {:?} to {:?}",
+                self.device, current.device
+            ));
+        }
+        if self.raw_base_pointer != current.raw_base_pointer {
+            return Some(format!(
+                "{label} raw base pointer changed from {:#x} to {:#x}",
+                self.raw_base_pointer, current.raw_base_pointer
+            ));
+        }
+        if self.byte_offset != current.byte_offset {
+            return Some(format!(
+                "{label} byte offset changed from {} to {}",
+                self.byte_offset, current.byte_offset
+            ));
+        }
+        if self.effective_pointer != current.effective_pointer {
+            return Some(format!(
+                "{label} effective pointer changed from {:#x} to {:#x}",
+                self.effective_pointer, current.effective_pointer
+            ));
+        }
         if self.dtype != current.dtype {
             return Some(format!(
                 "{label} dtype changed from {:?} to {:?}",
@@ -622,69 +654,137 @@ impl DirectTensorMetadata {
                 self.strides, current.strides
             ));
         }
-        if self.byte_offset != current.byte_offset {
-            return Some(format!(
-                "{label} byte offset changed from {} to {}",
-                self.byte_offset, current.byte_offset
-            ));
-        }
-        if self.device != current.device {
-            return Some(format!(
-                "{label} device changed from {:?} to {:?}",
-                self.device, current.device
-            ));
-        }
         None
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ArithmeticAliasConstraint {
-    OutputDisjointFromInputs,
+pub(super) enum ArithmeticAliasProof {
+    OutputDisjointFromEveryInput,
 }
 
+/// Complete identity and route-safety authority for one arithmetic execution.
+///
+/// The owned snapshot binds every fact used to derive device addresses plus
+/// the overlap proof that permits an out-of-place arithmetic launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DirectExecutionMetadata {
-    // Layout identity is exact. Effective pointer alignment is the only
-    // intentionally compatible (rather than equal) property and is checked
-    // against the retained cuBLASLt algorithm contract on every reuse.
-    inputs: Vec<DirectTensorMetadata>,
-    output: DirectTensorMetadata,
-    layout: ContractionLayout,
-    alias_constraint: ArithmeticAliasConstraint,
+pub(super) struct ArithmeticExecutionSignature {
+    pub(super) inputs: Vec<ArithmeticTensorSignature>,
+    pub(super) output: ArithmeticTensorSignature,
+    alias_proof: ArithmeticAliasProof,
 }
 
-impl DirectExecutionMetadata {
-    fn mismatch_reason(&self, current: &Self) -> Option<String> {
+impl ArithmeticExecutionSignature {
+    fn new(inputs: &[TensorView], output: &TensorMut, alias_proof: ArithmeticAliasProof) -> Self {
+        Self {
+            inputs: inputs
+                .iter()
+                .map(ArithmeticTensorSignature::input)
+                .collect(),
+            output: ArithmeticTensorSignature::output(output),
+            alias_proof,
+        }
+    }
+
+    pub(super) fn mismatch_reason(&self, current: &Self) -> Option<String> {
         if self.inputs.len() != current.inputs.len() {
             return Some(format!(
-                "direct input count changed from {} to {}",
+                "input count changed from {} to {}",
                 self.inputs.len(),
                 current.inputs.len()
             ));
         }
         for (index, (warmed, current)) in self.inputs.iter().zip(&current.inputs).enumerate() {
-            if let Some(reason) = warmed.mismatch_reason(current, &format!("direct input #{index}"))
-            {
+            if let Some(reason) = warmed.mismatch_reason(current, &format!("input #{index}")) {
                 return Some(reason);
             }
         }
-        if let Some(reason) = self
-            .output
-            .mismatch_reason(&current.output, "direct output")
-        {
+        if let Some(reason) = self.output.mismatch_reason(&current.output, "output") {
             return Some(reason);
+        }
+        if self.alias_proof != current.alias_proof {
+            return Some(format!(
+                "alias/overlap proof changed from {:?} to {:?}",
+                self.alias_proof, current.alias_proof
+            ));
+        }
+        None
+    }
+
+    fn validate_tensor_device(
+        actual: DeviceId,
+        expected: DeviceId,
+        label: &str,
+        equation: &str,
+    ) -> Result<()> {
+        if actual != expected {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Einsum `{equation}`: {label} is on {actual:?}, but the active CUDA \
+                 execution provider owns {expected:?}; move or allocate the tensor on the active \
+                 CUDA device before execution"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_device_ownership(
+        &self,
+        expected: DeviceId,
+        equation: &str,
+    ) -> Result<()> {
+        for (index, input) in self.inputs.iter().enumerate() {
+            Self::validate_tensor_device(
+                input.device,
+                expected,
+                &format!("input #{index}"),
+                equation,
+            )?;
+        }
+        Self::validate_tensor_device(self.output.device, expected, "output", equation)
+    }
+
+    pub(super) fn validate_alias_proof(&self, equation: &str) -> Result<()> {
+        if self.alias_proof != ArithmeticAliasProof::OutputDisjointFromEveryInput {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Einsum `{equation}`: semantic execution signature has no proof that the \
+                 output is disjoint from every input"
+            )));
+        }
+        Ok(())
+    }
+
+    fn pointers(&self) -> ContractionPointers {
+        ContractionPointers {
+            a: self
+                .inputs
+                .first()
+                .map_or(0, |input| input.effective_pointer),
+            b: self
+                .inputs
+                .get(1)
+                .map_or(0, |input| input.effective_pointer),
+            c: self.output.effective_pointer,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectExecutionMetadata {
+    // Tensor identity and layout interpretation are exact. The retained
+    // cuBLASLt alignment contract is also revalidated before every reuse.
+    signature: ArithmeticExecutionSignature,
+    layout: ContractionLayout,
+}
+
+impl DirectExecutionMetadata {
+    fn mismatch_reason(&self, current: &Self) -> Option<String> {
+        if let Some(reason) = self.signature.mismatch_reason(&current.signature) {
+            return Some(format!("direct {reason}"));
         }
         if self.layout != current.layout {
             return Some(format!(
                 "direct contraction interpretation changed from {:?} to {:?}",
                 self.layout, current.layout
-            ));
-        }
-        if self.alias_constraint != current.alias_constraint {
-            return Some(format!(
-                "direct alias constraint changed from {:?} to {:?}",
-                self.alias_constraint, current.alias_constraint
             ));
         }
         None
@@ -824,8 +924,7 @@ impl ArithmeticExecutionSnapshot {
         &self,
         request: ArithmeticRequest,
         direct_eligibility: &DirectRouteEligibility,
-        inputs: &[TensorView],
-        output: &mut TensorMut,
+        signature: &ArithmeticExecutionSignature,
         pointers: ContractionPointers,
     ) -> Result<Option<String>> {
         if self.request != request {
@@ -855,11 +954,12 @@ impl ArithmeticExecutionSnapshot {
                                 pointers.c,
                                 gemm.algorithm_contract(),
                                 current
+                                    .signature
                                     .inputs
                                     .iter()
                                     .map(|input| input.byte_offset)
                                     .collect::<Vec<_>>(),
-                                current.output.byte_offset
+                                current.signature.output.byte_offset
                             )))
                         }
                         ExecutionKind::Gemm(_) | ExecutionKind::NoOp | ExecutionKind::ZeroFill => {
@@ -879,13 +979,12 @@ impl ArithmeticExecutionSnapshot {
                         ));
                     }
                 };
-                if plan.matches(requested, request.memory_ceiling_bytes, inputs, output) {
+                if plan.matches(requested, request.memory_ceiling_bytes, signature) {
                     Ok(None)
                 } else {
-                    Ok(Some(
-                        "semantic route request, memory ceiling, effective addresses, dtypes, \
-                         shapes, strides, or output layout changed"
-                            .into(),
+                    Ok(plan.mismatch_reason(signature).map_or_else(
+                        || Some("semantic route request or memory ceiling changed".into()),
+                        |reason| Some(format!("semantic {reason}")),
                     ))
                 }
             }
@@ -1149,7 +1248,7 @@ impl EinsumKernel {
         *LAST_ROUTE.lock().unwrap_or_else(|error| error.into_inner()) = Some(route);
     }
 
-    fn validate_common(&self, inputs: &[TensorView], outputs: &[TensorMut]) -> Result<DataType> {
+    fn validate_common(&self, inputs: &[TensorView], outputs: &[TensorMut]) -> Result<()> {
         if inputs.len() != self.input_shapes.len() || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Einsum `{}`: expected {} inputs and 1 output, got {} and {}",
@@ -1159,6 +1258,21 @@ impl EinsumKernel {
                 outputs.len()
             )));
         }
+        let expected_device = self.expected_device();
+        for (index, input) in inputs.iter().enumerate() {
+            ArithmeticExecutionSignature::validate_tensor_device(
+                input.device,
+                expected_device,
+                &format!("input #{index}"),
+                self.plan.equation(),
+            )?;
+        }
+        ArithmeticExecutionSignature::validate_tensor_device(
+            outputs[0].device,
+            expected_device,
+            "output",
+            self.plan.equation(),
+        )?;
         let dtype = inputs[0].dtype;
         validate_einsum_dtype(self.plan.schema(), dtype)?;
         for (index, (input, expected_shape)) in inputs.iter().zip(&self.input_shapes).enumerate() {
@@ -1213,7 +1327,25 @@ impl EinsumKernel {
                 outputs[0].shape
             )));
         }
-        Ok(dtype)
+        Ok(())
+    }
+
+    fn expected_device(&self) -> DeviceId {
+        DeviceId::cuda(self.runtime.ordinal())
+    }
+
+    fn semantic_signature(
+        &self,
+        inputs: &[TensorView],
+        output: &TensorMut,
+    ) -> Result<ArithmeticExecutionSignature> {
+        let signature = ArithmeticExecutionSignature::new(
+            inputs,
+            output,
+            ArithmeticAliasProof::OutputDisjointFromEveryInput,
+        );
+        self.validate_no_output_alias(&signature)?;
+        Ok(signature)
     }
 
     fn compile_contraction(
@@ -1267,11 +1399,9 @@ impl EinsumKernel {
 
     fn build_arithmetic_execution(
         &self,
-        dtype: DataType,
-        inputs: &[TensorView],
-        output: &mut TensorMut,
         request: ArithmeticRequest,
         pointers: ContractionPointers,
+        signature: &ArithmeticExecutionSignature,
         direct_eligibility: &DirectRouteEligibility,
     ) -> Result<ArithmeticExecutionSnapshot> {
         let execution = match request.route {
@@ -1290,9 +1420,7 @@ impl EinsumKernel {
             EinsumRouteOverride::GenericNative => {
                 ArithmeticExecution::Semantic(CudaEinsumPlan::build(
                     &self.plan,
-                    dtype,
-                    inputs,
-                    output,
+                    signature.clone(),
                     &self.runtime,
                     RequestedRoute::GenericNative,
                     request.memory_ceiling_bytes,
@@ -1300,9 +1428,7 @@ impl EinsumKernel {
             }
             EinsumRouteOverride::Optimized => ArithmeticExecution::Semantic(CudaEinsumPlan::build(
                 &self.plan,
-                dtype,
-                inputs,
-                output,
+                signature.clone(),
                 &self.runtime,
                 RequestedRoute::Optimized,
                 request.memory_ceiling_bytes,
@@ -1313,9 +1439,7 @@ impl EinsumKernel {
                         Ok(execution) => ArithmeticExecution::Direct(execution),
                         Err(_) => ArithmeticExecution::Semantic(CudaEinsumPlan::build(
                             &self.plan,
-                            dtype,
-                            inputs,
-                            output,
+                            signature.clone(),
                             &self.runtime,
                             RequestedRoute::Auto,
                             request.memory_ceiling_bytes,
@@ -1325,9 +1449,7 @@ impl EinsumKernel {
                 DirectRouteEligibility::Ineligible(_) => {
                     ArithmeticExecution::Semantic(CudaEinsumPlan::build(
                         &self.plan,
-                        dtype,
-                        inputs,
-                        output,
+                        signature.clone(),
                         &self.runtime,
                         RequestedRoute::Auto,
                         request.memory_ceiling_bytes,
@@ -1345,26 +1467,16 @@ impl EinsumKernel {
         requested: EinsumRouteOverride,
         memory_ceiling_bytes: u128,
     ) -> Result<()> {
-        let dtype = self.validate_common(inputs, outputs)?;
-        let alias_constraint = self.validate_no_output_alias(inputs, &mut outputs[0])?;
-        let pointers = ContractionPointers {
-            a: inputs
-                .first()
-                .map(|input| cuptr(input.data_ptr::<u8>() as *const c_void))
-                .unwrap_or(0),
-            b: inputs
-                .get(1)
-                .map(|input| cuptr(input.data_ptr::<u8>() as *const c_void))
-                .unwrap_or(0),
-            c: cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void),
-        };
+        self.validate_common(inputs, outputs)?;
+        let signature = self.semantic_signature(inputs, &outputs[0])?;
+        let pointers = signature.pointers();
         let direct_eligibility =
-            self.direct_route_eligibility(inputs, &outputs[0], alias_constraint);
+            self.direct_route_eligibility(inputs, &outputs[0], signature.clone());
         let request = ArithmeticRequest {
             route: requested,
             memory_ceiling_bytes,
         };
-        let capturing = self.runtime.is_capturing()?;
+        let capturing = self.runtime.capture_active();
         let mut published = self.arithmetic_execution.lock().map_err(|_| {
             EpError::KernelFailed(format!(
                 "cuda_ep Einsum `{}`: arithmetic execution-snapshot lock was poisoned",
@@ -1372,13 +1484,9 @@ impl EinsumKernel {
             ))
         })?;
         let mismatch_reason = match published.as_ref() {
-            Some(snapshot) => snapshot.mismatch_reason(
-                request,
-                &direct_eligibility,
-                inputs,
-                &mut outputs[0],
-                pointers,
-            )?,
+            Some(snapshot) => {
+                snapshot.mismatch_reason(request, &direct_eligibility, &signature, pointers)?
+            }
             None => Some("no arithmetic execution snapshot has been warmed".into()),
         };
         let cache_hit = mismatch_reason.is_none();
@@ -1399,11 +1507,9 @@ impl EinsumKernel {
             None
         } else {
             Some(self.build_arithmetic_execution(
-                dtype,
-                inputs,
-                &mut outputs[0],
                 request,
                 pointers,
+                &signature,
                 &direct_eligibility,
             )?)
         };
@@ -1420,6 +1526,9 @@ impl EinsumKernel {
         let (route, workspace_bytes, workspace_ptr, metadata_bytes, capture_launches) =
             match &prepared.execution {
                 ArithmeticExecution::Direct(cached) => {
+                    signature
+                        .validate_device_ownership(self.expected_device(), self.plan.equation())?;
+                    signature.validate_alias_proof(self.plan.equation())?;
                     let layout = &cached.metadata.layout;
                     if layout.output_shape.as_slice() != outputs[0].shape {
                         return Err(EpError::KernelFailed(format!(
@@ -1478,7 +1587,12 @@ impl EinsumKernel {
                     )
                 }
                 ArithmeticExecution::Semantic(plan) => {
-                    plan.launch(&self.runtime)?;
+                    plan.launch(
+                        &self.runtime,
+                        self.expected_device(),
+                        self.plan.equation(),
+                        &signature,
+                    )?;
                     let summary = plan.summary();
                     match summary.route {
                         CudaEinsumRoute::GenericNative => {
@@ -1527,34 +1641,30 @@ impl EinsumKernel {
         Ok(())
     }
 
-    fn validate_no_output_alias(
-        &self,
-        inputs: &[TensorView],
-        output: &mut TensorMut,
-    ) -> Result<ArithmeticAliasConstraint> {
+    fn validate_no_output_alias(&self, signature: &ArithmeticExecutionSignature) -> Result<()> {
         let output_context = format!(
             "cuda_ep Einsum `{}` arithmetic output",
             self.plan.equation()
         );
         let output_range = checked_strided_byte_range(
-            cuptr(output.data.0 as *const c_void),
-            output.byte_offset,
-            output.dtype,
-            output.shape,
-            output.strides,
+            signature.output.raw_base_pointer,
+            signature.output.byte_offset,
+            signature.output.dtype,
+            &signature.output.shape,
+            &signature.output.strides,
             &output_context,
         )?;
-        for (index, input) in inputs.iter().enumerate() {
+        for (index, input) in signature.inputs.iter().enumerate() {
             let input_context = format!(
                 "cuda_ep Einsum `{}` arithmetic input #{index}",
                 self.plan.equation()
             );
             let input_range = checked_strided_byte_range(
-                cuptr(input.data.0),
+                input.raw_base_pointer,
                 input.byte_offset,
                 input.dtype,
-                input.shape,
-                input.strides,
+                &input.shape,
+                &input.strides,
                 &input_context,
             )?;
             if overlaps(output_range, input_range) {
@@ -1566,14 +1676,14 @@ impl EinsumKernel {
                 )));
             }
         }
-        Ok(ArithmeticAliasConstraint::OutputDisjointFromInputs)
+        Ok(())
     }
 
     fn direct_route_eligibility(
         &self,
         inputs: &[TensorView],
         output: &TensorMut,
-        alias_constraint: ArithmeticAliasConstraint,
+        signature: ArithmeticExecutionSignature,
     ) -> DirectRouteEligibility {
         if !matches!(
             inputs.first().map(|input| input.dtype),
@@ -1615,12 +1725,9 @@ impl EinsumKernel {
             .map(|input| input.shape.to_vec())
             .collect::<Vec<_>>();
         match concrete_contraction_layout(&self.plan, contraction, &shapes, inputs[0].dtype) {
-            Ok(layout) => DirectRouteEligibility::Eligible(DirectExecutionMetadata {
-                inputs: inputs.iter().map(DirectTensorMetadata::input).collect(),
-                output: DirectTensorMetadata::output(output),
-                layout,
-                alias_constraint,
-            }),
+            Ok(layout) => {
+                DirectRouteEligibility::Eligible(DirectExecutionMetadata { signature, layout })
+            }
             Err(error) => DirectRouteEligibility::Ineligible(format!(
                 "the canonical contraction cannot be represented by the direct descriptor: \
                  {error}"

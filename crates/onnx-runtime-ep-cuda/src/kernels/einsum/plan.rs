@@ -4,18 +4,19 @@ use std::sync::Arc;
 
 use cudarc::driver::LaunchConfig;
 use cudarc::driver::sys::CUdeviceptr;
-use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
 use onnx_runtime_ir::{
-    DataType, EinsumAxis, EinsumBinaryContractionPlan, EinsumContractionTreeStep,
+    DataType, DeviceId, EinsumAxis, EinsumBinaryContractionPlan, EinsumContractionTreeStep,
     EinsumOperandPlan, EinsumPlannerQuality, EinsumPrecisionPolicy, EinsumShapePlan,
     EinsumSupportedContractionTreeCandidate, EinsumValueId, compute_contiguous_strides,
 };
 
+use super::{ArithmeticExecutionSignature, ArithmeticTensorSignature};
 use crate::blas::{
     self, CaptureStridedBatchedGemmPlan, GemmDtype, StridedBatchedGemmParams, WORKSPACE_BYTES,
 };
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, RawCudaFunction, cuptr};
+use crate::runtime::{CudaRuntime, GraphDeviceAllocation, RawCudaFunction};
 
 const BLOCK: u32 = 256;
 const WORKSPACE_ALIGNMENT: usize = 256;
@@ -313,53 +314,6 @@ fn dtype_code(dtype: DataType) -> Result<u64> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TensorSignature {
-    pointer: CUdeviceptr,
-    dtype: DataType,
-    shape: Vec<usize>,
-    strides: Vec<i64>,
-}
-
-impl TensorSignature {
-    fn input(value: &TensorView) -> Self {
-        Self {
-            pointer: cuptr(value.data_ptr::<u8>() as *const c_void),
-            dtype: value.dtype,
-            shape: value.shape.to_vec(),
-            strides: value.strides.to_vec(),
-        }
-    }
-
-    fn output(value: &mut TensorMut) -> Self {
-        Self {
-            pointer: cuptr(value.data_ptr_mut::<u8>() as *const c_void),
-            dtype: value.dtype,
-            shape: value.shape.to_vec(),
-            strides: value.strides.to_vec(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ExecutionSignature {
-    inputs: Vec<TensorSignature>,
-    output: TensorSignature,
-}
-
-impl ExecutionSignature {
-    fn new(inputs: &[TensorView], output: &mut TensorMut) -> Self {
-        Self {
-            inputs: inputs.iter().map(TensorSignature::input).collect(),
-            output: TensorSignature::output(output),
-        }
-    }
-
-    fn matches(&self, inputs: &[TensorView], output: &mut TensorMut) -> bool {
-        *self == Self::new(inputs, output)
-    }
-}
-
 #[derive(Clone)]
 struct ValueLayout {
     pointer: CUdeviceptr,
@@ -398,7 +352,7 @@ pub(super) struct CudaEinsumPlanSummary {
 /// reuse this exact snapshot and retains every private allocation through
 /// [`DeviceGraphResource`] owners.
 pub(super) struct CudaEinsumPlan {
-    signature: ExecutionSignature,
+    signature: ArithmeticExecutionSignature,
     requested: RequestedRoute,
     memory_ceiling_bytes: u128,
     route: CudaEinsumRoute,
@@ -415,13 +369,12 @@ pub(super) struct CudaEinsumPlan {
 impl CudaEinsumPlan {
     pub(super) fn build(
         semantic: &EinsumShapePlan,
-        dtype: DataType,
-        inputs: &[TensorView],
-        output: &mut TensorMut,
+        signature: ArithmeticExecutionSignature,
         runtime: &Arc<CudaRuntime>,
         requested: RequestedRoute,
         memory_ceiling_bytes: u128,
     ) -> Result<Self> {
+        let dtype = signature.inputs[0].dtype;
         let arithmetic = Arithmetic::for_dtype(dtype)?;
         runtime.require_nvrtc_half_headers("Einsum")?;
         let precision =
@@ -432,13 +385,12 @@ impl CudaEinsumPlan {
                     semantic.schema()
                 ))
             })?;
-        let signature = ExecutionSignature::new(inputs, output);
         let dimensions = logical_dimensions(semantic)?;
         let selected = if requested != RequestedRoute::GenericNative {
             select_tree(
                 semantic,
                 precision.intermediate_element_size(),
-                inputs,
+                &signature.inputs,
                 memory_ceiling_bytes,
             )?
         } else {
@@ -466,8 +418,8 @@ impl CudaEinsumPlan {
                 let specs = tree_step_specs(
                     semantic,
                     precision.intermediate_dtype(),
-                    inputs,
-                    output,
+                    &signature.inputs,
+                    &signature.output,
                     candidate,
                     &dimensions,
                 )?;
@@ -488,8 +440,8 @@ impl CudaEinsumPlan {
                     vec![generic_step_spec(
                         semantic,
                         dtype,
-                        inputs,
-                        output,
+                        &signature.inputs,
+                        &signature.output,
                         &dimensions,
                     )?],
                 )
@@ -650,15 +602,34 @@ impl CudaEinsumPlan {
         &self,
         requested: RequestedRoute,
         memory_ceiling_bytes: u128,
-        inputs: &[TensorView],
-        output: &mut TensorMut,
+        signature: &ArithmeticExecutionSignature,
     ) -> bool {
         self.requested == requested
             && self.memory_ceiling_bytes == memory_ceiling_bytes
-            && self.signature.matches(inputs, output)
+            && self.signature == *signature
     }
 
-    pub(super) fn launch(&self, runtime: &CudaRuntime) -> Result<()> {
+    pub(super) fn mismatch_reason(
+        &self,
+        signature: &ArithmeticExecutionSignature,
+    ) -> Option<String> {
+        self.signature.mismatch_reason(signature)
+    }
+
+    pub(super) fn launch(
+        &self,
+        runtime: &CudaRuntime,
+        expected_device: DeviceId,
+        equation: &str,
+        signature: &ArithmeticExecutionSignature,
+    ) -> Result<()> {
+        if let Some(reason) = self.signature.mismatch_reason(signature) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Einsum: semantic execution signature changed after validation: {reason}"
+            )));
+        }
+        signature.validate_device_ownership(expected_device, equation)?;
+        signature.validate_alias_proof(equation)?;
         for launch in &self.launches {
             match launch {
                 PreparedLaunch::Generic {
@@ -857,7 +828,10 @@ fn dense_layout(
     }
 }
 
-fn leaf_layout(input: &TensorView, operand: &EinsumOperandPlan) -> Result<ValueLayout> {
+fn leaf_layout(
+    input: &ArithmeticTensorSignature,
+    operand: &EinsumOperandPlan,
+) -> Result<ValueLayout> {
     let mut axes = Vec::with_capacity(operand.unique_axes().len());
     let mut shape = Vec::with_capacity(operand.unique_axes().len());
     let mut strides = Vec::with_capacity(operand.unique_axes().len());
@@ -881,7 +855,7 @@ fn leaf_layout(input: &TensorView, operand: &EinsumOperandPlan) -> Result<ValueL
         strides.push(stride);
     }
     Ok(ValueLayout {
-        pointer: cuptr(input.data_ptr::<u8>() as *const c_void),
+        pointer: input.effective_pointer,
         dtype: input.dtype,
         axes,
         shape,
@@ -947,7 +921,7 @@ fn workspace_layout(
 fn select_tree<'a>(
     plan: &'a EinsumShapePlan,
     intermediate_element_size: usize,
-    inputs: &[TensorView],
+    inputs: &[ArithmeticTensorSignature],
     ceiling: u128,
 ) -> Result<
     Option<(
@@ -961,7 +935,10 @@ fn select_tree<'a>(
     if tree.quality() == EinsumPlannerQuality::GenericNativeFallback {
         return Ok(None);
     }
-    let shapes = inputs.iter().map(|input| input.shape).collect::<Vec<_>>();
+    let shapes = inputs
+        .iter()
+        .map(|input| input.shape.as_slice())
+        .collect::<Vec<_>>();
     let concrete = plan
         .resolve_concrete_contraction_tree(&shapes, intermediate_element_size)
         .map_err(|error| {
@@ -1038,8 +1015,8 @@ struct StepSpec {
 fn generic_step_spec(
     plan: &EinsumShapePlan,
     dtype: DataType,
-    inputs: &[TensorView],
-    output: &mut TensorMut,
+    inputs: &[ArithmeticTensorSignature],
+    output: &ArithmeticTensorSignature,
     dimensions: &BTreeMap<EinsumAxis, usize>,
 ) -> Result<StepSpec> {
     let program = plan.generic_native().index_program();
@@ -1072,7 +1049,7 @@ fn generic_step_spec(
                 .map(|&axis| iteration_axes[axis])
                 .collect();
             Ok(OperandSpec {
-                pointer: PointerSpec::Absolute(cuptr(input.data_ptr::<u8>() as *const c_void)),
+                pointer: PointerSpec::Absolute(input.effective_pointer),
                 dtype: input.dtype,
                 axes,
                 shape: input.shape.to_vec(),
@@ -1095,7 +1072,7 @@ fn generic_step_spec(
                 plan.equation()
             ))
         })?,
-        output_pointer: PointerSpec::Absolute(cuptr(output.data_ptr_mut::<u8>() as *const c_void)),
+        output_pointer: PointerSpec::Absolute(output.effective_pointer),
         output_dtype: dtype,
         output_strides: output.strides.to_vec(),
         operands,
@@ -1106,8 +1083,8 @@ fn generic_step_spec(
 fn tree_step_specs(
     plan: &EinsumShapePlan,
     intermediate_dtype: DataType,
-    inputs: &[TensorView],
-    output: &mut TensorMut,
+    inputs: &[ArithmeticTensorSignature],
+    output: &ArithmeticTensorSignature,
     candidate: &EinsumSupportedContractionTreeCandidate,
     dimensions: &BTreeMap<EinsumAxis, usize>,
 ) -> Result<Vec<StepSpec>> {
@@ -1124,7 +1101,7 @@ fn tree_step_specs(
         );
     }
     let final_layout = ValueLayout {
-        pointer: cuptr(output.data_ptr_mut::<u8>() as *const c_void),
+        pointer: output.effective_pointer,
         dtype,
         axes: plan.output_axes().to_vec(),
         shape: output.shape.to_vec(),
