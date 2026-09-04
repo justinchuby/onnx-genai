@@ -196,13 +196,21 @@ PR_TRIGGERED_WORKFLOWS: dict[str, frozenset[str]] = {
     "diff-guard.yml": frozenset(),
     "hostlock.yml": frozenset(),
     "miri.yml": frozenset(),
-    "mobius-producer-conformance.yml": frozenset(),
     "squad-ci.yml": frozenset(),
     "squad-heartbeat.yml": frozenset(),
     "visualizer-test.yml": frozenset(),
     "weight-cache-guard.yml": frozenset(),
     "wiki-lint.yml": frozenset(),
 }
+
+# Workflows intentionally limited to operator-invoked diagnostics. Recording
+# them here prevents an automatic PR, push, schedule, or release trigger from
+# being added without updating the integrity contract in the same change.
+MANUAL_ONLY_WORKFLOWS: frozenset[str] = frozenset(
+    {
+        "mobius-producer-conformance.yml",
+    }
+)
 
 # Crates that are intentionally not selected by any CI cargo-test lane.
 # Every entry is a written exception to the default rule: workspace members are
@@ -1389,6 +1397,7 @@ def workflow_files() -> list[Path]:
 def verify_workflow_integrity(
     simulate_deleted_job: str | None = None,
     simulate_dropped_trigger: str | None = None,
+    simulate_extra_trigger: str | None = None,
     simulate_gated_job: str | None = None,
 ) -> int:
     """Every workflow parses, defines exactly the jobs it is recorded as defining, and still runs.
@@ -1405,7 +1414,8 @@ def verify_workflow_integrity(
     the gap was measured, not theorised: `if: false` on `root-files`, `miri` or
     the hostlock job, and swapping `pull_request:` for `workflow_dispatch:` in
     any workflow, each left all three gates returning 0 while printing a line
-    byte-identical to a clean tree. `verify_pr_trigger_integrity` closes both.
+    byte-identical to a clean tree. `verify_trigger_integrity` closes both and
+    also keeps intentionally manual diagnostics manual-only.
     Matrix `include:` row removal is the one recorded vector still open --
     renaming the matrix variable is caught, because the recorded display name
     holds the unexpanded template and the template itself changes.
@@ -1428,8 +1438,9 @@ def verify_workflow_integrity(
     failures += _integrity_failures(
         {path.name for path in files}, parsed, WORKFLOW_JOB_INVENTORY
     )
-    failures += verify_pr_trigger_integrity(
+    failures += verify_trigger_integrity(
         simulate_dropped_trigger=simulate_dropped_trigger,
+        simulate_extra_trigger=simulate_extra_trigger,
         simulate_gated_job=simulate_gated_job,
     )
     seen = sum(len(jobs) for jobs in parsed.values())
@@ -1456,7 +1467,8 @@ def verify_workflow_integrity(
         return 1
     print(
         f"workflow job integrity ok: {len(files)} file(s), {seen} job(s) as "
-        f"recorded, {len(PR_TRIGGERED_WORKFLOWS)} still reporting on pull requests"
+        f"recorded, {len(PR_TRIGGERED_WORKFLOWS)} still reporting on pull requests, "
+        f"{len(MANUAL_ONLY_WORKFLOWS)} manual-only"
     )
     return 0
 
@@ -1614,17 +1626,25 @@ def workflow_triggers(text: str, source: str = "<workflow>") -> set[str]:
     )
 
 
-def verify_pr_trigger_integrity(
+def verify_trigger_integrity(
     simulate_dropped_trigger: str | None = None,
+    simulate_extra_trigger: str | None = None,
     simulate_gated_job: str | None = None,
 ) -> list[str]:
-    """Every recorded PR check still fires on pull requests, and still unconditionally.
+    """Recorded PR checks still fire, and manual diagnostics stay manual-only.
 
     `_integrity_failures` proves a job is still defined. This proves it still
     runs: the workflow triggers on `pull_request`, and no job hides behind a
-    condition that is not recorded for that file.
+    condition that is not recorded for that file. It also proves workflows
+    explicitly recorded as manual-only have exactly `workflow_dispatch`.
     """
     failures: list[str] = []
+    overlap = PR_TRIGGERED_WORKFLOWS.keys() & MANUAL_ONLY_WORKFLOWS
+    if overlap:
+        failures.append(
+            "workflow(s) cannot be both PR-triggered and manual-only: "
+            f"{sorted(overlap)}"
+        )
     for path in workflow_files():
         name = path.name
         if name not in WORKFLOW_JOB_INVENTORY:
@@ -1638,6 +1658,15 @@ def verify_pr_trigger_integrity(
         fires = "pull_request" in triggers
         if simulate_dropped_trigger == name:
             fires = False
+        if simulate_extra_trigger == name:
+            triggers.add("push")
+        if name in MANUAL_ONLY_WORKFLOWS:
+            if triggers != {"workflow_dispatch"}:
+                failures.append(
+                    f"{name}: recorded as manual-only but has triggers "
+                    f"{sorted(triggers)}; expected only ['workflow_dispatch']."
+                )
+            continue
         recorded = name in PR_TRIGGERED_WORKFLOWS
         if recorded and not fires:
             failures.append(
@@ -2671,6 +2700,14 @@ def _self_test_arms() -> tuple[int, int]:
             ["ci.yml", "pull_request"],
         ),
         (
+            "verify-workflow-integrity --simulate-extra-trigger "
+            "mobius-producer-conformance.yml",
+            verify_workflow_integrity,
+            {"simulate_extra_trigger": "mobius-producer-conformance.yml"},
+            1,
+            ["mobius-producer-conformance.yml", "manual-only", "push"],
+        ),
+        (
             "verify-workflow-integrity --simulate-gated-job diff-guard.yml",
             verify_workflow_integrity,
             {"simulate_gated_job": "diff-guard.yml"},
@@ -2819,6 +2856,10 @@ def main() -> int:
         help="pretend one workflow stopped triggering on pull_request, to prove the guard fails",
     )
     integrity_parser.add_argument(
+        "--simulate-extra-trigger",
+        help="pretend one workflow gained an automatic trigger, to prove the guard fails",
+    )
+    integrity_parser.add_argument(
         "--simulate-gated-job",
         help="pretend one workflow's jobs carry `if: false`, to prove the guard fails",
     )
@@ -2832,9 +2873,10 @@ def main() -> int:
         return verify_required_tier(args.simulate_dropped_lane)
     if args.command == "verify-workflow-integrity":
         return verify_workflow_integrity(
-            args.simulate_deleted_job,
-            args.simulate_dropped_trigger,
-            args.simulate_gated_job,
+            simulate_deleted_job=args.simulate_deleted_job,
+            simulate_dropped_trigger=args.simulate_dropped_trigger,
+            simulate_extra_trigger=args.simulate_extra_trigger,
+            simulate_gated_job=args.simulate_gated_job,
         )
     # Windows Python writes stdout in text mode and translates "\n" into
     # "\r\n". bash splits command substitution on IFS, which contains newline

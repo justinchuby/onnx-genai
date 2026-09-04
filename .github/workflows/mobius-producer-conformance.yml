@@ -1,12 +1,9 @@
 name: Mobius producer conformance (signal)
 
 on:
+  # Manual diagnostics only: this validates Mobius, an independently evolving
+  # external producer repository, so it must not gate ONNX GenAI changes.
   workflow_dispatch:
-  push:
-    branches:
-      - main
-  pull_request:
-    types: [opened, synchronize, reopened]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -19,13 +16,9 @@ jobs:
   metadata:
     name: Mobius metadata packages (signal)
     runs-on: ubuntu-latest
-    # Non-blocking signal. This job tracks Mobius `main` (see the checkout
-    # below), so producer-side regressions surface here in the logs and check
-    # output but must not gate ONNX GenAI PRs -- they are fixed upstream in
-    # Mobius. Job-level continue-on-error keeps the workflow run green while
-    # still exposing the failing job/step logs and the check signal (it does
-    # not make later steps run after a failure); the job is not a required
-    # status check.
+    # This manual diagnostic tracks Mobius `main` (see the checkout below).
+    # Job-level continue-on-error keeps the diagnostic run green while exposing
+    # producer-side failures that must be fixed upstream in Mobius.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
@@ -35,7 +28,7 @@ jobs:
         with:
           repository: onnxruntime/mobius
           # Intentionally track the Mobius default branch. This
-          # producer-conformance workflow is a non-blocking signal (see the
+          # producer-conformance workflow is a manual diagnostic (see the
           # job-level continue-on-error above): producer regressions are fixed
           # upstream in Mobius rather than by pinning an older revision here or
           # by relaxing ONNX GenAI runtime, tests, or metadata. Following
