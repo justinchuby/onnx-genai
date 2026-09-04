@@ -10,6 +10,9 @@ use crate::{
 };
 
 const LABELS: &[u8; 52] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const MAX_RECORDED_REJECTION_CAUSES: usize = 16;
+const ADDITIONAL_REJECTION_CAUSES: &str =
+    "additional distinct rejection causes omitted by the bounded diagnostic histogram";
 /// Maximum retained/transient generator metadata admitted in one call.
 ///
 /// This is an implementation resource guard, not an ONNX operand-arity limit.
@@ -454,16 +457,22 @@ pub fn generated_cases(config: GeneratorConfig) -> Result<Vec<CaseRecord>, Gener
     let mut cases = Vec::new();
     let mut retained_metadata = 0usize;
     let mut attempts = 0usize;
+    let mut first_rejection = None;
+    let mut rejection_counts = BTreeMap::<String, usize>::new();
     while cases.len() < config.random_cases {
-        attempts = attempts
-            .checked_add(1)
-            .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
-        if attempts > attempt_limit {
+        if attempts == attempt_limit {
             return Err(GeneratorError::Exhausted {
                 generated: cases.len(),
                 requested: config.random_cases,
+                attempts,
+                first_rejection: first_rejection
+                    .unwrap_or_else(|| "no candidate rejection was recorded".into()),
+                rejection_counts,
             });
         }
+        attempts = attempts
+            .checked_add(1)
+            .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
         let index = cases.len();
         let arity = required_arities
             .get(index)
@@ -491,22 +500,24 @@ pub fn generated_cases(config: GeneratorConfig) -> Result<Vec<CaseRecord>, Gener
             ValueProfile::Finite
         };
         let candidate = random_case(&mut rng, index, arity, dtype, opset, profile, config);
-        if generated_case_is_within_config(&candidate, config) {
-            let candidate_metadata = generated_case_metadata_bytes(&candidate)
-                .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
-            let next_metadata = retained_metadata
-                .checked_add(candidate_metadata)
-                .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
-            if next_metadata > metadata_limit {
-                return Err(GeneratorError::CorpusMetadata {
-                    requested: config.random_cases,
-                    bytes: next_metadata,
-                    limit: metadata_limit,
-                });
-            }
-            retained_metadata = next_metadata;
-            cases.push(candidate);
+        if let Err(rejection) = generated_case_is_within_config(&candidate, config) {
+            record_rejection(rejection, &mut first_rejection, &mut rejection_counts);
+            continue;
         }
+        let candidate_metadata = generated_case_metadata_bytes(&candidate)
+            .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
+        let next_metadata = retained_metadata
+            .checked_add(candidate_metadata)
+            .ok_or(GeneratorError::CaseCountOverflow(config.random_cases))?;
+        if next_metadata > metadata_limit {
+            return Err(GeneratorError::CorpusMetadata {
+                requested: config.random_cases,
+                bytes: next_metadata,
+                limit: metadata_limit,
+            });
+        }
+        retained_metadata = next_metadata;
+        cases.push(candidate);
     }
     Ok(cases)
 }
@@ -888,43 +899,89 @@ fn random_case(
     }
 }
 
-fn generated_case_is_within_config(case: &CaseRecord, config: GeneratorConfig) -> bool {
+fn generated_case_is_within_config(
+    case: &CaseRecord,
+    config: GeneratorConfig,
+) -> Result<(), String> {
     if !(config.min_operands..=config.max_operands).contains(&case.input_shapes.len()) {
-        return false;
+        return Err(format!(
+            "operand count {} is outside configured range {}..={}",
+            case.input_shapes.len(),
+            config.min_operands,
+            config.max_operands
+        ));
     }
     let mut total_elements = 0usize;
-    for shape in &case.input_shapes {
-        if shape.len() > config.max_rank
-            || shape
-                .iter()
-                .any(|&dimension| dimension > config.max_dimension)
+    for (input, shape) in case.input_shapes.iter().enumerate() {
+        if shape.len() > config.max_rank {
+            return Err(format!(
+                "input #{input} rank {} exceeds configured max_rank {}",
+                shape.len(),
+                config.max_rank
+            ));
+        }
+        if let Some((axis, dimension)) = shape
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|&(_, dimension)| dimension > config.max_dimension)
         {
-            return false;
+            return Err(format!(
+                "input #{input} axis #{axis} dimension {dimension} exceeds configured max_dimension {}",
+                config.max_dimension
+            ));
         }
-        let Some(elements) = checked_product(shape.iter().copied()) else {
-            return false;
-        };
+        let elements = checked_product(shape.iter().copied())
+            .ok_or_else(|| format!("input #{input} element count overflowed usize"))?;
         if elements > config.max_tensor_elements {
-            return false;
+            return Err(format!(
+                "input #{input} has {elements} elements, exceeding configured max_tensor_elements {}",
+                config.max_tensor_elements
+            ));
         }
-        let Some(updated) = total_elements.checked_add(elements) else {
-            return false;
-        };
+        let updated = total_elements.checked_add(elements).ok_or_else(|| {
+            format!("aggregate input element count overflowed while adding input #{input}")
+        })?;
         total_elements = updated;
     }
-    let Ok(analysis) = crate::analyze_equation(&case.equation, &case.input_shapes) else {
-        return false;
-    };
-    let Some(output_elements) = checked_product(analysis.output_shape().iter().copied()) else {
-        return false;
-    };
+    let analysis = crate::analyze_equation(&case.equation, &case.input_shapes)
+        .map_err(|error| format!("equation/shape analysis failed: {error}"))?;
+    let output_elements = checked_product(analysis.output_shape().iter().copied())
+        .ok_or_else(|| "output element count overflowed usize".to_string())?;
     if output_elements > config.max_tensor_elements {
-        return false;
+        return Err(format!(
+            "output has {output_elements} elements, exceeding configured max_tensor_elements {}",
+            config.max_tensor_elements
+        ));
     }
-    let Some(total_elements) = total_elements.checked_add(output_elements) else {
-        return false;
-    };
-    total_elements <= config.max_total_elements && case.validate().is_ok()
+    let total_elements = total_elements
+        .checked_add(output_elements)
+        .ok_or_else(|| "aggregate input/output element count overflowed usize".to_string())?;
+    if total_elements > config.max_total_elements {
+        return Err(format!(
+            "case has {total_elements} aggregate input/output elements, exceeding configured max_total_elements {}",
+            config.max_total_elements
+        ));
+    }
+    case.validate()
+        .map_err(|error| format!("case validation failed: {error}"))
+}
+
+fn record_rejection(
+    rejection: String,
+    first_rejection: &mut Option<String>,
+    rejection_counts: &mut BTreeMap<String, usize>,
+) {
+    first_rejection.get_or_insert_with(|| rejection.clone());
+    if let Some(count) = rejection_counts.get_mut(&rejection) {
+        *count += 1;
+    } else if rejection_counts.len() < MAX_RECORDED_REJECTION_CAUSES {
+        rejection_counts.insert(rejection, 1);
+    } else {
+        *rejection_counts
+            .entry(ADDITIONAL_REJECTION_CAUSES.into())
+            .or_default() += 1;
+    }
 }
 
 fn generated_case_metadata_bytes(case: &CaseRecord) -> Option<usize> {
@@ -1161,13 +1218,19 @@ pub enum GeneratorError {
     },
     /// Resource ceilings prevented enough legal cases from being generated.
     #[error(
-        "Einsum generator produced {generated} of {requested} requested cases before exhausting bounded retries; raise the element/work ceilings or reduce the requested corpus"
+        "Einsum generator produced {generated} of {requested} requested cases after {attempts} bounded attempts; first rejection: {first_rejection}; bounded rejection counts: {rejection_counts:?}; adjust the reported constraint, raise the corresponding resource ceiling, or reduce the requested corpus"
     )]
     Exhausted {
         /// Successfully generated records.
         generated: usize,
         /// Requested records.
         requested: usize,
+        /// Number of candidates evaluated.
+        attempts: usize,
+        /// First candidate rejection, preserving the causal failure.
+        first_rejection: String,
+        /// Deterministic histogram of all candidate rejection reasons.
+        rejection_counts: BTreeMap<String, usize>,
     },
 }
 
@@ -1189,5 +1252,62 @@ impl SplitMix64 {
         let span = (high as u128) - (low as u128) + 1;
         let offset = (u128::from(self.next()) % span) as usize;
         low + offset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhaustion_reports_first_rejection_and_histogram() {
+        let config = GeneratorConfig {
+            random_cases: 1,
+            min_operands: 1,
+            max_operands: 1,
+            max_rank: 0,
+            max_dimension: 0,
+            max_tensor_elements: 1,
+            max_total_elements: 2,
+            limits: CaseLimits {
+                gpu_case_bytes: 0,
+                cpu_working_set_bytes: 4096,
+                ..DEFAULT_GENERATOR.limits
+            },
+            ..DEFAULT_GENERATOR
+        };
+        let error = generated_cases(config).unwrap_err();
+        let GeneratorError::Exhausted {
+            generated,
+            requested,
+            attempts,
+            first_rejection,
+            rejection_counts,
+        } = &error
+        else {
+            panic!("expected bounded exhaustion, got {error}");
+        };
+        let expected =
+            "case validation failed: Einsum case needs 8 GPU bytes, exceeding the 0-byte case cap";
+        assert_eq!((*generated, *requested, *attempts), (0, 1, 500));
+        assert_eq!(first_rejection, expected);
+        assert_eq!(rejection_counts.get(expected), Some(&500));
+        assert!(
+            error
+                .to_string()
+                .contains("first rejection: case validation failed")
+        );
+    }
+
+    #[test]
+    fn rejection_histogram_has_a_fixed_metadata_bound() {
+        let mut first = None;
+        let mut counts = BTreeMap::new();
+        for index in 0..(MAX_RECORDED_REJECTION_CAUSES + 10) {
+            record_rejection(format!("reason {index}"), &mut first, &mut counts);
+        }
+        assert_eq!(first.as_deref(), Some("reason 0"));
+        assert_eq!(counts.len(), MAX_RECORDED_REJECTION_CAUSES + 1);
+        assert_eq!(counts.get(ADDITIONAL_REJECTION_CAUSES), Some(&10));
     }
 }
