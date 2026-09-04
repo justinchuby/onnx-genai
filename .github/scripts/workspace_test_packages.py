@@ -1531,17 +1531,92 @@ def _inventory_entry(name: str, jobs: Iterable[str]) -> str:
 #
 # This is deliberately a restricted parser, not an incomplete permissive one.
 # It accepts the ordinary scalar/list/mapping spellings used by workflows here,
-# and refuses every direct `on:` child it cannot classify. In particular,
-# aliases, tags, explicit/complex keys, and merge keys may resolve to an
-# automatic event in actionlint/GitHub; ignoring them would turn an unknown
-# syntax into a false green for a manual-only workflow.
-_ON_KEY = re.compile(r"""^(?:"on"|'on'|on)\s*:\s*(?P<inline>.*?)\s*$""")
-_TRIGGER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
-_ON_CHILD = re.compile(
+# and validates the complete top-level mapping before reading `on:`. A key the
+# parser cannot classify is therefore a refusal, never an invisible boundary
+# that can hide a second trigger definition.
+_WORKFLOW_TOP_LEVEL_KEYS = frozenset(
+    {
+        "concurrency",
+        "defaults",
+        "env",
+        "jobs",
+        "name",
+        "on",
+        "permissions",
+        "run-name",
+    }
+)
+_MAPPING_ENTRY = re.compile(
     r"""^(?P<key>"[A-Za-z][A-Za-z0-9_-]*"|'[A-Za-z][A-Za-z0-9_-]*'|"""
     r"""[A-Za-z][A-Za-z0-9_-]*)\s*:(?P<value>.*)$"""
 )
+_TRIGGER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 _ON_ITEM = re.compile(r"^-\s+(?P<value>.+?)\s*$")
+
+
+def _mapping_entry(
+    text: str,
+    source: str,
+    line_number: int,
+    context: str,
+) -> tuple[str, str]:
+    """One deliberately restricted YAML mapping entry."""
+    match = _MAPPING_ENTRY.fullmatch(text)
+    if match is None:
+        raise SystemExit(
+            f"{source}:{line_number}: unsupported syntax {context}: "
+            f"{text.strip()!r}. Keys must be unescaped plain, single-quoted, "
+            "or double-quoted ASCII names. Aliases, tags, explicit/complex "
+            "keys, merge keys, and flow-style mappings are refused rather "
+            "than ignored."
+        )
+    key = match.group("key")
+    if key[0] in "\"'":
+        key = key[1:-1]
+    return key, match.group("value")
+
+
+def _workflow_top_level(
+    lines: list[str],
+    source: str,
+) -> dict[str, tuple[int, str]]:
+    """Validate and return every entry in the workflow's root mapping."""
+    entries: dict[str, tuple[int, str]] = {}
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if line.startswith("\t"):
+            raise SystemExit(
+                f"{source}:{index + 1}: tab-indented workflow content is "
+                "refused; YAML indentation must be spaces."
+            )
+        if line.startswith(" "):
+            continue
+
+        key, value = _mapping_entry(
+            line,
+            source,
+            index + 1,
+            "for a top-level workflow key",
+        )
+        if key not in _WORKFLOW_TOP_LEVEL_KEYS:
+            raise SystemExit(
+                f"{source}:{index + 1}: unsupported top-level workflow key "
+                f"{key!r}. Expected one of "
+                f"{sorted(_WORKFLOW_TOP_LEVEL_KEYS)}. Unknown keys are refused "
+                "because YAML 1.1/1.2 scalar resolution, aliases, or future "
+                "syntax must not evade trigger validation."
+            )
+        if key in entries:
+            first = entries[key][0] + 1
+            raise SystemExit(
+                f"{source}: duplicate top-level `{key}:` keys at lines "
+                f"[{first}, {index + 1}]. Duplicate YAML keys are "
+                "parser-dependent and therefore refused."
+            )
+        entries[key] = (index, value)
+    return entries
 
 
 def _trigger_scalar(value: str, source: str, line_number: int) -> str:
@@ -1638,14 +1713,19 @@ def _block_triggers(
 
         direct = line[child_indent:]
         item = _ON_ITEM.fullmatch(direct)
-        child = _ON_CHILD.fullmatch(direct)
         if form is None:
             form = "sequence" if item is not None else "mapping"
 
         if form == "sequence" and item is not None:
             trigger = _trigger_scalar(item.group("value"), source, index + 1)
-        elif form == "mapping" and child is not None:
-            trigger = _trigger_scalar(child.group("key"), source, index + 1)
+        elif form == "mapping":
+            key, _ = _mapping_entry(
+                direct,
+                source,
+                index + 1,
+                "directly under the top-level `on:` mapping",
+            )
+            trigger = _trigger_scalar(key, source, index + 1)
         else:
             raise SystemExit(
                 f"{source}:{index + 1}: unsupported syntax directly under the "
@@ -1670,30 +1750,14 @@ def _block_triggers(
 def workflow_triggers(text: str, source: str = "<workflow>") -> set[str]:
     """The event names a workflow triggers on, or a fail-closed refusal."""
     lines = text.splitlines()
-    matches: list[tuple[int, re.Match[str]]] = []
-    for index, line in enumerate(lines):
-        if line.startswith((" ", "\t")) or line.lstrip().startswith("#"):
-            continue
-        match = _ON_KEY.match(line)
-        if match is not None:
-            matches.append((index, match))
-
-    if not matches:
+    top_level = _workflow_top_level(lines, source)
+    if "on" not in top_level:
         raise SystemExit(
             f"{source}: no top-level `on:` block, so the gate cannot tell when "
-            "this workflow runs. A tagged, aliased, explicit, or complex key is "
-            "not treated as `on:` because resolving it incompletely would be a "
-            "false-green risk."
-        )
-    if len(matches) != 1:
-        lines_found = [index + 1 for index, _ in matches]
-        raise SystemExit(
-            f"{source}: duplicate top-level `on:` keys at lines {lines_found}. "
-            "Duplicate YAML keys are parser-dependent and therefore refused."
+            "this workflow runs."
         )
 
-    index, match = matches[0]
-    inline = match.group("inline")
+    index, inline = top_level["on"]
     if inline.lstrip().startswith("#"):
         inline = ""
     else:
@@ -1847,6 +1911,25 @@ _TRIGGER_FORM_ARMS: tuple[
         True,
     ),
     (
+        "ordinary GitHub workflow top-level keys are accepted",
+        "name: Manual diagnostics\n"
+        "run-name: Manual ${{ github.run_id }}\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "env:\n"
+        "  SAFE: yes\n"
+        "defaults:\n"
+        "  run:\n"
+        "    shell: bash\n"
+        "concurrency:\n"
+        "  group: manual-${{ github.ref }}\n"
+        "  cancel-in-progress: true\n",
+        (),
+        True,
+    ),
+    (
         "plain push is refused",
         "on:\n  workflow_dispatch:\n  push:\n",
         ("manual-only", "push"),
@@ -1919,15 +2002,84 @@ _TRIGGER_FORM_ARMS: tuple[
         False,
     ),
     (
+        "tagged duplicate top-level on is refused closed",
+        "on:\n  workflow_dispatch:\n!!str on:\n  push:\n",
+        ("unsupported syntax", "!!str on"),
+        False,
+    ),
+    (
+        "aliased duplicate top-level on is refused closed",
+        "run-name: &trigger-key on\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "*trigger-key:\n"
+        "  push:\n",
+        ("unsupported syntax", "*trigger-key"),
+        False,
+    ),
+    (
+        "explicit duplicate top-level on is refused closed",
+        "on:\n  workflow_dispatch:\n? on\n:\n  push:\n",
+        ("unsupported syntax", "? on"),
+        False,
+    ),
+    (
+        "complex duplicate top-level on is refused closed",
+        "on:\n  workflow_dispatch:\n? [on]\n:\n  push:\n",
+        ("unsupported syntax", "? [on]"),
+        False,
+    ),
+    (
+        "merge-derived top-level on is refused closed",
+        "env: &hidden-trigger\n"
+        "  on:\n"
+        "    push:\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "<<: *hidden-trigger\n",
+        ("unsupported syntax", "<<: *hidden-trigger"),
+        False,
+    ),
+    (
+        "double-quoted duplicate top-level on is refused",
+        'on:\n  workflow_dispatch:\n"on":\n  push:\n',
+        ("duplicate top-level `on:`",),
+        False,
+    ),
+    (
+        "single-quoted duplicate top-level on is refused",
+        "on:\n  workflow_dispatch:\n'on':\n  push:\n",
+        ("duplicate top-level `on:`",),
+        False,
+    ),
+    (
+        "YAML boolean trap cannot follow a literal top-level on",
+        "on:\n  workflow_dispatch:\ntrue:\n  push:\n",
+        ("unsupported top-level workflow key", "'true'"),
+        False,
+    ),
+    (
+        "malformed duplicate top-level on value is refused",
+        "on:\n  workflow_dispatch:\non: [push\n",
+        ("duplicate top-level `on:`",),
+        False,
+    ),
+    (
+        "malformed duplicate top-level key is refused",
+        "on:\n  workflow_dispatch:\non\n  push:\n",
+        ("unsupported syntax", "'on'"),
+        False,
+    ),
+    (
         "YAML boolean true is not mistaken for on",
         "true:\n  workflow_dispatch:\n",
-        ("no top-level `on:`",),
+        ("unsupported top-level workflow key", "'true'"),
         False,
     ),
     (
         "an on-like key is not mistaken for on",
         "one:\n  workflow_dispatch:\n",
-        ("no top-level `on:`",),
+        ("unsupported top-level workflow key", "'one'"),
         False,
     ),
     (
