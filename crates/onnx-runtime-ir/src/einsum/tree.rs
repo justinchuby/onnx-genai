@@ -1144,6 +1144,25 @@ impl EinsumConcreteContractionTreePlan {
             .and_then(|index| self.candidates.get(index))
     }
 
+    /// Lowest-cost concrete candidate accepted by a backend-specific predicate.
+    ///
+    /// Cost ordering and the stable candidate-ID tie-break remain centralized
+    /// here; a backend supplies only the capability or resource admission rule.
+    pub fn preferred_candidate_matching(
+        &self,
+        mut predicate: impl FnMut(&EinsumConcreteContractionTreeCandidate) -> bool,
+    ) -> Option<&EinsumConcreteContractionTreeCandidate> {
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.cost().is_some() && predicate(candidate))
+            .min_by(|left, right| {
+                left.cost()
+                    .expect("filtered")
+                    .compare(right.cost().expect("filtered"))
+                    .then_with(|| left.id().cmp(right.id()))
+            })
+    }
+
     /// Lowest-cost candidate whose peak live temporary bytes fit `ceiling`.
     ///
     /// `None` is not a semantic rejection: the caller must select the
@@ -1152,19 +1171,11 @@ impl EinsumConcreteContractionTreePlan {
         &self,
         ceiling: u128,
     ) -> Option<&EinsumConcreteContractionTreeCandidate> {
-        self.candidates
-            .iter()
-            .filter(|candidate| {
-                candidate
-                    .cost()
-                    .is_some_and(|cost| cost.peak_live_temporary_bytes() <= ceiling)
-            })
-            .min_by(|left, right| {
-                left.cost()
-                    .expect("filtered")
-                    .compare(right.cost().expect("filtered"))
-                    .then_with(|| left.id().cmp(right.id()))
-            })
+        self.preferred_candidate_matching(|candidate| {
+            candidate
+                .cost()
+                .is_some_and(|cost| cost.peak_live_temporary_bytes() <= ceiling)
+        })
     }
 }
 

@@ -288,14 +288,29 @@ pub extern "C" fn nxrt_ep_reset_einsum_concurrency_probe() {
 
 /// Disable observation and return the maximum overlap for `route`.
 ///
-/// Routes are `0=view-copy`, `1=reduction/oracle`, and
-/// `2=materialized-GEMM`. An unknown route returns zero.
+/// Routes are `0=view-copy`, `1=reduction/oracle`,
+/// `2=materialized-GEMM`, and `3=generic/tree`. An unknown route returns zero.
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_ep_finish_einsum_concurrency_probe(route: usize) -> usize {
     onnx_runtime_ep_cpu::kernels::einsum::finish_concurrency_probe()
         .get(route)
         .copied()
         .unwrap_or(0)
+}
+
+/// Reset successful CPU Einsum route counters.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_einsum_route_telemetry() {
+    onnx_runtime_ep_cpu::kernels::einsum::reset_route_telemetry()
+}
+
+/// Successful CPU Einsum dispatches for one route index.
+///
+/// Indices are documented by
+/// `onnx_runtime_ep_cpu::kernels::einsum::route_telemetry_count`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_einsum_route_count(route: usize) -> usize {
+    onnx_runtime_ep_cpu::kernels::einsum::route_telemetry_count(route)
 }
 
 // ─── Build identity ─────────────────────────────────────────────────────────

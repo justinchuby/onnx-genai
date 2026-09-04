@@ -25,7 +25,7 @@ The checked-in `corpus-v1.json` stores only the generator configuration, case
 counts, and canonical JSON digest. Tensor payloads are regenerated from per-case
 seeds. The corpus contains:
 
-- 32 named cases and 128 seeded generated cases;
+- 33 named cases and 128 seeded generated cases (161 shared legal cases);
 - operand arities 1, 2, 3, 4, 8, 16, and a 64-scalar proof that legal
   variadic Einsum has no ONNX semantic maximum;
 - all 52 case-sensitive ASCII labels, diagonals, scalar terms, explicit and
@@ -76,5 +76,13 @@ route actually taken, planner quality, measured workspace, capture result, and
 output tensor. Capture assertions require nonzero captures and replays with zero
 fallbacks. `verify_observation` checks all fields against one oracle evaluation.
 
-The harness deliberately ships no CPU or CUDA adapter and no placeholder route.
-Backend owners must wire genuine forcing/telemetry before a route test can pass.
+The CPU EP supplies a real adapter in
+`crates/onnx-runtime-ep-cpu/tests/einsum_conformance.rs`. It executes every
+shared legal case through forced GenericNative, exercises every applicable
+exact-DP, deterministic-heuristic, and MatMul probe, reports measured route and
+workspace observations, and compares against this crate's independent oracle.
+It also adds four explicit dtype cases (165 total), plus 128-operand fallback
+and parallel-versus-scalar checks. The CUDA EP supplies its real adapter in
+`crates/onnx-runtime-ep-cuda/tests/einsum_conformance_gpu.rs`; it executes all
+161 shared legal cases through GenericNative and every applicable optimized or
+cuBLAS route. No placeholder observation is accepted.

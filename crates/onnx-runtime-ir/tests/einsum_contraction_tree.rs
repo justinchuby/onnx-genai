@@ -704,6 +704,11 @@ fn costs_are_checked_u128_zero_annihilates_and_memory_can_fall_back() {
         .unwrap()
         .unwrap();
     assert!(concrete.preferred_candidate().is_some());
+    assert_eq!(
+        concrete.preferred_candidate_matching(|_| true),
+        concrete.preferred_candidate()
+    );
+    assert!(concrete.preferred_candidate_matching(|_| false).is_none());
     assert!(
         concrete
             .preferred_candidate_with_memory_ceiling(0)

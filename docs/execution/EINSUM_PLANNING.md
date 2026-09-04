@@ -172,6 +172,23 @@ Precision is IR data, not a backend fast-path choice:
 
 ## Native CPU/CUDA execution
 
+The native CPU EP consumes the semantic plan directly and executes every legal
+equation through one of these observable routes:
+
+- zero-copy view/diagonal when the executor can preserve the view;
+- reduction/elementwise and scalar MatMul fallbacks with fixed-width arithmetic;
+- native MatMul/BMM when its layout and precision contract is compatible;
+- exact-DP or deterministic-greedy contraction candidates under the declared
+  temporary-memory ceiling;
+- the universal `GenericNative` index program when forced, when no candidate
+  fits, or when bounded planning intentionally returns
+  `GenericNativeFallback`.
+
+CPU generic and tree execution read arbitrary strided inputs, compute into
+execution-local typed scratch, and publish the output only after successful
+completion. Output tiles may run in parallel, but each output retains the same
+canonical input-product and reduction order.
+
 The CUDA EP executes every expression and homogeneous numeric dtype legal under
 the resolved schema. Its immutable, shape-specialized `CudaEinsumPlan` consumes
 the canonical index program directly, uploads metadata and selects algorithms
@@ -184,9 +201,12 @@ and output-layout contracts match; otherwise that step remains generic.
 cuBLASLt selection receives the alignment proven by each actual tensor origin
 (base pointer plus byte offset), and the cached plan records the selected
 algorithm's minimum A/B/C/D alignment so later launches cannot silently weaken
-that proof. F16/BF16 cuBLASLt selection excludes in-place and output-type
-split-K reductions, then verifies the selected split-K/reduction configuration;
-unsupported alignment or precision contracts fall back to `GenericNative`.
+that proof. Direct snapshot reuse also requires the exact warmed dtype, shapes,
+input/output strides, byte offsets, devices, contraction/transpose
+interpretation, and non-aliasing constraint. F16/BF16 cuBLASLt selection
+excludes in-place and output-type split-K reductions, then verifies the selected
+split-K/reduction configuration; unsupported alignment or precision contracts
+fall back to `GenericNative`.
 One transactional arithmetic snapshot owns both the selected Auto route and all
 of its private device resources. Capture reuses that exact direct-or-semantic
 decision instead of redispatching, and every private pointer is checked against
@@ -196,6 +216,3 @@ F16/BF16 inputs and intermediates accumulate in f32 and narrow once at the final
 output. Integer arithmetic uses explicit unsigned intermediates and narrows
 after each operation, implementing exact declared-width modular arithmetic
 without signed-overflow behavior.
-
-The CPU EP still has its earlier staged execution coverage and may decline
-general contraction trees or dtypes that its native kernel has not implemented.

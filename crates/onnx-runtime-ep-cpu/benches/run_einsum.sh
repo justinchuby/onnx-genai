@@ -56,7 +56,7 @@ export ONNX_GENAI_CPU_DECODE_THREADS="$physical_cores"
 export CARGO_TARGET_DIR="$target_dir"
 
 log="$target_dir/einsum-$mode.log"
-reason="CPU Einsum $mode (12 selectors)"
+reason="CPU Einsum $mode (26 selectors)"
 args=(cargo bench -p onnx-runtime-ep-cpu --bench einsum --)
 if [[ $mode == census ]]; then
   args+=(--list)
@@ -73,14 +73,14 @@ if [[ $mode == census ]]; then
     echo "selector census failed: found $selector_count Criterion selectors, expected 12" >&2
     exit 1
   fi
-  grep -Eq '^EINSUM_CENSUS_COMPLETE .* selector_count=12$' "$log" || {
-    echo "selector census failed: missing EINSUM_CENSUS_COMPLETE selector_count=12" >&2
+  grep -Eq '^EINSUM_CENSUS_COMPLETE .* selector_count=26$' "$log" || {
+    echo "selector census failed: missing EINSUM_CENSUS_COMPLETE selector_count=26" >&2
     exit 1
   }
-  echo "selector census passed: 12/12"
+  echo "selector census passed: 26/26"
 else
-  grep -Eq '^EINSUM_EVIDENCE_COMPLETE .* selector_count=12$' "$log" || {
-    echo "evidence sweep failed: missing EINSUM_EVIDENCE_COMPLETE selector_count=12" >&2
+  grep -Eq '^EINSUM_EVIDENCE_COMPLETE .* selector_count=26$' "$log" || {
+    echo "evidence sweep failed: missing EINSUM_EVIDENCE_COMPLETE selector_count=26" >&2
     exit 1
   }
 fi

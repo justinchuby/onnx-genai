@@ -156,11 +156,12 @@ static MATMUL_NBITS_DTYPES: &[DataType] = &[
 static FLOAT_COMPUTE_DTYPES: &[DataType] =
     &[DataType::Float32, DataType::Float16, DataType::BFloat16];
 
-/// Canonical ONNX opset-12 dtypes implemented by the native CPU Einsum kernel.
+/// Union of native CPU Einsum dtypes across schema revisions.
 ///
-/// BFloat16 is intentionally absent: it is not in the standard Einsum
-/// type-constraint, even though other CPU kernels can compute it.
-static EINSUM_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16];
+/// The plugin registry can advertise only one static union. The provider's
+/// schema-aware claim gate remains authoritative: BFloat16 is accepted only by
+/// Einsum-28, while all other members are legal from Einsum-12 onward.
+static EINSUM_DTYPES: &[DataType] = ARITH_DTYPES;
 
 /// The two quantized storage dtypes `QLinearMatMul` operands may use.
 static QUANTIZED_STORAGE_DTYPES: &[DataType] = &[DataType::Uint8, DataType::Int8];
@@ -390,9 +391,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // MatMul/Gemm support f64 as well as the three native compute dtypes.
         ("MatMul", "") | ("Gemm", "") => FLOAT_DTYPES,
 
-        // Intersection of the canonical opset-12 schema and the native kernel:
-        // f32/f16 only. BFloat16 support in other CPU kernels must not widen the
-        // standard Einsum contract.
+        // Static union across Einsum-12 and Einsum-28. The provider performs
+        // the required opset-aware BFloat16 gate before claiming the node.
         ("Einsum", "") => EINSUM_DTYPES,
 
         // Float-only ops (dispatch_float! or explicit float handling).
@@ -2994,11 +2994,8 @@ mod tests {
     #[test]
     fn einsum_descriptor_matches_the_canonical_kernel_dtype_contract() {
         let dtypes = supported_dtypes_for_op("Einsum", "");
-        assert_eq!(dtypes, &[DataType::Float32, DataType::Float16]);
-        assert!(
-            !dtypes.contains(&DataType::BFloat16),
-            "BFloat16 is not permitted by the canonical ONNX opset-12 Einsum schema"
-        );
+        assert_eq!(dtypes, ARITH_DTYPES);
+        assert!(dtypes.contains(&DataType::BFloat16));
     }
 
     /// The descriptor order is leaked into a `'static` slice handed to ORT, so
