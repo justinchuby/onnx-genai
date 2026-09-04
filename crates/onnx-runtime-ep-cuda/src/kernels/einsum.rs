@@ -21,9 +21,9 @@ use onnx_runtime_ep_api::{
     TensorView, ViewOutput,
 };
 use onnx_runtime_ir::{
-    DataType, EinsumContractionPlan, EinsumInput, EinsumOperandPlan, EinsumPermutationPlan,
-    EinsumPlan, EinsumPlanningClassification, EinsumSchema, EinsumShapePlan, Node, Shape,
-    TensorLayout,
+    DataType, DeviceId, EinsumContractionPlan, EinsumInput, EinsumOperandPlan,
+    EinsumPermutationPlan, EinsumPlan, EinsumPlanningClassification, EinsumSchema, EinsumShapePlan,
+    Node, Shape, TensorLayout,
 };
 
 use super::movement::{PersistentMetadata, launch_persistent_metadata};
@@ -573,24 +573,133 @@ enum ExecutionKind {
     Gemm(CachedGemm),
 }
 
-struct CachedExecution {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectTensorMetadata {
     dtype: DataType,
-    input_shapes: Vec<Vec<usize>>,
-    layout: ContractionLayout,
-    kind: ExecutionKind,
+    shape: Vec<usize>,
+    strides: Vec<i64>,
+    byte_offset: usize,
+    device: DeviceId,
 }
 
-impl CachedExecution {
-    fn matches_metadata(&self, inputs: &[TensorView], output: &TensorMut) -> bool {
-        self.dtype == inputs[0].dtype
-            && self.input_shapes.len() == inputs.len()
-            && self
-                .input_shapes
-                .iter()
-                .zip(inputs)
-                .all(|(expected, actual)| expected.as_slice() == actual.shape)
-            && self.layout.output_shape.as_slice() == output.shape
+impl DirectTensorMetadata {
+    fn input(input: &TensorView) -> Self {
+        Self {
+            dtype: input.dtype,
+            shape: input.shape.to_vec(),
+            strides: input.strides.to_vec(),
+            byte_offset: input.byte_offset,
+            device: input.device,
+        }
     }
+
+    fn output(output: &TensorMut) -> Self {
+        Self {
+            dtype: output.dtype,
+            shape: output.shape.to_vec(),
+            strides: output.strides.to_vec(),
+            byte_offset: output.byte_offset,
+            device: output.device,
+        }
+    }
+
+    fn mismatch_reason(&self, current: &Self, label: &str) -> Option<String> {
+        if self.dtype != current.dtype {
+            return Some(format!(
+                "{label} dtype changed from {:?} to {:?}",
+                self.dtype, current.dtype
+            ));
+        }
+        if self.shape != current.shape {
+            return Some(format!(
+                "{label} shape changed from {:?} to {:?}",
+                self.shape, current.shape
+            ));
+        }
+        if self.strides != current.strides {
+            return Some(format!(
+                "{label} strides changed from {:?} to {:?}",
+                self.strides, current.strides
+            ));
+        }
+        if self.byte_offset != current.byte_offset {
+            return Some(format!(
+                "{label} byte offset changed from {} to {}",
+                self.byte_offset, current.byte_offset
+            ));
+        }
+        if self.device != current.device {
+            return Some(format!(
+                "{label} device changed from {:?} to {:?}",
+                self.device, current.device
+            ));
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArithmeticAliasConstraint {
+    OutputDisjointFromInputs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectExecutionMetadata {
+    // Layout identity is exact. Effective pointer alignment is the only
+    // intentionally compatible (rather than equal) property and is checked
+    // against the retained cuBLASLt algorithm contract on every reuse.
+    inputs: Vec<DirectTensorMetadata>,
+    output: DirectTensorMetadata,
+    layout: ContractionLayout,
+    alias_constraint: ArithmeticAliasConstraint,
+}
+
+impl DirectExecutionMetadata {
+    fn mismatch_reason(&self, current: &Self) -> Option<String> {
+        if self.inputs.len() != current.inputs.len() {
+            return Some(format!(
+                "direct input count changed from {} to {}",
+                self.inputs.len(),
+                current.inputs.len()
+            ));
+        }
+        for (index, (warmed, current)) in self.inputs.iter().zip(&current.inputs).enumerate() {
+            if let Some(reason) = warmed.mismatch_reason(current, &format!("direct input #{index}"))
+            {
+                return Some(reason);
+            }
+        }
+        if let Some(reason) = self
+            .output
+            .mismatch_reason(&current.output, "direct output")
+        {
+            return Some(reason);
+        }
+        if self.layout != current.layout {
+            return Some(format!(
+                "direct contraction interpretation changed from {:?} to {:?}",
+                self.layout, current.layout
+            ));
+        }
+        if self.alias_constraint != current.alias_constraint {
+            return Some(format!(
+                "direct alias constraint changed from {:?} to {:?}",
+                self.alias_constraint, current.alias_constraint
+            ));
+        }
+        None
+    }
+}
+
+/// Single authority for both selecting and reusing the direct cuBLASLt route.
+enum DirectRouteEligibility {
+    Eligible(DirectExecutionMetadata),
+    Ineligible(String),
+}
+
+struct CachedExecution {
+    metadata: DirectExecutionMetadata,
+    kind: ExecutionKind,
 }
 
 struct CachedGemm {
@@ -698,7 +807,7 @@ struct ArithmeticRequest {
     memory_ceiling_bytes: u128,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ContractionPointers {
     a: CUdeviceptr,
     b: CUdeviceptr,
@@ -711,36 +820,74 @@ struct ArithmeticExecutionSnapshot {
 }
 
 impl ArithmeticExecutionSnapshot {
-    fn matches(
+    fn mismatch_reason(
         &self,
         request: ArithmeticRequest,
+        direct_eligibility: &DirectRouteEligibility,
         inputs: &[TensorView],
         output: &mut TensorMut,
         pointers: ContractionPointers,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         if self.request != request {
-            return Ok(false);
+            return Ok(Some(format!(
+                "execution request changed from {:?} to {:?}",
+                self.request, request
+            )));
         }
         match &self.execution {
-            ArithmeticExecution::Direct(cached) => {
-                if !cached.matches_metadata(inputs, output) {
-                    return Ok(false);
-                }
-                match &cached.kind {
-                    ExecutionKind::Gemm(gemm) => {
-                        gemm.supports(&cached.layout, pointers.a, pointers.b, pointers.c)
+            ArithmeticExecution::Direct(cached) => match direct_eligibility {
+                DirectRouteEligibility::Ineligible(reason) => Ok(Some(reason.clone())),
+                DirectRouteEligibility::Eligible(current) => {
+                    if let Some(reason) = cached.metadata.mismatch_reason(current) {
+                        return Ok(Some(reason));
                     }
-                    ExecutionKind::NoOp | ExecutionKind::ZeroFill => Ok(true),
+                    let layout = &cached.metadata.layout;
+                    match &cached.kind {
+                        ExecutionKind::Gemm(gemm)
+                            if !gemm.supports(layout, pointers.a, pointers.b, pointers.c)? =>
+                        {
+                            Ok(Some(format!(
+                                "direct effective pointers a={:#x}, b={:#x}, c={:#x} do not \
+                                 satisfy the warmed cuBLASLt alignment contract {:?}; byte \
+                                 offsets are inputs={:?}, output={}",
+                                pointers.a,
+                                pointers.b,
+                                pointers.c,
+                                gemm.algorithm_contract(),
+                                current
+                                    .inputs
+                                    .iter()
+                                    .map(|input| input.byte_offset)
+                                    .collect::<Vec<_>>(),
+                                current.output.byte_offset
+                            )))
+                        }
+                        ExecutionKind::Gemm(_) | ExecutionKind::NoOp | ExecutionKind::ZeroFill => {
+                            Ok(None)
+                        }
+                    }
                 }
-            }
+            },
             ArithmeticExecution::Semantic(plan) => {
                 let requested = match request.route {
                     EinsumRouteOverride::Auto => RequestedRoute::Auto,
                     EinsumRouteOverride::GenericNative => RequestedRoute::GenericNative,
                     EinsumRouteOverride::Optimized => RequestedRoute::Optimized,
-                    EinsumRouteOverride::CudaCublas => return Ok(false),
+                    EinsumRouteOverride::CudaCublas => {
+                        return Ok(Some(
+                            "forced cuBLASLt cannot reuse a warmed semantic snapshot".into(),
+                        ));
+                    }
                 };
-                Ok(plan.matches(requested, request.memory_ceiling_bytes, inputs, output))
+                if plan.matches(requested, request.memory_ceiling_bytes, inputs, output) {
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        "semantic route request, memory ceiling, effective addresses, dtypes, \
+                         shapes, strides, or output layout changed"
+                            .into(),
+                    ))
+                }
             }
         }
     }
@@ -1071,20 +1218,10 @@ impl EinsumKernel {
 
     fn compile_contraction(
         &self,
-        dtype: DataType,
-        a: CUdeviceptr,
-        b: CUdeviceptr,
-        c: CUdeviceptr,
+        metadata: DirectExecutionMetadata,
+        pointers: ContractionPointers,
     ) -> Result<CachedExecution> {
-        let EinsumPlanningClassification::Gemm(contraction) = self.plan.planning_classification()
-        else {
-            unreachable!("compile_contraction is called only for GEMM plans");
-        };
-        if let Some(reason) = contraction_structure_reason(&self.plan, contraction) {
-            return Err(not_implemented(reason));
-        }
-        let layout =
-            concrete_contraction_layout(&self.plan, contraction, &self.input_shapes, dtype)?;
+        let layout = &metadata.layout;
         let output_numel = checked_product(&layout.output_shape, "output")?;
         let kind = if output_numel == 0 {
             ExecutionKind::NoOp
@@ -1094,10 +1231,10 @@ impl EinsumKernel {
             self.runtime
                 .staged_warm_cache_mutation("Einsum direct cuBLASLt planning")?;
             let params = StridedBatchedGemmParams {
-                dtype: einsum_dtype(dtype)?,
-                a,
-                b,
-                c,
+                dtype: einsum_dtype(layout.dtype)?,
+                a: pointers.a,
+                b: pointers.b,
+                c: pointers.c,
                 m: layout.m,
                 k: layout.k,
                 n: layout.n,
@@ -1125,12 +1262,7 @@ impl EinsumKernel {
             };
             ExecutionKind::Gemm(CachedGemm { plan, workspace })
         };
-        Ok(CachedExecution {
-            dtype,
-            input_shapes: self.input_shapes.clone(),
-            layout,
-            kind,
-        })
+        Ok(CachedExecution { metadata, kind })
     }
 
     fn build_arithmetic_execution(
@@ -1140,20 +1272,20 @@ impl EinsumKernel {
         output: &mut TensorMut,
         request: ArithmeticRequest,
         pointers: ContractionPointers,
+        direct_eligibility: &DirectRouteEligibility,
     ) -> Result<ArithmeticExecutionSnapshot> {
         let execution = match request.route {
             EinsumRouteOverride::CudaCublas => {
-                if !self.fast_contraction_eligible(inputs, output) {
-                    return Err(not_implemented(format!(
-                        "Einsum `{}` cannot take the forced cuBLASLt route because its dtype, \
-                         strides, broadcast, diagonal, or output permutation does not satisfy the \
-                         descriptor contract",
-                        self.plan.equation()
-                    )));
-                }
-                ArithmeticExecution::Direct(
-                    self.compile_contraction(dtype, pointers.a, pointers.b, pointers.c)?,
-                )
+                let metadata = match direct_eligibility {
+                    DirectRouteEligibility::Eligible(metadata) => metadata,
+                    DirectRouteEligibility::Ineligible(reason) => {
+                        return Err(not_implemented(format!(
+                            "Einsum `{}` cannot take the forced cuBLASLt route: {reason}",
+                            self.plan.equation()
+                        )));
+                    }
+                };
+                ArithmeticExecution::Direct(self.compile_contraction(metadata.clone(), pointers)?)
             }
             EinsumRouteOverride::GenericNative => {
                 ArithmeticExecution::Semantic(CudaEinsumPlan::build(
@@ -1175,9 +1307,9 @@ impl EinsumKernel {
                 RequestedRoute::Optimized,
                 request.memory_ceiling_bytes,
             )?),
-            EinsumRouteOverride::Auto => {
-                if self.fast_contraction_eligible(inputs, output) {
-                    match self.compile_contraction(dtype, pointers.a, pointers.b, pointers.c) {
+            EinsumRouteOverride::Auto => match direct_eligibility {
+                DirectRouteEligibility::Eligible(metadata) => {
+                    match self.compile_contraction(metadata.clone(), pointers) {
                         Ok(execution) => ArithmeticExecution::Direct(execution),
                         Err(_) => ArithmeticExecution::Semantic(CudaEinsumPlan::build(
                             &self.plan,
@@ -1189,7 +1321,8 @@ impl EinsumKernel {
                             request.memory_ceiling_bytes,
                         )?),
                     }
-                } else {
+                }
+                DirectRouteEligibility::Ineligible(_) => {
                     ArithmeticExecution::Semantic(CudaEinsumPlan::build(
                         &self.plan,
                         dtype,
@@ -1200,7 +1333,7 @@ impl EinsumKernel {
                         request.memory_ceiling_bytes,
                     )?)
                 }
-            }
+            },
         };
         Ok(ArithmeticExecutionSnapshot { request, execution })
     }
@@ -1213,7 +1346,7 @@ impl EinsumKernel {
         memory_ceiling_bytes: u128,
     ) -> Result<()> {
         let dtype = self.validate_common(inputs, outputs)?;
-        self.validate_no_output_alias(inputs, &mut outputs[0])?;
+        let alias_constraint = self.validate_no_output_alias(inputs, &mut outputs[0])?;
         let pointers = ContractionPointers {
             a: inputs
                 .first()
@@ -1225,6 +1358,8 @@ impl EinsumKernel {
                 .unwrap_or(0),
             c: cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void),
         };
+        let direct_eligibility =
+            self.direct_route_eligibility(inputs, &outputs[0], alias_constraint);
         let request = ArithmeticRequest {
             route: requested,
             memory_ceiling_bytes,
@@ -1236,16 +1371,25 @@ impl EinsumKernel {
                 self.plan.equation()
             ))
         })?;
-        let cache_hit = published
-            .as_ref()
-            .map(|snapshot| snapshot.matches(request, inputs, &mut outputs[0], pointers))
-            .transpose()?
-            .unwrap_or(false);
-        if !cache_hit && capturing {
+        let mismatch_reason = match published.as_ref() {
+            Some(snapshot) => snapshot.mismatch_reason(
+                request,
+                &direct_eligibility,
+                inputs,
+                &mut outputs[0],
+                pointers,
+            )?,
+            None => Some("no arithmetic execution snapshot has been warmed".into()),
+        };
+        let cache_hit = mismatch_reason.is_none();
+        if let Some(reason) = mismatch_reason
+            && capturing
+        {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep Einsum `{}`: exact dtype/shape/stride/address/route and cuBLASLt \
-                 alignment snapshot was not warmed before CUDA graph capture",
-                self.plan.equation()
+                "cuda_ep Einsum `{}`: cannot reuse the warmed arithmetic snapshot during CUDA \
+                 graph capture because {reason}. HOW: abort capture and eagerly warm this exact \
+                 route/layout first",
+                self.plan.equation(),
             )));
         }
 
@@ -1260,6 +1404,7 @@ impl EinsumKernel {
                 &mut outputs[0],
                 request,
                 pointers,
+                &direct_eligibility,
             )?)
         };
         let prepared = if cache_hit {
@@ -1275,12 +1420,13 @@ impl EinsumKernel {
         let (route, workspace_bytes, workspace_ptr, metadata_bytes, capture_launches) =
             match &prepared.execution {
                 ArithmeticExecution::Direct(cached) => {
-                    if cached.layout.output_shape.as_slice() != outputs[0].shape {
+                    let layout = &cached.metadata.layout;
+                    if layout.output_shape.as_slice() != outputs[0].shape {
                         return Err(EpError::KernelFailed(format!(
                             "cuda_ep Einsum `{}`: output shape {:?}, expected {:?}",
                             self.plan.equation(),
                             outputs[0].shape,
-                            cached.layout.output_shape
+                            layout.output_shape
                         )));
                     }
                     let (workspace_bytes, workspace_ptr, contract) = match &cached.kind {
@@ -1304,16 +1450,10 @@ impl EinsumKernel {
                             (0, 0, None)
                         }
                         ExecutionKind::Gemm(gemm) => {
-                            gemm.launch(
-                                &cached.layout,
-                                &self.runtime,
-                                pointers.a,
-                                pointers.b,
-                                pointers.c,
-                            )?;
+                            gemm.launch(layout, &self.runtime, pointers.a, pointers.b, pointers.c)?;
                             GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
-                            if cached.layout.left_order == StorageOrder::Transposed
-                                || cached.layout.right_order == StorageOrder::Transposed
+                            if layout.left_order == StorageOrder::Transposed
+                                || layout.right_order == StorageOrder::Transposed
                             {
                                 DESCRIPTOR_TRANSPOSE_GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
                             } else {
@@ -1391,7 +1531,7 @@ impl EinsumKernel {
         &self,
         inputs: &[TensorView],
         output: &mut TensorMut,
-    ) -> Result<()> {
+    ) -> Result<ArithmeticAliasConstraint> {
         let output_context = format!(
             "cuda_ep Einsum `{}` arithmetic output",
             self.plan.equation()
@@ -1426,30 +1566,66 @@ impl EinsumKernel {
                 )));
             }
         }
-        Ok(())
+        Ok(ArithmeticAliasConstraint::OutputDisjointFromInputs)
     }
 
-    fn fast_contraction_eligible(&self, inputs: &[TensorView], output: &TensorMut) -> bool {
+    fn direct_route_eligibility(
+        &self,
+        inputs: &[TensorView],
+        output: &TensorMut,
+        alias_constraint: ArithmeticAliasConstraint,
+    ) -> DirectRouteEligibility {
         if !matches!(
             inputs.first().map(|input| input.dtype),
             Some(DataType::Float32 | DataType::Float16)
-        ) || inputs.iter().any(|input| !input.is_contiguous())
-            || !output.is_contiguous()
+        ) {
+            return DirectRouteEligibility::Ineligible(format!(
+                "the direct route requires Float16 or Float32 storage, got {:?}",
+                inputs.first().map(|input| input.dtype)
+            ));
+        }
+        if let Some((index, input)) = inputs
+            .iter()
+            .enumerate()
+            .find(|(_, input)| !input.is_contiguous())
         {
-            return false;
+            return DirectRouteEligibility::Ineligible(format!(
+                "direct input #{index} shape {:?} with strides {:?} is not contiguous",
+                input.shape, input.strides
+            ));
+        }
+        if !output.is_contiguous() {
+            return DirectRouteEligibility::Ineligible(format!(
+                "direct output shape {:?} with strides {:?} is not contiguous",
+                output.shape, output.strides
+            ));
         }
         let EinsumPlanningClassification::Gemm(contraction) = self.plan.planning_classification()
         else {
-            return false;
+            return DirectRouteEligibility::Ineligible(format!(
+                "canonical plan classification {:?} is not a binary GEMM contraction",
+                self.plan.planning_classification()
+            ));
         };
-        contraction_structure_reason(&self.plan, contraction).is_none()
-            && concrete_contraction_layout(
-                &self.plan,
-                contraction,
-                &self.input_shapes,
-                inputs[0].dtype,
-            )
-            .is_ok()
+        if let Some(reason) = contraction_structure_reason(&self.plan, contraction) {
+            return DirectRouteEligibility::Ineligible(reason);
+        }
+        let shapes = inputs
+            .iter()
+            .map(|input| input.shape.to_vec())
+            .collect::<Vec<_>>();
+        match concrete_contraction_layout(&self.plan, contraction, &shapes, inputs[0].dtype) {
+            Ok(layout) => DirectRouteEligibility::Eligible(DirectExecutionMetadata {
+                inputs: inputs.iter().map(DirectTensorMetadata::input).collect(),
+                output: DirectTensorMetadata::output(output),
+                layout,
+                alias_constraint,
+            }),
+            Err(error) => DirectRouteEligibility::Ineligible(format!(
+                "the canonical contraction cannot be represented by the direct descriptor: \
+                 {error}"
+            )),
+        }
     }
 
     fn view_spec(

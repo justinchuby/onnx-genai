@@ -1131,6 +1131,487 @@ fn auto_fallback_snapshot_is_reused_for_capture_and_replay_gpu() {
     ep.deallocate(output).unwrap();
 }
 
+fn execute_layout_matrix(
+    ep: &CudaExecutionProvider,
+    kernel: &dyn onnx_runtime_ep_api::Kernel,
+    a: &onnx_runtime_ep_api::DeviceBuffer,
+    a_strides: &[i64],
+    a_byte_offset: usize,
+    b: &onnx_runtime_ep_api::DeviceBuffer,
+    output: &mut onnx_runtime_ep_api::DeviceBuffer,
+    output_strides: &[i64],
+) -> onnx_runtime_ep_api::Result<()> {
+    let a_shape = [2usize, 3];
+    let b_shape = [3usize, 2];
+    let output_shape = [2usize, 2];
+    let b_strides = compute_contiguous_strides(&b_shape);
+    kernel.execute(
+        &[
+            TensorView::new(
+                DevicePtr(a.as_ptr()),
+                DataType::Float32,
+                &a_shape,
+                a_strides,
+                ep.device_id(),
+            )
+            .with_byte_offset(a_byte_offset),
+            TensorView::new(
+                DevicePtr(b.as_ptr()),
+                DataType::Float32,
+                &b_shape,
+                &b_strides,
+                ep.device_id(),
+            ),
+        ],
+        &mut [TensorMut::new(
+            DevicePtrMut(output.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            output_strides,
+            ep.device_id(),
+        )],
+    )
+}
+
+fn assert_auto_reselects_for_input_layout(
+    ep: &CudaExecutionProvider,
+    label: &str,
+    physical_a: &[f32],
+    a_strides: &[i64],
+    a_byte_offset: usize,
+    logical_a: &[f32],
+) {
+    let runtime = ep.runtime();
+    let a_shape = [2usize, 3];
+    let b_shape = [3usize, 2];
+    let output_shape = [2usize, 2];
+    let (kernel, inputs, buffers, mut output) = make_direct_kernel(
+        ep,
+        "ik,kj->ij",
+        &[a_shape.to_vec(), b_shape.to_vec()],
+        &output_shape,
+    );
+    let a_contiguous_strides = compute_contiguous_strides(&a_shape);
+    let output_strides = compute_contiguous_strides(&output_shape);
+
+    reset_einsum_execution_stats();
+    execute_layout_matrix(
+        ep,
+        kernel.as_ref(),
+        &buffers[0],
+        &a_contiguous_strides,
+        0,
+        &buffers[1],
+        &mut output,
+        &output_strides,
+    )
+    .expect("contiguous warm must select direct cuBLASLt");
+    let warm = einsum_execution_stats();
+    assert_eq!(
+        warm.last_route,
+        Some(onnx_runtime_ep_cuda::CudaEinsumRoute::CudaCublas)
+    );
+    assert_eq!(warm.plan_builds, 1);
+    assert_eq!(warm.gemm_launches, 1);
+
+    let physical_bytes = common::raw(physical_a);
+    let strided_a = ep.allocate(physical_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&physical_bytes, cuptr(strided_a.as_ptr()))
+            .unwrap()
+    };
+    execute_layout_matrix(
+        ep,
+        kernel.as_ref(),
+        &strided_a,
+        a_strides,
+        a_byte_offset,
+        &buffers[1],
+        &mut output,
+        &output_strides,
+    )
+    .unwrap_or_else(|error| panic!("{label}: Auto semantic reselection failed: {error}"));
+    runtime.synchronize().unwrap();
+    let reselected = einsum_execution_stats();
+    assert_ne!(
+        reselected.last_route,
+        Some(onnx_runtime_ep_cuda::CudaEinsumRoute::CudaCublas),
+        "{label}: stale direct snapshot must not consume a strided view"
+    );
+    assert_eq!(reselected.plan_builds, 2, "{label}");
+    assert_eq!(reselected.plan_rewarms, 1, "{label}");
+    assert_eq!(
+        reselected.gemm_launches, 1,
+        "{label}: only the original contiguous warm may use the direct GEMM"
+    );
+
+    let mut bytes = vec![0u8; output_shape.iter().product::<usize>() * 4];
+    unsafe { runtime.dtoh(&mut bytes, cuptr(output.as_ptr())).unwrap() };
+    let b = quantize(
+        &decode_floats(&inputs[1].bytes, DataType::Float32),
+        DataType::Float32,
+    );
+    let expected = f64_gemm_reference(
+        &quantize(logical_a, DataType::Float32),
+        &b,
+        1,
+        2,
+        3,
+        2,
+        false,
+        false,
+        0,
+        0,
+    );
+    assert_close(
+        &decode_floats(&bytes, DataType::Float32),
+        &expected,
+        DataType::Float32,
+        label,
+    );
+
+    ep.deallocate(strided_a).unwrap();
+    for buffer in buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn direct_snapshot_reselects_semantic_for_positive_and_negative_strides() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+
+    assert_auto_reselects_for_input_layout(
+        &ep,
+        "positive-strided input after contiguous warm",
+        &[1.0, 91.0, 2.0, 92.0, 3.0, 93.0, 4.0, 94.0, 5.0, 95.0, 6.0],
+        &[6, 2],
+        0,
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    );
+    assert_auto_reselects_for_input_layout(
+        &ep,
+        "negative-stride input after contiguous warm",
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        &[-3, -1],
+        5 * std::mem::size_of::<f32>(),
+        &[6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn direct_snapshot_reselects_semantic_for_output_layout_change() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let a_shape = [2usize, 3];
+    let b_shape = [3usize, 2];
+    let output_shape = [2usize, 2];
+    let (kernel, inputs, buffers, mut contiguous_output) = make_direct_kernel(
+        &ep,
+        "ik,kj->ij",
+        &[a_shape.to_vec(), b_shape.to_vec()],
+        &output_shape,
+    );
+    let input_strides = [
+        compute_contiguous_strides(&a_shape),
+        compute_contiguous_strides(&b_shape),
+    ];
+    let output_strides = compute_contiguous_strides(&output_shape);
+
+    reset_einsum_execution_stats();
+    execute_layout_matrix(
+        &ep,
+        kernel.as_ref(),
+        &buffers[0],
+        &input_strides[0],
+        0,
+        &buffers[1],
+        &mut contiguous_output,
+        &output_strides,
+    )
+    .unwrap();
+    assert_eq!(
+        einsum_execution_stats().last_route,
+        Some(onnx_runtime_ep_cuda::CudaEinsumRoute::CudaCublas)
+    );
+
+    let strided_output_strides = [3i64, 1];
+    let mut strided_output = ep.allocate(5 * std::mem::size_of::<f32>(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(
+                &common::raw(&[0.0f32, 0.0, 123.0, 0.0, 0.0]),
+                cuptr(strided_output.as_ptr()),
+            )
+            .unwrap()
+    };
+    execute_layout_matrix(
+        &ep,
+        kernel.as_ref(),
+        &buffers[0],
+        &input_strides[0],
+        0,
+        &buffers[1],
+        &mut strided_output,
+        &strided_output_strides,
+    )
+    .unwrap();
+    runtime.synchronize().unwrap();
+    let stats = einsum_execution_stats();
+    assert_ne!(
+        stats.last_route,
+        Some(onnx_runtime_ep_cuda::CudaEinsumRoute::CudaCublas)
+    );
+    assert_eq!(stats.plan_builds, 2);
+    assert_eq!(stats.plan_rewarms, 1);
+    assert_eq!(
+        stats.gemm_launches, 1,
+        "the stale direct snapshot must not write the strided output as contiguous"
+    );
+
+    let mut bytes = vec![0u8; 5 * std::mem::size_of::<f32>()];
+    unsafe {
+        runtime
+            .dtoh(&mut bytes, cuptr(strided_output.as_ptr()))
+            .unwrap()
+    };
+    let physical = decode_floats(&bytes, DataType::Float32);
+    assert_eq!(physical[2], 123.0, "output stride gap must stay untouched");
+    let got = [physical[0], physical[1], physical[3], physical[4]];
+    let a = quantize(
+        &decode_floats(&inputs[0].bytes, DataType::Float32),
+        DataType::Float32,
+    );
+    let b = quantize(
+        &decode_floats(&inputs[1].bytes, DataType::Float32),
+        DataType::Float32,
+    );
+    let expected = f64_gemm_reference(&a, &b, 1, 2, 3, 2, false, false, 0, 0);
+    assert_close(
+        &got,
+        &expected,
+        DataType::Float32,
+        "strided output after contiguous warm",
+    );
+
+    for buffer in buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(contiguous_output).unwrap();
+    ep.deallocate(strided_output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn direct_snapshot_layout_mismatch_fails_closed_during_capture() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let a_shape = [2usize, 3];
+    let b_shape = [3usize, 2];
+    let output_shape = [2usize, 2];
+    let (kernel, _inputs, buffers, mut output) = make_direct_kernel(
+        &ep,
+        "ik,kj->ij",
+        &[a_shape.to_vec(), b_shape.to_vec()],
+        &output_shape,
+    );
+    let contiguous_a_strides = compute_contiguous_strides(&a_shape);
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let strided_bytes = common::raw(&[
+        1.0f32, 91.0, 2.0, 92.0, 3.0, 93.0, 4.0, 94.0, 5.0, 95.0, 6.0,
+    ]);
+    let strided_a = ep.allocate(strided_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&strided_bytes, cuptr(strided_a.as_ptr()))
+            .unwrap()
+    };
+    let strided_a_strides = [6i64, 2];
+
+    reset_einsum_execution_stats();
+    execute_layout_matrix(
+        &ep,
+        kernel.as_ref(),
+        &buffers[0],
+        &contiguous_a_strides,
+        0,
+        &buffers[1],
+        &mut output,
+        &output_strides,
+    )
+    .unwrap();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute_layout_matrix(
+        &ep,
+        kernel.as_ref(),
+        &buffers[0],
+        &contiguous_a_strides,
+        0,
+        &buffers[1],
+        &mut output,
+        &output_strides,
+    )
+    .unwrap();
+    let launches_before_mismatch = einsum_execution_stats().gemm_launches;
+    let error = execute_layout_matrix(
+        &ep,
+        kernel.as_ref(),
+        &strided_a,
+        &strided_a_strides,
+        0,
+        &buffers[1],
+        &mut output,
+        &output_strides,
+    )
+    .expect_err("capture must reject a layout that was not warmed");
+    let message = error.to_string();
+    assert!(message.contains("cannot reuse the warmed arithmetic snapshot"));
+    assert!(message.contains("direct input #0"));
+    assert!(message.contains("strides [6, 2]"));
+    assert_eq!(
+        einsum_execution_stats().gemm_launches,
+        launches_before_mismatch,
+        "capture mismatch must fail before launching stale cuBLASLt"
+    );
+    runtime.end_graph_capture().unwrap();
+    assert!(runtime.reset_graph().unwrap());
+    assert_eq!(
+        einsum_execution_stats().plan_builds,
+        1,
+        "capture mismatch must not replan or mutate the warmed snapshot"
+    );
+
+    ep.deallocate(strided_a).unwrap();
+    for buffer in buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn failed_layout_rewarm_preserves_complete_direct_snapshot() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let a_shape = [2usize, 3];
+    let b_shape = [3usize, 2];
+    let output_shape = [2usize, 2];
+    let (kernel, _inputs, buffers, mut output) = make_direct_kernel(
+        &ep,
+        "ik,kj->ij",
+        &[a_shape.to_vec(), b_shape.to_vec()],
+        &output_shape,
+    );
+    let contiguous_a_strides = compute_contiguous_strides(&a_shape);
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let strided_bytes = common::raw(&[
+        1.0f32, 91.0, 2.0, 92.0, 3.0, 93.0, 4.0, 94.0, 5.0, 95.0, 6.0,
+    ]);
+    let strided_a = ep.allocate(strided_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&strided_bytes, cuptr(strided_a.as_ptr()))
+            .unwrap()
+    };
+    let strided_a_strides = [6i64, 2];
+
+    reset_einsum_execution_stats();
+    execute_layout_matrix(
+        &ep,
+        kernel.as_ref(),
+        &buffers[0],
+        &contiguous_a_strides,
+        0,
+        &buffers[1],
+        &mut output,
+        &output_strides,
+    )
+    .unwrap();
+    assert!(kernel.capture_support().is_supported());
+    let resources_before = kernel
+        .device_graph_resources()
+        .into_iter()
+        .map(|resource| resource.identity())
+        .collect::<Vec<_>>();
+
+    #[cfg(feature = "gpu-tests")]
+    runtime.fail_warm_transaction_at_for_test(1);
+    let error = execute_layout_matrix(
+        &ep,
+        kernel.as_ref(),
+        &strided_a,
+        &strided_a_strides,
+        0,
+        &buffers[1],
+        &mut output,
+        &output_strides,
+    )
+    .expect_err("injected semantic rewarm failure must be reported");
+    assert!(
+        error
+            .to_string()
+            .contains("injected staged warm-cache failure"),
+        "{error}"
+    );
+    assert_eq!(einsum_execution_stats().plan_builds, 1);
+    assert_eq!(einsum_execution_stats().plan_rewarms, 0);
+    assert_eq!(
+        kernel
+            .device_graph_resources()
+            .into_iter()
+            .map(|resource| resource.identity())
+            .collect::<Vec<_>>(),
+        resources_before,
+        "failed rewarm must retain the complete prior resource snapshot"
+    );
+
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute_layout_matrix(
+        &ep,
+        kernel.as_ref(),
+        &buffers[0],
+        &contiguous_a_strides,
+        0,
+        &buffers[1],
+        &mut output,
+        &output_strides,
+    )
+    .unwrap();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+    runtime.synchronize().unwrap();
+    assert_eq!(
+        einsum_execution_stats().last_route,
+        Some(onnx_runtime_ep_cuda::CudaEinsumRoute::CudaCublas)
+    );
+    assert!(runtime.reset_graph().unwrap());
+
+    ep.deallocate(strided_a).unwrap();
+    for buffer in buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output).unwrap();
+}
+
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
