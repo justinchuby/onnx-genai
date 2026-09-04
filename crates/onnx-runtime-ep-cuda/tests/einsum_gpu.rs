@@ -1417,6 +1417,132 @@ fn direct_snapshot_reselects_semantic_for_output_layout_change() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn direct_zero_fill_snapshot_reselects_semantic_for_output_layout_change() {
+    let _lock = suite_lock();
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let a_shape = [2usize, 0];
+    let b_shape = [0usize, 2];
+    let output_shape = [2usize, 2];
+    let (kernel, _inputs, buffers, mut contiguous_output) = make_direct_kernel(
+        &ep,
+        "ik,kj->ij",
+        &[a_shape.to_vec(), b_shape.to_vec()],
+        &output_shape,
+    );
+    let a_strides = compute_contiguous_strides(&a_shape);
+    let b_strides = compute_contiguous_strides(&b_shape);
+    let output_strides = compute_contiguous_strides(&output_shape);
+
+    reset_einsum_execution_stats();
+    kernel
+        .execute(
+            &[
+                TensorView::new(
+                    DevicePtr(buffers[0].as_ptr()),
+                    DataType::Float32,
+                    &a_shape,
+                    &a_strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(buffers[1].as_ptr()),
+                    DataType::Float32,
+                    &b_shape,
+                    &b_strides,
+                    ep.device_id(),
+                ),
+            ],
+            &mut [TensorMut::new(
+                DevicePtrMut(contiguous_output.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+        )
+        .unwrap();
+    let warm = einsum_execution_stats();
+    assert_eq!(
+        warm.last_route,
+        Some(onnx_runtime_ep_cuda::CudaEinsumRoute::CudaCublas)
+    );
+    assert_eq!(warm.zero_fill_launches, 1);
+
+    let strided_output_strides = [3i64, 1];
+    let mut strided_output = ep.allocate(5 * std::mem::size_of::<f32>(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(
+                &common::raw(&[9.0f32, 9.0, 123.0, 9.0, 9.0]),
+                cuptr(strided_output.as_ptr()),
+            )
+            .unwrap()
+    };
+    kernel
+        .execute(
+            &[
+                TensorView::new(
+                    DevicePtr(buffers[0].as_ptr()),
+                    DataType::Float32,
+                    &a_shape,
+                    &a_strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(buffers[1].as_ptr()),
+                    DataType::Float32,
+                    &b_shape,
+                    &b_strides,
+                    ep.device_id(),
+                ),
+            ],
+            &mut [TensorMut::new(
+                DevicePtrMut(strided_output.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &strided_output_strides,
+                ep.device_id(),
+            )],
+        )
+        .unwrap();
+    runtime.synchronize().unwrap();
+    let stats = einsum_execution_stats();
+    assert_ne!(
+        stats.last_route,
+        Some(onnx_runtime_ep_cuda::CudaEinsumRoute::CudaCublas)
+    );
+    assert_eq!(stats.plan_builds, 2);
+    assert_eq!(stats.plan_rewarms, 1);
+    assert_eq!(
+        stats.zero_fill_launches, 1,
+        "the warmed dense memset must not be reused for a strided output"
+    );
+
+    let mut bytes = vec![0u8; 5 * std::mem::size_of::<f32>()];
+    unsafe {
+        runtime
+            .dtoh(&mut bytes, cuptr(strided_output.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(
+        decode_floats(&bytes, DataType::Float32),
+        [0.0, 0.0, 123.0, 0.0, 0.0],
+        "semantic zero reduction must honor output strides and preserve the gap"
+    );
+
+    for buffer in buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(contiguous_output).unwrap();
+    ep.deallocate(strided_output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn direct_snapshot_layout_mismatch_fails_closed_during_capture() {
     let _lock = suite_lock();
     let ep = require_cuda();
