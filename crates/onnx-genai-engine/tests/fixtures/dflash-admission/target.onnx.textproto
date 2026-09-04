@@ -1,0 +1,315 @@
+ir_version: 11
+graph {
+  node: [{
+    input: ["token_embedding", "tokens"]
+    output: ["hidden_2"]
+    op_type: "Gather"
+    attribute: [{
+      name: "axis"
+      type: INT
+    }]
+  }, {
+    input: ["hidden_2"]
+    output: ["hidden_7"]
+    op_type: "Identity"
+  }, {
+    input: ["hidden_7"]
+    output: ["hidden_12"]
+    op_type: "Identity"
+  }, {
+    input: ["hidden_12", "lm_head"]
+    output: ["logits"]
+    op_type: "MatMul"
+  }, {
+    input: ["past_target", "hidden_12"]
+    output: ["present_target"]
+    op_type: "Concat"
+    attribute: [{
+      name: "axis"
+      i: 1
+      type: INT
+    }]
+  }, {
+    input: ["token_history", "tokens"]
+    output: ["present_tokens"]
+    op_type: "Concat"
+    attribute: [{
+      name: "axis"
+      i: 1
+      type: INT
+    }]
+  }, {
+    input: ["recurrent"]
+    output: ["next_recurrent"]
+    op_type: "Identity"
+  }, {
+    input: ["tokens"]
+    output: ["token_shape"]
+    op_type: "Shape"
+  }, {
+    input: ["token_shape", "recurrent_width"]
+    output: ["prefix_shape"]
+    op_type: "Concat"
+    attribute: [{
+      name: "axis"
+      type: INT
+    }]
+  }, {
+    input: ["recurrent", "prefix_axis"]
+    output: ["recurrent_row"]
+    op_type: "Unsqueeze"
+  }, {
+    input: ["recurrent_row", "prefix_shape"]
+    output: ["recurrent_prefixes"]
+    op_type: "Expand"
+  }]
+  initializer: [{
+    dims: [11, 3]
+    data_type: 1
+    name: "token_embedding"
+    raw_data: "\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\200?\000\000\200?\000\000\000\000\000\000\200?\000\000\000\000\000\000\200?\000\000\000\000\000\000\200?\000\000\200?\000\000\200\277\000\000\200?\000\000\000\000\000\000\000\000\000\000\200\277\000\000\200?\000\000\200?\000\000\000\000\000\000\200\277\000\000\200\277\000\000\200?\000\000\200?\000\000\000?\000\000\000?\000\000\000?"
+  }, {
+    dims: [3, 11]
+    data_type: 1
+    name: "lm_head"
+    raw_data: "\000\000\200?\000\000\000\000\000\000\000\000\000\000\200?\000\000\200?\000\000\000\000\000\000\200\277\000\000\000\000\000\000\200?\000\000\200\277\000\000\000?\000\000\000\000\000\000\200?\000\000\000\000\000\000\200?\000\000\000\000\000\000\200?\000\000\200?\000\000\200\277\000\000\000\000\000\000\200?\000\000\200\277\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\200?\000\000\200?\000\000\000\000\000\000\200?\000\000\200\277\000\000\200\277\000\000\000?"
+  }, {
+    dims: [1]
+    data_type: 7
+    name: "recurrent_width"
+    raw_data: "\002\000\000\000\000\000\000\000"
+  }, {
+    dims: [1]
+    data_type: 7
+    name: "prefix_axis"
+    raw_data: "\001\000\000\000\000\000\000\000"
+  }]
+  input: [{
+    name: "tokens"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }]
+        }
+      }
+    }
+  }, {
+    name: "past_target"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "target_sequence"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "token_history"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "token_sequence"
+          }]
+        }
+      }
+    }
+  }, {
+    name: "recurrent"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }]
+  output: [{
+    name: "hidden_2"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "hidden_7"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "hidden_12"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 11
+          }]
+        }
+      }
+    }
+  }, {
+    name: "present_target"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "updated_target_sequence"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "present_tokens"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "updated_target_sequence"
+          }]
+        }
+      }
+    }
+  }, {
+    name: "next_recurrent"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }, {
+    name: "recurrent_prefixes"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }]
+  value_info: [{
+    name: "token_shape"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }, {
+    name: "prefix_shape"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "recurrent_row"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_value: 1
+          }, {
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }]
+}
+opset_import: [{
+  version: 24
+}]

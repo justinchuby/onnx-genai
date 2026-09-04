@@ -1,0 +1,417 @@
+ir_version: 11
+graph {
+  node: [{
+    input: ["target_features", "conditioning_split_sizes"]
+    output: ["conditioning_hidden_2", "conditioning_hidden_7", "conditioning_hidden_12"]
+    op_type: "Split"
+    attribute: [{
+      name: "axis"
+      i: 2
+      type: INT
+    }]
+  }, {
+    input: ["conditioning_hidden_2", "conditioning_hidden_7"]
+    output: ["conditioning_7"]
+    op_type: "Add"
+  }, {
+    input: ["conditioning_7", "conditioning_hidden_12"]
+    output: ["conditioning"]
+    op_type: "Add"
+  }, {
+    input: ["conditioning", "output_projection"]
+    output: ["projected_conditioning"]
+    op_type: "MatMul"
+  }, {
+    input: ["masked_positions"]
+    output: ["masked_shape"]
+    op_type: "Shape"
+  }, {
+    input: ["masked_shape", "zero_index"]
+    output: ["batch_size"]
+    op_type: "Gather"
+    attribute: [{
+      name: "axis"
+      type: INT
+    }]
+  }, {
+    input: ["batch_size", "axis_zero"]
+    output: ["batch_vector"]
+    op_type: "Unsqueeze"
+  }, {
+    input: ["batch_vector", "proposal_width"]
+    output: ["candidate_shape"]
+    op_type: "Concat"
+    attribute: [{
+      name: "axis"
+      type: INT
+    }]
+  }, {
+    input: ["candidate_seed", "candidate_shape"]
+    output: ["candidate_tokens"]
+    op_type: "Expand"
+  }, {
+    input: ["batch_vector", "probability_tail"]
+    output: ["probability_shape"]
+    op_type: "Concat"
+    attribute: [{
+      name: "axis"
+      type: INT
+    }]
+  }, {
+    input: ["probability_seed", "probability_shape"]
+    output: ["proposal_probabilities"]
+    op_type: "Expand"
+  }, {
+    input: ["past_draft", "conditioning_hidden_2"]
+    output: ["present_draft"]
+    op_type: "Concat"
+    attribute: [{
+      name: "axis"
+      i: 1
+      type: INT
+    }]
+  }]
+  initializer: [{
+    dims: [3]
+    data_type: 7
+    name: "conditioning_split_sizes"
+    raw_data: "\003\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000"
+  }, {
+    data_type: 7
+    name: "zero_index"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }, {
+    dims: [1]
+    data_type: 7
+    name: "axis_zero"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }, {
+    dims: [1]
+    data_type: 7
+    name: "proposal_width"
+    raw_data: "\003\000\000\000\000\000\000\000"
+  }, {
+    dims: [1, 3]
+    data_type: 7
+    name: "candidate_seed"
+    raw_data: "\001\000\000\000\000\000\000\000\002\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000"
+  }, {
+    dims: [2]
+    data_type: 7
+    name: "probability_tail"
+    raw_data: "\003\000\000\000\000\000\000\000\013\000\000\000\000\000\000\000"
+  }, {
+    dims: [1, 3, 11]
+    data_type: 1
+    name: "probability_seed"
+    raw_data: "\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+  }]
+  input: [{
+    name: "target_features"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 9
+          }]
+        }
+      }
+    }
+  }, {
+    name: "noise_embeddings"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_value: 4
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "masked_positions"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_value: 4
+          }]
+        }
+      }
+    }
+  }, {
+    name: "position_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "total"
+          }]
+        }
+      }
+    }
+  }, {
+    name: "attention_mask"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "total"
+          }]
+        }
+      }
+    }
+  }, {
+    name: "output_projection"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_value: 3
+          }, {
+            dim_value: 11
+          }]
+        }
+      }
+    }
+  }, {
+    name: "past_draft"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "draft_sequence"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }]
+  output: [{
+    name: "candidate_tokens"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "proposal_probabilities"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_value: 3
+          }, {
+            dim_value: 11
+          }]
+        }
+      }
+    }
+  }, {
+    name: "present_draft"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "updated_draft_sequence"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }]
+  value_info: [{
+    name: "conditioning_hidden_2"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "conditioning_hidden_7"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "conditioning_hidden_12"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "conditioning_7"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "conditioning"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }, {
+    name: "projected_conditioning"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_param: "batch"
+          }, {
+            dim_param: "verify"
+          }, {
+            dim_value: 11
+          }]
+        }
+      }
+    }
+  }, {
+    name: "masked_shape"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }, {
+    name: "batch_size"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {}
+      }
+    }
+  }, {
+    name: "batch_vector"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_value: 1
+          }]
+        }
+      }
+    }
+  }, {
+    name: "candidate_shape"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_value: 2
+          }]
+        }
+      }
+    }
+  }, {
+    name: "probability_shape"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }]
+}
+opset_import: [{
+  version: 24
+}]
