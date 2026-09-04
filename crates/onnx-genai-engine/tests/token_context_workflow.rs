@@ -1708,20 +1708,52 @@ fn assert_token_context_outputs_equal(
 fn qwen4_exp_reference_generator_is_deterministic_and_in_sync() -> anyhow::Result<()> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generate_qwen4_exp_ple_reference.py");
-    let output = Command::new("python3")
-        .arg(&script)
-        .output()
-        .with_context(|| format!("run {}", script.display()))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "reference generator failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4_exp_ple_reference.json");
+    let generate = || {
+        Command::new("python3")
+            .arg(&script)
+            .output()
+            .with_context(|| format!("run {}", script.display()))
+    };
+    let first = generate()?;
+    let second = generate()?;
+    for output in [&first, &second] {
+        anyhow::ensure!(
+            output.status.success(),
+            "reference generator failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        first.stdout, second.stdout,
+        "reference generator emitted different bytes across identical runs"
+    );
+    assert!(
+        !first.stdout.contains(&b'\r'),
+        "reference generator must emit canonical LF bytes even on Windows"
+    );
+    assert!(
+        first.stdout.ends_with(b"\n") && !first.stdout.ends_with(b"\n\n"),
+        "reference generator must emit exactly one canonical final newline"
     );
     assert_eq!(
-        output.stdout,
+        first.stdout,
         include_bytes!("fixtures/qwen4_exp_ple_reference.json"),
-        "checked-in vectors are stale; rerun {}",
-        script.display()
+        "checked-in vectors are stale; rerun {} --output {}",
+        script.display(),
+        fixture.display()
+    );
+    let check = Command::new("python3")
+        .arg(&script)
+        .arg("--check")
+        .arg(&fixture)
+        .output()
+        .with_context(|| format!("check {}", fixture.display()))?;
+    anyhow::ensure!(
+        check.status.success(),
+        "reference generator rejected its canonical fixture: {}",
+        String::from_utf8_lossy(&check.stderr)
     );
     Ok(())
 }

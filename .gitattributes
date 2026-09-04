@@ -10,6 +10,11 @@
 # passes on Windows checkouts (autocrlf would otherwise convert it to CRLF).
 schema/inference_metadata.schema.json text eol=lf
 
+# The Qwen4 reference generator and fixture are compared byte-for-byte. Keep
+# both canonical on checkout so Git for Windows cannot make the artifact stale.
+crates/onnx-genai-engine/tests/fixtures/generate_qwen4_exp_ple_reference.py text eol=lf
+crates/onnx-genai-engine/tests/fixtures/qwen4_exp_ple_reference.json text eol=lf
+
 # Catalogue metadata examples are embedded with include_str! and matched line by
 # line in tests (e.g. crates/onnx-genai-metadata/tests/gemma4_e2b_workflow.rs
 # mutates specific `\n`-terminated lines). Force LF so autocrlf does not turn a

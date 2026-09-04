@@ -31,7 +31,16 @@ normalization followed by each stream's learned `1 + weight` scale, signed-root
 sigmoid gate, depthwise dilated convolution, and residual injection. Distinct
 deterministic synthetic scales cover `norm_key`, `norm_query`, and `norm_conv`.
 It emits checked-in vectors for full, two-chunk, and single-token decode
-boundaries.
+boundaries. Serialization sorts object keys, rejects non-finite values, encodes
+UTF-8 explicitly, and writes canonical LF bytes without platform text-newline
+translation. Regenerate from the repository root with:
+
+```shell
+python3 crates/onnx-genai-engine/tests/fixtures/generate_qwen4_exp_ple_reference.py \
+  --output crates/onnx-genai-engine/tests/fixtures/qwen4_exp_ple_reference.json
+```
+
+The generator's `--check` mode compares exact bytes.
 
 The vectors use deterministic synthetic weights and reduced table/hidden
 geometry so they remain small and hermetic. They establish **reference

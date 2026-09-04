@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 
 
@@ -284,21 +285,38 @@ def fixture() -> dict[str, object]:
     }
 
 
-def rendered() -> str:
-    return json.dumps(fixture(), indent=2, sort_keys=True) + "\n"
+def rendered() -> bytes:
+    document = json.dumps(
+        fixture(),
+        allow_nan=False,
+        ensure_ascii=True,
+        indent=2,
+        separators=(",", ": "),
+        sort_keys=True,
+    )
+    return (document + "\n").encode("utf-8")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--check", type=Path)
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument("--check", type=Path)
+    destination.add_argument("--output", type=Path)
     args = parser.parse_args()
     output = rendered()
-    if args.check is None:
-        print(output, end="")
+    if args.check is not None:
+        expected = args.check.read_bytes()
+        if expected != output:
+            raise SystemExit(
+                f"{args.check} is stale; regenerate it with "
+                f"{Path(__file__)} --output {args.check}"
+            )
         return 0
-    expected = args.check.read_text(encoding="utf-8")
-    if expected != output:
-        raise SystemExit(f"{args.check} is stale; regenerate it with this script")
+    if args.output is not None:
+        args.output.write_bytes(output)
+        return 0
+    # Bypass TextIOWrapper so Windows cannot translate canonical LF bytes to CRLF.
+    sys.stdout.buffer.write(output)
     return 0
 
 
