@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use anyhow::Context as _;
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef};
 use onnx_std::Model;
 
@@ -8,8 +9,8 @@ pub const TARGET_FILE: &str = "target.onnx.textproto";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Documents {
-    pub proposer: String,
-    pub target: String,
+    pub proposer: Vec<u8>,
+    pub target: Vec<u8>,
 }
 
 fn tensor_f32(shape: Vec<usize>, values: &[f32]) -> TensorData {
@@ -472,18 +473,54 @@ fn proposer_model() -> Model {
     Model::new(graph)
 }
 
-pub fn documents() -> onnx_std::Result<Documents> {
+fn canonical_textproto_bytes(name: &str, model: &Model) -> anyhow::Result<Vec<u8>> {
+    let document = onnx_std::textproto::to_textproto(model)?;
+    anyhow::ensure!(
+        !document.as_bytes().contains(&b'\r'),
+        "{name} TextFormat generator emitted a carriage return; canonical artifacts are UTF-8/LF"
+    );
+    Ok(document.into_bytes())
+}
+
+pub fn documents() -> anyhow::Result<Documents> {
     Ok(Documents {
-        proposer: onnx_std::textproto::to_textproto(&proposer_model())?,
-        target: onnx_std::textproto::to_textproto(&target_model())?,
+        proposer: canonical_textproto_bytes(PROPOSER_FILE, &proposer_model())?,
+        target: canonical_textproto_bytes(TARGET_FILE, &target_model())?,
     })
 }
 
 #[allow(dead_code)]
 pub fn write(root: &Path) -> anyhow::Result<()> {
     let documents = documents()?;
-    std::fs::create_dir_all(root)?;
-    std::fs::write(root.join(PROPOSER_FILE), documents.proposer)?;
-    std::fs::write(root.join(TARGET_FILE), documents.target)?;
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("create DFlash fixture directory {}", root.display()))?;
+    for (file, document) in [
+        (PROPOSER_FILE, documents.proposer.as_slice()),
+        (TARGET_FILE, documents.target.as_slice()),
+    ] {
+        let path = root.join(file);
+        std::fs::write(&path, document)
+            .with_context(|| format!("write canonical DFlash fixture {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn check(root: &Path) -> anyhow::Result<()> {
+    let documents = documents()?;
+    for (file, expected) in [
+        (PROPOSER_FILE, documents.proposer.as_slice()),
+        (TARGET_FILE, documents.target.as_slice()),
+    ] {
+        let path = root.join(file);
+        let committed = std::fs::read(&path)
+            .with_context(|| format!("read maintained DFlash fixture {}", path.display()))?;
+        anyhow::ensure!(
+            committed == expected,
+            "{} is stale or not canonical UTF-8/LF; regenerate with \
+             `cargo run -p onnx-genai-engine --example generate_dflash_admission_fixture`",
+            path.display()
+        );
+    }
     Ok(())
 }

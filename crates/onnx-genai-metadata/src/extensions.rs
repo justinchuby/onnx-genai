@@ -662,6 +662,21 @@ filename, tensor name, or optimization availability.\n",
     document
 }
 
+/// Render the registry as its committed byte representation: UTF-8 with LF
+/// line endings and exactly one final newline.
+pub fn extension_registry_markdown_bytes() -> Vec<u8> {
+    let document = extension_registry_markdown();
+    assert!(
+        !document.as_bytes().contains(&b'\r'),
+        "extension registry renderer must emit LF, never CR or CRLF"
+    );
+    assert!(
+        document.ends_with('\n') && !document.ends_with("\n\n"),
+        "extension registry renderer must emit exactly one final LF"
+    );
+    document.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

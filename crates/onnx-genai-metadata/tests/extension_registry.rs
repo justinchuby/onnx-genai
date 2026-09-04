@@ -3,7 +3,7 @@ use onnx_genai_metadata::{
         ATEM_XML_V1, BUILTIN_EXTENSIONS, CORE_CONFORMANCE, DFLASH_FLAT_BLOCK_V1,
         ExtensionAdmissionError, ExtensionConsumerSupport, ExtensionSurface, FallbackClass,
         KV_CHECKPOINT_V1, SPECULATIVE_V1, SupportStatus, TAGGED_JSON_V1, TOKEN_CONTEXT_V1,
-        admit_exact, extension_registry_markdown, find,
+        admit_exact, extension_registry_markdown_bytes, find,
     },
     inference_metadata_schema_json, parse_metadata,
     version::{
@@ -15,10 +15,29 @@ use onnx_genai_metadata::{
 
 #[test]
 fn committed_extension_registry_is_generated_from_the_machine_source() {
+    let generated = extension_registry_markdown_bytes();
+    assert!(std::str::from_utf8(&generated).is_ok());
+    assert!(
+        !generated.contains(&b'\r'),
+        "generated registry must use LF even on Windows"
+    );
+    assert!(
+        generated.ends_with(b"\n") && !generated.ends_with(b"\n\n"),
+        "generated registry must have exactly one final LF"
+    );
     assert_eq!(
-        include_str!("../../../docs/genai/METADATA_EXTENSION_REGISTRY.md"),
-        extension_registry_markdown(),
+        include_bytes!("../../../docs/genai/METADATA_EXTENSION_REGISTRY.md"),
+        generated.as_slice(),
         "regenerate with `cargo run -p onnx-genai-metadata --bin gen_extension_registry`"
+    );
+    let check = std::process::Command::new(env!("CARGO_BIN_EXE_gen_extension_registry"))
+        .arg("--check")
+        .output()
+        .expect("run extension-registry exact-byte check");
+    assert!(
+        check.status.success(),
+        "extension-registry exact-byte check failed: {}",
+        String::from_utf8_lossy(&check.stderr)
     );
 }
 
