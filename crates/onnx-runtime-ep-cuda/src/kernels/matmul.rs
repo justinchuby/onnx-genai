@@ -14,10 +14,8 @@
 //! * mismatched inner dims / dtypes → a plain kernel error (a real mistake, not
 //!   a missing feature)
 
-use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use cudarc::cublaslt::{result as cublaslt, sys as cublaslt_sys};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
     DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
@@ -25,8 +23,8 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{DataType, Node};
 
-use crate::blas::{self, GemmDtype, GemmParams, WORKSPACE_BYTES};
-use crate::error::{cublas_err, driver_err, not_implemented};
+use crate::blas::{self, GemmDtype, GemmParams};
+use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
 
 /// NVRTC module/entry for the dense decode GEMVs.
@@ -121,11 +119,10 @@ struct MatMulWarmState {
     /// while eliminating all capture-time setup and device allocation.
     f32_gemv: Option<F32GemvPlan>,
     /// cuBLASLt plans + persistent workspaces keyed by the 2-D (`batch == 1`)
-    /// dense shape `(dtype, M, K, N)`. Each distinct shape the node runs keeps
-    /// its own preselected algorithm, so alternating shapes — prefill `M>1`,
-    /// decode `M==1`, and a speculative `M=K` verify width — all replay without
-    /// a per-call heuristic query, keeping the plain-`MatMul` path (e.g. the
-    /// logits projection `lm_head`) CUDA-graph capturable across shape changes.
+    /// dense shape and the selected algorithm's pointer-alignment contract.
+    /// Each compatible shape the node runs keeps its own preselected algorithm,
+    /// so alternating prefill/decode/verify shapes replay without a per-call
+    /// heuristic query while a weaker-aligned subview is replanned safely.
     /// MRU-ordered (front = most recent); bounded by [`DENSE_PLAN_CACHE_CAP`].
     dense_plans: Vec<DenseGemmPlan>,
     /// Immutable signature and exact private workspace owner from the most
@@ -162,138 +159,57 @@ struct F32GemvPlan {
     runtime: Arc<CudaRuntime>,
     k: usize,
     n: usize,
-    handle: cublaslt_sys::cublasLtHandle_t,
-    desc: cublaslt_sys::cublasLtMatmulDesc_t,
-    a_layout: cublaslt_sys::cublasLtMatrixLayout_t,
-    b_layout: cublaslt_sys::cublasLtMatrixLayout_t,
-    c_layout: cublaslt_sys::cublasLtMatrixLayout_t,
-    algo: cublaslt_sys::cublasLtMatmulAlgo_t,
+    plan: blas::CaptureGemmPlan,
     workspace: Option<Arc<GraphDeviceAllocation>>,
-    workspace_bytes: usize,
 }
 
 // SAFETY: cuBLASLt handles/descriptors are context-independent host objects.
 // Calls through a plan are serialized by `MatMulKernel::f32_gemv`.
 unsafe impl Send for F32GemvPlan {}
 
-impl Drop for F32GemvPlan {
-    fn drop(&mut self) {
-        // SAFETY: every object was created once by `F32GemvPlan::new` and is
-        // destroyed exactly once after the plan can no longer be launched.
-        unsafe {
-            if !self.c_layout.is_null() {
-                let _ = cublaslt::destroy_matrix_layout(self.c_layout);
-            }
-            if !self.b_layout.is_null() {
-                let _ = cublaslt::destroy_matrix_layout(self.b_layout);
-            }
-            if !self.a_layout.is_null() {
-                let _ = cublaslt::destroy_matrix_layout(self.a_layout);
-            }
-            if !self.desc.is_null() {
-                let _ = cublaslt::destroy_matmul_desc(self.desc);
-            }
-            if !self.handle.is_null() {
-                let _ = cublaslt::destroy_handle(self.handle);
-            }
-        }
-    }
-}
-
 impl F32GemvPlan {
-    fn new(runtime: Arc<CudaRuntime>, k: usize, n: usize) -> Result<Self> {
-        let mut plan = Self {
+    fn new(runtime: Arc<CudaRuntime>, k: usize, n: usize, a: u64, b: u64, c: u64) -> Result<Self> {
+        let params = dense_gemm_params(GemmDtype::F32, 1, k, n, a, b, c);
+        let plan = blas::plan_capture_gemm(runtime.blas(), &params)?;
+        let workspace = if plan.workspace_bytes() > 0 {
+            Some(GraphDeviceAllocation::allocate(
+                &runtime,
+                plan.workspace_bytes(),
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
             runtime,
             k,
             n,
-            handle: std::ptr::null_mut(),
-            desc: std::ptr::null_mut(),
-            a_layout: std::ptr::null_mut(),
-            b_layout: std::ptr::null_mut(),
-            c_layout: std::ptr::null_mut(),
-            // SAFETY: the algorithm is not read until the heuristic initializes it.
-            algo: unsafe { std::mem::zeroed() },
-            workspace: None,
-            workspace_bytes: 0,
-        };
-        plan.handle = cublaslt::create_handle().map_err(|e| cublas_err("cublasLtCreate", e))?;
-        let dt = cublaslt_sys::cudaDataType_t::CUDA_R_32F;
-        plan.a_layout = cublaslt::create_matrix_layout(dt, n as u64, k as u64, n as i64)
-            .map_err(|e| cublas_err("cublasLtMatrixLayoutCreate(B)", e))?;
-        plan.b_layout = cublaslt::create_matrix_layout(dt, k as u64, 1, k as i64)
-            .map_err(|e| cublas_err("cublasLtMatrixLayoutCreate(A)", e))?;
-        plan.c_layout = cublaslt::create_matrix_layout(dt, n as u64, 1, n as i64)
-            .map_err(|e| cublas_err("cublasLtMatrixLayoutCreate(C)", e))?;
-        plan.desc =
-            cublaslt::create_matmul_desc(cublaslt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, dt)
-                .map_err(|e| cublas_err("cublasLtMatmulDescCreate", e))?;
-        let pref = cublaslt::create_matmul_pref()
-            .map_err(|e| cublas_err("cublasLtMatmulPreferenceCreate", e))?;
-        let heuristic_result = (|| {
-            unsafe {
-                cublaslt::set_matmul_pref_attribute(
-                    pref,
-                    cublaslt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                    (&WORKSPACE_BYTES) as *const usize as *const c_void,
-                    std::mem::size_of::<usize>(),
-                )
-            }
-            .map_err(|e| cublas_err("set MAX_WORKSPACE_BYTES", e))?;
-            unsafe {
-                cublaslt::get_matmul_algo_heuristic(
-                    plan.handle,
-                    plan.desc,
-                    plan.a_layout,
-                    plan.b_layout,
-                    plan.c_layout,
-                    plan.c_layout,
-                    pref,
-                )
-            }
-            .map_err(|e| cublas_err("select f32 M==1 MatMul algorithm", e))
-        })();
-        // SAFETY: `pref` is live and is never retained by the selected algorithm.
-        unsafe {
-            let _ = cublaslt::destroy_matmul_pref(pref);
-        }
-        let heuristic = heuristic_result?;
-        plan.algo = heuristic.algo;
-        plan.workspace_bytes = heuristic.workspaceSize;
-        if plan.workspace_bytes > 0 {
-            plan.workspace = Some(GraphDeviceAllocation::allocate(
-                &plan.runtime,
-                plan.workspace_bytes,
-            )?);
-        }
-        Ok(plan)
+            plan,
+            workspace,
+        })
+    }
+
+    fn matches(&self, k: usize, n: usize, a: u64, b: u64, c: u64) -> bool {
+        self.k == k
+            && self.n == n
+            && self
+                .plan
+                .supports(&dense_gemm_params(GemmDtype::F32, 1, k, n, a, b, c))
     }
 
     fn launch(&self, stream: cudarc::driver::sys::CUstream, a: u64, b: u64, c: u64) -> Result<()> {
-        let alpha = 1.0f32;
-        let beta = 0.0f32;
+        let params = dense_gemm_params(GemmDtype::F32, 1, self.k, self.n, a, b, c);
+        // SAFETY: pointers and workspace satisfy the contract established by
+        // the shared cuBLASLt planner.
         unsafe {
-            cublaslt::matmul(
-                self.handle,
-                self.desc,
-                (&alpha) as *const f32 as *const c_void,
-                (&beta) as *const f32 as *const c_void,
-                b as *const c_void,
-                self.a_layout,
-                a as *const c_void,
-                self.b_layout,
-                c as *const c_void,
-                self.c_layout,
-                c as *mut c_void,
-                self.c_layout,
-                (&self.algo) as *const cublaslt_sys::cublasLtMatmulAlgo_t,
+            self.plan.launch(
+                self.runtime.blas(),
+                stream,
+                &params,
                 self.workspace
                     .as_ref()
-                    .map_or(0, |workspace| workspace.ptr()) as *mut c_void,
-                self.workspace_bytes,
-                stream as cublaslt_sys::cudaStream_t,
+                    .map_or(0, |workspace| workspace.ptr()),
             )
         }
-        .map_err(|e| cublas_err("cublasLtMatmul f32 M==1", e))
     }
 
     fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
@@ -323,18 +239,38 @@ struct DenseGemmPlan {
 unsafe impl Send for DenseGemmPlan {}
 
 impl DenseGemmPlan {
-    fn matches(&self, dtype: GemmDtype, m: usize, k: usize, n: usize) -> bool {
-        self.dtype == dtype && self.m == m && self.k == k && self.n == n
+    #[allow(clippy::too_many_arguments)]
+    fn matches(
+        &self,
+        dtype: GemmDtype,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: u64,
+        b: u64,
+        c: u64,
+    ) -> bool {
+        self.dtype == dtype
+            && self.m == m
+            && self.k == k
+            && self.n == n
+            && self
+                .plan
+                .supports(&dense_gemm_params(dtype, m, k, n, a, b, c))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         runtime: Arc<CudaRuntime>,
         dtype: GemmDtype,
         m: usize,
         k: usize,
         n: usize,
+        a: u64,
+        b: u64,
+        c: u64,
     ) -> Result<Self> {
-        let params = dense_gemm_params(dtype, m, k, n, 0, 0, 0);
+        let params = dense_gemm_params(dtype, m, k, n, a, b, c);
         let plan = blas::plan_capture_gemm(runtime.blas(), &params)?;
         let workspace_bytes = plan.workspace_bytes();
         let workspace = if workspace_bytes > 0 {
@@ -919,7 +855,7 @@ impl MatMulKernel {
         if state
             .f32_gemv
             .as_ref()
-            .is_some_and(|candidate| candidate.k == k && candidate.n == n)
+            .is_some_and(|candidate| candidate.matches(k, n, a_ptr, b_ptr, c_ptr))
         {
             let cached = state.f32_gemv.as_ref().unwrap();
             let resource = cached.device_graph_resource();
@@ -937,7 +873,7 @@ impl MatMulKernel {
                 "cuda_ep MatMul: f32 GEMV K={k}, N={n} was not warmed before capture"
             )));
         }
-        let candidate = F32GemvPlan::new(self.runtime.clone(), k, n)?;
+        let candidate = F32GemvPlan::new(self.runtime.clone(), k, n, a_ptr, b_ptr, c_ptr)?;
         self.runtime
             .staged_warm_cache_mutation("MatMul f32 GEMV plan/workspace creation")?;
         if state.f32_gemv.is_some() {
@@ -954,12 +890,11 @@ impl MatMulKernel {
     /// Launch a plain 2-D (`batch == 1`) dense M>1 GEMM through a cached
     /// cuBLASLt plan (algorithm + persistent workspace) selected once at warmup.
     ///
-    /// Reusing the heuristic-selected algorithm reproduces the per-call
-    /// [`governed_gemm`](crate::blas::governed_gemm) arithmetic bit-for-bit at a
-    /// fixed shape, while eliminating the capture-time heuristic query,
-    /// allocation, and synchronization — so the launch is legal to record into
-    /// and replay from a CUDA graph. Mirrors [`Self::launch_dense_gemv_f32`]'s
-    /// warm-once / reject-cold-miss-during-capture contract.
+    /// Reusing the heuristic-selected algorithm preserves the shared cuBLASLt
+    /// precision contract at a fixed shape and pointer-alignment class while
+    /// eliminating the capture-time heuristic query, allocation, and
+    /// synchronization. Mirrors [`Self::launch_dense_gemv_f32`]'s warm-once /
+    /// reject-cold-miss-during-capture contract.
     #[allow(clippy::too_many_arguments)]
     fn launch_dense_capturable(
         &self,
@@ -973,15 +908,14 @@ impl MatMulKernel {
         c_ptr: u64,
     ) -> Result<Vec<DeviceGraphResource>> {
         let capturing = self.runtime.is_capturing()?;
-        // Shape-keyed lookup: every distinct (dtype, M, K, N) the node runs keeps
-        // its own warm cuBLASLt plan + workspace, so alternating shapes (prefill
-        // M>1, decode M==1, a speculative verify width) all replay a preselected
-        // algorithm with no per-call heuristic query. A hit is promoted to MRU so
-        // the hot decode shape is never the LRU eviction victim.
+        // Shape/alignment-contract lookup: a plan is reusable only when the
+        // current tensor origins prove the selected algorithm's requirements.
+        // A hit is promoted to MRU so the hot decode shape is not the LRU
+        // eviction victim.
         if let Some(idx) = state
             .dense_plans
             .iter()
-            .position(|plan| plan.matches(dtype, m, k, n))
+            .position(|plan| plan.matches(dtype, m, k, n, a_ptr, b_ptr, c_ptr))
         {
             let resource = state.dense_plans[idx].device_graph_resource();
             if capturing && let Some(resource) = &resource {
@@ -1008,7 +942,8 @@ impl MatMulKernel {
                  was not warmed before capture"
             )));
         }
-        let candidate = DenseGemmPlan::new(self.runtime.clone(), dtype, m, k, n)?;
+        let candidate =
+            DenseGemmPlan::new(self.runtime.clone(), dtype, m, k, n, a_ptr, b_ptr, c_ptr)?;
         self.runtime
             .staged_warm_cache_mutation("MatMul dense plan/workspace creation")?;
         if state.dense_plans.len() == DENSE_PLAN_CACHE_CAP {

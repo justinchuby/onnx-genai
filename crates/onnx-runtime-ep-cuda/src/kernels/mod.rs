@@ -509,7 +509,20 @@ static CUDA_ATTENTION_DTYPES: &[DataType] = &[
 /// Bounded CUDA Unique consumes f32 and returns f32 Y plus i64 metadata.
 static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 static CUDA_NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
-static CUDA_EINSUM_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16];
+static CUDA_EINSUM_DTYPES: &[DataType] = &[
+    DataType::Float16,
+    DataType::Float32,
+    DataType::Float64,
+    DataType::BFloat16,
+    DataType::Uint8,
+    DataType::Uint16,
+    DataType::Uint32,
+    DataType::Uint64,
+    DataType::Int8,
+    DataType::Int16,
+    DataType::Int32,
+    DataType::Int64,
+];
 
 /// Element types the CUDA EP advertises for `(op_type, domain)`.
 ///

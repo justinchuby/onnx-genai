@@ -77,7 +77,7 @@ plugin EPs (via C ABI bridge) handle them.
 | DequantizeLinear | 10 | INT4/INT8 weight dequantization. |
 | QuantizeLinear | 10 | Activation quantization. |
 | QLinearMatMul | 10 | Quantized matmul. |
-| Einsum | 12, 28 | Schema-aware universal semantic/index plan for every legal expression, with `Einsum-12` selected for imported opsets 12..27 and `Einsum-28` for opset 28+ (adding BF16). The CPU EP executes the full schema dtype set and arbitrary legal 1..N expressions through zero-copy views, reduction/product, MatMul/BMM, bounded exact-DP/greedy trees, or the mandatory GenericNative fallback. CUDA retains staged float32/float16 view/diagonal and flat GEMM/BMM coverage. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md), [EINSUM_CONFORMANCE.md](../testing/EINSUM_CONFORMANCE.md), and [CUDA_COVERAGE.md](CUDA_COVERAGE.md). |
+| Einsum | 12, 28 | Schema-aware universal semantic/index plan for every legal expression, with `Einsum-12` selected for imported opsets 12..27 and `Einsum-28` for opset 28+ (adding BF16). CPU and CUDA execute the full schema dtype set and arbitrary legal 1..N expressions through zero-copy views, reduction/product, MatMul/BMM, bounded exact-DP/greedy trees, or the mandatory GenericNative fallback; CUDA retains capture-safe snapshots and cuBLASLt fast paths when the complete layout/alignment contract matches. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md), [EINSUM_CONFORMANCE.md](../testing/EINSUM_CONFORMANCE.md), and [CUDA_COVERAGE.md](CUDA_COVERAGE.md). |
 | Tile | 6 | Repeat for broadcasting. |
 | Range | 11 | Position IDs generation. |
 | CumSum | 11 | Position computation. |

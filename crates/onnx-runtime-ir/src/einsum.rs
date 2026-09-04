@@ -495,6 +495,18 @@ impl EinsumPrecisionPolicy {
         }
     }
 
+    /// Resolve the precision contract for a dtype admitted by `schema`.
+    ///
+    /// Shape-only execution-provider factories can use this at runtime without
+    /// reparsing the equation or reconstructing the schema/type table.
+    pub fn for_schema(schema: EinsumSchema, dtype: DataType) -> Option<Self> {
+        if schema.supports_dtype(dtype) {
+            Some(Self::for_dtype(dtype))
+        } else {
+            None
+        }
+    }
+
     /// Homogeneous ONNX input/output dtype.
     pub const fn input_output_dtype(self) -> DataType {
         self.input_output_dtype

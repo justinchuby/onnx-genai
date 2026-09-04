@@ -170,7 +170,7 @@ Precision is IR data, not a backend fast-path choice:
   wrapping modulo `2^width` so signed overflow never relies on host-language
   undefined behavior.
 
-## CPU execution and staged CUDA execution
+## Native CPU/CUDA execution
 
 The native CPU EP consumes the semantic plan directly and executes every legal
 equation through one of these observable routes:
@@ -184,15 +184,35 @@ equation through one of these observable routes:
   fits, or when bounded planning intentionally returns
   `GenericNativeFallback`.
 
-Generic and tree execution read arbitrary strided inputs, compute into
+CPU generic and tree execution read arbitrary strided inputs, compute into
 execution-local typed scratch, and publish the output only after successful
 completion. Output tiles may run in parallel, but each output retains the same
-canonical input-product and reduction order. Float16/BFloat16 use Float32
-accumulators and narrow once; Float32 and Float64 retain their widths; integers
-use wrapping arithmetic at their declared width. BFloat16 remains gated to
-Einsum-28.
+canonical input-product and reduction order.
 
-Current CUDA continues executing its existing float32/float16 view/diagonal and
-flat GEMM/BMM paths and may temporarily decline GenericNative, general
-contraction-tree execution, and bfloat16 execution with an actionable
-staged-implementation message.
+The CUDA EP executes every expression and homogeneous numeric dtype legal under
+the resolved schema. Its immutable, shape-specialized `CudaEinsumPlan` consumes
+the canonical index program directly, uploads metadata and selects algorithms
+during warmup, and records only exact warmed signatures into CUDA graphs.
+`GenericNative` assigns output tiles directly and loops the canonical reduction
+space on device, so arbitrary-N expressions require no exponential
+intermediate. Bounded exact-DP/greedy trees reuse device temporary slots and may
+use cuBLASLt for f32 binary steps only when storage, accumulation, broadcast,
+and output-layout contracts match; otherwise that step remains generic.
+cuBLASLt selection receives the alignment proven by each actual tensor origin
+(base pointer plus byte offset), and the cached plan records the selected
+algorithm's minimum A/B/C/D alignment so later launches cannot silently weaken
+that proof. Direct snapshot reuse also requires the exact warmed dtype, shapes,
+input/output strides, byte offsets, devices, contraction/transpose
+interpretation, and non-aliasing constraint. F16/BF16 cuBLASLt selection
+excludes in-place and output-type split-K reductions, then verifies the selected
+split-K/reduction configuration; unsupported alignment or precision contracts
+fall back to `GenericNative`.
+One transactional arithmetic snapshot owns both the selected Auto route and all
+of its private device resources. Capture reuses that exact direct-or-semantic
+decision instead of redispatching, and every private pointer is checked against
+the active graph's registered ownership set before launch. Failed replacement
+warms leave the prior complete snapshot installed.
+F16/BF16 inputs and intermediates accumulate in f32 and narrow once at the final
+output. Integer arithmetic uses explicit unsigned intermediates and narrows
+after each operation, implementing exact declared-width modular arithmetic
+without signed-overflow behavior.

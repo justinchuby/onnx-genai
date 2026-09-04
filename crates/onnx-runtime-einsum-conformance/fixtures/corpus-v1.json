@@ -16,8 +16,8 @@
       "oracle_work_items": 2000000
     }
   },
-  "expected_case_count": 160,
+  "expected_case_count": 161,
   "expected_malformed_count": 24,
   "expected_route_probe_count": 348,
-  "generated_sha256": "733a01e6ca3397cff8761c00062fd7b603b9d3b23f6f599751ac1a5ddbd21bbd"
+  "generated_sha256": "2171a986d96e3fc91395610448acfdfa8333aa5923b1cbd2e45e13a0f440e682"
 }

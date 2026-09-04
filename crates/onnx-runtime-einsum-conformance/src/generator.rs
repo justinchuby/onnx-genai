@@ -83,7 +83,7 @@ pub fn named_cases() -> Vec<CaseRecord> {
             route_probes.extend(optimized_route_probes(arity));
         }
         if matmul {
-            route_probes.extend(matmul_route_probes());
+            route_probes.extend(matmul_route_probes(dtype));
         }
         cases.push(CaseRecord {
             id: id.into(),
@@ -357,6 +357,22 @@ pub fn named_cases() -> Vec<CaseRecord> {
         "scalar-product-64-operands",
         &high_arity_equation,
         &high_arity_refs,
+        ConformanceDType::Float32,
+        12,
+        ValueProfile::Finite,
+        false,
+    );
+    let max_depth_arity = 128;
+    let max_depth_equation = format!("{}->", ",".repeat(max_depth_arity - 1));
+    let max_depth_shapes = vec![Vec::new(); max_depth_arity];
+    let max_depth_refs = max_depth_shapes
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    push(
+        "scalar-product-128-operands",
+        &max_depth_equation,
+        &max_depth_refs,
         ConformanceDType::Float32,
         12,
         ValueProfile::Finite,
@@ -1012,7 +1028,10 @@ fn optimized_named_case(id: &str) -> bool {
         )
 }
 
-fn matmul_route_probes() -> Vec<RouteProbe> {
+fn matmul_route_probes(dtype: ConformanceDType) -> Vec<RouteProbe> {
+    if !matches!(dtype, ConformanceDType::Float16 | ConformanceDType::Float32) {
+        return Vec::new();
+    }
     vec![
         RouteProbe {
             backend: BackendKind::Cpu,

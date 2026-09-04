@@ -5,7 +5,7 @@ use onnx_runtime_ir::{
     EinsumContractionCost, EinsumContractionTreeStep, EinsumCostBound, EinsumExecutionSelection,
     EinsumInput, EinsumIntegerOverflowSemantics, EinsumOpsetPlanError, EinsumPlan,
     EinsumPlanErrorKind, EinsumPlannerBudget, EinsumPlannerFallbackReason, EinsumPlannerQuality,
-    EinsumSchema, EinsumShapePlan, EinsumTemporaryStoragePolicy,
+    EinsumPrecisionPolicy, EinsumSchema, EinsumShapePlan, EinsumTemporaryStoragePolicy,
 };
 
 type LegalCase<'a> = (&'a str, Vec<&'a [usize]>, Vec<usize>);
@@ -107,12 +107,20 @@ fn precision_policy_is_explicit_and_backend_neutral() {
         };
         let plan = plan(schema, "->", dtype, &[&scalar]);
         let policy = plan.precision_policy();
+        assert_eq!(
+            EinsumPrecisionPolicy::for_schema(schema, dtype),
+            Some(policy)
+        );
         assert_eq!(policy.input_output_dtype(), dtype);
         assert_eq!(policy.accumulator_dtype(), DataType::Float32);
         assert_eq!(policy.intermediate_dtype(), DataType::Float32);
         assert!(policy.narrow_once_at_output());
         assert_eq!(policy.integer_overflow(), None);
     }
+    assert_eq!(
+        EinsumPrecisionPolicy::for_schema(EinsumSchema::V12, DataType::BFloat16),
+        None
+    );
     for dtype in [DataType::Float32, DataType::Float64] {
         let policy = plan(EinsumSchema::V12, "->", dtype, &[&scalar]).precision_policy();
         assert_eq!(policy.accumulator_dtype(), dtype);
