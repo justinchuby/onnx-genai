@@ -1885,14 +1885,14 @@ pub enum StateUpdate {
     ///
     /// The valid region is the whole tensor, so no write cursor is graph-visible
     /// and the buffer's shape carries the length.
-    Append,
+    Append {},
     /// Each step replaces the complete fixed-size state tensor.
     ///
     /// This is the common discipline for recurrent accumulators, state-space
     /// carries, and causal-convolution history. The algorithm does not need a
     /// distinct state kind: separate groups already declare each tensor's
     /// shape, ports, lifetime, and rollback behavior.
-    Replace,
+    Replace {},
     /// Each step's positions are scattered into a buffer of FIXED capacity at
     /// destinations the graph reads from `write_indices`.
     ///

@@ -191,7 +191,7 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<DecoderAb
             continue;
         };
         if group.kind == StateKind::CompressedAttention {
-            let append = !matches!(group.update, Some(StateUpdate::Replace));
+            let append = !matches!(group.update, Some(StateUpdate::Replace {}));
             for (input, output) in ports.pairs() {
                 writes_attention_state = true;
                 if append {

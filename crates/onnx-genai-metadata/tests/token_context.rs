@@ -160,7 +160,7 @@ fn fixture() -> InferenceMetadata {
         .clone();
     token_group.kind = StateKind::Recurrent;
     token_group.layout = "bt".to_string();
-    token_group.update = Some(StateUpdate::Replace);
+    token_group.update = Some(StateUpdate::Replace {});
     token_group.capabilities = StateGroupCapabilities {
         rollback_positions: None,
         snapshot: true,

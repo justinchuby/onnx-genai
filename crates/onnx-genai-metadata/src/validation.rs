@@ -7647,7 +7647,7 @@ fn validate_state_group_properties(
                      compression recurrence, which this contract does not define"
                 ));
             }
-            let update = group.update.as_ref().unwrap_or(&StateUpdate::Append);
+            let update = group.update.as_ref().unwrap_or(&StateUpdate::Append {});
             for (component, aliases) in &group.ports {
                 for (cell, alias) in aliases {
                     let Some(role) = alias.role else {
@@ -7658,10 +7658,10 @@ fn validate_state_group_properties(
                         continue;
                     };
                     let role_matches_update = match update {
-                        StateUpdate::Append => {
+                        StateUpdate::Append {} => {
                             matches!(role, StatePortRole::CompressedKv | StatePortRole::IndexKey)
                         }
-                        StateUpdate::Replace => matches!(
+                        StateUpdate::Replace {} => matches!(
                             role,
                             StatePortRole::CompressionCarry | StatePortRole::IndexCarry
                         ),
@@ -7697,7 +7697,7 @@ fn validate_state_group_properties(
                                  declares batch axis {batch_axis:?} outside rank {rank}"
                             ));
                         }
-                        if matches!(update, StateUpdate::Append)
+                        if matches!(update, StateUpdate::Append {})
                             && batch_axis == group.sequence_axis
                         {
                             errors.push(format!(
@@ -7824,7 +7824,7 @@ fn validate_state_update(
     errors: &mut Vec<String>,
 ) {
     match &group.update {
-        Some(crate::schema::StateUpdate::Append)
+        Some(crate::schema::StateUpdate::Append {})
         | Some(crate::schema::StateUpdate::IndexedScatter { .. })
             if group.sequence_axis.is_none() =>
         {
@@ -7833,7 +7833,7 @@ fn validate_state_update(
                  sequence_axis"
             ));
         }
-        Some(crate::schema::StateUpdate::Replace) => {
+        Some(crate::schema::StateUpdate::Replace {}) => {
             if group.sequence_axis.is_some() {
                 errors.push(format!(
                     "state service group '{group_name}' uses replace for fixed-size state but \
