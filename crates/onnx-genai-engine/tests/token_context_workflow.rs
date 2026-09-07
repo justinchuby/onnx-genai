@@ -1737,9 +1737,11 @@ fn qwen4_exp_reference_generator_is_deterministic_and_in_sync() -> anyhow::Resul
         first.stdout.ends_with(b"\n") && !first.stdout.ends_with(b"\n\n"),
         "reference generator must emit exactly one canonical final newline"
     );
+    let checked_in = fs::read(&fixture)
+        .with_context(|| format!("read checked-in reference fixture {}", fixture.display()))?;
     assert_eq!(
         first.stdout,
-        include_bytes!("fixtures/qwen4_exp_ple_reference.json"),
+        checked_in,
         "checked-in vectors are stale; rerun {} --output {}",
         script.display(),
         fixture.display()

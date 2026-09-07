@@ -22,6 +22,7 @@ import argparse
 import json
 import math
 import sys
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 
@@ -45,6 +46,18 @@ GEOMETRY = {
     "seed": 1234,
     "eos_token_id": 248_044,
 }
+
+
+def deterministic_sqrt(value: float) -> float:
+    with localcontext() as context:
+        context.prec = 80
+        return float(Decimal.from_float(value).sqrt())
+
+
+def deterministic_exp(value: float) -> float:
+    with localcontext() as context:
+        context.prec = 80
+        return float(Decimal.from_float(value).exp())
 
 
 def splitmix64(value: int) -> int:
@@ -119,7 +132,9 @@ def rms_norm(values: list[float], learned_weight: list[float]) -> list[float]:
         raise ValueError(
             f"RMSNorm values and learned weights differ: {len(values)} != {len(learned_weight)}"
         )
-    scale = math.sqrt(sum(value * value for value in values) / len(values) + 1.0e-6)
+    scale = deterministic_sqrt(
+        sum(value * value for value in values) / len(values) + 1.0e-6
+    )
     return [
         value / scale * (1.0 + weight)
         for value, weight in zip(values, learned_weight)
@@ -190,9 +205,13 @@ def run_chunk(
                 query[begin:end],
                 table["norm_query"][begin:end],
             )
-            gate = sum(left * right for left, right in zip(key_group, query_group)) / math.sqrt(hidden_size)
-            signed_root = math.copysign(math.sqrt(max(abs(gate), 1.0e-6)), gate)
-            sigmoid = 1.0 / (1.0 + math.exp(-signed_root))
+            gate = sum(
+                left * right for left, right in zip(key_group, query_group)
+            ) / deterministic_sqrt(hidden_size)
+            signed_root = math.copysign(
+                deterministic_sqrt(max(abs(gate), 1.0e-6)), gate
+            )
+            sigmoid = 1.0 / (1.0 + deterministic_exp(-signed_root))
             gated.extend(sigmoid * lane for lane in value)
         current_gated.append(gated)
         normalized: list[float] = []
@@ -219,7 +238,7 @@ def run_chunk(
                 * table["conv_weights"][channel * GEOMETRY["conv_kernel"] + tap]
                 for tap in range(GEOMETRY["conv_kernel"])
             )
-            conv_silu = convolved / (1.0 + math.exp(-convolved))
+            conv_silu = convolved / (1.0 + deterministic_exp(-convolved))
             hidden.append(query[channel] + gated[channel] + conv_silu)
 
     context_len = GEOMETRY["ngram_size"] - 1

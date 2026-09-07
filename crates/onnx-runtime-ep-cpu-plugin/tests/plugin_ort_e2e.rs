@@ -2477,13 +2477,16 @@ fn conformance_einsum_generic_native_all_einsum12_numeric_dtypes() {
 #[test]
 fn conformance_einsum12_bfloat16_is_rejected_before_execution() {
     let _lock = lock_ort_ep();
+    // This is the ONNX TensorProto DataType value serialized into textproto,
+    // not the target-dependent bindgen representation of ORT's C enum.
+    const ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16: i32 = 16;
     let model_text = einsum_model_text_typed(
         "einsum12_bfloat16_invalid",
         "i->i",
         &[("A", &[4])],
         ("C", &[4]),
         12,
-        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 as i32,
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16,
     );
     let model_path = write_generated_model("einsum12_bfloat16_invalid", &model_text);
     let Some((_lib, api, env, opts, session, domain, custom_op, status)) = (unsafe {
