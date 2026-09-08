@@ -14,8 +14,9 @@ typed values + presence events + linear effects + delayed state
 
 It does not serialize authored sequences, branches, loops, phases, transaction
 groups, serving rows, or physical cache allocation. Core v1 permits zero or one
-reactor. Continuous batching is an optional proof that several isolated
-invocations may be lifted without changing their results.
+reactor. Continuous batching is a runtime-derived proof that several isolated
+component occurrences may be grouped without changing their invocation-local
+results; it adds no serialized continuous-batching block.
 
 ## 2. Workflow shape
 
@@ -121,10 +122,22 @@ components:
       id: onnx-genai.autoregressive-decode
       version: '1'
       bindings: {...}
+    port_layouts:
+      input_ids:
+        batch_layout: {kind: request_aligned, axis: 0}
+      logits:
+        batch_layout: {kind: request_aligned, axis: 0}
+    batch_capacity:
+      uniform_dimensions: [vocabulary]
+      budgets:
+        - {dimensions: [batch], max_total: 256}
 ```
 
 Metadata does not repeat or repair ONNX dtype, rank, or shape. Every
-graph-visible ONNX port must have sufficient `ValueInfo`.
+graph-visible ONNX port must have sufficient `ValueInfo`. `port_layouts`
+contains only non-ONNX batching/padding facts and cannot alter the artifact
+tensor signature. `batch_capacity` is the sole authored assertion that several
+independent contributions may share one component call.
 
 A runtime binding has no artifact signature, so it declares one:
 
@@ -143,7 +156,8 @@ components:
 
 Signatures classify every input as required or optional. Conditional output or
 optional-input presence rules must be statically expressible by the component
-contract. Optional values never determine node firing.
+contract. Optional values never determine node firing. Binding signatures also
+carry their non-ONNX `batch_layout` and padding facts directly.
 
 ## 5. Node union
 
@@ -645,5 +659,5 @@ device-wide synchronization     0
 ```
 
 Dynamic firing is valid and lowers to precompiled FSM blocks. Continuous
-batching may lift those blocks only when its optional interface proves
-observational equivalence to isolated execution.
+batching may group ready component occurrences only when a runtime-derived
+certificate proves observational equivalence to isolated execution.

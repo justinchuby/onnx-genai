@@ -10,18 +10,20 @@ Public checkpoint:
 
 Read these in order:
 
-1. `issue-2337-reactive-ir-v20-transitions.md` for finalized full/delta
+1. `issue-2337-qwen-reactive-ir-v22.md` for the graph-complete 24-layer Qwen
+   candidate using the clean grammar.
+2. `issue-2337-reactive-ir-v21-batching.md` for the derived continuous-batching
+   certificate and removal of a second serialized batching authority.
+3. `issue-2337-reactive-ir-v20-transitions.md` for finalized full/delta
    candidate invariants and the ordinary-component commit-policy surface.
-2. `issue-2337-reactive-ir-v19-schema.md` for the first clean consolidated core
+4. `issue-2337-reactive-ir-v19-schema.md` for the first clean consolidated core
    grammar.
-3. `issue-2337-reactive-ir-v18-lifecycle.md` for the simplified zero-or-one
+5. `issue-2337-reactive-ir-v18-lifecycle.md` for the simplified zero-or-one
    reactor lifecycle and state ownership rule.
-4. `issue-2337-reactive-ir-v17-effects.md` for event-scoped effect roots,
+6. `issue-2337-reactive-ir-v17-effects.md` for event-scoped effect roots,
    same-occurrence linearity, and commit-phase rules.
-5. `issue-2337-reactive-ir-v16-firing.md` for the current firing-inference
+7. `issue-2337-reactive-ir-v16-firing.md` for the current firing-inference
    decision and precise event relation checks.
-6. `issue-2337-reactive-ir-v12.md` for the core invocation versus optional
-   continuous-batching addon boundary.
 7. `issue-2337-qwen-reactive-ir-v11.md` for the latest Qwen-specific cache,
    padding, and continuation decisions. Its boolean gate syntax must be
    translated to the v19 grammar.
@@ -151,17 +153,15 @@ clock, compaction, transaction, and transform concepts made ordinary authoring
 too difficult.
 
 The core defines isolated, lockstep invocation semantics with a scalar reactor.
-The optional versioned continuous-batching addon may prove:
+There is no serialized continuous-batching addon in v1. The runtime derives a
+discardable grouping certificate from existing `batch_capacity`,
+`batch_layout`, `row_scope`, state capabilities, publications, effects, and
+backend evidence.
 
-- independent row ownership;
-- component row independence, selection, expansion, or collective behavior;
-- per-row state/effect/publication partitioning;
-- compaction, release, and copy-on-write legality;
-- lifting multiple invocation FSMs into serving batches.
-
-Ignoring the addon must always leave a correct isolated execution. A runtime
-without addon support falls back to isolated execution rather than rejecting
-the core graph or guessing row independence.
+Missing or failed derivation leaves a correct isolated execution. A runtime
+falls back per component call site rather than rejecting the core graph or
+guessing row independence. Runtime row selections remain positional and never
+serialize request, slot, page, or scheduler identity.
 
 ## Current Qwen shape
 
@@ -220,12 +220,10 @@ is no special commit-plan node or transition-local conditional DSL.
 
 ## Remaining design work
 
-1. Define the continuous-batching addon separately from the core schema.
-2. Expand a complete Qwen candidate YAML from the clean grammar.
-3. Pressure-test the clean grammar against diffusion, recurrent/SSM, tools,
+1. Pressure-test the clean grammar against diffusion, recurrent/SSM, tools,
     speculative trees, and revision outputs.
-4. Define Rust types, JSON Schema, validation diagnostics, and lowering.
-5. Measure parity against the existing execution path; do not infer
+2. Define Rust types, JSON Schema, validation diagnostics, and lowering.
+3. Measure parity against the existing execution path; do not infer
     performance from the abstraction.
 
 ## Model constraint for continuing the design session
