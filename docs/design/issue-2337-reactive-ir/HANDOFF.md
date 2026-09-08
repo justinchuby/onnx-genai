@@ -10,28 +10,64 @@ Public checkpoint:
 
 Read these in order:
 
-1. `issue-2337-reactive-ir-v12.md` for the core invocation versus optional
+1. `issue-2337-reactive-ir-v20-transitions.md` for finalized full/delta
+   candidate invariants and the ordinary-component commit-policy surface.
+2. `issue-2337-reactive-ir-v19-schema.md` for the first clean consolidated core
+   grammar.
+3. `issue-2337-reactive-ir-v18-lifecycle.md` for the simplified zero-or-one
+   reactor lifecycle and state ownership rule.
+4. `issue-2337-reactive-ir-v17-effects.md` for event-scoped effect roots,
+   same-occurrence linearity, and commit-phase rules.
+5. `issue-2337-reactive-ir-v16-firing.md` for the current firing-inference
+   decision and precise event relation checks.
+6. `issue-2337-reactive-ir-v12.md` for the core invocation versus optional
    continuous-batching addon boundary.
-2. `issue-2337-reactive-ir-v13-schema.md` for the first complete tagged-union
-   grammar. Its top-level clock and gate syntax are superseded below.
-3. `issue-2337-reactive-ir-v14-schema.md` for replacing the top-level clock
-   block with a graph-local reactor node.
-4. `issue-2337-reactive-ir-v15-events.md` for the current firing model:
-   first-class presence events, switches, event/value merge arms, and no gate
-   node.
-5. `issue-2337-qwen-reactive-ir-v11.md` for the latest Qwen-specific cache,
+7. `issue-2337-qwen-reactive-ir-v11.md` for the latest Qwen-specific cache,
    padding, and continuation decisions. Its boolean gate syntax must be
-   translated to the v15 event grammar.
+   translated to the v19 grammar.
 
-The next unresolved question was:
+v12-v15 and the earlier Qwen drafts are design history. Read them only when
+provenance for a decision is needed; they are no longer part of the active
+schema assembly instructions.
 
-> Should a component's firing event be inferred from the common presence event
-> of its required inputs, with `when` written only when the inputs are stable or
-> their event cannot be inferred; or should every component and bundle always
-> declare `when`?
+The firing question is now resolved:
 
-The recommendation before the session was interrupted was to infer firing from
-required input presence and require explicit `when` only when necessary.
+- components and bundles infer a named common event from required value/effect
+  input presence;
+- optional inputs do not participate in firing inference;
+- `when` is written only to anchor stable inputs or restrict execution to a
+  strict subevent;
+- an equivalent explicit `when` is rejected as duplicate authority;
+- switches keep explicit `when` because it names the parent event being
+  partitioned.
+
+The effect-root question is now resolved:
+
+- each root is explicitly scoped to one named event;
+- each event occurrence creates a fresh linear token instance;
+- reaction and completion roots are distinct;
+- every root occurrence reaches its sink before leaving that event;
+- core v1 forbids cross-reaction effect carry;
+- `after_invocation_commit` roots are scoped to the schema-provided
+  `invocation.committed` event.
+
+Completion identity is also resolved: a reactor graph exposes only
+`<reactor>.completed`; a one-shot DAG exposes only `invocation.completed`.
+There is no alias or parent/child pair in one graph. Both forms occupy the same
+lifecycle position before durable commit.
+
+Lifecycle ownership is intentionally simple in v1: a graph has zero or one
+reactor. All state belongs to that reactor when present, otherwise to the
+implicit `invocation.run` phase. There is no lifecycle-owner field or separate
+region inference. A distinct storage-ownership policy only says who manages
+the backing resource. Ordinary liveness from semantic sinks rejects unused
+nodes.
+
+Zero reaction limit skips only `first`/`steady`/`pulse` work. The completion
+postlude, durable commit, and `invocation.committed` phase still run normally.
+Completion-scoped transactional effects or publications therefore follow the
+ordinary graph rather than a special zero-limit rule; state does not update
+without a pulse.
 
 ## Locked design decisions
 
@@ -47,6 +83,12 @@ required input presence and require explicit `when` only when necessary.
   plus a typed reaction index value.
 - Boolean control becomes events through a switch node. Node `when` consumes an
   event, not a boolean expression.
+- Components and bundles infer firing from the named common presence event of
+  required inputs. Explicit `when` only anchors stable inputs or selects a
+  strict subevent; equivalent annotations are invalid.
+- Event implication, exclusion, and exact coverage are proven from lifecycle,
+  switch, and event-join partitions. The compiler does not infer control
+  correlation from ordinary tensor values.
 - Merge nodes have explicit event/value arms. Arms must be mutually exclusive,
   complete for their parent event, and type-compatible. Gate nodes are removed.
 - State is generic and carries no model-semantic kind. It delays one typed
@@ -76,13 +118,27 @@ required input presence and require explicit `when` only when necessary.
   the reactor and postlude succeed.
 - `state.final` and reactor `completed` expose the tentative final snapshot to
   the postlude. Postlude failure aborts to the admission baseline.
+- The same immutable `state.final` snapshot may be retained for a committed
+  effect after durable commit. Retention does not produce a second firing.
 - Output streams have one binding to an ordered typed publication batch rather
   than multiple independent emit nodes.
 - Effects separately declare commit behavior, retry behavior, and speculation
   safety. Commit behavior is pure, transactional, or
   after-invocation-commit.
-- `max_reactions = 0` is a successful no-op: no prefill, mutation, or
-  publication.
+- Effect linearity is per event occurrence. Exclusive, complete branch
+  consumers route one token family rather than fan it out.
+- Effect roots are explicitly event-scoped and produce a fresh token per event
+  occurrence. Reaction/completion roots are separate, and v1 has no
+  cross-reaction effect carry.
+- `invocation.committed` is emitted only after durable commit and is the only
+  legal root event for `after_invocation_commit` domains.
+- Reactor graphs use `<reactor>.completed`; one-shot DAGs use
+  `invocation.completed`. The names never coexist in one graph.
+- With one reactor, all state advances in its working phase. Without a reactor,
+  all state advances once under `invocation.run`. Lifecycle ownership is not
+  authored.
+- `max_reactions = 0` is a successful zero-pulse execution: no reaction work
+  runs, but completion, durable commit, and after-commit phases still do.
 - Dynamic firing is valid. Runtimes compile it to finite prebound blocks/FSM
   transitions; they do not reject it merely for being slower.
 - No hot-path YAML traversal, string lookup, dependency discovery, graph-object
@@ -144,8 +200,9 @@ The provisional state commit-plan binding produces:
 
 On reaction zero, it selects valid prompt positions plus the accepted sampled
 token. On steady reactions, it selects the accepted sampled token only. This
-component-produced plan was accepted provisionally; it still needs a final
-comparison against transition-local authoring before the schema is frozen.
+component-produced plan is now canonical: policy remains ordinary typed
+dataflow, while the state transition consumes its count/indices outputs. There
+is no special commit-plan node or transition-local conditional DSL.
 
 ## Known inconsistencies in historical drafts
 
@@ -163,22 +220,12 @@ comparison against transition-local authoring before the schema is frozen.
 
 ## Remaining design work
 
-1. Decide when firing events are inferred versus explicitly authored.
-2. Rewrite the v13 tagged-union grammar as one clean document using v15 event
-   semantics, with no clock/gate compatibility paths.
-3. Specify event implication, exclusion, and coverage checking precisely.
-4. Finalize one-shot DAG lifecycle events and state-final behavior.
-5. Specify reactor/state ownership derivation and reject disconnected
-   reaction-valued regions.
-6. Finalize the full/delta candidate-source invariants for append and indexed
-   scatter.
-7. Decide the canonical dynamic commit-plan surface.
-8. Define the continuous-batching addon separately from the core schema.
-9. Expand a complete Qwen candidate YAML from the clean grammar.
-10. Pressure-test the clean grammar against diffusion, recurrent/SSM, tools,
+1. Define the continuous-batching addon separately from the core schema.
+2. Expand a complete Qwen candidate YAML from the clean grammar.
+3. Pressure-test the clean grammar against diffusion, recurrent/SSM, tools,
     speculative trees, and revision outputs.
-11. Define Rust types, JSON Schema, validation diagnostics, and lowering.
-12. Measure parity against the existing execution path; do not infer
+4. Define Rust types, JSON Schema, validation diagnostics, and lowering.
+5. Measure parity against the existing execution path; do not infer
     performance from the abstraction.
 
 ## Model constraint for continuing the design session
