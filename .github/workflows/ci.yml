@@ -996,21 +996,125 @@ jobs:
       # measurement you cannot build is a measurement you do not have.
       - name: Build the CPU plugin cdylib with the MLAS research reference
         run: cargo build --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu-plugin --features mlas
+      - name: Install Windows crash diagnostics
+        id: crash-diagnostics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = New-Item -ItemType Directory -Force windows-arm64-diagnostics
+          $dumpDirectory = New-Item -ItemType Directory -Force (Join-Path $root "dumps")
+          $tools = New-Item -ItemType Directory -Force (Join-Path $root "tools")
+          $archive = Join-Path $tools "Procdump.zip"
+          Invoke-WebRequest https://download.sysinternals.com/files/Procdump.zip -OutFile $archive
+          $expected = "68e057587b0fd654efa095f76d80d633c0e5c60ea26fd3e7c0011c076bb2d00c"
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "ProcDump archive SHA-256 mismatch: expected $expected, got $actual."
+          }
+          Expand-Archive -Force $archive $tools
+          $procDump = (Resolve-Path (Join-Path $tools "procdump64a.exe")).Path
+          & $procDump -accepteula -ma -i $dumpDirectory.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "ProcDump postmortem registration failed with exit code $LASTEXITCODE."
+          }
+
+          $wer = "HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps"
+          New-Item -Force $wer | Out-Null
+          New-ItemProperty -Force $wer DumpFolder -PropertyType ExpandString -Value $dumpDirectory.FullName | Out-Null
+          New-ItemProperty -Force $wer DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force $wer DumpCount -PropertyType DWord -Value 20 | Out-Null
+          "procdump=$procDump" >> $env:GITHUB_OUTPUT
+          "dump_directory=$($dumpDirectory.FullName)" >> $env:GITHUB_OUTPUT
+
+          # A dump remains useful without cdb; installation failure is recorded
+          # and the artifact still fails closed after collection.
+          choco install windows-sdk-10-version-2004-windbg -y --no-progress 2>&1 |
+            Tee-Object (Join-Path $root "windbg-install.log")
+          "windbg_install_exit=$LASTEXITCODE" |
+            Set-Content (Join-Path $root "windbg-install-exit.txt")
       # Platform execution is the signal here; coverage for most of these
       # offline crates is already reported by x64/macOS lanes, and ARM64
       # instrumentation owned the critical path.
       - name: Test cross-platform offline crates
+        id: offline-tests
+        continue-on-error: true
         shell: bash
         run: |
           packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
           test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
-          cargo test --locked $packages
+          set +e
+          cargo test --locked $packages 2>&1 | tee windows-arm64-diagnostics/cargo-test.log
+          status="${PIPESTATUS[0]}"
+          set -e
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Run repeated process-isolated CPU filters
+        id: isolated-tests
+        if: always() && steps.crash-diagnostics.outcome == 'success'
+        shell: pwsh
+        run: |
+          & .github/scripts/windows_arm64_crash_diagnostics.ps1 -Rounds 10
+      - name: Analyze Windows crash dumps
+        if: always() && steps.crash-diagnostics.outcome == 'success'
+        shell: pwsh
+        run: |
+          $root = "windows-arm64-diagnostics"
+          $analysis = New-Item -ItemType Directory -Force (Join-Path $root "analysis")
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\arm64\cdb.exe",
+            "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe",
+            "$env:ProgramFiles\Windows Kits\10\Debuggers\arm64\cdb.exe",
+            "$env:ProgramFiles\Windows Kits\10\Debuggers\x64\cdb.exe"
+          )
+          $cdb = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($null -eq $cdb) {
+            "cdb.exe was not installed; upload the full dump and PDBs for offline analysis." |
+              Set-Content (Join-Path $analysis "cdb-unavailable.txt")
+            exit 0
+          }
+
+          $dumps = @(Get-ChildItem (Join-Path $root "dumps") -Filter *.dmp)
+          if ($dumps.Count -eq 0) {
+            "No dump was captured." | Set-Content (Join-Path $analysis "no-dump.txt")
+            exit 0
+          }
+          foreach ($dump in $dumps) {
+            $log = Join-Path $analysis "$($dump.BaseName)-cdb.txt"
+            & $cdb -y "srv*$root\symbols*https://msdl.microsoft.com/download/symbols" `
+              -z $dump.FullName `
+              -c ".symfix; .reload /f; !analyze -v; .ecxr; kv; lm; q" 2>&1 |
+              Tee-Object $log
+          }
+      - name: Upload Windows ARM64 crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-crash-${{ github.run_id }}-${{ github.run_attempt }}
+          path: windows-arm64-diagnostics
+          if-no-files-found: error
+          retention-days: 14
       - name: Clippy Windows ARM64 offline crates
+        if: always()
         shell: bash
         run: |
           packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
           test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
           cargo clippy --locked --all-targets --target aarch64-pc-windows-msvc $packages -- -D warnings
+      - name: Preserve Windows ARM64 failing status
+        if: always()
+        shell: pwsh
+        run: |
+          $offlineExit = "${{ steps.offline-tests.outputs.exit_code }}"
+          $isolatedFailure = Test-Path "windows-arm64-diagnostics\isolated-failure.txt"
+          if ("${{ steps.crash-diagnostics.outcome }}" -ne "success") {
+            throw "Crash diagnostic setup failed; refusing to report a green Windows ARM64 lane."
+          }
+          if ([string]::IsNullOrWhiteSpace($offlineExit)) {
+            throw "The broad offline test exit code was not recorded."
+          }
+          if ($offlineExit -ne "0" -or $isolatedFailure) {
+            throw "Windows ARM64 diagnostics captured a failing test process (broad exit=$offlineExit, isolated failure=$isolatedFailure)."
+          }
 
   ep-conformance:
     name: EP conformance (Linux x86_64)
