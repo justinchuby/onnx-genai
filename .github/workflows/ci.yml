@@ -996,6 +996,21 @@ jobs:
       # measurement you cannot build is a measurement you do not have.
       - name: Build the CPU plugin cdylib with the MLAS research reference
         run: cargo build --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu-plugin --features mlas
+      # WER observes the actual Rust test child, unlike wrapping `cargo test`
+      # with a debugger (which only sees Cargo). Keep two full dumps at most:
+      # enough to distinguish repeated crashes without allowing an unbounded
+      # artifact on a lane that executes hundreds of binaries.
+      - name: Enable bounded full crash dumps
+        shell: pwsh
+        run: |
+          $dumpDir = Join-Path $env:RUNNER_TEMP "nxrt-arm64-dumps"
+          New-Item -ItemType Directory -Force $dumpDir | Out-Null
+          $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
+          New-Item -Path $wer -Force | Out-Null
+          New-ItemProperty -Path $wer -Name DumpFolder -PropertyType ExpandString -Value $dumpDir -Force | Out-Null
+          New-ItemProperty -Path $wer -Name DumpType -PropertyType DWord -Value 2 -Force | Out-Null
+          New-ItemProperty -Path $wer -Name DumpCount -PropertyType DWord -Value 2 -Force | Out-Null
+          "NXRT_ARM64_DUMP_DIR=$dumpDir" >> $env:GITHUB_ENV
       # Platform execution is the signal here; coverage for most of these
       # offline crates is already reported by x64/macOS lanes, and ARM64
       # instrumentation owned the critical path.
@@ -1005,6 +1020,57 @@ jobs:
           packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
           test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
           cargo test --locked $packages
+      - name: Collect faulting binaries, PDBs, and WinDbg analysis
+        if: failure()
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP "nxrt-arm64-crash-evidence"
+          New-Item -ItemType Directory -Force $evidence | Out-Null
+          $dumps = @(Get-ChildItem $env:NXRT_ARM64_DUMP_DIR -Filter *.dmp -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -Last 2)
+          if ($dumps.Count -eq 0) {
+            "::warning::WER produced no dump; the failing process may have exited without a user-mode exception"
+          }
+          foreach ($dump in $dumps) {
+            Copy-Item $dump.FullName $evidence
+            $exeName = $dump.Name -replace '\.\d+\.dmp$', ''
+            $stem = [IO.Path]::GetFileNameWithoutExtension($exeName)
+            Get-ChildItem "target\debug\deps" -File -ErrorAction SilentlyContinue |
+              Where-Object {
+                ($_.Extension -eq ".exe" -or $_.Extension -eq ".pdb") -and
+                ($_.BaseName -eq $stem -or $_.BaseName.StartsWith("$stem-"))
+              } |
+              Copy-Item -Destination $evidence
+          }
+
+          $cdb = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers" -Filter cdb.exe -Recurse -ErrorAction SilentlyContinue |
+            Where-Object FullName -Match '\\arm64\\' | Select-Object -First 1
+          if ($cdb) {
+            foreach ($dump in $dumps) {
+              $analysis = Join-Path $evidence ($dump.BaseName + ".windbg.txt")
+              & $cdb.FullName -z $dump.FullName -c "!analyze -v; .ecxr; r; kP; lm; q" 2>&1 |
+                Out-File -Encoding utf8 $analysis
+            }
+          } else {
+            "::warning::ARM64 cdb.exe is not installed on this runner; upload still contains full dumps and symbols"
+          }
+
+          @{
+            run_id = "${{ github.run_id }}"
+            run_attempt = "${{ github.run_attempt }}"
+            job = "${{ github.job }}"
+            sha = "${{ github.sha }}"
+            dump_count = $dumps.Count
+          } | ConvertTo-Json | Out-File -Encoding utf8 (Join-Path $evidence "manifest.json")
+      - name: Upload Windows ARM64 crash evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-crash-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nxrt-arm64-crash-evidence
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 3
       - name: Clippy Windows ARM64 offline crates
         shell: bash
         run: |
