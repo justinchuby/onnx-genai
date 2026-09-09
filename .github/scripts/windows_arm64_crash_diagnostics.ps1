@@ -52,13 +52,19 @@ function Invoke-IsolatedFilter {
 
     "binary=$($Binary.FullName)`nfilter=$Filter`nround=$Round`narguments=$($arguments -join ' ')" |
         Set-Content -Path $log
-    & $Binary.FullName @arguments 2>&1 | Tee-Object -FilePath $log -Append
+    & $Binary.FullName @arguments 2>&1 |
+        Tee-Object -FilePath $log -Append |
+        Out-Host
     $exitCode = $LASTEXITCODE
     "exit_code=$exitCode" | Add-Content -Path $log
-    if ($exitCode -ne 0) {
-        return "$($Binary.Name) filter '$Filter' round $Round exited $exitCode"
+    return [pscustomobject]@{
+        binary = $Binary.Name
+        filter = $Filter
+        exact = [bool]$Exact
+        round = $Round
+        exit_code = $exitCode
+        log = $log
     }
-    return $null
 }
 
 if ($Rounds -lt 1 -or $Rounds -gt 25) {
@@ -71,35 +77,66 @@ Copy-DebugFiles $libBinary
 Copy-DebugFiles $differentialBinary
 
 $failures = [System.Collections.Generic.List[string]]::new()
+$results = [System.Collections.Generic.List[object]]::new()
 for ($round = 1; $round -le $Rounds; $round++) {
-    $failure = Invoke-IsolatedFilter `
+    $result = Invoke-IsolatedFilter `
         -Binary $libBinary `
         -Filter "backend_ab::tests::every_ab_covered_family_has_both_halves" `
         -Round $round `
         -Exact
-    if ($null -ne $failure) {
-        $failures.Add($failure)
+    $results.Add($result)
+    if ($result.exit_code -ne 0) {
+        $failures.Add("$($result.binary) filter '$($result.filter)' round $round exited $($result.exit_code)")
     }
 
     # The retry crashed after the seven non-SDPA tests had reported success.
     # This substring selects the three remaining SDPA tests in a fresh process.
-    $failure = Invoke-IsolatedFilter `
+    $result = Invoke-IsolatedFilter `
         -Binary $differentialBinary `
         -Filter "sdpa" `
         -Round $round
-    if ($null -ne $failure) {
-        $failures.Add($failure)
+    $results.Add($result)
+    if ($result.exit_code -ne 0) {
+        $failures.Add("$($result.binary) filter '$($result.filter)' round $round exited $($result.exit_code)")
     }
 
-    $failure = Invoke-IsolatedFilter `
+    $result = Invoke-IsolatedFilter `
         -Binary $differentialBinary `
         -Filter "concurrent_sdpa_sessions_lose_no_work" `
         -Round $round `
         -Exact
-    if ($null -ne $failure) {
-        $failures.Add($failure)
+    $results.Add($result)
+    if ($result.exit_code -ne 0) {
+        $failures.Add("$($result.binary) filter '$($result.filter)' round $round exited $($result.exit_code)")
     }
 }
+
+$binaryManifest = @($libBinary, $differentialBinary) | ForEach-Object {
+    $pdb = [System.IO.Path]::ChangeExtension($_.FullName, ".pdb")
+    [pscustomobject]@{
+        executable = $_.FullName
+        executable_sha256 = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+        pdb = if (Test-Path $pdb) { $pdb } else { $null }
+        pdb_sha256 = if (Test-Path $pdb) {
+            (Get-FileHash -Algorithm SHA256 $pdb).Hash.ToLowerInvariant()
+        } else {
+            $null
+        }
+    }
+}
+$manifest = [pscustomobject]@{
+    source_sha = (& git rev-parse HEAD).Trim()
+    github_run_id = $env:GITHUB_RUN_ID
+    github_run_attempt = $env:GITHUB_RUN_ATTEMPT
+    rounds = $Rounds
+    binaries = $binaryManifest
+    invocations = $results
+}
+$manifestPath = Join-Path $artifactRoot "attribution-manifest.json"
+$manifest | ConvertTo-Json -Depth 6 | Set-Content $manifestPath
+Write-Host "=== exact attribution manifest ==="
+Get-Content $manifestPath | Write-Host
+Write-Host "=== end exact attribution manifest ==="
 
 $summary = Join-Path $artifactRoot "isolated-summary.txt"
 if ($failures.Count -eq 0) {

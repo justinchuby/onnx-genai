@@ -1043,8 +1043,8 @@ jobs:
           packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
           test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
           set +e
-          cargo test --locked $packages 2>&1 | tee windows-arm64-diagnostics/cargo-test.log
-          status="${PIPESTATUS[0]}"
+          cargo test --locked $packages
+          status="$?"
           set -e
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
           exit 0
