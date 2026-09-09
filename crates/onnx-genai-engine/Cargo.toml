@@ -142,15 +142,15 @@ onnx-genai-genai-config = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
-onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.5", default-features = false }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.6", default-features = false }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
-onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
+onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.6", optional = true, default-features = false }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-std = { workspace = true }
-onnx-runtime-session = { path = "../onnx-runtime-session", version = "=0.1.0-dev.5", optional = true, default-features = false }
+onnx-runtime-session = { path = "../onnx-runtime-session", version = "=0.1.0-dev.6", optional = true, default-features = false }
 onnx-runtime-tracer = { workspace = true, optional = true }
 prost = { workspace = true }
 memmap2 = { workspace = true }

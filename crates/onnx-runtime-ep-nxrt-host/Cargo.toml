@@ -1,6 +1,6 @@
 [package]
 name = "onnx-runtime-ep-nxrt-host"
-version = "0.1.0"
+version = "0.1.0-dev.6"
 edition = "2021"
 description = "Dynamic loader and Rust-trait adapter for nxrt execution-provider plugins"
 publish = false

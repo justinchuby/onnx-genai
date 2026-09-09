@@ -12,7 +12,7 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 onnx-runtime-ep-api = { workspace = true }
-onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.6" }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 

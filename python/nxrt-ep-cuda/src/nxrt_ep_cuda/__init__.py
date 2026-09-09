@@ -21,7 +21,7 @@ from pathlib import Path
 
 __all__ = ["get_library_path", "register", "REGISTRATION_NAME", "__version__"]
 
-__version__ = "0.1.0.dev5"
+__version__ = "0.1.0.dev6"
 
 #: Default registration name passed to ONNX Runtime.
 REGISTRATION_NAME = "nxrt_ep_cuda"

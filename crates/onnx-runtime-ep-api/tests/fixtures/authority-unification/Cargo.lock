@@ -518,11 +518,11 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "onnx-genai-cuda-version-guard"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 
 [[package]]
 name = "onnx-genai-ort-sys"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "bindgen",
  "libloading 0.8.9",
@@ -533,11 +533,11 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-runtime-config"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 
 [[package]]
 name = "onnx-runtime-cuda-memory"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "cudarc",
  "onnx-runtime-memory-governor",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ep-api"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "libloading 0.8.9",
  "memmap2",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ep-cpu"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "atomic-wait",
  "half",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ep-cuda"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "arc-swap",
  "cudarc",
@@ -602,14 +602,14 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ir"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "onnx-runtime-loader"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "memmap2",
  "onnx-runtime-ir",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-memory"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "onnx-runtime-ir",
  "thiserror 2.0.20",
@@ -632,14 +632,14 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-memory-api"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "onnx-runtime-memory-governor"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "onnx-runtime-memory-api",
  "thiserror 2.0.20",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-optimizer"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-tracer",
@@ -656,11 +656,11 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-quantization"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 
 [[package]]
 name = "onnx-runtime-session"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "half",
  "onnx-genai-runtime-config",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-shape-inference"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "onnx-runtime-ir",
  "thiserror 2.0.20",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-tracer"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "libc",
  "prost",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-virtual-memory"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "libc",
  "onnx-runtime-memory-governor",

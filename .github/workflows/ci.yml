@@ -462,7 +462,9 @@ jobs:
       # during a release.
       - name: Check publish order
         if: ${{ !cancelled() }}
-        run: python3 scripts/check_publish_order.py
+        run: |
+          python3 -m unittest discover -s scripts -p test_check_publish_order.py
+          python3 scripts/check_publish_order.py
 
       - name: Verify workspace test package coverage
         if: ${{ !cancelled() }}
