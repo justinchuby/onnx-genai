@@ -63,14 +63,14 @@ native-backend = ["onnx-genai-engine/native-backend"]
 mlas = ["native-backend", "onnx-genai-engine/mlas"]
 
 [dependencies]
-onnx-genai = { path = "../onnx-genai", version = "=0.1.0-dev.5", default-features = false }
-onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.5", default-features = false }
+onnx-genai = { path = "../onnx-genai", version = "=0.1.0-dev.6", default-features = false }
+onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.6", default-features = false }
 onnx-genai-metadata = { workspace = true }
 # default-features = false so callers overriding the default CUDA 13.0 selector
 # with `--no-default-features` do not accidentally unify in a second cudarc CUDA
 # binding version from this inter-crate dependency.
-onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.5", default-features = false }
-onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.6", default-features = false }
+onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.6", optional = true, default-features = false }
 onnx-runtime-memory-governor = { workspace = true }
 onnx-genai-preprocess = { workspace = true }
 tokio = { workspace = true }
@@ -91,7 +91,7 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 image = { workspace = true, features = ["png"] }
 
 [dev-dependencies]
-onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.5", default-features = false, features = ["test-output-staging"] }
+onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.6", default-features = false, features = ["test-output-staging"] }
 onnx-runtime-virtual-memory = { workspace = true }
 tower = { workspace = true }
 tempfile = "3"

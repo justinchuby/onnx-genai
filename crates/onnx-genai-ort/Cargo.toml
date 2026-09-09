@@ -59,8 +59,8 @@ cuda-13000 = [
 [dependencies]
 half = { workspace = true, features = ["use-intrinsics"] }
 onnx-runtime-memory-governor = { workspace = true }
-onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.5", optional = true, default-features = false }
-onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
+onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.6", optional = true, default-features = false }
+onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.6", optional = true, default-features = false }
 libloading = { workspace = true, optional = true }
 # Only compiled under the `cuda` feature. `dynamic-loading` dlopen's the driver
 # (nvcuda) and NVRTC at runtime, so `cargo build` needs no CUDA toolkit. We use
@@ -76,7 +76,7 @@ onnx-genai-kv = { workspace = true }
 # the CUDA EP loader so the two can never drift (issue #1180). Consumed by
 # `src/cuda_rt.rs` (built only under the `cuda` feature); the table itself is
 # platform data independent of the selected CUDA API version.
-onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.5" }
+onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.6" }
 # The shared absolute trace time base, so these spans land on the same timeline
 # as the ones the runtime and its execution providers record.
 onnx-runtime-tracer = { workspace = true }
@@ -93,7 +93,7 @@ tokenizers = { workspace = true }
 tracing = { workspace = true }
 
 [build-dependencies]
-onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.5" }
+onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.6" }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }

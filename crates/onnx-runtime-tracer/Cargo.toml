@@ -49,7 +49,7 @@ libloading = { workspace = true, optional = true }
 # Canonical CUDA library names and pip-wheel layout, shared with the CUDA EP's
 # loader so the two cannot drift. Zero dependencies of its own; only pulled in
 # when cupti is enabled.
-onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.5", optional = true }
+onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.6", optional = true }
 # Intel ITT (VTune/Inspector) task annotations for the `itt` feature. Links the
 # static `ittnotify` C library (built from vendored source by `ittapi-sys` via
 # `cc`, no system/`protoc` dependency); only pulled in when `itt` is enabled. The

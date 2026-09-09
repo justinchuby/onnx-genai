@@ -45,7 +45,7 @@ onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-virtual-memory = { workspace = true }
-onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.5", default-features = false }
+onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.6", default-features = false }
 onnx-runtime-memory-governor = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
@@ -58,7 +58,7 @@ arc-swap = { workspace = true }
 # `onnx-genai-ort` so the two loaders can never drift (issue #1180). The table
 # is platform data independent of which CUDA API version the bindings target, so
 # no `cuda-*` feature is forwarded here.
-onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.5" }
+onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.6" }
 
 # cudarc: pure-Rust CUDA bindings (docs/architecture/ORT2.md §15.2). `dynamic-loading` means
 # `cargo build` needs NO CUDA toolkit — the driver and cuBLASLt are dlopen'd at
@@ -78,12 +78,12 @@ features = ["std", "driver", "cublaslt", "cudnn", "nvrtc", "f16", "dynamic-loadi
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-einsum-conformance = { workspace = true }
 onnx-runtime-shape-inference = { workspace = true }
-onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.5", default-features = false }
+onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.6", default-features = false }
 onnx-runtime-memory-governor = { workspace = true }
-onnx-genai-paged-attention = { path = "../onnx-genai-paged-attention", version = "=0.1.0-dev.5" }
+onnx-genai-paged-attention = { path = "../onnx-genai-paged-attention", version = "=0.1.0-dev.6" }
 
 [build-dependencies]
-onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.5", features = ["cuda"] }
+onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.6", features = ["cuda"] }
 
 [lints]
 workspace = true

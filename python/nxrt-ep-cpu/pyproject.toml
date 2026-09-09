@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nxrt-ep-cpu"
-version = "0.1.0.dev5"
+version = "0.1.0.dev6"
 description = "ONNX Runtime plugin execution provider (CPU) — bundled cdylib for register_execution_provider_library"
 requires-python = ">=3.8"
 license = { text = "MIT" }
