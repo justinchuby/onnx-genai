@@ -284,18 +284,20 @@ pub extern "C" fn nxrt_ep_reset_executed_node_count() {
 ///
 /// The first two entries into `route` rendezvous inside the compiled kernel so
 /// the test proves execution overlap rather than relying on launch timing.
+#[cfg(feature = "einsum_concurrency_probe")]
 #[unsafe(no_mangle)]
-pub extern "C" fn nxrt_ep_reset_einsum_concurrency_probe(route: usize) {
-    onnx_runtime_ep_cpu::kernels::einsum::reset_concurrency_probe(route)
+pub extern "C" fn nxrt_ep_begin_einsum_concurrency_probe(route: usize) -> u64 {
+    onnx_runtime_ep_cpu::kernels::einsum::begin_concurrency_probe(route)
 }
 
 /// Disable observation and return the maximum overlap for `route`.
 ///
 /// Routes are `0=view-copy`, `1=reduction/oracle`,
 /// `2=materialized-GEMM`, and `3=generic/tree`. An unknown route returns zero.
+#[cfg(feature = "einsum_concurrency_probe")]
 #[unsafe(no_mangle)]
-pub extern "C" fn nxrt_ep_finish_einsum_concurrency_probe(route: usize) -> usize {
-    onnx_runtime_ep_cpu::kernels::einsum::finish_concurrency_probe()
+pub extern "C" fn nxrt_ep_finish_einsum_concurrency_probe(generation: u64, route: usize) -> usize {
+    onnx_runtime_ep_cpu::kernels::einsum::finish_concurrency_probe(generation)
         .get(route)
         .copied()
         .unwrap_or(0)

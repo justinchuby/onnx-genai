@@ -38,7 +38,9 @@ use std::ffi::{CStr, CString, OsString};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+#[cfg(feature = "einsum_concurrency_probe")]
+use std::sync::{Arc, Barrier};
+use std::sync::{Mutex, MutexGuard};
 
 use onnx_genai_ort_sys as ort;
 
@@ -1118,18 +1120,47 @@ unsafe fn reset_ep_counter(lib: &libloading::Library, symbol: &[u8]) {
     unsafe { reset() };
 }
 
-unsafe fn reset_einsum_concurrency_probe(lib: &libloading::Library, route: usize) {
-    let reset: libloading::Symbol<'_, unsafe extern "C" fn(usize)> =
-        unsafe { lib.get(b"nxrt_ep_reset_einsum_concurrency_probe") }
-            .expect("CPU plugin must export the Einsum concurrency reset");
-    unsafe { reset(route) };
+#[cfg(feature = "einsum_concurrency_probe")]
+struct ScopedEinsumConcurrencyProbe {
+    finish: unsafe extern "C" fn(u64, usize) -> usize,
+    generation: u64,
+    route: usize,
 }
 
-unsafe fn finish_einsum_concurrency_probe(lib: &libloading::Library, route: usize) -> usize {
-    let finish: libloading::Symbol<'_, unsafe extern "C" fn(usize) -> usize> =
-        unsafe { lib.get(b"nxrt_ep_finish_einsum_concurrency_probe") }
-            .expect("CPU plugin must export the Einsum concurrency result");
-    unsafe { finish(route) }
+#[cfg(feature = "einsum_concurrency_probe")]
+impl ScopedEinsumConcurrencyProbe {
+    unsafe fn begin(lib: &libloading::Library, route: usize) -> Self {
+        let begin: libloading::Symbol<'_, unsafe extern "C" fn(usize) -> u64> =
+            unsafe { lib.get(b"nxrt_ep_begin_einsum_concurrency_probe") }
+                .expect("CPU plugin must export the Einsum concurrency begin hook");
+        let finish: libloading::Symbol<'_, unsafe extern "C" fn(u64, usize) -> usize> =
+            unsafe { lib.get(b"nxrt_ep_finish_einsum_concurrency_probe") }
+                .expect("CPU plugin must export the Einsum concurrency finish hook");
+        let generation = unsafe { begin(route) };
+        assert_ne!(generation, 0, "valid concurrency route must arm the probe");
+        Self {
+            finish: *finish,
+            generation,
+            route,
+        }
+    }
+
+    fn finish(mut self) -> usize {
+        let generation = std::mem::take(&mut self.generation);
+        unsafe { (self.finish)(generation, self.route) }
+    }
+}
+
+#[cfg(feature = "einsum_concurrency_probe")]
+impl Drop for ScopedEinsumConcurrencyProbe {
+    fn drop(&mut self) {
+        let generation = std::mem::take(&mut self.generation);
+        if generation != 0 {
+            unsafe {
+                (self.finish)(generation, self.route);
+            }
+        }
+    }
 }
 
 // ─── Helper: query EP graph assignment ────────────────────────────────────────
@@ -1728,6 +1759,7 @@ fn conformance_matmul_2d() {
 
 // ─── Conformance: Einsum ─────────────────────────────────────────────────────
 
+#[cfg(feature = "einsum_concurrency_probe")]
 #[derive(Clone, Copy)]
 enum ConcurrentEinsumRoute {
     View,
@@ -1736,12 +1768,14 @@ enum ConcurrentEinsumRoute {
     GenericNative,
 }
 
+#[cfg(feature = "einsum_concurrency_probe")]
 struct ConcurrentEinsumModel {
     equation: &'static str,
     inputs: Vec<(&'static str, Vec<i64>)>,
     output: (&'static str, Vec<i64>),
 }
 
+#[cfg(feature = "einsum_concurrency_probe")]
 impl ConcurrentEinsumRoute {
     fn label(self) -> &'static str {
         match self {
@@ -1822,6 +1856,7 @@ fn einsum_model_text_typed(
     text
 }
 
+#[cfg(feature = "einsum_concurrency_probe")]
 unsafe fn run_concurrent_einsum_once(
     api: *const ort::OrtApi,
     session: *mut ort::OrtSession,
@@ -2052,6 +2087,7 @@ unsafe fn run_concurrent_einsum_once(
 /// output-permuted GEMM both need f32 workspace, while the view-copy route must
 /// remain lock-free and overlap too.
 #[test]
+#[cfg(feature = "einsum_concurrency_probe")]
 fn concurrent_same_session_einsum_runs_are_isolated() {
     let _lock = lock_ort_ep();
     const THREADS: usize = 4;
@@ -2118,11 +2154,11 @@ fn concurrent_same_session_einsum_runs_are_isolated() {
         };
         drop(mode);
 
-        unsafe {
+        let probe = unsafe {
             assert_ops_assigned_to_our_ep(api, session, &["Einsum"], &registration);
             reset_ep_counter(&ep_lib, b"nxrt_ep_reset_executed_node_count");
-            reset_einsum_concurrency_probe(&ep_lib, route.probe_index());
-        }
+            ScopedEinsumConcurrencyProbe::begin(&ep_lib, route.probe_index())
+        };
         let barrier = Arc::new(Barrier::new(THREADS));
         let api_address = api as usize;
         let session_address = session as usize;
@@ -2148,7 +2184,7 @@ fn concurrent_same_session_einsum_runs_are_isolated() {
                 worker.join().expect("concurrent Einsum worker panicked");
             }
         });
-        let max_overlap = unsafe { finish_einsum_concurrency_probe(&ep_lib, route.probe_index()) };
+        let max_overlap = probe.finish();
         assert!(
             max_overlap >= 2,
             "{} route never overlapped inside the shared compiled kernel; max={max_overlap}",

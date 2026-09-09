@@ -41,6 +41,10 @@ mlas = ["dep:mlas-sys"]
 # gated further at runtime by ONNX_GENAI_PROFILE_GQA=1. Off by default; adds no
 # code to production builds.
 gqa_phase_profile = []
+# Test-only rendezvous and accounting used to prove same-session Einsum overlap.
+# Shipped builds do not enable this, so the production kernel has no probe load
+# and cannot be armed through the plugin ABI.
+einsum_concurrency_probe = []
 tracing = ["dep:onnx-runtime-tracer", "dep:tracing-crate"]
 
 [dependencies]
