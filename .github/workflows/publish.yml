@@ -165,6 +165,7 @@ jobs:
           # tracer; and ep-api needs the ORT ABI bindings.
           publish_crate onnx-genai-cuda-version-guard
           publish_crate onnx-runtime-tracer
+          publish_crate onnx-genai-runtime-config
           publish_crate onnx-genai-ort-sys
           publish_crate onnx-runtime-ir
           publish_crate onnx-model-package
@@ -185,7 +186,6 @@ jobs:
           publish_crate onnx-runtime-cuda-memory
           publish_crate onnx-runtime-ep-cuda
           publish_crate onnx-genai-metadata
-          publish_crate onnx-genai-runtime-config
           publish_crate onnx-runtime-session
           publish_crate onnx-runtime-capi
           publish_crate onnx-genai-preprocess
