@@ -1,5 +1,6 @@
 param(
     [int]$Rounds = 10,
+    [int]$FullProcessRounds = 5,
     [string]$TargetDirectory = "target\debug\deps",
     [string]$ArtifactDirectory = "windows-arm64-diagnostics"
 )
@@ -38,19 +39,29 @@ function Copy-DebugFiles {
 function Invoke-IsolatedFilter {
     param(
         [Parameter(Mandatory)][System.IO.FileInfo]$Binary,
-        [Parameter(Mandatory)][string]$Filter,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Filter,
         [Parameter(Mandatory)][int]$Round,
         [switch]$Exact
     )
 
-    $safeFilter = $Filter -replace '[^A-Za-z0-9_.-]', '_'
+    $filterLabel = if ([string]::IsNullOrEmpty($Filter)) { "<all-tests>" } else { $Filter }
+    $safeFilter = if ([string]::IsNullOrEmpty($Filter)) {
+        "all-tests"
+    } else {
+        $Filter -replace '[^A-Za-z0-9_.-]', '_'
+    }
     $log = Join-Path $logRoot "$($Binary.BaseName)-$safeFilter-round-$Round.log"
-    $arguments = @($Filter, "--nocapture", "--test-threads=1")
-    if ($Exact) {
-        $arguments += "--exact"
+    $arguments = @()
+    if (![string]::IsNullOrEmpty($Filter)) {
+        $arguments += $Filter
+        $arguments += "--nocapture"
+        $arguments += "--test-threads=1"
+        if ($Exact) {
+            $arguments += "--exact"
+        }
     }
 
-    "binary=$($Binary.FullName)`nfilter=$Filter`nround=$Round`narguments=$($arguments -join ' ')" |
+    "binary=$($Binary.FullName)`nfilter=$filterLabel`nround=$Round`narguments=$($arguments -join ' ')" |
         Set-Content -Path $log
     & $Binary.FullName @arguments 2>&1 |
         Tee-Object -FilePath $log -Append |
@@ -59,7 +70,7 @@ function Invoke-IsolatedFilter {
     "exit_code=$exitCode" | Add-Content -Path $log
     return [pscustomobject]@{
         binary = $Binary.Name
-        filter = $Filter
+        filter = $filterLabel
         exact = [bool]$Exact
         round = $Round
         exit_code = $exitCode
@@ -69,6 +80,9 @@ function Invoke-IsolatedFilter {
 
 if ($Rounds -lt 1 -or $Rounds -gt 25) {
     throw "Rounds must be in the bounded range 1..25; received $Rounds."
+}
+if ($FullProcessRounds -lt 1 -or $FullProcessRounds -gt 10) {
+    throw "FullProcessRounds must be in the bounded range 1..10; received $FullProcessRounds."
 }
 
 $libBinary = Resolve-TestBinary "onnx_runtime_ep_cpu-*.exe"
@@ -111,6 +125,16 @@ for ($round = 1; $round -le $Rounds; $round++) {
     }
 }
 
+for ($round = 1; $round -le $FullProcessRounds; $round++) {
+    foreach ($binary in @($libBinary, $differentialBinary)) {
+        $result = Invoke-IsolatedFilter -Binary $binary -Filter "" -Round $round
+        $results.Add($result)
+        if ($result.exit_code -ne 0) {
+            $failures.Add("$($result.binary) full process round $round exited $($result.exit_code)")
+        }
+    }
+}
+
 $binaryManifest = @($libBinary, $differentialBinary) | ForEach-Object {
     $pdb = [System.IO.Path]::ChangeExtension($_.FullName, ".pdb")
     [pscustomobject]@{
@@ -125,10 +149,13 @@ $binaryManifest = @($libBinary, $differentialBinary) | ForEach-Object {
     }
 }
 $manifest = [pscustomobject]@{
-    source_sha = (& git rev-parse HEAD).Trim()
+    checkout_sha = (& git rev-parse HEAD).Trim()
+    diagnostic_head_sha = $env:NXRT_DIAGNOSTIC_HEAD_SHA
+    diagnostic_base_sha = $env:NXRT_DIAGNOSTIC_BASE_SHA
     github_run_id = $env:GITHUB_RUN_ID
     github_run_attempt = $env:GITHUB_RUN_ATTEMPT
-    rounds = $Rounds
+    filtered_rounds = $Rounds
+    full_process_rounds = $FullProcessRounds
     binaries = $binaryManifest
     invocations = $results
 }
@@ -140,7 +167,8 @@ Write-Host "=== end exact attribution manifest ==="
 
 $summary = Join-Path $artifactRoot "isolated-summary.txt"
 if ($failures.Count -eq 0) {
-    "All $($Rounds * 3) process-isolated invocations passed." | Set-Content $summary
+    "All $(($Rounds * 3) + ($FullProcessRounds * 2)) process-isolated invocations passed." |
+        Set-Content $summary
 } else {
     @(
         "$($failures.Count) process-isolated invocation(s) failed:"

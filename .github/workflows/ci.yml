@@ -1052,8 +1052,11 @@ jobs:
         id: isolated-tests
         if: always() && steps.crash-diagnostics.outcome == 'success'
         shell: pwsh
+        env:
+          NXRT_DIAGNOSTIC_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          NXRT_DIAGNOSTIC_BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
         run: |
-          & .github/scripts/windows_arm64_crash_diagnostics.ps1 -Rounds 10
+          & .github/scripts/windows_arm64_crash_diagnostics.ps1 -Rounds 10 -FullProcessRounds 5
       - name: Analyze Windows crash dumps
         if: always() && steps.crash-diagnostics.outcome == 'success'
         shell: pwsh
