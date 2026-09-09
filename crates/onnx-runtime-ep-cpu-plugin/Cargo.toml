@@ -29,6 +29,10 @@ mlas = ["onnx-runtime-ep-cpu/mlas"]
 # (`plugin_export_abi::l1_no_symbol_leakage` pins that).
 dispatch_probe = ["onnx-runtime-ep-plugin/dispatch_probe"]
 
+# Test-only deterministic overlap probe. Its exports and kernel instrumentation
+# are absent unless explicitly requested by the integration-test invocation.
+einsum_concurrency_probe = ["onnx-runtime-ep-cpu/einsum_concurrency_probe"]
+
 [dependencies]
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.6" }

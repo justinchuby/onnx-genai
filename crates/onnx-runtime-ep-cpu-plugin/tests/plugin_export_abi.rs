@@ -934,8 +934,6 @@ fn l1_no_symbol_leakage() {
                 && *name != "nxrt_ep_reset_constant_weight_inputs"
                 && *name != "nxrt_ep_executed_node_count"
                 && *name != "nxrt_ep_reset_executed_node_count"
-                && *name != "nxrt_ep_reset_einsum_concurrency_probe"
-                && *name != "nxrt_ep_finish_einsum_concurrency_probe"
                 && *name != "nxrt_ep_reset_einsum_route_telemetry"
                 && *name != "nxrt_ep_einsum_route_count"
                 && *name != "nxrt_ep_build_features"
@@ -953,6 +951,12 @@ fn l1_no_symbol_leakage() {
                             | "nxrt_dispatch_probe_reset"
                             | "nxrt_dispatch_probe_available"
                             | "nxrt_dispatch_probe_phase_name"
+                    ))
+                && !(cfg!(feature = "einsum_concurrency_probe")
+                    && matches!(
+                        *name,
+                        "nxrt_ep_begin_einsum_concurrency_probe"
+                            | "nxrt_ep_finish_einsum_concurrency_probe"
                     ))
                 && !name.starts_with("_Z")
                 && !name.starts_with("__rust")

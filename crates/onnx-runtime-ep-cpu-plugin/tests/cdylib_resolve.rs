@@ -51,7 +51,7 @@ macro_rules! cdylib_features {
 // The single declaration site. Adding a feature to Cargo.toml without adding it
 // here fails `cdylib_feature_mirror`; adding it here mirrors it into the cdylib
 // rebuild automatically.
-cdylib_features!("mlas", "dispatch_probe");
+cdylib_features!("mlas", "dispatch_probe", "einsum_concurrency_probe");
 
 /// Locate the cpu-plugin cdylib, building it if needed.
 ///

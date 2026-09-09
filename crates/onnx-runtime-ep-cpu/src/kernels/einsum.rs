@@ -8,7 +8,7 @@ use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{
@@ -449,52 +449,343 @@ impl EinsumScratchRetention {
     }
 }
 
-const CONCURRENCY_ROUTES: usize = 4;
 const CONCURRENCY_VIEW: usize = 0;
 const CONCURRENCY_REDUCTION: usize = 1;
 const CONCURRENCY_MATERIALIZED_GEMM: usize = 2;
 const CONCURRENCY_GENERIC: usize = 3;
-static CONCURRENCY_PROBE_ENABLED: AtomicBool = AtomicBool::new(false);
-static CONCURRENCY_ACTIVE: [AtomicUsize; CONCURRENCY_ROUTES] =
-    [const { AtomicUsize::new(0) }; CONCURRENCY_ROUTES];
-static CONCURRENCY_MAX: [AtomicUsize; CONCURRENCY_ROUTES] =
-    [const { AtomicUsize::new(0) }; CONCURRENCY_ROUTES];
 
-struct ConcurrencyProbeGuard {
-    route: usize,
-}
+#[cfg(any(test, feature = "einsum_concurrency_probe"))]
+mod concurrency_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
-impl ConcurrencyProbeGuard {
-    fn enter(route: usize) -> Option<Self> {
-        if !CONCURRENCY_PROBE_ENABLED.load(Ordering::Relaxed) {
-            return None;
+    const ROUTES: usize = 4;
+    const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(10);
+    static ARMED_GENERATION: AtomicU64 = AtomicU64::new(0);
+    static STATE: OnceLock<(Mutex<State>, Condvar)> = OnceLock::new();
+
+    struct State {
+        generation: u64,
+        route: Option<usize>,
+        arrivals: usize,
+        released: bool,
+        completed: bool,
+        active: [usize; ROUTES],
+        max: [usize; ROUTES],
+    }
+
+    fn shared() -> &'static (Mutex<State>, Condvar) {
+        STATE.get_or_init(|| {
+            (
+                Mutex::new(State {
+                    generation: 0,
+                    route: None,
+                    arrivals: 0,
+                    released: true,
+                    completed: false,
+                    active: [0; ROUTES],
+                    max: [0; ROUTES],
+                }),
+                Condvar::new(),
+            )
+        })
+    }
+
+    fn lock_state() -> std::sync::MutexGuard<'static, State> {
+        shared()
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) struct Entry {
+        generation: u64,
+        route: usize,
+    }
+
+    impl Entry {
+        pub(super) fn enter(route: usize) -> Option<Self> {
+            let generation = ARMED_GENERATION.load(Ordering::Acquire);
+            if generation == 0 {
+                return None;
+            }
+
+            let (_, ready) = shared();
+            let mut state = lock_state();
+            if state.generation != generation || state.route != Some(route) || state.released {
+                return None;
+            }
+            state.active[route] += 1;
+            state.max[route] = state.max[route].max(state.active[route]);
+            state.arrivals += 1;
+            ready.notify_all();
+            if state.arrivals >= 2 {
+                state.completed = true;
+                state.released = true;
+                ready.notify_all();
+            } else {
+                let deadline = Instant::now() + RENDEZVOUS_TIMEOUT;
+                while state.generation == generation && !state.released {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        state.released = true;
+                        ready.notify_all();
+                        break;
+                    }
+                    let (next, timeout) = ready
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state = next;
+                    if timeout.timed_out() && state.generation == generation && !state.released {
+                        state.released = true;
+                        ready.notify_all();
+                    }
+                }
+            }
+            Some(Self { generation, route })
         }
-        let active = CONCURRENCY_ACTIVE[route].fetch_add(1, Ordering::AcqRel) + 1;
-        CONCURRENCY_MAX[route].fetch_max(active, Ordering::Relaxed);
-        Some(Self { route })
+    }
+
+    impl Drop for Entry {
+        fn drop(&mut self) {
+            let (_, ready) = shared();
+            let mut state = lock_state();
+            if state.generation == self.generation && state.active[self.route] != 0 {
+                state.active[self.route] -= 1;
+                ready.notify_all();
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn begin(route: usize) -> u64 {
+        ARMED_GENERATION.store(0, Ordering::Release);
+        let (_, ready) = shared();
+        let mut state = lock_state();
+
+        state.released = true;
+        ready.notify_all();
+        state.generation = state.generation.wrapping_add(1).max(1);
+        state.route = (route < ROUTES).then_some(route);
+        state.arrivals = 0;
+        state.released = route >= ROUTES;
+        state.completed = false;
+        state.active = [0; ROUTES];
+        state.max = [0; ROUTES];
+
+        let generation = state.generation;
+        if state.route.is_some() {
+            ARMED_GENERATION.store(generation, Ordering::Release);
+            generation
+        } else {
+            0
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn finish(generation: u64) -> [usize; ROUTES] {
+        if generation == 0 {
+            return [0; ROUTES];
+        }
+        let _ =
+            ARMED_GENERATION.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
+        let (_, ready) = shared();
+        let mut state = lock_state();
+        if state.generation != generation {
+            return [0; ROUTES];
+        }
+
+        let mut result = state.max;
+        if let Some(route) = state.route
+            && !state.completed
+        {
+            result[route] = 0;
+        }
+
+        state.released = true;
+        ready.notify_all();
+        state.generation = state.generation.wrapping_add(1).max(1);
+        state.route = None;
+        state.arrivals = 0;
+        state.completed = false;
+        state.active = [0; ROUTES];
+        state.max = [0; ROUTES];
+        result
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::mpsc;
+
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+        fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
+            TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        struct ScopedProbe {
+            generation: u64,
+        }
+
+        impl ScopedProbe {
+            fn new(route: usize) -> Self {
+                Self {
+                    generation: begin(route),
+                }
+            }
+
+            fn finish(mut self) -> [usize; ROUTES] {
+                let generation = std::mem::take(&mut self.generation);
+                finish(generation)
+            }
+        }
+
+        impl Drop for ScopedProbe {
+            fn drop(&mut self) {
+                let generation = std::mem::take(&mut self.generation);
+                let _ = finish(generation);
+            }
+        }
+
+        fn wait_for_arrival(generation: u64) {
+            let (_, ready) = shared();
+            let mut state = lock_state();
+            while state.generation == generation && state.arrivals == 0 {
+                state = ready
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        #[test]
+        fn unwind_teardown_wakes_waiter_and_next_probe_starts_cleanly() {
+            let _serial = lock_tests();
+            let (done_tx, done_rx) = mpsc::channel();
+            let unwind = catch_unwind(AssertUnwindSafe(|| {
+                let probe = ScopedProbe::new(super::super::CONCURRENCY_REDUCTION);
+                let generation = probe.generation;
+                std::thread::spawn(move || {
+                    let _entry = Entry::enter(super::super::CONCURRENCY_REDUCTION);
+                    done_tx.send(()).unwrap();
+                });
+                wait_for_arrival(generation);
+                panic!("deliberate armed-probe unwind");
+            }));
+            assert!(unwind.is_err());
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("teardown did not wake the blocked probe participant");
+
+            let probe = ScopedProbe::new(super::super::CONCURRENCY_REDUCTION);
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        let _entry = Entry::enter(super::super::CONCURRENCY_REDUCTION);
+                    });
+                }
+            });
+            assert!(probe.finish()[super::super::CONCURRENCY_REDUCTION] >= 2);
+        }
+
+        #[test]
+        fn finish_is_idempotent_and_recovers_from_state_lock_poisoning() {
+            let _serial = lock_tests();
+            let _ = catch_unwind(|| {
+                let _state = shared().0.lock().unwrap();
+                panic!("deliberately poison concurrency probe state");
+            });
+
+            let probe = ScopedProbe::new(super::super::CONCURRENCY_MATERIALIZED_GEMM);
+            let generation = probe.generation;
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        let _entry = Entry::enter(super::super::CONCURRENCY_MATERIALIZED_GEMM);
+                    });
+                }
+            });
+            assert!(probe.finish()[super::super::CONCURRENCY_MATERIALIZED_GEMM] >= 2);
+            assert_eq!(finish(generation), [0; ROUTES]);
+            assert_eq!(ARMED_GENERATION.load(Ordering::Acquire), 0);
+            let state = lock_state();
+            assert_eq!(state.route, None);
+            assert_eq!(state.active, [0; ROUTES]);
+            assert_eq!(state.max, [0; ROUTES]);
+        }
+
+        #[test]
+        fn stale_finish_cannot_disarm_a_new_probe() {
+            let _serial = lock_tests();
+            assert_eq!(begin(ROUTES), 0, "invalid route must remain disarmed");
+
+            let stale = begin(super::super::CONCURRENCY_REDUCTION);
+            let current = begin(super::super::CONCURRENCY_MATERIALIZED_GEMM);
+            assert_ne!(stale, current);
+            assert_eq!(finish(stale), [0; ROUTES]);
+            assert_eq!(ARMED_GENERATION.load(Ordering::Acquire), current);
+
+            let probe = ScopedProbe {
+                generation: current,
+            };
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        let _entry = Entry::enter(super::super::CONCURRENCY_MATERIALIZED_GEMM);
+                    });
+                }
+            });
+            assert!(probe.finish()[super::super::CONCURRENCY_MATERIALIZED_GEMM] >= 2);
+        }
+
+        #[test]
+        fn worker_panic_unwinds_owner_and_leaves_probe_disarmed() {
+            let _serial = lock_tests();
+            let unwind = catch_unwind(AssertUnwindSafe(|| {
+                let _probe = ScopedProbe::new(super::super::CONCURRENCY_REDUCTION);
+                std::thread::scope(|scope| {
+                    let panicking = scope.spawn(|| {
+                        let _entry = Entry::enter(super::super::CONCURRENCY_REDUCTION);
+                        panic!("deliberate probe worker panic");
+                    });
+                    let peer = scope.spawn(|| {
+                        let _entry = Entry::enter(super::super::CONCURRENCY_REDUCTION);
+                    });
+                    peer.join().unwrap();
+                    panicking.join().unwrap();
+                });
+            }));
+            assert!(unwind.is_err());
+            assert_eq!(ARMED_GENERATION.load(Ordering::Acquire), 0);
+            let state = lock_state();
+            assert_eq!(state.route, None);
+            assert_eq!(state.active, [0; ROUTES]);
+            assert_eq!(state.max, [0; ROUTES]);
+        }
     }
 }
 
-impl Drop for ConcurrencyProbeGuard {
-    fn drop(&mut self) {
-        CONCURRENCY_ACTIVE[self.route].fetch_sub(1, Ordering::AcqRel);
+#[cfg(any(test, feature = "einsum_concurrency_probe"))]
+use concurrency_probe::Entry as ConcurrencyProbeGuard;
+
+#[cfg(not(any(test, feature = "einsum_concurrency_probe")))]
+struct ConcurrencyProbeGuard;
+
+#[cfg(not(any(test, feature = "einsum_concurrency_probe")))]
+impl ConcurrencyProbeGuard {
+    #[inline(always)]
+    fn enter(_route: usize) -> Option<Self> {
+        None
     }
 }
 
+#[cfg(any(test, feature = "einsum_concurrency_probe"))]
 #[doc(hidden)]
-pub fn reset_concurrency_probe() {
-    for route in 0..CONCURRENCY_ROUTES {
-        CONCURRENCY_ACTIVE[route].store(0, Ordering::Relaxed);
-        CONCURRENCY_MAX[route].store(0, Ordering::Relaxed);
-    }
-    CONCURRENCY_PROBE_ENABLED.store(true, Ordering::Release);
-}
-
-#[doc(hidden)]
-pub fn finish_concurrency_probe() -> [usize; CONCURRENCY_ROUTES] {
-    CONCURRENCY_PROBE_ENABLED.store(false, Ordering::Release);
-    std::array::from_fn(|route| CONCURRENCY_MAX[route].load(Ordering::Acquire))
-}
+pub use concurrency_probe::{begin as begin_concurrency_probe, finish as finish_concurrency_probe};
 
 /// Bytes currently parked between Einsum calls across all execution threads.
 pub fn einsum_scratch_live_bytes() -> u64 {
