@@ -454,7 +454,7 @@ const CONCURRENCY_REDUCTION: usize = 1;
 const CONCURRENCY_MATERIALIZED_GEMM: usize = 2;
 const CONCURRENCY_GENERIC: usize = 3;
 
-#[cfg(any(test, feature = "einsum_concurrency_probe"))]
+#[cfg(feature = "einsum_concurrency_probe")]
 mod concurrency_probe {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
@@ -769,13 +769,13 @@ mod concurrency_probe {
     }
 }
 
-#[cfg(any(test, feature = "einsum_concurrency_probe"))]
+#[cfg(feature = "einsum_concurrency_probe")]
 use concurrency_probe::Entry as ConcurrencyProbeGuard;
 
-#[cfg(not(any(test, feature = "einsum_concurrency_probe")))]
+#[cfg(not(feature = "einsum_concurrency_probe"))]
 struct ConcurrencyProbeGuard;
 
-#[cfg(not(any(test, feature = "einsum_concurrency_probe")))]
+#[cfg(not(feature = "einsum_concurrency_probe"))]
 impl ConcurrencyProbeGuard {
     #[inline(always)]
     fn enter(_route: usize) -> Option<Self> {
@@ -783,7 +783,7 @@ impl ConcurrencyProbeGuard {
     }
 }
 
-#[cfg(any(test, feature = "einsum_concurrency_probe"))]
+#[cfg(feature = "einsum_concurrency_probe")]
 #[doc(hidden)]
 pub use concurrency_probe::{begin as begin_concurrency_probe, finish as finish_concurrency_probe};
 
