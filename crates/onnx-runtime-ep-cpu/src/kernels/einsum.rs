@@ -9,7 +9,8 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
@@ -459,6 +460,28 @@ static CONCURRENCY_ACTIVE: [AtomicUsize; CONCURRENCY_ROUTES] =
     [const { AtomicUsize::new(0) }; CONCURRENCY_ROUTES];
 static CONCURRENCY_MAX: [AtomicUsize; CONCURRENCY_ROUTES] =
     [const { AtomicUsize::new(0) }; CONCURRENCY_ROUTES];
+static CONCURRENCY_RENDEZVOUS: OnceLock<(Mutex<ConcurrencyRendezvous>, Condvar)> = OnceLock::new();
+
+struct ConcurrencyRendezvous {
+    route: usize,
+    arrivals: usize,
+    released: bool,
+    completed: bool,
+}
+
+fn concurrency_rendezvous() -> &'static (Mutex<ConcurrencyRendezvous>, Condvar) {
+    CONCURRENCY_RENDEZVOUS.get_or_init(|| {
+        (
+            Mutex::new(ConcurrencyRendezvous {
+                route: CONCURRENCY_ROUTES,
+                arrivals: 0,
+                released: true,
+                completed: false,
+            }),
+            Condvar::new(),
+        )
+    })
+}
 
 struct ConcurrencyProbeGuard {
     route: usize,
@@ -471,6 +494,7 @@ impl ConcurrencyProbeGuard {
         }
         let active = CONCURRENCY_ACTIVE[route].fetch_add(1, Ordering::AcqRel) + 1;
         CONCURRENCY_MAX[route].fetch_max(active, Ordering::Relaxed);
+        rendezvous_concurrent_entries(route);
         Some(Self { route })
     }
 }
@@ -481,19 +505,84 @@ impl Drop for ConcurrencyProbeGuard {
     }
 }
 
+fn rendezvous_concurrent_entries(route: usize) {
+    // A real same-session serialization bug must fail rather than hang the
+    // entire CI job. Timing cannot make the probe pass: a timed-out rendezvous
+    // is reported as zero overlap by `finish_concurrency_probe`.
+    const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(10);
+    let (state, ready) = concurrency_rendezvous();
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.route != route || state.released {
+        return;
+    }
+    state.arrivals += 1;
+    if state.arrivals >= 2 {
+        state.completed = true;
+        state.released = true;
+        ready.notify_all();
+        return;
+    }
+
+    let deadline = Instant::now() + RENDEZVOUS_TIMEOUT;
+    while !state.released {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            state.released = true;
+            ready.notify_all();
+            return;
+        }
+        let (next, timeout) = ready
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state = next;
+        if timeout.timed_out() && !state.released {
+            state.released = true;
+            ready.notify_all();
+        }
+    }
+}
+
 #[doc(hidden)]
-pub fn reset_concurrency_probe() {
+pub fn reset_concurrency_probe(route: usize) {
     for route in 0..CONCURRENCY_ROUTES {
         CONCURRENCY_ACTIVE[route].store(0, Ordering::Relaxed);
         CONCURRENCY_MAX[route].store(0, Ordering::Relaxed);
     }
+    let (state, ready) = concurrency_rendezvous();
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.route = route;
+    state.arrivals = 0;
+    state.released = route >= CONCURRENCY_ROUTES;
+    state.completed = false;
+    ready.notify_all();
     CONCURRENCY_PROBE_ENABLED.store(true, Ordering::Release);
 }
 
 #[doc(hidden)]
 pub fn finish_concurrency_probe() -> [usize; CONCURRENCY_ROUTES] {
     CONCURRENCY_PROBE_ENABLED.store(false, Ordering::Release);
-    std::array::from_fn(|route| CONCURRENCY_MAX[route].load(Ordering::Acquire))
+    let (state, ready) = concurrency_rendezvous();
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.released = true;
+    ready.notify_all();
+    let rendezvous_route = state.route;
+    let rendezvous_completed = state.completed;
+    std::array::from_fn(|route| {
+        // Only a pair observed concurrently at the route boundary is proof.
+        // Later incidental overlap after the deadlock-safety timeout does not
+        // satisfy the probe.
+        if route == rendezvous_route && !rendezvous_completed {
+            0
+        } else {
+            CONCURRENCY_MAX[route].load(Ordering::Acquire)
+        }
+    })
 }
 
 /// Bytes currently parked between Einsum calls across all execution threads.

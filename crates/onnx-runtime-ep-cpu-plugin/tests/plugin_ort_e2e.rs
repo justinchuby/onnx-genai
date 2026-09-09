@@ -1118,11 +1118,11 @@ unsafe fn reset_ep_counter(lib: &libloading::Library, symbol: &[u8]) {
     unsafe { reset() };
 }
 
-unsafe fn reset_einsum_concurrency_probe(lib: &libloading::Library) {
-    let reset: libloading::Symbol<'_, unsafe extern "C" fn()> =
+unsafe fn reset_einsum_concurrency_probe(lib: &libloading::Library, route: usize) {
+    let reset: libloading::Symbol<'_, unsafe extern "C" fn(usize)> =
         unsafe { lib.get(b"nxrt_ep_reset_einsum_concurrency_probe") }
             .expect("CPU plugin must export the Einsum concurrency reset");
-    unsafe { reset() };
+    unsafe { reset(route) };
 }
 
 unsafe fn finish_einsum_concurrency_probe(lib: &libloading::Library, route: usize) -> usize {
@@ -2121,7 +2121,7 @@ fn concurrent_same_session_einsum_runs_are_isolated() {
         unsafe {
             assert_ops_assigned_to_our_ep(api, session, &["Einsum"], &registration);
             reset_ep_counter(&ep_lib, b"nxrt_ep_reset_executed_node_count");
-            reset_einsum_concurrency_probe(&ep_lib);
+            reset_einsum_concurrency_probe(&ep_lib, route.probe_index());
         }
         let barrier = Arc::new(Barrier::new(THREADS));
         let api_address = api as usize;

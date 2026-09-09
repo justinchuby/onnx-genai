@@ -281,9 +281,12 @@ pub extern "C" fn nxrt_ep_reset_executed_node_count() {
 }
 
 /// Enable and reset route-scoped CPU Einsum concurrency observation.
+///
+/// The first two entries into `route` rendezvous inside the compiled kernel so
+/// the test proves execution overlap rather than relying on launch timing.
 #[unsafe(no_mangle)]
-pub extern "C" fn nxrt_ep_reset_einsum_concurrency_probe() {
-    onnx_runtime_ep_cpu::kernels::einsum::reset_concurrency_probe()
+pub extern "C" fn nxrt_ep_reset_einsum_concurrency_probe(route: usize) {
+    onnx_runtime_ep_cpu::kernels::einsum::reset_concurrency_probe(route)
 }
 
 /// Disable observation and return the maximum overlap for `route`.
