@@ -113,7 +113,7 @@ class PublishOrderTests(unittest.TestCase):
             problems,
         )
 
-    def test_dev_dependency_does_not_constrain_publish_order(self):
+    def test_dev_dependency_must_be_in_publish_order(self):
         packages = [
             package(
                 "nested-sys",
@@ -128,8 +128,11 @@ class PublishOrderTests(unittest.TestCase):
             ["nested-sys"], graph, frozenset()
         )
 
-        self.assertEqual(problems, [])
-        self.assertEqual(edges, 0)
+        self.assertEqual(edges, 1)
+        self.assertTrue(
+            any("test-helper, which is omitted" in problem for problem in problems),
+            problems,
+        )
 
     def test_duplicate_workspace_package_name_fails_closed(self):
         packages = [
