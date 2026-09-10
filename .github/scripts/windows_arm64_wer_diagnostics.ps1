@@ -191,7 +191,7 @@ function Setup-AndSelfTest {
     $process = Start-Process -FilePath $executable -Wait -PassThru
     "exit_code=$($process.ExitCode)" | Set-Content (Join-Path $selfTestRoot "exit-code.txt")
     $unsignedExit = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([int32]$process.ExitCode), 0)
-    if ($unsignedExit -ne [uint32]0xC0000005) {
+    if ($unsignedExit -ne 3221225477) {
         throw "Self-test child exited $($process.ExitCode), expected Windows access violation 0xC0000005."
     }
 
