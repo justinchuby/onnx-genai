@@ -162,8 +162,8 @@ function Run-Target {
         access_violation = $classification.IsAccessViolation
     } | ConvertTo-Json | Set-Content (Join-Path $manifestRoot "focused-exit.json")
 
-    "attempt_2_exit=$($process.ExitCode)" >> $env:GITHUB_OUTPUT
-    "attempt_2_kind=$($classification.Kind)" >> $env:GITHUB_OUTPUT
+    "focused_exit=$($process.ExitCode)" >> $env:GITHUB_OUTPUT
+    "focused_kind=$($classification.Kind)" >> $env:GITHUB_OUTPUT
     if ($classification.IsAccessViolation) {
         $dump = Wait-ForDump `
             -ExecutablePrefix ([System.IO.Path]::GetFileNameWithoutExtension($TargetExecutable)) `

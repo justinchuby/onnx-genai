@@ -92,7 +92,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        replica: [1]
+        replica: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     runs-on: windows-11-arm
     timeout-minutes: 150
     env:
@@ -100,7 +100,7 @@ jobs:
       RUSTFLAGS: "-D warnings"
       CMAKE_GENERATOR: "Visual Studio 17 2022"
       NXRT_REQUIRE_PLACEMENT_TESTS: "1"
-      TESTED_SHA: acc58ba4a2d1e381eb665f2f1954f70f14dec487
+      TESTED_SHA: 49590f7c22da2ee554aa131e394e8c5f50ef7961
       DIAGNOSTIC_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
@@ -114,7 +114,7 @@ jobs:
       - name: Check out exact candidate
         uses: actions/checkout@v5
         with:
-          ref: acc58ba4a2d1e381eb665f2f1954f70f14dec487
+          ref: 49590f7c22da2ee554aa131e394e8c5f50ef7961
           path: tested
           submodules: recursive
           persist-credentials: false
@@ -190,7 +190,7 @@ jobs:
         shell: bash
         run: cargo build --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu-plugin --features mlas
 
-      - name: Run broad warm pass and exact focused executable
+      - name: Run two broad passes and exact focused executable
         id: broad-tests
         working-directory: tested
         shell: bash
@@ -203,20 +203,34 @@ jobs:
           if [[ "$resolver_status" -ne 0 || -z "$packages" ]]; then
             echo "::error::lane 'offline-cross-platform' failed to resolve a non-empty package set"
             echo "resolver_exit=$resolver_status" >> "$GITHUB_OUTPUT"
-            echo "attempt_1_exit=not-run" >> "$GITHUB_OUTPUT"
-            echo "attempt_2_exit=not-run" >> "$GITHUB_OUTPUT"
+            echo "broad_attempt_1_exit=not-run" >> "$GITHUB_OUTPUT"
+            echo "broad_attempt_2_exit=not-run" >> "$GITHUB_OUTPUT"
+            echo "focused_exit=not-run" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           cargo test --locked $packages
           attempt_1="$?"
-          echo "attempt_1_exit=$attempt_1" >> "$GITHUB_OUTPUT"
+          echo "broad_attempt_1_exit=$attempt_1" >> "$GITHUB_OUTPUT"
           cd ../diagnostics
           pwsh -NoProfile -File .github/scripts/windows_arm64_wer_diagnostics.ps1 -Action CheckForRealDump -DiagnosticRoot windows-arm64-run
           dump_1="$(tail -n 1 "$GITHUB_OUTPUT" | tr -d '\r')"
           cd ../tested
           if [[ "$attempt_1" -ne 0 || "$dump_1" == "real_dump=true" ]]; then
-            echo "attempt_2_exit=stopped-after-failure-or-dump" >> "$GITHUB_OUTPUT"
+            echo "broad_attempt_2_exit=stopped-after-failure-or-dump" >> "$GITHUB_OUTPUT"
+            echo "focused_exit=stopped-after-failure-or-dump" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cargo test --locked $packages
+          attempt_2="$?"
+          echo "broad_attempt_2_exit=$attempt_2" >> "$GITHUB_OUTPUT"
+          cd ../diagnostics
+          pwsh -NoProfile -File .github/scripts/windows_arm64_wer_diagnostics.ps1 -Action CheckForRealDump -DiagnosticRoot windows-arm64-run
+          dump_2="$(tail -n 1 "$GITHUB_OUTPUT" | tr -d '\r')"
+          cd ../tested
+          if [[ "$attempt_2" -ne 0 || "$dump_2" == "real_dump=true" ]]; then
+            echo "focused_exit=stopped-after-failure-or-dump" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -227,7 +241,7 @@ jobs:
           target_exe="$(python -c 'import json,sys; xs=[json.loads(x) for x in open(sys.argv[1]) if x.startswith("{")]; print(next(x["executable"] for x in reversed(xs) if x.get("reason")=="compiler-artifact" and x.get("target",{}).get("name")=="native_vs_mlas_differential" and x.get("executable")))' ../diagnostics/windows-arm64-run/artifacts/logs/focused-build.json)"
           if [[ -z "$target_exe" || ! -f "$target_exe" || ! -f "${target_exe%.exe}.pdb" ]]; then
             echo "::error::failed to dynamically resolve focused executable/PDB pair"
-            echo "attempt_2_exit=target-resolution-failed" >> "$GITHUB_OUTPUT"
+            echo "focused_exit=target-resolution-failed" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           target_windows="$(cygpath -w "$target_exe")"
@@ -262,9 +276,10 @@ jobs:
             diagnostic_sha = "${{ steps.attribution.outputs.diagnostic_sha }}"
             replica = ${{ matrix.replica }}
             resolver_exit = "${{ steps.broad-tests.outputs.resolver_exit }}"
-            attempt_1_exit = "${{ steps.broad-tests.outputs.attempt_1_exit }}"
-            attempt_2_exit = "${{ steps.broad-tests.outputs.attempt_2_exit }}"
-            attempt_2_kind = "${{ steps.broad-tests.outputs.attempt_2_kind }}"
+            broad_attempt_1_exit = "${{ steps.broad-tests.outputs.broad_attempt_1_exit }}"
+            broad_attempt_2_exit = "${{ steps.broad-tests.outputs.broad_attempt_2_exit }}"
+            focused_exit = "${{ steps.broad-tests.outputs.focused_exit }}"
+            focused_kind = "${{ steps.broad-tests.outputs.focused_kind }}"
             dump_wait_exit = "${{ steps.broad-tests.outputs.dump_wait_exit }}"
             broad_step_outcome = "${{ steps.broad-tests.outcome }}"
             self_test_outcome = "${{ steps.self-test.outcome }}"
@@ -277,9 +292,10 @@ jobs:
         shell: pwsh
         run: |
           $failed = "${{ steps.self-test.outcome }}" -ne "success"
-          $attempt1 = "${{ steps.broad-tests.outputs.attempt_1_exit }}"
-          $attempt2 = "${{ steps.broad-tests.outputs.attempt_2_exit }}"
-          if ($attempt1 -ne "0" -or $attempt2 -ne "0") {
+          $attempt1 = "${{ steps.broad-tests.outputs.broad_attempt_1_exit }}"
+          $attempt2 = "${{ steps.broad-tests.outputs.broad_attempt_2_exit }}"
+          $focused = "${{ steps.broad-tests.outputs.focused_exit }}"
+          if ($attempt1 -ne "0" -or $attempt2 -ne "0" -or $focused -ne "0") {
             $failed = $true
           }
           $realDumps = @(Get-ChildItem diagnostics\windows-arm64-run\dumps -Filter *.dmp -ErrorAction SilentlyContinue)
