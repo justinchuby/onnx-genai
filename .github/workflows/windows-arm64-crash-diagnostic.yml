@@ -92,7 +92,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        replica: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        replica: [1]
     runs-on: windows-11-arm
     timeout-minutes: 150
     env:
@@ -220,6 +220,20 @@ jobs:
             exit 0
           fi
 
+          cargo test --locked -p onnx-runtime-ep-cpu --features mlas \
+            --test native_vs_mlas_differential --no-run --message-format=json \
+            > ../diagnostics/windows-arm64-run/artifacts/logs/focused-build.json
+          target_exe="$(python -c 'import json,sys; xs=[json.loads(x) for x in open(sys.argv[1]) if x.startswith(\"{\")]; print(next(x[\"executable\"] for x in reversed(xs) if x.get(\"reason\")==\"compiler-artifact\" and x.get(\"target\",{}).get(\"name\")==\"native_vs_mlas_differential\" and x.get(\"executable\")))' ../diagnostics/windows-arm64-run/artifacts/logs/focused-build.json)"
+          if [[ -z "$target_exe" || ! -f "$target_exe" || ! -f "${target_exe%.exe}.pdb" ]]; then
+            echo "::error::failed to dynamically resolve focused executable/PDB pair"
+            echo "attempt_2_exit=target-resolution-failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          target_windows="$(cygpath -w "$target_exe")"
+          pwsh -NoProfile -File ../diagnostics/.github/scripts/windows_arm64_wer_diagnostics.ps1 \
+            -Action ConfigureTarget -DiagnosticRoot ../diagnostics/windows-arm64-run \
+            -TargetExecutable "$target_windows"
+
           echo "cargo test --locked -p onnx-runtime-ep-cpu --features mlas --test native_vs_mlas_differential -- --nocapture" \
             > ../diagnostics/windows-arm64-run/artifacts/manifests/focused-command.txt
           {
@@ -234,6 +248,14 @@ jobs:
             --test native_vs_mlas_differential -- --nocapture
           attempt_2="$?"
           echo "attempt_2_exit=$attempt_2" >> "$GITHUB_OUTPUT"
+          if [[ "$attempt_2" -ne 0 ]]; then
+            pwsh -NoProfile -File ../diagnostics/.github/scripts/windows_arm64_wer_diagnostics.ps1 \
+              -Action WaitForTargetDump -DiagnosticRoot ../diagnostics/windows-arm64-run \
+              -TargetExecutable "$target_windows"
+            echo "dump_wait_exit=$?" >> "$GITHUB_OUTPUT"
+          else
+            echo "dump_wait_exit=not-needed" >> "$GITHUB_OUTPUT"
+          fi
           cd ../diagnostics
           pwsh -NoProfile -File .github/scripts/windows_arm64_wer_diagnostics.ps1 -Action CheckForRealDump -DiagnosticRoot windows-arm64-run
           exit 0

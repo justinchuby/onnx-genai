@@ -1,10 +1,11 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("SetupAndSelfTest", "CheckForRealDump", "CollectFailure", "SecretScan", "Cleanup")]
+    [ValidateSet("SetupAndSelfTest", "ConfigureTarget", "WaitForTargetDump", "CheckForRealDump", "CollectFailure", "SecretScan", "Cleanup")]
     [string]$Action,
     [Parameter(Mandatory)]
     [string]$DiagnosticRoot,
-    [string]$TestedRoot = ""
+    [string]$TestedRoot = "",
+    [string]$TargetExecutable = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,7 +48,10 @@ function Wait-ForDump {
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lifecycleLog = Join-Path $manifestRoot "wer-lifecycle.log"
     do {
+        $werFault = @(Get-Process -Name WerFault -ErrorAction SilentlyContinue)
+        "$(Get-Date -Format o) phase=waiting werfault_pids=$($werFault.Id -join ',')" | Add-Content $lifecycleLog
         $dump = Get-ChildItem -Path $dumpRoot -Filter "$ExecutablePrefix*.dmp" -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1
@@ -57,10 +61,58 @@ function Wait-ForDump {
             while ((Get-Date) -lt $deadline) {
                 $werFault = @(Get-Process -Name WerFault -ErrorAction SilentlyContinue)
                 $current = Get-Item -LiteralPath $dump.FullName -ErrorAction SilentlyContinue
+                "$(Get-Date -Format o) phase=stabilizing werfault_pids=$($werFault.Id -join ',') dump='$($dump.Name)' size=$(if ($null -eq $current) { -1 } else { $current.Length })" |
+                    Add-Content $lifecycleLog
                 if ($null -ne $current -and $current.Length -gt 0 -and $current.Length -eq $lastLength) {
                     $stableSamples++
                 } else {
                     $stableSamples = 0
+                }
+
+                function Configure-Target {
+                    New-DiagnosticDirectories
+                    if ([string]::IsNullOrWhiteSpace($TargetExecutable) -or !(Test-Path $TargetExecutable)) {
+                        throw "ConfigureTarget requires the dynamically resolved test executable; received '$TargetExecutable'."
+                    }
+                    $executable = Get-Item -LiteralPath $TargetExecutable
+                    $pdbPath = [System.IO.Path]::ChangeExtension($executable.FullName, ".pdb")
+                    if (!(Test-Path $pdbPath)) {
+                        throw "Dynamically resolved target '$($executable.FullName)' has no matching PDB '$pdbPath'."
+                    }
+
+                    $processKey = Join-Path $werRegistryPath $executable.Name
+                    New-Item -Force $processKey | Out-Null
+                    New-ItemProperty -Force $processKey DumpFolder -PropertyType ExpandString -Value $dumpRoot | Out-Null
+                    New-ItemProperty -Force $processKey DumpType -PropertyType DWord -Value 2 | Out-Null
+                    New-ItemProperty -Force $processKey DumpCount -PropertyType DWord -Value 1 | Out-Null
+
+                    $binaryDirectory = New-Item -ItemType Directory -Force -Path (Join-Path $artifactRoot "binaries")
+                    Copy-Item -Force $executable.FullName $binaryDirectory
+                    Copy-Item -Force $pdbPath $binaryDirectory
+                    [pscustomobject]@{
+                        process_name = $executable.Name
+                        process_registry_key = $processKey
+                        executable = $executable.FullName
+                        executable_sha256 = (Get-FileHash -Algorithm SHA256 $executable.FullName).Hash.ToLowerInvariant()
+                        pdb = $pdbPath
+                        pdb_sha256 = (Get-FileHash -Algorithm SHA256 $pdbPath).Hash.ToLowerInvariant()
+                    } | ConvertTo-Json | Set-Content (Join-Path $manifestRoot "resolved-crash-target.json")
+
+                    & reg.exe query ($werRegistryKey + "\" + $executable.Name) /s /reg:64 2>&1 |
+                        Set-Content (Join-Path $manifestRoot "target-wer-registry.txt")
+                }
+
+                function Wait-ForTargetDump {
+                    New-DiagnosticDirectories
+                    if ([string]::IsNullOrWhiteSpace($TargetExecutable)) {
+                        throw "WaitForTargetDump requires TargetExecutable."
+                    }
+                    $prefix = [System.IO.Path]::GetFileNameWithoutExtension($TargetExecutable)
+                    $dump = Wait-ForDump -ExecutablePrefix $prefix -TimeoutSeconds 180
+                    if ($null -eq $dump) {
+                        throw "No stable WER dump appeared for '$([System.IO.Path]::GetFileName($TargetExecutable))' within 180 seconds."
+                    }
+                    "Stable target dump: $($dump.FullName) ($($dump.Length) bytes)" | Write-Host
                 }
                 if ($null -ne $current) {
                     $lastLength = $current.Length
@@ -341,7 +393,7 @@ function Collect-Failure {
     if (Test-Path $broadLog) {
         $targetMatch = [regex]::Matches(
             (Get-Content -Raw $broadLog),
-            '(?im)process didn''t exit successfully:\s*`([^`]*native_vs_mlas_differential-[^`\\/:]+\.exe)`'
+            '(?im)process didn''t exit successfully:\s*`([^`]*native_vs_mlas_differential-[^`\\/:]+\.exe)(?:\s[^`]*)?`'
         ) | Select-Object -Last 1
     }
     if ($null -ne $targetMatch) {
@@ -442,6 +494,8 @@ function Restore-Registry {
 
 switch ($Action) {
     "SetupAndSelfTest" { Setup-AndSelfTest }
+    "ConfigureTarget" { Configure-Target }
+    "WaitForTargetDump" { Wait-ForTargetDump }
     "CheckForRealDump" { Check-ForRealDump }
     "CollectFailure" { Collect-Failure }
     "SecretScan" { New-DiagnosticDirectories; Assert-NoSecrets -Path $artifactRoot }
