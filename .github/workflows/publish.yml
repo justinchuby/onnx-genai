@@ -167,6 +167,7 @@ jobs:
           publish_crate onnx-runtime-tracer
           publish_crate onnx-genai-runtime-config
           publish_crate onnx-genai-ort-sys
+          publish_crate onnx-runtime-einsum-conformance
           publish_crate onnx-runtime-ir
           publish_crate onnx-model-package
           publish_crate onnx-runtime-shape-inference
@@ -181,9 +182,12 @@ jobs:
           publish_crate onnx-runtime-ep-api
           publish_crate mlas-sys
           publish_crate onnx-runtime-quantization
+          publish_crate onnx-runtime-hostmon
+          publish_crate onnx-runtime-operator-selection
           publish_crate onnx-runtime-ep-cpu
           publish_crate onnx-runtime-eager
           publish_crate onnx-runtime-cuda-memory
+          publish_crate onnx-genai-paged-attention
           publish_crate onnx-runtime-ep-cuda
           publish_crate onnx-genai-metadata
           publish_crate onnx-runtime-session
