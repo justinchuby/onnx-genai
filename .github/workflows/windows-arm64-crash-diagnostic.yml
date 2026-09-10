@@ -1,0 +1,232 @@
+name: Windows ARM64 crash diagnostic
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/scripts/windows_arm64_crash_self_test.c"
+      - ".github/scripts/windows_arm64_wer_diagnostics.ps1"
+      - ".github/workflows/windows-arm64-crash-diagnostic.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-arm64-crash-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  exact-candidate:
+    name: Exact candidate ${{ matrix.replica }}
+    strategy:
+      fail-fast: true
+      matrix:
+        replica: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    runs-on: windows-11-arm
+    timeout-minutes: 150
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-D warnings"
+      CMAKE_GENERATOR: "Visual Studio 17 2022"
+      NXRT_REQUIRE_PLACEMENT_TESTS: "1"
+      TESTED_SHA: c0fa3e24a578be65b8f946db6c1766f479e7dc60
+      DIAGNOSTIC_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Check out diagnostic revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.DIAGNOSTIC_SHA }}
+          path: diagnostics
+          persist-credentials: false
+
+      - name: Check out exact candidate
+        uses: actions/checkout@v5
+        with:
+          ref: c0fa3e24a578be65b8f946db6c1766f479e7dc60
+          path: tested
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Record exact source attribution
+        id: attribution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tested = (& git -C tested rev-parse HEAD).Trim()
+          $diagnostic = (& git -C diagnostics rev-parse HEAD).Trim()
+          if ($tested -ne $env:TESTED_SHA) {
+            throw "Test checkout mismatch: expected $env:TESTED_SHA, got $tested."
+          }
+          if ($diagnostic -ne $env:DIAGNOSTIC_SHA) {
+            throw "Diagnostic checkout mismatch: expected $env:DIAGNOSTIC_SHA, got $diagnostic."
+          }
+          $root = New-Item -ItemType Directory -Force diagnostics\windows-arm64-run\artifacts\manifests
+          [pscustomobject]@{
+            tested_sha = $tested
+            diagnostic_sha = $diagnostic
+            workflow_run_id = "${{ github.run_id }}"
+            workflow_run_attempt = "${{ github.run_attempt }}"
+            job = "${{ github.job }}"
+            replica = ${{ matrix.replica }}
+            runner_name = $env:RUNNER_NAME
+            runner_arch = $env:RUNNER_ARCH
+          } | ConvertTo-Json | Set-Content (Join-Path $root "attribution.json")
+          "tested_sha=$tested" >> $env:GITHUB_OUTPUT
+          "diagnostic_sha=$diagnostic" >> $env:GITHUB_OUTPUT
+          Write-Host "TESTED_SHA=$tested"
+          Write-Host "DIAGNOSTIC_SHA=$diagnostic"
+
+      - name: Install Windows SDK debugger
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install windows-sdk-10-version-2004-windbg -y --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows SDK debugger installation failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Configure HKLM WER and prove capture end-to-end
+        id: self-test
+        shell: pwsh
+        run: |
+          & diagnostics\.github\scripts\windows_arm64_wer_diagnostics.ps1 `
+            -Action SetupAndSelfTest `
+            -DiagnosticRoot diagnostics\windows-arm64-run
+
+      - name: Install exact candidate toolchain
+        working-directory: tested
+        shell: bash
+        run: rustup toolchain install
+
+      - name: Install exact candidate Python dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test dependencies
+        working-directory: tested
+        shell: bash
+        run: python -m pip install --upgrade numpy onnxscript
+
+      - name: Build mlas-sys on Windows ARM64
+        working-directory: tested
+        shell: bash
+        run: cargo build --locked --target aarch64-pc-windows-msvc -p mlas-sys
+
+      - name: Build CPU plugin with MLAS research reference
+        working-directory: tested
+        shell: bash
+        run: cargo build --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu-plugin --features mlas
+
+      - name: Run two exact broad Cargo executions
+        id: broad-tests
+        working-directory: tested
+        shell: bash
+        run: |
+          mkdir -p ../diagnostics/windows-arm64-run/artifacts/logs
+          exec > >(tee ../diagnostics/windows-arm64-run/artifacts/logs/broad-tests.log) 2>&1
+          set +e
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
+          resolver_status="$?"
+          if [[ "$resolver_status" -ne 0 || -z "$packages" ]]; then
+            echo "::error::lane 'offline-cross-platform' failed to resolve a non-empty package set"
+            echo "resolver_exit=$resolver_status" >> "$GITHUB_OUTPUT"
+            echo "attempt_1_exit=not-run" >> "$GITHUB_OUTPUT"
+            echo "attempt_2_exit=not-run" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cargo test --locked $packages
+          attempt_1="$?"
+          echo "attempt_1_exit=$attempt_1" >> "$GITHUB_OUTPUT"
+          cd ../diagnostics
+          pwsh -NoProfile -File .github/scripts/windows_arm64_wer_diagnostics.ps1 -Action CheckForRealDump -DiagnosticRoot windows-arm64-run
+          dump_1="$(tail -n 1 "$GITHUB_OUTPUT" | tr -d '\r')"
+          cd ../tested
+          if [[ "$attempt_1" -ne 0 || "$dump_1" == "real_dump=true" ]]; then
+            echo "attempt_2_exit=stopped-after-failure-or-dump" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cargo test --locked $packages
+          attempt_2="$?"
+          echo "attempt_2_exit=$attempt_2" >> "$GITHUB_OUTPUT"
+          cd ../diagnostics
+          pwsh -NoProfile -File .github/scripts/windows_arm64_wer_diagnostics.ps1 -Action CheckForRealDump -DiagnosticRoot windows-arm64-run
+          exit 0
+
+      - name: Write execution manifest
+        if: always()
+        shell: pwsh
+        run: |
+          $manifest = "diagnostics\windows-arm64-run\artifacts\manifests\execution.json"
+          [pscustomobject]@{
+            tested_sha = "${{ steps.attribution.outputs.tested_sha }}"
+            diagnostic_sha = "${{ steps.attribution.outputs.diagnostic_sha }}"
+            replica = ${{ matrix.replica }}
+            resolver_exit = "${{ steps.broad-tests.outputs.resolver_exit }}"
+            attempt_1_exit = "${{ steps.broad-tests.outputs.attempt_1_exit }}"
+            attempt_2_exit = "${{ steps.broad-tests.outputs.attempt_2_exit }}"
+            broad_step_outcome = "${{ steps.broad-tests.outcome }}"
+            self_test_outcome = "${{ steps.self-test.outcome }}"
+          } | ConvertTo-Json | Set-Content $manifest
+          Get-Content $manifest | Write-Host
+
+      - name: Detect failure or real dump
+        if: always()
+        id: result
+        shell: pwsh
+        run: |
+          $failed = "${{ steps.self-test.outcome }}" -ne "success"
+          $attempt1 = "${{ steps.broad-tests.outputs.attempt_1_exit }}"
+          $attempt2 = "${{ steps.broad-tests.outputs.attempt_2_exit }}"
+          if ($attempt1 -ne "0" -or $attempt2 -ne "0") {
+            $failed = $true
+          }
+          $realDumps = @(Get-ChildItem diagnostics\windows-arm64-run\dumps -Filter *.dmp -ErrorAction SilentlyContinue)
+          if ($realDumps.Count -gt 0) {
+            $failed = $true
+          }
+          "failed=$($failed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "real_dump_count=$($realDumps.Count)" >> $env:GITHUB_OUTPUT
+
+      - name: Collect and secret-scan bounded failure artifacts
+        if: always() && steps.result.outputs.failed == 'true'
+        id: collect
+        shell: pwsh
+        run: |
+          & diagnostics\.github\scripts\windows_arm64_wer_diagnostics.ps1 `
+            -Action CollectFailure `
+            -DiagnosticRoot diagnostics\windows-arm64-run `
+            -TestedRoot tested
+
+      - name: Restore original HKLM WER state
+        if: always()
+        shell: pwsh
+        run: |
+          & diagnostics\.github\scripts\windows_arm64_wer_diagnostics.ps1 `
+            -Action Cleanup `
+            -DiagnosticRoot diagnostics\windows-arm64-run
+
+      - name: Upload failure artifacts
+        if: always() && steps.result.outputs.failed == 'true' && steps.collect.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-crash-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.replica }}
+          path: diagnostics/windows-arm64-run/artifacts
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+      - name: Preserve nonzero diagnostic outcome
+        if: always()
+        shell: pwsh
+        run: |
+          if ("${{ steps.result.outputs.failed }}" -eq "true") {
+            throw "Replica ${{ matrix.replica }} failed or captured a real dump; preserving the nonzero outcome."
+          }
+          if ("${{ steps.result.outputs.failed }}" -ne "false") {
+            throw "Replica ${{ matrix.replica }} did not produce a trustworthy diagnostic result."
+          }
+          Write-Host "Replica ${{ matrix.replica }} completed two exact broad Cargo executions without a real dump."
