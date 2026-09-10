@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("SetupAndSelfTest", "CheckForRealDump", "CollectFailure", "Cleanup")]
+    [ValidateSet("SetupAndSelfTest", "CheckForRealDump", "CollectFailure", "SecretScan", "Cleanup")]
     [string]$Action,
     [Parameter(Mandatory)]
     [string]$DiagnosticRoot,
@@ -9,6 +9,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+. (Join-Path $PSScriptRoot "windows_arm64_diagnostic_helpers.ps1")
 
 $DiagnosticRoot = [System.IO.Path]::GetFullPath($DiagnosticRoot)
 $werRegistryPath = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
@@ -164,13 +166,19 @@ function Setup-AndSelfTest {
     New-ItemProperty -Force $werRegistryPath DumpFolder -PropertyType ExpandString -Value $dumpRoot | Out-Null
     New-ItemProperty -Force $werRegistryPath DumpType -PropertyType DWord -Value 2 | Out-Null
     New-ItemProperty -Force $werRegistryPath DumpCount -PropertyType DWord -Value 1 | Out-Null
+    $werState = if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting") {
+        Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting"
+    } else {
+        $null
+    }
+    $policyDisabled = Get-OptionalPropertyValue -InputObject $werState -Name "Disabled"
     $environmentReport = Join-Path $manifestRoot "wer-environment.txt"
     @(
         "dump_root=$dumpRoot"
         "dump_root_exists=$(Test-Path $dumpRoot)"
         "dump_root_acl=$((Get-Acl $dumpRoot).Sddl)"
         "wer_service=$((Get-Service WerSvc | Select-Object Name, Status, StartType | ConvertTo-Json -Compress))"
-        "policy_disabled=$(if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting') { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting' -Name Disabled -ErrorAction SilentlyContinue).Disabled })"
+        "policy_disabled=$(if ($null -eq $policyDisabled) { '<missing>' } else { $policyDisabled })"
     ) | Set-Content $environmentReport
     "=== native registry view ===" | Add-Content $environmentReport
     & reg.exe query $werRegistryKey /s /reg:64 2>&1 | Add-Content $environmentReport
@@ -340,5 +348,6 @@ switch ($Action) {
     "SetupAndSelfTest" { Setup-AndSelfTest }
     "CheckForRealDump" { Check-ForRealDump }
     "CollectFailure" { Collect-Failure }
+    "SecretScan" { New-DiagnosticDirectories; Assert-NoSecrets -Path $artifactRoot }
     "Cleanup" { Restore-Registry }
 }

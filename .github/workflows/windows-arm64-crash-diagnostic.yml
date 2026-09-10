@@ -5,7 +5,9 @@ on:
   pull_request:
     paths:
       - ".github/scripts/windows_arm64_crash_self_test.c"
+      - ".github/scripts/windows_arm64_diagnostic_helpers.ps1"
       - ".github/scripts/windows_arm64_wer_diagnostics.ps1"
+      - ".github/scripts/test_windows_arm64_diagnostic_helpers.ps1"
       - ".github/workflows/windows-arm64-crash-diagnostic.yml"
 
 permissions:
@@ -47,6 +49,10 @@ jobs:
             throw "Windows SDK debugger installation failed with exit code $LASTEXITCODE."
           }
 
+      - name: Test optional registry diagnostics
+        shell: pwsh
+        run: .github\scripts\test_windows_arm64_diagnostic_helpers.ps1
+
       - name: Prove intentional access-violation capture and CDB symbols
         id: self-test
         shell: pwsh
@@ -63,8 +69,16 @@ jobs:
             -Action Cleanup `
             -DiagnosticRoot windows-arm64-smoke
 
+      - name: Secret-scan bounded smoke evidence
+        if: always()
+        shell: pwsh
+        run: |
+          & .github\scripts\windows_arm64_wer_diagnostics.ps1 `
+            -Action SecretScan `
+            -DiagnosticRoot windows-arm64-smoke
+
       - name: Upload bounded smoke proof
-        if: steps.self-test.outcome == 'success'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-arm64-capture-smoke-${{ github.run_id }}-${{ github.run_attempt }}
