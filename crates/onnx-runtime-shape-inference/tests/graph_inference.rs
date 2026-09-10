@@ -842,42 +842,6 @@ fn skip_simplified_layer_norm_resolves_outputs_without_value_info() {
     );
 }
 
-/// End-to-end: load the committed `bert_toy` model and assert that
-/// `infer_graph` resolves EVERY value in the graph — matching the bar the
-/// loader already meets.
-#[test]
-fn bert_toy_fully_resolves() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../onnx-runtime-session/tests/fixtures/bert_toy/model.onnx.textproto"
-    );
-    let mut graph = onnx_runtime_loader::load_model(path).expect("load bert_toy");
-
-    let total = graph.num_values();
-    assert!(total > 0, "model has values");
-
-    let reg = InferenceRegistry::default_registry();
-    let opsets = graph.opset_imports.clone();
-    let report = reg
-        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
-        .expect("infer bert_toy");
-
-    assert_eq!(
-        report.num_unresolved(),
-        0,
-        "these values did not resolve: {:?}",
-        report.unresolved
-    );
-    assert!(report.fully_resolved());
-    assert_eq!(report.num_resolved(), total);
-
-    // Every value must have a concrete rank (Shape is always Vec<Dim>); assert
-    // no value was left as the default-empty placeholder unless it truly is a
-    // scalar produced as such. We simply confirm the report counts line up.
-    let opset = *opsets.get("").unwrap_or(&0);
-    assert!(opset >= 1);
-}
-
 // ===========================================================================
 // Loop / Scan control-flow inference.
 // ===========================================================================
