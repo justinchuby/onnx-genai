@@ -67,6 +67,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use super::atomic_wait;
+
 /// Independent job slots, i.e. how many dispatchers can be in flight before one
 /// has to run its fan-out inline.
 ///

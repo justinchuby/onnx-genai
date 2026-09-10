@@ -40,6 +40,7 @@
 //! crate actually needs. That restriction is what makes the native pool
 //! allocation-free and its lifetime argument short enough to check by hand.
 
+pub(crate) mod atomic_wait;
 pub mod pool;
 
 use std::num::NonZeroUsize;
