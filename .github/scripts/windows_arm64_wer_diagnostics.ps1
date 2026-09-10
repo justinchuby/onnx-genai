@@ -71,51 +71,6 @@ function Wait-ForDump {
                     $stableSamples = 0
                 }
 
-                function Configure-Target {
-                    New-DiagnosticDirectories
-                    if ([string]::IsNullOrWhiteSpace($TargetExecutable) -or !(Test-Path $TargetExecutable)) {
-                        throw "ConfigureTarget requires the dynamically resolved test executable; received '$TargetExecutable'."
-                    }
-                    $executable = Get-Item -LiteralPath $TargetExecutable
-                    $pdbPath = [System.IO.Path]::ChangeExtension($executable.FullName, ".pdb")
-                    if (!(Test-Path $pdbPath)) {
-                        throw "Dynamically resolved target '$($executable.FullName)' has no matching PDB '$pdbPath'."
-                    }
-
-                    $processKey = Join-Path $werRegistryPath $executable.Name
-                    New-Item -Force $processKey | Out-Null
-                    New-ItemProperty -Force $processKey DumpFolder -PropertyType ExpandString -Value $dumpRoot | Out-Null
-                    New-ItemProperty -Force $processKey DumpType -PropertyType DWord -Value 2 | Out-Null
-                    New-ItemProperty -Force $processKey DumpCount -PropertyType DWord -Value 1 | Out-Null
-
-                    $binaryDirectory = New-Item -ItemType Directory -Force -Path (Join-Path $artifactRoot "binaries")
-                    Copy-Item -Force $executable.FullName $binaryDirectory
-                    Copy-Item -Force $pdbPath $binaryDirectory
-                    [pscustomobject]@{
-                        process_name = $executable.Name
-                        process_registry_key = $processKey
-                        executable = $executable.FullName
-                        executable_sha256 = (Get-FileHash -Algorithm SHA256 $executable.FullName).Hash.ToLowerInvariant()
-                        pdb = $pdbPath
-                        pdb_sha256 = (Get-FileHash -Algorithm SHA256 $pdbPath).Hash.ToLowerInvariant()
-                    } | ConvertTo-Json | Set-Content (Join-Path $manifestRoot "resolved-crash-target.json")
-
-                    & reg.exe query ($werRegistryKey + "\" + $executable.Name) /s /reg:64 2>&1 |
-                        Set-Content (Join-Path $manifestRoot "target-wer-registry.txt")
-                }
-
-                function Wait-ForTargetDump {
-                    New-DiagnosticDirectories
-                    if ([string]::IsNullOrWhiteSpace($TargetExecutable)) {
-                        throw "WaitForTargetDump requires TargetExecutable."
-                    }
-                    $prefix = [System.IO.Path]::GetFileNameWithoutExtension($TargetExecutable)
-                    $dump = Wait-ForDump -ExecutablePrefix $prefix -TimeoutSeconds 180
-                    if ($null -eq $dump) {
-                        throw "No stable WER dump appeared for '$([System.IO.Path]::GetFileName($TargetExecutable))' within 180 seconds."
-                    }
-                    "Stable target dump: $($dump.FullName) ($($dump.Length) bytes)" | Write-Host
-                }
                 if ($null -ne $current) {
                     $lastLength = $current.Length
                 }
@@ -129,6 +84,52 @@ function Wait-ForDump {
         Start-Sleep -Seconds 2
     } while ((Get-Date) -lt $deadline)
     return $null
+}
+
+function Configure-Target {
+    New-DiagnosticDirectories
+    if ([string]::IsNullOrWhiteSpace($TargetExecutable) -or !(Test-Path $TargetExecutable)) {
+        throw "ConfigureTarget requires the dynamically resolved test executable; received '$TargetExecutable'."
+    }
+    $executable = Get-Item -LiteralPath $TargetExecutable
+    $pdbPath = [System.IO.Path]::ChangeExtension($executable.FullName, ".pdb")
+    if (!(Test-Path $pdbPath)) {
+        throw "Dynamically resolved target '$($executable.FullName)' has no matching PDB '$pdbPath'."
+    }
+
+    $processKey = Join-Path $werRegistryPath $executable.Name
+    New-Item -Force $processKey | Out-Null
+    New-ItemProperty -Force $processKey DumpFolder -PropertyType ExpandString -Value $dumpRoot | Out-Null
+    New-ItemProperty -Force $processKey DumpType -PropertyType DWord -Value 2 | Out-Null
+    New-ItemProperty -Force $processKey DumpCount -PropertyType DWord -Value 1 | Out-Null
+
+    $binaryDirectory = New-Item -ItemType Directory -Force -Path (Join-Path $artifactRoot "binaries")
+    Copy-Item -Force $executable.FullName $binaryDirectory
+    Copy-Item -Force $pdbPath $binaryDirectory
+    [pscustomobject]@{
+        process_name = $executable.Name
+        process_registry_key = $processKey
+        executable = $executable.FullName
+        executable_sha256 = (Get-FileHash -Algorithm SHA256 $executable.FullName).Hash.ToLowerInvariant()
+        pdb = $pdbPath
+        pdb_sha256 = (Get-FileHash -Algorithm SHA256 $pdbPath).Hash.ToLowerInvariant()
+    } | ConvertTo-Json | Set-Content (Join-Path $manifestRoot "resolved-crash-target.json")
+
+    & reg.exe query ($werRegistryKey + "\" + $executable.Name) /s /reg:64 2>&1 |
+        Set-Content (Join-Path $manifestRoot "target-wer-registry.txt")
+}
+
+function Wait-ForTargetDump {
+    New-DiagnosticDirectories
+    if ([string]::IsNullOrWhiteSpace($TargetExecutable)) {
+        throw "WaitForTargetDump requires TargetExecutable."
+    }
+    $prefix = [System.IO.Path]::GetFileNameWithoutExtension($TargetExecutable)
+    $dump = Wait-ForDump -ExecutablePrefix $prefix -TimeoutSeconds 180
+    if ($null -eq $dump) {
+        throw "No stable WER dump appeared for '$([System.IO.Path]::GetFileName($TargetExecutable))' within 180 seconds."
+    }
+    "Stable target dump: $($dump.FullName) ($($dump.Length) bytes)" | Write-Host
 }
 
 function Invoke-CdbAnalysis {
