@@ -100,7 +100,7 @@ jobs:
       RUSTFLAGS: "-D warnings"
       CMAKE_GENERATOR: "Visual Studio 17 2022"
       NXRT_REQUIRE_PLACEMENT_TESTS: "1"
-      TESTED_SHA: c0fa3e24a578be65b8f946db6c1766f479e7dc60
+      TESTED_SHA: acc58ba4a2d1e381eb665f2f1954f70f14dec487
       DIAGNOSTIC_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
@@ -114,7 +114,7 @@ jobs:
       - name: Check out exact candidate
         uses: actions/checkout@v5
         with:
-          ref: c0fa3e24a578be65b8f946db6c1766f479e7dc60
+          ref: acc58ba4a2d1e381eb665f2f1954f70f14dec487
           path: tested
           submodules: recursive
           persist-credentials: false
