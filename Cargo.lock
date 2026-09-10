@@ -2664,6 +2664,10 @@ dependencies = [
 [[package]]
 name = "onnx-runtime-ort-testkit"
 version = "0.1.0-dev.6"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-genai-ort-sys",
+]
 
 [[package]]
 name = "onnx-runtime-protocol-trace"

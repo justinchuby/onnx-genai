@@ -15,9 +15,6 @@
 //! Real ORT 1.27, not a mock.
 
 mod cdylib_resolve;
-/// Canonical ORT discovery lives in the `onnx-runtime-ort-testkit` crate —
-/// aliased here so existing `ort_discovery::`/`ort_path::` call sites keep working.
-use onnx_runtime_ort_testkit as ort_discovery;
 use onnx_runtime_ort_testkit as ort_path;
 /// Session-creation helper (binary + textproto fixtures) from `main`.
 #[path = "common/ort_session.rs"]
@@ -36,24 +33,8 @@ fn lock_ort_ep() -> MutexGuard<'static, ()> {
     ORT_EP_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn find_ort_lib_dir() -> Option<PathBuf> {
-    ort_discovery::find_ort_lib_dir()
-}
-
 fn find_ep_cdylib() -> Option<PathBuf> {
     cdylib_resolve::find_cpu_plugin_cdylib_optional()
-}
-
-unsafe fn get_ort_api(lib: &libloading::Library) -> *const ort::OrtApi {
-    type GetApiBaseFn = unsafe extern "C" fn() -> *const ort::OrtApiBase;
-    let get_api_base: libloading::Symbol<'_, GetApiBaseFn> =
-        unsafe { lib.get(b"OrtGetApiBase") }.expect("OrtGetApiBase not found");
-    let api_base = unsafe { get_api_base() };
-    assert!(!api_base.is_null());
-    let get_api = unsafe { (*api_base).GetApi }.expect("GetApi is null");
-    let api = unsafe { get_api(ort::ORT_API_VERSION) };
-    assert!(!api.is_null());
-    api
 }
 
 unsafe fn check_status(api: *const ort::OrtApi, status: *mut ort::OrtStatus, stage: &str) {
@@ -199,12 +180,15 @@ fn layernorm_dynamic_axis_mean_invstddev_shape() {
     let model_path = PathBuf::from(manifest_dir)
         .join("tests/fixtures/layer_norm_dynamic_axis/model.onnx.textproto");
 
-    let Some(ort_lib_dir) = find_ort_lib_dir() else {
-        if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
-            panic!("NXRT_REQUIRE_ORT_TESTS=1 but ORT not found");
+    let process = match ort_path::ort_test_process() {
+        Ok(process) => process,
+        Err(error) => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!("NXRT_REQUIRE_ORT_TESTS=1 but ORT initialization failed: {error}");
+            }
+            eprintln!("*** SKIPPED: layernorm_dynamic_axis — {error} ***");
+            return;
         }
-        eprintln!("*** SKIPPED: layernorm_dynamic_axis — ORT not found ***");
-        return;
     };
     let Some(ep_lib_path) = find_ep_cdylib() else {
         if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
@@ -222,16 +206,8 @@ fn layernorm_dynamic_axis_mean_invstddev_shape() {
     }
 
     unsafe {
-        let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-        let lib = libloading::Library::new(&ort_lib_path).expect("load libonnxruntime");
-        let api = get_ort_api(&lib);
-
-        // Create env
-        let mut env: *mut ort::OrtEnv = ptr::null_mut();
-        let logid = c"nxrt_bl1_ln";
-        let status =
-            ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
-        check_status(api, status, "CreateEnv");
+        let api = process.api();
+        let env = process.environment();
 
         // Register EP
         let reg_name = c"cpu_ep_bl1";
@@ -386,6 +362,5 @@ fn layernorm_dynamic_axis_mean_invstddev_shape() {
         ((*api).ReleaseSessionOptions.unwrap())(session_options);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 }

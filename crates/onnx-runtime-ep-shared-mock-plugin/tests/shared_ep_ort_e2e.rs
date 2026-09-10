@@ -64,24 +64,6 @@ fn lock_ort_ep() -> MutexGuard<'static, ()> {
 // ─── ORT plumbing ────────────────────────────────────────────────────────────
 
 /// # Safety
-/// `lib` must be a loaded libonnxruntime.
-unsafe fn get_ort_api(lib: &libloading::Library) -> *const ort::OrtApi {
-    type GetApiBaseFn = unsafe extern "C" fn() -> *const ort::OrtApiBase;
-    let get_api_base: libloading::Symbol<'_, GetApiBaseFn> =
-        unsafe { lib.get(b"OrtGetApiBase") }.expect("OrtGetApiBase not found in libonnxruntime");
-    let api_base = unsafe { get_api_base() };
-    assert!(!api_base.is_null(), "OrtGetApiBase returned null");
-    let get_api = unsafe { (*api_base).GetApi }.expect("OrtApiBase::GetApi is null");
-    let api = unsafe { get_api(ort::ORT_API_VERSION) };
-    assert!(
-        !api.is_null(),
-        "GetApi(ORT_API_VERSION={}) returned null — ORT version mismatch?",
-        ort::ORT_API_VERSION
-    );
-    api
-}
-
-/// # Safety
 /// `api` must be a valid `OrtApi`; `status` may be null.
 unsafe fn check_status(api: *const ort::OrtApi, status: *mut ort::OrtStatus, stage: &str) {
     if !status.is_null() {
@@ -103,7 +85,6 @@ unsafe fn check_status(api: *const ort::OrtApi, status: *mut ort::OrtStatus, sta
 
 /// Handles required by every test; `None` means "prerequisite missing".
 struct Fixture {
-    _ort_lib: libloading::Library,
     plugin_lib: libloading::Library,
     api: *const ort::OrtApi,
     plugin_path: PathBuf,
@@ -111,8 +92,8 @@ struct Fixture {
 
 impl Fixture {
     fn acquire(what: &str) -> Option<Self> {
-        let ort_lib_path = testkit::require_or_skip(
-            testkit::find_ort_lib(),
+        let process = testkit::require_or_skip(
+            testkit::ort_test_process().ok(),
             &format!("{what}: real ORT not found (build onnx-genai-ort-sys first)"),
         )?;
         let plugin_path = testkit::require_or_skip(
@@ -120,15 +101,12 @@ impl Fixture {
             &format!("{what}: {PLUGIN_PACKAGE} cdylib not found"),
         )?;
 
-        // SAFETY: both paths point at real shared libraries produced by this
-        // workspace's build.
-        let ort_lib = unsafe { libloading::Library::new(&ort_lib_path) }
-            .unwrap_or_else(|e| panic!("dlopen {}: {e}", ort_lib_path.display()));
+        // SAFETY: the path points at a real shared library produced by this
+        // workspace's build. ORT itself is held by the process-wide testkit.
         let plugin_lib = unsafe { libloading::Library::new(&plugin_path) }
             .unwrap_or_else(|e| panic!("dlopen {}: {e}", plugin_path.display()));
-        let api = unsafe { get_ort_api(&ort_lib) };
+        let api = process.api();
         Some(Self {
-            _ort_lib: ort_lib,
             plugin_lib,
             api,
             plugin_path,
@@ -192,22 +170,18 @@ fn fixture_model(name: &str) -> PathBuf {
     p
 }
 
-/// Create an env and register the plugin under `reg_name`.
+/// Register the plugin under `reg_name` on the process-wide environment.
 ///
 /// # Safety
 /// `api` must be a valid `OrtApi`.
-unsafe fn create_env_with_plugin(
+unsafe fn register_plugin(
     api: *const ort::OrtApi,
-    log_id: &str,
     reg_name: &CStr,
     plugin_path: &Path,
 ) -> *mut ort::OrtEnv {
-    let mut env: *mut ort::OrtEnv = ptr::null_mut();
-    let logid = CString::new(log_id).unwrap();
-    let status = unsafe {
-        ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env)
-    };
-    unsafe { check_status(api, status, "CreateEnv") };
+    let env = testkit::ort_test_process()
+        .expect("process-wide ORT environment")
+        .environment();
 
     let plugin_c = testkit::OrtPathBuf::new(plugin_path);
     let status = unsafe {
@@ -522,7 +496,7 @@ fn shared_ep_session_runs_and_workspace_is_plumbed() {
     let reg_name = CString::new("shared_mock_ws").unwrap();
 
     unsafe {
-        let env = create_env_with_plugin(api, "nxrt_shared_ws", &reg_name, &fx.plugin_path);
+        let env = register_plugin(api, &reg_name, &fx.plugin_path);
         let device = find_our_ep_device(api, env);
         let (session, options) = create_session_on_our_ep(api, env, device, &model);
 
@@ -567,7 +541,6 @@ fn shared_ep_session_runs_and_workspace_is_plumbed() {
         ((*api).ReleaseSessionOptions.unwrap())(options);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 }
 
@@ -592,7 +565,7 @@ fn shared_ep_routed_subgraph_intermediates_come_from_ort_scratch() {
     let reg_name = CString::new("shared_mock_chain").unwrap();
 
     unsafe {
-        let env = create_env_with_plugin(api, "nxrt_shared_chain", &reg_name, &fx.plugin_path);
+        let env = register_plugin(api, &reg_name, &fx.plugin_path);
         let device = find_our_ep_device(api, env);
         let (session, options) = create_session_on_our_ep(api, env, device, &model);
 
@@ -651,7 +624,6 @@ fn shared_ep_routed_subgraph_intermediates_come_from_ort_scratch() {
         ((*api).ReleaseSessionOptions.unwrap())(options);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 }
 
@@ -677,7 +649,7 @@ fn shared_ep_two_sessions_share_one_instance() {
     let live_before = fx.counter("nxrt_mock_shared_ep_instances_live");
 
     unsafe {
-        let env = create_env_with_plugin(api, "nxrt_shared_two", &reg_name, &fx.plugin_path);
+        let env = register_plugin(api, &reg_name, &fx.plugin_path);
         let device = find_our_ep_device(api, env);
 
         let (session_a, options_a) = create_session_on_our_ep(api, env, device, &model);
@@ -718,7 +690,6 @@ fn shared_ep_two_sessions_share_one_instance() {
         ((*api).ReleaseSessionOptions.unwrap())(options_b);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 
     assert_eq!(
@@ -752,7 +723,7 @@ fn shared_ep_shutdown_runs_once_at_library_unregister() {
     let live_before = fx.counter("nxrt_mock_shared_ep_instances_live");
 
     unsafe {
-        let env = create_env_with_plugin(api, "nxrt_shared_shutdown", &reg_name, &fx.plugin_path);
+        let env = register_plugin(api, &reg_name, &fx.plugin_path);
         let device = find_our_ep_device(api, env);
         let (session, options) = create_session_on_our_ep(api, env, device, &model);
 
@@ -795,8 +766,6 @@ fn shared_ep_shutdown_runs_once_at_library_unregister() {
             "the shared EP must be dropped once the factory is released"
         );
 
-        ((*api).ReleaseEnv.unwrap())(env);
-
         assert_eq!(
             fx.counter("nxrt_mock_shared_ep_shutdown_calls"),
             shutdowns_before + 1,
@@ -837,7 +806,7 @@ fn session_persistent_workspace_is_declined_not_downgraded() {
     let reg_name = CString::new("shared_mock_persistent").unwrap();
 
     unsafe {
-        let env = create_env_with_plugin(api, "nxrt_shared_persistent", &reg_name, &fx.plugin_path);
+        let env = register_plugin(api, &reg_name, &fx.plugin_path);
         let device = find_our_ep_device(api, env);
         let (session, options) = create_session_on_our_ep(api, env, device, &model);
 
@@ -887,7 +856,6 @@ fn session_persistent_workspace_is_declined_not_downgraded() {
         ((*api).ReleaseSessionOptions.unwrap())(options);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
     }
     fx.set_persistent_workspace(false);
 }
@@ -995,7 +963,7 @@ fn workspace_plans_do_not_repeat_for_an_unchanged_shape() {
     const RUNS: usize = 12;
 
     unsafe {
-        let env = create_env_with_plugin(api, "nxrt_shared_plan_cache", &reg_name, &fx.plugin_path);
+        let env = register_plugin(api, &reg_name, &fx.plugin_path);
         let device = find_our_ep_device(api, env);
         let (session, options) = create_session_on_our_ep(api, env, device, &model);
 
@@ -1051,7 +1019,6 @@ fn workspace_plans_do_not_repeat_for_an_unchanged_shape() {
         ((*api).ReleaseSessionOptions.unwrap())(options);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 }
 
@@ -1078,7 +1045,7 @@ fn a_changed_shape_gets_its_own_workspace_plan() {
     let reg_name = CString::new("shared_mock_dynamic_plan").unwrap();
 
     unsafe {
-        let env = create_env_with_plugin(api, "nxrt_shared_dyn_plan", &reg_name, &fx.plugin_path);
+        let env = register_plugin(api, &reg_name, &fx.plugin_path);
         let device = find_our_ep_device(api, env);
         let (session, options) = create_session_on_our_ep(api, env, device, &model);
 
@@ -1122,7 +1089,6 @@ fn a_changed_shape_gets_its_own_workspace_plan() {
         ((*api).ReleaseSessionOptions.unwrap())(options);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 }
 
@@ -1150,8 +1116,7 @@ fn a_declined_workspace_never_asks_ort_where_the_operands_live() {
     const RUNS: usize = 4;
 
     unsafe {
-        let env =
-            create_env_with_plugin(api, "nxrt_shared_lazy_declined", &reg_name, &fx.plugin_path);
+        let env = register_plugin(api, &reg_name, &fx.plugin_path);
         let device = find_our_ep_device(api, env);
         let (session, options) = create_session_on_our_ep(api, env, device, &model);
 
@@ -1191,7 +1156,6 @@ fn a_declined_workspace_never_asks_ort_where_the_operands_live() {
         ((*api).ReleaseSessionOptions.unwrap())(options);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 }
 
@@ -1215,8 +1179,7 @@ fn only_the_nodes_that_receive_a_workspace_query_placement() {
     let reg_name = CString::new("shared_mock_lazy_served").unwrap();
 
     unsafe {
-        let env =
-            create_env_with_plugin(api, "nxrt_shared_lazy_served", &reg_name, &fx.plugin_path);
+        let env = register_plugin(api, &reg_name, &fx.plugin_path);
         let device = find_our_ep_device(api, env);
         let (session, options) = create_session_on_our_ep(api, env, device, &model);
 
@@ -1258,6 +1221,5 @@ fn only_the_nodes_that_receive_a_workspace_query_placement() {
         ((*api).ReleaseSessionOptions.unwrap())(options);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 }

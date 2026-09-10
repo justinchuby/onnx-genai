@@ -15,17 +15,6 @@ fn lock_ort() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-unsafe fn ort_api(library: &libloading::Library) -> *const ort::OrtApi {
-    type GetApiBase = unsafe extern "C" fn() -> *const ort::OrtApiBase;
-    let get_api_base: libloading::Symbol<'_, GetApiBase> =
-        unsafe { library.get(b"OrtGetApiBase") }.expect("OrtGetApiBase");
-    let base = unsafe { get_api_base() };
-    let get_api = unsafe { (*base).GetApi }.expect("GetApi");
-    let api = unsafe { get_api(ort::ORT_API_VERSION) };
-    assert!(!api.is_null());
-    api
-}
-
 unsafe fn check(api: *const ort::OrtApi, status: *mut ort::OrtStatus, stage: &str) {
     if status.is_null() {
         return;
@@ -101,7 +90,6 @@ unsafe fn assignments(
 }
 
 struct Session {
-    _ort: libloading::Library,
     plugin: libloading::Library,
     api: *const ort::OrtApi,
     env: *mut ort::OrtEnv,
@@ -120,7 +108,6 @@ impl Drop for Session {
                 self.registration.as_ptr(),
             );
             check(self.api, status, "UnregisterExecutionProviderLibrary");
-            ((*self.api).ReleaseEnv.unwrap())(self.env);
         }
     }
 }
@@ -134,29 +121,17 @@ unsafe fn session_with_fallback(
     registration: &str,
     disable_cpu_fallback: bool,
 ) -> Option<Session> {
-    let ort_dir = onnx_runtime_ort_testkit::find_ort_lib_dir()?;
+    let process = onnx_runtime_ort_testkit::ort_test_process().ok()?;
     let plugin_path = onnx_runtime_ort_testkit::find_plugin_cdylib_with_features(
         "onnx-runtime-ep-cuda-plugin",
         &["cuda"],
     )?;
-    let ort_library =
-        unsafe { libloading::Library::new(ort_dir.join(onnx_runtime_ort_testkit::ort_lib_name())) }
-            .ok()?;
     let plugin = unsafe { libloading::Library::new(&plugin_path) }.ok()?;
     let reset_compiled: libloading::Symbol<'_, unsafe extern "C" fn()> =
         unsafe { plugin.get(b"nxrt_ep_reset_compiled_node_count") }.ok()?;
     unsafe { reset_compiled() };
-    let api = unsafe { ort_api(&ort_library) };
-
-    let mut env = ptr::null_mut();
-    let log_id = CString::new(format!("cuda_unique_{registration}")).unwrap();
-    unsafe {
-        check(
-            api,
-            ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, log_id.as_ptr(), &mut env),
-            "CreateEnv",
-        )
-    };
+    let api = process.api();
+    let env = process.environment();
     let registration = CString::new(registration).unwrap();
     let plugin_path = onnx_runtime_ort_testkit::OrtPathBuf::new(&plugin_path);
     unsafe {
@@ -274,7 +249,6 @@ unsafe fn session_with_fallback(
         )
     };
     Some(Session {
-        _ort: ort_library,
         plugin,
         api,
         env,
