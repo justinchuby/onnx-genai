@@ -52,7 +52,25 @@ function Wait-ForDump {
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1
         if ($null -ne $dump) {
-            return $dump
+            $lastLength = -1L
+            $stableSamples = 0
+            while ((Get-Date) -lt $deadline) {
+                $werFault = @(Get-Process -Name WerFault -ErrorAction SilentlyContinue)
+                $current = Get-Item -LiteralPath $dump.FullName -ErrorAction SilentlyContinue
+                if ($null -ne $current -and $current.Length -gt 0 -and $current.Length -eq $lastLength) {
+                    $stableSamples++
+                } else {
+                    $stableSamples = 0
+                }
+                if ($null -ne $current) {
+                    $lastLength = $current.Length
+                }
+                if ($werFault.Count -eq 0 -and $stableSamples -ge 2) {
+                    return $current
+                }
+                Start-Sleep -Seconds 2
+            }
+            throw "WER created '$($dump.FullName)', but WerFault did not finish and stabilize the dump within $TimeoutSeconds seconds."
         }
         Start-Sleep -Seconds 2
     } while ((Get-Date) -lt $deadline)
@@ -318,6 +336,41 @@ function Collect-Failure {
         Copy-Item -Recurse -Force $selfTestRoot $selfTestArtifact
     }
 
+    $broadLog = Join-Path $artifactRoot "logs\broad-tests.log"
+    $targetMatch = $null
+    if (Test-Path $broadLog) {
+        $targetMatch = [regex]::Matches(
+            (Get-Content -Raw $broadLog),
+            '(?im)process didn''t exit successfully:\s*`([^`]*native_vs_mlas_differential-[^`\\/:]+\.exe)`'
+        ) | Select-Object -Last 1
+    }
+    if ($null -ne $targetMatch) {
+        $reportedExecutable = $targetMatch.Groups[1].Value
+        $executableName = [System.IO.Path]::GetFileName($reportedExecutable)
+        $executable = Get-ChildItem -Path (Join-Path $TestedRoot "target\debug\deps") -Filter $executableName -File |
+            Select-Object -First 1
+        if ($null -eq $executable) {
+            throw "Cargo reported crashing target '$reportedExecutable', but '$executableName' was not found under target/debug/deps."
+        }
+        $pdbPath = [System.IO.Path]::ChangeExtension($executable.FullName, ".pdb")
+        if (!(Test-Path $pdbPath)) {
+            throw "Cargo reported crashing target '$reportedExecutable', but dynamically matching PDB '$pdbPath' was not found."
+        }
+        [pscustomobject]@{
+            reported_executable = $reportedExecutable
+            resolved_executable = $executable.FullName
+            resolved_pdb = $pdbPath
+            executable_sha256 = (Get-FileHash -Algorithm SHA256 $executable.FullName).Hash.ToLowerInvariant()
+            pdb_sha256 = (Get-FileHash -Algorithm SHA256 $pdbPath).Hash.ToLowerInvariant()
+        } | ConvertTo-Json | Set-Content (Join-Path $manifestRoot "resolved-crash-target.json")
+
+        $dumpPrefix = [System.IO.Path]::GetFileNameWithoutExtension($executableName)
+        $dump = Wait-ForDump -ExecutablePrefix $dumpPrefix -TimeoutSeconds 120
+        if ($null -eq $dump) {
+            throw "Cargo reported access violation in '$executableName', but no matching WER dump stabilized within 120 seconds."
+        }
+    }
+
     $dumps = @(Get-ChildItem -Path $dumpRoot -Filter *.dmp -ErrorAction SilentlyContinue)
     if ($dumps.Count -gt 1) {
         throw "Dump bound violated during collection: found $($dumps.Count) real dumps."
@@ -343,7 +396,7 @@ function Collect-Failure {
         if (!$executableName.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
             $executableName = "$executableName.exe"
         }
-        $executable = Get-ChildItem -Path (Join-Path $TestedRoot "target\debug\deps") -Filter $executableName -Recurse |
+        $executable = Get-ChildItem -Path (Join-Path $TestedRoot "target\debug\deps") -Filter $executableName -File |
             Select-Object -First 1
         if ($null -eq $executable) {
             throw "A dump was captured for '$executableName', but its exact executable was not found under target/debug/deps."

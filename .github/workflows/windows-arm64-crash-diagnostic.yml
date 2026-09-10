@@ -220,7 +220,18 @@ jobs:
             exit 0
           fi
 
-          cargo test --locked $packages
+          echo "cargo test --locked -p onnx-runtime-ep-cpu --features mlas --test native_vs_mlas_differential -- --nocapture" \
+            > ../diagnostics/windows-arm64-run/artifacts/manifests/focused-command.txt
+          {
+            echo "RUNNER_ARCH=$RUNNER_ARCH"
+            echo "RUSTFLAGS=$RUSTFLAGS"
+            echo "CMAKE_GENERATOR=$CMAKE_GENERATOR"
+            echo "NXRT_REQUIRE_PLACEMENT_TESTS=$NXRT_REQUIRE_PLACEMENT_TESTS"
+            rustc -vV
+            cargo -vV
+          } > ../diagnostics/windows-arm64-run/artifacts/manifests/focused-environment.txt
+          cargo test --locked -p onnx-runtime-ep-cpu --features mlas \
+            --test native_vs_mlas_differential -- --nocapture
           attempt_2="$?"
           echo "attempt_2_exit=$attempt_2" >> "$GITHUB_OUTPUT"
           cd ../diagnostics
