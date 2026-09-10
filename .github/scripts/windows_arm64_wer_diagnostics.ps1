@@ -51,7 +51,8 @@ function Wait-ForDump {
     $lifecycleLog = Join-Path $manifestRoot "wer-lifecycle.log"
     do {
         $werFault = @(Get-Process -Name WerFault -ErrorAction SilentlyContinue)
-        "$(Get-Date -Format o) phase=waiting werfault_pids=$($werFault.Id -join ',')" | Add-Content $lifecycleLog
+        $werFaultPids = @($werFault | ForEach-Object Id)
+        "$(Get-Date -Format o) phase=waiting werfault_pids=$($werFaultPids -join ',')" | Add-Content $lifecycleLog
         $dump = Get-ChildItem -Path $dumpRoot -Filter "$ExecutablePrefix*.dmp" -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1
@@ -61,7 +62,8 @@ function Wait-ForDump {
             while ((Get-Date) -lt $deadline) {
                 $werFault = @(Get-Process -Name WerFault -ErrorAction SilentlyContinue)
                 $current = Get-Item -LiteralPath $dump.FullName -ErrorAction SilentlyContinue
-                "$(Get-Date -Format o) phase=stabilizing werfault_pids=$($werFault.Id -join ',') dump='$($dump.Name)' size=$(if ($null -eq $current) { -1 } else { $current.Length })" |
+                $werFaultPids = @($werFault | ForEach-Object Id)
+                "$(Get-Date -Format o) phase=stabilizing werfault_pids=$($werFaultPids -join ',') dump='$($dump.Name)' size=$(if ($null -eq $current) { -1 } else { $current.Length })" |
                     Add-Content $lifecycleLog
                 if ($null -ne $current -and $current.Length -gt 0 -and $current.Length -eq $lastLength) {
                     $stableSamples++
