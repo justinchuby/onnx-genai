@@ -223,7 +223,7 @@ jobs:
           cargo test --locked -p onnx-runtime-ep-cpu --features mlas \
             --test native_vs_mlas_differential --no-run --message-format=json \
             > ../diagnostics/windows-arm64-run/artifacts/logs/focused-build.json
-          target_exe="$(python -c 'import json,sys; xs=[json.loads(x) for x in open(sys.argv[1]) if x.startswith(\"{\")]; print(next(x[\"executable\"] for x in reversed(xs) if x.get(\"reason\")==\"compiler-artifact\" and x.get(\"target\",{}).get(\"name\")==\"native_vs_mlas_differential\" and x.get(\"executable\")))' ../diagnostics/windows-arm64-run/artifacts/logs/focused-build.json)"
+          target_exe="$(python -c 'import json,sys; xs=[json.loads(x) for x in open(sys.argv[1]) if x.startswith("{")]; print(next(x["executable"] for x in reversed(xs) if x.get("reason")=="compiler-artifact" and x.get("target",{}).get("name")=="native_vs_mlas_differential" and x.get("executable")))' ../diagnostics/windows-arm64-run/artifacts/logs/focused-build.json)"
           if [[ -z "$target_exe" || ! -f "$target_exe" || ! -f "${target_exe%.exe}.pdb" ]]; then
             echo "::error::failed to dynamically resolve focused executable/PDB pair"
             echo "attempt_2_exit=target-resolution-failed" >> "$GITHUB_OUTPUT"
