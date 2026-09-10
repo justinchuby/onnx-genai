@@ -103,6 +103,7 @@ use crate::kernels::matmul_nbits::output_chunk_len_for;
 use crate::persistent_pool_width::{
     DEFAULT_SERVICE_CPUS_PER_NUMA_NODE, PoolLayoutInputs, resolve_pool_layout,
 };
+use crate::task_runtime::atomic_wait;
 
 /// Environment switch selecting the persistent SPMD decode pool policy:
 /// **unset (the default) or `=1`** uses the persistent SPMD pool deterministically
