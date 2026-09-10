@@ -10,6 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+$DiagnosticRoot = [System.IO.Path]::GetFullPath($DiagnosticRoot)
 $werRegistryPath = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
 $werRegistryKey = "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
 $stateRoot = Join-Path $DiagnosticRoot "registry-state"
@@ -163,6 +164,18 @@ function Setup-AndSelfTest {
     New-ItemProperty -Force $werRegistryPath DumpFolder -PropertyType ExpandString -Value $dumpRoot | Out-Null
     New-ItemProperty -Force $werRegistryPath DumpType -PropertyType DWord -Value 2 | Out-Null
     New-ItemProperty -Force $werRegistryPath DumpCount -PropertyType DWord -Value 1 | Out-Null
+    $environmentReport = Join-Path $manifestRoot "wer-environment.txt"
+    @(
+        "dump_root=$dumpRoot"
+        "dump_root_exists=$(Test-Path $dumpRoot)"
+        "dump_root_acl=$((Get-Acl $dumpRoot).Sddl)"
+        "wer_service=$((Get-Service WerSvc | Select-Object Name, Status, StartType | ConvertTo-Json -Compress))"
+        "policy_disabled=$(if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting') { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting' -Name Disabled -ErrorAction SilentlyContinue).Disabled })"
+    ) | Set-Content $environmentReport
+    "=== native registry view ===" | Add-Content $environmentReport
+    & reg.exe query $werRegistryKey /s /reg:64 2>&1 | Add-Content $environmentReport
+    "=== alternate registry view ===" | Add-Content $environmentReport
+    & reg.exe query $werRegistryKey /s /reg:32 2>&1 | Add-Content $environmentReport
 
     $cdb = Find-Cdb
     Set-Content -Path (Join-Path $stateRoot "cdb-path.txt") -Value $cdb
@@ -227,6 +240,7 @@ function Setup-AndSelfTest {
 
     Remove-Item -Force $dump.FullName
     Copy-Item -Recurse -Force $selfTestRoot (Join-Path $artifactRoot "self-test-proof")
+    Assert-NoSecrets -Path $artifactRoot
     "Self-test passed: HKLM WER captured a full ARM64 dump and CDB named intentional_access_violation_probe." |
         Write-Host
 }

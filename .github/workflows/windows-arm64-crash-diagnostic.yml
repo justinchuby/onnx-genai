@@ -16,10 +16,67 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  capture-smoke:
+    name: WER capture smoke
+    runs-on: windows-11-arm
+    timeout-minutes: 20
+    env:
+      DIAGNOSTIC_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Check out exact diagnostic revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.DIAGNOSTIC_SHA }}
+          persist-credentials: false
+
+      - name: Verify diagnostic checkout
+        shell: pwsh
+        run: |
+          $actual = (& git rev-parse HEAD).Trim()
+          if ($actual -ne $env:DIAGNOSTIC_SHA) {
+            throw "Diagnostic checkout mismatch: expected $env:DIAGNOSTIC_SHA, got $actual."
+          }
+          Write-Host "DIAGNOSTIC_SHA=$actual"
+
+      - name: Install Windows SDK debugger
+        shell: pwsh
+        run: |
+          choco install windows-sdk-10-version-2004-windbg -y --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows SDK debugger installation failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Prove intentional access-violation capture and CDB symbols
+        id: self-test
+        shell: pwsh
+        run: |
+          & .github\scripts\windows_arm64_wer_diagnostics.ps1 `
+            -Action SetupAndSelfTest `
+            -DiagnosticRoot windows-arm64-smoke
+
+      - name: Restore original HKLM WER state
+        if: always()
+        shell: pwsh
+        run: |
+          & .github\scripts\windows_arm64_wer_diagnostics.ps1 `
+            -Action Cleanup `
+            -DiagnosticRoot windows-arm64-smoke
+
+      - name: Upload bounded smoke proof
+        if: steps.self-test.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-capture-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: windows-arm64-smoke/artifacts
+          if-no-files-found: error
+          retention-days: 14
+
   exact-candidate:
     name: Exact candidate ${{ matrix.replica }}
+    needs: capture-smoke
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         replica: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     runs-on: windows-11-arm
