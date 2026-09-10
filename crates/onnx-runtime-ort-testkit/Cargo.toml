@@ -11,3 +11,5 @@ description = "Shared test-only helpers for discovering a real ONNX Runtime and 
 workspace = true
 
 [dependencies]
+libloading = { workspace = true }
+onnx-genai-ort-sys = { workspace = true }

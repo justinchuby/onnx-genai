@@ -11,8 +11,8 @@
 //! This crate is the single source of truth; test files depend on it as a
 //! `dev-dependency` instead of `#[path = ...] mod`-including a duplicate.
 //!
-//! The crate is `publish = false` and carries no runtime dependencies — it is
-//! never linked into shipped artifacts.
+//! The crate is `publish = false` and is never linked into shipped artifacts.
+//! Its dependencies are limited to loading the pinned ORT C API for tests.
 //!
 //! # Environment variables
 //!
@@ -30,8 +30,156 @@
 //! cdylib).
 
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+use onnx_genai_ort_sys as ort;
+
+/// One real ONNX Runtime library and default environment for the test process.
+///
+/// ORT permits only one `LoggingManager` with `InstanceType::Default` at a
+/// time. `CreateEnv` creates that default manager, so independently constructing
+/// an environment in parallel tests is invalid even when every handle is
+/// eventually released. Sessions remain independently owned and may be created
+/// and destroyed concurrently from this shared environment.
+///
+/// This value lives in a static [`OnceLock`]. It is intentionally not dropped:
+/// ORT and plugin EPs retain process-global pointers into the host library and
+/// environment, so unloading or releasing them during test-process teardown can
+/// race destructors in other static objects. The operating system reclaims both
+/// at process exit, matching ORT's established process-lifetime environment
+/// pattern.
+pub struct OrtTestProcess {
+    library: libloading::Library,
+    api: NonNull<ort::OrtApi>,
+    environment: NonNull<ort::OrtEnv>,
+}
+
+// SAFETY: ORT documents an environment as a process-level object usable by
+// concurrent sessions. The library and both opaque pointers remain alive for
+// the entire process and are never mutated or released by this helper.
+unsafe impl Send for OrtTestProcess {}
+// SAFETY: Same invariant as `Send`; callers receive stable handles whose
+// lifetime is process-wide, while ORT synchronizes its internal shared state.
+unsafe impl Sync for OrtTestProcess {}
+
+impl OrtTestProcess {
+    /// Loaded upstream ORT library. It remains loaded for the process lifetime.
+    pub fn library(&self) -> &libloading::Library {
+        &self.library
+    }
+
+    /// ORT API table associated with [`Self::library`].
+    pub fn api(&self) -> *const ort::OrtApi {
+        self.api.as_ptr()
+    }
+
+    /// The process-wide default ORT environment.
+    pub fn environment(&self) -> *mut ort::OrtEnv {
+        self.environment.as_ptr()
+    }
+}
+
+static ORT_ENVIRONMENT_CREATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of successful default ORT environment creations in this process.
+///
+/// Exposed so integration tests can deterministically prove that concurrent
+/// setup converges on one environment instead of racing multiple `CreateEnv`
+/// calls.
+pub fn ort_environment_creation_count() -> usize {
+    ORT_ENVIRONMENT_CREATIONS.load(Ordering::Acquire)
+}
+
+/// Load upstream ORT and create its one default environment for this process.
+///
+/// The first call performs initialization; concurrent and subsequent calls
+/// receive the exact same library, API table, and environment handles.
+pub fn ort_test_process() -> Result<&'static OrtTestProcess, &'static str> {
+    static PROCESS: OnceLock<Result<OrtTestProcess, String>> = OnceLock::new();
+    PROCESS
+        .get_or_init(create_ort_test_process)
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn create_ort_test_process() -> Result<OrtTestProcess, String> {
+    let library_path = find_ort_lib()
+        .ok_or_else(|| "upstream ONNX Runtime shared library was not found".to_string())?;
+    // SAFETY: The handle is retained in `OrtTestProcess` for the process
+    // lifetime, longer than every symbol and object obtained from it.
+    let library = unsafe { libloading::Library::new(&library_path) }
+        .map_err(|error| format!("failed to load {}: {error}", library_path.display()))?;
+
+    type GetApiBaseFn = unsafe extern "C" fn() -> *const ort::OrtApiBase;
+    // SAFETY: `library` is a live ORT shared-library handle.
+    let get_api_base: libloading::Symbol<'_, GetApiBaseFn> = unsafe {
+        library
+            .get(b"OrtGetApiBase")
+            .map_err(|error| format!("OrtGetApiBase was not exported: {error}"))?
+    };
+    // SAFETY: Calling the exported ORT entry point is its documented ABI.
+    let api_base = unsafe { get_api_base() };
+    let api_base = NonNull::new(api_base.cast_mut())
+        .ok_or_else(|| "OrtGetApiBase returned null".to_string())?;
+    // SAFETY: `api_base` came from ORT and remains valid while `library` lives.
+    let get_api = unsafe { api_base.as_ref().GetApi }
+        .ok_or_else(|| "OrtApiBase::GetApi is null".to_string())?;
+    // SAFETY: The requested API version is generated from the same pinned ORT
+    // headers used to compile this workspace.
+    let api = unsafe { get_api(ort::ORT_API_VERSION) };
+    let api = NonNull::new(api.cast_mut()).ok_or_else(|| {
+        format!(
+            "GetApi(ORT_API_VERSION={}) returned null",
+            ort::ORT_API_VERSION
+        )
+    })?;
+
+    let log_id = CString::new("nxrt-test-process").expect("static log id has no NUL");
+    let mut environment = std::ptr::null_mut();
+    // SAFETY: `api` is the live ORT API table, `log_id` is NUL-terminated, and
+    // `environment` is a valid out-parameter.
+    let status = unsafe {
+        api.as_ref()
+            .CreateEnv
+            .ok_or_else(|| "OrtApi::CreateEnv is null".to_string())?(
+            ort::ORT_LOGGING_LEVEL_WARNING,
+            log_id.as_ptr(),
+            &mut environment,
+        )
+    };
+    if !status.is_null() {
+        // SAFETY: `status` and the API table were returned by this ORT library.
+        let message = unsafe {
+            api.as_ref()
+                .GetErrorMessage
+                .and_then(|get_message| NonNull::new(get_message(status).cast_mut()))
+                .map(|message| {
+                    CStr::from_ptr(message.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_else(|| "(no error message)".to_string())
+        };
+        // SAFETY: Status is owned by the failed `CreateEnv` call.
+        if let Some(release_status) = unsafe { api.as_ref().ReleaseStatus } {
+            unsafe { release_status(status) };
+        }
+        return Err(format!("CreateEnv failed: {message}"));
+    }
+    let environment = NonNull::new(environment)
+        .ok_or_else(|| "CreateEnv returned a null environment".to_string())?;
+    ORT_ENVIRONMENT_CREATIONS.fetch_add(1, Ordering::Release);
+
+    Ok(OrtTestProcess {
+        library,
+        api,
+        environment,
+    })
+}
 
 /// Platform-appropriate filename of the upstream ONNX Runtime shared library.
 pub fn ort_lib_name() -> &'static str {
@@ -57,10 +205,9 @@ fn workspace_root() -> PathBuf {
 /// The ORT version this workspace pins, read from `ort-sys`' build script.
 ///
 /// `ort-sys` declares `const ORT_VERSION: &str = "x.y.z"` and downloads exactly
-/// that tarball, so the build script is the single source of truth. The testkit
-/// carries no dependencies (it is `publish = false` and must never be linked
-/// into a shipped artifact), so it reads the declaration rather than importing
-/// it.
+/// that tarball, so the build script is the single source of truth. The
+/// generated bindings expose the ABI version but not this release string, so
+/// the testkit reads the declaration from the build script.
 ///
 /// `None` means the pin could not be established — the source tree is not
 /// present beside the test binary, which happens when a prebuilt binary is run

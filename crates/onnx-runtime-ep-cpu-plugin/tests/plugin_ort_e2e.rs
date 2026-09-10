@@ -38,9 +38,7 @@ use std::ffi::{CStr, CString, OsString};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::ptr;
-#[cfg(feature = "einsum_concurrency_probe")]
-use std::sync::{Arc, Barrier};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
 use onnx_genai_ort_sys as ort;
 
@@ -119,6 +117,22 @@ fn find_ep_cdylib() -> Option<PathBuf> {
     cdylib_resolve::find_cpu_plugin_cdylib_optional()
 }
 
+fn shared_ort_process() -> Option<&'static ort_path::OrtTestProcess> {
+    match ort_path::ort_test_process() {
+        Ok(process) => Some(process),
+        Err(error) => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!(
+                    "NXRT_REQUIRE_ORT_TESTS=1 but the process-wide ORT environment \
+                     could not be initialized: {error}"
+                );
+            }
+            eprintln!("\n*** SKIPPED: process-wide ORT environment unavailable: {error} ***\n");
+            None
+        }
+    }
+}
+
 /// When `NXRT_REQUIRE_ORT_TESTS=1`, tests must fail instead of silently skipping
 /// if ORT or the EP cdylib is unavailable.
 ///
@@ -191,16 +205,11 @@ unsafe fn check_status(api: *const ort::OrtApi, status: *mut ort::OrtStatus, sta
 /// This is a prerequisite for all other L3 tests.
 #[test]
 fn ort_api_sanity() {
-    let ort_lib_dir = skip_if_missing!(
-        find_ort_lib_dir(),
+    let process = skip_if_missing!(
+        shared_ort_process(),
         "ort_api_sanity: ORT not found; run `cargo build -p onnx-genai-ort-sys` first"
     );
-    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-
-    let lib = unsafe { libloading::Library::new(&ort_lib_path) }
-        .unwrap_or_else(|e| panic!("Failed to dlopen {}: {e}", ort_lib_path.display()));
-
-    let api = unsafe { get_ort_api(&lib) };
+    let api = process.api();
 
     macro_rules! require_fn {
         ($f:ident) => {
@@ -234,6 +243,78 @@ fn ort_api_sanity() {
     eprintln!("✓ ort_api_sanity: All plugin-EP API slots are populated in ORT 1.27");
 }
 
+/// Concurrent test setup must converge on one Default LoggingManager while
+/// every thread independently owns and destroys its sessions.
+#[test]
+fn concurrent_sessions_share_one_process_environment() {
+    let Some(process) = shared_ort_process() else {
+        return;
+    };
+    let model_path = Arc::new(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/add_1x4/model.onnx.textproto"),
+    );
+    assert!(
+        model_path.exists(),
+        "missing concurrent environment fixture: {}",
+        model_path.display()
+    );
+
+    const THREADS: usize = 16;
+    const SESSIONS_PER_THREAD: usize = 4;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let expected_api = process.api() as usize;
+    let expected_env = process.environment() as usize;
+    let mut workers = Vec::with_capacity(THREADS);
+
+    for _ in 0..THREADS {
+        let barrier = Arc::clone(&barrier);
+        let model_path = Arc::clone(&model_path);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            let process = ort_path::ort_test_process().expect("shared ORT test process");
+            assert_eq!(process.api() as usize, expected_api);
+            assert_eq!(process.environment() as usize, expected_env);
+
+            for _ in 0..SESSIONS_PER_THREAD {
+                let api = process.api();
+                let env = process.environment();
+                let mut options = ptr::null_mut();
+                let mut session = ptr::null_mut();
+                unsafe {
+                    check_status(
+                        api,
+                        ((*api).CreateSessionOptions.expect("CreateSessionOptions"))(&mut options),
+                        "CreateSessionOptions(concurrent environment regression)",
+                    );
+                    check_status(
+                        api,
+                        ort_session::create_session(
+                            api,
+                            env,
+                            options,
+                            model_path.as_path(),
+                            &mut session,
+                        ),
+                        "CreateSession(concurrent environment regression)",
+                    );
+                    ((*api).ReleaseSession.expect("ReleaseSession"))(session);
+                    ((*api).ReleaseSessionOptions.expect("ReleaseSessionOptions"))(options);
+                }
+            }
+        }));
+    }
+
+    for worker in workers {
+        worker.join().expect("concurrent session worker panicked");
+    }
+    assert_eq!(
+        ort_path::ort_environment_creation_count(),
+        1,
+        "the test process must create exactly one default ORT environment"
+    );
+}
+
 // ─── L3 — RegisterExecutionProviderLibrary ───────────────────────────────────
 
 /// Drive `RegisterExecutionProviderLibrary` + `GetEpDevices` without running a model.
@@ -244,24 +325,18 @@ fn ort_api_sanity() {
 #[test]
 fn ort_register_ep_library() {
     let _lock = lock_ort_ep();
-    let ort_lib_dir =
-        skip_if_missing!(find_ort_lib_dir(), "ort_register_ep_library: ORT not found");
     let ep_lib_path = skip_if_missing!(
         find_ep_cdylib(),
         "ort_register_ep_library: EP cdylib not found; run cargo build -p onnx-runtime-ep-cpu-plugin"
     );
-
-    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-    let lib = unsafe { libloading::Library::new(&ort_lib_path) }.expect("dlopen ORT failed");
-    let api = unsafe { get_ort_api(&lib) };
+    let process = skip_if_missing!(
+        shared_ort_process(),
+        "ort_register_ep_library: ORT not found"
+    );
+    let api = process.api();
+    let env = process.environment();
 
     unsafe {
-        let mut env: *mut ort::OrtEnv = ptr::null_mut();
-        let logid = CString::new("nxrt_reg_test").unwrap();
-        let status =
-            ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
-        check_status(api, status, "CreateEnv");
-
         let reg_name = CString::new("cpu_ep").unwrap();
         let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
         let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(
@@ -271,9 +346,7 @@ fn ort_register_ep_library() {
         );
         check_status(api, status, "RegisterExecutionProviderLibrary");
         eprintln!("✓ RegisterExecutionProviderLibrary succeeded");
-
         ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 }
 
@@ -285,13 +358,13 @@ fn ort_register_ep_library() {
 #[test]
 fn ort_loads_our_ep_and_runs_model() {
     let _lock = lock_ort_ep();
-    let ort_lib_dir = skip_if_missing!(
-        find_ort_lib_dir(),
-        "ort_loads_our_ep_and_runs_model: ORT not found"
-    );
     let ep_lib_path = skip_if_missing!(
         find_ep_cdylib(),
         "ort_loads_our_ep_and_runs_model: EP cdylib not found"
+    );
+    let process = skip_if_missing!(
+        shared_ort_process(),
+        "ort_loads_our_ep_and_runs_model: ORT not found"
     );
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -303,18 +376,11 @@ fn ort_loads_our_ep_and_runs_model() {
         model_path.display()
     );
 
-    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-    let lib = unsafe { libloading::Library::new(&ort_lib_path) }.expect("dlopen ORT");
-    let api = unsafe { get_ort_api(&lib) };
+    let api = process.api();
+    let env = process.environment();
 
     unsafe {
-        // Stage 1: Env
-        let mut env: *mut ort::OrtEnv = ptr::null_mut();
-        let logid = CString::new("nxrt_e2e").unwrap();
-        let status =
-            ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
-        check_status(api, status, "CreateEnv");
-        eprintln!("✓ Stage 1: CreateEnv");
+        eprintln!("✓ Stage 1: Reuse process-wide Env");
 
         // Stage 2: RegisterExecutionProviderLibrary
         let reg_name = CString::new("cpu_ep_e2e").unwrap();
@@ -459,7 +525,6 @@ fn ort_loads_our_ep_and_runs_model() {
         ((*api).ReleaseSessionOptions.unwrap())(session_options);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
         eprintln!("\n✅ ort_loads_our_ep_and_runs_model: ALL STAGES PASSED");
     }
 }
@@ -474,13 +539,13 @@ fn ort_loads_our_ep_and_runs_model() {
 #[test]
 fn ort_unsupported_op_declines_not_crashes() {
     let _lock = lock_ort_ep();
-    let ort_lib_dir = skip_if_missing!(
-        find_ort_lib_dir(),
-        "ort_unsupported_op_declines_not_crashes: ORT not found"
-    );
     let ep_lib_path = skip_if_missing!(
         find_ep_cdylib(),
         "ort_unsupported_op_declines_not_crashes: EP cdylib not found"
+    );
+    let process = skip_if_missing!(
+        shared_ort_process(),
+        "ort_unsupported_op_declines_not_crashes: ORT not found"
     );
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -495,17 +560,10 @@ fn ort_unsupported_op_declines_not_crashes() {
         return;
     }
 
-    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-    let lib = unsafe { libloading::Library::new(&ort_lib_path) }.expect("dlopen ORT");
-    let api = unsafe { get_ort_api(&lib) };
+    let api = process.api();
+    let env = process.environment();
 
     unsafe {
-        let mut env: *mut ort::OrtEnv = ptr::null_mut();
-        let logid = CString::new("nxrt_neg_test").unwrap();
-        let status =
-            ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
-        check_status(api, status, "CreateEnv");
-
         let reg_name = CString::new("cpu_ep_neg").unwrap();
         let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
         let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(
@@ -610,7 +668,6 @@ fn ort_unsupported_op_declines_not_crashes() {
         ((*api).ReleaseSession.unwrap())(session);
         ((*api).ReleaseSessionOptions.unwrap())(session_options);
         ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
-        ((*api).ReleaseEnv.unwrap())(env);
         eprintln!("\n✅ ort_unsupported_op_declines_not_crashes: PASSED");
     }
 }
@@ -618,14 +675,11 @@ fn ort_unsupported_op_declines_not_crashes() {
 /// Diagnostic: print which ORT EP API function pointers are non-null.
 #[test]
 fn diag_ort_ep_api_nullcheck() {
-    let ort_lib_dir = skip_if_missing!(
-        find_ort_lib_dir(),
+    let process = skip_if_missing!(
+        shared_ort_process(),
         "diag_ort_ep_api_nullcheck: ORT not found"
     );
-    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-    let lib = unsafe { libloading::Library::new(&ort_lib_path) }
-        .unwrap_or_else(|e| panic!("Failed to load ORT at {}: {e}", ort_lib_path.display()));
-    let api = unsafe { get_ort_api(&lib) };
+    let api = process.api();
     macro_rules! check_fn {
         ($field:ident) => {
             eprintln!(
@@ -668,43 +722,11 @@ fn diag_ort_ep_api_nullcheck() {
 // "library is already registered" collision in ORT's global EP registry.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Shared setup helper: load ORT, create Env, register EP, find our device,
-/// build SessionOptions, append EP, create session.
-///
-/// Returns `None` when ORT or the EP cdylib are absent (test should skip).
-///
-/// # Safety
-/// All ORT API calls are unsafe; caller must drive teardown:
-///   ReleaseSession, ReleaseSessionOptions, UnregisterExecutionProviderLibrary, ReleaseEnv.
-/// The process-wide `onnxruntime` handle, loaded once and never unloaded.
-///
-/// Each test used to `dlopen` its own handle and drop it at test end, which
-/// `dlclose`s the library. That is what made this binary crash with an
-/// intermittent `STATUS_ACCESS_VIOLATION` at a run-varying location: our plugin
-/// cdylib stays resident and caches the host `OrtApi` in a process-global
-/// (`status.rs::HOST_ORT_API`, set from `CreateEpFactories`), so unloading and
-/// reloading ORT underneath it leaves that pointer describing a library that is
-/// no longer mapped where it was.
-///
-/// Evidence for that reading, measured on this binary:
-///
-/// * every test passes in isolation, but the suite crashes after 10-16 of them;
-/// * the crash lands on a *different* test each run (shape_f32, matmul_2d,
-///   matmul_batched_nd), so it is cumulative rather than test-specific;
-/// * `--test-threads=1` crashes 4/4, so it is not a data race — which also means
-///   adding more locking cannot fix it;
-/// * `stress_register_run_unregister_cycles` drives **25** full
-///   CreateEnv/register/session/run/unregister/ReleaseEnv cycles and passes,
-///   because it deliberately holds one library handle for its whole duration.
-///   Cycle count is therefore not the variable; library load/unload is.
-///
-/// ORT is a process singleton in real use, so holding one handle for the test
-/// binary's lifetime matches production and removes the reload entirely.
-fn shared_ort_library(path: &std::path::Path) -> Option<&'static libloading::Library> {
-    static LIB: std::sync::OnceLock<Option<libloading::Library>> = std::sync::OnceLock::new();
-    LIB.get_or_init(|| unsafe { libloading::Library::new(path) }.ok())
-        .as_ref()
-}
+// The shared setup below reuses the testkit's process-lifetime ORT library and
+// default environment. ORT permits only one Default LoggingManager, and the
+// plugin caches host API pointers, so neither resource may be recreated or
+// unloaded between parallel tests. Sessions and registration keys remain
+// independently created and destroyed.
 
 unsafe extern "C" fn dsa_schema_create_kernel(
     _op: *const ort::OrtCustomOp,
@@ -886,32 +908,11 @@ unsafe fn conformance_setup_with_session_status(
         return None;
     }
 
-    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-    let lib = match shared_ort_library(&ort_lib_path) {
-        Some(l) => l,
-        None => {
-            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
-                panic!(
-                    "NXRT_REQUIRE_ORT_TESTS=1 but dlopen failed for {}",
-                    ort_lib_path.display()
-                );
-            }
-            eprintln!(
-                "*** SKIPPED: dlopen failed for {} ***",
-                ort_lib_path.display()
-            );
-            return None;
-        }
-    };
+    let _ = ort_lib_dir;
+    let process = shared_ort_process()?;
+    let lib = process.library();
     let api = unsafe { get_ort_api(lib) };
-
-    // Env
-    let mut env: *mut ort::OrtEnv = ptr::null_mut();
-    let logid = std::ffi::CString::new(format!("nxrt_{reg_name}")).unwrap();
-    let status = unsafe {
-        ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env)
-    };
-    unsafe { check_status(api, status, "CreateEnv") };
+    let env = process.environment();
 
     // Register EP library
     let reg_name_c = std::ffi::CString::new(reg_name).unwrap();
@@ -1055,7 +1056,8 @@ unsafe fn conformance_setup(
     Some((lib, api, env, session_options, session))
 }
 
-/// Shared teardown: ReleaseSession, ReleaseSessionOptions, Unregister, ReleaseEnv.
+/// Shared teardown: release independently owned session state and unregister
+/// the test's plugin key. The process-wide environment is intentionally kept.
 unsafe fn conformance_teardown_with_custom_domain(
     api: *const ort::OrtApi,
     env: *mut ort::OrtEnv,
@@ -1075,7 +1077,6 @@ unsafe fn conformance_teardown_with_custom_domain(
         if !custom_op_domain.is_null() {
             ((*api).ReleaseCustomOpDomain.unwrap())(custom_op_domain);
         }
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 }
 
@@ -3106,30 +3107,22 @@ fn conformance_two_sessions() {
     let model_b =
         PathBuf::from(manifest_dir).join("tests/fixtures/add_broadcast/model.onnx.textproto");
 
-    let ort_lib_dir = skip_if_missing!(
-        find_ort_lib_dir(),
-        "conformance_two_sessions: ORT not found"
-    );
     let ep_lib_path = skip_if_missing!(
         find_ep_cdylib(),
         "conformance_two_sessions: EP cdylib not found"
+    );
+    let process = skip_if_missing!(
+        shared_ort_process(),
+        "conformance_two_sessions: ORT not found"
     );
     if !model_a.exists() || !model_b.exists() {
         eprintln!("*** SKIPPED: conformance_two_sessions — fixture(s) missing ***");
         return;
     }
 
-    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-
     unsafe {
-        let lib = libloading::Library::new(&ort_lib_path).expect("dlopen ORT");
-        let api = get_ort_api(&lib);
-
-        let mut env: *mut ort::OrtEnv = ptr::null_mut();
-        let logid = std::ffi::CString::new("nxrt_two_sess").unwrap();
-        let status =
-            ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
-        check_status(api, status, "CreateEnv");
+        let api = process.api();
+        let env = process.environment();
 
         let reg_name = std::ffi::CString::new("cpu_ep_2sess").unwrap();
         let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
@@ -3282,7 +3275,6 @@ fn conformance_two_sessions() {
         ((*api).ReleaseSessionOptions.unwrap())(opts_a);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
-        ((*api).ReleaseEnv.unwrap())(env);
         eprintln!("\n✅ conformance_two_sessions: PASSED — both sessions independent and correct");
     }
 }
@@ -3382,20 +3374,15 @@ fn conformance_matmul_batched_nd() {
 /// pointer. This stress test exceeds that threshold by 4× so any regression
 /// will be caught before it reaches production.
 ///
-/// Each cycle uses a fresh Env, fresh session, fresh registration key, and
-/// verifies the Run output independently. Corrupt memory typically manifests
+/// Each cycle uses the process-wide Env plus a fresh session and registration
+/// key, and verifies the Run output independently. Corrupt memory typically manifests
 /// as a DeviceType=-112 panic or a segfault on the device-lookup assertion.
 #[test]
 fn stress_register_run_unregister_cycles() {
     let _lock = lock_ort_ep();
 
-    let ort_lib_dir = {
-        let d = find_ort_lib_dir();
-        if d.is_none() {
-            eprintln!("*** SKIPPED: stress_register_run_unregister_cycles — ORT not found ***");
-            return;
-        }
-        d.unwrap()
+    let Some(process) = shared_ort_process() else {
+        return;
     };
     let ep_lib_path = {
         let p = find_ep_cdylib();
@@ -3417,10 +3404,8 @@ fn stress_register_run_unregister_cycles() {
         return;
     }
 
-    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-    // Keep the library loaded for the whole test — dlopen reference-counts.
-    let lib = unsafe { libloading::Library::new(&ort_lib_path) }.expect("dlopen ORT");
-    let api = unsafe { get_ort_api(&lib) };
+    let api = process.api();
+    let env = process.environment();
     let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
 
     const CYCLES: usize = 25;
@@ -3429,16 +3414,6 @@ fn stress_register_run_unregister_cycles() {
         let reg_c = CString::new(reg_key.as_str()).unwrap();
 
         unsafe {
-            // Env
-            let logid = CString::new(format!("stress_{cycle}")).unwrap();
-            let mut env: *mut ort::OrtEnv = ptr::null_mut();
-            let status = ((*api).CreateEnv.unwrap())(
-                ort::ORT_LOGGING_LEVEL_WARNING,
-                logid.as_ptr(),
-                &mut env,
-            );
-            check_status(api, status, &format!("CreateEnv[{cycle}]"));
-
             // Register
             let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(
                 env,
@@ -3529,7 +3504,6 @@ fn stress_register_run_unregister_cycles() {
             ((*api).ReleaseSessionOptions.unwrap())(sess_opts);
             let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_c.as_ptr());
             check_status(api, status, &format!("Unregister[{cycle}]"));
-            ((*api).ReleaseEnv.unwrap())(env);
         }
 
         eprintln!("  ✓ cycle {}/{CYCLES}", cycle + 1);

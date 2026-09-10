@@ -28,31 +28,12 @@ fn lock_ort_ep() -> MutexGuard<'static, ()> {
     })
 }
 
-fn find_ort_lib_dir() -> Option<PathBuf> {
-    ort_discovery::find_ort_lib_dir()
-}
-
-/// Canonical ORT discovery lives in the `onnx-runtime-ort-testkit` crate —
-/// aliased here so existing `ort_discovery::` call sites keep working.
-use onnx_runtime_ort_testkit as ort_discovery;
 /// Session-creation helper (binary + textproto fixtures) from `main`.
 #[path = "common/ort_session.rs"]
 mod ort_session;
 
 fn find_ep_cdylib() -> Option<PathBuf> {
     cdylib_resolve::find_cpu_plugin_cdylib_optional()
-}
-
-unsafe fn get_ort_api(lib: &libloading::Library) -> *const ort::OrtApi {
-    type GetApiBaseFn = unsafe extern "C" fn() -> *const ort::OrtApiBase;
-    let get_api_base: libloading::Symbol<'_, GetApiBaseFn> =
-        unsafe { lib.get(b"OrtGetApiBase") }.expect("OrtGetApiBase not found");
-    let api_base = unsafe { get_api_base() };
-    assert!(!api_base.is_null());
-    let get_api = unsafe { (*api_base).GetApi }.expect("GetApi is null");
-    let api = unsafe { get_api(ort::ORT_API_VERSION) };
-    assert!(!api.is_null());
-    api
 }
 
 unsafe fn check_status(api: *const ort::OrtApi, status: *mut ort::OrtStatus, stage: &str) {
@@ -78,18 +59,19 @@ unsafe fn setup(
     reg_name: &str,
     model_path: &std::path::Path,
 ) -> Option<(
-    libloading::Library,
+    &'static libloading::Library,
     *const ort::OrtApi,
     *mut ort::OrtEnv,
     *mut ort::OrtSessionOptions,
     *mut ort::OrtSession,
 )> {
-    let ort_lib_dir = match find_ort_lib_dir() {
-        Some(d) => d,
-        None => {
+    let process = match ort_path::ort_test_process() {
+        Ok(process) => process,
+        Err(error) => {
             if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
-                panic!("NXRT_REQUIRE_ORT_TESTS=1 but ORT lib dir not found");
+                panic!("NXRT_REQUIRE_ORT_TESTS=1 but ORT initialization failed: {error}");
             }
+            eprintln!("*** SKIPPED: ORT initialization failed: {error} ***");
             return None;
         }
     };
@@ -115,31 +97,9 @@ unsafe fn setup(
         );
         return None;
     }
-    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-    let lib = match unsafe { libloading::Library::new(&ort_lib_path) } {
-        Ok(l) => l,
-        Err(e) => {
-            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
-                panic!(
-                    "NXRT_REQUIRE_ORT_TESTS=1 but dlopen failed for {}: {e}",
-                    ort_lib_path.display()
-                );
-            }
-            eprintln!(
-                "*** SKIPPED: dlopen failed for {}: {e} ***",
-                ort_lib_path.display()
-            );
-            return None;
-        }
-    };
-    let api = unsafe { get_ort_api(&lib) };
-
-    let mut env: *mut ort::OrtEnv = ptr::null_mut();
-    let logid = std::ffi::CString::new(format!("nxrt_{reg_name}")).unwrap();
-    let status = unsafe {
-        ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env)
-    };
-    unsafe { check_status(api, status, "CreateEnv") };
+    let lib = process.library();
+    let api = process.api();
+    let env = process.environment();
 
     let reg_name_c = std::ffi::CString::new(reg_name).unwrap();
     let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
@@ -239,7 +199,6 @@ unsafe fn teardown(
         let reg_name_c = std::ffi::CString::new(reg_name).unwrap();
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name_c.as_ptr());
         check_status(api, status, "UnregisterEP");
-        ((*api).ReleaseEnv.unwrap())(env);
     }
 }
 
