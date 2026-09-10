@@ -64,25 +64,43 @@ function Invoke-CdbAnalysis {
         [Parameter(Mandatory)][string]$Cdb,
         [Parameter(Mandatory)][System.IO.FileInfo]$Dump,
         [Parameter(Mandatory)][string]$SymbolDirectory,
+        [Parameter(Mandatory)][string]$SourceDirectory,
         [Parameter(Mandatory)][string]$OutputPath
     )
 
-    $commands = @(
-        ".sympath+ $SymbolDirectory",
-        ".reload /f",
-        "!analyze -v",
-        ".ecxr",
-        "r",
-        "ub @pc L8",
-        "u @pc L8",
-        "kv",
-        "lm",
-        "q"
-    ) -join "; "
-    & $Cdb -logo $OutputPath -y "$SymbolDirectory;srv*$DiagnosticRoot\symbol-cache*https://msdl.microsoft.com/download/symbols" `
-        -z $Dump.FullName -c $commands
-    if ($LASTEXITCODE -ne 0) {
-        throw "cdb failed for '$($Dump.FullName)' with exit code $LASTEXITCODE."
+    $helpInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $helpInfo.FileName = $Cdb
+    $helpInfo.UseShellExecute = $false
+    $helpInfo.RedirectStandardOutput = $true
+    $helpInfo.RedirectStandardError = $true
+    $helpInfo.ArgumentList.Add("-?")
+    $helpProcess = [System.Diagnostics.Process]::Start($helpInfo)
+    $help = $helpProcess.StandardOutput.ReadToEnd() + $helpProcess.StandardError.ReadToEnd()
+    $helpProcess.WaitForExit()
+    if ($help -notmatch '(?im)(?:^|\s)(?:-|/)cf\b') {
+        throw "Installed CDB '$Cdb' does not advertise the required -cf command-file switch."
+    }
+
+    $commandFile = [System.IO.Path]::ChangeExtension($OutputPath, ".commands.txt")
+    Write-CdbCommandFile `
+        -Path $commandFile `
+        -SymbolDirectory $SymbolDirectory `
+        -SourceDirectory $SourceDirectory `
+        -SymbolCache (Join-Path $DiagnosticRoot "symbol-cache") | Out-Null
+    $arguments = Get-CdbArgumentList `
+        -OutputPath $OutputPath `
+        -DumpPath $Dump.FullName `
+        -CommandFile $commandFile
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Cdb
+    $startInfo.UseShellExecute = $false
+    foreach ($argument in $arguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) {
+        throw "cdb failed for '$($Dump.FullName)' with exit code $($process.ExitCode); command file='$commandFile'."
     }
 }
 
@@ -115,7 +133,8 @@ function Assert-NoSecrets {
         ("Bea" + "rer [A-Za-z0-9._~+/=-]{20,}")
     )
     $findings = [System.Collections.Generic.List[string]]::new()
-    foreach ($file in Get-ChildItem -Path $Path -File -Recurse) {
+    $scanFiles = @(Get-SecretScanFiles -Path $Path)
+    foreach ($file in $scanFiles) {
         $stream = [System.IO.File]::OpenRead($file.FullName)
         try {
             $buffer = New-Object byte[] (1024 * 1024)
@@ -145,7 +164,7 @@ function Assert-NoSecrets {
         $findings | Set-Content (Join-Path $DiagnosticRoot "SECRET_SCAN_FAILED.txt")
         throw "Secret scan rejected $($findings.Count) potential secret(s); artifacts must not be uploaded."
     }
-    "Secret scan passed for $((Get-ChildItem -Path $Path -File -Recurse).Count) artifact files." |
+    "Secret scan passed for $($scanFiles.Count) allowlisted text/script/manifest/log artifact files; binaries and symbol cache were excluded by construction." |
         Set-Content (Join-Path $manifestRoot "secret-scan.txt")
 }
 
@@ -228,20 +247,39 @@ function Setup-AndSelfTest {
     }
 
     $analysis = Join-Path $selfTestRoot "cdb.txt"
-    Invoke-CdbAnalysis -Cdb $cdb -Dump $dump -SymbolDirectory $selfTestRoot -OutputPath $analysis
+    Invoke-CdbAnalysis `
+        -Cdb $cdb `
+        -Dump $dump `
+        -SymbolDirectory $selfTestRoot `
+        -SourceDirectory $PSScriptRoot `
+        -OutputPath $analysis
     $analysisText = Get-Content -Raw $analysis
-    foreach ($required in @("c0000005", "intentional_access_violation_probe", "nxrt_crash_self_test")) {
-        if ($analysisText -notmatch [regex]::Escape($required)) {
-            throw "CDB self-test analysis did not contain required proof '$required'."
+    $assertions = [ordered]@{
+        access_violation = '(?i)c0000005'
+        matching_symbolized_frame = '(?i)nxrt_crash_self_test!intentional_access_violation_probe'
+        matching_source = '(?i)windows_arm64_crash_self_test\.c'
+    }
+    foreach ($assertion in $assertions.GetEnumerator()) {
+        if ($analysisText -notmatch $assertion.Value) {
+            throw "CDB self-test analysis failed '$($assertion.Key)' proof; expected pattern '$($assertion.Value)'."
         }
     }
     [pscustomobject]@{
         dump = $dump.Name
         dump_sha256 = (Get-FileHash -Algorithm SHA256 $dump.FullName).Hash.ToLowerInvariant()
+        executable = [System.IO.Path]::GetFileName($executable)
         executable_sha256 = (Get-FileHash -Algorithm SHA256 $executable).Hash.ToLowerInvariant()
+        pdb = [System.IO.Path]::GetFileName($pdb)
         pdb_sha256 = (Get-FileHash -Algorithm SHA256 $pdb).Hash.ToLowerInvariant()
         expected_exception = "0xc0000005"
         required_faulting_frame = "intentional_access_violation_probe"
+        required_symbolized_frame = "nxrt_crash_self_test!intentional_access_violation_probe"
+        required_source = "windows_arm64_crash_self_test.c"
+        assertions = [pscustomobject]@{
+            access_violation = $true
+            matching_symbolized_frame = $true
+            matching_source = $true
+        }
         cdb = $cdb
         verified = $true
     } | ConvertTo-Json | Set-Content (Join-Path $selfTestRoot "proof.json")
@@ -294,7 +332,12 @@ function Collect-Failure {
         }
         $cdb = Find-Cdb
         $analysis = Join-Path $analysisRoot "$($dump.BaseName)-cdb.txt"
-        Invoke-CdbAnalysis -Cdb $cdb -Dump $dump -SymbolDirectory (Join-Path $TestedRoot "target\debug\deps") -OutputPath $analysis
+        Invoke-CdbAnalysis `
+            -Cdb $cdb `
+            -Dump $dump `
+            -SymbolDirectory (Join-Path $TestedRoot "target\debug\deps") `
+            -SourceDirectory $TestedRoot `
+            -OutputPath $analysis
 
         $executableName = $dump.BaseName -replace '\.\d+$', ''
         if (!$executableName.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
