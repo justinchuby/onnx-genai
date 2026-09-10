@@ -190,7 +190,7 @@ jobs:
         shell: bash
         run: cargo build --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu-plugin --features mlas
 
-      - name: Run two exact broad Cargo executions
+      - name: Run broad warm pass and exact focused executable
         id: broad-tests
         working-directory: tested
         shell: bash
@@ -222,7 +222,8 @@ jobs:
 
           cargo test --locked -p onnx-runtime-ep-cpu --features mlas \
             --test native_vs_mlas_differential --no-run --message-format=json \
-            > ../diagnostics/windows-arm64-run/artifacts/logs/focused-build.json
+            > ../diagnostics/windows-arm64-run/artifacts/logs/focused-build.json \
+            2> ../diagnostics/windows-arm64-run/artifacts/logs/focused-build.stderr.log
           target_exe="$(python -c 'import json,sys; xs=[json.loads(x) for x in open(sys.argv[1]) if x.startswith("{")]; print(next(x["executable"] for x in reversed(xs) if x.get("reason")=="compiler-artifact" and x.get("target",{}).get("name")=="native_vs_mlas_differential" and x.get("executable")))' ../diagnostics/windows-arm64-run/artifacts/logs/focused-build.json)"
           if [[ -z "$target_exe" || ! -f "$target_exe" || ! -f "${target_exe%.exe}.pdb" ]]; then
             echo "::error::failed to dynamically resolve focused executable/PDB pair"
@@ -244,18 +245,9 @@ jobs:
             rustc -vV
             cargo -vV
           } > ../diagnostics/windows-arm64-run/artifacts/manifests/focused-environment.txt
-          cargo test --locked -p onnx-runtime-ep-cpu --features mlas \
-            --test native_vs_mlas_differential -- --nocapture
-          attempt_2="$?"
-          echo "attempt_2_exit=$attempt_2" >> "$GITHUB_OUTPUT"
-          if [[ "$attempt_2" -ne 0 ]]; then
-            pwsh -NoProfile -File ../diagnostics/.github/scripts/windows_arm64_wer_diagnostics.ps1 \
-              -Action WaitForTargetDump -DiagnosticRoot ../diagnostics/windows-arm64-run \
-              -TargetExecutable "$target_windows"
-            echo "dump_wait_exit=$?" >> "$GITHUB_OUTPUT"
-          else
-            echo "dump_wait_exit=not-needed" >> "$GITHUB_OUTPUT"
-          fi
+          pwsh -NoProfile -File ../diagnostics/.github/scripts/windows_arm64_wer_diagnostics.ps1 \
+            -Action RunTarget -DiagnosticRoot ../diagnostics/windows-arm64-run \
+            -TargetExecutable "$target_windows"
           cd ../diagnostics
           pwsh -NoProfile -File .github/scripts/windows_arm64_wer_diagnostics.ps1 -Action CheckForRealDump -DiagnosticRoot windows-arm64-run
           exit 0
@@ -272,6 +264,8 @@ jobs:
             resolver_exit = "${{ steps.broad-tests.outputs.resolver_exit }}"
             attempt_1_exit = "${{ steps.broad-tests.outputs.attempt_1_exit }}"
             attempt_2_exit = "${{ steps.broad-tests.outputs.attempt_2_exit }}"
+            attempt_2_kind = "${{ steps.broad-tests.outputs.attempt_2_kind }}"
+            dump_wait_exit = "${{ steps.broad-tests.outputs.dump_wait_exit }}"
             broad_step_outcome = "${{ steps.broad-tests.outcome }}"
             self_test_outcome = "${{ steps.self-test.outcome }}"
           } | ConvertTo-Json | Set-Content $manifest
@@ -295,8 +289,8 @@ jobs:
           "failed=$($failed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "real_dump_count=$($realDumps.Count)" >> $env:GITHUB_OUTPUT
 
-      - name: Collect and secret-scan bounded failure artifacts
-        if: always() && steps.result.outputs.failed == 'true'
+      - name: Collect and secret-scan bounded diagnostic artifacts
+        if: always()
         id: collect
         shell: pwsh
         run: |
@@ -313,11 +307,20 @@ jobs:
             -Action Cleanup `
             -DiagnosticRoot diagnostics\windows-arm64-run
 
-      - name: Upload failure artifacts
-        if: always() && steps.result.outputs.failed == 'true' && steps.collect.outcome == 'success'
+      - name: Secret-scan final text evidence
+        if: always()
+        id: final-scan
+        shell: pwsh
+        run: |
+          & diagnostics\.github\scripts\windows_arm64_wer_diagnostics.ps1 `
+            -Action SecretScan `
+            -DiagnosticRoot diagnostics\windows-arm64-run
+
+      - name: Upload diagnostic artifacts
+        if: always() && steps.collect.outcome == 'success' && steps.final-scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: windows-arm64-crash-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.replica }}
+          name: windows-arm64-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.replica }}
           path: diagnostics/windows-arm64-run/artifacts
           if-no-files-found: error
           retention-days: 14
@@ -333,4 +336,4 @@ jobs:
           if ("${{ steps.result.outputs.failed }}" -ne "false") {
             throw "Replica ${{ matrix.replica }} did not produce a trustworthy diagnostic result."
           }
-          Write-Host "Replica ${{ matrix.replica }} completed two exact broad Cargo executions without a real dump."
+          Write-Host "Replica ${{ matrix.replica }} completed the broad warm pass and exact focused executable without a real dump."

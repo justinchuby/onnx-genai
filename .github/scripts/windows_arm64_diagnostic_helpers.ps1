@@ -14,6 +14,61 @@ function Get-OptionalPropertyValue {
     return $property.Value
 }
 
+function Get-LocalDumpProcessSubkey {
+    param(
+        [Parameter(Mandatory)][string]$LocalDumpsPath,
+        [Parameter(Mandatory)][string]$ExecutablePath
+    )
+
+    $executableName = [System.IO.Path]::GetFileName($ExecutablePath.Replace('\', '/'))
+    if ([string]::IsNullOrWhiteSpace($executableName) -or
+        !$executableName.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "LocalDumps process configuration requires an executable path ending in .exe; received '$ExecutablePath'."
+    }
+    return "$($LocalDumpsPath.TrimEnd('\'))\$executableName"
+}
+
+function Update-DumpStabilityState {
+    param(
+        [long]$PreviousLength,
+        [int]$StableSamples,
+        [AllowNull()][object]$CurrentLength
+    )
+
+    if ($null -eq $CurrentLength -or [long]$CurrentLength -le 0) {
+        return [pscustomobject]@{ Length = $PreviousLength; StableSamples = 0 }
+    }
+    $length = [long]$CurrentLength
+    $nextSamples = if ($length -eq $PreviousLength) {
+        $StableSamples + 1
+    } else {
+        0
+    }
+    return [pscustomobject]@{
+        Length = $length
+        StableSamples = $nextSamples
+    }
+}
+
+function Get-WindowsProcessExitClassification {
+    param([Parameter(Mandatory)][int]$ExitCode)
+
+    $unsigned = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([int32]$ExitCode), 0)
+    if ($ExitCode -eq 0) {
+        return [pscustomobject]@{ Kind = "success"; IsAccessViolation = $false; UnsignedExitCode = $unsigned }
+    }
+    if ($ExitCode -eq 101) {
+        return [pscustomobject]@{ Kind = "rust-test-failure"; IsAccessViolation = $false; UnsignedExitCode = $unsigned }
+    }
+    if ($ExitCode -eq 139) {
+        return [pscustomobject]@{ Kind = "shell-mapped-access-violation"; IsAccessViolation = $true; UnsignedExitCode = $unsigned }
+    }
+    if ($unsigned -eq 3221225477) {
+        return [pscustomobject]@{ Kind = "windows-access-violation"; IsAccessViolation = $true; UnsignedExitCode = $unsigned }
+    }
+    return [pscustomobject]@{ Kind = "other-failure"; IsAccessViolation = $false; UnsignedExitCode = $unsigned }
+}
+
 function New-CdbCommandLines {
     param(
         [Parameter(Mandatory)][string]$SymbolDirectory,

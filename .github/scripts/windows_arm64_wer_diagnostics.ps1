@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("SetupAndSelfTest", "ConfigureTarget", "WaitForTargetDump", "CheckForRealDump", "CollectFailure", "SecretScan", "Cleanup")]
+    [ValidateSet("SetupAndSelfTest", "ConfigureTarget", "RunTarget", "WaitForTargetDump", "CheckForRealDump", "CollectFailure", "SecretScan", "Cleanup")]
     [string]$Action,
     [Parameter(Mandatory)]
     [string]$DiagnosticRoot,
@@ -65,15 +65,13 @@ function Wait-ForDump {
                 $werFaultPids = @($werFault | ForEach-Object Id)
                 "$(Get-Date -Format o) phase=stabilizing werfault_pids=$($werFaultPids -join ',') dump='$($dump.Name)' size=$(if ($null -eq $current) { -1 } else { $current.Length })" |
                     Add-Content $lifecycleLog
-                if ($null -ne $current -and $current.Length -gt 0 -and $current.Length -eq $lastLength) {
-                    $stableSamples++
-                } else {
-                    $stableSamples = 0
-                }
-
-                if ($null -ne $current) {
-                    $lastLength = $current.Length
-                }
+                $currentLength = if ($null -eq $current) { $null } else { [long]$current.Length }
+                $stability = Update-DumpStabilityState `
+                    -PreviousLength $lastLength `
+                    -StableSamples $stableSamples `
+                    -CurrentLength $currentLength
+                $lastLength = $stability.Length
+                $stableSamples = $stability.StableSamples
                 if ($werFault.Count -eq 0 -and $stableSamples -ge 2) {
                     return $current
                 }
@@ -97,7 +95,26 @@ function Configure-Target {
         throw "Dynamically resolved target '$($executable.FullName)' has no matching PDB '$pdbPath'."
     }
 
-    $processKey = Join-Path $werRegistryPath $executable.Name
+    $processKey = Get-LocalDumpProcessSubkey -LocalDumpsPath $werRegistryPath -ExecutablePath $executable.FullName
+    $processKeyNative = $werRegistryKey + "\" + $executable.Name
+    $targetState = Join-Path $stateRoot "target-subkey-state.json"
+    $targetBackup = Join-Path $stateRoot "target-LocalDumps.reg"
+    $processKeyExisted = Test-Path $processKey
+    [pscustomobject]@{
+        process_name = $executable.Name
+        process_key = $processKey
+        process_key_existed = $processKeyExisted
+    } | ConvertTo-Json | Tee-Object -FilePath $targetState |
+        Set-Content (Join-Path $manifestRoot "target-subkey-state.json")
+    if ($processKeyExisted) {
+        & reg.exe query $processKeyNative /s /reg:64 2>&1 |
+            Set-Content (Join-Path $manifestRoot "target-wer-registry-before.txt")
+        & reg.exe export $processKeyNative $targetBackup /y | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to back up the existing LocalDumps subkey '$processKeyNative'."
+        }
+    }
+
     New-Item -Force $processKey | Out-Null
     New-ItemProperty -Force $processKey DumpFolder -PropertyType ExpandString -Value $dumpRoot | Out-Null
     New-ItemProperty -Force $processKey DumpType -PropertyType DWord -Value 2 | Out-Null
@@ -115,8 +132,50 @@ function Configure-Target {
         pdb_sha256 = (Get-FileHash -Algorithm SHA256 $pdbPath).Hash.ToLowerInvariant()
     } | ConvertTo-Json | Set-Content (Join-Path $manifestRoot "resolved-crash-target.json")
 
-    & reg.exe query ($werRegistryKey + "\" + $executable.Name) /s /reg:64 2>&1 |
+    & reg.exe query $processKeyNative /s /reg:64 2>&1 |
         Set-Content (Join-Path $manifestRoot "target-wer-registry.txt")
+}
+
+function Run-Target {
+    New-DiagnosticDirectories
+    if ([string]::IsNullOrWhiteSpace($TargetExecutable) -or !(Test-Path $TargetExecutable)) {
+        throw "RunTarget requires the dynamically resolved test executable; received '$TargetExecutable'."
+    }
+
+    $stdoutPath = Join-Path $artifactRoot "logs\focused-stdout.log"
+    $stderrPath = Join-Path $artifactRoot "logs\focused-stderr.log"
+    $process = Start-Process `
+        -FilePath $TargetExecutable `
+        -ArgumentList "--nocapture" `
+        -RedirectStandardOutput $stdoutPath `
+        -RedirectStandardError $stderrPath `
+        -Wait `
+        -PassThru
+    $classification = Get-WindowsProcessExitClassification -ExitCode $process.ExitCode
+    [pscustomobject]@{
+        executable = (Resolve-Path $TargetExecutable).Path
+        arguments = @("--nocapture")
+        exit_code_signed = $process.ExitCode
+        exit_code_unsigned = $classification.UnsignedExitCode
+        exit_code_hex = "0x{0:X8}" -f $classification.UnsignedExitCode
+        classification = $classification.Kind
+        access_violation = $classification.IsAccessViolation
+    } | ConvertTo-Json | Set-Content (Join-Path $manifestRoot "focused-exit.json")
+
+    "attempt_2_exit=$($process.ExitCode)" >> $env:GITHUB_OUTPUT
+    "attempt_2_kind=$($classification.Kind)" >> $env:GITHUB_OUTPUT
+    if ($classification.IsAccessViolation) {
+        $dump = Wait-ForDump `
+            -ExecutablePrefix ([System.IO.Path]::GetFileNameWithoutExtension($TargetExecutable)) `
+            -TimeoutSeconds 180
+        if ($null -eq $dump) {
+            "dump_wait_exit=missing-after-access-violation" >> $env:GITHUB_OUTPUT
+        } else {
+            "dump_wait_exit=stable" >> $env:GITHUB_OUTPUT
+        }
+    } else {
+        "dump_wait_exit=not-access-violation" >> $env:GITHUB_OUTPUT
+    }
 }
 
 function Wait-ForTargetDump {
@@ -431,6 +490,8 @@ function Collect-Failure {
         throw "Dump bound violated during collection: found $($dumps.Count) real dumps."
     }
     $files = [System.Collections.Generic.List[object]]::new()
+    $collectionErrors = [System.Collections.Generic.List[string]]::new()
+    $binaryDirectory = Join-Path $artifactRoot "binaries"
     foreach ($dump in $dumps) {
         if ($dump.Name -like "nxrt_crash_self_test*") {
             "The intentional self-test dump was not retained after a failed self-test; see self-test logs." |
@@ -438,31 +499,36 @@ function Collect-Failure {
             Remove-Item -Force $dump.FullName
             continue
         }
-        $cdb = Find-Cdb
         $analysis = Join-Path $analysisRoot "$($dump.BaseName)-cdb.txt"
-        Invoke-CdbAnalysis `
-            -Cdb $cdb `
-            -Dump $dump `
-            -SymbolDirectory (Join-Path $TestedRoot "target\debug\deps") `
-            -SourceDirectory $TestedRoot `
-            -OutputPath $analysis
+        try {
+            $cdb = Find-Cdb
+            Invoke-CdbAnalysis `
+                -Cdb $cdb `
+                -Dump $dump `
+                -SymbolDirectory $binaryDirectory `
+                -SourceDirectory $TestedRoot `
+                -OutputPath $analysis
+        } catch {
+            $message = "CDB analysis failed for '$($dump.FullName)': $($_.Exception.Message)"
+            $collectionErrors.Add($message)
+            $message | Set-Content $analysis
+        }
 
         $executableName = $dump.BaseName -replace '\.\d+$', ''
         if (!$executableName.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
             $executableName = "$executableName.exe"
         }
-        $executable = Get-ChildItem -Path (Join-Path $TestedRoot "target\debug\deps") -Filter $executableName -File |
+        $executable = Get-ChildItem -Path $binaryDirectory -Filter $executableName -File |
             Select-Object -First 1
         if ($null -eq $executable) {
-            throw "A dump was captured for '$executableName', but its exact executable was not found under target/debug/deps."
+            $collectionErrors.Add("A dump was captured for '$executableName', but its pre-launch staged executable was not found.")
+            continue
         }
         $pdbPath = [System.IO.Path]::ChangeExtension($executable.FullName, ".pdb")
         if (!(Test-Path $pdbPath)) {
-            throw "A dump was captured for '$executableName', but matching PDB '$pdbPath' was not found."
+            $collectionErrors.Add("A dump was captured for '$executableName', but its pre-launch staged PDB was not found.")
+            continue
         }
-        $binaryDirectory = New-Item -ItemType Directory -Force -Path (Join-Path $artifactRoot "binaries")
-        Copy-Item -Force $executable.FullName $binaryDirectory
-        Copy-Item -Force $pdbPath $binaryDirectory
         $files.Add([pscustomobject]@{
             dump = $dump.Name
             dump_sha256 = (Get-FileHash -Algorithm SHA256 $dump.FullName).Hash.ToLowerInvariant()
@@ -475,6 +541,11 @@ function Collect-Failure {
         Copy-Item -Force $dump.FullName $artifactRoot
     }
     $files | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $manifestRoot "captured-files.json")
+    if ($collectionErrors.Count -eq 0) {
+        "none" | Set-Content (Join-Path $manifestRoot "collection-errors.txt")
+    } else {
+        $collectionErrors | Set-Content (Join-Path $manifestRoot "collection-errors.txt")
+    }
     Assert-NoSecrets -Path $artifactRoot
 }
 
@@ -482,6 +553,26 @@ function Restore-Registry {
     if (!(Test-Path $stateRoot)) {
         Write-Warning "No registry backup directory exists; cleanup has no recorded state to restore."
         return
+    }
+    $targetStatePath = Join-Path $stateRoot "target-subkey-state.json"
+    if (Test-Path $targetStatePath) {
+        $targetState = Get-Content -Raw $targetStatePath | ConvertFrom-Json
+        if (Test-Path $targetState.process_key) {
+            Remove-Item -Recurse -Force $targetState.process_key
+        }
+        $targetBackup = Join-Path $stateRoot "target-LocalDumps.reg"
+        if ($targetState.process_key_existed -and (Test-Path $targetBackup)) {
+            & reg.exe import $targetBackup | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to restore the original LocalDumps process subkey '$($targetState.process_key)'."
+            }
+        }
+        if (Test-Path $targetState.process_key) {
+            & reg.exe query ($werRegistryKey + "\" + $targetState.process_name) /s /reg:64 2>&1 |
+                Set-Content (Join-Path $manifestRoot "target-wer-registry-restored.txt")
+        } else {
+            "absent" | Set-Content (Join-Path $manifestRoot "target-wer-registry-restored.txt")
+        }
     }
     if (Test-Path $werRegistryPath) {
         Remove-Item -Recurse -Force $werRegistryPath
@@ -498,6 +589,7 @@ function Restore-Registry {
 switch ($Action) {
     "SetupAndSelfTest" { Setup-AndSelfTest }
     "ConfigureTarget" { Configure-Target }
+    "RunTarget" { Run-Target }
     "WaitForTargetDump" { Wait-ForTargetDump }
     "CheckForRealDump" { Check-ForRealDump }
     "CollectFailure" { Collect-Failure }
