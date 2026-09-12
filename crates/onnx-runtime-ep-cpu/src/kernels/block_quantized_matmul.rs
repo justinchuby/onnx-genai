@@ -15,7 +15,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorBacking, TensorMut, TensorView,
 };
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::block_quant_schema::{
+    BLOCK_QUANTIZED_MATMUL_INPUT_COUNT, BLOCK_QUANTIZED_MATMUL_INPUT_NAMES, BQMM_ACTIVATION,
+    BQMM_BIAS, BQMM_SCALE, BQMM_WEIGHT, PlanarBlockGeometry, planar_geometry_from_node,
+    require_layout_v1,
+};
+use onnx_runtime_ir::{DataType, Node, Shape};
 use onnx_runtime_quantization::{
     IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XS_SIGNS, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID,
 };
@@ -23,13 +28,13 @@ use rayon::prelude::*;
 
 use super::block_dequant::{decode_e2m1, decode_e8m0_scale};
 use super::matmul::gemm;
+use super::planar_block_quant::{PlanarLayout, dequantize_planar_kn, validate_planar_values};
 use super::{check_arity, to_dense_bytes};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
 const OP: &str = "BlockQuantizedMatMul";
 const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
-const LAYOUT_VERSION: i64 = 1;
 
 const MXFP4_QK: usize = 32;
 const MXFP4_BLOCK_BYTES: usize = 17;
@@ -193,31 +198,23 @@ impl BlockFormat {
 pub struct BlockQuantizedMatMulKernel {
     k: usize,
     n: usize,
-    format: BlockFormat,
+    format: MatMulFormat,
     packed_b_constant: bool,
     weight_identity: DenseWeightIdentity,
     weight_cache: DenseWeightCache,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatMulFormat {
+    Interleaved(BlockFormat),
+    Planar(PlanarBlockGeometry),
 }
 
 pub struct BlockQuantizedMatMulFactory;
 
 impl KernelFactory for BlockQuantizedMatMulFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let k = required_positive_attr(node, "K")?;
-        let n = required_positive_attr(node, "N")?;
-        let layout_version = optional_int_attr(node, "block_layout_version")?.unwrap_or(1);
-        if layout_version != LAYOUT_VERSION {
-            return Err(error(format!(
-                "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
-            )));
-        }
-        let format = match node.attr("format") {
-            Some(attribute) => attribute
-                .as_str()
-                .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
-                .and_then(BlockFormat::parse)?,
-            None => return Err(error("missing required string attribute 'format'")),
-        };
+        let (k, n, format) = validate_node(node)?;
 
         Ok(Box::new(BlockQuantizedMatMulKernel {
             k,
@@ -232,22 +229,42 @@ impl KernelFactory for BlockQuantizedMatMulFactory {
 
 impl Kernel for BlockQuantizedMatMulKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
-        self.packed_b_constant = constant_inputs.get(1).copied().unwrap_or(false);
+        self.packed_b_constant = constant_inputs.get(BQMM_WEIGHT).copied().unwrap_or(false)
+            && match self.format {
+                MatMulFormat::Interleaved(_) => true,
+                MatMulFormat::Planar(_) => {
+                    constant_inputs.get(BQMM_SCALE).copied().unwrap_or(false)
+                }
+            };
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity(OP, inputs, outputs, 2, 3, 1)?;
-        require_compute_dtype("A", inputs[0].dtype)?;
-        require_dtype("packed_B", inputs[1].dtype, DataType::Uint8)?;
+        check_arity(
+            OP,
+            inputs,
+            outputs,
+            BLOCK_QUANTIZED_MATMUL_INPUT_COUNT,
+            BLOCK_QUANTIZED_MATMUL_INPUT_COUNT,
+            1,
+        )?;
+        for &index in &[BQMM_ACTIVATION, BQMM_WEIGHT] {
+            if inputs[index].is_absent() {
+                return Err(error(format!(
+                    "required input {index} ('{}') is absent",
+                    BLOCK_QUANTIZED_MATMUL_INPUT_NAMES[index]
+                )));
+            }
+        }
+        require_compute_dtype("A", inputs[BQMM_ACTIVATION].dtype)?;
         require_compute_dtype("Y", outputs[0].dtype)?;
-        if outputs[0].dtype != inputs[0].dtype {
+        if outputs[0].dtype != inputs[BQMM_ACTIVATION].dtype {
             return Err(error(format!(
                 "Y dtype {:?} must match A dtype {:?}",
-                outputs[0].dtype, inputs[0].dtype
+                outputs[0].dtype, inputs[BQMM_ACTIVATION].dtype
             )));
         }
 
-        let a_shape = inputs[0].shape;
+        let a_shape = inputs[BQMM_ACTIVATION].shape;
         if a_shape.is_empty() || a_shape[a_shape.len() - 1] != self.k {
             return Err(error(format!(
                 "A must have rank >= 1 and last dimension K={}, got {:?}",
@@ -257,19 +274,12 @@ impl Kernel for BlockQuantizedMatMulKernel {
         let expected_output_shape = [&a_shape[..a_shape.len() - 1], &[self.n]].concat();
         require_shape("Y", outputs[0].shape, &expected_output_shape)?;
 
-        let blocks = self.k.div_ceil(self.format.qk());
-        require_shape(
-            "packed_B",
-            inputs[1].shape,
-            &[self.n, blocks, self.format.block_bytes()],
-        )?;
-
-        let bias = if let Some(bias) = inputs.get(2).filter(|input| !input.is_absent()) {
+        let bias = if let Some(bias) = inputs.get(BQMM_BIAS).filter(|input| !input.is_absent()) {
             require_compute_dtype("bias", bias.dtype)?;
-            if bias.dtype != inputs[0].dtype {
+            if bias.dtype != inputs[BQMM_ACTIVATION].dtype {
                 return Err(error(format!(
                     "bias dtype {:?} must match A dtype {:?}",
-                    bias.dtype, inputs[0].dtype
+                    bias.dtype, inputs[BQMM_ACTIVATION].dtype
                 )));
             }
             require_shape("bias", bias.shape, &[self.n])?;
@@ -278,40 +288,87 @@ impl Kernel for BlockQuantizedMatMulKernel {
             None
         };
 
-        let activations = to_dense_f32_widen(OP, &inputs[0])?;
+        let activations = to_dense_f32_widen(OP, &inputs[BQMM_ACTIVATION])?;
         let owned_weight;
         let cached_weight;
-        let weight_kn = if self.packed_b_constant {
-            let resolved = self.weight_identity.resolve(
-                &inputs[1],
-                self.format,
-                self.k,
-                self.n,
-                0,
-                None,
-                || packed_tensor_bytes(&inputs[1]),
-            )?;
-            let mut resolved_payload = resolved.payload;
-            let (weight, status) =
-                self.weight_cache
-                    .get_or_insert_with(resolved.key.as_ref(), || {
-                        BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
-                        let packed = match resolved_payload.take() {
-                            Some(packed) => packed,
-                            None => packed_tensor_bytes(&inputs[1])?,
-                        };
-                        dequantize_weight_kn(self.format, self.k, self.n, &packed)
-                    })?;
-            if matches!(status, DenseWeightCacheStatus::Hit) {
-                BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
+        let weight_kn = match self.format {
+            MatMulFormat::Interleaved(format) => {
+                require_dtype("packed_B", inputs[BQMM_WEIGHT].dtype, DataType::Uint8)?;
+                if !inputs[BQMM_SCALE].is_absent() {
+                    return Err(error(
+                        "aux_scale_B must be omitted for an interleaved block format",
+                    ));
+                }
+                let blocks = self.k.div_ceil(format.qk());
+                require_shape(
+                    "packed_B",
+                    inputs[BQMM_WEIGHT].shape,
+                    &[self.n, blocks, format.block_bytes()],
+                )?;
+                if self.packed_b_constant {
+                    let resolved = self.weight_identity.resolve(
+                        &inputs[BQMM_WEIGHT],
+                        format,
+                        self.k,
+                        self.n,
+                        0,
+                        None,
+                        || packed_tensor_bytes(&inputs[BQMM_WEIGHT]),
+                    )?;
+                    let mut resolved_payload = resolved.payload;
+                    let (weight, status) =
+                        self.weight_cache
+                            .get_or_insert_with(resolved.key.as_ref(), || {
+                                BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+                                let packed = match resolved_payload.take() {
+                                    Some(packed) => packed,
+                                    None => packed_tensor_bytes(&inputs[BQMM_WEIGHT])?,
+                                };
+                                dequantize_weight_kn(format, self.k, self.n, &packed)
+                            })?;
+                    if matches!(status, DenseWeightCacheStatus::Hit) {
+                        BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    cached_weight = weight;
+                    cached_weight.as_slice()
+                } else {
+                    BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+                    let packed = packed_tensor_bytes(&inputs[BQMM_WEIGHT])?;
+                    owned_weight = dequantize_weight_kn(format, self.k, self.n, &packed)?;
+                    &owned_weight
+                }
             }
-            cached_weight = weight;
-            cached_weight.as_slice()
-        } else {
-            BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
-            let packed = packed_tensor_bytes(&inputs[1])?;
-            owned_weight = dequantize_weight_kn(self.format, self.k, self.n, &packed)?;
-            &owned_weight
+            MatMulFormat::Planar(geometry) => {
+                let scale = inputs
+                    .get(BQMM_SCALE)
+                    .filter(|input| !input.is_absent())
+                    .ok_or_else(|| error("planar format requires input 2 ('aux_scale_B')"))?;
+                require_dtype(
+                    "packed_B",
+                    inputs[BQMM_WEIGHT].dtype,
+                    geometry.format.weight_dtype(),
+                )?;
+                require_dtype("aux_scale_B", scale.dtype, geometry.format.scale_dtype())?;
+                let layout = PlanarLayout::new(
+                    geometry.format,
+                    self.n,
+                    self.k,
+                    geometry.block_out,
+                    geometry.block_in,
+                )?;
+                require_shape(
+                    "packed_B",
+                    inputs[BQMM_WEIGHT].shape,
+                    &layout.packed_shape(),
+                )?;
+                require_shape("aux_scale_B", scale.shape, &layout.scale_shape())?;
+                let packed = to_dense_bytes(&inputs[BQMM_WEIGHT])?;
+                let scales = to_dense_bytes(scale)?;
+                validate_planar_values(&layout, &packed, &scales)?;
+                BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+                owned_weight = dequantize_planar_kn(&layout, &packed, &scales)?;
+                &owned_weight
+            }
         };
 
         let m = numel(&a_shape[..a_shape.len() - 1]);
@@ -358,8 +415,170 @@ impl BlockQuantizedMatMulKernel {
     fn dequantize_weight_kn(&self, packed: &TensorView) -> Result<Vec<f32>> {
         let packed = packed_tensor_bytes(packed)?;
         BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
-        dequantize_weight_kn(self.format, self.k, self.n, &packed)
+        match self.format {
+            MatMulFormat::Interleaved(format) => {
+                dequantize_weight_kn(format, self.k, self.n, &packed)
+            }
+            MatMulFormat::Planar(_) => Err(error(
+                "planar test decoding requires both packed weight and aux scale",
+            )),
+        }
     }
+}
+
+fn validate_node(node: &Node) -> Result<(usize, usize, MatMulFormat)> {
+    if node.inputs.len() != BLOCK_QUANTIZED_MATMUL_INPUT_COUNT {
+        return Err(error(format!(
+            "expected exactly {BLOCK_QUANTIZED_MATMUL_INPUT_COUNT} positional inputs, got {}",
+            node.inputs.len()
+        )));
+    }
+    if node.outputs.len() != 1 {
+        return Err(error(format!(
+            "expected exactly 1 output, got {}",
+            node.outputs.len()
+        )));
+    }
+    for &index in &[BQMM_ACTIVATION, BQMM_WEIGHT] {
+        if node.inputs[index].is_none() {
+            return Err(error(format!(
+                "required input {index} ('{}') is omitted",
+                BLOCK_QUANTIZED_MATMUL_INPUT_NAMES[index]
+            )));
+        }
+    }
+    for name in node.attributes.keys() {
+        if !matches!(
+            name.as_str(),
+            "K" | "N" | "format" | "block_layout_version" | "block_size_out" | "block_size_in"
+        ) {
+            return Err(error(format!(
+                "attribute '{name}' is not part of the BlockQuantizedMatMul v1 ABI"
+            )));
+        }
+    }
+    require_layout_v1(node, OP).map_err(error)?;
+    let k = required_positive_attr(node, "K")?;
+    let n = required_positive_attr(node, "N")?;
+    let planar = planar_geometry_from_node(node, OP, "format", "block_size_out", "block_size_in")
+        .map_err(error)?;
+    let format = if let Some(planar) = planar {
+        if node.inputs[BQMM_SCALE].is_none() {
+            return Err(error("planar format requires input 2 ('aux_scale_B')"));
+        }
+        MatMulFormat::Planar(planar)
+    } else {
+        if node.inputs[BQMM_SCALE].is_some() {
+            return Err(error(
+                "aux_scale_B must be omitted for an interleaved block format",
+            ));
+        }
+        let text = node
+            .attr("format")
+            .and_then(|attr| attr.as_str())
+            .expect("planar parser validated format as a string");
+        MatMulFormat::Interleaved(BlockFormat::parse(text)?)
+    };
+    Ok((k, n, format))
+}
+
+pub(crate) fn unsupported_reason(
+    node: &Node,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Option<Cow<'static, str>> {
+    let (k, n, format) = match validate_node(node) {
+        Ok(validated) => validated,
+        Err(err) => return Some(Cow::Owned(err.to_string())),
+    };
+    if shapes.len() != BLOCK_QUANTIZED_MATMUL_INPUT_COUNT
+        || input_dtypes.len() != BLOCK_QUANTIZED_MATMUL_INPUT_COUNT
+    {
+        return Some(Cow::Owned(format!(
+            "{OP}: claim metadata must cover all {BLOCK_QUANTIZED_MATMUL_INPUT_COUNT} positional inputs"
+        )));
+    }
+    let activation = input_dtypes[BQMM_ACTIVATION];
+    if !matches!(
+        activation,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
+        return Some(Cow::Owned(format!(
+            "{OP}: activation dtype {activation:?} unsupported"
+        )));
+    }
+    if input_dtypes[BQMM_BIAS] != DataType::Undefined && input_dtypes[BQMM_BIAS] != activation {
+        return Some(Cow::Owned(format!(
+            "{OP}: bias dtype {:?} must match activation dtype {activation:?}",
+            input_dtypes[BQMM_BIAS]
+        )));
+    }
+    let (weight_dtype, scale_dtype, weight_rank, scale_rank) = match format {
+        MatMulFormat::Interleaved(_) => (DataType::Uint8, DataType::Undefined, 3, 0),
+        MatMulFormat::Planar(geometry) => (
+            geometry.format.weight_dtype(),
+            geometry.format.scale_dtype(),
+            2,
+            2,
+        ),
+    };
+    for (index, expected) in [(BQMM_WEIGHT, weight_dtype), (BQMM_SCALE, scale_dtype)] {
+        if input_dtypes[index] != expected {
+            return Some(Cow::Owned(format!(
+                "{OP}: input {index} ('{}') dtype {:?} unsupported; expected {expected:?}",
+                BLOCK_QUANTIZED_MATMUL_INPUT_NAMES[index], input_dtypes[index]
+            )));
+        }
+    }
+    if shapes[BQMM_ACTIVATION].is_empty() {
+        return Some(Cow::Borrowed(
+            "BlockQuantizedMatMul: activation must have rank at least 1",
+        ));
+    }
+    if let Some(last) = shapes[BQMM_ACTIVATION]
+        .last()
+        .and_then(|dim| dim.as_static())
+        && last != k
+    {
+        return Some(Cow::Owned(format!(
+            "{OP}: activation last dimension {last} must equal K={k}"
+        )));
+    }
+    if shapes[BQMM_WEIGHT].len() != weight_rank {
+        return Some(Cow::Owned(format!(
+            "{OP}: packed_B rank {} unsupported; expected {weight_rank}",
+            shapes[BQMM_WEIGHT].len()
+        )));
+    }
+    if scale_rank != 0 && shapes[BQMM_SCALE].len() != scale_rank {
+        return Some(Cow::Owned(format!(
+            "{OP}: aux_scale_B rank {} unsupported; expected {scale_rank}",
+            shapes[BQMM_SCALE].len()
+        )));
+    }
+    if let MatMulFormat::Planar(geometry) = format {
+        let layout =
+            match PlanarLayout::new(geometry.format, n, k, geometry.block_out, geometry.block_in) {
+                Ok(layout) => layout,
+                Err(err) => return Some(Cow::Owned(err.to_string())),
+            };
+        for (index, expected) in [
+            (BQMM_WEIGHT, layout.packed_shape()),
+            (BQMM_SCALE, layout.scale_shape()),
+        ] {
+            for (axis, &value) in expected.iter().enumerate() {
+                if let Some(actual) = shapes[index][axis].as_static()
+                    && actual != value
+                {
+                    return Some(Cow::Owned(format!(
+                        "{OP}: input {index} ('{}') axis {axis} is {actual}, expected {value}",
+                        BLOCK_QUANTIZED_MATMUL_INPUT_NAMES[index]
+                    )));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Stable identity for one immutable packed initializer slot in one kernel.
@@ -1435,11 +1654,11 @@ mod tests {
             static_shape(b_shape.iter().copied()),
         );
         graph.add_input(packed_b);
-        let mut inputs = vec![Some(a), Some(packed_b)];
+        let mut inputs = vec![Some(a), Some(packed_b), None, None];
         if with_bias {
             let bias = graph.create_named_value("bias", DataType::Float32, static_shape([n]));
             graph.add_input(bias);
-            inputs.push(Some(bias));
+            inputs[BQMM_BIAS] = Some(bias);
         }
         let output = graph.create_named_value(
             "Y",
@@ -1476,7 +1695,7 @@ mod tests {
         let kernel = BlockQuantizedMatMulKernel {
             k: 32,
             n: 1,
-            format: BlockFormat::Mxfp4,
+            format: MatMulFormat::Interleaved(BlockFormat::Mxfp4),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -1581,7 +1800,15 @@ mod tests {
         let bias = Owned::f32(&[n], &bias);
         let mut y = Owned::zeros_f32(&[m, n]);
         kernel
-            .execute(&[a.view(), b.view(), bias.view()], &mut [y.view_mut()])
+            .execute(
+                &[
+                    a.view(),
+                    b.view(),
+                    TensorView::absent(DataType::Undefined),
+                    bias.view(),
+                ],
+                &mut [y.view_mut()],
+            )
             .unwrap();
         for (actual, expected) in y.to_f32().iter().zip(expected) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
@@ -1601,7 +1828,15 @@ mod tests {
         let mut y = Owned::zeros_f32(&[1, 1]);
 
         kernel
-            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .execute(
+                &[
+                    a.view(),
+                    b.view(),
+                    TensorView::absent(DataType::Undefined),
+                    TensorView::absent(DataType::Undefined),
+                ],
+                &mut [y.view_mut()],
+            )
             .unwrap();
 
         let after =
@@ -1630,7 +1865,7 @@ mod tests {
         let kernel = BlockQuantizedMatMulKernel {
             k,
             n,
-            format: BlockFormat::Mxfp4,
+            format: MatMulFormat::Interleaved(BlockFormat::Mxfp4),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -1646,7 +1881,12 @@ mod tests {
             let mut output = Owned::zeros(DataType::BFloat16, &[rows, n]);
             kernel
                 .execute(
-                    &[activation.view(), packed_weight.view(), bias.view()],
+                    &[
+                        activation.view(),
+                        packed_weight.view(),
+                        TensorView::absent(DataType::Undefined),
+                        bias.view(),
+                    ],
                     &mut [output.view_mut()],
                 )
                 .unwrap();
@@ -1687,7 +1927,7 @@ mod tests {
         let decoder = BlockQuantizedMatMulKernel {
             k: 32,
             n: 1,
-            format: BlockFormat::Iq4Nl,
+            format: MatMulFormat::Interleaved(BlockFormat::Iq4Nl),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -1712,7 +1952,15 @@ mod tests {
         let b = Owned::u8(&[1, 1, 18], &packed);
         let mut y = Owned::zeros_f32(&[1, 1]);
         kernel
-            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .execute(
+                &[
+                    a.view(),
+                    b.view(),
+                    TensorView::absent(DataType::Undefined),
+                    TensorView::absent(DataType::Undefined),
+                ],
+                &mut [y.view_mut()],
+            )
             .unwrap();
         assert!((y.to_f32()[0] - reference).abs() <= 1e-5);
     }
@@ -1727,7 +1975,7 @@ mod tests {
         let decoder = BlockQuantizedMatMulKernel {
             k: IQ_SUPER_QK,
             n: 1,
-            format: BlockFormat::Iq4Xs,
+            format: MatMulFormat::Interleaved(BlockFormat::Iq4Xs),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -1755,7 +2003,7 @@ mod tests {
         let decoder = BlockQuantizedMatMulKernel {
             k: IQ_SUPER_QK,
             n: 1,
-            format: BlockFormat::Iq3S,
+            format: MatMulFormat::Interleaved(BlockFormat::Iq3S),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -1788,7 +2036,7 @@ mod tests {
         let decoder = BlockQuantizedMatMulKernel {
             k: IQ_SUPER_QK,
             n: 1,
-            format: BlockFormat::Iq3Xxs,
+            format: MatMulFormat::Interleaved(BlockFormat::Iq3Xxs),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -1821,7 +2069,7 @@ mod tests {
         let decoder = BlockQuantizedMatMulKernel {
             k: IQ_SUPER_QK,
             n: 1,
-            format: BlockFormat::Iq2S,
+            format: MatMulFormat::Interleaved(BlockFormat::Iq2S),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -1855,7 +2103,7 @@ mod tests {
         let decoder = BlockQuantizedMatMulKernel {
             k: IQ_SUPER_QK,
             n: 1,
-            format: BlockFormat::Iq2Xs,
+            format: MatMulFormat::Interleaved(BlockFormat::Iq2Xs),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -1887,7 +2135,7 @@ mod tests {
         let decoder = BlockQuantizedMatMulKernel {
             k: IQ_SUPER_QK,
             n: 1,
-            format: BlockFormat::Iq2Xxs,
+            format: MatMulFormat::Interleaved(BlockFormat::Iq2Xxs),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -1929,7 +2177,7 @@ mod tests {
         let decoder = BlockQuantizedMatMulKernel {
             k: IQ_SUPER_QK,
             n: 1,
-            format: BlockFormat::Iq1S,
+            format: MatMulFormat::Interleaved(BlockFormat::Iq1S),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -1956,7 +2204,7 @@ mod tests {
         let decoder = BlockQuantizedMatMulKernel {
             k: IQ_SUPER_QK,
             n: 1,
-            format: BlockFormat::Iq1M,
+            format: MatMulFormat::Interleaved(BlockFormat::Iq1M),
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
@@ -2125,7 +2373,7 @@ mod tests {
                 let uncached = BlockQuantizedMatMulKernel {
                     k,
                     n,
-                    format,
+                    format: MatMulFormat::Interleaved(format),
                     packed_b_constant: false,
                     weight_identity: DenseWeightIdentity::default(),
                     weight_cache: DenseWeightCache::new(),
@@ -2133,7 +2381,12 @@ mod tests {
                 let mut expected = Owned::zeros(dtype, &[1, n]);
                 uncached
                     .execute(
-                        &[activation.view(), packed_b.view()],
+                        &[
+                            activation.view(),
+                            packed_b.view(),
+                            TensorView::absent(DataType::Undefined),
+                            TensorView::absent(DataType::Undefined),
+                        ],
                         &mut [expected.view_mut()],
                     )
                     .unwrap();
@@ -2141,23 +2394,33 @@ mod tests {
                 let mut cached = BlockQuantizedMatMulKernel {
                     k,
                     n,
-                    format,
+                    format: MatMulFormat::Interleaved(format),
                     packed_b_constant: false,
                     weight_identity: DenseWeightIdentity::default(),
                     weight_cache: DenseWeightCache::new(),
                 };
-                cached.set_constant_inputs(&[false, true]);
+                cached.set_constant_inputs(&[false, true, false, false]);
                 let hits_before = BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed);
                 let mut actual = Owned::zeros(dtype, &[1, n]);
                 cached
                     .execute(
-                        &[activation.view(), packed_b.view()],
+                        &[
+                            activation.view(),
+                            packed_b.view(),
+                            TensorView::absent(DataType::Undefined),
+                            TensorView::absent(DataType::Undefined),
+                        ],
                         &mut [actual.view_mut()],
                     )
                     .unwrap();
                 cached
                     .execute(
-                        &[activation.view(), packed_b.view()],
+                        &[
+                            activation.view(),
+                            packed_b.view(),
+                            TensorView::absent(DataType::Undefined),
+                            TensorView::absent(DataType::Undefined),
+                        ],
                         &mut [actual.view_mut()],
                     )
                     .unwrap();
@@ -2206,21 +2469,37 @@ mod tests {
         let mut kernel = BlockQuantizedMatMulKernel {
             k,
             n,
-            format: BlockFormat::Mxfp4,
+            format: MatMulFormat::Interleaved(BlockFormat::Mxfp4),
             packed_b_constant: true,
             weight_identity: DenseWeightIdentity::default(),
             weight_cache: DenseWeightCache::new(),
         };
-        kernel.set_constant_inputs(&[false, true]);
+        kernel.set_constant_inputs(&[false, true, false, false]);
 
         let hits_before = BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed);
         kernel
-            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .execute(
+                &[
+                    a.view(),
+                    b.view(),
+                    TensorView::absent(DataType::Undefined),
+                    TensorView::absent(DataType::Undefined),
+                ],
+                &mut [y.view_mut()],
+            )
             .unwrap();
         let identity_after_first = kernel.weight_identity.stats();
         let activity_after_first = kernel.weight_cache.activity();
         kernel
-            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .execute(
+                &[
+                    a.view(),
+                    b.view(),
+                    TensorView::absent(DataType::Undefined),
+                    TensorView::absent(DataType::Undefined),
+                ],
+                &mut [y.view_mut()],
+            )
             .unwrap();
 
         assert_eq!(
@@ -2477,7 +2756,7 @@ mod tests {
             let kernel = BlockQuantizedMatMulKernel {
                 k: K,
                 n: N,
-                format,
+                format: MatMulFormat::Interleaved(format),
                 packed_b_constant: false,
                 weight_identity: DenseWeightIdentity::default(),
                 weight_cache: DenseWeightCache::new(),

@@ -53,6 +53,14 @@ impl HostTensor {
             bytes: values.to_vec(),
         }
     }
+
+    fn raw(dtype: DataType, shape: &[usize], values: &[u8]) -> Self {
+        Self {
+            dtype,
+            shape: shape.to_vec(),
+            bytes: values.to_vec(),
+        }
+    }
 }
 
 fn require_cuda() -> CudaExecutionProvider {
@@ -90,11 +98,11 @@ fn model_node(
     );
     graph.add_input(a);
     graph.add_input(packed);
-    let mut inputs = vec![Some(a), Some(packed)];
+    let mut inputs = vec![Some(a), Some(packed), None, None];
     if with_bias {
         let bias = graph.create_named_value("bias", DataType::Float32, static_shape([n]));
         graph.add_input(bias);
-        inputs.push(Some(bias));
+        inputs[3] = Some(bias);
     }
     let output = graph.create_named_value(
         "Y",
@@ -125,7 +133,7 @@ fn run_cpu(graph: &Graph, node: NodeId, inputs: &[HostTensor], output_shape: &[u
         .iter()
         .map(|input| compute_contiguous_strides(&input.shape))
         .collect();
-    let views: Vec<_> = inputs
+    let compact_views: Vec<_> = inputs
         .iter()
         .zip(&strides)
         .map(|(input, strides)| {
@@ -138,6 +146,15 @@ fn run_cpu(graph: &Graph, node: NodeId, inputs: &[HostTensor], output_shape: &[u
             )
         })
         .collect();
+    let views = [
+        compact_views[0],
+        compact_views[1],
+        TensorView::absent(DataType::Float8E8M0),
+        compact_views
+            .get(2)
+            .copied()
+            .unwrap_or_else(|| TensorView::absent(DataType::Float32)),
+    ];
     let output_strides = compute_contiguous_strides(output_shape);
     let mut output = vec![0u8; output_shape.iter().product::<usize>() * 4];
     let output_view = TensorMut::new(
@@ -162,7 +179,14 @@ fn run_gpu(
     output_shape: &[usize],
 ) -> onnx_runtime_ep_api::Result<Vec<f32>> {
     let model = Model::new(graph);
-    let concrete_shapes: Vec<Vec<usize>> = inputs.iter().map(|input| input.shape.clone()).collect();
+    let concrete_shapes = vec![
+        inputs[0].shape.clone(),
+        inputs[1].shape.clone(),
+        vec![],
+        inputs
+            .get(2)
+            .map_or_else(Vec::new, |input| input.shape.clone()),
+    ];
     let kernel = ep.get_kernel(model.graph.node(node), &concrete_shapes, 1)?;
     let runtime = ep.runtime();
     let mut buffers = Vec::<DeviceBuffer>::new();
@@ -176,7 +200,7 @@ fn run_gpu(
         .iter()
         .map(|input| compute_contiguous_strides(&input.shape))
         .collect();
-    let views: Vec<_> = inputs
+    let compact_views: Vec<_> = inputs
         .iter()
         .zip(&buffers)
         .zip(&strides)
@@ -190,6 +214,15 @@ fn run_gpu(
             )
         })
         .collect();
+    let views = [
+        compact_views[0],
+        compact_views[1],
+        TensorView::absent(DataType::Float8E8M0),
+        compact_views
+            .get(2)
+            .copied()
+            .unwrap_or_else(|| TensorView::absent(DataType::Float32)),
+    ];
     let output_len = output_shape.iter().product::<usize>();
     let mut output_buffer = ep.allocate(output_len * 4, 256)?;
     let output_strides = compute_contiguous_strides(output_shape);
@@ -204,7 +237,252 @@ fn run_gpu(
     let mut output = vec![0u8; output_len * 4];
     // SAFETY: the destination exactly covers the f32 output allocation.
     unsafe { runtime.dtoh(&mut output, cuptr(output_buffer.as_ptr()))? };
-    drop(views);
+    for buffer in buffers {
+        ep.deallocate(buffer)?;
+    }
+    ep.deallocate(output_buffer)?;
+    Ok(output
+        .chunks_exact(4)
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .collect())
+}
+
+fn planar_model_node(
+    format: &str,
+    a_shape: &[usize],
+    packed: &HostTensor,
+    scale: &HostTensor,
+    output_shape: &[usize],
+    k: usize,
+    n: usize,
+    with_bias: bool,
+) -> (Graph, NodeId) {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(DOMAIN.into(), 1);
+    let a = graph.create_named_value(
+        "A",
+        DataType::Float32,
+        static_shape(a_shape.iter().copied()),
+    );
+    let weight = graph.create_named_value(
+        "packed_B",
+        packed.dtype,
+        static_shape(packed.shape.iter().copied()),
+    );
+    let aux_scale = graph.create_named_value(
+        "aux_scale_B",
+        scale.dtype,
+        static_shape(scale.shape.iter().copied()),
+    );
+    for value in [a, weight, aux_scale] {
+        graph.add_input(value);
+    }
+    let mut inputs = vec![Some(a), Some(weight), Some(aux_scale), None];
+    if with_bias {
+        let bias = graph.create_named_value("bias", DataType::Float32, static_shape([n]));
+        graph.add_input(bias);
+        inputs[3] = Some(bias);
+    }
+    let output = graph.create_named_value(
+        "Y",
+        DataType::Float32,
+        static_shape(output_shape.iter().copied()),
+    );
+    let mut node = Node::new(NodeId(0), "BlockQuantizedMatMul", inputs, vec![output]);
+    node.domain = DOMAIN.into();
+    node.attributes.insert("K".into(), Attribute::Int(k as i64));
+    node.attributes.insert("N".into(), Attribute::Int(n as i64));
+    node.attributes.insert(
+        "format".into(),
+        Attribute::String(format.as_bytes().to_vec()),
+    );
+    let (block_out, block_in) = if format == "fp4_planar" {
+        (1, 32)
+    } else {
+        (n.div_ceil(scale.shape[0]), k.div_ceil(scale.shape[1]))
+    };
+    node.attributes
+        .insert("block_size_out".into(), Attribute::Int(block_out as i64));
+    node.attributes
+        .insert("block_size_in".into(), Attribute::Int(block_in as i64));
+    node.attributes
+        .insert("block_layout_version".into(), Attribute::Int(1));
+    let node = graph.insert_node(node);
+    graph.add_output(output);
+    (graph, node)
+}
+
+fn run_planar_cpu(
+    graph: &Graph,
+    node: NodeId,
+    inputs: &[HostTensor],
+    output_shape: &[usize],
+) -> onnx_runtime_ep_api::Result<Vec<f32>> {
+    let model = Model::new(graph);
+    let mut kernel = CpuExecutionProvider::new()
+        .get_kernel(model.graph.node(node), &[], 1)
+        .unwrap();
+    kernel.set_constant_inputs(&[false, true, true, false]);
+    let strides: Vec<_> = inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect();
+    let views = [
+        TensorView::new(
+            DevicePtr(inputs[0].bytes.as_ptr().cast()),
+            inputs[0].dtype,
+            &inputs[0].shape,
+            &strides[0],
+            DeviceId::cpu(),
+        ),
+        TensorView::new(
+            DevicePtr(inputs[1].bytes.as_ptr().cast()),
+            inputs[1].dtype,
+            &inputs[1].shape,
+            &strides[1],
+            DeviceId::cpu(),
+        ),
+        TensorView::new(
+            DevicePtr(inputs[2].bytes.as_ptr().cast()),
+            inputs[2].dtype,
+            &inputs[2].shape,
+            &strides[2],
+            DeviceId::cpu(),
+        ),
+        inputs.get(3).map_or_else(
+            || TensorView::absent(DataType::Float32),
+            |bias| {
+                TensorView::new(
+                    DevicePtr(bias.bytes.as_ptr().cast()),
+                    bias.dtype,
+                    &bias.shape,
+                    &strides[3],
+                    DeviceId::cpu(),
+                )
+            },
+        ),
+    ];
+    let output_strides = compute_contiguous_strides(output_shape);
+    let mut output = vec![0u8; output_shape.iter().product::<usize>() * 4];
+    kernel.execute(
+        &views,
+        &mut [TensorMut::new(
+            DevicePtrMut(output.as_mut_ptr().cast()),
+            DataType::Float32,
+            output_shape,
+            &output_strides,
+            DeviceId::cpu(),
+        )],
+    )?;
+    Ok(output
+        .chunks_exact(4)
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .collect())
+}
+
+fn run_planar_gpu(
+    ep: &CudaExecutionProvider,
+    graph: &Graph,
+    node: NodeId,
+    inputs: &[HostTensor],
+    output_shape: &[usize],
+    graph_replays: usize,
+) -> onnx_runtime_ep_api::Result<Vec<f32>> {
+    let model = Model::new(graph);
+    let concrete_shapes = vec![
+        inputs[0].shape.clone(),
+        inputs[1].shape.clone(),
+        inputs[2].shape.clone(),
+        inputs
+            .get(3)
+            .map_or_else(Vec::new, |input| input.shape.clone()),
+    ];
+    let mut kernel = ep.get_kernel(model.graph.node(node), &concrete_shapes, 1)?;
+    kernel.set_constant_inputs(&[false, true, true, false]);
+    let runtime = ep.runtime();
+    let mut buffers = Vec::new();
+    for input in inputs {
+        let buffer = ep.allocate(input.bytes.len(), 256)?;
+        unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr()))? };
+        buffers.push(buffer);
+    }
+    let strides: Vec<_> = inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect();
+    let views = [
+        TensorView::new(
+            DevicePtr(buffers[0].as_ptr()),
+            inputs[0].dtype,
+            &inputs[0].shape,
+            &strides[0],
+            ep.device_id(),
+        ),
+        TensorView::new(
+            DevicePtr(buffers[1].as_ptr()),
+            inputs[1].dtype,
+            &inputs[1].shape,
+            &strides[1],
+            ep.device_id(),
+        ),
+        TensorView::new(
+            DevicePtr(buffers[2].as_ptr()),
+            inputs[2].dtype,
+            &inputs[2].shape,
+            &strides[2],
+            ep.device_id(),
+        ),
+        inputs.get(3).map_or_else(
+            || TensorView::absent(DataType::Float32),
+            |bias| {
+                TensorView::new(
+                    DevicePtr(buffers[3].as_ptr()),
+                    bias.dtype,
+                    &bias.shape,
+                    &strides[3],
+                    ep.device_id(),
+                )
+            },
+        ),
+    ];
+    let output_len = output_shape.iter().product::<usize>();
+    let mut output_buffer = ep.allocate(output_len * 4, 256)?;
+    let output_strides = compute_contiguous_strides(output_shape);
+    let mut execute = || {
+        kernel.execute(
+            &views,
+            &mut [TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+        )
+    };
+    if let Err(error) = execute() {
+        drop(execute);
+        for buffer in buffers {
+            ep.deallocate(buffer)?;
+        }
+        ep.deallocate(output_buffer)?;
+        return Err(error);
+    }
+    if graph_replays != 0 {
+        runtime.begin_graph_capture(&[kernel.as_ref()])?;
+        execute()?;
+        runtime.end_graph_capture()?;
+        for _ in 0..graph_replays {
+            runtime.replay_graph()?;
+        }
+    }
+    let mut output = vec![0u8; output_len * 4];
+    unsafe { runtime.dtoh(&mut output, cuptr(output_buffer.as_ptr()))? };
+    if graph_replays != 0 {
+        assert!(runtime.has_graph_executable()?);
+        assert_eq!(runtime.graph_segment_count()?, 1);
+        assert!(runtime.reset_graph()?);
+    }
     for buffer in buffers {
         ep.deallocate(buffer)?;
     }
@@ -586,6 +864,115 @@ fn block_quantized_iq1_known_blocks_match_cpu_semantics_on_gpu() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn planar_fp8_and_fp4_production_matmul_match_cpu_with_tails_and_graph_replay() {
+    let ep = require_cuda();
+    let cases = [
+        (
+            "block_fp8",
+            vec![2usize, 5],
+            HostTensor::raw(
+                DataType::Float8E4M3FN,
+                &[3, 5],
+                &[
+                    0x38, 0x40, 0x3c, 0x00, 0xb8, 0x40, 0x38, 0xbc, 0x30, 0x00, 0x34, 0xb4, 0x38,
+                    0x40, 0xc0,
+                ],
+            ),
+            HostTensor::raw(DataType::Float8E8M0, &[2, 2], &[127, 128, 126, 127]),
+            vec![3usize],
+            vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0, -0.5, 1.5, 0.25, -3.0],
+            vec![0.25, -0.5, 1.0],
+        ),
+        (
+            "fp4_planar",
+            vec![1usize, 32],
+            HostTensor::raw(
+                DataType::Int8,
+                &[3, 16],
+                &[
+                    0x21, 0x43, 0x65, 0x07, 0x89, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x70, 0x98,
+                    0xba, 0xdc, 0xfe, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00, 0x99, 0xaa,
+                    0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x88, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc,
+                    0xfe, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+                ],
+            ),
+            HostTensor::raw(DataType::Float8E8M0, &[3, 1], &[127, 126, 128]),
+            vec![3usize],
+            (0..32).map(|index| index as f32 / 16.0 - 1.0).collect(),
+            vec![0.125, -0.25, 0.5],
+        ),
+    ];
+    for (format, a_shape, packed, scale, output_shape, activations, bias) in cases {
+        let k = *a_shape.last().unwrap();
+        let n = packed.shape[0];
+        let output_shape = [&a_shape[..a_shape.len() - 1], output_shape.as_slice()].concat();
+        let inputs = [
+            HostTensor::f32(&a_shape, &activations),
+            packed.clone(),
+            scale.clone(),
+            HostTensor::f32(&[n], &bias),
+        ];
+        let (graph, node) =
+            planar_model_node(format, &a_shape, &packed, &scale, &output_shape, k, n, true);
+        let expected = run_planar_cpu(&graph, node, &inputs, &output_shape).unwrap();
+        let actual = run_planar_gpu(&ep, &graph, node, &inputs, &output_shape, 3).unwrap();
+        assert_close(&actual, &expected);
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn planar_production_matmul_rejects_reserved_and_overflow_values() {
+    let ep = require_cuda();
+    for (label, weight, scale, expected) in [
+        ("reserved scale", vec![0x38u8; 32], 0xff, "reserved E8M0"),
+        (
+            "reserved weight",
+            {
+                let mut values = vec![0x38u8; 32];
+                values[7] = 0x7f;
+                values
+            },
+            127,
+            "reserved E4M3",
+        ),
+        ("overflow", vec![0x7eu8; 32], 0xfe, "overflow"),
+    ] {
+        let packed = HostTensor::raw(DataType::Float8E4M3FN, &[1, 32], &weight);
+        let aux_scale = HostTensor::raw(DataType::Float8E8M0, &[1, 1], &[scale]);
+        let inputs = [
+            HostTensor::f32(&[1, 32], &[1.0; 32]),
+            packed.clone(),
+            aux_scale.clone(),
+        ];
+        let (graph, node) = planar_model_node(
+            "block_fp8",
+            &[1, 32],
+            &packed,
+            &aux_scale,
+            &[1, 1],
+            32,
+            1,
+            false,
+        );
+        let error = run_planar_gpu(&ep, &graph, node, &inputs, &[1, 1], 0)
+            .expect_err(label)
+            .to_string();
+        assert!(
+            error.contains(expected),
+            "{label}: expected '{expected}' in '{error}'"
+        );
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn supported_formats_and_prefill_route_to_cuda() {
     let ep = require_cuda();
     for format in [
@@ -607,8 +994,18 @@ fn supported_formats_and_prefill_route_to_cuda() {
             ep.supports_op(
                 model.graph.node(node),
                 1,
-                &[static_shape([1, qk]), static_shape([1, 1, block_bytes])],
-                &[],
+                &[
+                    static_shape([1, qk]),
+                    static_shape([1, 1, block_bytes]),
+                    vec![],
+                    vec![],
+                ],
+                &[
+                    DataType::Float32,
+                    DataType::Uint8,
+                    DataType::Undefined,
+                    DataType::Undefined,
+                ],
                 &[]
             ),
             KernelMatch::Supported { .. }
@@ -621,8 +1018,18 @@ fn supported_formats_and_prefill_route_to_cuda() {
         ep.supports_op(
             model.graph.node(node),
             1,
-            &[static_shape([1, 32]), static_shape([1, 1, 18])],
-            &[],
+            &[
+                static_shape([1, 32]),
+                static_shape([1, 1, 18]),
+                vec![],
+                vec![],
+            ],
+            &[
+                DataType::Float32,
+                DataType::Uint8,
+                DataType::Undefined,
+                DataType::Undefined,
+            ],
             &[]
         ),
         KernelMatch::Unsupported { .. }
@@ -644,8 +1051,18 @@ fn supported_formats_and_prefill_route_to_cuda() {
             ep.supports_op(
                 model.graph.node(node),
                 1,
-                &[static_shape([2, qk]), static_shape([1, 1, block_bytes])],
-                &[],
+                &[
+                    static_shape([2, qk]),
+                    static_shape([1, 1, block_bytes]),
+                    vec![],
+                    vec![],
+                ],
+                &[
+                    DataType::Float32,
+                    DataType::Uint8,
+                    DataType::Undefined,
+                    DataType::Undefined,
+                ],
                 &[]
             ),
             KernelMatch::Supported { .. }
@@ -661,8 +1078,15 @@ fn supported_formats_and_prefill_route_to_cuda() {
             &[
                 vec![Dim::Symbolic(SymbolId(0)), Dim::Static(32)],
                 static_shape([1, 1, 17]),
+                vec![],
+                vec![],
             ],
-            &[],
+            &[
+                DataType::Float32,
+                DataType::Uint8,
+                DataType::Undefined,
+                DataType::Undefined,
+            ],
             &[]
         ),
         KernelMatch::Supported { .. }

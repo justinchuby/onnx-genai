@@ -3,21 +3,30 @@
 use std::borrow::Cow;
 use std::ffi::c_void;
 use std::fmt::Write;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::block_quant_schema::{
+    BLOCK_QUANTIZED_MATMUL_INPUT_COUNT as INPUT_COUNT,
+    BLOCK_QUANTIZED_MATMUL_INPUT_NAMES as INPUT_NAMES, BQMM_ACTIVATION, BQMM_BIAS, BQMM_SCALE,
+    BQMM_WEIGHT, PlanarBlockGeometry, planar_geometry_from_node, require_layout_v1,
+};
+use onnx_runtime_ir::{DataType, Node, Shape};
 use onnx_runtime_quantization::{
     IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XS_SIGNS, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID,
 };
 
 use crate::error::driver_err;
+use crate::kernels::planar_block_decode::{
+    PlanarActivationDtype, PlanarLinearDims, PlanarLinearPointers, launch_planar_linear_borrowed,
+    validate_planar_bank_device, warm_planar_linear,
+};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "BlockQuantizedMatMul";
 const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
-const LAYOUT_VERSION: i64 = 1;
 const SMALL_QK: usize = 32;
 const IQ_SUPER_QK: usize = 256;
 const MXFP4_BLOCK_BYTES: usize = 17;
@@ -670,28 +679,57 @@ pub struct BlockQuantizedMatMulFactory {
 
 impl KernelFactory for BlockQuantizedMatMulFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let k = required_positive_attr(node, "K")?;
-        let n = required_positive_attr(node, "N")?;
-        let layout_version = optional_int_attr(node, "block_layout_version")?.unwrap_or(1);
-        if layout_version != LAYOUT_VERSION {
+        if node.inputs.len() != INPUT_COUNT {
             return Err(error(format!(
-                "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
+                "expected exactly {INPUT_COUNT} positional inputs, got {}",
+                node.inputs.len()
             )));
         }
-        let format = match node.attr("format") {
-            Some(attribute) => attribute
-                .as_str()
-                .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
-                .and_then(BlockFormat::parse)?,
-            None => return Err(error("missing required string attribute 'format'")),
+        let k = required_positive_attr(node, "K")?;
+        let n = required_positive_attr(node, "N")?;
+        require_layout_v1(node, OP).map_err(error)?;
+        let format = if let Some(geometry) =
+            planar_geometry_from_node(node, OP, "format", "block_size_out", "block_size_in")
+                .map_err(error)?
+        {
+            warm_planar_linear(&self.runtime)?;
+            MatMulFormat::Planar(geometry)
+        } else {
+            MatMulFormat::Interleaved(match node.attr("format") {
+                Some(attribute) => attribute
+                    .as_str()
+                    .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
+                    .and_then(BlockFormat::parse)?,
+                None => return Err(error("missing required string attribute 'format'")),
+            })
+        };
+        let validation_scratch = if matches!(format, MatMulFormat::Planar(_)) {
+            Some(self.runtime.alloc_raw(std::mem::size_of::<u32>())?)
+        } else {
+            None
         };
         Ok(Box::new(BlockQuantizedMatMulKernel {
             runtime: self.runtime.clone(),
             k,
             n,
             format,
+            constant_inputs: [false; INPUT_COUNT],
+            validation_scratch,
+            validated_bank: Mutex::new(None),
         }))
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MatMulFormat {
+    Interleaved(BlockFormat),
+    Planar(PlanarBlockGeometry),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanarBankIdentity {
+    packed: CUdeviceptr,
+    scale: CUdeviceptr,
 }
 
 #[derive(Debug)]
@@ -699,17 +737,40 @@ struct BlockQuantizedMatMulKernel {
     runtime: Arc<CudaRuntime>,
     k: usize,
     n: usize,
-    format: BlockFormat,
+    format: MatMulFormat,
+    constant_inputs: [bool; INPUT_COUNT],
+    validation_scratch: Option<CUdeviceptr>,
+    validated_bank: Mutex<Option<PlanarBankIdentity>>,
 }
 
 impl Kernel for BlockQuantizedMatMulKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        for (index, value) in constant_inputs
+            .iter()
+            .copied()
+            .enumerate()
+            .take(INPUT_COUNT)
+        {
+            self.constant_inputs[index] = value;
+        }
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        if !(2..=3).contains(&inputs.len()) || outputs.len() != 1 {
+        if inputs.len() != INPUT_COUNT || outputs.len() != 1 {
             return Err(error(format!(
-                "expected 2 to 3 inputs and 1 output, got {} inputs and {} outputs",
+                "expected exactly {INPUT_COUNT} inputs and 1 output, got {} inputs and {} outputs",
                 inputs.len(),
                 outputs.len()
             )));
+        }
+        if let MatMulFormat::Planar(geometry) = self.format {
+            return self.execute_planar(inputs, outputs, geometry);
+        }
+        let MatMulFormat::Interleaved(format) = self.format else {
+            unreachable!()
+        };
+        if !inputs[BQMM_SCALE].is_absent() {
+            return Err(error("aux_scale_B must be omitted for interleaved format"));
         }
         require_dtype("A", inputs[0].dtype, DataType::Float32)?;
         require_dtype("packed_B", inputs[1].dtype, DataType::Uint8)?;
@@ -721,9 +782,9 @@ impl Kernel for BlockQuantizedMatMulKernel {
             outputs[0].shape,
             self.k,
             self.n,
-            self.format,
+            format,
         )?;
-        let bias = inputs.get(2).filter(|input| !input.is_absent());
+        let bias = inputs.get(BQMM_BIAS).filter(|input| !input.is_absent());
         if let Some(bias) = bias {
             require_dtype("bias", bias.dtype, DataType::Float32)?;
             require_shape("bias", bias.shape, &[self.n])?;
@@ -746,8 +807,8 @@ impl Kernel for BlockQuantizedMatMulKernel {
         let n = as_i32("N", self.n)?;
         let grid_x = as_grid_x("N", n)?;
         let blocks = as_i32("block count", blocks)?;
-        let block_bytes = as_i32("block byte count", self.format.block_bytes())?;
-        let qk = as_i32("block element count", self.format.qk())?;
+        let block_bytes = as_i32("block byte count", format.block_bytes())?;
+        let qk = as_i32("block element count", format.qk())?;
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let mut flops = (m as u64)
                 .saturating_mul(self.n as u64)
@@ -768,7 +829,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
             .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
             .unwrap_or(0);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let format = self.format.kernel_id();
+        let format = format.kernel_id();
 
         if m == 1 {
             let function = self
@@ -832,80 +893,269 @@ impl Kernel for BlockQuantizedMatMulKernel {
     }
 }
 
-pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
-    let format = match node.attr("format") {
-        Some(attribute) => match attribute.as_str() {
-            Some(format) => format,
-            None => {
-                return Some(Cow::Borrowed(
-                    "BlockQuantizedMatMul: attribute 'format' must be a string naming a CUDA-supported block format",
-                ));
+impl BlockQuantizedMatMulKernel {
+    fn execute_planar(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        geometry: PlanarBlockGeometry,
+    ) -> Result<()> {
+        for &index in &[BQMM_ACTIVATION, BQMM_WEIGHT, BQMM_SCALE] {
+            if inputs[index].is_absent() {
+                return Err(error(format!(
+                    "required input {index} ('{}') is absent",
+                    INPUT_NAMES[index]
+                )));
             }
-        },
-        None => {
-            return Some(Cow::Borrowed(
-                "BlockQuantizedMatMul: missing required string attribute 'format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, iq1_m, q2_k, q3_k, q5_k, q6_k, or q8_0",
+        }
+        if !self.constant_inputs[BQMM_WEIGHT] || !self.constant_inputs[BQMM_SCALE] {
+            return Err(error(
+                "planar packed_B and aux_scale_B must be immutable session constants",
             ));
         }
+        let dtype = PlanarActivationDtype::from_data_type(inputs[BQMM_ACTIVATION].dtype)?;
+        if outputs[0].dtype != inputs[BQMM_ACTIVATION].dtype {
+            return Err(error(format!(
+                "Y dtype {:?} must match A dtype {:?}",
+                outputs[0].dtype, inputs[BQMM_ACTIVATION].dtype
+            )));
+        }
+        require_dtype(
+            "packed_B",
+            inputs[BQMM_WEIGHT].dtype,
+            geometry.format.weight_dtype(),
+        )?;
+        require_dtype(
+            "aux_scale_B",
+            inputs[BQMM_SCALE].dtype,
+            geometry.format.scale_dtype(),
+        )?;
+        let a_shape = inputs[BQMM_ACTIVATION].shape;
+        if a_shape.is_empty() || a_shape[a_shape.len() - 1] != self.k {
+            return Err(error(format!(
+                "A must have rank >= 1 and last dimension K={}, got {a_shape:?}",
+                self.k
+            )));
+        }
+        let m = checked_product(&a_shape[..a_shape.len() - 1], "A leading dimension product")?;
+        let expected_output = [&a_shape[..a_shape.len() - 1], &[self.n]].concat();
+        require_shape("Y", outputs[0].shape, &expected_output)?;
+        let dims = PlanarLinearDims {
+            format: geometry.format.kernel_id(),
+            m_rows: m,
+            in_features: self.k,
+            out_features: self.n,
+            bs0: geometry.block_out,
+            bs1: geometry.block_in,
+        };
+        let lengths = dims.expected_lengths()?;
+        let expected_weight = [self.n, self.k / geometry.format.pack_factor()];
+        require_shape("packed_B", inputs[BQMM_WEIGHT].shape, &expected_weight)?;
+        let expected_scale = [
+            self.n.div_ceil(geometry.block_out),
+            self.k.div_ceil(geometry.block_in),
+        ];
+        require_shape("aux_scale_B", inputs[BQMM_SCALE].shape, &expected_scale)?;
+        if inputs[BQMM_WEIGHT].byte_size() != lengths.packed_bytes
+            || inputs[BQMM_SCALE].byte_size() != lengths.scale_bytes
+        {
+            return Err(error("planar weight or scale byte extent mismatch"));
+        }
+        let bias = inputs.get(BQMM_BIAS).filter(|input| !input.is_absent());
+        if let Some(bias) = bias {
+            require_dtype("bias", bias.dtype, inputs[BQMM_ACTIVATION].dtype)?;
+            require_shape("bias", bias.shape, &[self.n])?;
+        }
+        for (name, contiguous) in [
+            ("A", inputs[BQMM_ACTIVATION].is_contiguous()),
+            ("packed_B", inputs[BQMM_WEIGHT].is_contiguous()),
+            ("aux_scale_B", inputs[BQMM_SCALE].is_contiguous()),
+            ("bias", bias.is_none_or(TensorView::is_contiguous)),
+            ("Y", outputs[0].is_contiguous()),
+        ] {
+            if !contiguous {
+                return Err(error(format!(
+                    "{name} must be contiguous on the CUDA execution provider"
+                )));
+            }
+        }
+
+        let packed = cuptr(inputs[BQMM_WEIGHT].data_ptr::<u8>() as *const c_void);
+        let scale = cuptr(inputs[BQMM_SCALE].data_ptr::<u8>() as *const c_void);
+        let identity = PlanarBankIdentity { packed, scale };
+        {
+            let mut validated = self
+                .validated_bank
+                .lock()
+                .map_err(|_| error("planar bank validation state is poisoned"))?;
+            if *validated != Some(identity) {
+                if self.runtime.is_capturing()? {
+                    return Err(error(
+                        "planar bank must be admitted before CUDA graph capture",
+                    ));
+                }
+                validate_planar_bank_device(
+                    &self.runtime,
+                    &dims,
+                    1,
+                    packed,
+                    scale,
+                    self.validation_scratch
+                        .ok_or_else(|| error("planar validation scratch is missing"))?,
+                )?;
+                *validated = Some(identity);
+            }
+        }
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let mut flops = (m as u64)
+                .saturating_mul(self.n as u64)
+                .saturating_mul(self.k as u64)
+                .saturating_mul(2);
+            if bias.is_some() {
+                flops = flops.saturating_add((m as u64).saturating_mul(self.n as u64));
+            }
+            flops
+        });
+        if m == 0 {
+            return Ok(());
+        }
+        let activation = cuptr(inputs[BQMM_ACTIVATION].data_ptr::<u8>() as *const c_void);
+        let bias = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let pointers = PlanarLinearPointers {
+            activation,
+            packed,
+            scale,
+            bias,
+            output,
+        };
+        // SAFETY: shape, dtype, byte extent, value admission, and immutable
+        // pointer identity were all established above.
+        unsafe { launch_planar_linear_borrowed(&self.runtime, dtype, &dims, &pointers) }
+    }
+}
+
+impl Drop for BlockQuantizedMatMulKernel {
+    fn drop(&mut self) {
+        if let Some(scratch) = self.validation_scratch.take() {
+            // SAFETY: this kernel uniquely owns the raw validation word.
+            let _ = unsafe { self.runtime.free_raw(scratch) };
+        }
+    }
+}
+
+pub(crate) fn unsupported_reason(
+    node: &Node,
+    shapes: &[Shape],
+    dtypes: &[DataType],
+) -> Option<Cow<'static, str>> {
+    let reject = |message: String| Some(Cow::Owned(format!("{OP}: {message}")));
+    if node.inputs.len() != INPUT_COUNT
+        || shapes.len() != INPUT_COUNT
+        || dtypes.len() != INPUT_COUNT
+    {
+        return reject(format!(
+            "expected exactly {INPUT_COUNT} positional inputs and matching metadata"
+        ));
+    }
+    if let Err(message) = require_layout_v1(node, OP) {
+        return Some(Cow::Owned(message));
+    }
+    let k = match required_positive_attr(node, "K") {
+        Ok(value) => value,
+        Err(error) => return Some(Cow::Owned(error.to_string())),
     };
-    if !matches!(
-        format,
-        "mxfp4"
-            | "iq4_nl"
-            | "iq4_xs"
-            | "iq2_xxs"
-            | "iq3_xxs"
-            | "iq2_xs"
-            | "iq2_s"
-            | "iq3_s"
-            | "iq1_s"
-            | "iq1_m"
-            | "q2_k"
-            | "q3_k"
-            | "q5_k"
-            | "q6_k"
-            | "q8_0"
-    ) {
-        return Some(Cow::Owned(format!(
-            "BlockQuantizedMatMul: CUDA does not support format '{format}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, iq1_m, q2_k, q3_k, q5_k, q6_k, or q8_0"
-        )));
-    }
-    if let Some(attribute) = node.attr("block_layout_version") {
-        match attribute.as_int() {
-            Some(version) if version == LAYOUT_VERSION => {}
-            Some(version) => {
-                return Some(Cow::Owned(format!(
-                    "BlockQuantizedMatMul: CUDA requires block_layout_version={LAYOUT_VERSION}, got {version} — re-export the packed weights with the current layout"
-                )));
-            }
-            None => {
-                return Some(Cow::Owned(format!(
-                    "BlockQuantizedMatMul: block_layout_version must be integer {LAYOUT_VERSION} — re-export the packed weights with the current layout"
-                )));
-            }
+    let n = match required_positive_attr(node, "N") {
+        Ok(value) => value,
+        Err(error) => return Some(Cow::Owned(error.to_string())),
+    };
+    let geometry =
+        match planar_geometry_from_node(node, OP, "format", "block_size_out", "block_size_in") {
+            Ok(value) => value,
+            Err(message) => return Some(Cow::Owned(message)),
+        };
+    for &index in &[BQMM_ACTIVATION, BQMM_WEIGHT] {
+        if node.inputs[index].is_none() {
+            return reject(format!(
+                "required input {index} ('{}') is omitted",
+                INPUT_NAMES[index]
+            ));
         }
     }
-    for name in ["K", "N"] {
-        match node.attr(name) {
-            Some(attribute) => match attribute.as_int() {
-                Some(value) if value > 0 => {}
-                Some(value) => {
-                    return Some(Cow::Owned(format!(
-                        "BlockQuantizedMatMul: attribute '{name}' must be positive, got {value} — export the static matrix dimension"
-                    )));
-                }
-                None => {
-                    return Some(Cow::Owned(format!(
-                        "BlockQuantizedMatMul: attribute '{name}' must be an integer — export the static matrix dimension"
-                    )));
-                }
-            },
-            None => {
-                return Some(Cow::Owned(format!(
-                    "BlockQuantizedMatMul: missing required positive integer attribute '{name}' — export the static matrix dimension"
-                )));
+    let planar = geometry.is_some();
+    if node.inputs[BQMM_SCALE].is_some() != planar {
+        return reject(if planar {
+            "aux_scale_B is required for planar format".into()
+        } else {
+            "aux_scale_B must be omitted for interleaved format".into()
+        });
+    }
+    let activation_dtypes: &[DataType] = if planar {
+        &[DataType::Float32, DataType::Float16, DataType::BFloat16]
+    } else {
+        &[DataType::Float32]
+    };
+    if !activation_dtypes.contains(&dtypes[BQMM_ACTIVATION]) {
+        return reject(format!(
+            "A dtype {:?} is unsupported",
+            dtypes[BQMM_ACTIVATION]
+        ));
+    }
+    if let Some(geometry) = geometry {
+        if dtypes[BQMM_WEIGHT] != geometry.format.weight_dtype()
+            || dtypes[BQMM_SCALE] != geometry.format.scale_dtype()
+        {
+            return reject(format!(
+                "planar weight/scale dtypes must be {:?}/{:?}",
+                geometry.format.weight_dtype(),
+                geometry.format.scale_dtype()
+            ));
+        }
+        if shapes[BQMM_WEIGHT].len() != 2 || shapes[BQMM_SCALE].len() != 2 {
+            return reject("planar weight and scale must both have rank 2".into());
+        }
+        let dims = PlanarLinearDims {
+            format: geometry.format.kernel_id(),
+            m_rows: 1,
+            in_features: k,
+            out_features: n,
+            bs0: geometry.block_out,
+            bs1: geometry.block_in,
+        };
+        if let Err(error) = dims.expected_lengths() {
+            return Some(Cow::Owned(error.to_string()));
+        }
+        for (index, axis, expected) in [
+            (BQMM_WEIGHT, 0, n),
+            (BQMM_WEIGHT, 1, k / geometry.format.pack_factor()),
+            (BQMM_SCALE, 0, n.div_ceil(geometry.block_out)),
+            (BQMM_SCALE, 1, k.div_ceil(geometry.block_in)),
+        ] {
+            if let Some(actual) = shapes[index][axis].as_static()
+                && actual != expected
+            {
+                return reject(format!(
+                    "{} shape axis {axis} must be {expected}, got {actual}",
+                    INPUT_NAMES[index]
+                ));
             }
         }
+    } else {
+        if dtypes[BQMM_WEIGHT] != DataType::Uint8 {
+            return reject("interleaved packed_B must be Uint8".into());
+        }
+        let text = node
+            .attr("format")
+            .and_then(|attribute| attribute.as_str())
+            .unwrap_or("");
+        if BlockFormat::parse(text).is_err() {
+            return reject(format!("CUDA does not support format '{text}'"));
+        }
+    }
+    if node.inputs[BQMM_BIAS].is_some() && dtypes[BQMM_BIAS] != dtypes[BQMM_ACTIVATION] {
+        return reject("bias dtype must match A".into());
     }
     None
 }
@@ -1044,20 +1294,42 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_ir::{Attribute, NodeId};
+    use onnx_runtime_ir::{Attribute, NodeId, ValueId, static_shape};
 
     #[test]
     fn placement_decline_names_unsupported_format_and_fix() {
-        let mut node = Node::new(NodeId(0), "BlockQuantizedMatMul", vec![], vec![]);
+        let mut node = Node::new(
+            NodeId(0),
+            "BlockQuantizedMatMul",
+            vec![Some(ValueId(0)), Some(ValueId(1)), None, None],
+            vec![],
+        );
         node.domain = "pkg.nxrt".into();
         node.attributes
             .insert("format".into(), Attribute::String(b"q4_0".to_vec()));
         node.attributes.insert("K".into(), Attribute::Int(32));
         node.attributes.insert("N".into(), Attribute::Int(1));
+        node.attributes
+            .insert("block_layout_version".into(), Attribute::Int(1));
 
-        let reason = unsupported_reason(&node).expect("q4_0 must be declined");
+        let reason = unsupported_reason(
+            &node,
+            &[
+                static_shape([1, 32]),
+                static_shape([1, 1, 18]),
+                vec![],
+                vec![],
+            ],
+            &[
+                DataType::Float32,
+                DataType::Uint8,
+                DataType::Undefined,
+                DataType::Undefined,
+            ],
+        )
+        .expect("q4_0 must be declined");
         assert!(reason.contains("q4_0"), "{reason}");
-        assert!(reason.contains("re-export weights"), "{reason}");
+        assert!(reason.contains("does not support"), "{reason}");
     }
 
     #[test]

@@ -34,16 +34,11 @@
 //! never a dense-expert fallback.
 
 use onnx_runtime_ep_api::{EpError, Result};
+pub use onnx_runtime_ir::block_quant_schema::{
+    FP4_MICROSCALE_BLOCK, FP4_PACK_FACTOR, PlanarBlockFormat,
+};
 
 use super::block_dequant::{decode_e2m1, decode_e4m3fn, decode_e8m0_scale};
-
-/// Logical input elements per UE8M0 micro-scale in a planar-FP4 tensor. MXFP4
-/// pins this to 32 (NVFP4 would instead use 16 + an E4M3 block scale + an FP32
-/// global scale, which this format is explicitly not).
-pub const FP4_MICROSCALE_BLOCK: usize = 32;
-
-/// Two E2M1 nibbles are packed into every `I8` byte of a planar-FP4 weight.
-pub const FP4_PACK_FACTOR: usize = 2;
 
 fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("planar block quant: {}", message.into()))
@@ -109,64 +104,6 @@ fn bank_identity(
 // ---------------------------------------------------------------------------
 // Format
 // ---------------------------------------------------------------------------
-
-/// A planar block-scaled weight format: a packed weight tensor plus a separate
-/// UE8M0 scale bank. Distinct from the interleaved single-tensor
-/// [`BlockFormat`](super::block_quantized_matmul::BlockFormat) family.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PlanarBlockFormat {
-    /// `F8_E4M3` weight + 2D `F8_E8M0` block scale.
-    BlockFp8,
-    /// `I8`-packed `E2M1` nibbles + 1D `F8_E8M0` block-32 micro-scale.
-    Fp4Planar,
-}
-
-impl PlanarBlockFormat {
-    /// Parse the runtime format string. These names are the runtime capability
-    /// strings the Mobius #602 / Deckard #593 emitters target; they are
-    /// deliberately distinct from the interleaved `mxfp4` name.
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "block_fp8" => Ok(Self::BlockFp8),
-            "fp4_planar" => Ok(Self::Fp4Planar),
-            _ => Err(error(format!(
-                "unsupported planar format '{value}'; supported planar formats are block_fp8 and fp4_planar"
-            ))),
-        }
-    }
-
-    /// The stable runtime capability / format string for this format.
-    pub fn capability_str(self) -> &'static str {
-        match self {
-            Self::BlockFp8 => "block_fp8",
-            Self::Fp4Planar => "fp4_planar",
-        }
-    }
-
-    /// Name of the packed-weight element dtype, as it appears in a safetensors
-    /// header.
-    pub fn weight_dtype_name(self) -> &'static str {
-        match self {
-            Self::BlockFp8 => "F8_E4M3",
-            Self::Fp4Planar => "I8",
-        }
-    }
-
-    /// Name of the scale-bank element dtype (both formats use UE8M0).
-    pub fn scale_dtype_name(self) -> &'static str {
-        "F8_E8M0"
-    }
-
-    /// Number of logical weight elements stored per packed byte along the input
-    /// dimension: 1 for block-FP8 (E4M3 is one byte each), 2 for planar-FP4
-    /// (two E2M1 nibbles per byte).
-    pub fn pack_factor(self) -> usize {
-        match self {
-            Self::BlockFp8 => 1,
-            Self::Fp4Planar => FP4_PACK_FACTOR,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Layout / bank descriptor (property-typed contract)

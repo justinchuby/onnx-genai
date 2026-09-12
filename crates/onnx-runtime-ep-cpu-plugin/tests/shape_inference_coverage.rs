@@ -62,8 +62,6 @@ const DECLINED: &[(&str, &str)] = &[
     ("com.microsoft", "FusedAttention"),
     ("com.microsoft", "FusedGemm"),
     ("com.microsoft", "FusedMatMulBias"),
-    ("pkg.nxrt", "BlockQuantizedMatMul"),
-    ("pkg.nxrt", "BlockQuantizedMoE"),
     ("pkg.nxrt", "CompressedSparseAttention"),
     ("pkg.nxrt", "IndexShare"),
     ("pkg.nxrt", "PackedVarlenAttention"),

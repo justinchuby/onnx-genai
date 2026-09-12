@@ -152,7 +152,7 @@ pub unsafe extern "C" fn CreateEpFactories(
         // Runtime makes into the library.
         disable_persistent_decode_pool();
         let entries = build_kernel_registry_entries();
-        unsafe {
+        let status = unsafe {
             onnx_runtime_ep_plugin::factory::create_ep_factories_with_registry(
                 api_base,
                 out_factories_raw,
@@ -161,7 +161,30 @@ pub unsafe extern "C" fn CreateEpFactories(
                 || Box::new(CpuExecutionProvider::new()),
                 entries,
             )
+        };
+        if status.is_null() && !out_factories_raw.is_null() && max_factories != 0 {
+            let factory = unsafe { *out_factories_raw };
+            let api = unsafe {
+                (*api_base)
+                    .GetApi
+                    .map(|get_api| {
+                        get_api(onnx_runtime_ep_plugin::onnx_genai_ort_sys::ORT_API_VERSION)
+                    })
+                    .unwrap_or(std::ptr::null())
+            };
+            let domain_status = unsafe {
+                onnx_runtime_ep_plugin::nxrt_schema::attach_nxrt_custom_domain(factory, api)
+            };
+            if !domain_status.is_null() {
+                let _ = unsafe { onnx_runtime_ep_plugin::factory::release_ep_factory(factory) };
+                unsafe {
+                    *out_factories_raw = std::ptr::null_mut();
+                    *out_num_raw = 0;
+                }
+                return domain_status;
+            }
         }
+        status
     }));
     match result {
         Ok(status) => status,

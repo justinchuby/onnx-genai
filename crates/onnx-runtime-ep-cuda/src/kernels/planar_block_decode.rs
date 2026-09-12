@@ -151,7 +151,7 @@ __device__ __forceinline__ void planar_store(__nv_bfloat16* out, float v) { *out
 template<typename T>
 __device__ __forceinline__ void planar_linear_impl(
     const T* a, const unsigned char* packed, const unsigned char* scale,
-    T* c, int m_rows, int in_features, int out_features,
+    const T* bias, T* c, int m_rows, int in_features, int out_features,
     int format, int bs0, int bs1) {
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long long)m_rows * out_features) return;
@@ -165,34 +165,90 @@ __device__ __forceinline__ void planar_linear_impl(
             : planar_fp4_element(packed, scale, out_features, in_features, col, k);
         acc += planar_to_f32(a_row[k]) * w;
     }
-    planar_store(&c[(long long)row * out_features + col], acc);
+    planar_store(&c[(long long)row * out_features + col],
+                 acc + (bias ? planar_to_f32(bias[col]) : 0.0f));
 }
 extern "C" __global__ void planar_linear_f32(
     const float* a, const unsigned char* packed, const unsigned char* scale,
-    float* c, int m_rows, int in_features, int out_features,
+    const float* bias, float* c, int m_rows, int in_features, int out_features,
     int format, int bs0, int bs1) {
-    planar_linear_impl<float>(a, packed, scale, c, m_rows, in_features,
+    planar_linear_impl<float>(a, packed, scale, bias, c, m_rows, in_features,
                               out_features, format, bs0, bs1);
 }
 extern "C" __global__ void planar_linear_f16(
     const __half* a, const unsigned char* packed, const unsigned char* scale,
-    __half* c, int m_rows, int in_features, int out_features,
+    const __half* bias, __half* c, int m_rows, int in_features, int out_features,
     int format, int bs0, int bs1) {
-    planar_linear_impl<__half>(a, packed, scale, c, m_rows, in_features,
+    planar_linear_impl<__half>(a, packed, scale, bias, c, m_rows, in_features,
                                out_features, format, bs0, bs1);
 }
 extern "C" __global__ void planar_linear_bf16(
     const __nv_bfloat16* a, const unsigned char* packed, const unsigned char* scale,
-    __nv_bfloat16* c, int m_rows, int in_features, int out_features,
+    const __nv_bfloat16* bias, __nv_bfloat16* c, int m_rows, int in_features, int out_features,
     int format, int bs0, int bs1) {
-    planar_linear_impl<__nv_bfloat16>(a, packed, scale, c, m_rows, in_features,
+    planar_linear_impl<__nv_bfloat16>(a, packed, scale, bias, c, m_rows, in_features,
                                       out_features, format, bs0, bs1);
+}
+extern "C" __global__ void planar_validate_bank(
+    const unsigned char* packed, const unsigned char* scale,
+    unsigned int* error, int experts, int out_features, int in_features,
+    int format, int bs0, int bs1,
+    unsigned long long packed_expert_stride,
+    unsigned long long scale_expert_stride) {
+    const unsigned long long total =
+        (unsigned long long)experts * out_features * in_features;
+    for (unsigned long long index =
+             (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < total;
+         index += (unsigned long long)gridDim.x * blockDim.x) {
+        const int in_col = (int)(index % in_features);
+        const unsigned long long outer = index / in_features;
+        const int out_row = (int)(outer % out_features);
+        const int expert = (int)(outer / out_features);
+        const unsigned char* expert_packed =
+            packed + (unsigned long long)expert * packed_expert_stride;
+        const unsigned char* expert_scale =
+            scale + (unsigned long long)expert * scale_expert_stride;
+        const int scale_col = format == 0
+            ? in_col / bs1
+            : in_col / 32;
+        const int scale_cols = format == 0
+            ? 1 + (in_features - 1) / bs1
+            : in_features / 32;
+        const int scale_row = format == 0 ? out_row / bs0 : out_row;
+        const unsigned char se =
+            expert_scale[(long long)scale_row * scale_cols + scale_col];
+        if (se == 0xffu) {
+            atomicOr(error, 1u);
+            continue;
+        }
+        float value;
+        if (format == 0) {
+            const unsigned char code =
+                expert_packed[(long long)out_row * in_features + in_col];
+            if ((code & 0x7fu) == 0x7fu) {
+                atomicOr(error, 2u);
+                continue;
+            }
+            value = planar_e4m3(code) * planar_e8m0_scale(se);
+        } else {
+            const unsigned char byte =
+                expert_packed[(long long)out_row * (in_features / 2) + (in_col / 2)];
+            const unsigned char nib =
+                (in_col & 1) ? (byte >> 4) : (byte & 0x0fu);
+            value = planar_e2m1(nib) * planar_e8m0_scale(se);
+        }
+        if (!isfinite(value)) {
+            atomicOr(error, 4u);
+        }
+    }
 }
 "#;
 
 /// Entry-point name of the `f32` planar linear kernel in [`PLANAR_BLOCK_DECODE_CUH`].
 #[allow(dead_code)]
 pub(crate) const PLANAR_LINEAR_ENTRY: &str = "planar_linear_f32";
+pub(crate) const PLANAR_VALIDATE_ENTRY: &str = "planar_validate_bank";
 
 /// Activation precision the planar linear kernel is launched for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -572,15 +628,21 @@ pub fn warm_planar_linear(runtime: &CudaRuntime) -> Result<()> {
     for dtype in PlanarActivationDtype::all() {
         runtime.nvrtc_function(PLANAR_LINEAR_MODULE, PLANAR_BLOCK_DECODE_CUH, dtype.entry())?;
     }
+    runtime.nvrtc_function(
+        PLANAR_LINEAR_MODULE,
+        PLANAR_BLOCK_DECODE_CUH,
+        PLANAR_VALIDATE_ENTRY,
+    )?;
     Ok(())
 }
 
 #[derive(Clone, Copy)]
-struct PlanarLinearRawPtrs {
-    activation: CUdeviceptr,
-    packed: CUdeviceptr,
-    scale: CUdeviceptr,
-    output: CUdeviceptr,
+pub(crate) struct PlanarLinearPointers {
+    pub(crate) activation: CUdeviceptr,
+    pub(crate) packed: CUdeviceptr,
+    pub(crate) scale: CUdeviceptr,
+    pub(crate) bias: CUdeviceptr,
+    pub(crate) output: CUdeviceptr,
 }
 
 /// Threads per block for the one-thread-per-output planar linear kernel.
@@ -650,10 +712,11 @@ pub fn launch_planar_linear(
         "planar linear bank",
     )?;
     let access = super::SealedLaunchAccess::new();
-    let ptrs = PlanarLinearRawPtrs {
+    let ptrs = PlanarLinearPointers {
         activation: cuptr(activation.as_ptr()),
         packed: admission.banks.packed.ptr(&access),
         scale: admission.banks.scale.ptr(&access),
+        bias: 0,
         output: cuptr(output.as_mut_ptr()),
     };
     // SAFETY: the sealed admission owns the exact immutable bank allocations;
@@ -661,11 +724,24 @@ pub fn launch_planar_linear(
     unsafe { launch_planar_linear_raw(runtime, dtype, dims, &ptrs) }
 }
 
+pub(crate) unsafe fn launch_planar_linear_borrowed(
+    runtime: &CudaRuntime,
+    dtype: PlanarActivationDtype,
+    dims: &PlanarLinearDims,
+    pointers: &PlanarLinearPointers,
+) -> Result<()> {
+    dims.expected_lengths()?;
+    // SAFETY: this crate-private bridge is called only after the operator has
+    // validated the immutable input extents, dtypes, values, and pointer
+    // identity for the session lifetime.
+    unsafe { launch_planar_linear_raw(runtime, dtype, dims, pointers) }
+}
+
 unsafe fn launch_planar_linear_raw(
     runtime: &CudaRuntime,
     dtype: PlanarActivationDtype,
     dims: &PlanarLinearDims,
-    ptrs: &PlanarLinearRawPtrs,
+    ptrs: &PlanarLinearPointers,
 ) -> Result<()> {
     let function =
         runtime.nvrtc_function(PLANAR_LINEAR_MODULE, PLANAR_BLOCK_DECODE_CUH, dtype.entry())?;
@@ -696,6 +772,7 @@ unsafe fn launch_planar_linear_raw(
         .arg(&ptrs.activation)
         .arg(&ptrs.packed)
         .arg(&ptrs.scale)
+        .arg(&ptrs.bias)
         .arg(&ptrs.output)
         .arg(&m_rows)
         .arg(&in_features)
@@ -715,6 +792,77 @@ unsafe fn launch_planar_linear_raw(
     }
     .map_err(|err| driver_err(&format!("launch {}", dtype.entry()), err))?;
     Ok(())
+}
+
+pub(crate) fn validate_planar_bank_device(
+    runtime: &CudaRuntime,
+    dims: &PlanarLinearDims,
+    experts: usize,
+    packed: CUdeviceptr,
+    scale: CUdeviceptr,
+    scratch: CUdeviceptr,
+) -> Result<()> {
+    if runtime.is_capturing()? {
+        return Err(kernel_err(
+            "planar bank value admission must complete before CUDA graph capture",
+        ));
+    }
+    let lengths = dims.expected_lengths()?;
+    let function = runtime.nvrtc_function(
+        PLANAR_LINEAR_MODULE,
+        PLANAR_BLOCK_DECODE_CUH,
+        PLANAR_VALIDATE_ENTRY,
+    )?;
+    // SAFETY: `scratch` is a live four-byte kernel-owned allocation.
+    unsafe { runtime.htod(&0u32.to_ne_bytes(), scratch) }?;
+    let total = experts
+        .checked_mul(dims.out_features)
+        .and_then(|value| value.checked_mul(dims.in_features))
+        .ok_or_else(|| kernel_err("planar validation element count overflow"))?;
+    let grid = (total as u64).div_ceil(u64::from(PLANAR_LINEAR_BLOCK));
+    let grid =
+        u32::try_from(grid.max(1)).map_err(|_| kernel_err("planar validation grid exceeds u32"))?;
+    let experts = i32::try_from(experts)
+        .map_err(|_| kernel_err("expert count exceeds the i32 kernel ABI"))?;
+    let out_features = dims.out_features as i32;
+    let in_features = dims.in_features as i32;
+    let format = dims.format;
+    let bs0 = dims.bs0 as i32;
+    let bs1 = dims.bs1 as i32;
+    let packed_stride = lengths.packed_bytes as u64;
+    let scale_stride = lengths.scale_bytes as u64;
+    let mut builder = runtime.stream().launch_builder(&function);
+    builder
+        .arg(&packed)
+        .arg(&scale)
+        .arg(&scratch)
+        .arg(&experts)
+        .arg(&out_features)
+        .arg(&in_features)
+        .arg(&format)
+        .arg(&bs0)
+        .arg(&bs1)
+        .arg(&packed_stride)
+        .arg(&scale_stride);
+    // SAFETY: operator shape validation proves every bank extent and the
+    // scalar ABI matches `planar_validate_bank`.
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (PLANAR_LINEAR_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map_err(|err| driver_err("launch planar bank validation", err))?;
+    let mut bytes = [0u8; 4];
+    // SAFETY: `scratch` is a live four-byte allocation; dtoh drains the stream.
+    unsafe { runtime.dtoh(&mut bytes, scratch) }?;
+    match u32::from_ne_bytes(bytes) {
+        0 => Ok(()),
+        code if code & 1 != 0 => Err(kernel_err("reserved E8M0 scale exponent 0xff")),
+        code if code & 2 != 0 => Err(kernel_err("reserved E4M3 NaN encoding")),
+        _ => Err(kernel_err("decoded planar weight overflows f32")),
+    }
 }
 
 /// Planar matmul weight formats with a proven, launched CUDA kernel on this
