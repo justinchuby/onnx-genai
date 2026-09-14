@@ -1036,3 +1036,84 @@ fn a_fixture_stranded_by_a_kill_is_cleaned_rather_than_inherited() {
         "lock_dir must recover a stranded fixture, not leave it for the next run"
     );
 }
+
+/// The advice this crate prints must be a command the script still accepts.
+///
+/// [`Report::warning`] tells a benchmarker what to run before publishing
+/// numbers, and #1926 made `--reason` mandatory. So the advice and the script
+/// have to move together: when the advice goes stale, the person we most want
+/// to succeed -- the one about to publish -- is handed a command that exits 1.
+///
+/// Reading a substring of the advice cannot catch that. `hostlock.sh run
+/// --owner` is a prefix of both the accepted form and the refused one, and the
+/// two existing assertions on this shape are `assertIn` of exactly that prefix.
+/// So this test does not read the advice. It runs it, through a shell, from the
+/// repository root -- which is what the reader of the message does -- and so
+/// also pins the relative path the message quotes.
+#[test]
+fn the_advice_we_print_is_a_command_the_script_still_accepts() {
+    use onnx_runtime_hostmon::hostlock::LockState;
+    use onnx_runtime_hostmon::window::Window;
+
+    let report = Window::opened_at(LockState::Free).close_as(None, || LockState::Free);
+    let advice = report
+        .warning()
+        .expect("an unprotected report must warn; with no warning there is no advice to check");
+
+    // Control before verdict: require exactly one backticked command. A reword
+    // that dropped the command would otherwise leave nothing to run, and
+    // "ran nothing successfully" reaches the result line as a pass.
+    let commands: Vec<&str> = advice
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|c| c.contains("hostlock.sh"))
+        .collect();
+    assert_eq!(
+        commands.len(),
+        1,
+        "expected exactly one backticked hostlock.sh command in the advice, found {}: {advice}",
+        commands.len()
+    );
+
+    // Filling the placeholders is part of the check: if a reword renames them,
+    // this fires here rather than handing the shell a literal `<you>`.
+    let command = commands[0];
+    let filled = command
+        .replace("<you>", "advice-probe")
+        .replace("<what this measures>", "checking the printed advice runs");
+    assert!(
+        !filled.contains('<') && !filled.contains('>'),
+        "unsubstituted placeholder left in the advice: {filled}"
+    );
+
+    let root = script()
+        .parent()
+        .and_then(Path::parent)
+        .expect("hostlock.sh lives at <repo>/scripts/")
+        .to_path_buf();
+    let dir = ScratchLock(lock_dir("hostlock-advice"));
+
+    // The ambient environment is stripped deliberately. `HOSTLOCK_REASON` and
+    // `HOSTLOCK_OWNER` are accepted as substitutes for the flags, so inheriting
+    // either would let advice that had *lost* those flags still exit 0 -- the
+    // test would pass on the strength of this process's environment rather than
+    // of the string under test.
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!("{filled} -- true"))
+        .current_dir(&root)
+        .env("HOSTLOCK_DIR", &dir.0)
+        .env("HOSTLOCK_PRIVATE_OK", "1")
+        .env_remove("HOSTLOCK_REASON")
+        .env_remove("HOSTLOCK_OWNER")
+        .output()
+        .expect("failed to run the advice");
+
+    assert!(
+        out.status.success(),
+        "the advice we print is not a command the script accepts.\n  advice: {command}\n  ran:    {filled} -- true\n  exit:   {:?}\n  stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
