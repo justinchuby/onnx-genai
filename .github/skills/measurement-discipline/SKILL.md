@@ -409,14 +409,38 @@ Measured per binary under `--exact`:
 | name resolves and the test runs | `n = 1`, accepts | accepts |
 | bare-name drift, nothing selected | `n = 0`, refuses | refuses |
 | the test gained `#[ignore]` | **`n = 1`, accepts** | refuses |
+| the same path exists in two binaries | `n = 2`, refuses | **accepts, twice** |
 
-The last row is the one to keep in mind: `--list` prints an `#[ignore]`d test
+The `#[ignore]` row is the one to keep in mind: `--list` prints an `#[ignore]`d test
 with the same `: test` suffix, so the count accepts a run that executed nothing
 (`0 passed; 0 failed; 1 ignored`) and the result string refuses it. **The listing
 proves the name resolves, never that the arm ran.** So compose the two for their
 diagnostics — the count distinguishes *the name is gone* from *the test failed*,
 which one exit code cannot — but do not describe the count as the half that makes
 the string trustworthy. Under `--exact` it is the half with the false green.
+
+That last sentence holds **per binary**, which is the scope the uniqueness
+argument is good for. `--exact` demands equality against a full test path, and
+paths are unique *within* a binary — not across them. Drop the `-p`/`--lib`
+restriction and the same path can resolve in two targets, at which point the two
+halves swap roles. Measured, two binaries built from identical sources, one
+`--exact` filter:
+
+```
+test result: ok. 1 passed; 0 failed; ...      <- binary A
+test result: ok. 1 passed; 0 failed; ...      <- binary B
+--list count across both binaries : n=2
+tests actually executed           : 2
+STRING half ('1 passed' in output) : ACCEPTS
+COUNT  half (n == 1)               : refuses (n=2)
+```
+
+Two tests ran under a check that claims one did, and the string accepts because
+it is satisfied by *each* summary separately — it never sees the total. So which
+half is load-bearing depends on the target restriction: keep `-p "$PKG" --lib`
+and the count is the half with the false green; drop it and the string is. The
+restriction is not tidiness, it is the precondition the uniqueness argument
+needs. Keep it, and keep both halves.
 
 **All of the above is about cardinality, and cardinality is the weaker half.** A
 count answers *how many tests ran*; it never answers *whether they were the ones
