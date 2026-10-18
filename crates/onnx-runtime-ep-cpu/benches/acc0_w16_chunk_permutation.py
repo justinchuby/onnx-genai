@@ -95,7 +95,17 @@ it only sees "always the same index".
 So RULE 2 adds a *distributional* statistic, as a new named rule, testing the
 shape of the whole histogram rather than its peak:
 
-  chi2 = sum_i (obs_i - n/L)^2 / (n/L)   over the L=15 profiled lanes
+  chi2 = sum_i (obs_i - n/L)^2 / (n/L)   over that frame's L bins
+
+  The two frames have different L. The lane frame has L = the number of
+  profiled lanes (15): lane indices cannot exceed the worker list. The chunk
+  frame has L = WIDTH (16), because CHUNK is (idx+k) % WIDTH and the dispatcher
+  computes a shard without appearing in the worker list, so the chunk alphabet
+  is one symbol wider than the lane alphabet. Scoring the chunk arm on 15 bins
+  drops every chunk-15 sample from the sum while still dividing by the full n.
+  (Corrected 2026-08-27; measured to leave every verdict in this study
+  unchanged, since it perturbs the observed statistic and its shuffle null
+  alike, but it is wrong and would not stay harmless at other widths.)
 
   * CHUNK frame null: shuffle the `k` labels across launches. This holds the
     lane frame **exactly invariant** (shuffling `k` cannot change `idx`) while
@@ -486,14 +496,20 @@ def rule2(pairs, lanes, draws, seed=20260824):
     n = len(pairs)
 
     lane_obs = chi2_uniform(idxs, lanes)
-    chunk_obs = chi2_uniform([CHUNK(i, k) for i, k in pairs], lanes)
+    # The two frames do not have the same alphabet. Lane indices run over the
+    # `lanes` profiled workers, but CHUNK is (idx+k) % WIDTH and so runs over
+    # WIDTH symbols -- one more than there are profiled lanes, because the
+    # dispatcher computes a shard without appearing in the worker list. Scoring
+    # the chunk arm on `lanes` bins silently drops every sample whose chunk
+    # index is WIDTH-1 while still dividing by the full n.
+    chunk_obs = chi2_uniform([CHUNK(i, k) for i, k in pairs], WIDTH)
 
     # Chunk null: shuffle k (lane frame is invariant under this by construction).
     chunk_null = []
     for _ in range(draws):
         sh = ks[:]
         rng.shuffle(sh)
-        chunk_null.append(chi2_uniform([CHUNK(i, k) for i, k in zip(idxs, sh)], lanes))
+        chunk_null.append(chi2_uniform([CHUNK(i, k) for i, k in zip(idxs, sh)], WIDTH))
     chunk_p = sum(1 for v in chunk_null if v >= chunk_obs) / draws
 
     # Lane null: uniform multinomial at the same n.
