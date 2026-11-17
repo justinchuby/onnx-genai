@@ -80,6 +80,9 @@ WORKFLOW_JOB_INVENTORY: dict[str, tuple[str, ...]] = {
         "Deletion ratio",
         "Root file allowlist",
     ),
+    "fuzz.yml": (
+        "IR pattern parser fuzz",
+    ),
     "hostlock.yml": (
         "Host lock conformance",
     ),
@@ -184,6 +187,7 @@ PR_TRIGGERED_WORKFLOWS: dict[str, frozenset[str]] = {
     "audit.yml": frozenset(),
     "ci.yml": frozenset({_DOCS_ONLY_GUARD}),
     "diff-guard.yml": frozenset(),
+    "fuzz.yml": frozenset(),
     "hostlock.yml": frozenset(),
     "miri.yml": frozenset(),
     "squad-ci.yml": frozenset(),

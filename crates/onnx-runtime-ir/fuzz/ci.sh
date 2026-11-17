@@ -20,16 +20,17 @@ fi
 cd "$(dirname "$0")"
 toolchain="${FUZZ_TOOLCHAIN:-nightly}"
 targets=(pattern_text pattern_tokens)
-limits=(-rss_limit_mb=2048 -timeout=10 -max_len=8192)
+limits=(-rss_limit_mb=2048 -timeout=10)
 
-cargo "+$toolchain" fuzz build -O
+cargo "+$toolchain" fuzz build -O -a
 for target in "${targets[@]}"; do
     mkdir -p "corpus/$target" "artifacts/$target"
     echo "::group::$target: replay committed seeds"
-    cargo "+$toolchain" fuzz run -O "$target" "seeds/$target" -- -runs=0 "${limits[@]}"
+    # File arguments avoid libFuzzer's corpus max_len truncation.
+    cargo "+$toolchain" fuzz run -O -a "$target" "seeds/$target/"* -- -runs=1 "${limits[@]}"
     echo "::endgroup::"
     echo "::group::$target: ${seconds}s coverage-guided smoke"
-    cargo "+$toolchain" fuzz run -O "$target" "corpus/$target" "seeds/$target" -- \
-        -max_total_time="$seconds" -print_final_stats=1 "${limits[@]}"
+    cargo "+$toolchain" fuzz run -O -a "$target" "corpus/$target" "seeds/$target" -- \
+        -max_total_time="$seconds" -print_final_stats=1 -max_len=8192 "${limits[@]}"
     echo "::endgroup::"
 done
