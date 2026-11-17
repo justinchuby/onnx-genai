@@ -758,7 +758,7 @@ impl SessionBuilder {
                 (None, None) => return Err(SessionError::NoModelSource),
             }
         };
-        executor::ensure_execution_supported(&graph)?;
+        executor::prepare_execution(&mut graph)?;
 
         // Decoder precision rewrite (opt-in). Applied here — on the freshly
         // loaded graph, before the I/O signature (`IoMeta`) is computed and
@@ -1233,7 +1233,7 @@ impl InferenceSession {
         // the default ONNX domain is `""`, never `"ai.onnx"`. The executor and
         // validators rely on this, comparing `domain.is_empty()` directly.
         let mut graph = graph;
-        executor::ensure_execution_supported(&graph)?;
+        executor::prepare_execution(&mut graph)?;
         {
             let mut span = trace_span("session.normalize_validate", "session");
             graph.normalize_domains();

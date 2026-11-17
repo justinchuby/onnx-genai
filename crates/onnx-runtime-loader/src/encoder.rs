@@ -70,7 +70,7 @@ pub const DEFAULT_OPSET_VERSION: i64 = 24;
 
 /// Model-level metadata that the IR [`Graph`] does not itself carry.
 ///
-/// The load path drops these (it only keeps `opset_imports` on the `Graph`), so
+/// Except for `ir_version`, the load path does not retain these on `Graph`, so
 /// a caller that wants a faithful `ModelProto` supplies them here. All fields
 /// default to empty/zero except [`ir_version`](ModelMetadata::ir_version).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,15 +128,18 @@ impl<'a> Model<'a> {
     /// A model over `graph` with default metadata and no external weight store.
     ///
     /// **Note on defaulted metadata:** the load path does not preserve
-    /// model-level metadata (it keeps only `opset_imports` on the `Graph`), so a
-    /// model built this way stamps [`DEFAULT_IR_VERSION`] and empty producer /
+    /// other model-level metadata, so a model built this way retains the graph's
+    /// IR version (or [`DEFAULT_IR_VERSION`]) and stamps empty producer /
     /// version / `metadata_props` fields. A rewrite path that must reproduce the
     /// original model faithfully should capture the source metadata and pass it
     /// via [`Model::with_metadata`] rather than relying on these defaults.
     pub fn new(graph: &'a Graph) -> Self {
         Self {
             graph,
-            metadata: ModelMetadata::default(),
+            metadata: ModelMetadata {
+                ir_version: graph.ir_version.unwrap_or(DEFAULT_IR_VERSION),
+                ..ModelMetadata::default()
+            },
             weights: None,
         }
     }

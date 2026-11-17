@@ -251,7 +251,12 @@ impl Compiler<'_> {
                 .insert(parameter.name.clone(), parameter.annotation.clone());
         }
         let mut plans = vec![start];
-        for (targets, expression) in &definition.statements {
+        for (statement, (targets, expression)) in definition.statements.iter().enumerate() {
+            let instance = if matches!(targets[0].name.as_str(), "_" | "None") {
+                format!("#statement:{statement}")
+            } else {
+                targets[0].name.clone()
+            };
             let mut next = Vec::new();
             for plan in plans {
                 for target in targets {
@@ -275,8 +280,7 @@ impl Compiler<'_> {
                     mut plan,
                     outputs,
                     ports,
-                } in
-                    self.expression(plan, expression, targets.len(), &targets[0].name, depth)?
+                } in self.expression(plan, expression, targets.len(), &instance, depth)?
                 {
                     if outputs.len() != targets.len() {
                         if targets.len() != 1
@@ -324,14 +328,15 @@ impl Compiler<'_> {
             }
             plans = next;
         }
-        for expression in &definition.returns {
+        for (returned, expression) in definition.returns.iter().enumerate() {
+            let instance = format!("#return:{returned}");
             let mut next = Vec::new();
             for plan in plans {
                 for ExpressionPlan {
                     mut plan,
                     outputs,
                     ports,
-                } in self.expression(plan, expression, 1, "root", depth)?
+                } in self.expression(plan, expression, 1, &instance, depth)?
                 {
                     plan.outputs.extend(outputs);
                     plan.output_signature.extend(ports);

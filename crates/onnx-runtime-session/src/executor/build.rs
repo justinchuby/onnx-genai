@@ -1,5 +1,11 @@
 use super::*;
 
+pub(crate) fn prepare_execution(graph: &mut Graph) -> Result<()> {
+    ensure_execution_supported(graph)?;
+    onnx_runtime_loader::prepare_graph_for_execution(graph)?;
+    Ok(())
+}
+
 pub(crate) fn ensure_execution_supported(graph: &Graph) -> Result<()> {
     if !graph.sparse_initializers.is_empty() {
         return Err(SessionError::UnsupportedModel {
@@ -13,7 +19,7 @@ pub(crate) fn ensure_execution_supported(graph: &Graph) -> Result<()> {
         .inputs
         .iter()
         .copied()
-        .filter(|value| graph.initializers.contains_key(value))
+        .filter(|value| graph.is_initializer(*value) && !graph.is_constant_initializer(*value))
         .map(|value| {
             graph
                 .value(value)
@@ -27,29 +33,6 @@ pub(crate) fn ensure_execution_supported(graph: &Graph) -> Result<()> {
             reason: format!(
                 "initializer-backed graph input(s) {} are overridable defaults, which execution does not support yet; remove them from graph inputs or bind them through a runtime that supports overridable initializers",
                 overridable.join(", ")
-            ),
-        });
-    }
-    if let Some((node, slots)) = graph.nodes.iter().find_map(|(id, node)| {
-        let slots: Vec<_> = node
-            .outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, output)| output.is_none().then_some(slot))
-            .collect();
-        (!slots.is_empty()).then_some((id, slots))
-    }) {
-        let payload = graph.node(node);
-        return Err(SessionError::UnsupportedModel {
-            reason: format!(
-                "node {:?} ({}) omits optional output slot(s) {}; execution does not yet route absent output slots without fabricating buffers, so re-export with those outputs present or use the source-preserving IR/encoder path",
-                node,
-                payload.op_type,
-                slots
-                    .iter()
-                    .map(usize::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
             ),
         });
     }
@@ -941,13 +924,13 @@ impl Executor {
     }
 
     fn build_with_mode(
-        graph: Graph,
+        mut graph: Graph,
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
         hetero_enabled: bool,
     ) -> Result<Self> {
-        ensure_execution_supported(&graph)?;
+        prepare_execution(&mut graph)?;
         if hetero_enabled && !require_cuda && ep.device_type() != DeviceType::Cpu {
             let cpu = auto_detect_cpu_ep()?;
             let providers = vec![

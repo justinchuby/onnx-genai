@@ -19,6 +19,9 @@ use crate::value::{Value, ValueId};
 /// passes can rewrite the graph and then [`Graph::validate`] it.
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
+    /// Model IR version, inherited by nested bodies; `None` for graphs built
+    /// without a ModelProto. IR versions before 4 forbid initializer overrides.
+    pub ir_version: Option<i64>,
     pub nodes: Arena<NodeId, Node>,
     pub values: Arena<ValueId, Value>,
     /// Graph inputs, in order. These have no producer.
@@ -26,7 +29,7 @@ pub struct Graph {
     /// Graph outputs, in order.
     pub outputs: Vec<ValueId>,
     /// Dense initializer defaults, keyed by the value they populate. An
-    /// initializer that is also a graph input is overridable, not constant.
+    /// initializer that is also a graph input is overridable in IR >= 4.
     pub initializers: HashMap<ValueId, WeightRef>,
     /// Sparse initializer declarations, keyed by their `values.name` identity.
     /// Kept in the canonical ONNX representation, including external payload
@@ -450,9 +453,11 @@ impl Graph {
         self.initializers.contains_key(&value) || self.sparse_initializers.contains_key(&value)
     }
 
-    /// An initializer is immutable only when it is not also a graph input.
+    /// Before IR 4, initializer inputs are immutable. Later initializer inputs
+    /// are overridable defaults; an unknown version uses that conservative rule.
     pub fn is_constant_initializer(&self, value: ValueId) -> bool {
-        self.is_initializer(value) && !self.inputs.contains(&value)
+        self.is_initializer(value)
+            && (self.ir_version.is_some_and(|version| version < 4) || !self.inputs.contains(&value))
     }
 
     // === Traversal ===

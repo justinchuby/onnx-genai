@@ -577,10 +577,10 @@ fn ratio4_node_five_outputs(inputs: &[HostTensor]) -> (Graph, NodeId) {
         .outputs
         .pop()
         .expect("ratio4_node builds 6 outputs");
-    if let Some(dropped) = dropped {
-        if let Some(index) = graph.outputs.iter().position(|&value| value == dropped) {
-            graph.remove_output(index);
-        }
+    if let Some(dropped) = dropped
+        && let Some(index) = graph.outputs.iter().position(|&value| value == dropped)
+    {
+        graph.remove_output(index);
     }
     (graph, node)
 }

@@ -3,7 +3,6 @@
 //! Implements `GetCapability`, `Compile`, `ReleaseNodeComputeInfos`, and
 //! `GetKernelRegistry` by delegating to the Rust `ExecutionProvider` trait.
 
-use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
-use onnx_runtime_ir::{DataType, DeviceType, NodeIndex, ValueId};
+use onnx_runtime_ir::{DataType, DeviceType, NodeIndex};
 
 /// How an [`ExportedEp`] holds its backing Rust [`ExecutionProvider`].
 ///
@@ -504,9 +503,7 @@ fn ep_get_capability_inner(
     // cannot produce a tensor if we don't know its element type. This is
     // independent of the registry filter: even when no registry entries
     // exist, we refuse to claim nodes whose output types are unknown.
-    // Absent optional outputs (tracked out-of-band via the reader's
-    // `absent_outputs` set) are exempt — they represent known absence.
-    let absent = reader.absent_outputs();
+    // Absent optional slots have no SSA value and are skipped.
     let claims: Vec<_> = claims
         .into_iter()
         .filter(|claim| {
@@ -521,14 +518,10 @@ fn ep_get_capability_inner(
                         return false;
                     };
                     if value.dtype == DataType::Undefined {
-                        // Absent optional outputs are a known absence, not an
-                        // unresolved dtype — do not decline the node for these.
-                        if !absent.contains(&vid) {
-                            return false;
-                        }
+                        return false;
                     }
                 }
-                node_passes_dtype_filter(node, ir_graph, &exported.registry_entries, absent)
+                node_passes_dtype_filter(node, ir_graph, &exported.registry_entries)
             })
         })
         .collect();
@@ -635,7 +628,6 @@ pub(crate) fn node_passes_dtype_filter(
     node: &onnx_runtime_ir::Node,
     ir_graph: &onnx_runtime_ir::Graph,
     entries: &[KernelRegistryEntry],
-    absent_outputs: &HashSet<ValueId>,
 ) -> bool {
     if entries.is_empty() {
         return true;
@@ -676,12 +668,6 @@ pub(crate) fn node_passes_dtype_filter(
         let Some(value) = ir_graph.values.get(vid) else {
             continue;
         };
-        // Absent optional outputs are exempt from the dtype filter — the
-        // kernel doesn't actually produce them, so their dtype doesn't need
-        // to be in supported_dtypes.
-        if absent_outputs.contains(&vid) {
-            continue;
-        }
         if value.dtype == DataType::Undefined {
             return false;
         }
@@ -883,8 +869,16 @@ fn ep_compile_inner(
                     let node_output_vals = view.node_outputs(node_idx);
                     let mut output_dtypes: Vec<DataType> = node_output_vals
                         .iter()
-                        .map(|slot| {
-                            slot.map_or(DataType::Undefined, |val_idx| view.value(val_idx).dtype)
+                        .enumerate()
+                        .map(|(slot, value)| {
+                            value.map_or_else(
+                                || {
+                                    reader
+                                        .absent_output_dtype(node.id, slot)
+                                        .unwrap_or(DataType::Undefined)
+                                },
+                                |val_idx| view.value(val_idx).dtype,
+                            )
                         })
                         .collect();
                     let absent_output_slots: std::collections::HashSet<usize> = node_output_vals
@@ -2037,12 +2031,7 @@ mod tests {
             &[DataType::Float32],
         );
         let node = g.nodes.get(nid).unwrap();
-        assert!(super::node_passes_dtype_filter(
-            node,
-            &g,
-            &entries,
-            &std::collections::HashSet::new()
-        ));
+        assert!(super::node_passes_dtype_filter(node, &g, &entries,));
     }
 
     /// Node with unsupported dtype (Int64 for Add that only supports f32/f16)
@@ -2065,12 +2054,7 @@ mod tests {
             &[DataType::Int64],
         );
         let node = g.nodes.get(nid).unwrap();
-        assert!(!super::node_passes_dtype_filter(
-            node,
-            &g,
-            &entries,
-            &std::collections::HashSet::new()
-        ));
+        assert!(!super::node_passes_dtype_filter(node, &g, &entries,));
     }
 
     /// The union of an op's edge dtypes is not its kernel's rule.
@@ -2103,7 +2087,6 @@ mod tests {
             ],
             output_dtype_constraints: &[],
         }];
-        let empty = std::collections::HashSet::new();
 
         // A, B, scales, zero_points — all as the kernel requires.
         let (good, good_id) = graph_with_node(
@@ -2121,7 +2104,6 @@ mod tests {
             good.nodes.get(good_id).unwrap(),
             &good,
             &entries,
-            &empty
         ));
 
         // float16 zero_points: in the union, wrong for slot 3.
@@ -2137,12 +2119,7 @@ mod tests {
             &[DataType::Float32],
         );
         assert!(
-            !super::node_passes_dtype_filter(
-                bad.nodes.get(bad_id).unwrap(),
-                &bad,
-                &entries,
-                &empty
-            ),
+            !super::node_passes_dtype_filter(bad.nodes.get(bad_id).unwrap(), &bad, &entries,),
             "a float16 zero_points node must not be claimed: the kernel rejects it"
         );
 
@@ -2163,7 +2140,6 @@ mod tests {
                 swapped.nodes.get(swapped_id).unwrap(),
                 &swapped,
                 &entries,
-                &empty
             ),
             "a uint8 activation must not be claimed"
         );
@@ -2191,7 +2167,6 @@ mod tests {
             ],
             output_dtype_constraints: &[(0, &[DataType::Int64])],
         }];
-        let empty = std::collections::HashSet::new();
 
         let (good, good_id) = graph_with_node(
             "DsaIndexSelect",
@@ -2208,7 +2183,6 @@ mod tests {
             good.nodes.get(good_id).unwrap(),
             &good,
             &entries,
-            &empty
         ));
 
         let (bad, bad_id) = graph_with_node(
@@ -2223,12 +2197,7 @@ mod tests {
             &[DataType::Float32],
         );
         assert!(
-            !super::node_passes_dtype_filter(
-                bad.nodes.get(bad_id).unwrap(),
-                &bad,
-                &entries,
-                &empty
-            ),
+            !super::node_passes_dtype_filter(bad.nodes.get(bad_id).unwrap(), &bad, &entries,),
             "a Float32 selected_indices output must be declined before Compile/Compute"
         );
     }
@@ -2247,12 +2216,7 @@ mod tests {
         }];
         let (g, nid) = graph_with_node("Add", "", &[DataType::Undefined], &[DataType::Float32]);
         let node = g.nodes.get(nid).unwrap();
-        assert!(!super::node_passes_dtype_filter(
-            node,
-            &g,
-            &entries,
-            &std::collections::HashSet::new()
-        ));
+        assert!(!super::node_passes_dtype_filter(node, &g, &entries,));
     }
 
     /// Node with no matching registry entry is NOT claimed (fail closed).
@@ -2269,12 +2233,7 @@ mod tests {
         }];
         let (g, nid) = graph_with_node("UnknownOp", "", &[DataType::Float32], &[DataType::Float32]);
         let node = g.nodes.get(nid).unwrap();
-        assert!(!super::node_passes_dtype_filter(
-            node,
-            &g,
-            &entries,
-            &std::collections::HashSet::new()
-        ));
+        assert!(!super::node_passes_dtype_filter(node, &g, &entries,));
     }
 
     /// Empty registry entries → filter is bypassed (legacy compile-only mode).
@@ -2282,17 +2241,12 @@ mod tests {
     fn dtype_filter_bypassed_when_no_entries() {
         let (g, nid) = graph_with_node("Add", "", &[DataType::Int64], &[DataType::Int64]);
         let node = g.nodes.get(nid).unwrap();
-        assert!(super::node_passes_dtype_filter(
-            node,
-            &g,
-            &[],
-            &std::collections::HashSet::new()
-        ));
+        assert!(super::node_passes_dtype_filter(node, &g, &[],));
     }
 
     /// B1: A model-provided value whose name happens to start with
-    /// `__absent_output_` must NOT be treated as absent — only ValueIds
-    /// explicitly in the out-of-band `absent_outputs` set are exempt.
+    /// `__absent_output_` must NOT be treated as absent — only `None` slots
+    /// are exempt.
     #[test]
     fn forgeable_name_not_treated_as_absent() {
         use onnx_runtime_ir::{Graph, Node, NodeId};
@@ -2317,24 +2271,15 @@ mod tests {
             output_dtype_constraints: &[],
         }];
 
-        // Empty absent set — the forgery name should NOT grant exemption.
-        let empty_absent = std::collections::HashSet::new();
         assert!(
-            !super::node_passes_dtype_filter(node, &g, &entries, &empty_absent),
-            "Value named '__absent_output_*' must NOT bypass dtype filter \
-             unless its ValueId is in the out-of-band absent_outputs set"
+            !super::node_passes_dtype_filter(node, &g, &entries),
+            "a present value named '__absent_output_*' must not bypass the dtype filter"
         );
 
-        // With the ValueId in the absent set — it should pass.
-        let mut absent = std::collections::HashSet::new();
-        absent.insert(forgery);
-        // Still fails because Undefined is not in supported_dtypes and we
-        // only skip the Undefined check for absent outputs — the entry
-        // supported_dtypes filter is separate.
-        // The point: absent membership is by ValueId, not by name.
+        let absent = Node::new_with_output_slots(NodeId(0), "Add", vec![Some(input)], vec![None]);
         assert!(
-            super::node_passes_dtype_filter(node, &g, &entries, &absent),
-            "ValueId in absent_outputs set should be exempt from Undefined rejection"
+            super::node_passes_dtype_filter(&absent, &g, &entries),
+            "a missing output slot has no unresolved value dtype"
         );
     }
 

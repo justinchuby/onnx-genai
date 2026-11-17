@@ -67,6 +67,7 @@ pub(crate) fn build_graph(
     let model = inlined.as_ref();
 
     let mut graph = Graph::new();
+    graph.ir_version = Some(model.ir_version);
     graph.model_functions = model_functions;
 
     graph.opset_imports = import_opsets(&model.opset_import, "model")?;
@@ -132,7 +133,7 @@ fn build_model_function_catalog(
             node: func.node.clone(),
             ..Default::default()
         };
-        let mut body = build_subgraph(&gp)?;
+        let mut body = build_subgraph(&gp, Some(model.ir_version))?;
         body.opset_imports = import_opsets(&func.opset_import, &function_label(&key))?;
         onnx_runtime_ir::pattern::MatchSession::new(&body).map_err(|error| {
             LoaderError::GraphBuild(format!(
@@ -363,12 +364,16 @@ fn build_graph_proto(
                 validate_type_proto(tp, &vi.name, 0)?;
                 validate_initializer_type(graph, vid, tp, &vi.name)?;
             }
-            let (dtype, shape, type_known, shape_known) = value_info_type(graph, vi)?;
-            let value = graph.value_mut(vid);
-            value.declared_type = vi.r#type.clone();
-            value.dtype = dtype;
-            value.shape = shape;
-            mark_unknown_type_info(graph, vid, type_known, shape_known);
+            if graph.ir_version.is_some_and(|version| version < 4) {
+                graph.value_mut(vid).declared_type = vi.r#type.clone();
+            } else {
+                let (dtype, shape, type_known, shape_known) = value_info_type(graph, vi)?;
+                let value = graph.value_mut(vid);
+                value.declared_type = vi.r#type.clone();
+                value.dtype = dtype;
+                value.shape = shape;
+                mark_unknown_type_info(graph, vid, type_known, shape_known);
+            }
             graph.add_input(vid);
             continue;
         }
@@ -651,13 +656,13 @@ pub(crate) fn convert_attribute(
                 .collect::<Result<_, _>>()?,
         ),
         AT::Graph => match ap.g.as_ref() {
-            Some(g) => Attribute::Graph(Box::new(build_subgraph(g)?)),
+            Some(g) => Attribute::Graph(Box::new(build_subgraph(g, graph.ir_version)?)),
             None => return Ok(None),
         },
         AT::Graphs => Attribute::Graphs(
             ap.graphs
                 .iter()
-                .map(build_subgraph)
+                .map(|body| build_subgraph(body, graph.ir_version))
                 .collect::<Result<_, _>>()?,
         ),
         AT::TypeProto => match ap.tp.as_ref() {
@@ -678,12 +683,12 @@ pub(crate) fn convert_attribute(
         // Field-presence fallback when `type` is UNDEFINED.
         AT::Undefined => {
             if let Some(g) = ap.g.as_ref() {
-                Attribute::Graph(Box::new(build_subgraph(g)?))
+                Attribute::Graph(Box::new(build_subgraph(g, graph.ir_version)?))
             } else if !ap.graphs.is_empty() {
                 Attribute::Graphs(
                     ap.graphs
                         .iter()
-                        .map(build_subgraph)
+                        .map(|body| build_subgraph(body, graph.ir_version))
                         .collect::<Result<_, _>>()?,
                 )
             } else if let Some(t) = ap.t.as_ref() {
@@ -708,8 +713,9 @@ pub(crate) fn convert_attribute(
     Ok(Some((ap.name.clone(), attr)))
 }
 
-fn build_subgraph(gp: &GraphProto) -> Result<Graph, LoaderError> {
+fn build_subgraph(gp: &GraphProto, ir_version: Option<i64>) -> Result<Graph, LoaderError> {
     let mut graph = Graph::new();
+    graph.ir_version = ir_version;
     build_graph_proto(&mut graph, gp, false)?;
     Ok(graph)
 }

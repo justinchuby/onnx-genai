@@ -353,6 +353,68 @@ fn sparse_initializer_payload_identity_and_input_overlap_roundtrip() {
 }
 
 #[test]
+fn pre_ir4_initializer_inputs_are_constants_without_losing_source_presence() {
+    let mut source = model(onnx::GraphProto {
+        input: vec![info("weight", None)],
+        output: vec![info("out", Some(tensor(None)))],
+        initializer: vec![onnx::TensorProto {
+            name: "weight".into(),
+            data_type: DataType::Float32.to_onnx(),
+            dims: vec![2],
+            raw_data: [3.0f32, 4.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+            ..Default::default()
+        }],
+        node: vec![onnx::NodeProto {
+            op_type: "Identity".into(),
+            input: vec!["weight".into()],
+            output: vec!["out".into()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    for version in [3, 4] {
+        source.ir_version = version;
+        let graph = load_model_ir_bytes(&source.encode_to_vec()).unwrap();
+        let value = graph.inputs[0];
+        assert_eq!(graph.ir_version, Some(version));
+        assert_eq!(graph.is_constant_initializer(value), version < 4);
+        assert_eq!(
+            graph.value(value).tensor_dtype(),
+            (version < 4).then_some(DataType::Float32)
+        );
+        assert_eq!(graph.value(value).tensor_shape().is_some(), version < 4);
+        let encoded = encode_model_proto(&Model::new(&graph)).unwrap();
+        assert_eq!(encoded.ir_version, version);
+        assert_eq!(encoded.graph.unwrap().input[0].name, "weight");
+        assert!(graph.value(value).declared_type.is_none());
+        let mut execution = graph.clone();
+        onnx_runtime_loader::prepare_graph_for_execution(&mut execution).unwrap();
+        assert_eq!(execution.inputs.len(), usize::from(version >= 4));
+        assert_eq!(execution.ir_version, Some(4));
+        let lowered = encode_model_proto(&Model::new(&execution)).unwrap();
+        assert_eq!(lowered.ir_version, 4);
+        assert_eq!(
+            lowered.graph.unwrap().input.len(),
+            usize::from(version >= 4)
+        );
+        assert_eq!(
+            graph.inputs,
+            vec![value],
+            "execution lowering must not mutate the source snapshot"
+        );
+        if version < 4 {
+            let runtime = onnx_runtime_loader::load_model_bytes(&source.encode_to_vec()).unwrap();
+            let encoded = encode_model_proto(&Model::new(&runtime)).unwrap();
+            assert_eq!(encoded.ir_version, 4);
+            assert!(encoded.graph.unwrap().input.is_empty());
+        }
+    }
+}
+
+#[test]
 fn dense_initializer_remains_an_overridable_graph_input_not_a_literal() {
     let source = model(onnx::GraphProto {
         input: vec![info("weight", Some(tensor(None)))],
@@ -662,7 +724,7 @@ fn nested_external_initializer_shadows_ancestor_and_retains_live_bytes() {
     assert_eq!(store.bytes(weight), Some(payload.as_slice()));
     assert!(child.is_constant_initializer(id));
     let pattern = PatternLibrary::parse_ort(
-        "pattern Body(x){return Identity(x)} pattern Root(x){return custom.Region(x,body=Body)}",
+        "pattern Body(x){return Identity(x)} pattern Root(x){owner=custom.Region(x,body=Body);return owner}",
         &|domain, op| domain.is_empty() && op == "Identity",
     )
     .unwrap()
@@ -675,7 +737,7 @@ fn nested_external_initializer_shadows_ancestor_and_retains_live_bytes() {
         .unwrap();
     assert!(
         matched
-            .instance("root.body")
+            .instance("owner.body")
             .unwrap()
             .resolve_input("x", &graph)
             .is_err()

@@ -278,9 +278,77 @@ fn build_from_bytes_with_weights(
 
     validate_ir(&graph)?;
     validate_loaded_model(&graph)?;
+    prepare_graph_for_execution(&mut graph)?;
     infer_shapes(&mut graph)?;
 
     Ok((graph, Arc::new(store)))
+}
+
+/// Lower a private execution graph without changing a source-preserving IR.
+///
+/// Pre-IR-4 initializer inputs are immutable, not runtime feeds. Missing output
+/// slots retain their positions as anonymous scratch values when followed by a
+/// present output; absent trailing outputs do not require kernel buffers.
+/// Newly introduced scratch metadata is inferred, never copied from another slot.
+pub fn prepare_graph_for_execution(graph: &mut Graph) -> Result<(), LoaderError> {
+    fn lower(graph: &mut Graph) -> bool {
+        let mut changed = false;
+        if graph.ir_version.is_some_and(|version| version < 4) {
+            let inputs: Vec<_> = graph
+                .inputs
+                .iter()
+                .copied()
+                .filter(|value| !graph.is_initializer(*value))
+                .collect();
+            changed |= inputs.len() != graph.inputs.len();
+            graph.set_inputs(inputs);
+        }
+        let nodes: Vec<_> = graph.nodes.keys().collect();
+        for id in nodes {
+            let outputs = &graph.node(id).outputs;
+            let count = outputs
+                .iter()
+                .rposition(Option::is_some)
+                .map_or(0, |i| i + 1);
+            let holes: Vec<_> = outputs[..count]
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, output)| output.is_none().then_some(slot))
+                .collect();
+            changed |= count != outputs.len() || !holes.is_empty();
+            graph.node_mut(id).outputs.truncate(count);
+            for slot in holes {
+                let scratch = graph.create_value(onnx_runtime_ir::DataType::Undefined, vec![]);
+                graph.mark_value_shape_unknown(scratch);
+                graph.value_mut(scratch).producer = Some(id);
+                graph.node_mut(id).outputs[slot] = Some(scratch);
+            }
+            for attribute in graph.node_mut(id).attributes.values_mut() {
+                match attribute {
+                    onnx_runtime_ir::Attribute::Graph(body) => changed |= lower(body),
+                    onnx_runtime_ir::Attribute::Graphs(bodies) => {
+                        for body in bodies {
+                            changed |= lower(body);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for body in graph.subgraphs.values_mut() {
+            changed |= lower(body);
+        }
+        if changed && graph.ir_version.is_some_and(|version| version < 4) {
+            graph.ir_version = Some(4);
+        }
+        changed
+    }
+
+    validate_einsum_nodes(graph)?;
+    if lower(graph) {
+        infer_shapes(graph)?;
+    }
+    Ok(())
 }
 
 fn build_source_ir_from_bytes_with_weights(
@@ -685,9 +753,8 @@ pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
     check_graph(graph, &graph.opset_imports)
 }
 
-/// Validate ONNX model metadata and protobuf-level graph invariants that are
-/// intentionally not preserved by the runtime IR (notably `ir_version` and
-/// `AttributeProto::ref_attr_name`).
+/// Validate ONNX model metadata and protobuf-level graph invariants before
+/// graph construction and execution lowering.
 ///
 /// This runs before graph construction, ensuring invalid names cannot be
 /// coalesced into a single IR value and attribute references cannot be dropped.

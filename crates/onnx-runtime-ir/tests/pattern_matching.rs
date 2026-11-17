@@ -60,6 +60,52 @@ fn library(source: &str) -> Result<PatternLibrary, PatternError> {
 }
 
 #[test]
+fn anonymous_calls_have_independent_attribute_and_dimension_scopes() {
+    for body in [
+        "return act(x), act(y)",
+        "root=act(x);return root,act(y)",
+        "_,a=pair(x);_,b=pair(y);return a,b",
+    ] {
+        let source = format!(
+            "pattern act(x:float[N])->(y:float[N]) {{y=LeakyRelu(x,alpha=alpha);return y}}
+             pattern pair(x:float[N]) {{a=act(x);b=Identity(a);return a,b}}
+             pattern P(x,y)->(left,right) {{{body}}}"
+        );
+        let pattern = library(&source).unwrap().graph_pattern("P").unwrap();
+        let mut graph = Graph::new();
+        let x = input(&mut graph, "x");
+        let y = input(&mut graph, "y");
+        graph.value_mut(y).shape = vec![3.into()];
+        let mut returned = Vec::new();
+        for (value, alpha) in [(x, 0.1), (y, 0.2)] {
+            let (node, values) = op(&mut graph, "LeakyRelu", &[Some(value)], 1);
+            graph
+                .node_mut(node)
+                .attributes
+                .insert("alpha".into(), Attribute::Float(alpha));
+            graph.value_mut(values[0]).shape = graph.value(value).shape.clone();
+            let result = if body.contains("pair(") {
+                let (_, output) = op(&mut graph, "Identity", &[Some(values[0])], 1);
+                graph.value_mut(output[0]).shape = graph.value(value).shape.clone();
+                output[0]
+            } else {
+                values[0]
+            };
+            returned.push(result);
+        }
+        graph.set_outputs(returned);
+        assert!(
+            MatchSession::new(&graph)
+                .unwrap()
+                .match_graph(&pattern, Default::default())
+                .unwrap()
+                .is_some(),
+            "{body}"
+        );
+    }
+}
+
+#[test]
 fn pinned_interfaces_anonymous_alternatives_and_hygienic_scopes() {
     let fixture = include_str!("fixtures/patterns/interfaces.ortpattern");
     for call in ["Forms", "(first | second)"] {

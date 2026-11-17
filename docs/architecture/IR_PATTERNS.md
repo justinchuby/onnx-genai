@@ -100,6 +100,8 @@ An implementation may declare extra discovered captures:
 Call it with only `scale(x)`; `alpha` is discovered structurally and available
 under the call's scope. Extra attribute captures are also supported. Separate
 instances keep independent values, attributes, dimensions and type variables.
+Anonymous return calls and discarded assignment targets receive distinct internal
+scopes, never a shared synthetic capture name. Name a result to inspect its scope.
 Interface inputs cannot become attributes, and interface/declared outputs
 cannot become absent through an optional alias.
 
@@ -225,7 +227,8 @@ Constraining an unresolved function `ref_attr_name` returns `MissingMetadata`;
 bind the function's explicit/default attributes first, or inspect the raw
 reference metadata without claiming its runtime value.
 To compare with ORT's resolved graph, the adapter must materialize the same
-defaults/types in advance. `const` and literals exclude initializer/input overlap.
+defaults/types in advance. `const` and literals exclude overridable initializer
+inputs (IR >= 4, or unknown version); pre-IR-4 initializer inputs are immutable.
 Literal reads validate recognized inline storage. External bytes are never
 loaded implicitly: a literal requiring `WeightRef::External` returns
 `MissingMetadata`; materialize through the loader first. Sparse constant
@@ -271,7 +274,8 @@ Use `onnx_runtime_loader::load_model_ir_bytes` (or its path/weight variants) for
 structural analysis and round trips. These source-preserving entry points do not
 run shape inference or expand local functions. Existing execution loaders
 deliberately lower functions and infer shapes; they are not source-preserving
-transforms. Model-level metadata is still supplied separately to the encoder.
+transforms. `Graph::ir_version` retains the source version, inherited by nested
+bodies; other model-level metadata is still supplied separately to the encoder.
 `onnx-std` model loading uses this source path too; it no longer silently
 substitutes fake graph inputs for sparse initializers. Its raw function checker
 can validate declarations before strict IR construction.
@@ -285,11 +289,20 @@ attributes; unresolved references are not fabricated values.
 
 Dense and sparse initializer defaults retain their shared identity with graph
 inputs. `Graph::is_initializer` covers either storage form;
-`is_constant_initializer` additionally excludes graph inputs. Sparse declarations
+`is_constant_initializer` excludes graph inputs unless the model's IR version
+predates initializer overrides (IR < 4). Sparse declarations
 retain their original `SparseTensorProto`, including external payload references;
 they are not densified or implicitly fetched. String tensor elements are raw
 byte vectors, including non-UTF-8 data. The serializer re-emits both storage forms
 and the complete ordered graph input interface.
+
+Execution preparation removes immutable pre-IR-4 initializer inputs from runtime
+feeds. It trims absent trailing outputs and supplies anonymous scratch values
+for interior holes on a private execution graph, preserving producer slot
+positions and inferring scratch types/shapes. Source IR and serializer output
+retain the original holes. Lowered legacy graphs are marked IR 4 so re-encoding
+does not claim the old initializer-as-input requirement. IR >= 4 overridable defaults remain an explicit
+unsupported execution case rather than silently freezing their values.
 
 Preserving source information does **not** implement sparse execution, arbitrary
 container kernels, function expansion semantics inside the matcher, or all ORT

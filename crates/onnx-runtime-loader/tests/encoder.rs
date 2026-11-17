@@ -406,7 +406,8 @@ fn optional_output_holes_round_trip_positionally() {
     };
 
     let (graph, store) =
-        load_model_bytes_with_weights(&model.encode_to_vec(), ".").expect("load holes");
+        onnx_runtime_loader::load_model_ir_bytes_with_weights(&model.encode_to_vec(), ".")
+            .expect("load source holes");
     let dropout = graph.nodes.values().next().expect("Dropout node");
     assert_eq!(dropout.outputs.len(), 3);
     assert!(dropout.outputs[0].is_some());

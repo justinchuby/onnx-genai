@@ -13596,7 +13596,7 @@ fn qmoe_residency_plan_seam_is_substitutable_with_an_alternate_policy() {
 }
 
 #[test]
-fn execution_rejects_optional_output_holes_before_planning() {
+fn execution_trims_absent_trailing_outputs_without_changing_the_source() {
     let mut graph = Graph::new();
     let input = graph.create_named_value("x", DataType::Float32, vec![2.into()]);
     let output = graph.create_named_value("y", DataType::Float32, vec![2.into()]);
@@ -13609,11 +13609,8 @@ fn execution_rejects_optional_output_holes_before_planning() {
         vec![Some(output), None],
     ));
 
-    let error = ensure_execution_supported(&graph).unwrap_err().to_string();
-    assert!(error.contains("Dropout"), "{error}");
-    assert!(error.contains("output slot(s) 1"), "{error}");
-    assert!(
-        error.contains("does not yet route absent output slots"),
-        "{error}"
-    );
+    let source = graph.clone();
+    prepare_execution(&mut graph).unwrap();
+    assert_eq!(graph.node(NodeId(0)).outputs, vec![Some(output)]);
+    assert_eq!(source.node(NodeId(0)).outputs, vec![Some(output), None]);
 }
