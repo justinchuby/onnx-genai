@@ -20,7 +20,7 @@ use crate::value::ValueId;
 pub const RUNTIME_DOMAIN: &str = "pkg.nxrt";
 
 /// Unique identifier for a [`Node`] within a [`Graph`](crate::Graph).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct NodeId(pub u32);
 
 impl ArenaKey for NodeId {

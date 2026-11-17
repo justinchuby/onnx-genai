@@ -1,0 +1,6 @@
+# From ORT Pattern_Rewriter.md, "Matching alternatives at one root".
+# Reference: c992a5210bf5bf6a8f8ace36d8c6304ba70f1821. See ORT_LICENSE.
+pattern E(x) {
+  value = Identity(x) | x
+  return Sigmoid(value)
+}

@@ -1,0 +1,3 @@
+# From PatternRewriterTests.OptionalInputConstraintsAndAbsentRepetition.
+# Reference: c992a5210bf5bf6a8f8ace36d8c6304ba70f1821. See ORT_LICENSE.
+(x,v:tensor[...] | None)=>{a=Identity(x);return Clip(a,v,v);}

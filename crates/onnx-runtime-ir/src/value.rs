@@ -11,7 +11,7 @@ use crate::node::NodeId;
 use crate::shape::Shape;
 
 /// Unique identifier for a [`Value`] within a [`Graph`](crate::Graph).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ValueId(pub u32);
 
 impl ArenaKey for ValueId {
