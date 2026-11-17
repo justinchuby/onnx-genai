@@ -1,4 +1,4 @@
-use onnx_runtime_ir::pattern::{MatchOptions, MatchSession, Pattern};
+use onnx_runtime_ir::pattern::{Input, MatchOptions, MatchSession, Pattern};
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
@@ -12,44 +12,83 @@ use onnx_runtime_optimizer::{
 use std::sync::LazyLock;
 
 static QUANTIZED_PROJECTION: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_native("(args:slots[0:*])=>return com.microsoft.MatMulNBits(...args)")
-        .expect("built-in quantized projection pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let args = p.slot_sequence("args", 0, None);
+    let out = p
+        .node("MatMulNBits", [args])
+        .domain("com.microsoft")
+        .output();
+    p.finish(out)
+        .expect("built-in quantized projection pattern must compile; fix its Rust definition")
 });
 
 static CAST: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort("(x)=>{out=Cast(x);return out}")
-        .expect("built-in Cast pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let out = p.op("Cast", [x]);
+    p.capture("out", out);
+    p.finish(out)
+        .expect("built-in Cast pattern must compile; fix its Rust definition")
 });
 
 static CONSTANT: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort("()=>{out=Constant();return out}")
-        .expect("built-in Constant pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let out = p.op::<Input>("Constant", []);
+    p.capture("out", out);
+    p.finish(out)
+        .expect("built-in Constant pattern must compile; fix its Rust definition")
 });
 
 static THRESHOLD: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort(
-        "(x,threshold)=>{out=Greater(x,threshold)|GreaterOrEqual(x,threshold);return out}",
-    )
-    .expect("built-in threshold pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let [x, threshold] = p.inputs(["x", "threshold"]);
+    let out = p
+        .node("Greater", [x, threshold])
+        .or_node("GreaterOrEqual", [x, threshold])
+        .output();
+    p.capture("out", out);
+    p.finish(out)
+        .expect("built-in threshold pattern must compile; fix its Rust definition")
 });
 
 static BETA_GATE: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort("(raw)=>{out=Sigmoid(raw);return out}")
-        .expect("built-in beta gate pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let raw = p.input("raw");
+    let out = p.op("Sigmoid", [raw]);
+    p.capture("out", out);
+    p.finish(out)
+        .expect("built-in beta gate pattern must compile; fix its Rust definition")
 });
 
 static DECAY_GATES: LazyLock<[Pattern; 2]> = LazyLock::new(|| {
-    ["coefficient=c", "exp=Exp(c);coefficient=Neg(exp)"].map(|coefficient| {
-        Pattern::parse_ort(&format!(
-            "(a,bias,c)=>{{
-                {coefficient};
-                sum=Add(a,bias)|Add(bias,a);
-                soft=Softplus(sum);
-                product=Mul(coefficient,soft)|Mul(soft,coefficient);
-                out=Cast(product)|product;return out
-            }}"
-        ))
-        .expect("built-in decay gate pattern must compile; fix its textual definition")
+    [false, true].map(|negative_exp| {
+        let mut p = Pattern::builder();
+        let [a, bias, c] = p.inputs(["a", "bias", "c"]);
+        let coefficient = if negative_exp {
+            let exp = p.op("Exp", [c]);
+            p.capture("exp", exp);
+            p.op("Neg", [exp])
+        } else {
+            p.alias(c).output()
+        };
+        let sum = p.node("Add", [a, bias]).or_node("Add", [bias, a]).output();
+        let soft = p.op("Softplus", [sum]);
+        let product = p
+            .node("Mul", [coefficient, soft])
+            .or_node("Mul", [soft, coefficient])
+            .output();
+        let out = p.node("Cast", [product]).or_value(product).output();
+        for (name, value) in [
+            ("coefficient", coefficient),
+            ("sum", sum),
+            ("soft", soft),
+            ("product", product),
+            ("out", out),
+        ] {
+            p.capture(name, value);
+        }
+        p.finish(out)
+            .expect("built-in decay gate pattern must compile; fix its Rust definition")
     })
 });
 
@@ -72,59 +111,101 @@ fn cast_index(session: &MatchSession<'_>) -> OptimizerResult<CastIndex> {
 }
 
 static RSQRT: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "CUDA rsqrt",
-        "(x)=>{sqrt=Sqrt(x);out=Reciprocal(sqrt);return out}",
-        "sqrt",
-    )
-    .expect("built-in rsqrt pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let sqrt = p.op("Sqrt", [x]);
+    let out = p.op("Reciprocal", [sqrt]);
+    p.capture("sqrt", sqrt);
+    p.capture("out", out);
+    let pattern = p
+        .finish(out)
+        .expect("built-in rsqrt pattern must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("CUDA rsqrt", pattern, "sqrt")
+        .expect("built-in rsqrt anchor must identify the square-root output")
 });
 
 static L2_NORMALIZE: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "CUDA L2 normalization",
-        "(x,axes:slots[0:*])=>{
-            sq=ReduceSumSquare(x,...axes);nrm=Sqrt(sq);out=Div(x,nrm);return out
-        }",
-        "out",
-    )
-    .expect("built-in L2 normalization pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let axes = p.slot_sequence("axes", 0, None);
+    let sq = p.op("ReduceSumSquare", [Input::Value(x), Input::Sequence(axes)]);
+    let nrm = p.op("Sqrt", [sq]);
+    let out = p.op("Div", [x, nrm]);
+    for (name, value) in [("sq", sq), ("nrm", nrm), ("out", out)] {
+        p.capture(name, value);
+    }
+    let pattern = p
+        .finish(out)
+        .expect("built-in L2 normalization pattern must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("CUDA L2 normalization", pattern, "out")
+        .expect("built-in L2 normalization anchor must identify the division output")
 });
 
 static SWIGLU: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "CUDA SwiGLU",
-        "(gate,up)=>{
-            silu=com.microsoft.Silu(gate)|Swish(gate);
-            out=Mul(silu,up)|Mul(up,silu);return out
-        }",
-        "silu",
-    )
-    .expect("built-in SwiGLU pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let [gate, up] = p.inputs(["gate", "up"]);
+    let silu = p
+        .node("Silu", [gate])
+        .domain("com.microsoft")
+        .or_node("Swish", [gate])
+        .output();
+    let out = p
+        .node("Mul", [silu, up])
+        .or_node("Mul", [up, silu])
+        .output();
+    p.capture("silu", silu);
+    p.capture("out", out);
+    let pattern = p
+        .finish(out)
+        .expect("built-in SwiGLU pattern must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("CUDA SwiGLU", pattern, "silu")
+        .expect("built-in SwiGLU anchor must identify the activation output")
 });
 
 static GATE_UP_SWIGLU: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "CUDA gate/up SwiGLU",
-        "(x,gs:slots[0:*],us:slots[0:*])=>{
-            gate=com.microsoft.MatMulNBits(x,...gs);
-            up=com.microsoft.MatMulNBits(x,...us);
-            out=Mul(gate,up);return out
-        }",
-        "out",
-    )
-    .expect("built-in gate/up SwiGLU pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let gs = p.slot_sequence("gs", 0, None);
+    let us = p.slot_sequence("us", 0, None);
+    let gate = p
+        .node("MatMulNBits", [Input::Value(x), Input::Sequence(gs)])
+        .domain("com.microsoft")
+        .output();
+    let up = p
+        .node("MatMulNBits", [Input::Value(x), Input::Sequence(us)])
+        .domain("com.microsoft")
+        .output();
+    let out = p.op("Mul", [gate, up]);
+    for (name, value) in [("gate", gate), ("up", up), ("out", out)] {
+        p.capture(name, value);
+    }
+    let pattern = p
+        .finish(out)
+        .expect("built-in gate/up SwiGLU pattern must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("CUDA gate/up SwiGLU", pattern, "out")
+        .expect("built-in gate/up SwiGLU anchor must identify the multiplication output")
 });
 
 static SKIP_RMSNORM: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "CUDA residual RMS normalization",
-        "(a,b,gamma,rest:slots[0:*])=>{
-            sum=Add(a,b);out=SimplifiedLayerNormalization(sum,gamma,...rest);return out,sum
-        }",
-        "out",
-    )
-    .expect("built-in residual norm pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let [a, b, gamma] = p.inputs(["a", "b", "gamma"]);
+    let rest = p.slot_sequence("rest", 0, None);
+    let sum = p.op("Add", [a, b]);
+    let out = p.op(
+        "SimplifiedLayerNormalization",
+        [
+            Input::Value(sum),
+            Input::Value(gamma),
+            Input::Sequence(rest),
+        ],
+    );
+    p.capture("sum", sum);
+    p.capture("out", out);
+    let pattern = p
+        .finish_outputs([out, sum])
+        .expect("built-in residual norm pattern must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("CUDA residual RMS normalization", pattern, "out")
+        .expect("built-in residual norm anchor must identify the normalization output")
 });
 
 use crate::kernels::linear_attention::{

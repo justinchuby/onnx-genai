@@ -1,3 +1,4 @@
+use onnx_runtime_ir::pattern::{Input, Pattern};
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
@@ -11,42 +12,75 @@ use onnx_runtime_optimizer::{
 use std::sync::LazyLock;
 
 static GATE_UP: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "CPU gate/up",
-        "(x,gs:slots[0:*],us:slots[0:*]) => {
-            gate=com.microsoft.MatMulNBits(x,...gs);
-            up=com.microsoft.MatMulNBits(x,...us);
-            activation=Swish(gate)|com.microsoft.Silu(gate);
-            out=Mul(activation,up)|Mul(up,activation); return out
-        }",
-        "activation",
-    )
-    .expect("built-in CPU gate/up pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let gs = p.slot_sequence("gs", 0, None);
+    let us = p.slot_sequence("us", 0, None);
+    let gate = p
+        .node("MatMulNBits", [Input::Value(x), Input::Sequence(gs)])
+        .domain("com.microsoft")
+        .output();
+    let up = p
+        .node("MatMulNBits", [Input::Value(x), Input::Sequence(us)])
+        .domain("com.microsoft")
+        .output();
+    let activation = p
+        .node("Swish", [gate])
+        .or_node("Silu", [gate])
+        .domain("com.microsoft")
+        .output();
+    let out = p
+        .node("Mul", [activation, up])
+        .or_node("Mul", [up, activation])
+        .output();
+    for (name, value) in [
+        ("gate", gate),
+        ("up", up),
+        ("activation", activation),
+        ("out", out),
+    ] {
+        p.capture(name, value);
+    }
+    let pattern = p
+        .finish(out)
+        .expect("built-in CPU gate/up pattern must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("CPU gate/up", pattern, "activation")
+        .expect("built-in CPU gate/up anchor must identify the activation output")
 });
 
 static CONV_BN: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "CPU Conv/BatchNormalization",
-        "(args:slots[0:*],scale,bias,mean,var) => {
-            conv=Conv(...args);
-            bn=BatchNormalization(conv,scale,bias,mean,var);
-            out=Relu(bn)|bn; return out
-        }",
-        "bn",
-    )
-    .expect("built-in Conv/BatchNormalization pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let args = p.slot_sequence("args", 0, None);
+    let [scale, bias, mean, variance] = p.inputs(["scale", "bias", "mean", "var"]);
+    let conv = p.op("Conv", [args]);
+    let bn = p.op("BatchNormalization", [conv, scale, bias, mean, variance]);
+    let out = p.node("Relu", [bn]).or_value(bn).output();
+    for (name, value) in [("conv", conv), ("bn", bn), ("out", out)] {
+        p.capture(name, value);
+    }
+    let pattern = p
+        .finish(out)
+        .expect("built-in Conv/BatchNormalization pattern must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("CPU Conv/BatchNormalization", pattern, "bn")
+        .expect("built-in Conv/BatchNormalization anchor must identify the normalization output")
 });
 
 static SIBLING_PROJECTION: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "CPU sibling projection",
-        "(activation,args:slots[1:*])=>{
-            out=MatMul(activation,...args)|com.microsoft.FusedMatMulBias(activation,...args);
-            return out
-        }",
-        "out",
-    )
-    .expect("built-in sibling projection pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let activation = p.input("activation");
+    let args = p.slot_sequence("args", 1, None);
+    let inputs = [Input::Value(activation), Input::Sequence(args)];
+    let out = p
+        .node("MatMul", inputs)
+        .or_node("FusedMatMulBias", inputs)
+        .domain("com.microsoft")
+        .output();
+    p.capture("out", out);
+    let pattern = p
+        .finish(out)
+        .expect("built-in sibling projection pattern must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("CPU sibling projection", pattern, "out")
+        .expect("built-in sibling projection anchor must identify the projection output")
 });
 
 const PROJECTION_FUSION_ENV: &str = "ONNX_GENAI_PROJECTION_FUSION";

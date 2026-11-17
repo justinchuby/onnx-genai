@@ -1,63 +1,148 @@
 use super::*;
 use crate::recognition::{capture_node, capture_value};
-use onnx_runtime_ir::pattern::{Match, MatchOptions};
+use onnx_runtime_ir::pattern::{Input, Match, MatchOptions, PatternBuilder, PatternValue};
 use std::sync::LazyLock;
 
 pub(super) static LAYERNORM: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "LayerNorm",
-        "(x,power,eps,scale,bias,axes:slots[0:*],vaxes:slots[0:*])=>{
-            mean=ReduceMean(x,...axes);diff=Sub(x,mean);
-            square=Pow(diff,power);variance=ReduceMean(square,...vaxes);
-            variance_eps=Add(variance,eps)|Add(eps,variance);
-            std=Sqrt(variance_eps);numerator=diff|Sub(x,mean);
-            norm=Div(numerator,std);scaled=Mul(norm,scale)|Mul(scale,norm);
-            out=Add(scaled,bias)|Add(bias,scaled);return out
-        }",
-        "mean",
-    )
-    .expect("built-in LayerNorm recognition must compile; fix its textual rule")
+    let mut p = Pattern::builder();
+    let [x, power, eps, scale, bias] = p.inputs(["x", "power", "eps", "scale", "bias"]);
+    let axes = p.slot_sequence("axes", 0, None);
+    let vaxes = p.slot_sequence("vaxes", 0, None);
+    let mean = p.op("ReduceMean", [Input::Value(x), Input::Sequence(axes)]);
+    let diff = p.op("Sub", [x, mean]);
+    let square = p.op("Pow", [diff, power]);
+    let variance = p.op("ReduceMean", [Input::Value(square), Input::Sequence(vaxes)]);
+    let variance_eps = p
+        .node("Add", [variance, eps])
+        .or_node("Add", [eps, variance])
+        .output();
+    let std = p.op("Sqrt", [variance_eps]);
+    let numerator = p.alias(diff).or_node("Sub", [x, mean]).output();
+    let norm = p.op("Div", [numerator, std]);
+    let scaled = p
+        .node("Mul", [norm, scale])
+        .or_node("Mul", [scale, norm])
+        .output();
+    let out = p
+        .node("Add", [scaled, bias])
+        .or_node("Add", [bias, scaled])
+        .output();
+    for (name, value) in [
+        ("mean", mean),
+        ("diff", diff),
+        ("square", square),
+        ("variance", variance),
+        ("variance_eps", variance_eps),
+        ("std", std),
+        ("numerator", numerator),
+        ("norm", norm),
+        ("scaled", scaled),
+        ("out", out),
+    ] {
+        p.capture(name, value);
+    }
+    let pattern = p
+        .finish(out)
+        .expect("built-in LayerNorm recognition must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("LayerNorm", pattern, "mean")
+        .expect("built-in LayerNorm anchor must identify the mean output")
 });
 
 pub(super) static GELU: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "GELU",
-        "(x,inner_constant,half_constant,one)=>{
-            inner=Div(x,inner_constant)|Mul(x,inner_constant)|Mul(inner_constant,x);
-            erf=Erf(inner);plus_one=Add(erf,one)|Add(one,erf);
-            half=Mul(x,half_constant)|Mul(half_constant,x)|Div(x,half_constant);
-            out=Mul(half,plus_one)|Mul(plus_one,half);return out
-        }",
-        "erf",
-    )
-    .expect("built-in GELU recognition must compile; fix its textual rule")
+    let mut p = Pattern::builder();
+    let [x, inner_constant, half_constant, one] =
+        p.inputs(["x", "inner_constant", "half_constant", "one"]);
+    let inner = p
+        .node("Div", [x, inner_constant])
+        .or_node("Mul", [x, inner_constant])
+        .or_node("Mul", [inner_constant, x])
+        .output();
+    let erf = p.op("Erf", [inner]);
+    let plus_one = p
+        .node("Add", [erf, one])
+        .or_node("Add", [one, erf])
+        .output();
+    let half = p
+        .node("Mul", [x, half_constant])
+        .or_node("Mul", [half_constant, x])
+        .or_node("Div", [x, half_constant])
+        .output();
+    let out = p
+        .node("Mul", [half, plus_one])
+        .or_node("Mul", [plus_one, half])
+        .output();
+    for (name, value) in [
+        ("inner", inner),
+        ("erf", erf),
+        ("plus_one", plus_one),
+        ("half", half),
+        ("out", out),
+    ] {
+        p.capture(name, value);
+    }
+    let pattern = p
+        .finish(out)
+        .expect("built-in GELU recognition must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("GELU", pattern, "erf")
+        .expect("built-in GELU anchor must identify the Erf output")
 });
 
-const SCALE_BODY: &str = "scores=MatMul(q,key);scaled=Mul(scores,c)|Mul(c,scores)|Div(scores,c);";
+fn score_scale(
+    p: &mut PatternBuilder,
+    q: PatternValue,
+    key: PatternValue,
+    c: PatternValue,
+) -> PatternValue {
+    let scores = p.op("MatMul", [q, key]);
+    let scaled = p
+        .node("Mul", [scores, c])
+        .or_node("Mul", [c, scores])
+        .or_node("Div", [scores, c])
+        .output();
+    p.capture("scores", scores);
+    p.capture("scaled", scaled);
+    scaled
+}
 
 static SCORE_SCALE: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort(&format!("(q,key,c)=>{{{SCALE_BODY}return scaled}}"))
-        .expect("built-in score scaling must compile; fix its textual rule")
+    let mut p = Pattern::builder();
+    let [q, key, c] = p.inputs(["q", "key", "c"]);
+    let scaled = score_scale(&mut p, q, key, c);
+    p.finish(scaled)
+        .expect("built-in score scaling must compile; fix its Rust definition")
 });
 
 static TRANSPOSE: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort("(x)=>{out=Transpose(x);return out}")
-        .expect("built-in Transpose recognition must compile; fix its textual rule")
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let out = p.op("Transpose", [x]);
+    p.capture("out", out);
+    p.finish(out)
+        .expect("built-in Transpose recognition must compile; fix its Rust definition")
 });
 
 pub(super) static ATTENTION: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "SDPA",
-        &format!(
-            "(q,k,v,c,mask:value|None)=>{{
-            key=Transpose(k)|k;{SCALE_BODY}
-            masked=Add(scaled,mask)|Add(mask,scaled)|scaled;
-            softmax=Softmax(masked);out=MatMul(softmax,v);return out
-        }}"
-        ),
-        "softmax",
-    )
-    .expect("built-in SDPA recognition must compile; fix its textual rule")
+    let mut p = Pattern::builder();
+    let [q, k, v, c] = p.inputs(["q", "k", "v", "c"]);
+    let mask = p.optional_value("mask");
+    let key = p.node("Transpose", [k]).or_value(k).output();
+    p.capture("key", key);
+    let scaled = score_scale(&mut p, q, key, c);
+    let masked = p
+        .node("Add", [scaled, mask])
+        .or_node("Add", [mask, scaled])
+        .or_value(scaled)
+        .output();
+    let softmax = p.op("Softmax", [masked]);
+    let out = p.op("MatMul", [softmax, v]);
+    for (name, value) in [("masked", masked), ("softmax", softmax), ("out", out)] {
+        p.capture(name, value);
+    }
+    let pattern = p
+        .finish(out)
+        .expect("built-in SDPA recognition must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("SDPA", pattern, "softmax")
+        .expect("built-in SDPA anchor must identify the Softmax output")
 });
 
 fn named_nodes(matched: &Match<'_>, names: &[&str]) -> Result<Vec<NodeId>> {

@@ -10,26 +10,42 @@ use crate::{OptimizerError, Result};
 
 /// Exact shared-input SiLU decomposition, in either multiplication order.
 pub static SILU_DECOMPOSITION: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "SiLU decomposition",
-        "(x) => { sigmoid=Sigmoid(x); out=Mul(x,sigmoid)|Mul(sigmoid,x); return out }",
-        "sigmoid",
-    )
-    .expect("built-in SiLU pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let sigmoid = p.op("Sigmoid", [x]);
+    let out = p
+        .node("Mul", [x, sigmoid])
+        .or_node("Mul", [sigmoid, x])
+        .output();
+    p.capture("sigmoid", sigmoid);
+    p.capture("out", out);
+    let pattern = p
+        .finish(out)
+        .expect("built-in SiLU pattern must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("SiLU decomposition", pattern, "sigmoid")
+        .expect("built-in SiLU anchor must identify the sigmoid output")
 });
 
 /// Quantized projection plus a separate bias; eligibility remains EP-owned.
 pub static MATMUL_NBITS_BIAS: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    RecognitionRule::parse(
-        "MatMulNBits bias",
-        "(args:slots[0:*],bias) => {
-            projection=com.microsoft.MatMulNBits(...args);
-            out=Add(projection,bias)|Add(bias,projection);
-            return out
-        }",
-        "out",
-    )
-    .expect("built-in MatMulNBits bias pattern must compile; fix its textual definition")
+    let mut p = Pattern::builder();
+    let args = p.slot_sequence("args", 0, None);
+    let bias = p.input("bias");
+    let projection = p
+        .node("MatMulNBits", [args])
+        .domain("com.microsoft")
+        .output();
+    let out = p
+        .node("Add", [projection, bias])
+        .or_node("Add", [bias, projection])
+        .output();
+    p.capture("projection", projection);
+    p.capture("out", out);
+    let pattern = p
+        .finish(out)
+        .expect("built-in MatMulNBits bias pattern must compile; fix its Rust definition");
+    RecognitionRule::from_pattern("MatMulNBits bias", pattern, "out")
+        .expect("built-in MatMulNBits bias anchor must identify the Add output")
 });
 
 pub fn capture_value(
@@ -52,7 +68,7 @@ pub fn capture_node(matched: &Match<'_>, name: &str) -> std::result::Result<Node
     })
 }
 
-/// A compile-once native textual rule with an explicit traversal anchor.
+/// A compile-once rule with an explicit traversal anchor.
 ///
 /// The anchor need not be the pattern's last operator. This preserves a
 /// provider's existing rewrite order while the IR engine recognizes the DAG.

@@ -133,6 +133,176 @@ fn builder_qdq_shared_dag_has_text_acceptance_and_capture_parity() {
 }
 
 #[test]
+fn builder_sequences_aliases_and_ordered_alternatives_have_text_parity() {
+    let text = Pattern::parse_native(
+        "(x,slots:slots[0:2])=>{
+            a=vendor.Custom(x,...slots);b=vendor.Custom(a,...slots);
+            choice=a|Neg(a);out=Add(choice,b)|Add(b,choice);return out
+        }",
+    )
+    .unwrap();
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let slots = p.slot_sequence("slots", 0, Some(2));
+    let a = p
+        .node("Custom", [Input::Value(x), Input::Sequence(slots)])
+        .domain("vendor")
+        .output();
+    let b = p
+        .node("Custom", [Input::Value(a), Input::Sequence(slots)])
+        .domain("vendor")
+        .output();
+    let choice = p.alias(a).or_node("Neg", [a]).output();
+    let out = p
+        .node("Add", [choice, b])
+        .or_node("Add", [b, choice])
+        .output();
+    for (name, value) in [("a", a), ("b", b), ("choice", choice), ("out", out)] {
+        p.capture(name, value);
+    }
+    let built = p.finish(out).unwrap();
+    for length in 0..=3 {
+        for absent in [false, true] {
+            for same in [false, true] {
+                for negate in [false, true] {
+                    for swapped in [false, true] {
+                        for domain in ["vendor", ""] {
+                            let mut graph = Graph::new();
+                            graph.opset_imports.insert("vendor".into(), 1);
+                            let x = input(&mut graph, "x");
+                            let other = input(&mut graph, "other");
+                            let slots = vec![if absent { None } else { Some(x) }; length];
+                            let mut first_inputs = vec![Some(x)];
+                            first_inputs.extend_from_slice(&slots);
+                            let (a_node, a) = op(&mut graph, "Custom", &first_inputs, 1);
+                            graph.node_mut(a_node).domain = "vendor".into();
+                            let mut second_inputs = vec![Some(a[0])];
+                            second_inputs.extend_from_slice(&slots);
+                            if !same && length != 0 {
+                                second_inputs[1] = Some(other);
+                            }
+                            let (b_node, b) = op(&mut graph, "Custom", &second_inputs, 1);
+                            graph.node_mut(b_node).domain = domain.into();
+                            let choice = if negate {
+                                op(&mut graph, "Neg", &[Some(a[0])], 1).1[0]
+                            } else {
+                                a[0]
+                            };
+                            let mut inputs = [Some(choice), Some(b[0])];
+                            if swapped {
+                                inputs.swap(0, 1);
+                            }
+                            let (root, outputs) = op(&mut graph, "Add", &inputs, 1);
+                            graph.set_outputs(outputs);
+                            let session = MatchSession::new(&graph).unwrap();
+                            let expected =
+                                session.match_at(&text, root, Default::default()).unwrap();
+                            let actual =
+                                session.match_at(&built, root, Default::default()).unwrap();
+                            assert_eq!(
+                                actual.is_some(),
+                                length <= 2 && (same || length == 0) && domain == "vendor"
+                            );
+                            assert_eq!(actual.is_some(), expected.is_some());
+                            if let (Some(actual), Some(expected)) = (actual, expected) {
+                                assert_eq!(
+                                    actual.selected_alternative(),
+                                    expected.selected_alternative()
+                                );
+                                assert_eq!(
+                                    actual.selected_alternative(),
+                                    usize::from(negate) * 2 + usize::from(swapped)
+                                );
+                                assert_eq!(actual.nodes(), expected.nodes());
+                                assert_eq!(
+                                    actual.sequence("slots").unwrap(),
+                                    expected.sequence("slots").unwrap()
+                                );
+                                for name in ["x", "a", "b", "choice", "out"] {
+                                    assert_eq!(
+                                        actual.value(name).unwrap(),
+                                        expected.value(name).unwrap()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn builder_alternative_attributes_and_domains_stay_branch_local() {
+    let text = Pattern::parse_ort(
+        "(x,alpha:float|None)=>{out=Identity(x)|vendor.LeakyRelu(x,alpha=alpha);return out}",
+    )
+    .unwrap();
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let alpha = p.optional_attribute("alpha", AttributeType::Float);
+    let out = p
+        .node("Identity", [x])
+        .or_node("LeakyRelu", [x])
+        .domain("vendor")
+        .attr("alpha", alpha)
+        .output();
+    p.capture("out", out);
+    let built = p.finish(out).unwrap();
+    for name in ["Identity", "LeakyRelu"] {
+        for domain in ["", "vendor"] {
+            for alpha in [None, Some(Attribute::Float(0.25)), Some(Attribute::Int(1))] {
+                let mut graph = Graph::new();
+                graph.opset_imports.insert("vendor".into(), 1);
+                let x = input(&mut graph, "x");
+                let (root, outputs) = op(&mut graph, name, &[Some(x)], 1);
+                graph.node_mut(root).domain = domain.into();
+                if let Some(alpha) = &alpha {
+                    graph
+                        .node_mut(root)
+                        .attributes
+                        .insert("alpha".into(), alpha.clone());
+                }
+                graph.set_outputs(outputs);
+                let session = MatchSession::new(&graph).unwrap();
+                let expected = session.match_at(&text, root, Default::default()).unwrap();
+                let actual = session.match_at(&built, root, Default::default()).unwrap();
+                assert_eq!(actual.is_some(), expected.is_some());
+                assert_eq!(
+                    actual.is_some(),
+                    (name == "Identity" && domain.is_empty())
+                        || (name == "LeakyRelu"
+                            && domain == "vendor"
+                            && !matches!(alpha, Some(Attribute::Int(_))))
+                );
+                if let (Some(actual), Some(expected)) = (actual, expected) {
+                    assert_eq!(
+                        actual.selected_alternative(),
+                        expected.selected_alternative()
+                    );
+                    if name == "Identity" {
+                        assert_eq!(
+                            actual.attribute("alpha").unwrap_err().kind,
+                            PatternErrorKind::InvalidCapture
+                        );
+                        assert_eq!(
+                            expected.attribute("alpha").unwrap_err().kind,
+                            PatternErrorKind::InvalidCapture
+                        );
+                    } else {
+                        assert_eq!(
+                            actual.attribute("alpha").unwrap().map(std::ptr::from_ref),
+                            expected.attribute("alpha").unwrap().map(std::ptr::from_ref)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn builder_explicit_slots_and_multioutputs_preserve_order_and_identity() {
     for repeated in [false, true] {
         let text = Pattern::parse_ort(if repeated {
@@ -552,6 +722,30 @@ fn builder_diagnoses_foreign_handles_duplicates_scopes_and_invalid_definitions()
     let mut p = Pattern::builder();
     let x = p.input("x");
     return_builder_error(p.finish(x), "no anchor");
+
+    let foreign_slots = other.slot_sequence("foreign_slots", 0, None);
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let out = p
+        .node("Identity", [x])
+        .or_node("Custom", [Input::Value(x), Input::Sequence(foreign_slots)])
+        .output();
+    return_builder_error(p.finish(out), "operator \"Custom\" input 1");
+
+    let mut p = Pattern::builder();
+    let slots = p.slot_sequence("bad", 3, Some(2));
+    let out = p.op("Custom", [slots]);
+    return_builder_error(p.finish(out), "maximum 2 below minimum 3");
+
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let out = p.alias(x).domain("vendor").output();
+    return_builder_error(p.finish(out), "value alternative has no operator domain");
+
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let out = p.alias(x).attr("axis", 1_i64).output();
+    return_builder_error(p.finish(out), "value alternative has no attributes");
 }
 
 fn return_builder_error(result: Result<Pattern, PatternError>, expected: &str) {
@@ -586,6 +780,22 @@ fn builder_checks_empty_returns_unused_inputs_and_shared_compiler_limits() {
     assert_eq!(error.kind, PatternErrorKind::BudgetExceeded);
     assert!(error.message.contains("64 plans/nodes"), "{error}");
 
+    for count in [64, 65] {
+        let mut p = Pattern::builder();
+        let x = p.input("x");
+        let mut node = p.node("Identity", [x]);
+        for _ in 1..count {
+            node = node.or_node("Identity", [x]);
+        }
+        let out = node.output();
+        let result = p.finish(out);
+        if count == 64 {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result.unwrap_err().kind, PatternErrorKind::BudgetExceeded);
+        }
+    }
+
     let mut p = Pattern::builder();
     let x = p.input("x");
     let mut body = p.finish_body([x]).unwrap();
@@ -610,29 +820,35 @@ fn native_optional_values_do_not_require_tensor_metadata() {
         Pattern::parse_ort(source).unwrap_err().kind,
         PatternErrorKind::Unsupported
     );
-    let pattern = Pattern::parse_native(source).unwrap();
-    let mut graph = Graph::new();
-    let x = graph.create_value(DataType::Undefined, vec![]);
-    graph.add_input(x);
-    let (root, output) = op(&mut graph, "Maybe", &[Some(x)], 1);
-    graph.add_output(output[0]);
-    assert!(!graph.value_type_is_known(x));
-    let matched = MatchSession::new(&graph)
-        .unwrap()
-        .match_at(&pattern, root, MatchOptions::default())
-        .unwrap()
-        .unwrap();
-    assert_eq!(matched.value("x").unwrap().unwrap().id(), x);
-    for inputs in [vec![None], vec![]] {
-        let mut node = graph.node(root).clone();
-        node.inputs = inputs;
-        graph.replace_node(root, node);
+    let text = Pattern::parse_native(source).unwrap();
+    let mut p = Pattern::builder();
+    let x = p.optional_value("x");
+    let out = p.op("Maybe", [x]);
+    let built = p.finish(out).unwrap();
+    for pattern in [&text, &built] {
+        let mut graph = Graph::new();
+        let x = graph.create_value(DataType::Undefined, vec![]);
+        graph.add_input(x);
+        let (root, output) = op(&mut graph, "Maybe", &[Some(x)], 1);
+        graph.add_output(output[0]);
+        assert!(!graph.value_type_is_known(x));
         let matched = MatchSession::new(&graph)
             .unwrap()
-            .match_at(&pattern, root, MatchOptions::default())
+            .match_at(pattern, root, MatchOptions::default())
             .unwrap()
             .unwrap();
-        assert!(matched.value("x").unwrap().is_none());
+        assert_eq!(matched.value("x").unwrap().unwrap().id(), x);
+        for inputs in [vec![None], vec![]] {
+            let mut node = graph.node(root).clone();
+            node.inputs = inputs;
+            graph.replace_node(root, node);
+            let matched = MatchSession::new(&graph)
+                .unwrap()
+                .match_at(pattern, root, MatchOptions::default())
+                .unwrap()
+                .unwrap();
+            assert!(matched.value("x").unwrap().is_none());
+        }
     }
     for invalid in [
         "(x:value[2])=>return Maybe(x)",
