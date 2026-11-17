@@ -58,10 +58,9 @@ jobs:
           - name: Windows AMD64
             os: windows-latest
             archs: AMD64
-          # macOS is Apple Silicon (arm64) ONLY, mirroring wheels.yml. macos-14
-          # is the GitHub-hosted Apple Silicon runner.
+          # macOS is Apple Silicon (arm64) ONLY, mirroring wheels.yml.
           - name: macOS arm64
-            os: macos-14
+            os: macos-15
             archs: arm64
           # Windows on ARM64: windows-11-arm is the GitHub-hosted Windows 11
           # ARM64 runner. Official CPython has NO win_arm64 build for 3.10

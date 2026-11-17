@@ -40,9 +40,9 @@ jobs:
           # an Intel-macOS ONNX Runtime; a job that can never pass just trains
           # everyone to ignore a red pipeline.
           # See .squad/decisions.md and crates/onnx-runtime-python/README.md.
-          # macos-14 is the GitHub-hosted Apple Silicon runner.
+          # macos-15 is the oldest supported GitHub-hosted Apple Silicon runner.
           - name: macOS arm64
-            os: macos-14
+            os: macos-15
             archs: arm64
     runs-on: ${{ matrix.os }}
     env:

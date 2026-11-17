@@ -257,7 +257,7 @@ jobs:
             os: windows-latest
             archs: AMD64
           - name: macOS arm64
-            os: macos-14
+            os: macos-15
             archs: arm64
     runs-on: ${{ matrix.os }}
     env:
@@ -392,7 +392,7 @@ jobs:
           # ONNX Runtime 1.27 publishes no osx-x86_64 native archive (ort-sys
           # 404s) and MLX is Apple-Silicon only, so we build just arm64.
           - name: macOS arm64
-            os: macos-14
+            os: macos-15
             archs: arm64
             cuda: false
         include:
