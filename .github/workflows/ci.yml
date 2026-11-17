@@ -1302,6 +1302,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
+      # Keep compile/list coverage without full variable debug data or
+      # incremental state filling the hosted runner's disk.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_TEST_DEBUG: "1"
 
     steps:
       - uses: actions/checkout@v5
@@ -1337,9 +1342,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-${{ github.job }}-bounded-debug-v1-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-${{ github.job }}-bounded-debug-v1-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
 
       # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit.
       # The CUDA integration tests are compiled and reported as ignored unless
@@ -1490,6 +1495,9 @@ jobs:
     runs-on: windows-latest
     env:
       CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_TEST_DEBUG: "1"
 
     steps:
       - uses: actions/checkout@v5
@@ -1525,9 +1533,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-${{ github.job }}-bounded-debug-v1-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-${{ github.job }}-bounded-debug-v1-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
 
       # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit,
       # but ep-cuda tests require a CUDA runtime/GPU and must not join the
