@@ -24,6 +24,7 @@
 //! | Graph operations | [`Node`], [`NodeId`], [`Attribute`] |
 //! | Constant / weight storage | [`TensorData`], [`SparseTensorData`], [`WeightRef`] |
 //! | The graph itself | [`Graph`] |
+//! | Shared ONNX protobuf schema | [`onnx`], [`ONNX_FILE_DESCRIPTOR_SET`] |
 //! | Errors | [`IrError`], [`GraphError`] |
 //!
 //! ## Design guarantees
@@ -55,6 +56,11 @@ mod graph;
 mod graph_view;
 mod layout;
 mod node;
+pub mod onnx;
+
+/// Descriptor for the same vendored schema that defines [`onnx`].
+pub const ONNX_FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/onnx_descriptor.bin"));
 mod scan_inline;
 mod shape;
 mod tensor;

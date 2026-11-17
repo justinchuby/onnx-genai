@@ -392,7 +392,7 @@ def run_case(
     try:
         with np.errstate(all="ignore"), warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            reference = ReferenceEvaluator(model, optimized=False).run(None, {})
+            reference = ReferenceEvaluator(model).run(None, {})
     except Exception as err:
         return Result(op, source, "ERROR", f"reference failed: {err}")
 

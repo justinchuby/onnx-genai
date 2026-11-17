@@ -49,8 +49,8 @@ session, eager, and EP API:
 The IR/protobuf layer is ahead of execution:
 
 - ONNX specifies `string_data` elements as UTF-8, without NUL termination or BOM
-  (`crates/onnx-runtime-loader/proto/onnx.proto3:711-716`), and forbids storing strings in
-  `raw_data` (`crates/onnx-runtime-loader/proto/onnx.proto3:728-733`).
+  (`crates/onnx-runtime-ir/proto/onnx.proto3:711-716`), and forbids storing strings in
+  `raw_data` (`crates/onnx-runtime-ir/proto/onnx.proto3:728-733`).
 - Loader import fills `TensorData::strings`, but currently uses lossy UTF-8 conversion
   (`crates/onnx-runtime-loader/src/weights.rs:715-733`).
 - Encoder export correctly selects `string_data` instead of `raw_data`

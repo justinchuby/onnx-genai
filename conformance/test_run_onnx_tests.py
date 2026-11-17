@@ -103,5 +103,32 @@ class ExitCodeTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 1)
 
 
+class RunCaseTests(unittest.TestCase):
+    def test_current_reference_evaluator_reaches_output_comparison(self) -> None:
+        import numpy as np
+
+        model = run_onnx_tests.manual_model("Constant")
+
+        def run_native(command: list[str], **_kwargs) -> SimpleNamespace:
+            run_onnx_tests.write_tensor(
+                Path(command[2]) / "output_0.nxrt",
+                np.array([1.25, -2.5], dtype=np.float32),
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with (
+            tempfile.TemporaryDirectory() as work_dir,
+            patch.object(
+                run_onnx_tests.subprocess, "run", side_effect=run_native
+            ) as native,
+        ):
+            actual = run_onnx_tests.run_case(
+                "Constant", "test", model, Path("synthetic-runner"), Path(work_dir)
+            )
+
+        self.assertEqual(actual.status, "PASS", actual.detail)
+        native.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
