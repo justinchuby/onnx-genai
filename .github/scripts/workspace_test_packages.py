@@ -108,14 +108,8 @@ WORKFLOW_JOB_INVENTORY: dict[str, tuple[str, ...]] = {
     "squad-docs.yml": (
         "build",
     ),
-    "squad-heartbeat.yml": (
-        "heartbeat",
-    ),
     "squad-insider-release.yml": (
         "release",
-    ),
-    "squad-issue-assign.yml": (
-        "assign-work",
     ),
     "squad-label-enforce.yml": (
         "enforce",
@@ -129,12 +123,6 @@ WORKFLOW_JOB_INVENTORY: dict[str, tuple[str, ...]] = {
     ),
     "squad-release.yml": (
         "release",
-    ),
-    "squad-triage.yml": (
-        "triage",
-    ),
-    "sync-squad-labels.yml": (
-        "sync-labels",
     ),
     "visualizer-test.yml": (
         "Node security and leaf-accounting tests",
@@ -198,7 +186,6 @@ PR_TRIGGERED_WORKFLOWS: dict[str, frozenset[str]] = {
     "hostlock.yml": frozenset(),
     "miri.yml": frozenset(),
     "squad-ci.yml": frozenset(),
-    "squad-heartbeat.yml": frozenset(),
     "visualizer-test.yml": frozenset(),
     "weight-cache-guard.yml": frozenset(),
     "wiki-lint.yml": frozenset(),
