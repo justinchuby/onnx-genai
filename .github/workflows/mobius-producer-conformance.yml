@@ -21,10 +21,10 @@ jobs:
     # producer-side failures that must be fixed upstream in Mobius.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: onnxruntime/mobius
           # Intentionally track the Mobius default branch. This
@@ -35,7 +35,7 @@ jobs:
           # `main` is deliberate and is not a reproducibility bug.
           ref: main
           path: validation/mobius
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install Mobius dependencies

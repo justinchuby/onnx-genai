@@ -41,7 +41,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # Keep audit on Rust stable deliberately: this follows Rust's stability promise
       # without freezing security fixes.
       - name: Install Rust stable toolchain

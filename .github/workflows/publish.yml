@@ -43,7 +43,7 @@ jobs:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # Keep release publishing on Rust stable deliberately: this follows Rust's
@@ -220,10 +220,10 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.10'
       # Keep release publishing on Rust stable deliberately: this follows Rust's
@@ -268,10 +268,10 @@ jobs:
         -w {dest_dir} -v {wheel}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
       - name: Install Rust stable toolchain
@@ -291,12 +291,12 @@ jobs:
           done
           exit 1
       - name: Build and smoke-test nxrt CPU wheel
-        uses: pypa/cibuildwheel@v4.1.0
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           package-dir: crates/onnx-runtime-python
           output-dir: wheelhouse
       - name: Upload nxrt CPU wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nxrt-wheels-${{ matrix.os }}-${{ matrix.archs }}
           path: wheelhouse/*.whl
@@ -314,7 +314,7 @@ jobs:
 
     steps:
       - name: Download nxrt CPU wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: nxrt-wheels-*
           path: wheelhouse
@@ -335,10 +335,10 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       # Keep release publishing on Rust stable deliberately: this follows Rust's
@@ -418,10 +418,10 @@ jobs:
       CIBW_TEST_SKIP: "*-macosx_* *-win_arm64"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       # Keep release publishing on Rust stable deliberately: this follows Rust's
@@ -450,13 +450,13 @@ jobs:
           fi
 
       - name: Build and smoke-test wheel
-        uses: pypa/cibuildwheel@v4.1.0
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           package-dir: ${{ matrix.package_dir }}
           output-dir: wheelhouse
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: onnx-genai-wheels-${{ matrix.package }}-${{ matrix.platform.os }}-${{ matrix.platform.archs }}
           path: wheelhouse/*.whl
@@ -474,7 +474,7 @@ jobs:
 
     steps:
       - name: Download onnx-genai wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: onnx-genai-wheels-*
           path: dist

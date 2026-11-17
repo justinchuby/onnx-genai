@@ -89,10 +89,10 @@ jobs:
         -w {dest_dir} -v {wheel}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # 3.10 has no win_arm64 build; the ARM64 row pins 3.11 via the matrix.
           python-version: ${{ matrix.python_version || '3.10' }}
@@ -119,13 +119,13 @@ jobs:
           exit 1
 
       - name: Build and smoke-test nxrt-ep-cpu wheel
-        uses: pypa/cibuildwheel@v4.1.0
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           package-dir: python/nxrt-ep-cpu
           output-dir: wheelhouse
 
       - name: Upload nxrt-ep-cpu wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nxrt-ep-cpu-${{ matrix.os }}-${{ matrix.archs }}
           path: wheelhouse/*.whl
@@ -146,7 +146,7 @@ jobs:
 
     steps:
       - name: Download nxrt-ep-cpu wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: nxrt-ep-cpu-*
           path: wheelhouse
@@ -210,10 +210,10 @@ jobs:
         -w {dest_dir} {wheel}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
       # Keep wheel publishing on Rust stable deliberately: this follows Rust's
@@ -240,13 +240,13 @@ jobs:
       # promotion still requires CUDA-enabled runners to validate the driver and
       # the nvidia-*-cu13 dependency set end to end (issue #768).
       - name: Build and import-test nxrt-ep-cuda wheel
-        uses: pypa/cibuildwheel@v4.1.0
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           package-dir: python/nxrt-ep-cuda
           output-dir: wheelhouse
 
       - name: Upload nxrt-ep-cuda wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nxrt-ep-cuda-${{ matrix.os }}-${{ matrix.archs }}
           path: wheelhouse/*.whl
@@ -268,7 +268,7 @@ jobs:
 
     steps:
       - name: Download nxrt-ep-cuda wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: nxrt-ep-cuda-*
           path: wheelhouse
