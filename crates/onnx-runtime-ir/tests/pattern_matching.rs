@@ -1052,6 +1052,40 @@ fn invalid_ir_diagnostics_and_budgets_are_not_nonmatches() {
     assert!(library("pattern A(x){y=B(x);return y} pattern B(x){y=A(x);return y}").is_err());
 }
 
+// Fuzz regressions (crates/onnx-runtime-ir/fuzz): each input once panicked or
+// overflowed the stack instead of returning a diagnostic.
+#[test]
+fn malformed_sources_return_diagnostics_with_char_aligned_spans() {
+    let deep_list = format!(
+        "(x)=>return Clip(x,{}{})",
+        "[".repeat(30_000),
+        "]".repeat(30_000)
+    );
+    let cases = [
+        (
+            "(x:fl\u{FFFD}oat)=>return Identity(x)",
+            PatternErrorKind::Syntax,
+        ),
+        (
+            "(x:tensor[\"\"])=>return Identity(x)",
+            PatternErrorKind::Unsupported,
+        ),
+        ("(x)=>return Clip(x,[\"\"])", PatternErrorKind::Unsupported),
+        ("(x)=>return Clip(x,[[1]])", PatternErrorKind::Unsupported),
+        (deep_list.as_str(), PatternErrorKind::Unsupported),
+    ];
+    for (source, kind) in cases {
+        for error in [
+            Pattern::parse_ort(source).unwrap_err(),
+            Pattern::parse_native(source).unwrap_err(),
+        ] {
+            assert_eq!(error.kind, kind, "{source:.80}: {error}");
+            let span = error.span.start..error.span.end;
+            assert!(source.get(span).is_some(), "{source:.80}: {error}");
+        }
+    }
+}
+
 #[test]
 fn native_sequences_preserve_order_absence_bounds_and_repeated_identity() {
     let pattern = Pattern::parse_native(

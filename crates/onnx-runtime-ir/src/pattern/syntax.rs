@@ -211,9 +211,10 @@ impl Parser {
                 i += 1;
                 source[start..i].into()
             } else {
+                let width = source[start..].chars().next().map_or(1, char::len_utf8);
                 return Err(fail(
                     start,
-                    start + 1,
+                    start + width,
                     "unexpected character; use the supported ORT pattern dialect",
                 ));
             };
@@ -422,10 +423,9 @@ impl Parser {
                     }
                     let dimension = if self.take("_") {
                         Dimension::Any
-                    } else if self
-                        .peek()
-                        .is_some_and(|t| t.as_bytes()[0].is_ascii_digit())
-                    {
+                    } else if self.tokens.get(self.position).is_some_and(|t| {
+                        !t.string && t.text.starts_with(|c: char| c.is_ascii_digit())
+                    }) {
                         let number = self.peek().unwrap().parse().map_err(|_| {
                             self.error(
                                 PatternErrorKind::Syntax,
@@ -632,10 +632,9 @@ impl Parser {
             });
         }
         if self.peek() == Some("[")
-            && self
-                .tokens
-                .get(self.position + 1)
-                .is_some_and(|token| token.text.as_bytes()[0].is_ascii_alphabetic())
+            && self.tokens.get(self.position + 1).is_some_and(|token| {
+                !token.string && token.text.starts_with(|c: char| c.is_ascii_alphabetic())
+            })
         {
             if !self.native {
                 return Err(self.error(
@@ -767,6 +766,10 @@ impl Parser {
             let mut values = Vec::new();
             if !self.take("]") {
                 loop {
+                    if self.peek() == Some("[") && !self.tokens[self.position].string {
+                        return Err(self.error(PatternErrorKind::Unsupported,
+                            "literal lists must be flat and uniformly int64 or float32; use a predicate for other tensors"));
+                    }
                     values.push(self.literal()?);
                     if self.take("]") {
                         break;
