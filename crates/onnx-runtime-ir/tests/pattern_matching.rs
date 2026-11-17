@@ -2087,6 +2087,84 @@ fn parser_expansion_and_search_limits_are_explicit() {
 }
 
 #[test]
+fn documented_parser_limits_accept_the_boundary_and_reject_one_past_it() {
+    fn budget(result: Result<(), PatternError>, message: &str) {
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, PatternErrorKind::BudgetExceeded, "{error}");
+        assert!(error.message.contains(message), "{error}");
+    }
+    fn syntax(result: Result<Pattern, PatternError>, message: &str) {
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, PatternErrorKind::Syntax, "{error}");
+        assert!(error.message.contains(message), "{error}");
+    }
+    let inline = |source: &str| Pattern::parse_ort(source).map(|_| ());
+    let lib = |source: &str| library(source).map(|_| ());
+
+    // 1 MiB of source, padded by a comment so only the byte length varies;
+    // the oversized source is rejected before it is tokenized.
+    let mut source = "(x)=>return Identity(x)\n#".to_string();
+    source.push_str(&"a".repeat((1 << 20) - source.len()));
+    Pattern::parse_ort(&source).unwrap();
+    source.push('a');
+    let error = Pattern::parse_ort(&source).unwrap_err();
+    assert_eq!((error.span.start, error.span.end), (0, source.len()));
+    syntax(Err(error), "exceeds 1 MiB");
+
+    // 65,536 tokens: 11 structural tokens plus skipped empty statements.
+    let tokens = |n: usize| format!("(x)=>{{{}return Identity(x)}}", ";".repeat(n - 11));
+    Pattern::parse_ort(&tokens(65_536)).unwrap();
+    syntax(Pattern::parse_ort(&tokens(65_537)), "exceeds 65536 tokens");
+
+    let nested = |n: usize| format!("(x)=>return {}Identity(x){}", "(".repeat(n), ")".repeat(n));
+    // The call's own parentheses are the 64th level.
+    inline(&nested(62)).unwrap();
+    budget(inline(&nested(63)), "expression nesting reaches 64");
+
+    let alternatives = |n: usize| format!("(x)=>return {}", vec!["Identity(x)"; n].join("|"));
+    inline(&alternatives(64)).unwrap();
+    budget(inline(&alternatives(65)), "more than 64 alternatives");
+
+    // 256 aliases parse but exceed 256 compiled values (x plus 256 names).
+    let statements = |n: usize| {
+        let aliases: String = (0..n).map(|i| format!("a{i}=x;")).collect();
+        format!("(x)=>{{{aliases}return Identity(x)}}")
+    };
+    inline(&statements(255)).unwrap();
+    budget(inline(&statements(256)), "256 values");
+    budget(inline(&statements(257)), "more than 256 statements");
+
+    let union = |n: usize| {
+        let shapes: Vec<_> = (0..n).map(|i| format!("tensor[{i}]")).collect();
+        format!("(x:{})=>return Identity(x)", shapes.join("|"))
+    };
+    inline(&union(64)).unwrap();
+    budget(inline(&union(65)), "64 alternatives");
+
+    let rank = |n: usize| format!("(x:tensor[{}])=>return Identity(x)", vec!["1"; n].join(","));
+    inline(&rank(64)).unwrap();
+    budget(inline(&rank(65)), "64 dimensions");
+
+    let definitions = |n: usize| -> String {
+        (0..n)
+            .map(|i| format!("pattern P{i}(x){{return Identity(x)}}"))
+            .collect()
+    };
+    lib(&definitions(256)).unwrap();
+    budget(lib(&definitions(257)), "256 definitions");
+
+    let chain = |n: usize| {
+        let mut source = "pattern P0(x){return Identity(x)}".to_string();
+        for i in 1..n {
+            source.push_str(&format!("pattern P{i}(x){{return P{}(x)}}", i - 1));
+        }
+        source
+    };
+    lib(&chain(32)).unwrap();
+    budget(lib(&chain(33)), "factor or simplify");
+}
+
+#[test]
 fn whole_graph_extra_header_inputs_bind_structural_leaves_like_ort() {
     let pattern = library("pattern Body(x,w){return Add(x,w)}")
         .unwrap()
