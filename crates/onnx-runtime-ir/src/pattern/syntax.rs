@@ -55,6 +55,7 @@ pub(super) enum ExprKind {
     Alternatives(Vec<Expr>),
     Spread(String),
     GraphList(Vec<String>),
+    Graph(Pattern),
     AnonymousCall(Vec<String>, Vec<Expr>),
 }
 

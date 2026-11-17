@@ -5,6 +5,103 @@ once, resolves named definitions to immutable plans, and matches an unchanged
 `Graph` through a prepared `MatchSession`. There is no rewriting, partition
 selection, constant folding, kernel dispatch, or C++/Python dependency.
 
+## Typed Rust builder
+
+The ordinary Rust builder authors the same immutable plans without generating
+or reparsing text. It shares the text compiler's SSA, connectivity, arity,
+annotation and graph-body validation, capture API and matcher:
+
+```rust,ignore
+let mut p = Pattern::builder();
+let [x, w, scale] = p.inputs(["x", "w", "scale"]);
+let weight = p.op("DequantizeLinear", [w, scale]);
+let y = p.op("MatMul", [x, weight]);
+let pattern = p.finish(y)?;
+```
+
+Defaults are the standard ONNX domain, one output and exact ordered inputs.
+Input names are already captures: `pattern.value_capture("w")?` and
+`matched.value("w")?` work normally. Intermediate names are internal; name only
+those you need with `p.capture("weight", weight)` (before or after their uses).
+This also names the operator instance for nested `instance("name.body")` access.
+Each binding can be explicitly named once; duplicate names across value and
+attribute kinds are errors, not overwrites. With multiple outputs, the first
+output's name names the operator instance.
+
+Uncommon constraints stay explicit:
+
+```rust,ignore
+let mut p = Pattern::builder();
+let x = p.input("x");
+let axis = p.optional_attribute("axis", AttributeType::Int);
+let [left, right] = p.node("Split", [x])
+    .domain("vendor")
+    .attr("axis", axis)
+    .attr("sizes", vec![16_i64, 16])
+    .outputs();
+let y = p.op("Add", [left, right]);
+let pattern = p.finish(y)?;
+```
+
+Attribute literals support `i64`, `f32`, `&str`, `Vec<i64>` and `Vec<f32>`;
+`AttributeValue::String` accepts raw bytes. Typed attribute captures support
+integer/float/string scalars and lists, and tensors. `attribute` requires
+presence; `optional_attribute` also admits absence. Reusing the same handle
+requires equal presence/content, just as reusing a text capture does.
+
+`optional_input("zero")` declares `tensor[...] | None`. To demand an absent
+slot, use `None::<PatternValue>` in an `Option<PatternValue>` input array, for
+example `p.op("Clip", [Some(x), None, None])`. Heterogeneous explicit slots use
+`Input::{Value, Absent, Any}`; every `Any` occurrence is a fresh **present**
+wildcard. Repeated value handles require exact scoped SSA identity, not merely
+matching producers; output positions remain distinct. `finish_outputs([a, b])`
+sets exact ordered returns. Arity is structural, not ONNX schema validation:
+the declared operator signatures must match the graph exactly.
+
+Build control-flow bodies in independent builders. Finished bodies are immutable
+and reusable; each attribute matches in its own scope:
+
+```rust,ignore
+let mut branch = Pattern::builder();
+let x = branch.input("x");
+let y = branch.op("Identity", [x]);
+let branch = branch.finish_body([y])?;
+
+let mut p = Pattern::builder();
+let c = p.input("condition");
+let y = p.node("If", [c])
+    .attr("then_branch", branch.clone())
+    .attr("else_branch", branch)
+    .output();
+p.capture("selected", y);
+let pattern = p.finish(y)?;
+```
+
+`finish` requires a connected operator entry with distinct produced returns.
+`finish_body` instead uses whole-graph semantics, allowing unused positional
+formals, input passthrough and duplicate returns (for example a Loop body's
+`[cond, state]`). All body work must still reach a return, and matching covers
+the complete body. Outer handles cannot be used inside a body builder: declare
+local structural leaves, then use `resolve_input` to inspect lexical provenance
+as described below. Body handles cannot be used as tensors or attribute captures.
+
+Construction methods collect errors so the common path needs only one `?`.
+`finish`/`finish_body` report foreign handles, wrong scopes, invalid names,
+duplicates, unfinished nodes and construction context together before compiling.
+Compiler validation failures retain their category and remedy, prefixed with
+`pattern builder`. Builder diagnostics use a zero byte span because there is no
+source text. A node must be completed with `output()` or `outputs()`; dropping
+one records an error rather than losing its constraints. No constructor panics
+on invalid pattern definitions. Graph nesting is bounded at 32 levels.
+
+The builder intentionally covers structural operators, optional slots, attributes,
+multiple outputs and GRAPH bodies, not another spelling for every text feature.
+Use text for named calls/alternatives, tensor annotations/literals, variadics
+and GRAPHS lists, absent output slots, or a read-only predicate for semantic
+eligibility. Zero-input operators need an explicitly typed empty input array,
+for example `p.op("RandomNormal", [] as [PatternValue; 0])`. Neither
+authoring path infers schema defaults or changes the matching backend.
+
 ## Text and interoperability
 
 ONNX defines an [experimental textual model/function grammar][onnx-text].

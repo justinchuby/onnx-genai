@@ -20,10 +20,15 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod builder;
 mod compile;
 mod execute;
 mod syntax;
 
+pub use builder::{
+    AttributeType, AttributeValue, Body, Input, NodeBuilder, PatternAttribute, PatternBuilder,
+    PatternValue,
+};
 pub use execute::{
     AttributeCapture, BindingView, BoundaryPolicy, DimensionValue, Match, MatchBudget,
     MatchOptions, MatchSession, ScopedValue, ValueCapture,
@@ -92,6 +97,11 @@ pub struct Pattern {
 }
 
 impl Pattern {
+    /// Author a pattern with typed Rust handles and the same compiler as text.
+    pub fn builder() -> PatternBuilder {
+        PatternBuilder::new()
+    }
+
     /// Parse an anonymous ORT pattern `(inputs) => { ... return outputs }`.
     /// Unsupported syntax is rejected, never interpreted as an ONNX model.
     pub fn parse_ort(source: &str) -> Result<Self> {

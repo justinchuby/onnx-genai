@@ -1,6 +1,6 @@
 use onnx_runtime_ir::pattern::{
-    BoundaryPolicy, DimensionValue, MatchBudget, MatchOptions, MatchSession, Pattern, PatternError,
-    PatternErrorKind, PatternLibrary,
+    AttributeType, BoundaryPolicy, DimensionValue, Input, MatchBudget, MatchOptions, MatchSession,
+    Pattern, PatternError, PatternErrorKind, PatternLibrary,
 };
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, SparseTensorData, TensorData, ValueId, WeightRef,
@@ -57,6 +57,550 @@ fn registered(domain: &str, op: &str) -> bool {
 
 fn library(source: &str) -> Result<PatternLibrary, PatternError> {
     PatternLibrary::parse_ort(source, &registered)
+}
+
+#[test]
+fn builder_qdq_shared_dag_has_text_acceptance_and_capture_parity() {
+    let text = Pattern::parse_ort(
+        "(x,packed,scale,zero:tensor[...]|None)=>{
+            weights=DequantizeLinear(packed,scale,zero)
+            a=MatMul(x,weights);b=MatMul(x,weights);return Add(a,b)
+        }",
+    )
+    .unwrap();
+    let mut p = Pattern::builder();
+    let [x, packed, scale] = p.inputs(["x", "packed", "scale"]);
+    let zero = p.optional_input("zero");
+    let weights = p.op("DequantizeLinear", [packed, scale, zero]);
+    let a = p.op("MatMul", [x, weights]);
+    let b = p.op("MatMul", [x, weights]);
+    let y = p.op("Add", [a, b]);
+    // Naming after uses must preserve both SSA identity and normal capture access.
+    p.capture("weights", weights);
+    let built = p.finish(y).unwrap();
+    let key = built.value_capture("weights").unwrap();
+    for slots in 0..4 {
+        for shared_weight in [false, true] {
+            for shared_operator in [false, true] {
+                let mut graph = Graph::new();
+                let x = input(&mut graph, "x");
+                let packed = input(&mut graph, "packed");
+                let scale = input(&mut graph, "scale");
+                let zero = input(&mut graph, "zero");
+                let mut inputs = vec![Some(packed), Some(scale)];
+                match slots {
+                    0 => {}
+                    1 => inputs.push(None),
+                    2 => inputs.push(Some(zero)),
+                    _ => inputs.extend([Some(zero), Some(scale)]),
+                }
+                let (_, weights) = op(&mut graph, "DequantizeLinear", &inputs, 1);
+                let (_, a) = op(&mut graph, "MatMul", &[Some(x), Some(weights[0])], 1);
+                let b = if shared_operator {
+                    a[0]
+                } else {
+                    op(
+                        &mut graph,
+                        "MatMul",
+                        &[
+                            Some(x),
+                            Some(if shared_weight { weights[0] } else { packed }),
+                        ],
+                        1,
+                    )
+                    .1[0]
+                };
+                let (root, outputs) = op(&mut graph, "Add", &[Some(a[0]), Some(b)], 1);
+                graph.set_outputs(outputs);
+                let session = MatchSession::new(&graph).unwrap();
+                let expected = session.match_at(&text, root, Default::default()).unwrap();
+                let actual = session.match_at(&built, root, Default::default()).unwrap();
+                assert_eq!(actual.is_some(), expected.is_some());
+                assert_eq!(
+                    actual.is_some(),
+                    slots < 3 && shared_weight && !shared_operator
+                );
+                if let (Some(actual), Some(expected)) = (actual, expected) {
+                    assert_eq!(actual.nodes(), expected.nodes());
+                    for name in ["x", "packed", "scale", "zero", "weights"] {
+                        assert_eq!(actual.value(name).unwrap(), expected.value(name).unwrap());
+                    }
+                    assert_eq!(actual.captured(&key).unwrap().unwrap().id(), weights[0]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn builder_explicit_slots_and_multioutputs_preserve_order_and_identity() {
+    for repeated in [false, true] {
+        let text = Pattern::parse_ort(if repeated {
+            "(x)=>{a,b=Split(x);return Add(a,a)}"
+        } else {
+            "(x)=>{a,b=Split(x);return Add(a,b)}"
+        })
+        .unwrap();
+        let mut p = Pattern::builder();
+        let x = p.input("x");
+        let [a, b] = p.node("Split", [x]).outputs();
+        p.capture("a", a);
+        p.capture("b", b);
+        let y = p.op("Add", [a, if repeated { a } else { b }]);
+        let built = p.finish(y).unwrap();
+        for order in [[0, 0], [0, 1], [1, 0], [1, 1]] {
+            let mut graph = Graph::new();
+            let x = input(&mut graph, "x");
+            let (_, values) = op(&mut graph, "Split", &[Some(x)], 2);
+            let (root, outputs) = op(&mut graph, "Add", &order.map(|i| Some(values[i])), 1);
+            graph.set_outputs(outputs);
+            let session = MatchSession::new(&graph).unwrap();
+            let actual = session.match_at(&built, root, Default::default()).unwrap();
+            let expected = session.match_at(&text, root, Default::default()).unwrap();
+            assert_eq!(actual.is_some(), expected.is_some(), "{order:?}");
+            assert_eq!(
+                actual.is_some(),
+                order == if repeated { [0, 0] } else { [0, 1] }
+            );
+            if let Some(actual) = actual {
+                assert_eq!(actual.value("a").unwrap().unwrap().id(), values[0]);
+                assert_eq!(actual.value("b").unwrap().unwrap().id(), values[1]);
+            }
+        }
+    }
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let [a, b] = p.node("Split", [x]).outputs();
+    let built = p.finish_outputs([b, a]).unwrap();
+    let text = Pattern::parse_ort("(x)=>{a,b=Split(x);return b,a}").unwrap();
+    for count in 1..=3 {
+        for reverse in [false, true] {
+            let mut graph = Graph::new();
+            let x = input(&mut graph, "x");
+            let (root, mut outputs) = op(&mut graph, "Split", &[Some(x)], count);
+            if reverse {
+                outputs.reverse();
+            }
+            graph.set_outputs(outputs);
+            let session = MatchSession::new(&graph).unwrap();
+            assert_eq!(
+                session
+                    .match_at(&built, root, Default::default())
+                    .unwrap()
+                    .is_some(),
+                count == 2
+            );
+            let actual = session.match_graph(&built, Default::default()).unwrap();
+            let expected = session.match_graph(&text, Default::default()).unwrap();
+            assert_eq!(actual.is_some(), expected.is_some());
+            assert_eq!(actual.is_some(), count == 2 && reverse);
+        }
+    }
+    for wildcard in [false, true] {
+        let text = Pattern::parse_ort(if wildcard {
+            "(x)=>return Clip(x,_,None)"
+        } else {
+            "(x)=>return Clip(x,None,None)"
+        })
+        .unwrap();
+        let mut p = Pattern::builder();
+        let x = p.input("x");
+        let y = p.op(
+            "Clip",
+            [
+                Input::Value(x),
+                if wildcard { Input::Any } else { Input::Absent },
+                Input::Absent,
+            ],
+        );
+        let built = p.finish(y).unwrap();
+        for tail in [
+            vec![],
+            vec![None],
+            vec![Some(0)],
+            vec![None, None],
+            vec![Some(0), None],
+            vec![None, None, None],
+        ] {
+            let mut graph = Graph::new();
+            let x = input(&mut graph, "x");
+            let inputs = std::iter::once(Some(x))
+                .chain(tail.iter().map(|slot| slot.map(|_| x)))
+                .collect::<Vec<_>>();
+            let (root, outputs) = op(&mut graph, "Clip", &inputs, 1);
+            graph.set_outputs(outputs);
+            let session = MatchSession::new(&graph).unwrap();
+            assert_eq!(
+                session
+                    .match_at(&built, root, Default::default())
+                    .unwrap()
+                    .is_some(),
+                session
+                    .match_at(&text, root, Default::default())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+}
+
+#[test]
+fn builder_domains_and_attribute_captures_share_text_semantics() {
+    let text = Pattern::parse_ort(
+        "(x,axis:int|None)=>{a=vendor.Act(x,axis=axis,alpha=0.25,tag='ok',axes=[1,2],weights=[0.5,1.0]);return vendor.Act(a,axis=axis)}"
+    ).unwrap();
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let axis = p.optional_attribute("axis", AttributeType::Int);
+    let a = p
+        .node("Act", [x])
+        .domain("vendor")
+        .attr("axis", axis)
+        .attr("alpha", 0.25_f32)
+        .attr("tag", "ok")
+        .attr("axes", vec![1_i64, 2])
+        .attr("weights", vec![0.5_f32, 1.0])
+        .output();
+    let y = p
+        .node("Act", [a])
+        .domain("vendor")
+        .attr("axis", axis)
+        .output();
+    let built = p.finish(y).unwrap();
+    let key = built.attribute_capture("axis").unwrap();
+    assert!(built.value_capture("axis").is_err());
+    assert!(built.attribute_capture("x").is_err());
+    for first in [None, Some(Attribute::Int(1)), Some(Attribute::Float(1.0))] {
+        for second in [None, Some(Attribute::Int(1)), Some(Attribute::Int(2))] {
+            for domain in ["vendor", ""] {
+                let mut graph = Graph::new();
+                graph.opset_imports.insert("vendor".into(), 1);
+                let x = input(&mut graph, "x");
+                let (a, values) = op(&mut graph, "Act", &[Some(x)], 1);
+                let (root, outputs) = op(&mut graph, "Act", &[Some(values[0])], 1);
+                graph.node_mut(a).domain = domain.into();
+                graph.node_mut(root).domain = domain.into();
+                for (name, value) in [
+                    ("alpha", Attribute::Float(0.25)),
+                    ("tag", Attribute::String(b"ok".to_vec())),
+                    ("axes", Attribute::Ints(vec![1, 2])),
+                    ("weights", Attribute::Floats(vec![0.5, 1.0])),
+                ] {
+                    graph.node_mut(a).attributes.insert(name.into(), value);
+                }
+                for (node, attr) in [(a, &first), (root, &second)] {
+                    if let Some(attr) = attr {
+                        graph
+                            .node_mut(node)
+                            .attributes
+                            .insert("axis".into(), attr.clone());
+                    }
+                }
+                graph.set_outputs(outputs);
+                let session = MatchSession::new(&graph).unwrap();
+                let actual = session.match_at(&built, root, Default::default()).unwrap();
+                let expected = session.match_at(&text, root, Default::default()).unwrap();
+                assert_eq!(actual.is_some(), expected.is_some());
+                if let (Some(actual), Some(expected)) = (actual, expected) {
+                    assert_eq!(
+                        actual.attribute("axis").unwrap().map(std::ptr::from_ref),
+                        expected.attribute("axis").unwrap().map(std::ptr::from_ref)
+                    );
+                    assert_eq!(
+                        actual
+                            .captured_attribute(&key)
+                            .unwrap()
+                            .map(Attribute::as_int),
+                        first.as_ref().map(Attribute::as_int)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn builder_repeated_optional_values_agree_on_identity_and_absence() {
+    let text = Pattern::parse_ort(
+        "(x,limit:tensor[...]|None)=>{a=Clip(x,limit,limit);return Identity(a)}",
+    )
+    .unwrap();
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let limit = p.optional_input("limit");
+    let a = p.op("Clip", [x, limit, limit]);
+    let y = p.node("Identity", [a]).domain("ai.onnx").output();
+    let built = p.finish(y).unwrap();
+    for slots in [
+        vec![],
+        vec![None],
+        vec![None, None],
+        vec![Some(0), Some(0)],
+        vec![Some(0), Some(1)],
+        vec![Some(0), None],
+        vec![None, Some(0)],
+    ] {
+        let mut graph = Graph::new();
+        let x = input(&mut graph, "x");
+        let limits = [input(&mut graph, "low"), input(&mut graph, "high")];
+        let inputs = std::iter::once(Some(x))
+            .chain(slots.iter().map(|slot| slot.map(|i| limits[i])))
+            .collect::<Vec<_>>();
+        let (_, values) = op(&mut graph, "Clip", &inputs, 1);
+        let (root, outputs) = op(&mut graph, "Identity", &[Some(values[0])], 1);
+        graph.set_outputs(outputs);
+        let session = MatchSession::new(&graph).unwrap();
+        let actual = session.match_at(&built, root, Default::default()).unwrap();
+        let expected = session.match_at(&text, root, Default::default()).unwrap();
+        assert_eq!(actual.is_some(), expected.is_some(), "{slots:?}");
+        if let (Some(actual), Some(expected)) = (actual, expected) {
+            assert_eq!(
+                actual.value("limit").unwrap(),
+                expected.value("limit").unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn builder_control_flow_bodies_are_hygienic_and_cover_complete_graphs() {
+    let text = library(
+        "pattern Branch(x){y=Identity(x);return y}
+         pattern P(c){y=If(c,then_branch=Branch,else_branch=Branch);return y}",
+    )
+    .unwrap()
+    .pattern("P")
+    .unwrap();
+    let mut body = Pattern::builder();
+    let x = body.input("x");
+    let y = body.op("Identity", [x]);
+    body.capture("y", y);
+    let body = body.finish_body([y]).unwrap();
+    let mut p = Pattern::builder();
+    let c = p.input("c");
+    let y = p
+        .node("If", [c])
+        .attr("then_branch", body.clone())
+        .attr("else_branch", body)
+        .output();
+    p.capture("y", y);
+    let built = p.finish(y).unwrap();
+    for dead_work in [false, true] {
+        let mut graph = Graph::new();
+        let condition = input(&mut graph, "cond");
+        let outer = input(&mut graph, "outer");
+        let (root, outputs) = op(&mut graph, "If", &[Some(condition)], 1);
+        for attr in ["then_branch", "else_branch"] {
+            let mut body = branch("outer");
+            if dead_work && attr == "then_branch" {
+                let x = body.node(NodeId(0)).inputs[0];
+                op(&mut body, "Neg", &[x], 1);
+            }
+            graph
+                .node_mut(root)
+                .attributes
+                .insert(attr.into(), Attribute::Graph(Box::new(body)));
+        }
+        graph.set_outputs(outputs);
+        let session = MatchSession::new(&graph).unwrap();
+        let actual = session.match_at(&built, root, Default::default()).unwrap();
+        let expected = session.match_at(&text, root, Default::default()).unwrap();
+        assert_eq!(actual.is_some(), expected.is_some());
+        assert_eq!(actual.is_some(), !dead_work);
+        if let (Some(actual), Some(expected)) = (actual, expected) {
+            for scope in ["y.then_branch", "y.else_branch"] {
+                let a = actual.instance(scope).unwrap();
+                let b = expected.instance(scope).unwrap();
+                assert_eq!(a.value("x").unwrap(), b.value("x").unwrap());
+                assert_eq!(a.resolve_input("x", &graph).unwrap().id(), outer);
+            }
+            assert_ne!(
+                actual
+                    .instance("y.then_branch")
+                    .unwrap()
+                    .value("x")
+                    .unwrap(),
+                actual
+                    .instance("y.else_branch")
+                    .unwrap()
+                    .value("x")
+                    .unwrap()
+            );
+        }
+    }
+    // A Loop body may return its formals (including duplicate SSA identities).
+    let mut body = Pattern::builder();
+    let [_iter, cond, state] = body.inputs(["iter", "cond", "state"]);
+    let body = body.finish_body([cond, state, state]).unwrap();
+    let mut p = Pattern::builder();
+    let trip = p.optional_input("trip");
+    let [cond, state] = p.inputs(["cond", "state"]);
+    let [a, b] = p
+        .node("Loop", [trip, cond, state])
+        .attr("body", body)
+        .outputs();
+    assert!(p.finish_outputs([a, b]).is_ok());
+}
+
+#[test]
+fn builder_diagnoses_foreign_handles_duplicates_scopes_and_invalid_definitions() {
+    let mut other = Pattern::builder();
+    let foreign = other.input("foreign");
+    let foreign_attr = other.attribute("alpha", AttributeType::Float);
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let y = p
+        .node("Add", [x, foreign])
+        .attr("alpha", foreign_attr)
+        .output();
+    let error = p.finish_outputs([y, foreign]).unwrap_err();
+    assert_eq!(error.kind, PatternErrorKind::InvalidPattern);
+    for context in [
+        "operator \"Add\" input 1",
+        "attribute \"alpha\"",
+        "return 1",
+        "another builder/scope",
+    ] {
+        assert!(error.message.contains(context), "{error}");
+    }
+    let mut body = Pattern::builder();
+    let y = body.op("Identity", [foreign]);
+    assert!(
+        body.finish_body([y])
+            .unwrap_err()
+            .message
+            .contains("local input")
+    );
+
+    for source in [
+        "(x)=>{a=Identity(x);return x}",
+        "(x)=>{a=Identity(x);b=Neg(x);return a,b}",
+        "(x)=>{a=Identity(x);return a,a}",
+    ] {
+        assert!(Pattern::parse_ort(source).is_err());
+    }
+    for failure in 0..12 {
+        let mut p = Pattern::builder();
+        let x = p.input("x");
+        let y = p.op("Identity", [x]);
+        let expected = match failure {
+            0 => {
+                p.input("x");
+                "duplicate capture"
+            }
+            1 => {
+                p.capture("x", y);
+                "duplicate capture"
+            }
+            2 => {
+                p.attribute("x", AttributeType::Int);
+                "duplicate capture"
+            }
+            3 => {
+                p.capture("None", y);
+                "ASCII identifier"
+            }
+            4 => {
+                p.op("Neg", [x]);
+                "does not reach any return"
+            }
+            5 => {
+                return_builder_error(p.finish_outputs([y, y]), "distinct produced");
+                continue;
+            }
+            6 => {
+                return_builder_error(p.finish(x), "does not reach any return");
+                continue;
+            }
+            7 => {
+                let z = p.op("Neg", [x]);
+                return_builder_error(p.finish_outputs([y, z]), "disconnected");
+                continue;
+            }
+            8 => {
+                p.node("Split", [y]).outputs::<0>();
+                "zero outputs"
+            }
+            9 => {
+                let node = p.node("Identity", [y]);
+                drop(node);
+                "not completed"
+            }
+            10 => {
+                p.node("Identity", [y])
+                    .attr("axis", 1_i64)
+                    .attr("axis", 2_i64)
+                    .output();
+                "duplicated"
+            }
+            _ => {
+                p.node("Identity", [y]).domain("a").domain("b").output();
+                "domain is specified twice"
+            }
+        };
+        return_builder_error(p.finish(y), expected);
+    }
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    p.attribute("axis", AttributeType::Int);
+    let y = p.op("Identity", [x]);
+    return_builder_error(p.finish(y), "attribute capture \"axis\" is unused");
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let y = p.op("vendor.Identity", [x]);
+    return_builder_error(p.finish(y), ".domain(");
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    return_builder_error(p.finish(x), "no anchor");
+}
+
+fn return_builder_error(result: Result<Pattern, PatternError>, expected: &str) {
+    let error = result.unwrap_err();
+    assert_eq!(error.kind, PatternErrorKind::InvalidPattern);
+    assert!(error.message.contains(expected), "{error}");
+}
+
+#[test]
+fn builder_checks_empty_returns_unused_inputs_and_shared_compiler_limits() {
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let y = p.op("Identity", [x]);
+    p.capture("y", y);
+    p.capture("second_name", y);
+    return_builder_error(p.finish(y), "already named");
+
+    let p = Pattern::builder();
+    return_builder_error(p.finish_outputs([]), "return list is empty");
+    let mut p = Pattern::builder();
+    p.input("unused");
+    let x = p.input("x");
+    let y = p.op("Identity", [x]);
+    return_builder_error(p.finish(y), "required header parameter is unused");
+
+    let mut p = Pattern::builder();
+    let mut y = p.input("x");
+    for _ in 0..65 {
+        y = p.op("Identity", [y]);
+    }
+    let error = p.finish(y).unwrap_err();
+    assert_eq!(error.kind, PatternErrorKind::BudgetExceeded);
+    assert!(error.message.contains("64 plans/nodes"), "{error}");
+
+    let mut p = Pattern::builder();
+    let x = p.input("x");
+    let mut body = p.finish_body([x]).unwrap();
+    for depth in 1..=32 {
+        let mut p = Pattern::builder();
+        let x = p.input("x");
+        let y = p.node("Control", [x]).attr("body", body).output();
+        let result = p.finish_body([y]);
+        if depth == 32 {
+            let error = result.unwrap_err();
+            assert!(error.message.contains("nesting reaches 32"), "{error}");
+            break;
+        }
+        body = result.unwrap();
+    }
 }
 
 #[test]

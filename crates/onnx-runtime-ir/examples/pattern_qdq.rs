@@ -3,7 +3,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use onnx_runtime_ir::pattern::{MatchOptions, MatchSession, Pattern};
+use onnx_runtime_ir::pattern::{MatchOptions, MatchSession, Pattern, PatternError};
 use onnx_runtime_ir::{DataType, Graph, Node, NodeId, ValueId, static_shape};
 
 const PATTERN: &str = r"
@@ -12,6 +12,16 @@ const PATTERN: &str = r"
         return MatMul(x, weights)
     }
 ";
+
+fn typed_pattern() -> Result<Pattern, PatternError> {
+    let mut p = Pattern::builder();
+    let [x, packed, scale] = p.inputs(["x", "packed", "scale"]);
+    let zero = p.optional_input("zero");
+    let weights = p.op("DequantizeLinear", [packed, scale, zero]);
+    p.capture("weights", weights);
+    let y = p.op("MatMul", [x, weights]);
+    p.finish(y)
+}
 
 fn graph() -> (Graph, NodeId, NodeId) {
     let mut graph = Graph::new();
@@ -69,7 +79,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (graph, hit, miss) = graph();
     let pattern = Pattern::parse_ort(PATTERN)?;
+    let typed = typed_pattern()?;
     let session = MatchSession::new(&graph)?;
+    let typed_match = session
+        .match_at(&typed, hit, MatchOptions::default())?
+        .ok_or("typed QDQ pattern did not match; check builder/text structural parity")?;
     let matched = session
         .match_at(&pattern, hit, MatchOptions::default())?
         .ok_or("QDQ fixture did not match; the example's structural contract regressed")?;
@@ -77,14 +91,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         matched.value("packed")?.unwrap().value().dtype,
         DataType::Uint8
     );
+    assert_eq!(typed_match.nodes(), matched.nodes());
+    for name in ["x", "packed", "scale", "zero", "weights"] {
+        assert_eq!(typed_match.value(name)?, matched.value(name)?);
+    }
     assert!(
         session
             .match_at(&pattern, miss, MatchOptions::default())?
             .is_none()
     );
+    assert!(
+        session
+            .match_at(&typed, miss, MatchOptions::default())?
+            .is_none()
+    );
     if arguments.is_empty() {
         println!(
-            "QDQ structure: {:?}; packed={:?}; zero omitted",
+            "Text and typed QDQ structure: {:?}; packed={:?}; zero omitted",
             matched.nodes(),
             matched.value("packed")?.unwrap().id()
         );

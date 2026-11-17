@@ -17,6 +17,10 @@ fn limit(span: SourceSpan) -> PatternError {
 }
 
 pub(super) fn inline(definition: Definition) -> Result<Pattern> {
+    compile_body(definition, true)
+}
+
+pub(super) fn compile_body(definition: Definition, operator_entry: bool) -> Result<Pattern> {
     let mut compiler = Compiler {
         definitions: BTreeMap::new(),
         compiled: BTreeMap::new(),
@@ -25,12 +29,14 @@ pub(super) fn inline(definition: Definition) -> Result<Pattern> {
         registry: None,
     };
     let plans = compiler.body(&definition, 0)?;
-    for plan in &plans {
-        verify_entry(plan)?;
+    if operator_entry {
+        for plan in &plans {
+            verify_entry(plan)?;
+        }
     }
     Ok(Pattern {
         plans: plans.into(),
-        operator_entry: true,
+        operator_entry,
     })
 }
 
@@ -759,6 +765,7 @@ impl Compiler<'_> {
                 let mut compiled_attributes = Vec::new();
                 for (key, expression) in attributes {
                     let attribute = match &expression.kind {
+                        ExprKind::Graph(pattern) => AttributePlan::Graph(pattern.clone()),
                         ExprKind::Literal(literal) => AttributePlan::Literal(literal.clone()),
                         ExprKind::Name(name) if self.definitions.contains_key(name) => {
                             if plan.names.contains_key(name) {
