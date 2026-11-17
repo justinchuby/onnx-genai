@@ -55,6 +55,8 @@ pub fn extract_sdk(
                 ("include", relative)
             } else if let Some(relative) = entry_name.strip_prefix(&native_prefix) {
                 ("lib", relative)
+            } else if matches!(entry_name.as_str(), "LICENSE" | "ThirdPartyNotices.txt") {
+                ("", entry_name.as_str())
             } else {
                 continue;
             };
@@ -93,23 +95,27 @@ pub fn extract_sdk(
         }
     }
 
-    let header = dest.join("include/onnxruntime_c_api.h");
-    let expected_api = format!("#define ORT_API_VERSION {api_version}");
-    let contents = std::fs::read_to_string(&header)
-        .map_err(|err| format!("Cannot read SDK header {}: {err}", header.display()))?;
-    if !contents.lines().any(|line| line.trim() == expected_api) {
-        return Err(format!(
-            "SDK header {} does not declare ORT_API_VERSION {api_version}; \
-             refusing to mix headers and runtime ABI.",
-            header.display()
-        ));
-    }
+    validate_header_api(&dest.join("include/onnxruntime_c_api.h"), api_version)?;
     let library = dest.join("lib").join(versioned_library);
     if !library.is_file() {
         return Err(format!(
             "SDK is missing runtime {} for {}.",
             library.display(),
             target.rid
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_header_api(header: &Path, api_version: &str) -> Result<(), String> {
+    let expected_api = format!("#define ORT_API_VERSION {api_version}");
+    let contents = std::fs::read_to_string(header)
+        .map_err(|err| format!("Cannot read SDK header {}: {err}", header.display()))?;
+    if !contents.lines().any(|line| line.trim() == expected_api) {
+        return Err(format!(
+            "SDK header {} does not declare ORT_API_VERSION {api_version}; \
+             refusing to mix headers and runtime ABI.",
+            header.display()
         ));
     }
     Ok(())

@@ -28,6 +28,8 @@ fn installs_only_matching_native_sdk_with_versioned_runtime_names() {
     write_sdk(
         &archive,
         &[
+            ("LICENSE", b"SDK license"),
+            ("ThirdPartyNotices.txt", b"SDK third-party notices"),
             (
                 "build/native/include/onnxruntime_c_api.h",
                 b"#define ORT_API_VERSION 29\n",
@@ -87,6 +89,11 @@ fn installs_only_matching_native_sdk_with_versioned_runtime_names() {
         );
         assert!(!dest.join("runtimes").exists());
         assert!(!dest.join("lib/net8.0").exists());
+        assert_eq!(std::fs::read(dest.join("LICENSE")).unwrap(), b"SDK license");
+        assert_eq!(
+            std::fs::read(dest.join("ThirdPartyNotices.txt")).unwrap(),
+            b"SDK third-party notices"
+        );
         if rid == "win-x64" {
             assert_eq!(
                 std::fs::read(dest.join("lib/onnxruntime.lib")).unwrap(),

@@ -205,9 +205,6 @@ MANUAL_ONLY_WORKFLOWS: frozenset[str] = frozenset(
 # Every entry is a written exception to the default rule: workspace members are
 # tested unless they are listed here with a reason.
 DENYLIST: dict[str, str] = {
-    # Build script downloads a native ONNX Runtime distribution; this is why CI
-    # must never use bare `cargo test --workspace`.
-    "onnx-genai-ort-sys": "build script downloads a native ONNX Runtime distribution",
     # Benchmark crate includes CUDA/native performance entry points; benchmark
     # execution belongs in explicit perf/GPU jobs, not every PR test lane.
     "onnx-genai-bench": "benchmark/perf crate; not a unit-test CI target",
@@ -256,7 +253,7 @@ LINT_EXEMPT: dict[str, str] = {
 
 # Packages that need the ORT-backed lane because they directly or transitively
 # load ONNX Runtime. They are still tested by default; they are only kept out of
-# the offline lanes to preserve the ort-sys download constraint above.
+# the offline lanes to keep native SDK downloads in the ORT-backed jobs.
 ORT_BACKED = frozenset(
     {
         "onnx-genai",
@@ -264,6 +261,7 @@ ORT_BACKED = frozenset(
         "onnx-genai-cli",
         "onnx-genai-engine",
         "onnx-genai-ort",
+        "onnx-genai-ort-sys",
         "onnx-genai-server",
     }
 )

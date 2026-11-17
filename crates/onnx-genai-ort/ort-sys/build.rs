@@ -381,18 +381,10 @@ fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
 
 fn cached_prebuilt_matches_version(download_dir: &Path) -> bool {
     let header_path = download_dir.join("include").join("onnxruntime_c_api.h");
-    header_matches_api_version(&header_path)
+    build_support::validate_header_api(&header_path, ORT_API_VERSION).is_ok()
         && expected_versioned_runtime_path(&download_dir.join("lib")).exists()
-}
-
-fn header_matches_api_version(header_path: &Path) -> bool {
-    let Ok(header) = std::fs::read_to_string(header_path) else {
-        return false;
-    };
-
-    header
-        .lines()
-        .any(|line| line.trim() == format!("#define ORT_API_VERSION {ORT_API_VERSION}"))
+        && download_dir.join("LICENSE").is_file()
+        && download_dir.join("ThirdPartyNotices.txt").is_file()
 }
 
 fn ensure_major_version_runtime_link(lib_dir: &Path) {

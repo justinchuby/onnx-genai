@@ -775,7 +775,7 @@ jobs:
       # so what is added here is codegen, linking and the run itself.
       #
       # NXRT_REQUIRE_ORT_TESTS mirrors the `CLI ORT` job env. No test in these
-      # six crates reads it today; it is set so that the first one that does
+      # ORT-backed crates reads it today; it is set so that the first one that does
       # cannot silently skip here after passing there.
       #
       # Serialized for the reason the `CLI ORT` step was: several integration
