@@ -161,8 +161,12 @@ unbound extra header value prevents a whole-graph match.
 The existing IR can store both an inline `Attribute::Graph` and an indexed
 `Graph::subgraphs` copy. Matching uses the indexed body when present, as an
 explicit authoritative execution view; it does not traverse both. Native
-`GRAPHS` uses attribute-list order, not formatted index-name parsing. Eliminating
+`GRAPHS` uses declared attribute-list order and the matching indexed body when
+present; indexed copies are not visited again as extra bodies. Eliminating
 duplicate ownership is future IR work, not a second store added by this module.
+Indexed locations use `GraphAttribute::single(name)` or
+`GraphAttribute::element(name, index)`, never a formatted string: a literal
+GRAPH named `bodies[0]` cannot collide with element zero of GRAPHS `bodies`.
 
 Capture references contribute dependencies from ancestor producers to containing
 owners, projected across nesting. Preparation rejects capture-induced cycles,
@@ -171,6 +175,9 @@ enumeration uses documented raw-ID order, not an assertion that explicit-edge
 topological ordering accounts for captures.
 
 Attributes are read from the provided map. **No schema defaults are inserted.**
+Constraining an unresolved function `ref_attr_name` returns `MissingMetadata`;
+bind the function's explicit/default attributes first, or inspect the raw
+reference metadata without claiming its runtime value.
 To compare with ORT's resolved graph, the adapter must materialize the same
 defaults/types in advance. `const` and literals exclude initializer/input overlap.
 Literal reads validate recognized inline storage. External bytes are never
@@ -180,8 +187,10 @@ evaluation is unsupported. Numerical float literals treat signed zeros as equal;
 repeated float attribute captures compare their stored bits, matching normalized
 protobuf-content semantics for the represented fields.
 
-Concrete tensor constraints require known metadata; placeholder dtype/shape is
-not proof. Rank-specific constraints reject unknown rank. Repeated dimension
+Concrete tensor constraints require known dense-tensor metadata; an unannotated
+value is not implicitly a tensor. Source values with missing or non-tensor type
+descriptors have `DataType::Undefined`, not a fabricated float32 scalar.
+Rank-specific constraints reject unknown rank. Repeated dimension
 names require known equal static extents or equal nonempty symbolic names.
 Unknown singleton dimensions remain unbound. These are constraints, not shape
 inference.
@@ -200,18 +209,52 @@ must represent otherwise external outputs/uses. Provider/layer annotations and
 replacement-cycle policy are not represented here. EPs retain alias/lifetime,
 side-effect, opset, numerical, shape/layout and kernel-support guards.
 
-### Representation limits
+### Source fidelity versus execution and pattern semantics
 
-The matcher cannot reconstruct source information the loader discarded:
-optional output holes, full non-tensor value types/unknownness, sparse
-initializers, byte-string tensor elements and complete function overload/default/
-attribute-reference binding. The supported core expects **present dense outputs**
-and faithfully represented initializer/input overlap; do not use a lossy adapter
-to prove absence, immutability or whole-ONNX conformance. Generic attribute captures
-can borrow all represented variants. Repeated GRAPH/GRAPHS, TYPE_PROTO and
-SPARSE_TENSORS equality is explicitly unsupported; graph constraints or bounded
-consumer predicates are required. No claim of all-ONNX or full ORT compatibility
-is made.
+The IR shares the existing generated ONNX schema with the loader instead of
+maintaining a second, incomplete recursive type language. `Value::declared_type`
+retains the declared `TypeProto`: tensor, sparse tensor, sequence, map, optional,
+opaque or explicitly unknown. Missing rank differs from scalar rank; dimensions
+retain unknown/empty-symbol presence and denotations. `dtype`/`shape` are separate
+dense-tensor inference facts, never replacements for a container descriptor.
+TYPE_PROTO attributes use the same schema messages.
+
+Use `onnx_runtime_loader::load_model_ir_bytes` (or its path/weight variants) for
+structural analysis and round trips. These source-preserving entry points do not
+run shape inference or expand local functions. Existing execution loaders
+deliberately lower functions and infer shapes; they are not source-preserving
+transforms. Model-level metadata is still supplied separately to the encoder.
+`onnx-std` model loading uses this source path too; it no longer silently
+substitutes fake graph inputs for sparse initializers. Its raw function checker
+can validate declarations before strict IR construction.
+
+Local functions retain their exact `(domain, name, overload)` identity, own
+imports, formal/default/reference attributes and canonical `FunctionProto`
+declaration. That declaration is the serialization source; the derived body is
+an execution/analysis view, not a function-rewrite API. Calls retain overload and
+raw attribute binding metadata. Execution lowering binds explicit/default
+attributes; unresolved references are not fabricated values.
+
+Dense and sparse initializer defaults retain their shared identity with graph
+inputs. `Graph::is_initializer` covers either storage form;
+`is_constant_initializer` additionally excludes graph inputs. Sparse declarations
+retain their original `SparseTensorProto`, including external payload references;
+they are not densified or implicitly fetched. String tensor elements are raw
+byte vectors, including non-UTF-8 data. The serializer re-emits both storage forms
+and the complete ordered graph input interface.
+
+Preserving source information does **not** implement sparse execution, arbitrary
+container kernels, function expansion semantics inside the matcher, or all ORT
+pattern productions. Unsupported runtime cases must fail explicitly before
+tensor allocation/constant specialization. Schema defaults are still a separate
+schema-layer responsibility; raw absence remains absence.
+
+Generic captures and predicates can inspect full declared types and sparse
+payloads, but recursive type-pattern syntax and sparse literal evaluation are
+not implemented. Repeated GRAPH/GRAPHS, TYPE_PROTO and SPARSE_TENSORS equality is
+explicitly unsupported; graph constraints or bounded consumer predicates are
+required. No claim of all-ONNX execution or complete ORT-source compatibility is
+made.
 
 ## Errors, budgets and costs
 

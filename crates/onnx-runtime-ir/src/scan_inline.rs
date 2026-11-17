@@ -111,7 +111,7 @@ struct ScanInlinePlan {
 impl ScanInlinePlan {
     fn extract(graph: &Graph, scan_id: NodeId) -> Option<Self> {
         let node = graph.try_node(scan_id)?;
-        let body = graph.subgraphs.get(&(scan_id, "body".to_string()))?.clone();
+        let body = graph.subgraphs.get(&(scan_id, "body".into()))?.clone();
 
         let num_scan_inputs = usize::try_from(node.attr("num_scan_inputs")?.as_int()?).ok()?;
         if num_scan_inputs == 0 || node.inputs.len() < num_scan_inputs {
@@ -140,8 +140,8 @@ impl ScanInlinePlan {
 
         let state_inputs = collect_present(&node.inputs[..num_state])?;
         let scan_inputs = collect_present(&node.inputs[num_state..])?;
-        let state_outputs = node.outputs[..num_state].to_vec();
-        let scan_outputs = node.outputs[num_state..].to_vec();
+        let state_outputs = collect_present(&node.outputs[..num_state])?;
+        let scan_outputs = collect_present(&node.outputs[num_state..])?;
 
         let input_axes_raw = int_list_attr(node, "scan_input_axes", num_scan_inputs)?;
         let output_axes_raw = int_list_attr(node, "scan_output_axes", num_scan_outputs)?;
@@ -277,10 +277,16 @@ impl ScanInlinePlan {
                 .iter()
                 .map(|slot| slot.map(|v| remap[&v]))
                 .collect();
-            let outputs = bn.outputs.iter().map(|v| remap[v]).collect();
-            let mut nn = Node::new(NodeId(0), bn.op_type.clone(), inputs, outputs);
+            let outputs = bn
+                .outputs
+                .iter()
+                .map(|slot| slot.map(|v| remap[&v]))
+                .collect();
+            let mut nn =
+                Node::new_with_output_slots(NodeId(0), bn.op_type.clone(), inputs, outputs);
             nn.name = bn.name.clone();
             nn.domain = bn.domain.clone();
+            nn.overload = bn.overload.clone();
             nn.version = bn.version;
             nn.attributes = bn.attributes.clone();
             nn.doc_string = bn.doc_string.clone();

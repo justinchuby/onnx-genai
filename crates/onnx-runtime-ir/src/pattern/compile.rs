@@ -164,6 +164,9 @@ impl Compiler<'_> {
             let mut next = Vec::new();
             for plan in plans {
                 for target in targets {
+                    if target.name == "None" || target.name == "_" {
+                        continue;
+                    }
                     if plan.names.contains_key(&target.name)
                         || plan.attribute_names.contains_key(&target.name)
                     {
@@ -180,6 +183,13 @@ impl Compiler<'_> {
                     self.expression(plan, expression, targets.len(), &targets[0].name, depth)?
                 {
                     for (target, output) in targets.iter().zip(outputs) {
+                        if target.name == "None" {
+                            plan.values[output] = ValuePlan::Absent;
+                            continue;
+                        }
+                        if target.name == "_" {
+                            continue;
+                        }
                         if plan.names.insert(target.name.clone(), output).is_some() {
                             return Err(invalid(
                                 expression.span,
@@ -624,6 +634,7 @@ fn annotate(
             plan.annotations.push((
                 slot,
                 vec![Constraint {
+                    tensor: false,
                     absent: false,
                     immutable: false,
                     element: None,
@@ -727,6 +738,7 @@ fn constraint_from_raw(raw: &RawConstraint, span: SourceSpan) -> Result<Constrai
         ));
     }
     Ok(Constraint {
+        tensor: raw.name != "None",
         absent: raw.name == "None",
         immutable: raw.immutable,
         element,

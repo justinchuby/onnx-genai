@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::dtype::DataType;
-use crate::shape::Shape;
+pub use crate::onnx::TypeProto;
 
 mod sealed {
     pub trait Sealed {}
@@ -107,7 +107,7 @@ pub struct TensorData {
     /// this is empty and `strings` is used instead.
     pub data: Vec<u8>,
     /// String payloads for [`DataType::String`] tensors.
-    pub strings: Vec<String>,
+    pub strings: Vec<Vec<u8>>,
 }
 
 impl TensorData {
@@ -175,26 +175,6 @@ pub struct SparseTensorData {
     pub indices: TensorData,
     /// Dense shape.
     pub dims: Vec<usize>,
-}
-
-/// An ONNX `TypeProto`: the type of a value, which may be a tensor or a
-/// container of tensors (see `docs/architecture/ORT2.md` §3.2).
-#[derive(Clone, Debug, PartialEq)]
-pub enum TypeProto {
-    Tensor {
-        dtype: DataType,
-        shape: Shape,
-    },
-    Sequence(Box<TypeProto>),
-    Optional(Box<TypeProto>),
-    Map {
-        key: DataType,
-        value: Box<TypeProto>,
-    },
-    SparseTensor {
-        dtype: DataType,
-        shape: Shape,
-    },
 }
 
 /// A reference to initializer (weight) data.

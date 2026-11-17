@@ -1,5 +1,18 @@
 use super::*;
 
+fn required_node_output(node: &Node, index: usize, op: &str) -> Result<ValueId> {
+    node.outputs
+        .get(index)
+        .copied()
+        .flatten()
+        .ok_or_else(|| SessionError::UnsupportedModel {
+            reason: format!(
+                "{op} node {:?} omits required output slot {index}; execution rejects optional output holes before planning",
+                node.id
+            ),
+        })
+}
+
 impl ChildExecutor {
     /// Create the reusable wrapper for a loaded subgraph body.
     ///
@@ -568,7 +581,7 @@ impl Executor {
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
     ) -> Result<PreparedSubgraph> {
-        let key = (node_id, attr_key.to_string());
+        let key = (node_id, attr_key.into());
         let body = self.graph.subgraphs.get(&key).ok_or_else(|| {
             SessionError::Internal(format!(
                 "control-flow node #{} references missing subgraph '{attr_key}'",
@@ -693,7 +706,7 @@ impl Executor {
             let then_branch = self
                 .graph
                 .subgraphs
-                .get(&(node.id, "then_branch".to_string()))
+                .get(&(node.id, "then_branch".into()))
                 .ok_or_else(|| SessionError::ControlFlow {
                     op: "If".to_string(),
                     reason: "missing required 'then_branch' subgraph".to_string(),
@@ -701,7 +714,7 @@ impl Executor {
             let else_branch = self
                 .graph
                 .subgraphs
-                .get(&(node.id, "else_branch".to_string()))
+                .get(&(node.id, "else_branch".into()))
                 .ok_or_else(|| SessionError::ControlFlow {
                     op: "If".to_string(),
                     reason: "missing required 'else_branch' subgraph".to_string(),
@@ -756,7 +769,11 @@ impl Executor {
         // branch that reads loop-varying outer values is never memoized, so a
         // stale output is impossible.
         if self.if_last_predicate.get(&node.id) == Some(&cond)
-            && node.outputs.iter().all(|v| resolved.contains_key(v))
+            && node
+                .outputs
+                .iter()
+                .flatten()
+                .all(|v| resolved.contains_key(v))
         {
             return Ok(());
         }
@@ -767,7 +784,7 @@ impl Executor {
         let taken_branch_is_invariant = self
             .graph
             .subgraphs
-            .get(&(node.id, attr_key.to_string()))
+            .get(&(node.id, attr_key.into()))
             .map(|body| required_outer_names(body).is_empty())
             .unwrap_or(false);
         let prepared = {
@@ -789,7 +806,15 @@ impl Executor {
         {
             let _s = phase_span!("execif.store_output");
             for (vid, t) in node.outputs.iter().zip(outs.iter()) {
-                self.store_output_tensor(*vid, t, resolved, external)?;
+                let Some(vid) = *vid else {
+                    return Err(SessionError::UnsupportedModel {
+                        reason: format!(
+                            "If node {:?} omits an output slot produced by branch {attr_key}",
+                            node.id
+                        ),
+                    });
+                };
+                self.store_output_tensor(vid, t, resolved, external)?;
             }
         }
         // Only enable future skips when the taken branch is loop-invariant.
@@ -814,7 +839,7 @@ impl Executor {
         let body = self
             .graph
             .subgraphs
-            .get(&(node.id, "body".to_string()))
+            .get(&(node.id, "body".into()))
             .ok_or_else(|| SessionError::ControlFlow {
                 op: "Loop".to_string(),
                 reason: "missing required 'body' subgraph".to_string(),
@@ -888,6 +913,13 @@ impl Executor {
             .zip(node.outputs.iter().skip(carried.len()))
             .enumerate()
             .map(|(index, (&body_output, &node_output))| {
+                let node_output = node_output.ok_or_else(|| SessionError::UnsupportedModel {
+                    reason: format!(
+                        "Loop node {:?} omits required scan output slot {}",
+                        node.id,
+                        carried.len() + index
+                    ),
+                })?;
                 let body_value = body.value(body_output);
                 let node_dtype = self.value_dtypes[&node_output];
                 let dtype = if body.value_type_is_known(body_output) {
@@ -1090,12 +1122,17 @@ impl Executor {
 
         // Emit outputs: carried finals, then stacked scan outputs.
         for (i, t) in carried.iter().enumerate() {
-            self.store_output_tensor(node.outputs[i], t, resolved, external)?;
+            self.store_output_tensor(
+                required_node_output(node, i, "Loop")?,
+                t,
+                resolved,
+                external,
+            )?;
         }
         for (s, (acc, empty_spec)) in scan_acc.into_iter().zip(empty_scan_specs).enumerate() {
             let (dtype, shape, bytes) = acc.finish_with_empty(empty_spec, s)?;
             self.store_output_bytes(
-                node.outputs[num_carried + s],
+                required_node_output(node, num_carried + s, "Loop")?,
                 dtype,
                 shape,
                 &bytes,
@@ -1123,7 +1160,7 @@ impl Executor {
         let body = self
             .graph
             .subgraphs
-            .get(&(node.id, "body".to_string()))
+            .get(&(node.id, "body".into()))
             .ok_or_else(|| SessionError::ControlFlow {
                 op: "Scan".to_string(),
                 reason: "missing required 'body' subgraph".to_string(),
@@ -1206,6 +1243,13 @@ impl Executor {
             .zip(output_axes)
             .enumerate()
             .map(|(index, ((&body_output, &node_output), &axis))| {
+                let node_output = node_output.ok_or_else(|| SessionError::UnsupportedModel {
+                    reason: format!(
+                        "Scan node {:?} omits required scan output slot {}",
+                        node.id,
+                        state.len() + index
+                    ),
+                })?;
                 let body_value = body.value(body_output);
                 let node_dtype = self.value_dtypes[&node_output];
                 let dtype = if body.value_type_is_known(body_output) {
@@ -1455,7 +1499,12 @@ impl Executor {
         }
 
         for (i, t) in state.iter().enumerate() {
-            self.store_output_tensor(node.outputs[i], t, resolved, external)?;
+            self.store_output_tensor(
+                required_node_output(node, i, "Scan")?,
+                t,
+                resolved,
+                external,
+            )?;
         }
         for (s, ((acc, empty_spec), (&axis, &direction))) in scan_acc
             .into_iter()
@@ -1465,7 +1514,7 @@ impl Executor {
         {
             let (dtype, shape, bytes) = acc.finish_scan(axis, direction, empty_spec, s)?;
             self.store_output_bytes(
-                node.outputs[num_state + s],
+                required_node_output(node, num_state + s, "Scan")?,
                 dtype,
                 shape,
                 &bytes,

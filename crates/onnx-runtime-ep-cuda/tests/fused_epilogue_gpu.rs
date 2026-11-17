@@ -100,7 +100,7 @@ fn run_model(
         .iter()
         .map(|&id| as_static_shape(&graph.value(id).shape).unwrap())
         .collect();
-    let out_shape = as_static_shape(&graph.value(node.outputs[0]).shape).unwrap();
+    let out_shape = as_static_shape(&graph.value(node.outputs[0].unwrap()).shape).unwrap();
     let host_inputs = [a, b, bias];
     let mut buffers = Vec::new();
     for values in host_inputs {

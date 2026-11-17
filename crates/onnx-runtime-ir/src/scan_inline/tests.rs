@@ -159,7 +159,7 @@ fn build_hybrid(scan_extent: usize) -> Hybrid {
         .insert("scan_output_axes".to_string(), Attribute::Ints(vec![0]));
     let scan = g.insert_node(scan);
 
-    g.subgraphs.insert((scan, "body".to_string()), build_body());
+    g.subgraphs.insert((scan, "body".into()), build_body());
 
     g.add_output(present_state);
     g.add_output(scan_out);
@@ -222,7 +222,7 @@ fn lowers_single_trip_scan_to_straight_line_body() {
     // Scan node removed and its body subgraph dropped.
     assert!(!out.nodes.contains(h.scan), "Scan node must be removed");
     assert!(
-        !out.subgraphs.contains_key(&(h.scan, "body".to_string())),
+        !out.subgraphs.contains_key(&(h.scan, "body".into())),
         "Scan body subgraph must be dropped"
     );
     let after = op_counts(&out);
@@ -301,7 +301,13 @@ fn lowers_single_trip_scan_to_straight_line_body() {
     assert_eq!(static_dims(&out, h.present_state), Some(vec![2, 4]));
     assert_eq!(static_dims(&out, h.scan_out), Some(vec![1, 2, 4]));
     // The squeezed slice drops the size-1 scan axis to the body rank.
-    assert_eq!(static_dims(&out, squeeze.outputs[0]), Some(vec![2, 4]));
+    assert_eq!(
+        static_dims(
+            &out,
+            squeeze.outputs[0].expect("Squeeze output must be present")
+        ),
+        Some(vec![2, 4])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +336,7 @@ fn leaves_multi_trip_scan_untouched() {
     let h = build_hybrid(3);
     let out = inline_single_trip_scan_bodies(&h.graph);
     assert!(out.nodes.contains(h.scan), "multi-trip Scan must survive");
-    assert!(out.subgraphs.contains_key(&(h.scan, "body".to_string())));
+    assert!(out.subgraphs.contains_key(&(h.scan, "body".into())));
     assert_unchanged(&h.graph, &out);
 }
 
@@ -359,7 +365,7 @@ fn leaves_non_recurrent_scan_untouched() {
         vec![out_v],
     ));
     body.add_output(out_v);
-    g.subgraphs.insert((scan, "body".to_string()), body);
+    g.subgraphs.insert((scan, "body".into()), body);
     g.add_output(y);
 
     let out = inline_single_trip_scan_bodies(&g);
@@ -396,11 +402,7 @@ fn remap_produces_fresh_non_colliding_interior_ids() {
     // The body's own ValueId namespace overlaps numerically with the parent's
     // (both arenas start near 0), so a correct remap MUST allocate brand-new
     // parent ids for every interior body value rather than reuse a body id.
-    let body = h
-        .graph
-        .subgraphs
-        .get(&(h.scan, "body".to_string()))
-        .unwrap();
+    let body = h.graph.subgraphs.get(&(h.scan, "body".into())).unwrap();
     let body_ids: HashSet<u32> = body.values.keys().map(|v| v.0).collect();
     let parent_ids_before: HashSet<u32> = h.graph.values.keys().map(|v| v.0).collect();
     // Precondition: the namespaces genuinely overlap, so this test is not vacuous.
@@ -418,7 +420,7 @@ fn remap_produces_fresh_non_colliding_interior_ids() {
         for v in node.input_values() {
             assert!(out.values.contains(v), "node input {v:?} must be live");
         }
-        for &v in &node.outputs {
+        for v in node.output_values() {
             assert!(out.values.contains(v), "node output {v:?} must be live");
         }
     }
@@ -436,7 +438,7 @@ fn remap_produces_fresh_non_colliding_interior_ids() {
         if !interior_producers.contains(&node.op_type.as_str()) {
             continue;
         }
-        for &v in &node.outputs {
+        for v in node.output_values() {
             if boundary.contains(&v) {
                 continue; // a rewired Scan boundary output, legitimately reused
             }

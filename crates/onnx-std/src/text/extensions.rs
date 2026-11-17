@@ -228,7 +228,6 @@ fn merge_attribute(residual: AttributeProto, mut native: AttributeProto) -> Attr
 
     // Start from the readable attribute so its kind, value, and repeated
     // cardinality always win. Add back only payload details the DSL omits.
-    native.ref_attr_name = residual.ref_attr_name;
     native.doc_string = residual.doc_string;
     match AttributeType::try_from(native.r#type).unwrap_or(AttributeType::Undefined) {
         AttributeType::String if is_opaque_string_placeholder(&native.s) => {
@@ -348,6 +347,7 @@ fn merge_value_info(mut residual: ValueInfoProto, native: ValueInfoProto) -> Val
     residual.name = native.name;
     residual.r#type = match (residual.r#type.take(), native.r#type) {
         (Some(patch), Some(native)) => Some(merge_type(patch, native)),
+        (Some(patch), None) => Some(patch),
         (_, native) => native,
     };
     residual
@@ -375,30 +375,9 @@ fn merge_type(mut residual: TypeProto, native: TypeProto) -> TypeProto {
                 (_, native) => native,
             };
         }
-        (Some(value), Some(native))
-            if is_unrepresented_container(value) && is_native_placeholder(&native) => {}
         (_, native) => residual.value = native,
     }
     residual
-}
-
-fn is_unrepresented_container(value: &type_proto::Value) -> bool {
-    matches!(
-        value,
-        type_proto::Value::SequenceType(_)
-            | type_proto::Value::MapType(_)
-            | type_proto::Value::OptionalType(_)
-            | type_proto::Value::OpaqueType(_)
-    )
-}
-
-fn is_native_placeholder(value: &type_proto::Value) -> bool {
-    matches!(
-        value,
-        type_proto::Value::TensorType(tensor)
-            if tensor.elem_type == onnx_runtime_loader::proto::onnx::tensor_proto::DataType::Float as i32
-                && tensor.shape.as_ref().is_some_and(|shape| shape.dim.is_empty())
-    )
 }
 
 fn merge_shape(residual: TensorShapeProto, native: TensorShapeProto) -> TensorShapeProto {

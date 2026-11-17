@@ -1,5 +1,7 @@
 use super::*;
-use crate::{Attribute, Dim, Graph, GraphView, GraphViewCache, NodeId, ValueId, WeightRef};
+use crate::{
+    Attribute, Dim, Graph, GraphAttribute, GraphView, GraphViewCache, NodeId, ValueId, WeightRef,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Whether escaping intermediate values are allowed. Neither mode mutates IR.
@@ -526,10 +528,10 @@ impl<'g> MatchSession<'g> {
                     "duplicate value name {name:?}; make SSA names unique in each scope"
                 )));
             }
-            if value.producer.is_some()
-                || graph.inputs.contains(&id)
-                || graph.initializers.contains_key(&id)
-            {
+            if value.producer.is_some() || graph.inputs.contains(&id) || graph.is_initializer(id) {
+                continue;
+            }
+            if value.consumers.is_empty() && !value.is_graph_output {
                 continue;
             }
             let name = value.name.as_deref().ok_or_else(|| graph_error(format!(
@@ -538,6 +540,13 @@ impl<'g> MatchSession<'g> {
             for &(ancestor, _) in ancestors.iter().rev() {
                 let parent = &self.scopes[ancestor];
                 if let Some(&parent_id) = parent.names.get(name) {
+                    if parent.graph.value(parent_id).producer.is_none()
+                        && !parent.graph.inputs.contains(&parent_id)
+                        && !parent.graph.is_initializer(parent_id)
+                        && !parent.origins.contains_key(&parent_id)
+                    {
+                        continue;
+                    }
                     let mut chain = vec![ScopedValue {
                         graph: parent.graph,
                         id: parent_id,
@@ -596,26 +605,39 @@ impl<'g> MatchSession<'g> {
         });
         for (owner, node) in graph.nodes.iter() {
             let mut bodies: BTreeMap<(String, usize), &Graph> = BTreeMap::new();
+            let mut indexed = std::collections::BTreeSet::new();
             for (name, attribute) in &node.attributes {
                 match attribute {
                     Attribute::Graph(body) => {
+                        let key = GraphAttribute::single(name.clone());
+                        indexed.insert(key.clone());
                         // The executor's indexed body is authoritative when present.
                         bodies.insert(
                             (name.clone(), 0),
-                            graph.subgraphs.get(&(owner, name.clone())).unwrap_or(body),
+                            graph.subgraphs.get(&(owner, key)).unwrap_or(body),
                         );
                     }
                     Attribute::Graphs(list) => {
                         for (index, body) in list.iter().enumerate() {
-                            bodies.insert((name.clone(), index), body);
+                            let key = GraphAttribute::element(name.clone(), index);
+                            indexed.insert(key.clone());
+                            bodies.insert(
+                                (name.clone(), index),
+                                graph.subgraphs.get(&(owner, key)).unwrap_or(body),
+                            );
                         }
                     }
                     _ => {}
                 }
             }
-            for ((node_id, name), body) in &graph.subgraphs {
-                if *node_id == owner {
-                    bodies.entry((name.clone(), 0)).or_insert(body);
+            for ((node_id, location), body) in &graph.subgraphs {
+                if *node_id == owner && !indexed.contains(location) {
+                    if location.index.is_some() || node.attributes.contains_key(&location.name) {
+                        return Err(graph_error(format!(
+                            "node {owner:?} indexed body {location:?} has no corresponding GRAPH/GRAPHS location; repair its attribute name, kind and list index"
+                        )));
+                    }
+                    bodies.entry((location.name.clone(), 0)).or_insert(body);
                 }
             }
             let mut next_ancestors = ancestors.to_vec();
@@ -661,7 +683,7 @@ impl<'g> MatchSession<'g> {
                 let formals: Vec<_> = graph
                     .inputs
                     .iter()
-                    .filter(|v| !graph.initializers.contains_key(v))
+                    .filter(|v| !graph.is_initializer(**v))
                     .copied()
                     .collect();
                 if plan.inputs.len() < formals.len() || plan.outputs.len() != graph.outputs.len() {
@@ -908,7 +930,7 @@ impl<'g> MatchSession<'g> {
         }
         state.nodes[ordinal] = Some(actual);
         for (slot, &value) in expected.outputs.iter().zip(&node.outputs) {
-            if !bind_value(plan, state, *slot, Some(value)) {
+            if !bind_value(plan, state, *slot, value) {
                 return Ok(false);
             }
         }
@@ -961,6 +983,16 @@ impl<'g> MatchSession<'g> {
         }
         for (name, constraint) in &expected.attributes {
             let attribute = node.attributes.get(name);
+            if let Some(Attribute::Ref { name: formal, .. }) = attribute {
+                return Err(PatternError::new(
+                    PatternErrorKind::MissingMetadata,
+                    SourceSpan::default(),
+                    format!(
+                        "node {:?} attribute {name:?} refers to unbound function attribute {formal:?}; bind the function call's explicit/default attributes before constraining their values",
+                        node.id
+                    ),
+                ));
+            }
             match constraint {
                 AttributePlan::Literal(literal) => {
                     let Some(attribute) = attribute else {
@@ -1141,7 +1173,7 @@ impl<'g> MatchSession<'g> {
                 .filter_map(|slot| state.values[*slot].flatten())
                 .collect();
             for &node in &nodes {
-                for &output in &graph.node(node).outputs {
+                for output in graph.node(node).output_values() {
                     if exposed.contains(&output) {
                         continue;
                     }
@@ -1242,6 +1274,10 @@ fn annotations(
                 break;
             }
             let value = graph.value(actual);
+            if c.tensor && !graph.value_type_is_known(actual) {
+                valid = false;
+                break;
+            }
             let origin = scope
                 .origins
                 .get(&actual)
@@ -1457,7 +1493,7 @@ fn charge_tensor(tensor: &TensorData, budget: &mut MatchBudget) -> Result<()> {
             .saturating_add(tensor.name.as_ref().map_or(0, String::len)),
     )?;
     for value in &tensor.strings {
-        bytes(budget, size_of::<String>().saturating_add(value.len()))?;
+        bytes(budget, size_of::<Vec<u8>>().saturating_add(value.len()))?;
     }
     Ok(())
 }
@@ -1493,7 +1529,7 @@ fn tensor_equal(a: &TensorData, b: &TensorData, budget: &mut MatchBudget) -> Res
 
 fn is_constant(value: ScopedValue<'_>) -> bool {
     !value.graph.inputs.contains(&value.id)
-        && (value.graph.initializers.contains_key(&value.id)
+        && (value.graph.is_initializer(value.id)
             || value.value().producer.is_some_and(|id| {
                 let node = value.graph.node(id);
                 crate::is_default_domain(&node.domain)
@@ -1517,6 +1553,11 @@ fn constant_equal(
 ) -> Result<bool> {
     if value.graph.inputs.contains(&value.id) {
         return Ok(false);
+    }
+    if value.graph.sparse_initializers.contains_key(&value.id) {
+        return Err(unsupported(
+            "dense literal comparison cannot evaluate a sparse initializer; inspect its preserved sparse payload in a predicate",
+        ));
     }
     let tensor = if let Some(weight) = value.graph.initializers.get(&value.id) {
         match weight {
@@ -1624,13 +1665,14 @@ fn validate_edges(graph: &Graph) -> Result<()> {
                 }
             }
         }
-        for value in &node.outputs {
-            let actual = graph.try_value(*value).ok_or_else(|| {
+        for (slot, value) in node.outputs.iter().enumerate() {
+            let Some(value) = *value else { continue };
+            let actual = graph.try_value(value).ok_or_else(|| {
                 graph_error(format!(
-                    "node {id:?} output {value:?} is missing; create the output first"
+                    "node {id:?} output slot {slot} references missing {value:?}; create the output first"
                 ))
             })?;
-            if producers.insert(*value, id).is_some() || actual.producer != Some(id) {
+            if producers.insert(value, id).is_some() || actual.producer != Some(id) {
                 return Err(graph_error(format!(
                     "output {value:?} has inconsistent/multiple producers; use SSA graph mutation APIs"
                 )));
@@ -1667,6 +1709,7 @@ fn validate_edges(graph: &Graph) -> Result<()> {
         .iter()
         .chain(&graph.outputs)
         .chain(graph.initializers.keys())
+        .chain(graph.sparse_initializers.keys())
     {
         if graph.try_value(*value).is_none() {
             return Err(graph_error(format!(

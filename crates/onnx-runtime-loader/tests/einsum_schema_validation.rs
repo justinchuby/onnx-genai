@@ -176,9 +176,11 @@ fn loader_rejects_einsum_empty_required_output_name() {
     let invalid = invalid.to_string();
     assert!(invalid.contains("<unnamed node #0>"), "{invalid}");
     assert!(invalid.contains("equation `i->i`"), "{invalid}");
-    assert!(invalid.contains("declares 1 output"), "{invalid}");
-    assert!(invalid.contains("required output #0"), "{invalid}");
-    assert!(invalid.contains("empty or omitted name"), "{invalid}");
+    assert!(
+        invalid.contains("requires output slot 0 to be present"),
+        "{invalid}"
+    );
+    assert!(invalid.contains("it is omitted"), "{invalid}");
 }
 
 #[test]

@@ -91,7 +91,7 @@ pub use einsum::{
     EinsumTemporaryValuePlan, EinsumUnaryReductionPlan, EinsumUnsupportedReason, EinsumValueId,
 };
 pub use error::{GraphError, IrError, Result};
-pub use graph::{Graph, ModelFunction, ModelFunctionKey};
+pub use graph::{Graph, GraphAttribute, ModelFunction, ModelFunctionKey};
 pub use graph_view::{ConsumerUse, FrozenGraph, GraphView, GraphViewCache, NodeIndex, ValueIndex};
 pub use layout::{
     MemoryFormat, TensorLayout, broadcast_shapes, compute_contiguous_strides, is_contiguous,

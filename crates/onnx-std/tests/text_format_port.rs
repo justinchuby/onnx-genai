@@ -76,6 +76,98 @@ fn rejects_upstream_missing_opset_separator() {
 }
 
 #[test]
+fn native_function_reference_roundtrip_and_unknown_type_placeholders() {
+    let source = r#"
+<
+  ir_version: 11,
+  opset_import: ["" : 24]
+>
+main (float[2] x) => (float[2] y) {
+  y = Identity <alpha = @"formal,\"a\":x":FLOAT, declared = <type>, declarations = <2 types>>(x)
+}
+"#;
+    let model = assert_print_stable(source);
+    let node = model.graph.nodes.values().next().unwrap();
+    assert!(
+        matches!(node.attr("alpha"), Some(Attribute::Ref { name, kind })
+        if name == "formal,\"a\":x"
+        && *kind == onnx_runtime_ir::onnx::attribute_proto::AttributeType::Float)
+    );
+    assert!(matches!(node.attr("declared"), Some(Attribute::TypeProto(tp)) if tp.value.is_none()));
+    assert!(
+        matches!(node.attr("declarations"), Some(Attribute::TypeProtos(types))
+        if types.iter().all(|tp| tp.value.is_none()))
+    );
+    assert!(from_text(&source.replace(":FLOAT", ":UNKNOWN")).is_err());
+    assert!(from_text(&source.replace(r#""formal,\"a\":x""#, r#""""#)).is_err());
+}
+
+#[test]
+fn unknown_rank_does_not_roundtrip_as_a_scalar() {
+    let source = r#"
+<
+  ir_version: 11,
+  opset_import: ["" : 24]
+>
+main (float x) => (float[] y) {
+  y = Identity(x)
+}
+"#;
+    let parsed = assert_print_stable(source);
+    assert_eq!(parsed.graph.value(parsed.graph.inputs[0]).rank(), None);
+    assert_eq!(parsed.graph.value(parsed.graph.outputs[0]).rank(), Some(0));
+    let proto = parsed.to_proto().unwrap();
+    let model = Model::from_proto(proto.clone()).unwrap();
+    assert_eq!(
+        from_text(&to_text(&model)).unwrap().to_proto().unwrap(),
+        proto
+    );
+}
+
+#[test]
+fn literal_graph_attribute_and_graph_list_marker_are_distinct() {
+    let model = assert_print_stable(
+        r#"
+<
+  ir_version: 11,
+  opset_import: ["" : 24, "custom" : 1]
+>
+main (float[2] x) => (float[2] y) {
+  y = custom.Owner(x)
+  "bodies[0]" = graph
+  (float[2] a) => (float[2] b) {
+    b = Neg(a)
+  }
+  bodies[0] = graph
+  (float[2] a) => (float[2] b) {
+    b = Identity(a)
+  }
+}
+"#,
+    );
+    let root = model.graph.nodes.keys().next().unwrap();
+    assert_eq!(model.graph.subgraphs.len(), 2);
+    assert_eq!(
+        model.graph.subgraphs[&(root, "bodies[0]".into())]
+            .nodes
+            .values()
+            .next()
+            .unwrap()
+            .op_type,
+        "Neg"
+    );
+    assert_eq!(
+        model.graph.subgraphs[&(root, onnx_runtime_ir::GraphAttribute::element("bodies", 0))]
+            .nodes
+            .values()
+            .next()
+            .unwrap()
+            .op_type,
+        "Identity"
+    );
+}
+
+#[test]
 fn quoted_symbolic_dimension_is_stable() {
     let source = r#"
 <

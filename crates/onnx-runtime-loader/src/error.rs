@@ -170,6 +170,36 @@ pub enum LoaderError {
     GraphBuild(String),
 
     #[error(
+        "illegal ONNX model: model-local function {domain}::{name} with overload {overload:?} \
+         is declared more than once. RULES #1: (domain, name, overload) is the canonical \
+         FunctionProto identity and must be unique. Expected: remove or rename one duplicate"
+    )]
+    DuplicateModelFunction {
+        domain: String,
+        name: String,
+        overload: String,
+    },
+
+    #[error(
+        "illegal ONNX model: model-local function {function} has malformed attribute formals: \
+         {detail}. Expected: give every required/defaulted formal a distinct non-empty name and \
+         declare it in exactly one of FunctionProto.attribute or attribute_proto"
+    )]
+    MalformedFunctionAttribute { function: String, detail: String },
+
+    #[error(
+        "illegal ONNX model: node {node} in model-local function {function} has attribute \
+         {attribute:?} referring to undeclared formal attribute {reference:?}. Expected: add \
+         {reference:?} to FunctionProto.attribute or attribute_proto, or fix ref_attr_name"
+    )]
+    UnresolvedFunctionAttributeRef {
+        function: String,
+        node: String,
+        attribute: String,
+        reference: String,
+    },
+
+    #[error(
         "illegal ONNX model: model-local function {function} is recursive (call chain: \
          {chain}). RULES #1: ONNX function bodies may reference other model-local functions \
          but MUST NOT be recursive — inlining cannot terminate. Expected: break the cycle so \

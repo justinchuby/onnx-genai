@@ -124,7 +124,7 @@ fn convert_graph_fp32_to_fp16(graph: &mut Graph, weights: &WeightStore) {
     // 4. Recurse into the indexed control-flow subgraphs (If cos/sin branches),
     //    so the later on-device select lowering materializes fp16 caches. These
     //    branches are pure `Constant` selections with no external initializers.
-    let subgraph_keys: Vec<(NodeId, String)> = graph.subgraphs.keys().cloned().collect();
+    let subgraph_keys: Vec<_> = graph.subgraphs.keys().cloned().collect();
     for key in subgraph_keys {
         if let Some(mut sub) = graph.subgraphs.remove(&key) {
             retype_float_values(&mut sub);

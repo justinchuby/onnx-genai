@@ -133,7 +133,7 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         // not a runtime fault.
         | E::ExternalBuffer { .. } => OrtErrorCode::InvalidArgument,
         E::NoModelSource => OrtErrorCode::NoModel,
-        E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
+        E::UnsupportedOp { .. } | E::UnsupportedModel { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_)
         | E::ExecutionProviderUnavailable(_)
         | E::ExecutionProviderArtifactsPending { .. }
@@ -902,6 +902,12 @@ mod tests {
     fn session_error_mapping_covers_structural_and_shape_variants() {
         use onnx_runtime_session::SessionError as E;
 
+        assert_eq!(
+            map_session_error(&E::UnsupportedModel {
+                reason: "sparse initializer execution is not implemented".into(),
+            }),
+            OrtErrorCode::NotImplemented
+        );
         assert_eq!(
             map_session_error(&E::DanglingEpContext {
                 source_key: Some("QNN".into()),

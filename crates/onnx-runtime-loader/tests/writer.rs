@@ -80,7 +80,11 @@ fn embed_dump_replaces_subgraph_and_round_trips() {
         .iter()
         .map(|s| name_of(&g2, s.unwrap()))
         .collect();
-    let outs: Vec<String> = n.outputs().iter().map(|v| name_of(&g2, *v)).collect();
+    let outs: Vec<String> = n
+        .outputs()
+        .iter()
+        .map(|v| name_of(&g2, v.expect("EPContext output must be present")))
+        .collect();
     assert_eq!(ins, vec!["X".to_string()]);
     assert_eq!(outs, vec!["Y".to_string()]);
 
@@ -293,7 +297,7 @@ fn multiple_partition_boundaries_keep_documented_order_and_attributes() {
     assert_eq!(
         a.outputs()
             .iter()
-            .map(|&value| name_of(&dumped, value))
+            .map(|&value| name_of(&dumped, value.expect("EPContext output must be present")))
             .collect::<Vec<_>>(),
         ["A"]
     );
@@ -311,7 +315,7 @@ fn multiple_partition_boundaries_keep_documented_order_and_attributes() {
     assert_eq!(
         b.outputs()
             .iter()
-            .map(|&value| name_of(&dumped, value))
+            .map(|&value| name_of(&dumped, value.expect("EPContext output must be present")))
             .collect::<Vec<_>>(),
         ["B"]
     );
@@ -329,7 +333,7 @@ fn multiple_partition_boundaries_keep_documented_order_and_attributes() {
     assert_eq!(
         c.outputs()
             .iter()
-            .map(|&value| name_of(&dumped, value))
+            .map(|&value| name_of(&dumped, value.expect("EPContext output must be present")))
             .collect::<Vec<_>>(),
         ["C_mid"]
     );
@@ -543,7 +547,12 @@ fn duplicate_primary_identity_round_trips_external() {
     }
     // Identify each reloaded node by its boundary output name (partition 0
     // produces "A", partition 1 produces "B") so we can tie each to its own blob.
-    nodes.sort_by_key(|n| name_of(&g2, n.outputs()[0]));
+    nodes.sort_by_key(|n| {
+        name_of(
+            &g2,
+            n.outputs()[0].expect("EPContext output must be present"),
+        )
+    });
 
     let r0 = resolve_ep_context(&dir, &nodes[0]).expect("resolve blob 0");
     let r1 = resolve_ep_context(&dir, &nodes[1]).expect("resolve blob 1");

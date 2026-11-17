@@ -139,6 +139,58 @@ fn absent_slots_present_wildcards_repeated_optional_and_exact_arity() {
 }
 
 #[test]
+fn absent_output_slots_are_distinct_from_present_wildcards() {
+    let absent =
+        Pattern::parse_ort("(x)=>{y,None=Dropout(x);return y}").expect("absent output pattern");
+    let present =
+        Pattern::parse_ort("(x)=>{y,_=Dropout(x);return y}").expect("present output pattern");
+
+    let mut graph = Graph::new();
+    let x = input(&mut graph, "x");
+    let y = graph.create_value(DataType::Float32, vec![2.into()]);
+    let root = graph.insert_node(Node::new_with_output_slots(
+        NodeId(0),
+        "Dropout",
+        vec![Some(x)],
+        vec![Some(y), None],
+    ));
+    assert!(
+        MatchSession::new(&graph)
+            .unwrap()
+            .match_at(&absent, root, Default::default())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        MatchSession::new(&graph)
+            .unwrap()
+            .match_at(&present, root, Default::default())
+            .unwrap()
+            .is_none()
+    );
+
+    let mask = graph.create_value(DataType::Bool, vec![2.into()]);
+    graph.replace_node(
+        root,
+        Node::new(NodeId(0), "Dropout", vec![Some(x)], vec![y, mask]),
+    );
+    assert!(
+        MatchSession::new(&graph)
+            .unwrap()
+            .match_at(&absent, root, Default::default())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        MatchSession::new(&graph)
+            .unwrap()
+            .match_at(&present, root, Default::default())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn literal_ort_alternative_fixture_and_predicate_rollback() {
     // ORT Pattern_Rewriter.md, "Matching alternatives at one root", pinned in
     // docs/architecture/IR_PATTERNS.md. Independently constructed IR fixture.
@@ -808,12 +860,7 @@ fn descendant_capture_is_a_boundary_use_and_capture_dependencies_cannot_cycle() 
     );
     drop(session);
     // owner -> a -> capture(owner) is an implicit dependency cycle.
-    let replacement = Node::new(
-        NodeId(0),
-        "Identity",
-        vec![Some(graph.node(owner).outputs[0])],
-        a,
-    );
+    let replacement = Node::new(NodeId(0), "Identity", vec![graph.node(owner).outputs[0]], a);
     graph.replace_node(NodeId(0), replacement);
     let error = MatchSession::new(&graph).err().unwrap();
     assert_eq!(error.kind, PatternErrorKind::InvalidGraph);
@@ -1100,7 +1147,7 @@ fn repeated_tensor_attributes_charge_string_names_and_sparse_dimensions() {
         dtype: DataType::String,
         dims: vec![1],
         data: vec![],
-        strings: vec!["x".repeat(512)],
+        strings: vec![vec![b'x'; 512]],
     };
     let mut named = TensorData::from_raw(DataType::Float32, vec![0], vec![]);
     named.name = Some("n".repeat(512));

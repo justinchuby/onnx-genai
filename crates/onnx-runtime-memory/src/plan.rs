@@ -199,7 +199,7 @@ where
 
     // Walk nodes in topological order.
     for (i, &node_id) in live.order.iter().enumerate() {
-        for &out in &graph.node(node_id).outputs {
+        for out in graph.node(node_id).output_values() {
             if !live.intervals.contains_key(&out) {
                 continue; // view / weight / excluded output — no slot
             }

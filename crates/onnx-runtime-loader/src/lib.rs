@@ -44,7 +44,7 @@ use onnx_runtime_ir::{Graph, WeightRef};
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 use onnx_runtime_tracer::{Args, SpanGuard};
 
-use crate::graph_builder::BuiltGraph;
+use crate::graph_builder::{BuiltGraph, FunctionLoading};
 
 pub mod encoder;
 pub mod epcontext;
@@ -97,6 +97,16 @@ pub fn load_model(path: impl AsRef<Path>) -> Result<Graph, LoaderError> {
     Ok(load_model_with_weights(path)?.0)
 }
 
+/// Load a model into source-preserving IR without execution lowering.
+///
+/// Unlike [`load_model`], this keeps model-local function calls and their
+/// declarations intact and does not run shape inference or execution-only
+/// validation. Use this API for inspection, transformation, and round-tripping;
+/// use [`load_model`] when preparing a graph for runtime execution.
+pub fn load_model_ir(path: impl AsRef<Path>) -> Result<Graph, LoaderError> {
+    Ok(load_model_ir_with_weights(path)?.0)
+}
+
 /// Load a model from an in-memory protobuf buffer, producing a [`Graph`].
 ///
 /// External initializer data (if any) is resolved relative to the current
@@ -109,6 +119,13 @@ pub fn load_model(path: impl AsRef<Path>) -> Result<Graph, LoaderError> {
 /// keep them live.
 pub fn load_model_bytes(bytes: &[u8]) -> Result<Graph, LoaderError> {
     Ok(load_model_bytes_with_weights(bytes, Path::new("."))?.0)
+}
+
+/// Load in-memory ONNX bytes into source-preserving IR.
+///
+/// This is the byte-buffer counterpart of [`load_model_ir`].
+pub fn load_model_ir_bytes(bytes: &[u8]) -> Result<Graph, LoaderError> {
+    Ok(load_model_ir_bytes_with_weights(bytes, Path::new("."))?.0)
 }
 
 /// Load a model from a filesystem path, returning both the [`Graph`] and the
@@ -128,7 +145,18 @@ pub fn load_model_with_weights(
     let path = path.as_ref();
     let bytes = read_model_binary(path)?;
     let model_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    build_from_bytes_with_weights(&bytes, model_dir, None)
+    build_from_bytes_with_weights(&bytes, model_dir, FunctionLoading::InlineAll)
+}
+
+/// Load a model and weights into source-preserving IR without lowering
+/// model-local functions or applying runtime execution policy.
+pub fn load_model_ir_with_weights(
+    path: impl AsRef<Path>,
+) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
+    let path = path.as_ref();
+    let bytes = read_model_binary(path)?;
+    let model_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    build_source_ir_from_bytes_with_weights(&bytes, model_dir)
 }
 
 /// Read a model file into the binary protobuf bytes of its `ModelProto`.
@@ -195,7 +223,19 @@ pub fn load_model_bytes_with_weights(
     bytes: &[u8],
     base_dir: impl AsRef<Path>,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
-    build_from_bytes_with_weights(bytes, base_dir.as_ref(), None)
+    build_from_bytes_with_weights(bytes, base_dir.as_ref(), FunctionLoading::InlineAll)
+}
+
+/// Load in-memory ONNX bytes and weights into source-preserving IR.
+///
+/// Function calls, overloads, declarations, formal/default attributes,
+/// `ref_attr_name` bindings, and function-local opset imports are retained.
+/// Shape inference and execution-only validation are intentionally not run.
+pub fn load_model_ir_bytes_with_weights(
+    bytes: &[u8],
+    base_dir: impl AsRef<Path>,
+) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
+    build_source_ir_from_bytes_with_weights(bytes, base_dir.as_ref())
 }
 
 /// Like [`load_model_bytes_with_weights`], but a matched function-call node is
@@ -209,33 +249,100 @@ pub fn load_model_bytes_with_weights_filtered(
     base_dir: impl AsRef<Path>,
     keep_as_op: &function_inline::KeepAsOp<'_>,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
-    build_from_bytes_with_weights(bytes, base_dir.as_ref(), Some(keep_as_op))
+    build_from_bytes_with_weights(
+        bytes,
+        base_dir.as_ref(),
+        FunctionLoading::InlineFiltered(keep_as_op),
+    )
 }
 
 fn build_from_bytes_with_weights(
     bytes: &[u8],
     model_dir: &Path,
-    keep_as_op: Option<&function_inline::KeepAsOp<'_>>,
+    function_loading: FunctionLoading<'_>,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
     let model = parse_model(bytes)?;
     validate_proto(&model)?;
     let BuiltGraph {
         mut graph,
         name_map,
-    } = build_graph(&model, keep_as_op)?;
+    } = build_graph(&model, function_loading)?;
 
     // Fail-fast legality check that needs no weights: reject illegal opset
     // imports before we touch the (potentially large) weight files.
     validate_opset_imports(&graph)?;
 
-    let store = load_weights(&model, model_dir, &name_map)?;
+    let mut store = load_weights(&model, model_dir, &name_map)?;
     attach_weights(&mut graph, &store);
+    weights::resolve_nested_weights(&mut graph, model_dir, &mut store)?;
 
     validate_ir(&graph)?;
     validate_loaded_model(&graph)?;
     infer_shapes(&mut graph)?;
 
     Ok((graph, Arc::new(store)))
+}
+
+fn build_source_ir_from_bytes_with_weights(
+    bytes: &[u8],
+    model_dir: &Path,
+) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
+    let model = parse_model(bytes)?;
+    validate_source_model_proto(&model)?;
+    let BuiltGraph {
+        mut graph,
+        name_map,
+    } = build_graph(&model, FunctionLoading::Preserve)?;
+    let mut store = load_weights(&model, model_dir, &name_map)?;
+    attach_weights(&mut graph, &store);
+    weights::resolve_nested_weights(&mut graph, model_dir, &mut store)?;
+    onnx_runtime_ir::pattern::MatchSession::new(&graph)
+        .map_err(|error| LoaderError::GraphBuild(error.to_string()))?;
+    validate_no_initializer_producer(&graph)?;
+    Ok((graph, Arc::new(store)))
+}
+
+fn validate_source_model_proto(model: &proto::onnx::ModelProto) -> Result<(), LoaderError> {
+    if model.ir_version < 1 {
+        return Err(LoaderError::InvalidIrVersion {
+            ir_version: model.ir_version,
+        });
+    }
+    if model.ir_version >= 3 && model.opset_import.is_empty() {
+        return Err(LoaderError::MissingModelOpsetImport {
+            ir_version: model.ir_version,
+        });
+    }
+
+    fn reject_root_refs(graph: &proto::onnx::GraphProto) -> Result<(), LoaderError> {
+        for (index, node) in graph.node.iter().enumerate() {
+            let node_name = if node.name.is_empty() {
+                format!("<unnamed node #{index}>")
+            } else {
+                format!("{:?}", node.name)
+            };
+            for attribute in &node.attribute {
+                if !attribute.ref_attr_name.is_empty() {
+                    return Err(LoaderError::RefAttributeOutsideFunction {
+                        op_type: node.op_type.clone(),
+                        node: node_name.clone(),
+                        domain: display_domain(&node.domain),
+                        attr: attribute.name.clone(),
+                        ref_attr_name: attribute.ref_attr_name.clone(),
+                    });
+                }
+                for nested in attribute.g.iter().chain(&attribute.graphs) {
+                    reject_root_refs(nested)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    if let Some(graph) = &model.graph {
+        reject_root_refs(graph)?;
+    }
+    Ok(())
 }
 
 fn parse_model(bytes: &[u8]) -> Result<proto::onnx::ModelProto, LoaderError> {
@@ -262,10 +369,10 @@ fn validate_proto(model: &proto::onnx::ModelProto) -> Result<(), LoaderError> {
 
 fn build_graph(
     model: &proto::onnx::ModelProto,
-    keep_as_op: Option<&function_inline::KeepAsOp<'_>>,
+    function_loading: FunctionLoading<'_>,
 ) -> Result<BuiltGraph, LoaderError> {
     let mut span = trace_span("load.build_graph", "load");
-    let built = graph_builder::build_graph(model, keep_as_op)?;
+    let built = graph_builder::build_graph(model, function_loading)?;
     if let Some(span) = span.as_mut() {
         span.set_args(
             Args::new()
@@ -469,7 +576,14 @@ pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
                     ),
                 });
             }
-            let output_id = node.outputs[0];
+            let Some(output_id) = node.outputs[0] else {
+                return Err(LoaderError::InvalidEinsum {
+                    node: node_label(node),
+                    detail: format!(
+                        "equation `{equation}` requires output slot 0 to be present, but it is omitted"
+                    ),
+                });
+            };
             let output = graph.values.get(output_id).ok_or_else(|| LoaderError::InvalidEinsum {
                 node: node_label(node),
                 detail: format!(
@@ -802,7 +916,7 @@ pub fn validate_no_dangling_refs(graph: &Graph) -> Result<(), LoaderError> {
             };
             let is_sourced = value.producer.is_some()
                 || graph_inputs.contains(&vid)
-                || graph.initializers.contains_key(&vid);
+                || graph.is_initializer(vid);
             if !is_sourced {
                 let tensor = value
                     .name
@@ -838,7 +952,11 @@ pub fn validate_no_dangling_refs(graph: &Graph) -> Result<(), LoaderError> {
 /// fast and cleanly regardless of the execution path. We name the tensor and
 /// the offending producing node.
 pub fn validate_no_initializer_producer(graph: &Graph) -> Result<(), LoaderError> {
-    for &vid in graph.initializers.keys() {
+    for &vid in graph
+        .initializers
+        .keys()
+        .chain(graph.sparse_initializers.keys())
+    {
         let Some(value) = graph.values.get(vid) else {
             continue;
         };

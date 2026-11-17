@@ -1,5 +1,61 @@
 use super::*;
 
+pub(crate) fn ensure_execution_supported(graph: &Graph) -> Result<()> {
+    if !graph.sparse_initializers.is_empty() {
+        return Err(SessionError::UnsupportedModel {
+            reason: format!(
+                "{} sparse initializer(s) are present; convert them to dense TensorProto initializers before creating a session",
+                graph.sparse_initializers.len()
+            ),
+        });
+    }
+    let overridable: Vec<_> = graph
+        .inputs
+        .iter()
+        .copied()
+        .filter(|value| graph.initializers.contains_key(value))
+        .map(|value| {
+            graph
+                .value(value)
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{value:?}"))
+        })
+        .collect();
+    if !overridable.is_empty() {
+        return Err(SessionError::UnsupportedModel {
+            reason: format!(
+                "initializer-backed graph input(s) {} are overridable defaults, which execution does not support yet; remove them from graph inputs or bind them through a runtime that supports overridable initializers",
+                overridable.join(", ")
+            ),
+        });
+    }
+    if let Some((node, slots)) = graph.nodes.iter().find_map(|(id, node)| {
+        let slots: Vec<_> = node
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, output)| output.is_none().then_some(slot))
+            .collect();
+        (!slots.is_empty()).then_some((id, slots))
+    }) {
+        let payload = graph.node(node);
+        return Err(SessionError::UnsupportedModel {
+            reason: format!(
+                "node {:?} ({}) omits optional output slot(s) {}; execution does not yet route absent output slots without fabricating buffers, so re-export with those outputs present or use the source-preserving IR/encoder path",
+                node,
+                payload.op_type,
+                slots
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Count default-domain `Scan` nodes in a graph — the population
 /// [`Executor::build_decode_inline_sibling`] compares before/after inlining to
 /// decide whether a decode-inline plan is warranted.
@@ -128,7 +184,9 @@ pub(super) fn rewrite_kv_capacity_appends(graph: &mut Graph, ep: &dyn ExecutionP
         let (Some(past), Some(current)) = (node.inputs[0], node.inputs[1]) else {
             continue;
         };
-        let present = node.outputs[0];
+        let Some(present) = node.outputs[0] else {
+            continue;
+        };
 
         // The eligibility classifier proves the *value provenance* of this
         // `Concat`'s output is safe (it structurally reaches a proven-safe
@@ -207,10 +265,10 @@ pub(super) fn rewrite_kv_capacity_appends(graph: &mut Graph, ep: &dyn ExecutionP
 }
 
 pub(super) fn validate_if_branch_outputs(graph: &Graph, node: &Node) -> Result<()> {
-    let Some(then_branch) = graph.subgraphs.get(&(node.id, "then_branch".to_string())) else {
+    let Some(then_branch) = graph.subgraphs.get(&(node.id, "then_branch".into())) else {
         return Ok(());
     };
-    let Some(else_branch) = graph.subgraphs.get(&(node.id, "else_branch".to_string())) else {
+    let Some(else_branch) = graph.subgraphs.get(&(node.id, "else_branch".into())) else {
         return Ok(());
     };
 
@@ -889,6 +947,7 @@ impl Executor {
         require_cuda: bool,
         hetero_enabled: bool,
     ) -> Result<Self> {
+        ensure_execution_supported(&graph)?;
         if hetero_enabled && !require_cuda && ep.device_type() != DeviceType::Cpu {
             let cpu = auto_detect_cpu_ep()?;
             let providers = vec![
@@ -1614,7 +1673,7 @@ impl Executor {
             value_dtypes.entry(vid).or_insert(graph.value(vid).dtype);
         }
         for &nid in order {
-            for &out in &graph.node(nid).outputs {
+            for out in graph.node(nid).output_values() {
                 value_shapes
                     .entry(out)
                     .or_insert_with(|| graph.value(out).shape.clone());
@@ -1639,7 +1698,7 @@ impl Executor {
         for &nid in order {
             let node = graph.node(nid);
             if produces_sequence_output(&node.op_type, &node.domain) {
-                for &out in &node.outputs {
+                for out in node.output_values() {
                     sequence_values.insert(out);
                 }
             }
@@ -1649,7 +1708,7 @@ impl Executor {
         for &nid in order {
             let node = graph.node(nid);
             if is_control_flow_op(&node.op_type, &node.domain) {
-                for &out in &node.outputs {
+                for out in node.output_values() {
                     control_flow_output_values.insert(out);
                 }
             }
@@ -1694,7 +1753,7 @@ impl Executor {
                 slots.pop();
             }
             let inputs = slots;
-            let outputs: Vec<ValueId> = node.outputs.clone();
+            let outputs: Vec<ValueId> = node.output_values().collect();
             let input_dtypes: Vec<DataType> = inputs
                 .iter()
                 .map(|v| {

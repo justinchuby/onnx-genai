@@ -49,7 +49,7 @@ fn fuses_matmul_add() {
     assert!(g.validate().is_ok());
     // Output still a graph output.
     assert_eq!(g.outputs.len(), 1);
-    assert_eq!(fused.outputs, g.outputs);
+    assert_eq!(fused.output_values().collect::<Vec<_>>(), g.outputs);
 }
 
 #[test]
@@ -255,7 +255,7 @@ fn fuses_layernorm_chain() {
         (eps - 1e-12).abs() < 1e-18,
         "epsilon extracted from the var+eps constant, got {eps}"
     );
-    assert_eq!(fused.outputs, g.outputs);
+    assert_eq!(fused.output_values().collect::<Vec<_>>(), g.outputs);
     assert!(g.validate().is_ok());
 }
 
@@ -429,7 +429,7 @@ fn fuses_layernorm_split_chain() {
         (eps - 1e-12).abs() < 1e-18,
         "epsilon extracted from the var+eps constant, got {eps}"
     );
-    assert_eq!(fused.outputs, g.outputs);
+    assert_eq!(fused.output_values().collect::<Vec<_>>(), g.outputs);
     assert!(g.validate().is_ok());
 }
 
@@ -1410,7 +1410,7 @@ fn fuses_gelu_div_sqrt2() {
         .map(|(id, _)| id)
         .unwrap();
     assert_eq!(fused.inputs[0], Some(x));
-    assert_eq!(fused.outputs, g.outputs);
+    assert_eq!(fused.output_values().collect::<Vec<_>>(), g.outputs);
     assert!(g.nodes.values().all(|n| n.op_type != "Erf"));
     assert!(g.validate().is_ok());
 }
@@ -1600,7 +1600,7 @@ fn serialized_graph_bytes(mut graph: Graph) -> Vec<u8> {
     opsets.sort_by_key(|(domain, _)| *domain);
     writeln!(&mut snapshot, "opsets={opsets:?}").unwrap();
     let mut subgraphs: Vec<_> = graph.subgraphs.iter().collect();
-    subgraphs.sort_by_key(|((id, name), _)| (id.0, name.as_str()));
+    subgraphs.sort_by_key(|((id, location), _)| (id.0, location));
     writeln!(&mut snapshot, "subgraphs={subgraphs:?}").unwrap();
 
     for (id, node) in graph.nodes.iter() {

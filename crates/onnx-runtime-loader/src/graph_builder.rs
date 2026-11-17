@@ -26,6 +26,12 @@ pub(crate) struct BuiltGraph {
     pub(crate) name_map: HashMap<String, ValueId>,
 }
 
+pub(crate) enum FunctionLoading<'a> {
+    InlineAll,
+    InlineFiltered(&'a crate::function_inline::KeepAsOp<'a>),
+    Preserve,
+}
+
 /// Build the IR graph (nodes, values, symbols, opsets) from a `ModelProto`.
 ///
 /// Weights and shape inference are applied by later pipeline stages.
@@ -46,33 +52,24 @@ pub(crate) struct BuiltGraph {
 /// [`Graph::validate`]: onnx_runtime_ir::Graph::validate
 pub(crate) fn build_graph(
     model: &ModelProto,
-    keep_as_op: Option<&crate::function_inline::KeepAsOp<'_>>,
+    function_loading: FunctionLoading<'_>,
 ) -> Result<BuiltGraph, LoaderError> {
-    let (model_functions, ambiguous_model_functions) = build_model_function_catalog(model)?;
-    // Expand any model-local function calls into their primitive bodies before
-    // building the IR, so the rest of the pipeline only ever sees ops the
-    // runtime has kernels for. No-op (borrow) when the model declares no
-    // functions. When `keep_as_op` is supplied, a function call a fused kernel
-    // claims is kept as an op instead of being inlined.
-    let inlined = match keep_as_op {
-        Some(keep) => crate::function_inline::inline_functions_filtered(model, keep)?,
-        None => crate::function_inline::inline_functions(model)?,
+    let model_functions = build_model_function_catalog(model)?;
+    // Runtime loading explicitly lowers function calls. Fidelity loading keeps
+    // the source call graph intact and carries the declarations in the IR.
+    let inlined = match function_loading {
+        FunctionLoading::InlineAll => crate::function_inline::inline_functions(model)?,
+        FunctionLoading::InlineFiltered(keep) => {
+            crate::function_inline::inline_functions_filtered(model, keep)?
+        }
+        FunctionLoading::Preserve => std::borrow::Cow::Borrowed(model),
     };
     let model = inlined.as_ref();
 
     let mut graph = Graph::new();
     graph.model_functions = model_functions;
-    graph.ambiguous_model_functions = ambiguous_model_functions;
 
-    // Opset imports: domain -> version.
-    for opset in &model.opset_import {
-        if opset.version > 0 {
-            graph.opset_imports.insert(
-                normalize_domain(&opset.domain).to_string(),
-                opset.version as u64,
-            );
-        }
-    }
+    graph.opset_imports = import_opsets(&model.opset_import, "model")?;
 
     let graph_proto = model
         .graph
@@ -84,110 +81,170 @@ pub(crate) fn build_graph(
     Ok(BuiltGraph { graph, name_map })
 }
 
-fn attribute_proto_has_ref_attr(attribute: &AttributeProto) -> bool {
-    if !attribute.ref_attr_name.is_empty() {
-        return true;
-    }
-    attribute
-        .g
-        .iter()
-        .chain(attribute.graphs.iter())
-        .any(graph_proto_has_ref_attr)
-}
-
-fn graph_proto_has_ref_attr(graph: &GraphProto) -> bool {
-    graph
-        .node
-        .iter()
-        .any(|node| node.attribute.iter().any(attribute_proto_has_ref_attr))
-}
-
-fn function_attribute_names(func: &onnx::FunctionProto) -> Vec<String> {
-    let mut attributes = func.attribute.clone();
-    attributes.extend(
-        func.attribute_proto
-            .iter()
-            .map(|attr| attr.name.clone())
-            .filter(|name| !name.is_empty()),
-    );
-    attributes.sort();
-    attributes.dedup();
-    attributes
-}
-
 fn build_model_function_catalog(
     model: &ModelProto,
-) -> Result<
-    (
-        HashMap<ModelFunctionKey, ModelFunction>,
-        std::collections::HashSet<ModelFunctionKey>,
-    ),
-    LoaderError,
-> {
+) -> Result<HashMap<ModelFunctionKey, ModelFunction>, LoaderError> {
     let mut functions: HashMap<ModelFunctionKey, ModelFunction> = HashMap::new();
-    let mut ambiguous = std::collections::HashSet::new();
     for func in &model.functions {
-        let key = (
-            normalize_domain(&func.domain).to_string(),
-            func.name.clone(),
-        );
-        if ambiguous.contains(&key) {
-            continue;
-        }
+        let key = ModelFunctionKey::from_function(func);
         if functions.contains_key(&key) {
-            functions.remove(&key);
-            ambiguous.insert(key);
-            continue;
+            return Err(LoaderError::DuplicateModelFunction {
+                domain: key.domain,
+                name: key.name,
+                overload: key.overload,
+            });
         }
 
+        validate_function_attribute_bindings(func)?;
+        let value_info: HashMap<&str, &onnx::ValueInfoProto> = func
+            .value_info
+            .iter()
+            .map(|value| (value.name.as_str(), value))
+            .collect();
         let gp = GraphProto {
             input: func
                 .input
                 .iter()
-                .map(|name| onnx::ValueInfoProto {
-                    name: name.clone(),
-                    ..Default::default()
+                .map(|name| {
+                    value_info.get(name.as_str()).map_or_else(
+                        || onnx::ValueInfoProto {
+                            name: name.clone(),
+                            ..Default::default()
+                        },
+                        |value| (*value).clone(),
+                    )
                 })
                 .collect(),
             output: func
                 .output
                 .iter()
-                .map(|name| onnx::ValueInfoProto {
-                    name: name.clone(),
-                    ..Default::default()
+                .map(|name| {
+                    value_info.get(name.as_str()).map_or_else(
+                        || onnx::ValueInfoProto {
+                            name: name.clone(),
+                            ..Default::default()
+                        },
+                        |value| (*value).clone(),
+                    )
                 })
                 .collect(),
+            value_info: func.value_info.clone(),
             node: func.node.clone(),
             ..Default::default()
         };
         let mut body = build_subgraph(&gp)?;
-        for opset in &func.opset_import {
-            if opset.version > 0 {
-                body.opset_imports.insert(
-                    normalize_domain(&opset.domain).to_string(),
-                    opset.version as u64,
-                );
-            }
-        }
-        let attributes = function_attribute_names(func);
-        let has_attribute_refs = func
-            .node
-            .iter()
-            .any(|node| node.attribute.iter().any(attribute_proto_has_ref_attr));
+        body.opset_imports = import_opsets(&func.opset_import, &function_label(&key))?;
+        onnx_runtime_ir::pattern::MatchSession::new(&body).map_err(|error| {
+            LoaderError::GraphBuild(format!(
+                "model-local function {} has invalid graph structure: {error}",
+                function_label(&key)
+            ))
+        })?;
         functions.insert(
             key,
             ModelFunction {
-                domain: normalize_domain(&func.domain).to_string(),
-                name: func.name.clone(),
-                inputs: func.input.clone(),
-                outputs: func.output.clone(),
-                attributes,
-                has_attribute_refs,
+                declaration: func.clone(),
                 body,
             },
         );
     }
-    Ok((functions, ambiguous))
+    Ok(functions)
+}
+
+fn import_opsets(
+    imports: &[onnx::OperatorSetIdProto],
+    context: &str,
+) -> Result<HashMap<String, u64>, LoaderError> {
+    let mut resolved = HashMap::new();
+    for import in imports {
+        let domain = normalize_domain(&import.domain).to_string();
+        if import.version <= 0 {
+            return Err(LoaderError::GraphBuild(format!(
+                "{context}: domain {:?} imports invalid opset {}; declare a positive version",
+                import.domain, import.version
+            )));
+        }
+        if resolved.insert(domain, import.version as u64).is_some() {
+            return Err(LoaderError::GraphBuild(format!(
+                "{context}: domain {:?} has duplicate opset imports; declare each canonical domain once",
+                import.domain
+            )));
+        }
+    }
+    Ok(resolved)
+}
+
+fn validate_function_attribute_bindings(func: &onnx::FunctionProto) -> Result<(), LoaderError> {
+    let key = ModelFunctionKey::from_function(func);
+    let function = function_label(&key);
+    let mut formals = std::collections::HashSet::new();
+    for name in &func.attribute {
+        if name.is_empty() || !formals.insert(name.as_str()) {
+            return Err(LoaderError::MalformedFunctionAttribute {
+                function,
+                detail: format!("required formal attribute {name:?} is empty or duplicated"),
+            });
+        }
+    }
+    for default in &func.attribute_proto {
+        if default.name.is_empty() || !formals.insert(default.name.as_str()) {
+            return Err(LoaderError::MalformedFunctionAttribute {
+                function,
+                detail: format!(
+                    "defaulted formal attribute {:?} is empty, duplicated, or also required",
+                    default.name
+                ),
+            });
+        }
+    }
+
+    fn validate_graph_refs(
+        graph: &GraphProto,
+        formals: &std::collections::HashSet<&str>,
+        function: &str,
+    ) -> Result<(), LoaderError> {
+        for node in &graph.node {
+            for attribute in &node.attribute {
+                if !attribute.ref_attr_name.is_empty()
+                    && !formals.contains(attribute.ref_attr_name.as_str())
+                {
+                    return Err(LoaderError::UnresolvedFunctionAttributeRef {
+                        function: function.to_string(),
+                        node: if node.name.is_empty() {
+                            format!("{}::{}", node.domain, node.op_type)
+                        } else {
+                            node.name.clone()
+                        },
+                        attribute: attribute.name.clone(),
+                        reference: attribute.ref_attr_name.clone(),
+                    });
+                }
+                for nested in attribute.g.iter().chain(&attribute.graphs) {
+                    validate_graph_refs(nested, formals, function)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let body = GraphProto {
+        node: func.node.clone(),
+        ..Default::default()
+    };
+    validate_graph_refs(&body, &formals, &function)
+}
+
+fn function_label(key: &ModelFunctionKey) -> String {
+    let domain = if key.domain.is_empty() {
+        "ai.onnx"
+    } else {
+        &key.domain
+    };
+    if key.overload.is_empty() {
+        format!("{domain}::{}", key.name)
+    } else {
+        format!("{domain}::{}:{}", key.name, key.overload)
+    }
 }
 
 /// Populate `graph` from a `GraphProto`. When `is_top_level` is true, inputs
@@ -203,10 +260,18 @@ fn build_graph_proto(
     // 1. Initializers: fully-typed source values (producer = None).
     for init in &gp.initializer {
         if init.name.is_empty() {
-            continue;
+            return Err(LoaderError::GraphBuild(
+                "initializer has no name; assign a unique value name before loading".into(),
+            ));
+        }
+        if names.contains_key(&init.name) {
+            return Err(LoaderError::GraphBuild(format!(
+                "duplicate initializer name {:?}; assign unique initializer identities",
+                init.name
+            )));
         }
         let dtype = decode_dtype(init.data_type, || format!("initializer '{}'", init.name))?;
-        let dims_vec: Vec<usize> = init.dims.iter().map(|&d| d.max(0) as usize).collect();
+        let dims_vec = checked_dims(&init.dims, &format!("initializer {:?}", init.name))?;
         let shape: Shape = dims_vec.iter().copied().map(Dim::Static).collect();
         let vid = graph.create_named_value(init.name.clone(), dtype, shape);
         names.insert(init.name.clone(), vid);
@@ -214,21 +279,71 @@ fn build_graph_proto(
         // top-level weight loader (`weights::load_weights` only walks the root
         // `GraphProto`), so a control-flow body's own constants would otherwise
         // be producer-less values with no data — indistinguishable from an
-        // outer-scope capture, and unrunnable. Inline their bytes here so the
-        // subgraph is a self-contained runnable graph. Only inline-encoded
-        // initializers are supported inside subgraphs; an external-data body
-        // initializer is left unbound and surfaces as a clear missing-source
-        // error at execution rather than being silently mis-read.
-        if !is_top_level
-            && init.data_location != crate::proto::onnx::tensor_proto::DataLocation::External as i32
-        {
-            let td = crate::weights::tensor_data_from_proto(init, dtype, &dims_vec)?;
-            graph.set_initializer(vid, onnx_runtime_ir::WeightRef::Inline(td));
+        // outer-scope capture. Attach inline bytes or a model-relative external
+        // descriptor now; the loader resolves nested external mappings later.
+        if !is_top_level {
+            let weight = if init.data_location == onnx::tensor_proto::DataLocation::External as i32
+            {
+                crate::weights::external_initializer_reference(
+                    init,
+                    dtype,
+                    dims_vec,
+                    std::path::Path::new(""),
+                )?
+            } else {
+                onnx_runtime_ir::WeightRef::Inline(crate::weights::tensor_data_from_proto(
+                    init, dtype, &dims_vec,
+                )?)
+            };
+            graph.set_initializer(vid, weight);
         }
     }
 
-    // 2. Graph inputs. Names that are also initializers are constants, not
-    //    real graph inputs (invariant §3.5.3). Both the top-level graph and
+    for init in &gp.sparse_initializer {
+        let values = init.values.as_ref().ok_or_else(|| {
+            LoaderError::GraphBuild(
+                "sparse initializer is missing values; provide a named TensorProto".into(),
+            )
+        })?;
+        if values.name.is_empty() || names.contains_key(&values.name) {
+            return Err(LoaderError::GraphBuild(format!(
+                "sparse initializer name {:?} is empty or duplicated; assign a unique values.name",
+                values.name
+            )));
+        }
+        let indices = init.indices.as_ref().ok_or_else(|| {
+            LoaderError::GraphBuild(format!(
+                "sparse initializer {:?} is missing indices; provide int64 COO indices",
+                values.name
+            ))
+        })?;
+        let dtype = decode_dtype(values.data_type, || {
+            format!("sparse initializer {:?}", values.name)
+        })?;
+        let dims = checked_dims(&init.dims, &format!("sparse initializer {:?}", values.name))?;
+        checked_dims(&values.dims, &format!("sparse values {:?}", values.name))?;
+        checked_dims(&indices.dims, &format!("sparse indices {:?}", values.name))?;
+        if dtype == DataType::Undefined
+            || indices.data_type != DataType::Int64.to_onnx()
+            || values.dims.len() != 1
+            || !(indices.dims == values.dims || indices.dims == [values.dims[0], dims.len() as i64])
+        {
+            return Err(LoaderError::GraphBuild(format!(
+                "sparse initializer {:?} has invalid dtype/COO shapes; use values [nnz] and int64 indices [nnz] or [nnz,rank]",
+                values.name
+            )));
+        }
+        validate_sparse_payload(init, &dims)?;
+        let vid = graph.create_named_value(
+            values.name.clone(),
+            dtype,
+            dims.into_iter().map(Dim::Static).collect(),
+        );
+        names.insert(values.name.clone(), vid);
+        graph.sparse_initializers.insert(vid, init.clone());
+    }
+
+    // 2. Graph inputs, including overridable initializer defaults. Both the top-level graph and
     //    control-flow subgraph bodies record their formal input signature in
     //    `graph.inputs`, in declared order: a subgraph body's formal parameters
     //    (e.g. Loop's `iter_num`/`cond`/loop-carried, Scan's state/scan slices)
@@ -237,11 +352,29 @@ fn build_graph_proto(
         if vi.name.is_empty() {
             continue;
         }
-        if names.contains_key(&vi.name) {
-            continue; // initializer-backed constant input
+        if let Some(&vid) = names.get(&vi.name) {
+            if graph.inputs.contains(&vid) {
+                return Err(LoaderError::GraphBuild(format!(
+                    "duplicate graph input {:?}; declare each formal once",
+                    vi.name
+                )));
+            }
+            if let Some(tp) = &vi.r#type {
+                validate_type_proto(tp, &vi.name, 0)?;
+                validate_initializer_type(graph, vid, tp, &vi.name)?;
+            }
+            let (dtype, shape, type_known, shape_known) = value_info_type(graph, vi)?;
+            let value = graph.value_mut(vid);
+            value.declared_type = vi.r#type.clone();
+            value.dtype = dtype;
+            value.shape = shape;
+            mark_unknown_type_info(graph, vid, type_known, shape_known);
+            graph.add_input(vid);
+            continue;
         }
         let (dtype, shape, type_known, shape_known) = value_info_type(graph, vi)?;
         let vid = graph.create_named_value(vi.name.clone(), dtype, shape);
+        graph.value_mut(vid).declared_type = vi.r#type.clone();
         mark_unknown_type_info(graph, vid, type_known, shape_known);
         names.insert(vi.name.clone(), vid);
         graph.add_input(vid);
@@ -254,6 +387,7 @@ fn build_graph_proto(
         }
         let (dtype, shape, type_known, shape_known) = value_info_type(graph, vi)?;
         let vid = graph.create_named_value(vi.name.clone(), dtype, shape);
+        graph.value_mut(vid).declared_type = vi.r#type.clone();
         mark_unknown_type_info(graph, vid, type_known, shape_known);
         names.insert(vi.name.clone(), vid);
     }
@@ -266,6 +400,7 @@ fn build_graph_proto(
         if !names.contains_key(&vi.name) {
             let (dtype, shape, type_known, shape_known) = value_info_type(graph, vi)?;
             let vid = graph.create_named_value(vi.name.clone(), dtype, shape);
+            graph.value_mut(vid).declared_type = vi.r#type.clone();
             mark_unknown_type_info(graph, vid, type_known, shape_known);
             names.insert(vi.name.clone(), vid);
         }
@@ -285,23 +420,22 @@ fn build_graph_proto(
             })
             .collect();
 
-        let outputs: Vec<ValueId> = np
+        let outputs: Vec<Option<ValueId>> = np
             .output
             .iter()
             .map(|name| {
                 if name.is_empty() {
-                    // An omitted (unused) optional output: give it an anonymous
-                    // value to preserve positional arity.
-                    graph.create_value(DataType::Float32, Vec::new())
+                    None
                 } else {
-                    get_or_create(graph, &mut names, name)
+                    Some(get_or_create(graph, &mut names, name))
                 }
             })
             .collect();
 
-        let mut node = Node::new(NodeId(0), np.op_type.clone(), inputs, outputs);
+        let mut node = Node::new_with_output_slots(NodeId(0), np.op_type.clone(), inputs, outputs);
         node.name = np.name.clone();
         node.domain = normalize_domain(&np.domain).to_string();
+        node.overload = np.overload.clone();
         if !np.doc_string.is_empty() {
             node.doc_string = Some(np.doc_string.clone());
         }
@@ -331,7 +465,7 @@ fn build_graph_proto(
 
 /// After a node is inserted, move any `Graph`/`Graphs` attribute bodies into the
 /// graph's `subgraphs` index so traversal/validation can reach them (§3.3).
-fn register_subgraphs(graph: &mut Graph, nid: NodeId) {
+pub(crate) fn register_subgraphs(graph: &mut Graph, nid: NodeId) {
     let attrs: Vec<(String, usize)> = graph
         .node(nid)
         .attributes
@@ -346,13 +480,19 @@ fn register_subgraphs(graph: &mut Graph, nid: NodeId) {
         match graph.node(nid).attributes.get(&key) {
             Some(Attribute::Graph(g)) => {
                 let sub = (**g).clone();
-                graph.subgraphs.insert((nid, key), sub);
+                graph.subgraphs.insert((nid, key.into()), sub);
             }
             Some(Attribute::Graphs(_)) => {
                 for i in 0..count {
                     if let Some(Attribute::Graphs(gs)) = graph.node(nid).attributes.get(&key) {
                         let sub = gs[i].clone();
-                        graph.subgraphs.insert((nid, format!("{key}[{i}]")), sub);
+                        graph.subgraphs.insert(
+                            (
+                                nid,
+                                onnx_runtime_ir::GraphAttribute::element(key.clone(), i),
+                            ),
+                            sub,
+                        );
                     }
                 }
             }
@@ -367,7 +507,7 @@ fn get_or_create(graph: &mut Graph, names: &mut HashMap<String, ValueId>, name: 
     if let Some(&vid) = names.get(name) {
         return vid;
     }
-    let vid = graph.create_named_value(name.to_string(), DataType::Float32, Vec::new());
+    let vid = graph.create_named_value(name.to_string(), DataType::Undefined, Vec::new());
     graph.mark_value_type_unknown(vid);
     graph.mark_value_shape_unknown(vid);
     names.insert(name.to_string(), vid);
@@ -402,9 +542,7 @@ fn value_info_type(
 ) -> Result<(DataType, Shape, bool, bool), LoaderError> {
     match vi.r#type.as_ref() {
         Some(tp) => type_proto_to_dtype_shape(graph, tp, &vi.name),
-        // A value-info with no type at all is genuinely untyped, not an
-        // unmodeled dtype: keep the tensor-centric placeholder default.
-        None => Ok((DataType::Float32, Vec::new(), false, false)),
+        None => Ok((DataType::Undefined, Vec::new(), false, false)),
     }
 }
 
@@ -413,6 +551,7 @@ fn type_proto_to_dtype_shape(
     tp: &onnx::TypeProto,
     name: &str,
 ) -> Result<(DataType, Shape, bool, bool), LoaderError> {
+    validate_type_proto(tp, &format!("value-info '{name}'"), 0)?;
     match tp.value.as_ref() {
         Some(type_proto::Value::TensorType(t)) => {
             let dtype = decode_dtype(t.elem_type, || format!("value-info '{name}'"))?;
@@ -422,22 +561,13 @@ fn type_proto_to_dtype_shape(
                 .as_ref()
                 .map(|s| tensor_shape_to_shape(graph, s))
                 .unwrap_or_default();
-            Ok((dtype, shape, true, shape_known))
+            Ok((dtype, shape, dtype != DataType::Undefined, shape_known))
         }
-        Some(type_proto::Value::SparseTensorType(t)) => {
-            let dtype = decode_dtype(t.elem_type, || format!("value-info '{name}'"))?;
-            let shape_known = t.shape.is_some();
-            let shape = t
-                .shape
-                .as_ref()
-                .map(|s| tensor_shape_to_shape(graph, s))
-                .unwrap_or_default();
-            Ok((dtype, shape, true, shape_known))
+        Some(type_proto::Value::SparseTensorType(_)) => {
+            // Sparse values are not dense-tensor evidence.
+            Ok((DataType::Undefined, Vec::new(), false, false))
         }
-        // Non-tensor containers (sequence/map/optional): the IR value model is
-        // tensor-centric; record a placeholder type. These do not occur in the
-        // Phase-1 (BERT) op set.
-        _ => Ok((DataType::Float32, Vec::new(), false, false)),
+        _ => Ok((DataType::Undefined, Vec::new(), false, false)),
     }
 }
 
@@ -462,7 +592,7 @@ fn tensor_shape_to_shape(graph: &mut Graph, tsp: &TensorShapeProto) -> Shape {
 
 /// Convert an `AttributeProto` to an IR `(name, Attribute)`. Returns `Ok(None)`
 /// for empty/absent attributes.
-fn convert_attribute(
+pub(crate) fn convert_attribute(
     graph: &mut Graph,
     ap: &AttributeProto,
 ) -> Result<Option<(String, Attribute)>, LoaderError> {
@@ -470,7 +600,25 @@ fn convert_attribute(
 
     // Determine the attribute kind, falling back to field-presence heuristics
     // for IR<0.0.2 protos where `type` may be unset.
-    let ty = AT::try_from(ap.r#type).unwrap_or(AT::Undefined);
+    let ty = AT::try_from(ap.r#type).map_err(|_| LoaderError::GraphBuild(format!(
+        "attribute {:?} declares unknown kind {}; supply a supported ONNX AttributeType instead of guessing its payload",
+        ap.name, ap.r#type
+    )))?;
+    if !ap.ref_attr_name.is_empty() {
+        if ty == AT::Undefined {
+            return Err(LoaderError::GraphBuild(format!(
+                "attribute {:?} references formal {:?} without a type; specify its ONNX AttributeType",
+                ap.name, ap.ref_attr_name
+            )));
+        }
+        return Ok(Some((
+            ap.name.clone(),
+            Attribute::Ref {
+                name: ap.ref_attr_name.clone(),
+                kind: ty,
+            },
+        )));
+    }
 
     let attr = match ty {
         AT::Float => Attribute::Float(ap.f),
@@ -514,7 +662,12 @@ fn convert_attribute(
         ),
         AT::TypeProto => match ap.tp.as_ref() {
             Some(tp) => Attribute::TypeProto(convert_type_proto(graph, tp)?),
-            None => return Ok(None),
+            None => {
+                return Err(LoaderError::GraphBuild(format!(
+                    "TYPE_PROTO attribute {:?} is missing tp; supply a TypeProto (empty means unknown)",
+                    ap.name
+                )));
+            }
         },
         AT::TypeProtos => Attribute::TypeProtos(
             ap.type_protos
@@ -563,7 +716,7 @@ fn build_subgraph(gp: &GraphProto) -> Result<Graph, LoaderError> {
 
 fn convert_tensor(t: &onnx::TensorProto) -> Result<TensorData, LoaderError> {
     let dtype = decode_dtype(t.data_type, || format!("attribute tensor '{}'", t.name))?;
-    let dims: Vec<usize> = t.dims.iter().map(|&d| d.max(0) as usize).collect();
+    let dims = checked_dims(&t.dims, &format!("attribute tensor {:?}", t.name))?;
     tensor_data_from_proto(t, dtype, &dims)
 }
 
@@ -583,80 +736,211 @@ fn convert_sparse_tensor(
     Ok(onnx_runtime_ir::SparseTensorData {
         values,
         indices,
-        dims: tensor.dims.iter().map(|&dim| dim.max(0) as usize).collect(),
+        dims: checked_dims(&tensor.dims, "sparse tensor attribute")?,
     })
 }
 
-fn convert_type_proto(graph: &mut Graph, tp: &onnx::TypeProto) -> Result<TypeProto, LoaderError> {
-    let ty = match tp.value.as_ref() {
+fn checked_dims(dims: &[i64], context: &str) -> Result<Vec<usize>, LoaderError> {
+    dims.iter().map(|&dim| usize::try_from(dim).map_err(|_| {
+        LoaderError::GraphBuild(format!(
+            "{context}: dimension {dim} is negative or exceeds the host index range; repair the concrete tensor shape"
+        ))
+    })).collect()
+}
+
+fn validate_sparse_payload(
+    sparse: &onnx::SparseTensorProto,
+    dims: &[usize],
+) -> Result<(), LoaderError> {
+    let values = sparse.values.as_ref().expect("checked sparse values");
+    let indices = sparse.indices.as_ref().expect("checked sparse indices");
+    let malformed = |detail: &str| {
+        LoaderError::GraphBuild(format!(
+            "sparse initializer {:?}: {detail}; repair the COO payload and dimensions",
+            values.name
+        ))
+    };
+    let nnz = usize::try_from(values.dims[0]).map_err(|_| malformed("negative nnz"))?;
+    let total =
+        onnx_runtime_ir::checked_numel(dims).ok_or_else(|| malformed("dense shape overflows"))?;
+    if nnz > total {
+        return Err(malformed("nnz exceeds dense element count"));
+    }
+    for tensor in [values, indices] {
+        if tensor.data_location == onnx::tensor_proto::DataLocation::External as i32 {
+            crate::weights::external_initializer_reference(
+                tensor,
+                decode_dtype(tensor.data_type, || {
+                    format!("sparse initializer {:?}", values.name)
+                })?,
+                checked_dims(&tensor.dims, "external sparse tensor")?,
+                std::path::Path::new(""),
+            )?;
+            continue;
+        }
+        let data = convert_tensor(tensor)?;
+        let valid = if data.dtype == DataType::String {
+            data.checked_numel() == Some(data.strings.len())
+        } else {
+            data.checked_expected_bytes() == Some(data.data.len())
+        };
+        if !valid {
+            return Err(malformed(
+                "tensor element count disagrees with its stored payload",
+            ));
+        }
+    }
+    if indices.data_location == onnx::tensor_proto::DataLocation::External as i32 {
+        return Ok(());
+    }
+    let data = convert_tensor(indices)?;
+    let coordinates = onnx_runtime_ir::read_vec_le::<i64>(&data.data)
+        .map_err(|_| malformed("indices are not complete int64 elements"))?;
+    if indices.dims.len() == 1 {
+        let mut previous = None;
+        for coordinate in coordinates {
+            let index =
+                usize::try_from(coordinate).map_err(|_| malformed("negative linear index"))?;
+            if index >= total || previous.is_some_and(|prior| index <= prior) {
+                return Err(malformed(
+                    "linear indices are out of range, unsorted or duplicated",
+                ));
+            }
+            previous = Some(index);
+        }
+    } else if !dims.is_empty() {
+        let mut previous: Option<&[i64]> = None;
+        for coordinate in coordinates.chunks_exact(dims.len()) {
+            if coordinate
+                .iter()
+                .zip(dims)
+                .any(|(&index, &dim)| usize::try_from(index).map_or(true, |index| index >= dim))
+                || previous.is_some_and(|prior| coordinate <= prior)
+            {
+                return Err(malformed(
+                    "coordinate indices are out of range, unsorted or duplicated",
+                ));
+            }
+            previous = Some(coordinate);
+        }
+    }
+    Ok(())
+}
+
+fn validate_initializer_type(
+    graph: &Graph,
+    value: ValueId,
+    tp: &TypeProto,
+    name: &str,
+) -> Result<(), LoaderError> {
+    let Some(kind) = tp.value.as_ref() else {
+        return Ok(());
+    };
+    let type_proto::Value::TensorType(tensor) = kind else {
+        return Err(LoaderError::GraphBuild(format!(
+            "initializer input {name:?} declares a non-tensor type; declare the dense value type of its initializer default"
+        )));
+    };
+    let default = graph.value(value);
+    if tensor.elem_type != DataType::Undefined.to_onnx()
+        && tensor.elem_type != default.dtype.to_onnx()
+    {
+        return Err(LoaderError::GraphBuild(format!(
+            "initializer input {name:?} dtype {} disagrees with default {:?}; align the declaration and initializer",
+            tensor.elem_type, default.dtype
+        )));
+    }
+    if let Some(shape) = &tensor.shape {
+        let compatible = shape.dim.len() == default.shape.len()
+            && shape
+                .dim
+                .iter()
+                .zip(&default.shape)
+                .all(|(declared, actual)| match (&declared.value, actual) {
+                    (Some(tensor_shape_proto::dimension::Value::DimValue(a)), Dim::Static(b)) => {
+                        usize::try_from(*a).ok() == Some(*b)
+                    }
+                    _ => true,
+                });
+        if !compatible {
+            return Err(LoaderError::GraphBuild(format!(
+                "initializer input {name:?} shape disagrees with its default {:?}; align the declaration and initializer",
+                default.shape
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn convert_type_proto(_graph: &mut Graph, tp: &onnx::TypeProto) -> Result<TypeProto, LoaderError> {
+    validate_type_proto(tp, "TYPE_PROTO attribute", 0)?;
+    Ok(tp.clone())
+}
+
+fn validate_type_proto(tp: &TypeProto, context: &str, depth: usize) -> Result<(), LoaderError> {
+    if depth > 64 {
+        return Err(LoaderError::GraphBuild(format!(
+            "{context}: recursive type exceeds 64 levels; simplify the type descriptor"
+        )));
+    }
+    let missing = || {
+        LoaderError::GraphBuild(format!(
+            "{context}: container type is missing its element/value descriptor; supply an explicit TypeProto (empty means unknown)"
+        ))
+    };
+    match tp.value.as_ref() {
         Some(type_proto::Value::TensorType(t)) => {
-            let dtype = decode_dtype(t.elem_type, || "type-proto attribute (tensor)".to_string())?;
-            let shape = t
-                .shape
-                .as_ref()
-                .map(|s| tensor_shape_to_shape(graph, s))
-                .unwrap_or_default();
-            TypeProto::Tensor { dtype, shape }
+            decode_dtype(t.elem_type, || context.to_string())?;
+            validate_tensor_shape(t.shape.as_ref(), context)?;
         }
         Some(type_proto::Value::SparseTensorType(t)) => {
-            let dtype = decode_dtype(t.elem_type, || {
-                "type-proto attribute (sparse tensor)".to_string()
-            })?;
-            let shape = t
-                .shape
-                .as_ref()
-                .map(|s| tensor_shape_to_shape(graph, s))
-                .unwrap_or_default();
-            TypeProto::SparseTensor { dtype, shape }
+            decode_dtype(t.elem_type, || context.to_string())?;
+            validate_tensor_shape(t.shape.as_ref(), context)?;
         }
-        Some(type_proto::Value::SequenceType(s)) => {
-            let inner = s
-                .elem_type
-                .as_ref()
-                .map(|e| convert_type_proto(graph, e))
-                .transpose()?
-                .unwrap_or(TypeProto::Tensor {
-                    dtype: DataType::Float32,
-                    shape: Vec::new(),
-                });
-            TypeProto::Sequence(Box::new(inner))
+        Some(type_proto::Value::SequenceType(t)) => {
+            validate_type_proto(
+                t.elem_type.as_deref().ok_or_else(missing)?,
+                context,
+                depth + 1,
+            )?;
         }
-        Some(type_proto::Value::OptionalType(o)) => {
-            let inner = o
-                .elem_type
-                .as_ref()
-                .map(|e| convert_type_proto(graph, e))
-                .transpose()?
-                .unwrap_or(TypeProto::Tensor {
-                    dtype: DataType::Float32,
-                    shape: Vec::new(),
-                });
-            TypeProto::Optional(Box::new(inner))
+        Some(type_proto::Value::OptionalType(t)) => {
+            validate_type_proto(
+                t.elem_type.as_deref().ok_or_else(missing)?,
+                context,
+                depth + 1,
+            )?;
         }
-        Some(type_proto::Value::MapType(m)) => {
-            let key = decode_dtype(m.key_type, || "type-proto attribute (map key)".to_string())?;
-            let value = m
-                .value_type
-                .as_ref()
-                .map(|e| convert_type_proto(graph, e))
-                .transpose()?
-                .unwrap_or(TypeProto::Tensor {
-                    dtype: DataType::Float32,
-                    shape: Vec::new(),
-                });
-            TypeProto::Map {
-                key,
-                value: Box::new(value),
+        Some(type_proto::Value::MapType(t)) => {
+            if !matches!(t.key_type, 2..=7 | 8 | 12 | 13) {
+                return Err(LoaderError::GraphBuild(format!(
+                    "{context}: map key type {} is not an ONNX integer or string type; repair key_type",
+                    t.key_type
+                )));
             }
+            validate_type_proto(
+                t.value_type.as_deref().ok_or_else(missing)?,
+                context,
+                depth + 1,
+            )?;
         }
-        Some(type_proto::Value::OpaqueType(_)) => TypeProto::Tensor {
-            dtype: DataType::Float32,
-            shape: Vec::new(),
-        },
-        None => TypeProto::Tensor {
-            dtype: DataType::Float32,
-            shape: Vec::new(),
-        },
-    };
-    Ok(ty)
+        Some(type_proto::Value::OpaqueType(_)) | None => {}
+    }
+    Ok(())
+}
+
+fn validate_tensor_shape(
+    shape: Option<&TensorShapeProto>,
+    context: &str,
+) -> Result<(), LoaderError> {
+    if shape.is_some_and(|s| {
+        s.dim.iter().any(
+            |d| matches!(d.value, Some(tensor_shape_proto::dimension::Value::DimValue(n)) if n < 0),
+        )
+    }) {
+        return Err(LoaderError::GraphBuild(format!(
+            "{context}: tensor type declares a negative dimension; use an absent dimension for unknown extent"
+        )));
+    }
+    Ok(())
 }

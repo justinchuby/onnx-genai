@@ -305,7 +305,8 @@ fn prefill_fusion_audit() {
             let out_shape: Vec<_> = n
                 .outputs
                 .iter()
-                .map(|&o| {
+                .filter_map(|&o| o)
+                .map(|o| {
                     let v = graph.value(o);
                     format!("{:?}", v.shape)
                 })

@@ -516,7 +516,7 @@ fn ep_get_capability_inner(
                 };
                 // Fail-closed: every output must have a resolved, producible dtype
                 // UNLESS it is an intentionally absent optional output slot.
-                for &vid in &node.outputs {
+                for vid in node.output_values() {
                     let Some(value) = ir_graph.values.get(vid) else {
                         return false;
                     };
@@ -672,6 +672,7 @@ pub(crate) fn node_passes_dtype_filter(
         }
     }
     for (slot, &vid) in node.outputs.iter().enumerate() {
+        let Some(vid) = vid else { continue };
         let Some(value) = ir_graph.values.get(vid) else {
             continue;
         };
@@ -879,19 +880,17 @@ fn ep_compile_inner(
                     // authoritative dtype for Cast, Where, Shape, etc.
                     // Absent optional outputs now carry their actual ORT-declared
                     // dtype (not Undefined) so scratch buffers are sized correctly.
-                    let absent = reader.absent_outputs();
                     let node_output_vals = view.node_outputs(node_idx);
                     let mut output_dtypes: Vec<DataType> = node_output_vals
                         .iter()
-                        .map(|&val_idx| view.value(val_idx).dtype)
+                        .map(|slot| {
+                            slot.map_or(DataType::Undefined, |val_idx| view.value(val_idx).dtype)
+                        })
                         .collect();
                     let absent_output_slots: std::collections::HashSet<usize> = node_output_vals
                         .iter()
                         .enumerate()
-                        .filter(|&(_, &val_idx)| {
-                            let vid = view.value_id(val_idx);
-                            absent.contains(&vid)
-                        })
+                        .filter(|(_, slot)| slot.is_none())
                         .map(|(slot, _)| slot)
                         .collect();
 
@@ -1017,7 +1016,7 @@ fn ep_compile_inner(
         // fall back cleanly at this stage, whereas a Run-time failure is much
         // harder for users to diagnose.
         if info.entries.len() > 1 {
-            match build_subgraph_routing(&view, ir_graph, reader.absent_outputs()) {
+            match build_subgraph_routing(&view, ir_graph) {
                 Some(routing) => info.set_routing(routing),
                 None => {
                     cleanup_partial_infos(out_infos, i);
@@ -1129,7 +1128,7 @@ fn claim_has_unroutable_internal_output(
         let Some(node) = graph.nodes.get(nid) else {
             return true;
         };
-        for &produced in &node.outputs {
+        for produced in node.output_values() {
             let Some(value) = graph.values.get(produced) else {
                 return true;
             };
@@ -1191,7 +1190,6 @@ fn parse_bool_flag(value: Option<&str>) -> bool {
 fn build_subgraph_routing(
     view: &onnx_runtime_ir::GraphView<'_>,
     graph: &onnx_runtime_ir::Graph,
-    absent_outputs: &std::collections::HashSet<onnx_runtime_ir::ValueId>,
 ) -> Option<crate::compute::SubgraphRouting> {
     use crate::compute::{NodeInputSource, NodeOutputSink};
     use std::collections::HashMap;
@@ -1247,13 +1245,15 @@ fn build_subgraph_routing(
         // Build output sinks.
         let node_outputs = view.node_outputs(node_idx);
         let mut sinks = Vec::with_capacity(node_outputs.len());
-        for &val_idx in node_outputs {
-            let vid = view.value_id(val_idx);
-            if absent_outputs.contains(&vid) {
+        for &slot in node_outputs {
+            let Some(val_idx) = slot else {
                 // Absent optional output — no buffer needed; scratch-allocated
                 // at compute time via absent_output_slots.
                 sinks.push(NodeOutputSink::Absent);
-            } else if let Some(&ort_idx) = output_index.get(&vid) {
+                continue;
+            };
+            let vid = view.value_id(val_idx);
+            if let Some(&ort_idx) = output_index.get(&vid) {
                 sinks.push(NodeOutputSink::Ort(ort_idx));
             } else {
                 // Intermediate — assign a buffer.

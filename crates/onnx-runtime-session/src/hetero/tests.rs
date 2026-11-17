@@ -21,8 +21,8 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{
-    DataType, Graph, ModelFunction, Node, NodeId, Shape, TensorData, TensorLayout, WeightRef,
-    static_shape,
+    Attribute, DataType, Graph, ModelFunction, Node, NodeId, Shape, TensorData, TensorLayout,
+    WeightRef, static_shape,
 };
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_loader::proto::onnx;
@@ -418,12 +418,17 @@ fn add_relu_body(name: &str, inner_call: Option<&str>) -> ModelFunction {
     }
     body.add_output(y);
     ModelFunction {
-        domain: "custom.domain".to_string(),
-        name: name.to_string(),
-        inputs: vec!["X".to_string(), "B".to_string()],
-        outputs: vec!["Y".to_string()],
-        attributes: Vec::new(),
-        has_attribute_refs: false,
+        declaration: onnx::FunctionProto {
+            domain: "custom.domain".to_string(),
+            name: name.to_string(),
+            input: vec!["X".to_string(), "B".to_string()],
+            output: vec!["Y".to_string()],
+            opset_import: vec![onnx::OperatorSetIdProto {
+                domain: String::new(),
+                version: 17,
+            }],
+            ..Default::default()
+        },
         body,
     }
 }
@@ -448,16 +453,16 @@ fn kept_fused_add_relu_graph(nested: bool) -> Graph {
     graph.add_output(y);
     if nested {
         graph.model_functions.insert(
-            ("custom.domain".to_string(), "OuterFusedAddRelu".to_string()),
+            ModelFunctionKey::new("custom.domain", "OuterFusedAddRelu", ""),
             add_relu_body("OuterFusedAddRelu", Some("InnerFusedAddRelu")),
         );
         graph.model_functions.insert(
-            ("custom.domain".to_string(), "InnerFusedAddRelu".to_string()),
+            ModelFunctionKey::new("custom.domain", "InnerFusedAddRelu", ""),
             add_relu_body("InnerFusedAddRelu", None),
         );
     } else {
         graph.model_functions.insert(
-            ("custom.domain".to_string(), "FusedAddRelu".to_string()),
+            ModelFunctionKey::new("custom.domain", "FusedAddRelu", ""),
             add_relu_body("FusedAddRelu", None),
         );
     }
@@ -559,6 +564,7 @@ fn onnx_ref_attr(name: &str, ref_attr_name: &str) -> onnx::AttributeProto {
     onnx::AttributeProto {
         name: name.to_string(),
         ref_attr_name: ref_attr_name.to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Float as i32,
         ..Default::default()
     }
 }
@@ -727,7 +733,7 @@ fn kept_function_declined_by_assignment_ep_is_inlined_and_runs() {
 }
 
 #[test]
-fn attribute_parameterized_kept_function_legalization_fails_closed() {
+fn attribute_parameterized_kept_function_binds_during_legalization() {
     let bytes = attributed_leaky_relu_model_bytes();
     let keep = |node: &Node, _opset: u64, _dtypes: &[DataType]| node.op_type == "ParamLeakyRelu";
     let (graph, _store) =
@@ -736,20 +742,27 @@ fn attribute_parameterized_kept_function_legalization_fails_closed() {
     assert_eq!(op_count(&graph, "ParamLeakyRelu"), 1);
     let function = graph
         .model_functions
-        .get(&("custom.domain".to_string(), "ParamLeakyRelu".to_string()))
+        .get(&ModelFunctionKey::new(
+            "custom.domain",
+            "ParamLeakyRelu",
+            "",
+        ))
         .expect("model-local function catalog should retain metadata");
-    assert_eq!(function.attributes, vec!["alpha".to_string()]);
-    assert!(
-        function.has_attribute_refs,
-        "ref_attr_name must be captured before IR conversion drops it"
-    );
+    assert_eq!(function.declaration.attribute, vec!["alpha".to_string()]);
 
     let providers = vec![accel_slot(0, vec!["Relu"]), cpu_slot(1)];
-    let err = plan(&graph, &providers).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("ParamLeakyRelu"), "{msg}");
-    assert!(msg.contains("attribute-parameterized"), "{msg}");
-    assert!(msg.contains("Phase 2"), "{msg}");
+    let plan = plan(&graph, &providers).expect("formal attributes should bind during legalization");
+    let legalized = plan.legalized_graph.as_ref().unwrap();
+    let leaky = legalized
+        .nodes
+        .iter()
+        .find(|(_, node)| node.op_type == "LeakyRelu")
+        .map(|(_, node)| node)
+        .expect("function body should be present");
+    assert_eq!(
+        leaky.attr("alpha").and_then(Attribute::as_float),
+        Some(0.25)
+    );
 }
 
 #[test]
@@ -774,17 +787,36 @@ fn nested_kept_functions_legalize_to_fixpoint() {
 }
 
 #[test]
-fn ambiguous_model_function_identity_fails_closed() {
+fn overloaded_model_function_legalizes_by_exact_identity() {
     let mut graph = kept_fused_add_relu_graph(false);
+    let mut selected = graph.model_functions.values().next().unwrap().clone();
     graph.model_functions.clear();
-    graph
-        .ambiguous_model_functions
-        .insert(("custom.domain".to_string(), "FusedAddRelu".to_string()));
+
+    let mut other = selected.clone();
+    other.declaration.overload = "other".to_string();
+    let other_nodes: Vec<_> = other.body.nodes.keys().collect();
+    for node_id in other_nodes {
+        let node = other.body.node_mut(node_id);
+        if node.op_type == "Relu" {
+            node.op_type = "Abs".to_string();
+        }
+    }
+    selected.declaration.overload = "selected".to_string();
+    let graph_nodes: Vec<_> = graph.nodes.keys().collect();
+    for node_id in graph_nodes {
+        let node = graph.node_mut(node_id);
+        if node.op_type == "FusedAddRelu" {
+            node.overload = "selected".to_string();
+        }
+    }
+    graph.model_functions.insert(other.key(), other);
+    graph.model_functions.insert(selected.key(), selected);
+
     let providers = vec![accel_slot(0, vec!["Relu"]), cpu_slot(1)];
-    let err = plan(&graph, &providers).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("multiple overloads"), "{msg}");
-    assert!(msg.contains("FusedAddRelu"), "{msg}");
+    let plan = plan(&graph, &providers).unwrap();
+    let legalized = plan.legalized_graph.as_ref().unwrap();
+    assert_eq!(op_count(legalized, "Relu"), 1);
+    assert_eq!(op_count(legalized, "Abs"), 0);
 }
 
 #[test]
@@ -932,7 +964,7 @@ fn topological_order_preserved() {
     let mut produced_by: std::collections::HashMap<ValueId, usize> = Default::default();
     for (i, part) in plan.partitions.iter().enumerate() {
         for &node in &part.nodes {
-            for &out in &graph.node(node).outputs {
+            for out in graph.node(node).output_values() {
                 produced_by.insert(out, i);
             }
         }

@@ -139,7 +139,7 @@ fn print_node(out: &mut String, graph: &Graph, nid: NodeId, depth: usize, opts: 
     let outputs = node
         .outputs
         .iter()
-        .map(|&v| value_name(graph, v))
+        .map(|slot| slot.map_or_else(String::new, |v| value_name(graph, v)))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -208,24 +208,38 @@ fn print_node(out: &mut String, graph: &Graph, nid: NodeId, depth: usize, opts: 
             Attribute::Graph(inline) => {
                 let sub = graph
                     .subgraphs
-                    .get(&(nid, attr_name.clone()))
+                    .get(&(nid, attr_name.clone().into()))
                     .unwrap_or(inline);
-                let _ = writeln!(out, "{pad}{attr_name} = graph");
+                let _ = writeln!(out, "{pad}{} = graph", graph_attribute_name(attr_name));
                 print_graph(out, sub, "", depth, opts);
             }
             Attribute::Graphs(inline) => {
                 for (index, fallback) in inline.iter().enumerate() {
-                    let indexed_name = format!("{attr_name}[{index}]");
                     let sub = graph
                         .subgraphs
-                        .get(&(nid, indexed_name.clone()))
+                        .get(&(
+                            nid,
+                            onnx_runtime_ir::GraphAttribute::element(attr_name.clone(), index),
+                        ))
                         .unwrap_or(fallback);
-                    let _ = writeln!(out, "{pad}{indexed_name} = graph");
+                    let _ = writeln!(
+                        out,
+                        "{pad}{}[{index}] = graph",
+                        graph_attribute_name(attr_name)
+                    );
                     print_graph(out, sub, "", depth, opts);
                 }
             }
             _ => {}
         }
+    }
+}
+
+fn graph_attribute_name(name: &str) -> String {
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        name.to_string()
+    } else {
+        serde_json::Value::String(name.to_string()).to_string()
     }
 }
 
@@ -240,7 +254,11 @@ fn is_subgraph_attr(attr: &Attribute) -> bool {
 /// A value rendered as `dtype[shape] name` (or just `dtype name` for a scalar).
 fn typed_value(graph: &Graph, vid: ValueId) -> String {
     let value = graph.value(vid);
-    let ty = type_string(value.dtype, &value.shape, graph);
+    let ty = if graph.value_shape_is_known(vid) {
+        type_string(value.dtype, &value.shape, graph)
+    } else {
+        dtype_name(value.dtype).to_string()
+    };
     format!("{} {}", ty, value_name(graph, vid))
 }
 
@@ -303,6 +321,11 @@ fn weight_kind(weight: &WeightRef) -> &'static str {
 /// Render a scalar or list attribute value compactly.
 fn attr_value(attr: &Attribute) -> String {
     match attr {
+        Attribute::Ref { name, kind } => format!(
+            "@{}:{}",
+            serde_json::Value::String(name.clone()),
+            kind.as_str_name()
+        ),
         Attribute::Int(v) => v.to_string(),
         Attribute::Float(v) => format!("{v:?}"),
         Attribute::String(bytes) => match std::str::from_utf8(bytes) {

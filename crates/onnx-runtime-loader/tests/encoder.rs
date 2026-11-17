@@ -352,6 +352,7 @@ fn round_trip_structural_and_byte_exact() {
         Some(Attribute::String(bytes)) => {
             assert_eq!(bytes, &opaque_blob(), "opaque blob must be byte-exact");
         }
+
         other => panic!("ep_cache_context should be a STRING attribute, got {other:?}"),
     }
 
@@ -384,6 +385,40 @@ fn round_trip_structural_and_byte_exact() {
         (Some(Attribute::String(a)), Some(Attribute::String(b))) => assert_eq!(a, b),
         _ => panic!("ep_cache_context missing"),
     }
+}
+
+#[test]
+fn optional_output_holes_round_trip_positionally() {
+    let model = onnx::ModelProto {
+        ir_version: 8,
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: String::new(),
+            version: 17,
+        }],
+        graph: Some(onnx::GraphProto {
+            name: "optional-output-holes".into(),
+            input: vec![value_info("X", 1, &[Dimlike::Static(2)])],
+            output: vec![value_info("Y", 1, &[Dimlike::Static(2)])],
+            node: vec![node("Dropout", &["X"], &["Y", "", ""])],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let (graph, store) =
+        load_model_bytes_with_weights(&model.encode_to_vec(), ".").expect("load holes");
+    let dropout = graph.nodes.values().next().expect("Dropout node");
+    assert_eq!(dropout.outputs.len(), 3);
+    assert!(dropout.outputs[0].is_some());
+    assert_eq!(&dropout.outputs[1..], &[None, None]);
+    assert_eq!(dropout.output_values().count(), 1);
+
+    let encoded = encode_model(&Model::new(&graph).with_weights(&store)).expect("encode holes");
+    let decoded = onnx::ModelProto::decode(encoded.as_slice()).expect("decode encoded model");
+    assert_eq!(
+        decoded.graph.unwrap().node[0].output,
+        vec!["Y".to_string(), String::new(), String::new()]
+    );
 }
 
 #[test]
@@ -690,7 +725,7 @@ fn control_flow_subgraphs_round_trip() {
     for attr_name in ["then_branch", "else_branch"] {
         let subgraph = graph2
             .subgraphs
-            .get(&(if_node.id, attr_name.to_string()))
+            .get(&(if_node.id, attr_name.into()))
             .expect("indexed branch");
         assert!(subgraph.inputs.is_empty(), "{attr_name} input signature");
         assert_eq!(subgraph.outputs.len(), 1, "{attr_name} output signature");
@@ -700,7 +735,7 @@ fn control_flow_subgraphs_round_trip() {
 
 #[test]
 fn graphs_attribute_encodes_every_indexed_body() {
-    use onnx_runtime_ir::{DataType, Node, NodeId};
+    use onnx_runtime_ir::{DataType, GraphAttribute, Node, NodeId};
 
     let body = |op: &str| {
         let mut graph = Graph::new();
@@ -723,12 +758,13 @@ fn graphs_attribute_encodes_every_indexed_body() {
         Attribute::Graphs(vec![Graph::new(), Graph::new()]),
     );
     let node_id = graph.insert_node(node);
+    graph.subgraphs.insert(
+        (node_id, GraphAttribute::element("bodies", 0)),
+        body("Relu"),
+    );
     graph
         .subgraphs
-        .insert((node_id, "bodies[0]".into()), body("Relu"));
-    graph
-        .subgraphs
-        .insert((node_id, "bodies[1]".into()), body("Neg"));
+        .insert((node_id, GraphAttribute::element("bodies", 1)), body("Neg"));
     graph.add_output(y);
 
     let proto = encode_model_proto(&Model::new(&graph)).expect("encode Graphs attribute");

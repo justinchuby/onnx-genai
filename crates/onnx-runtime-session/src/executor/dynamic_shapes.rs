@@ -482,6 +482,7 @@ pub(super) fn plugin_fused_output_shapes(
             &mut interner,
         ) {
             for (&output, io) in inner.outputs.iter().zip(outputs) {
+                let Some(output) = output else { continue };
                 if let Some(type_info) = io.type_info {
                     let concrete = type_info
                         .shape
@@ -508,6 +509,7 @@ pub(super) fn plugin_fused_output_shapes(
         if inner
             .outputs
             .iter()
+            .flatten()
             .any(|output| !resolved.contains_key(output))
         {
             let inner_opset = effective_opset(shape_graph, inner);
@@ -523,6 +525,7 @@ pub(super) fn plugin_fused_output_shapes(
                 return None;
             }
             for (&output, shape) in inner.outputs.iter().zip(out_shapes) {
+                let Some(output) = output else { continue };
                 bind_shape_symbols(
                     shape_graph.value(output).shape.as_slice(),
                     &shape,

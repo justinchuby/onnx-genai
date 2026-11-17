@@ -300,7 +300,7 @@ fn provider_by_id(providers: &[ProviderPlacement], ep: EpId) -> Option<&Provider
 }
 
 fn model_function_key(node: &Node) -> ModelFunctionKey {
-    (node.domain.clone(), node.op_type.clone())
+    ModelFunctionKey::from_node(node)
 }
 
 fn function_like_node_bound(graph: &Graph) -> usize {
@@ -310,7 +310,6 @@ fn function_like_node_bound(graph: &Graph) -> usize {
         .filter(|(_, node)| {
             let key = model_function_key(node);
             graph.model_functions.contains_key(&key)
-                || graph.ambiguous_model_functions.contains(&key)
         })
         .count();
     for subgraph in graph.subgraphs.values() {
@@ -338,14 +337,6 @@ fn unsupported_function_nodes(
             continue;
         }
         let key = model_function_key(node);
-        if graph.ambiguous_model_functions.contains(&key) {
-            return Err(SessionError::Internal(format!(
-                "cannot legalize model-local function node {}::{} (node #{}): \
-                 multiple overloads share this (domain, op_type); add overload-aware \
-                 function metadata before heterogeneous planning",
-                node.domain, node.op_type, node_id.0
-            )));
-        }
         if graph.model_functions.contains_key(&key) {
             out.push(node_id);
         } else {
@@ -375,18 +366,8 @@ fn assigned_function_mismatches(
     for (&node_id, &ep) in placement {
         let node = graph.node(node_id);
         let key = model_function_key(node);
-        if !graph.model_functions.contains_key(&key)
-            && !graph.ambiguous_model_functions.contains(&key)
-        {
+        if !graph.model_functions.contains_key(&key) {
             continue;
-        }
-        if graph.ambiguous_model_functions.contains(&key) {
-            return Err(SessionError::Internal(format!(
-                "cannot legalize model-local function node {}::{} (node #{}): \
-                 multiple overloads share this (domain, op_type); add overload-aware \
-                 function metadata before heterogeneous planning",
-                node.domain, node.op_type, node_id.0
-            )));
         }
         let Some(slot) = provider_by_id(providers, ep) else {
             return Err(SessionError::Internal(format!(
@@ -434,84 +415,95 @@ fn create_remapped_value(
     new_value
 }
 
-fn function_has_attribute_parameters(call: &Node, function: &ModelFunction) -> bool {
-    // Phase 1 IR function bodies intentionally do not preserve
-    // AttributeProto::ref_attr_name, and the IR-level inliner below only copies
-    // body attributes. Be conservative: any FunctionProto formal attribute, any
-    // proto-level ref_attr_name captured before IR conversion, or any call-site
-    // attributes on the kept function require proto-level binding and must fail
-    // closed here rather than silently inlining defaults/missing attributes.
-    !function.attributes.is_empty() || function.has_attribute_refs || !call.attributes.is_empty()
+fn rename_function_captures(graph: &mut Graph, names: &HashMap<String, String>) {
+    let local_inputs: HashSet<_> = graph.inputs.iter().copied().collect();
+    let initializer_values: HashSet<_> = graph.initializers.keys().copied().collect();
+    let value_ids: Vec<_> = graph.values.keys().collect();
+    for value_id in value_ids {
+        let value = graph.value_mut(value_id);
+        if value.producer.is_none()
+            && !local_inputs.contains(&value_id)
+            && !initializer_values.contains(&value_id)
+            && let Some(name) = value.name.as_mut()
+            && let Some(replacement) = names.get(name)
+        {
+            *name = replacement.clone();
+        }
+    }
+    let node_ids: Vec<_> = graph.nodes.keys().collect();
+    for node_id in node_ids {
+        for attribute in graph.node_mut(node_id).attributes.values_mut() {
+            match attribute {
+                onnx_runtime_ir::Attribute::Graph(nested) => {
+                    rename_function_captures(nested.as_mut(), names);
+                }
+                onnx_runtime_ir::Attribute::Graphs(nested) => {
+                    for graph in nested.iter_mut() {
+                        rename_function_captures(graph, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
-fn body_has_control_flow(body: &Graph) -> bool {
-    // TODO(hetero-function-phase2): support full scope-aware Graph/Graphs
-    // attribute remapping by sharing the proto inliner's FunctionLibrary-grade
-    // expansion primitive. Phase 1 handles functions that appear inside
-    // subgraphs, but not function bodies that themselves contain control flow.
-    !body.subgraphs.is_empty()
-        || body.nodes.iter().any(|(_, node)| {
-            node.attributes.values().any(|attr| {
-                matches!(
-                    attr,
-                    onnx_runtime_ir::Attribute::Graph(_) | onnx_runtime_ir::Attribute::Graphs(_)
-                )
-            })
-        })
+fn register_node_subgraphs(graph: &mut Graph, node_id: NodeId) {
+    let attributes: Vec<_> = graph
+        .node(node_id)
+        .attributes
+        .iter()
+        .map(|(name, attribute)| (name.clone(), attribute.clone()))
+        .collect();
+    for (name, attribute) in attributes {
+        match attribute {
+            onnx_runtime_ir::Attribute::Graph(nested) => {
+                graph.subgraphs.insert((node_id, name.into()), *nested);
+            }
+            onnx_runtime_ir::Attribute::Graphs(nested) => {
+                for (index, graph_body) in nested.into_iter().enumerate() {
+                    graph.subgraphs.insert(
+                        (
+                            node_id,
+                            onnx_runtime_ir::GraphAttribute::element(name.clone(), index),
+                        ),
+                        graph_body,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn inline_model_function_node(graph: &mut Graph, node_id: NodeId) -> Result<()> {
     let call = graph.node(node_id).clone();
     let key = model_function_key(&call);
-    if graph.ambiguous_model_functions.contains(&key) {
-        return Err(SessionError::Internal(format!(
-            "cannot legalize model-local function node {}::{} (node #{}): \
-             multiple overloads share this (domain, op_type); add overload-aware \
-             function metadata before heterogeneous planning",
-            call.domain, call.op_type, node_id.0
-        )));
-    }
     let function: ModelFunction = graph.model_functions.get(&key).cloned().ok_or_else(|| {
         SessionError::Internal(format!(
-            "node {}::{} (node #{}) is not a model-local function",
-            call.domain, call.op_type, node_id.0
+            "node {}::{} overload {:?} (node #{}) is not a model-local function",
+            call.domain, call.op_type, call.overload, node_id.0
         ))
     })?;
-    if body_has_control_flow(&function.body) {
-        return Err(SessionError::Internal(format!(
-            "cannot legalize model-local function node {}::{} (node #{}): \
-             function bodies containing control-flow subgraphs require the deferred \
-             overload-aware FunctionLibrary/IR splicer",
-            call.domain, call.op_type, node_id.0
-        )));
-    }
-    if function_has_attribute_parameters(&call, &function) {
-        // Phase 2: bind call-site/ref_attr_name attributes by sharing the
-        // proto-level function_inline primitive instead of this IR-only splicer.
-        return Err(SessionError::Internal(format!(
-            "cannot legalize model-local function node {}::{} (node #{}): \
-             attribute-parameterized function legalization at assignment time is not yet supported; \
-             Phase 2 must bind call-site/ref_attr_name attributes via the shared function_inline primitive",
-            call.domain, call.op_type, node_id.0
-        )));
-    }
+    let mut body = function.body.clone();
+    onnx_runtime_loader::function_inline::bind_ir_function_attributes(&call, &function, &mut body)?;
 
     let mut remap: HashMap<ValueId, Option<ValueId>> = HashMap::new();
-    for (index, formal) in function.inputs.iter().enumerate() {
-        if let Some(body_value) = value_by_name(&function.body, formal) {
+    for (index, formal) in function.declaration.input.iter().enumerate() {
+        if let Some(body_value) = value_by_name(&body, formal) {
             remap.insert(body_value, call.inputs.get(index).copied().flatten());
         }
     }
 
     let mut aliases: Vec<(ValueId, ValueId)> = Vec::new();
-    for (index, formal) in function.outputs.iter().enumerate() {
-        let Some(&actual) = call.outputs.get(index) else {
+    for (index, formal) in function.declaration.output.iter().enumerate() {
+        let Some(actual) = call.outputs.get(index).copied().flatten() else {
             continue;
         };
-        let Some(body_value) = value_by_name(&function.body, formal) else {
+        let Some(body_value) = value_by_name(&body, formal) else {
             continue;
         };
-        if function.body.value(body_value).producer.is_some() {
+        if body.value(body_value).producer.is_some() {
             remap.insert(body_value, Some(actual));
         } else if let Some(Some(src)) = remap.get(&body_value).copied() {
             if src != actual {
@@ -530,20 +522,19 @@ fn inline_model_function_node(graph: &mut Graph, node_id: NodeId) -> Result<()> 
         if let Some(mapped) = remap.get(&value) {
             return *mapped;
         }
-        let base = function
-            .body
+        let base = body
             .value(value)
             .name
             .clone()
             .unwrap_or_else(|| format!("v{}", value.0));
         let name = format!("__fn{}_{}_{}", node_id.0, fresh_index, base);
         fresh_index += 1;
-        let new_value = create_remapped_value(parent, &function.body, value, name);
+        let new_value = create_remapped_value(parent, &body, value, name);
         remap.insert(value, Some(new_value));
         Some(new_value)
     };
 
-    let order = function.body.topological_order().map_err(|error| {
+    let order = body.topological_order().map_err(|error| {
         SessionError::Internal(format!(
             "cannot legalize model-local function node {}::{} (node #{}): function body is invalid: {error}",
             call.domain, call.op_type, node_id.0
@@ -551,7 +542,7 @@ fn inline_model_function_node(graph: &mut Graph, node_id: NodeId) -> Result<()> 
     })?;
     let mut new_nodes = Vec::new();
     for body_node_id in order {
-        let body_node = function.body.node(body_node_id);
+        let body_node = body.node(body_node_id);
         let inputs = body_node
             .inputs
             .iter()
@@ -560,17 +551,42 @@ fn inline_model_function_node(graph: &mut Graph, node_id: NodeId) -> Result<()> 
         let outputs = body_node
             .outputs
             .iter()
-            .filter_map(|&value| get_or_create(graph, &mut remap, value))
+            .map(|slot| slot.and_then(|value| get_or_create(graph, &mut remap, value)))
             .collect::<Vec<_>>();
-        let mut node = Node::new(NodeId(0), body_node.op_type.clone(), inputs, outputs);
+        let mut node =
+            Node::new_with_output_slots(NodeId(0), body_node.op_type.clone(), inputs, outputs);
         node.name = if body_node.name.is_empty() {
             format!("__fn{}_n{}", node_id.0, body_node_id.0)
         } else {
             format!("__fn{}_{}", node_id.0, body_node.name)
         };
         node.domain = body_node.domain.clone();
-        node.version = body_node.version;
+        node.overload = body_node.overload.clone();
+        node.version = body
+            .effective_opset(body_node)
+            .and_then(|version| i64::try_from(version).ok());
         node.attributes = body_node.attributes.clone();
+        let capture_names: HashMap<String, String> = remap
+            .iter()
+            .filter_map(|(source, target)| {
+                let source = body.value(*source).name.as_ref()?;
+                let target = target.and_then(|value| graph.value(value).name.as_ref())?;
+                Some((source.clone(), target.clone()))
+            })
+            .collect();
+        for attribute in node.attributes.values_mut() {
+            match attribute {
+                onnx_runtime_ir::Attribute::Graph(nested) => {
+                    rename_function_captures(nested, &capture_names);
+                }
+                onnx_runtime_ir::Attribute::Graphs(nested) => {
+                    for graph in nested {
+                        rename_function_captures(graph, &capture_names);
+                    }
+                }
+                _ => {}
+            }
+        }
         node.doc_string = body_node.doc_string.clone();
         new_nodes.push(node);
     }
@@ -582,7 +598,8 @@ fn inline_model_function_node(graph: &mut Graph, node_id: NodeId) -> Result<()> 
 
     graph.remove_node(node_id);
     for node in new_nodes {
-        graph.insert_node(node);
+        let inserted = graph.insert_node(node);
+        register_node_subgraphs(graph, inserted);
     }
     Ok(())
 }
@@ -623,13 +640,9 @@ fn legalize_function_fallbacks(
         let mismatches = assigned_function_mismatches(graph, providers, &placement)?;
         if mismatches.is_empty() {
             let model_functions = graph.model_functions.clone();
-            let ambiguous_model_functions = graph.ambiguous_model_functions.clone();
             for subgraph in graph.subgraphs.values_mut() {
                 if subgraph.model_functions.is_empty() {
                     subgraph.model_functions = model_functions.clone();
-                }
-                if subgraph.ambiguous_model_functions.is_empty() {
-                    subgraph.ambiguous_model_functions = ambiguous_model_functions.clone();
                 }
                 changed |= legalize_function_fallbacks(subgraph, providers, max_iterations)?;
             }
@@ -871,9 +884,7 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
         ));
     }
     let mut planned_graph = graph.clone();
-    let bound = function_like_node_bound(&planned_graph)
-        + planned_graph.model_functions.len()
-        + planned_graph.ambiguous_model_functions.len();
+    let bound = function_like_node_bound(&planned_graph) + planned_graph.model_functions.len();
     let legalized = if bound > 0 {
         legalize_function_fallbacks(&mut planned_graph, providers, bound)?
     } else {
@@ -896,7 +907,7 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
     let mut value_to_partition = HashMap::new();
     for (index, part) in partitions.iter().enumerate() {
         for &node in &part.nodes {
-            for &out in &graph.node(node).outputs {
+            for out in graph.node(node).output_values() {
                 value_to_partition.insert(out, index);
             }
         }
@@ -908,7 +919,7 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
     let mut value_to_partition = HashMap::new();
     for (index, part) in partitions.iter().enumerate() {
         for &node in &part.nodes {
-            for &out in &graph.node(node).outputs {
+            for out in graph.node(node).output_values() {
                 value_to_partition.insert(out, index);
             }
         }
@@ -1115,11 +1126,13 @@ fn extract_subgraph(parent: &Graph, partition: &Partition) -> SubgraphExtraction
         let outputs = node
             .outputs
             .iter()
-            .map(|&v| get_or_create(&mut sub, &mut remap, v))
+            .map(|slot| slot.map(|v| get_or_create(&mut sub, &mut remap, v)))
             .collect::<Vec<_>>();
-        let mut new_node = Node::new(NodeId(0), node.op_type.clone(), inputs, outputs);
+        let mut new_node =
+            Node::new_with_output_slots(NodeId(0), node.op_type.clone(), inputs, outputs);
         new_node.name = node.name.clone();
         new_node.domain = node.domain.clone();
+        new_node.overload = node.overload.clone();
         new_node.version = node.version;
         new_node.attributes = node.attributes.clone();
         sub.insert_node(new_node);

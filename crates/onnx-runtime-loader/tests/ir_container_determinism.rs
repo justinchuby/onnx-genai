@@ -57,13 +57,13 @@ fn reference_remove_node(graph: &mut Graph, node: NodeId) {
     for input_index in 0..input_count {
         graph.replace_input(node, input_index, None);
     }
-    for &output in &outputs {
+    for output in outputs.iter().flatten().copied() {
         if graph.value(output).producer == Some(node) {
             graph.value_mut(output).producer = None;
         }
     }
     graph.nodes.remove(node);
-    for output in outputs {
+    for output in outputs.into_iter().flatten() {
         let orphan = graph.try_value(output).is_some_and(|value| {
             value.producer.is_none()
                 && !graph.has_uses(output)

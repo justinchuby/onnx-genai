@@ -97,9 +97,7 @@ fn control_flow_node(
 /// looks up when it runs the control-flow node.
 fn register(parent: &mut Graph, node_id: NodeId, attr_key: &str, mut body: Graph) {
     body.opset_imports.entry(String::new()).or_insert(17);
-    parent
-        .subgraphs
-        .insert((node_id, attr_key.to_string()), body);
+    parent.subgraphs.insert((node_id, attr_key.into()), body);
 }
 
 fn new_parent() -> Graph {

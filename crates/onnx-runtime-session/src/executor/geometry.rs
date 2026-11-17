@@ -488,7 +488,7 @@ pub(super) fn binding_shape_result_is_observed(graph: &Graph, input: ValueId) ->
                 && node.op_type == "Shape"
                 && node.inputs.first().copied().flatten() == Some(input)
         })
-        .flat_map(|(_, node)| node.outputs.iter().copied())
+        .flat_map(|(_, node)| node.output_values())
         .collect::<HashSet<_>>();
     if shape_outputs.is_empty() {
         return false;
@@ -624,7 +624,9 @@ pub(super) fn is_kv_cache_growth_concat(graph: &Graph, node: &Node) -> bool {
         && node
             .outputs
             .first()
-            .is_some_and(|output| graph.outputs.contains(output))
+            .copied()
+            .flatten()
+            .is_some_and(|output| graph.outputs.contains(&output))
 }
 
 /// The shape-relabelling/scaling op set that carries an operand's length axis
@@ -673,8 +675,8 @@ pub(super) fn kv_cache_growth_concat_source(graph: &Graph, value: ValueId) -> Op
 
     let mut producer: HashMap<ValueId, NodeId> = HashMap::new();
     for (node_id, node) in graph.nodes.iter() {
-        for out in &node.outputs {
-            producer.insert(*out, node_id);
+        for out in node.output_values() {
+            producer.insert(out, node_id);
         }
     }
 
@@ -758,7 +760,7 @@ fn forward_shape_preserving_matmul_consumers(
                 continue;
             }
             if is_shape_preserving_relabel_op(node) {
-                frontier.extend(node.outputs.iter().copied());
+                frontier.extend(node.output_values());
             }
         }
     }
@@ -935,7 +937,7 @@ fn classify_mask_consumer(
         // harmless at `q_seq == 1`, where the window saturates to the same
         // position for any width >= the valid length — hence the policy split.
         if node.op_type == "Shape" && shape_policy == ShapeConsumptionPolicy::Disqualify {
-            let consumed = node.outputs.iter().any(|out| consumers.contains_key(out));
+            let consumed = node.output_values().any(|out| consumers.contains_key(&out));
             if consumed {
                 return ConsumerRole::Mixes(format!(
                     "{} output is consumed, so the padded max_len would leak into \
@@ -1066,8 +1068,8 @@ fn expand_target_is_mask_derived(graph: &Graph, expand: &Node, mask: ValueId) ->
 
     let mut producer: std::collections::HashMap<ValueId, NodeId> = std::collections::HashMap::new();
     for (node_id, node) in graph.nodes.iter() {
-        for out in &node.outputs {
-            producer.insert(*out, node_id);
+        for out in node.output_values() {
+            producer.insert(out, node_id);
         }
     }
     let Some(Some(target)) = expand.inputs.get(1).copied() else {
@@ -1153,7 +1155,7 @@ fn mask_binding_feeds_capacity_form_attention_impl(
                 ConsumerRole::Sink => {
                     reached_attention = true;
                     if node.is_default_domain() && node.op_type == "Softmax" {
-                        sink_softmax_outputs.extend(node.outputs.iter().copied());
+                        sink_softmax_outputs.extend(node.output_values());
                     }
                 }
                 ConsumerRole::InvariantLeaf => {}
@@ -1166,7 +1168,7 @@ fn mask_binding_feeds_capacity_form_attention_impl(
                             score_role_concats.insert(concat_id);
                         }
                     }
-                    frontier.extend(node.outputs.iter().copied());
+                    frontier.extend(node.output_values());
                 }
                 ConsumerRole::Mixes(reason) => return Err(reason),
             }

@@ -161,7 +161,7 @@ impl<'g> EpContextNode<'g> {
     }
 
     /// The node's variadic output values (partition boundary outputs, in order).
-    pub fn outputs(&self) -> &'g [ValueId] {
+    pub fn outputs(&self) -> &'g [Option<ValueId>] {
         &self.inner.outputs
     }
 

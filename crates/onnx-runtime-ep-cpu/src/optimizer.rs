@@ -111,7 +111,9 @@ impl OptimizationPass for CpuSiluFusion {
             let Some(x) = sigmoid.inputs[0] else {
                 continue;
             };
-            let sigmoid_output = sigmoid.outputs[0];
+            let Some(sigmoid_output) = sigmoid.outputs[0] else {
+                continue;
+            };
             if graph.outputs.contains(&sigmoid_output) {
                 continue;
             }
@@ -272,7 +274,7 @@ impl MatMulNBitsBias {
         let add = graph.try_node(add_id)?;
         let lhs = add.inputs[0]?;
         let rhs = add.inputs[1]?;
-        let add_output = add.outputs[0];
+        let add_output = add.outputs[0]?;
 
         // Try each operand as the MatMulNBits side; the other is the bias.
         for (matmul_output, bias) in [(lhs, rhs), (rhs, lhs)] {
@@ -317,7 +319,7 @@ impl MatMulNBitsBias {
         if matmul.op_type != "MatMulNBits"
             || matmul.domain != MICROSOFT_DOMAIN
             || matmul.outputs.len() != 1
-            || matmul.outputs[0] != matmul_output
+            || matmul.outputs[0] != Some(matmul_output)
         {
             return false;
         }
@@ -402,7 +404,7 @@ impl Projection {
         let activation = node.inputs[0]?;
         let weight = node.inputs[1]?;
         let scales = node.inputs[2]?;
-        let output = node.outputs[0];
+        let output = node.outputs[0]?;
         let k = positive_attr(node, "K")?;
         let n = positive_attr(node, "N")?;
         let bits = optional_nonnegative_attr(node, "bits", 4)?;
@@ -498,7 +500,7 @@ impl GateUpCandidate {
     ) -> Option<Self> {
         let activation = graph.try_node(activation_id)?;
         let gate_output = activation.inputs[0]?;
-        let activation_output = activation.outputs[0];
+        let activation_output = activation.outputs[0]?;
         if graph.outputs.contains(&gate_output)
             || graph.outputs.contains(&activation_output)
             || graph.consumers(gate_output) != [activation_id]
@@ -636,7 +638,7 @@ impl GateUpCandidate {
             Some(fused_weight_value),
             Some(fused_scale_value),
         ];
-        fused_node.outputs = vec![fused_output];
+        fused_node.outputs = vec![Some(fused_output)];
         fused_node
             .attributes
             .insert("N".to_string(), Attribute::Int(total_n as i64));
@@ -751,14 +753,14 @@ impl ConvBnFusion {
             return None;
         }
         let conv_output = bn.inputs[0]?;
-        let bn_output = bn.outputs[0];
+        let bn_output = bn.outputs[0]?;
 
         let conv_id = graph.value(conv_output).producer?;
         let conv = graph.try_node(conv_id)?;
         if conv.op_type != "Conv"
             || !matches!(conv.domain.as_str(), "" | "ai.onnx")
             || conv.outputs.len() != 1
-            || conv.outputs[0] != conv_output
+            || conv.outputs[0] != Some(conv_output)
             || conv.attr("activation").is_some()
         {
             return None;
@@ -848,7 +850,7 @@ impl ConvBnFusion {
                     && matches!(relu.domain.as_str(), "" | "ai.onnx")
                     && relu.inputs.len() == 1
                     && relu.outputs.len() == 1)
-                    .then_some((relu_id, relu.outputs[0]))
+                    .then_some((relu_id, relu.outputs[0]?))
             })
             .flatten();
 
@@ -1121,7 +1123,7 @@ fn find_mergeable_sibling_group(graph: &Graph, ctx: &PassContext) -> Option<Sibl
         let mut valid = true;
         for &nid in &candidates {
             let node = graph.node(nid);
-            let output = node.outputs[0];
+            let output = node.outputs[0]?;
 
             // The output must not be a graph output.
             if graph.outputs.contains(&output) {
@@ -1582,7 +1584,10 @@ mod tests {
         assert_eq!(mm.inputs[4], None);
         assert_eq!(mm.inputs[5], Some(bias));
         // The fused MatMulNBits output now feeds the graph output directly.
-        assert_eq!(graph.outputs, vec![mm.outputs[0]]);
+        assert_eq!(
+            graph.outputs,
+            vec![mm.outputs[0].expect("MatMul output must be present")]
+        );
         assert!(graph.validate().is_ok());
     }
 
@@ -1631,7 +1636,7 @@ mod tests {
         let (mut graph, mm_id, _) = matmul_bias_graph(&static_shape([N]), false);
         // Add a second consumer of the MatMulNBits output so it is no longer
         // private to the Add and cannot be dropped.
-        let mm_out = graph.node(mm_id).outputs[0];
+        let mm_out = graph.node(mm_id).outputs[0].expect("MatMul output must be present");
         let other = graph.create_named_value("other", DataType::Float32, static_shape([1, N]));
         graph.insert_node(Node::new(
             NodeId(0),
@@ -1652,7 +1657,7 @@ mod tests {
         let (mut graph, mm_id, _) = matmul_bias_graph(&static_shape([N]), false);
         // Expose the intermediate MatMulNBits result as a graph output; folding
         // would remove an observable value.
-        let mm_out = graph.node(mm_id).outputs[0];
+        let mm_out = graph.node(mm_id).outputs[0].expect("MatMul output must be present");
         let mut outputs = graph.outputs.clone();
         outputs.push(mm_out);
         graph.set_outputs(outputs);
@@ -1883,7 +1888,7 @@ mod tests {
         );
         // Expose the Conv output as a graph output so folding would drop an
         // observable value.
-        let conv_out = graph.node(conv_id).outputs[0];
+        let conv_out = graph.node(conv_id).outputs[0].expect("Conv output must be present");
         let mut outputs = graph.outputs.clone();
         outputs.push(conv_out);
         graph.set_outputs(outputs);

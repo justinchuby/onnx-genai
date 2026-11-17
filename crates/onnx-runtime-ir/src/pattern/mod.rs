@@ -244,6 +244,7 @@ enum Literal {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Constraint {
+    tensor: bool,
     absent: bool,
     immutable: bool,
     element: Option<DataType>,

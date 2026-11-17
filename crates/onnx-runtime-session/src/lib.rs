@@ -191,6 +191,11 @@ mod error {
         HeterogeneousExecutionUnsupported { placement_summary: String },
 
         #[error(
+            "model source is preserved faithfully but is not executable by this runtime: {reason}"
+        )]
+        UnsupportedModel { reason: String },
+
+        #[error(
             "unsupported operator {domain}::{op_type}: no available execution provider has a \
              kernel; node {node}, opset {opset}; decline reason: {reason}; consulted execution \
              providers (priority order): {execution_providers}. To fix: {remediation}",
@@ -753,6 +758,7 @@ impl SessionBuilder {
                 (None, None) => return Err(SessionError::NoModelSource),
             }
         };
+        executor::ensure_execution_supported(&graph)?;
 
         // Decoder precision rewrite (opt-in). Applied here — on the freshly
         // loaded graph, before the I/O signature (`IoMeta`) is computed and
@@ -1227,6 +1233,7 @@ impl InferenceSession {
         // the default ONNX domain is `""`, never `"ai.onnx"`. The executor and
         // validators rely on this, comparing `domain.is_empty()` directly.
         let mut graph = graph;
+        executor::ensure_execution_supported(&graph)?;
         {
             let mut span = trace_span("session.normalize_validate", "session");
             graph.normalize_domains();

@@ -271,7 +271,7 @@ fn collect_structural_growing_symbols_excluding(
         // present_sequence, head_dim]`, seq axis = penultimate). CSA cache
         // records land on outputs[1]/[3] (`[query[0], records, width]`).
         for &idx in slots.present_outputs {
-            if let Some(&vid) = node.outputs.get(idx)
+            if let Some(Some(vid)) = node.outputs.get(idx).copied()
                 && let Some(value) = graph.try_value(vid)
                 && let Some(sym) = kv_growing_symbol(&value.shape)
             {
@@ -281,7 +281,7 @@ fn collect_structural_growing_symbols_excluding(
         // CSA ratio-4 output 5 carries the growing `selections` symbol on its
         // LAST axis (`[query[0], index_heads, query_seq, selections]`).
         for &idx in slots.last_axis_outputs {
-            if let Some(&vid) = node.outputs.get(idx)
+            if let Some(Some(vid)) = node.outputs.get(idx).copied()
                 && let Some(value) = graph.try_value(vid)
                 && let Some(sym) = last_axis_growing_symbol(&value.shape)
             {
@@ -413,9 +413,7 @@ pub(super) fn collect_freeze_safe_mask_symbols(graph: &Graph) -> HashSet<SymbolI
                     continue;
                 }
                 if is_additive_mask_builder_op(node) {
-                    for out in &node.outputs {
-                        frontier.push(*out);
-                    }
+                    frontier.extend(node.output_values());
                 }
             }
         }
@@ -449,7 +447,7 @@ pub(super) fn collect_capacity_pinned_kv_symbols(graph: &Graph) -> HashSet<Symbo
             }
         }
         for &idx in slots.present_outputs {
-            if let Some(&vid) = node.outputs.get(idx)
+            if let Some(Some(vid)) = node.outputs.get(idx).copied()
                 && let Some(value) = graph.try_value(vid)
                 && let Some(sym) = kv_growing_symbol(&value.shape)
             {
@@ -735,7 +733,9 @@ pub(super) fn node_capture_seq_independent(
             .try_value(vid)
             .is_none_or(|value| !shape_references_any(&value.shape, growing))
     };
-    node.outputs.iter().all(|&vid| edge_free_of_growing(vid))
+    node.outputs
+        .iter()
+        .all(|slot| slot.is_none_or(edge_free_of_growing))
         && node
             .inputs
             .iter()

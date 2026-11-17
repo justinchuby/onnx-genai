@@ -7,6 +7,7 @@ use crate::arena::Arena;
 use crate::dtype::DataType;
 use crate::error::GraphError;
 use crate::node::{Node, NodeId};
+use crate::onnx::FunctionProto;
 use crate::shape::{Shape, SymbolConstraints, SymbolId};
 use crate::tensor::WeightRef;
 use crate::value::{Value, ValueId};
@@ -24,8 +25,13 @@ pub struct Graph {
     pub inputs: Vec<ValueId>,
     /// Graph outputs, in order.
     pub outputs: Vec<ValueId>,
-    /// Constant initializer weights, keyed by the value they populate.
+    /// Dense initializer defaults, keyed by the value they populate. An
+    /// initializer that is also a graph input is overridable, not constant.
     pub initializers: HashMap<ValueId, WeightRef>,
+    /// Sparse initializer declarations, keyed by their `values.name` identity.
+    /// Kept in the canonical ONNX representation, including external payload
+    /// descriptors. They are never silently densified or treated as missing.
+    pub sparse_initializers: HashMap<ValueId, crate::onnx::SparseTensorProto>,
     /// Constraints on symbolic dimensions.
     pub symbol_constraints: HashMap<SymbolId, SymbolConstraints>,
     /// Symbol pairs that shape inference unified while broadcasting two distinct
@@ -74,45 +80,110 @@ pub struct Graph {
     pub inference_symbol_floor: Option<u32>,
     /// Imported opsets: domain → version.
     pub opset_imports: HashMap<String, u64>,
-    /// Subgraph bodies for control-flow ops, keyed by `(node, attr_name)`.
-    pub subgraphs: HashMap<(NodeId, String), Graph>,
-    /// Unique model-local functions keyed by normalized `(domain, op_type)`.
-    ///
-    /// Phase-1 heterogeneous legalization intentionally fails closed on overload
-    /// ambiguity, so overload is not represented here; ambiguous keys are tracked
-    /// separately in [`Self::ambiguous_model_functions`].
-    /// TODO(hetero-function-phase2): replace this with an overload-aware
-    /// FunctionLibrary/IR function identity instead of the bounded unique-name
-    /// catalog used by the Phase-1 correctness fix.
+    /// Graph-valued bodies keyed by owner and typed attribute/list location.
+    pub subgraphs: HashMap<(NodeId, GraphAttribute), Graph>,
+    /// Model-local functions keyed by canonical `(domain, name, overload)`.
     pub model_functions: HashMap<ModelFunctionKey, ModelFunction>,
-    /// Model-local function names that are ambiguous without overload metadata.
-    pub ambiguous_model_functions: HashSet<ModelFunctionKey>,
 
     next_symbol: u32,
     symbol_names: HashMap<String, SymbolId>,
-    unknown_value_types: HashSet<ValueId>,
-    unknown_value_shapes: HashSet<ValueId>,
 }
 
-/// Phase-1 identity for a model-local function body.
-pub type ModelFunctionKey = (String, String);
+/// A graph-valued attribute location. Literal names and ordered `GRAPHS`
+/// positions are separate: `single("bodies[0]")` cannot alias `element("bodies", 0)`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GraphAttribute {
+    pub name: String,
+    pub index: Option<usize>,
+}
+
+impl GraphAttribute {
+    pub fn single(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            index: None,
+        }
+    }
+
+    pub fn element(name: impl Into<String>, index: usize) -> Self {
+        Self {
+            name: name.into(),
+            index: Some(index),
+        }
+    }
+}
+
+impl From<String> for GraphAttribute {
+    fn from(name: String) -> Self {
+        Self::single(name)
+    }
+}
+
+impl From<&str> for GraphAttribute {
+    fn from(name: &str) -> Self {
+        Self::single(name)
+    }
+}
+
+impl std::fmt::Display for GraphAttribute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.index {
+            Some(index) => write!(f, "{}[{index}]", self.name),
+            None => self.name.fmt(f),
+        }
+    }
+}
+
+/// Canonical identity of a model-local ONNX function.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ModelFunctionKey {
+    pub domain: String,
+    pub name: String,
+    pub overload: String,
+}
+
+impl ModelFunctionKey {
+    pub fn new(
+        domain: impl AsRef<str>,
+        name: impl Into<String>,
+        overload: impl Into<String>,
+    ) -> Self {
+        Self {
+            domain: crate::normalize_domain(domain.as_ref()).to_string(),
+            name: name.into(),
+            overload: overload.into(),
+        }
+    }
+
+    pub fn from_node(node: &Node) -> Self {
+        Self::new(&node.domain, node.op_type.clone(), node.overload.clone())
+    }
+
+    pub fn from_function(function: &FunctionProto) -> Self {
+        Self::new(
+            &function.domain,
+            function.name.clone(),
+            function.overload.clone(),
+        )
+    }
+}
 
 /// A model-local ONNX function body converted into IR for late legalization.
 #[derive(Clone, Debug)]
 pub struct ModelFunction {
-    pub domain: String,
-    pub name: String,
-    pub inputs: Vec<String>,
-    pub outputs: Vec<String>,
-    /// Formal attribute names declared by the FunctionProto (`attribute` plus
-    /// names from `attribute_proto`). The IR does not preserve `ref_attr_name`
-    /// bindings, so heterogeneous assignment-time IR inlining must treat these
-    /// as requiring proto-level attribute binding.
-    pub attributes: Vec<String>,
-    /// Whether any FunctionProto body attribute (including nested subgraphs) used
-    /// `ref_attr_name`. This is captured before IR conversion drops that field.
-    pub has_attribute_refs: bool,
+    /// Canonical source declaration. This retains overload identity, formal and
+    /// default attributes, function-local opset imports, documentation, value
+    /// information, and metadata without projecting them into a lossy parallel
+    /// descriptor model.
+    pub declaration: FunctionProto,
+    /// Executable IR form of [`Self::declaration`]'s node body.
     pub body: Graph,
+}
+
+impl ModelFunction {
+    pub fn key(&self) -> ModelFunctionKey {
+        ModelFunctionKey::from_function(&self.declaration)
+    }
 }
 
 /// Upper bound on a plausible opset version.
@@ -211,33 +282,35 @@ impl Graph {
 
     /// Whether a value's element type came from explicit source type information.
     pub fn value_type_is_known(&self, id: ValueId) -> bool {
-        !self.unknown_value_types.contains(&id)
+        self.try_value(id)
+            .is_some_and(|value| value.tensor_dtype().is_some())
     }
 
     /// Whether a value's rank and dimensions came from explicit source shape information.
     pub fn value_shape_is_known(&self, id: ValueId) -> bool {
-        !self.unknown_value_shapes.contains(&id)
+        self.try_value(id)
+            .is_some_and(|value| value.tensor_shape().is_some())
     }
 
     /// Mark a value's placeholder element type as unknown.
     pub fn mark_value_type_unknown(&mut self, id: ValueId) {
-        self.unknown_value_types.insert(id);
+        self.value_mut(id).tensor_type_known = false;
     }
 
     /// Mark a value's element type as known.
     pub fn mark_value_type_known(&mut self, id: ValueId) {
-        self.unknown_value_types.remove(&id);
+        self.value_mut(id).tensor_type_known = true;
     }
 
     /// Mark a value's placeholder shape as unknown.
     pub fn mark_value_shape_unknown(&mut self, id: ValueId) {
-        self.unknown_value_shapes.insert(id);
+        self.value_mut(id).tensor_shape_known = false;
     }
 
     /// Mark a value's shape as known (e.g. after seeding a control-flow
     /// subgraph's formal input from the owning node's operand shape).
     pub fn mark_value_shape_known(&mut self, id: ValueId) {
-        self.unknown_value_shapes.remove(&id);
+        self.value_mut(id).tensor_shape_known = true;
     }
 
     // === Symbolic dimensions ===
@@ -368,7 +441,18 @@ impl Graph {
 
     /// Attach initializer weights to `value`.
     pub fn set_initializer(&mut self, value: ValueId, weight: WeightRef) {
+        self.sparse_initializers.remove(&value);
         self.initializers.insert(value, weight);
+    }
+
+    /// Whether a value has a dense or sparse initializer default.
+    pub fn is_initializer(&self, value: ValueId) -> bool {
+        self.initializers.contains_key(&value) || self.sparse_initializers.contains_key(&value)
+    }
+
+    /// An initializer is immutable only when it is not also a graph input.
+    pub fn is_constant_initializer(&self, value: ValueId) -> bool {
+        self.is_initializer(value) && !self.inputs.contains(&value)
     }
 
     // === Traversal ===
@@ -393,7 +477,7 @@ impl Graph {
     pub fn successors(&self, node: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        for &v in &self.node(node).outputs {
+        for v in self.node(node).output_values() {
             if let Some(val) = self.values.get(v) {
                 for c in val.consumers.nodes() {
                     if seen.insert(c) {
@@ -530,7 +614,7 @@ impl Graph {
             return;
         }
         self.disconnect_edges(id);
-        let outputs = self.node(id).outputs.clone();
+        let outputs: Vec<_> = self.node(id).output_values().collect();
         self.nodes.remove(id);
         for v in outputs {
             self.gc_value_if_orphan(v);
@@ -630,7 +714,7 @@ impl Graph {
 
         let mut new_node = new_node;
         new_node.inputs = vec![Some(value)];
-        new_node.outputs = vec![new_value];
+        new_node.outputs = vec![Some(new_value)];
         self.insert_node(new_node)
     }
 
@@ -738,7 +822,7 @@ impl Graph {
                     }
                 }
             }
-            for &v in &node.outputs {
+            for v in node.output_values() {
                 if !self.values.contains(v) {
                     errors.push(GraphError::DanglingValue(v));
                     continue;
@@ -754,7 +838,7 @@ impl Graph {
             if let Some(p) = val.producer {
                 if !self.nodes.contains(p) {
                     errors.push(GraphError::DanglingNode(p));
-                } else if !self.node(p).outputs.contains(&vid) {
+                } else if !self.node(p).outputs.contains(&Some(vid)) {
                     errors.push(GraphError::ProducerLinkMismatch(vid));
                 }
             }
@@ -785,7 +869,7 @@ impl Graph {
             match self.values.get(out) {
                 Some(val) => {
                     debug_assert!(val.is_graph_output);
-                    let is_source = val.is_graph_input || self.initializers.contains_key(&out);
+                    let is_source = val.is_graph_input || self.is_initializer(out);
                     if val.producer.is_none() && !is_source {
                         errors.push(GraphError::MissingProducer(out));
                     }
@@ -836,7 +920,7 @@ impl Graph {
                 metadata.consumers.insert(id, input_index as u32);
             }
         }
-        for v in outputs {
+        for v in outputs.into_iter().flatten() {
             if let Some(val) = self.values.get_mut(v) {
                 val.producer = Some(id);
             }
@@ -851,7 +935,7 @@ impl Graph {
         for input_index in 0..input_count {
             self.replace_input(id, input_index, None);
         }
-        for v in outputs {
+        for v in outputs.into_iter().flatten() {
             if let Some(val) = self.values.get_mut(v)
                 && val.producer == Some(id)
             {
@@ -872,14 +956,12 @@ impl Graph {
                     && v.consumers.is_empty()
                     && !v.is_graph_input
                     && !v.is_graph_output
-                    && !self.initializers.contains_key(&value)
+                    && !self.is_initializer(value)
             }
             None => false,
         };
         if orphan {
             self.values.remove(value);
-            self.unknown_value_types.remove(&value);
-            self.unknown_value_shapes.remove(&value);
         }
     }
 }
@@ -961,7 +1043,7 @@ mod tests {
                 }
             }
         }
-        for &value in &outputs {
+        for value in outputs.iter().flatten().copied() {
             if let Some(metadata) = graph.values.get_mut(value)
                 && metadata.producer == Some(id)
             {
@@ -969,18 +1051,16 @@ mod tests {
             }
         }
         graph.nodes.remove(id);
-        for value in outputs {
+        for value in outputs.into_iter().flatten() {
             let orphan = graph.values.get(value).is_some_and(|metadata| {
                 metadata.producer.is_none()
                     && metadata.consumers.is_empty()
                     && !graph.inputs.contains(&value)
                     && !graph.outputs.contains(&value)
-                    && !graph.initializers.contains_key(&value)
+                    && !graph.is_initializer(value)
             });
             if orphan {
                 graph.values.remove(value);
-                graph.unknown_value_types.remove(&value);
-                graph.unknown_value_shapes.remove(&value);
             }
         }
     }
@@ -1195,7 +1275,7 @@ mod tests {
         let ident = Node::new(NodeId(0), "Identity", vec![], vec![]);
         let nid = g.insert_on_edge(ValueId(2), ident);
         // Add now consumes the new value produced by Identity.
-        let new_out = g.node(nid).outputs[0];
+        let new_out = g.node(nid).outputs[0].expect("Identity output must be present");
         assert_eq!(g.value(new_out).producer, Some(nid));
         assert!(g.node(NodeId(1)).input_values().any(|v| v == new_out));
         assert!(g.validate().is_ok());
@@ -1644,7 +1724,7 @@ mod tests {
     #[test]
     fn replace_node_preserves_id() {
         let mut g = sample_graph();
-        let d = g.node(NodeId(1)).outputs[0];
+        let d = g.node(NodeId(1)).outputs[0].expect("Add output must be present");
         let b = g.node(NodeId(1)).inputs[0];
         let c = g.node(NodeId(1)).inputs[1];
         let sub = Node::new(NodeId(0), "Sub", vec![b, c], vec![d]);
@@ -1652,6 +1732,33 @@ mod tests {
         assert_eq!(id, NodeId(1));
         assert_eq!(g.node(NodeId(1)).op_type, "Sub");
         assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn omitted_output_slot_has_no_value_or_producer_edge() {
+        let mut graph = Graph::new();
+        let input = graph.create_value(DataType::Float32, static_shape([2]));
+        let output = graph.create_value(DataType::Float32, static_shape([2]));
+        graph.add_input(input);
+        let node = graph.insert_node(Node::new_with_output_slots(
+            NodeId(0),
+            "Dropout",
+            vec![Some(input)],
+            vec![Some(output), None],
+        ));
+
+        assert_eq!(graph.node(node).outputs, vec![Some(output), None]);
+        assert_eq!(
+            graph.node(node).output_values().collect::<Vec<_>>(),
+            [output]
+        );
+        assert_eq!(graph.value(output).producer, Some(node));
+        assert_eq!(
+            graph.num_values(),
+            2,
+            "an omitted slot must not fabricate a value"
+        );
+        graph.validate().unwrap();
     }
 
     #[test]

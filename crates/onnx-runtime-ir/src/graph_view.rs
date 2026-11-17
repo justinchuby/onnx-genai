@@ -43,7 +43,7 @@ pub struct GraphViewCache {
     node_inputs: Vec<Range<usize>>,
     flat_node_inputs: Vec<Option<ValueIndex>>,
     node_outputs: Vec<Range<usize>>,
-    flat_node_outputs: Vec<ValueIndex>,
+    flat_node_outputs: Vec<Option<ValueIndex>>,
     value_producer: Vec<Option<NodeIndex>>,
     value_consumer_uses: Vec<Range<usize>>,
     consumer_uses: Vec<ConsumerUse>,
@@ -103,11 +103,11 @@ impl GraphViewCache {
             node_inputs.push(input_start..flat_node_inputs.len());
 
             let output_start = flat_node_outputs.len();
-            for &output in &node.outputs {
-                flat_node_outputs.push(
+            for output in &node.outputs {
+                flat_node_outputs.push(output.map(|output| {
                     value_index_by_raw_id[output.0 as usize]
-                        .expect("validated node output must be a live value"),
-                );
+                        .expect("validated node output must be a live value")
+                }));
             }
             node_outputs.push(output_start..flat_node_outputs.len());
         }
@@ -159,7 +159,7 @@ impl GraphViewCache {
             .collect();
         let initializer_bits = live_values
             .iter()
-            .map(|id| graph.initializers.contains_key(id))
+            .map(|id| graph.is_initializer(*id))
             .collect();
 
         Ok(Self {
@@ -247,7 +247,7 @@ impl<'a> GraphView<'a> {
     }
 
     /// Positional outputs.
-    pub fn node_outputs(self, node: NodeIndex) -> &'a [ValueIndex] {
+    pub fn node_outputs(self, node: NodeIndex) -> &'a [Option<ValueIndex>] {
         &self.cache.flat_node_outputs[self.cache.node_outputs[node.as_usize()].clone()]
     }
 
@@ -348,7 +348,7 @@ mod tests {
         );
         assert_eq!(view.producer(middle), Some(first));
         assert_eq!(view.consumers(middle)[0].node, second);
-        assert_eq!(view.node_outputs(second), &[output]);
+        assert_eq!(view.node_outputs(second), &[Some(output)]);
     }
 
     #[test]

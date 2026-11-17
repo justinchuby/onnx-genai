@@ -2193,7 +2193,6 @@ fn runtime_dispatch_specialization_model() -> Vec<u8> {
         DataType::Float32,
         vec![Dim::Symbolic(rows), Dim::Symbolic(columns)],
     );
-    graph.mark_value_shape_unknown(reshaped);
     graph.insert_node(Node::new(
         NodeId(0),
         "Reshape",
@@ -2206,7 +2205,6 @@ fn runtime_dispatch_specialization_model() -> Vec<u8> {
         DataType::Float32,
         vec![Dim::Symbolic(rows), Dim::Symbolic(columns)],
     );
-    graph.mark_value_shape_unknown(y);
     graph.insert_node(Node::new(
         NodeId(1),
         "Add",

@@ -827,40 +827,27 @@ fn resolve_initializer(
             raw: init.data_type,
             context: format!("initializer {:?}", init.name),
         })?;
-    let dims: Vec<usize> = init.dims.iter().map(|&d| d.max(0) as usize).collect();
+    let dims: Vec<usize> = init.dims.iter().map(|&dim| usize::try_from(dim).map_err(|_| {
+        LoaderError::GraphBuild(format!(
+            "initializer {:?}: dimension {dim} is invalid; supply nonnegative concrete dimensions", init.name
+        ))
+    })).collect::<Result<_, _>>()?;
 
     if init.data_location == tensor_proto::DataLocation::External as i32 {
-        let mut location = None;
-        let mut offset: usize = 0;
-        let mut length: Option<usize> = None;
-        for kv in &init.external_data {
-            match kv.key.as_str() {
-                "location" => location = Some(kv.value.clone()),
-                "offset" => offset = kv.value.parse().unwrap_or(0),
-                "length" => length = kv.value.parse().ok(),
-                _ => {}
-            }
-        }
-        let location = location.ok_or_else(|| {
-            LoaderError::GraphBuild(format!(
-                "external initializer {:?} missing 'location'",
-                init.name
-            ))
-        })?;
-        let path = resolve_external_path(model_dir, &location)?;
-        store.mmap_file(&path)?;
-        let expected_length = TensorData::from_raw(dtype, dims.clone(), Vec::new())
-            .checked_expected_bytes()
-            .ok_or_else(|| {
-                LoaderError::GraphBuild(format!(
-                    "external initializer {:?} geometry overflows for shape {dims:?} and dtype {dtype:?}",
-                    init.name
-                ))
-            })?;
-        let length = length.unwrap_or(expected_length);
+        let weight = external_initializer_reference(init, dtype, dims, model_dir)?;
+        let WeightRef::External {
+            ref path,
+            offset,
+            length,
+            ..
+        } = weight
+        else {
+            unreachable!()
+        };
+        store.mmap_file(path)?;
         // Validate the window lies within the mapped file (catches truncated or
         // mis-described external data early).
-        if let Some(mmap) = store.mmaps.get(&path) {
+        if let Some(mmap) = store.mmaps.get(path) {
             let end = offset.checked_add(length);
             if end.is_none_or(|e| e > mmap.mmap.len()) {
                 return Err(LoaderError::Mmap(format!(
@@ -872,17 +859,122 @@ fn resolve_initializer(
                 )));
             }
         }
-        Ok(WeightRef::External {
-            path,
-            offset,
-            length,
-            dtype,
-            dims,
-        })
+        Ok(weight)
     } else {
         let data = tensor_data_from_proto(init, dtype, &dims)?;
         Ok(WeightRef::Inline(data))
     }
+}
+
+pub(crate) fn external_initializer_reference(
+    init: &TensorProto,
+    dtype: DataType,
+    dims: Vec<usize>,
+    model_dir: &Path,
+) -> Result<WeightRef, LoaderError> {
+    let mut fields = HashMap::new();
+    for field in &init.external_data {
+        if fields
+            .insert(field.key.as_str(), field.value.as_str())
+            .is_some()
+        {
+            return Err(LoaderError::GraphBuild(format!(
+                "external initializer {:?} repeats {:?}; supply each external_data key once",
+                init.name, field.key
+            )));
+        }
+    }
+    let location = fields.get("location").filter(|location| !location.is_empty()).ok_or_else(|| {
+        LoaderError::GraphBuild(format!(
+            "external initializer {:?} missing 'location'; supply a model-relative external_data location", init.name
+        ))
+    })?;
+    let parse = |key| {
+        fields.get(key).map(|value| value.parse::<usize>().map_err(|_| {
+        LoaderError::GraphBuild(format!(
+            "external initializer {:?}: {key} {value:?} is not a nonnegative host-sized integer; repair external_data", init.name
+        ))
+    })).transpose()
+    };
+    let offset = parse("offset")?.unwrap_or(0);
+    let expected = TensorData::from_raw(dtype, dims.clone(), Vec::new())
+        .checked_expected_bytes().ok_or_else(|| LoaderError::GraphBuild(format!(
+            "external initializer {:?}: tensor geometry overflows for shape {dims:?} or dtype {dtype:?} has no bounded dense byte size; repair the descriptor", init.name
+        )))?;
+    let length = parse("length")?.unwrap_or(expected);
+    if matches!(dtype, DataType::String | DataType::Undefined)
+        || length != expected
+        || offset.checked_add(length).is_none()
+    {
+        return Err(LoaderError::GraphBuild(format!(
+            "external initializer {:?}: length {length} does not describe {expected} numeric tensor bytes, or offset overflows; repair external_data",
+            init.name
+        )));
+    }
+    Ok(WeightRef::External {
+        path: resolve_external_path(model_dir, location)?,
+        offset,
+        length,
+        dtype,
+        dims,
+    })
+}
+
+/// Resolve nested graph initializers without putting graph-local ValueIds into
+/// the root weight map. Mappings are shared by path; descriptors stay in scope.
+pub(crate) fn resolve_nested_weights(
+    graph: &mut onnx_runtime_ir::Graph,
+    model_dir: &Path,
+    store: &mut WeightStore,
+) -> Result<(), LoaderError> {
+    fn body(
+        graph: &mut onnx_runtime_ir::Graph,
+        model_dir: &Path,
+        store: &mut WeightStore,
+    ) -> Result<(), LoaderError> {
+        for weight in graph.initializers.values_mut() {
+            let WeightRef::External {
+                path,
+                offset,
+                length,
+                ..
+            } = weight
+            else {
+                continue;
+            };
+            let relative = path.to_str().ok_or_else(|| LoaderError::GraphBuild(
+                "nested initializer path is not representable as ONNX text; repair its location".into()
+            ))?;
+            let resolved = resolve_external_path(model_dir, relative)?;
+            store.mmap_file(&resolved)?;
+            let end = offset.checked_add(*length);
+            if end.is_none_or(|end| end > store.mmaps[&resolved].mmap.len()) {
+                return Err(LoaderError::Mmap(format!(
+                    "nested initializer {} window at {offset} with length {length} exceeds the external file; repair its descriptor",
+                    resolved.display()
+                )));
+            }
+            *path = resolved;
+        }
+        resolve_nested_weights(graph, model_dir, store)
+    }
+    for child in graph.subgraphs.values_mut() {
+        body(child, model_dir, store)?;
+    }
+    for node in graph.nodes.values_mut() {
+        for attribute in node.attributes.values_mut() {
+            match attribute {
+                onnx_runtime_ir::Attribute::Graph(child) => body(child, model_dir, store)?,
+                onnx_runtime_ir::Attribute::Graphs(children) => {
+                    for child in children {
+                        body(child, model_dir, store)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Join an external-data location onto `model_dir`, rejecting paths that can
@@ -907,16 +999,19 @@ pub(crate) fn tensor_data_from_proto(
     }
 
     if dtype == DataType::String {
-        td.strings = proto
-            .string_data
-            .iter()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .collect();
+        td.strings = proto.string_data.clone();
+        if !proto.raw_data.is_empty() || td.checked_numel() != Some(td.strings.len()) {
+            return Err(LoaderError::GraphBuild(format!(
+                "STRING tensor {:?}: shape {dims:?} does not match {} byte-string elements or uses raw_data; supply one string_data element per tensor element",
+                proto.name,
+                td.strings.len()
+            )));
+        }
         return Ok(td);
     }
 
     // Prefer raw_data when present (the common, mmap-friendly encoding).
-    if !proto.raw_data.is_empty() {
+    if !proto.raw_data.is_empty() && dtype != DataType::Undefined {
         td.data = proto.raw_data.clone();
         return Ok(td);
     }

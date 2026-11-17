@@ -328,6 +328,23 @@ impl Parser {
         };
         Ok(Parameter { name, annotation })
     }
+
+    fn assignment_target(&mut self) -> Result<Parameter> {
+        if matches!(self.peek(), Some("None" | "_")) {
+            let name = self.identifier()?;
+            if self.peek() == Some(":") {
+                return Err(self.error(
+                    PatternErrorKind::InvalidPattern,
+                    "absent and wildcard output slots cannot have annotations",
+                ));
+            }
+            return Ok(Parameter {
+                name,
+                annotation: None,
+            });
+        }
+        self.parameter()
+    }
     fn constraint(&mut self) -> Result<RawConstraint> {
         let immutable = self.take("const");
         let name = self.identifier()?;
@@ -460,9 +477,9 @@ impl Parser {
                     "pattern needs explicit return values or a return operator call",
                 ));
             }
-            let mut targets = vec![self.parameter()?];
+            let mut targets = vec![self.assignment_target()?];
             while self.take(",") {
-                targets.push(self.parameter()?);
+                targets.push(self.assignment_target()?);
             }
             self.expect("=")?;
             let expression = self.expression(0)?;

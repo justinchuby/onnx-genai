@@ -158,7 +158,7 @@ fn run_model(
     let x_id = node.inputs[0].unwrap();
     let w_id = node.inputs[1].unwrap();
     let b_id = node.inputs[2].unwrap();
-    let y_id = node.outputs[0];
+    let y_id = node.outputs[0].unwrap();
     let x_shape = as_static_shape(&graph.value(x_id).shape).unwrap();
     let y_shape = as_static_shape(&graph.value(y_id).shape).unwrap();
     let dtype = graph.value(x_id).dtype;

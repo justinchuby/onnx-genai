@@ -188,7 +188,8 @@ fn check_graph_connections(
                 ));
             }
         }
-        for (index, &value_id) in node.outputs.iter().enumerate() {
+        for (index, &slot) in node.outputs.iter().enumerate() {
+            let Some(value_id) = slot else { continue };
             let problem = match graph.try_value(value_id) {
                 None => Some(format!(
                     "output {index} references missing value id {}",

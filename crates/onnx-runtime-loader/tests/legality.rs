@@ -259,6 +259,7 @@ fn ref_attribute_in_nested_function_subgraph_loads() {
     let mut legal = model(onnx::GraphProto::default());
     legal.functions.push(onnx::FunctionProto {
         name: "NestedReference".to_string(),
+        attribute: vec!["axis_parameter".to_string()],
         node: vec![node_with_attrs(
             "If",
             vec![graph_attr(

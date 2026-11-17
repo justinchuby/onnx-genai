@@ -79,6 +79,115 @@ use crate::proto::onnx::{
 /// default behavior is preserved for every op no kernel claims.
 pub type KeepAsOp<'a> = dyn Fn(&Node, u64, &[DataType]) -> bool + 'a;
 
+enum AttributeBinding<'a, T> {
+    Supplied(&'a T),
+    Default(&'a AttributeProto),
+}
+
+fn resolve_attribute_binding<'a, T>(
+    name: &str,
+    supplied: Option<&'a T>,
+    function: &'a FunctionProto,
+    function_name: String,
+    node_name: String,
+) -> Result<Option<AttributeBinding<'a, T>>, LoaderError> {
+    if let Some(value) = supplied {
+        return Ok(Some(AttributeBinding::Supplied(value)));
+    }
+    if let Some(default) = function
+        .attribute_proto
+        .iter()
+        .find(|attribute| attribute.name == name)
+    {
+        return Ok(Some(AttributeBinding::Default(default)));
+    }
+    if function.attribute.iter().any(|required| required == name) {
+        return Err(LoaderError::MissingRequiredFunctionAttribute {
+            function: function_name,
+            node: node_name,
+            attribute: name.to_string(),
+        });
+    }
+    Ok(None)
+}
+
+/// Resolve formal/default function attributes into a cloned IR body.
+///
+/// The binding rule is shared with protobuf inlining: call-site values win,
+/// then `FunctionProto.attribute_proto` defaults, while a missing required
+/// formal is an actionable error. References nested in GRAPH/GRAPHS attributes
+/// are resolved recursively.
+pub fn bind_ir_function_attributes(
+    call: &Node,
+    function: &onnx_runtime_ir::ModelFunction,
+    body: &mut onnx_runtime_ir::Graph,
+) -> Result<(), LoaderError> {
+    fn bind_graph(
+        graph: &mut onnx_runtime_ir::Graph,
+        call: &Node,
+        function: &onnx_runtime_ir::ModelFunction,
+    ) -> Result<(), LoaderError> {
+        let node_ids: Vec<_> = graph.nodes.keys().collect();
+        for node_id in node_ids {
+            let keys: Vec<String> = graph.node(node_id).attributes.keys().cloned().collect();
+            for key in keys {
+                let current = graph.node(node_id).attributes[&key].clone();
+                let replacement = match current {
+                    Attribute::Ref { name, .. } => match resolve_attribute_binding(
+                        &name,
+                        call.attributes.get(&name),
+                        &function.declaration,
+                        fmt_key(&fn_key_of_function(&function.declaration)),
+                        if call.name.is_empty() {
+                            format!("{}::{}", call.domain, call.op_type)
+                        } else {
+                            call.name.clone()
+                        },
+                    )? {
+                        Some(AttributeBinding::Supplied(value)) => Some(value.clone()),
+                        Some(AttributeBinding::Default(default)) => Some(
+                            crate::graph_builder::convert_attribute(graph, default)?
+                                .map(|(_, value)| value)
+                                .ok_or_else(|| LoaderError::MalformedFunctionAttribute {
+                                    function: fmt_key(&fn_key_of_function(&function.declaration)),
+                                    detail: format!(
+                                        "default attribute {name:?} has no encoded value"
+                                    ),
+                                })?,
+                        ),
+                        None => None,
+                    },
+                    value => Some(value),
+                };
+                if let Some(replacement) = replacement {
+                    graph.node_mut(node_id).attributes.insert(key, replacement);
+                } else {
+                    graph.node_mut(node_id).attributes.remove(&key);
+                }
+            }
+
+            let keys: Vec<String> = graph.node(node_id).attributes.keys().cloned().collect();
+            for key in keys {
+                if let Some(attribute) = graph.node_mut(node_id).attributes.get_mut(&key) {
+                    match attribute {
+                        Attribute::Graph(nested) => bind_graph(nested, call, function)?,
+                        Attribute::Graphs(nested) => {
+                            for graph in nested {
+                                bind_graph(graph, call, function)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            crate::graph_builder::register_subgraphs(graph, node_id);
+        }
+        Ok(())
+    }
+
+    bind_graph(body, call, function)
+}
+
 /// Per-inline claim context: the caller's keep-as-op predicate plus the
 /// proto-level metadata needed to evaluate it (value dtypes and per-domain
 /// opset). Built once, at the top-level graph, and shared by reference.
@@ -121,6 +230,7 @@ fn claim_view_node(np: &NodeProto) -> Node {
     let mut node = Node::new(NodeId(0), np.op_type.clone(), Vec::new(), Vec::new());
     node.name = np.name.clone();
     node.domain = normalize_domain(&np.domain).to_string();
+    node.overload = np.overload.clone();
     for ap in &np.attribute {
         if let Some(attr) = scalar_attribute(ap) {
             node.attributes.insert(ap.name.clone(), attr);
@@ -688,30 +798,21 @@ fn bind_attribute(
         return Ok(Some(attr.clone()));
     }
     let a = &attr.ref_attr_name;
-
-    // Call-site value wins.
-    if let Some(supplied) = call.attribute.iter().find(|ca| &ca.name == a) {
-        let mut bound = supplied.clone();
-        bound.name = attr.name.clone();
-        bound.ref_attr_name.clear();
-        return Ok(Some(bound));
-    }
-    // Otherwise the function's declared default, if any.
-    if let Some(default) = func.attribute_proto.iter().find(|d| &d.name == a) {
-        let mut bound = default.clone();
-        bound.name = attr.name.clone();
-        bound.ref_attr_name.clear();
-        return Ok(Some(bound));
-    }
-    // No value and no default: an error if the attribute is required, else drop.
-    if func.attribute.iter().any(|req| req == a) {
-        return Err(LoaderError::MissingRequiredFunctionAttribute {
-            function: fmt_key(key),
-            node: node_label(call),
-            attribute: a.clone(),
-        });
-    }
-    Ok(None)
+    let source = resolve_attribute_binding(
+        a,
+        call.attribute.iter().find(|attribute| &attribute.name == a),
+        func,
+        fmt_key(key),
+        node_label(call),
+    )?;
+    let mut bound = match source {
+        Some(AttributeBinding::Supplied(value)) => value.clone(),
+        Some(AttributeBinding::Default(value)) => value.clone(),
+        None => return Ok(None),
+    };
+    bound.name = attr.name.clone();
+    bound.ref_attr_name.clear();
+    Ok(Some(bound))
 }
 
 /// Apply `rename` to a node's value references: its inputs, its outputs, and any
