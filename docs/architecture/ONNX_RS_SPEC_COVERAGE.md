@@ -2,7 +2,7 @@
 
 This audit binds `onnx-std` to **ONNX v1.20.0 / IR version 13**. The vendored
 schema declares IR 13 and the `UINT2`/`INT2` additions
-([`onnx.proto3:115-125`](../../crates/onnx-runtime-loader/proto/onnx.proto3#L115-L125)).
+([`onnx.proto3:115-125`](../../crates/onnx-runtime-ir/proto/onnx.proto3#L115-L125)).
 The authoritative comparison inputs are:
 
 - `onnx/onnx.proto` and `onnx/onnx.proto3` at tag `v1.20.0`;
@@ -58,11 +58,11 @@ I/O, and dedicated multi-device paths are exercised in
 
 The field-number source is the vendored v1.20-compatible schema:
 attributes/value/node/multi-device
-([`onnx.proto3:134-320`](../../crates/onnx-runtime-loader/proto/onnx.proto3#L134-L320)),
+([`onnx.proto3:134-320`](../../crates/onnx-runtime-ir/proto/onnx.proto3#L134-L320)),
 model/training/graph
-([`onnx.proto3:341-599`](../../crates/onnx-runtime-loader/proto/onnx.proto3#L341-L599)),
+([`onnx.proto3:341-599`](../../crates/onnx-runtime-ir/proto/onnx.proto3#L341-L599)),
 tensors/types/functions
-([`onnx.proto3:604-996`](../../crates/onnx-runtime-loader/proto/onnx.proto3#L604-L996)).
+([`onnx.proto3:604-996`](../../crates/onnx-runtime-ir/proto/onnx.proto3#L604-L996)).
 
 | Message | Every field (number) | Wire model | Checker | Text DSL | TextProto | JSON |
 |---|---|---:|---:|---:|---:|---:|

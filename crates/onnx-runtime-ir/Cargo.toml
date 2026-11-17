@@ -10,6 +10,12 @@ categories = ["science", "data-structures"]
 
 [dependencies]
 thiserror = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+prost = { workspace = true }
+prost-build = "0.13"
+protox = "0.7"
 
 [dev-dependencies]
 onnx-runtime-einsum-conformance = { workspace = true }

@@ -4,7 +4,7 @@
 //! build does not depend on a system `protoc` binary, then hand the resulting
 //! `FileDescriptorSet` to `prost-build` for Rust code generation. The generated
 //! file lands in `$OUT_DIR/onnx.rs` (named after the proto `package onnx;`) and
-//! is `include!`d by `src/proto.rs`.
+//! is `include!`d by `src/onnx.rs`.
 
 use prost::Message;
 use std::path::PathBuf;

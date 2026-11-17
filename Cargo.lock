@@ -2581,6 +2581,9 @@ name = "onnx-runtime-ir"
 version = "0.1.0-dev.6"
 dependencies = [
  "onnx-runtime-einsum-conformance",
+ "prost",
+ "prost-build",
+ "protox",
  "thiserror 2.0.19",
 ]
 
@@ -2594,9 +2597,7 @@ dependencies = [
  "onnx-runtime-shape-inference",
  "onnx-runtime-tracer",
  "prost",
- "prost-build",
  "prost-reflect",
- "protox",
  "thiserror 2.0.19",
 ]
 

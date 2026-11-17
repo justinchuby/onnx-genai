@@ -127,7 +127,7 @@ fn const_i64(out: &str, dims: &[i64], values: &[i64]) -> onnx::NodeProto {
     node_attrs("Constant", &[], &[out], vec![attr])
 }
 
-fn model(graph: onnx::GraphProto, opset: i64) -> Vec<u8> {
+fn model(graph: onnx_runtime_ir::onnx::GraphProto, opset: i64) -> Vec<u8> {
     let m = onnx::ModelProto {
         ir_version: 8,
         opset_import: vec![onnx::OperatorSetIdProto {
