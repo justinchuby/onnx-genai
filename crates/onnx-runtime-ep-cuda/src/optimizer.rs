@@ -1,9 +1,131 @@
+use onnx_runtime_ir::pattern::{MatchOptions, MatchSession, Pattern};
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
+};
+use onnx_runtime_optimizer::RecognitionRule;
+use onnx_runtime_optimizer::recognition::{
+    MATMUL_NBITS_BIAS, SILU_DECOMPOSITION, capture_node, capture_value,
 };
 use onnx_runtime_optimizer::{
     OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
 };
+use std::sync::LazyLock;
+
+static QUANTIZED_PROJECTION: LazyLock<Pattern> = LazyLock::new(|| {
+    Pattern::parse_native("(args:slots[0:*])=>return com.microsoft.MatMulNBits(...args)")
+        .expect("built-in quantized projection pattern must compile; fix its textual definition")
+});
+
+static CAST: LazyLock<Pattern> = LazyLock::new(|| {
+    Pattern::parse_ort("(x)=>{out=Cast(x);return out}")
+        .expect("built-in Cast pattern must compile; fix its textual definition")
+});
+
+static CONSTANT: LazyLock<Pattern> = LazyLock::new(|| {
+    Pattern::parse_ort("()=>{out=Constant();return out}")
+        .expect("built-in Constant pattern must compile; fix its textual definition")
+});
+
+static THRESHOLD: LazyLock<Pattern> = LazyLock::new(|| {
+    Pattern::parse_ort(
+        "(x,threshold)=>{out=Greater(x,threshold)|GreaterOrEqual(x,threshold);return out}",
+    )
+    .expect("built-in threshold pattern must compile; fix its textual definition")
+});
+
+static BETA_GATE: LazyLock<Pattern> = LazyLock::new(|| {
+    Pattern::parse_ort("(raw)=>{out=Sigmoid(raw);return out}")
+        .expect("built-in beta gate pattern must compile; fix its textual definition")
+});
+
+static DECAY_GATES: LazyLock<[Pattern; 2]> = LazyLock::new(|| {
+    ["coefficient=c", "exp=Exp(c);coefficient=Neg(exp)"].map(|coefficient| {
+        Pattern::parse_ort(&format!(
+            "(a,bias,c)=>{{
+                {coefficient};
+                sum=Add(a,bias)|Add(bias,a);
+                soft=Softplus(sum);
+                product=Mul(coefficient,soft)|Mul(soft,coefficient);
+                out=Cast(product)|product;return out
+            }}"
+        ))
+        .expect("built-in decay gate pattern must compile; fix its textual definition")
+    })
+});
+
+type CastIndex = std::collections::HashMap<NodeId, (ValueId, ValueId)>;
+
+fn cast_index(session: &MatchSession<'_>) -> OptimizerResult<CastIndex> {
+    session
+        .find_matches(&CAST, MatchOptions::default())?
+        .into_iter()
+        .map(|matched| {
+            Ok((
+                capture_node(&matched, "out")?,
+                (
+                    capture_value(&matched, "x")?,
+                    capture_value(&matched, "out")?,
+                ),
+            ))
+        })
+        .collect()
+}
+
+static RSQRT: LazyLock<RecognitionRule> = LazyLock::new(|| {
+    RecognitionRule::parse(
+        "CUDA rsqrt",
+        "(x)=>{sqrt=Sqrt(x);out=Reciprocal(sqrt);return out}",
+        "sqrt",
+    )
+    .expect("built-in rsqrt pattern must compile; fix its textual definition")
+});
+
+static L2_NORMALIZE: LazyLock<RecognitionRule> = LazyLock::new(|| {
+    RecognitionRule::parse(
+        "CUDA L2 normalization",
+        "(x,axes:slots[0:*])=>{
+            sq=ReduceSumSquare(x,...axes);nrm=Sqrt(sq);out=Div(x,nrm);return out
+        }",
+        "out",
+    )
+    .expect("built-in L2 normalization pattern must compile; fix its textual definition")
+});
+
+static SWIGLU: LazyLock<RecognitionRule> = LazyLock::new(|| {
+    RecognitionRule::parse(
+        "CUDA SwiGLU",
+        "(gate,up)=>{
+            silu=com.microsoft.Silu(gate)|Swish(gate);
+            out=Mul(silu,up)|Mul(up,silu);return out
+        }",
+        "silu",
+    )
+    .expect("built-in SwiGLU pattern must compile; fix its textual definition")
+});
+
+static GATE_UP_SWIGLU: LazyLock<RecognitionRule> = LazyLock::new(|| {
+    RecognitionRule::parse(
+        "CUDA gate/up SwiGLU",
+        "(x,gs:slots[0:*],us:slots[0:*])=>{
+            gate=com.microsoft.MatMulNBits(x,...gs);
+            up=com.microsoft.MatMulNBits(x,...us);
+            out=Mul(gate,up);return out
+        }",
+        "out",
+    )
+    .expect("built-in gate/up SwiGLU pattern must compile; fix its textual definition")
+});
+
+static SKIP_RMSNORM: LazyLock<RecognitionRule> = LazyLock::new(|| {
+    RecognitionRule::parse(
+        "CUDA residual RMS normalization",
+        "(a,b,gamma,rest:slots[0:*])=>{
+            sum=Add(a,b);out=SimplifiedLayerNormalization(sum,gamma,...rest);return out
+        }",
+        "out",
+    )
+    .expect("built-in residual norm pattern must compile; fix its textual definition")
+});
 
 use crate::kernels::linear_attention::{
     FUSE_BETA_SIGMOID_ATTR, FUSE_DECAY_SOFTPLUS_ATTR, FUSE_NEG_EXP_ATTR,
@@ -162,76 +284,47 @@ impl OptimizationPass for CudaSiluFusion {
     }
 
     fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
-        let sigmoid_ids: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "Sigmoid"
-                    && node.is_default_domain()
-                    && node.inputs.len() == 1
-                    && node.outputs.len() == 1)
-                    .then_some(id)
-            })
-            .collect();
-        let mut changed = false;
-
-        for sigmoid_id in sigmoid_ids {
-            let Some(sigmoid) = graph.try_node(sigmoid_id) else {
-                continue;
-            };
-            let Some(x) = sigmoid.inputs[0] else {
-                continue;
-            };
-            // The fused SwiGLU epilogue has a byte-exact decomposed kernel for
-            // both fp16 (`decomposed_silu_mul_f16`) and bf16
-            // (`decomposed_silu_mul_bf16`): each rounds the intermediate
-            // `sigmoid` and the `x * sigmoid` product back to the narrow dtype
-            // exactly as the standalone `Sigmoid`/`Mul` ops do, so greedy tokens
-            // stay byte-identical. bf16 decoders such as Muse-Glimmer-30B export
-            // the SwiGLU as a standalone `Sigmoid` + `Mul(x, sigmoid)` pair in
-            // their native bf16 stream; without bf16 here the ~2 glue nodes per
-            // layer never collapse into the fused launch.
-            if !matches!(graph.value(x).dtype, DataType::Float16 | DataType::BFloat16) {
-                continue;
-            }
-            let Some(sigmoid_output) = sigmoid.outputs[0] else {
-                continue;
-            };
-            if graph.outputs.contains(&sigmoid_output) {
-                continue;
-            }
-            let consumers = graph.consumers(sigmoid_output);
-            if consumers.len() != 1 {
-                continue;
-            }
-            let mul_id = consumers[0];
-            let mul = graph.node(mul_id);
-            if mul.op_type != "Mul"
-                || !mul.is_default_domain()
-                || mul.inputs.len() != 2
-                || mul.outputs.len() != 1
-                || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
-                    || (mul.inputs[1] == Some(x) && mul.inputs[0] == Some(sigmoid_output)))
-            {
-                continue;
-            }
-
-            let mut silu = mul.clone();
-            silu.op_type = "Silu".to_string();
-            silu.domain = MICROSOFT_DOMAIN.to_string();
-            silu.version = None;
-            silu.inputs = vec![Some(x)];
-            silu.attributes.clear();
-            silu.attributes
-                .insert(DECOMPOSED_SILU_ATTR.into(), Attribute::Int(1));
-            graph.replace_node(mul_id, silu);
-            graph.remove_node(sigmoid_id);
-            graph
-                .opset_imports
-                .entry(MICROSOFT_DOMAIN.to_string())
-                .or_insert(1);
-            changed = true;
-        }
+        let changed = SILU_DECOMPOSITION.rewrite(
+            graph,
+            |graph, matched| {
+                let sigmoid_id = capture_node(matched, "sigmoid")?;
+                let sigmoid_output = capture_value(matched, "sigmoid")?;
+                let mul_id = capture_node(matched, "out")?;
+                let x = capture_value(matched, "x")?;
+                // The fused SwiGLU epilogue has a byte-exact decomposed kernel for
+                // both fp16 (`decomposed_silu_mul_f16`) and bf16
+                // (`decomposed_silu_mul_bf16`): each rounds the intermediate
+                // `sigmoid` and the `x * sigmoid` product back to the narrow dtype
+                // exactly as the standalone `Sigmoid`/`Mul` ops do, so greedy tokens
+                // stay byte-identical. bf16 decoders such as Muse-Glimmer-30B export
+                // the SwiGLU as a standalone `Sigmoid` + `Mul(x, sigmoid)` pair in
+                // their native bf16 stream; without bf16 here the ~2 glue nodes per
+                // layer never collapse into the fused launch.
+                if !matches!(graph.value(x).dtype, DataType::Float16 | DataType::BFloat16) {
+                    return Ok(None);
+                }
+                Ok((!graph.outputs.contains(&sigmoid_output)
+                    && graph.consumers(sigmoid_output) == [mul_id])
+                .then_some((sigmoid_id, mul_id, x)))
+            },
+            |graph, (sigmoid_id, mul_id, x)| {
+                let mul = graph.node(mul_id);
+                let mut silu = mul.clone();
+                silu.op_type = "Silu".to_string();
+                silu.domain = MICROSOFT_DOMAIN.to_string();
+                silu.version = None;
+                silu.inputs = vec![Some(x)];
+                silu.attributes.clear();
+                silu.attributes
+                    .insert(DECOMPOSED_SILU_ATTR.into(), Attribute::Int(1));
+                graph.replace_node(mul_id, silu);
+                graph.remove_node(sigmoid_id);
+                graph
+                    .opset_imports
+                    .entry(MICROSOFT_DOMAIN.to_string())
+                    .or_insert(1);
+            },
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -280,65 +373,38 @@ impl OptimizationPass for CudaRsqrtFusion {
     }
 
     fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
-        let sqrt_ids: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "Sqrt"
-                    && node.is_default_domain()
-                    && node.inputs.len() == 1
-                    && node.outputs.len() == 1)
-                    .then_some(id)
-            })
-            .collect();
-        let mut changed = false;
-
-        for sqrt_id in sqrt_ids {
-            let Some(sqrt) = graph.try_node(sqrt_id) else {
-                continue;
-            };
-            let Some(x) = sqrt.inputs[0] else {
-                continue;
-            };
-            // The fused `rsqrt` kernel exists for f32/f16/bf16 and reproduces the
-            // two-op rounding exactly, so restrict the fusion to those dtypes.
-            if !matches!(
-                graph.value(x).dtype,
-                DataType::Float32 | DataType::Float16 | DataType::BFloat16
-            ) {
-                continue;
-            }
-            let Some(sqrt_output) = sqrt.outputs[0] else {
-                continue;
-            };
-            if graph.outputs.contains(&sqrt_output) {
-                continue;
-            }
-            let consumers = graph.consumers(sqrt_output);
-            if consumers.len() != 1 {
-                continue;
-            }
-            let recip_id = consumers[0];
-            let recip = graph.node(recip_id);
-            if recip.op_type != "Reciprocal"
-                || !recip.is_default_domain()
-                || recip.inputs.len() != 1
-                || recip.outputs.len() != 1
-                || recip.inputs[0] != Some(sqrt_output)
-                || recip.attr(CUDA_RSQRT_ATTR).is_some()
-            {
-                continue;
-            }
-
-            let mut rsqrt = recip.clone();
-            rsqrt.inputs = vec![Some(x)];
-            rsqrt
-                .attributes
-                .insert(CUDA_RSQRT_ATTR.into(), Attribute::Int(1));
-            graph.replace_node(recip_id, rsqrt);
-            graph.remove_node(sqrt_id);
-            changed = true;
-        }
+        let changed = RSQRT.rewrite(
+            graph,
+            |graph, matched| {
+                let sqrt_id = capture_node(matched, "sqrt")?;
+                let sqrt_output = capture_value(matched, "sqrt")?;
+                let recip_id = capture_node(matched, "out")?;
+                let x = capture_value(matched, "x")?;
+                // The fused `rsqrt` kernel exists for f32/f16/bf16 and reproduces the
+                // two-op rounding exactly, so restrict the fusion to those dtypes.
+                if !matches!(
+                    graph.value(x).dtype,
+                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
+                ) {
+                    return Ok(None);
+                }
+                let recip = graph.node(recip_id);
+                Ok((!graph.outputs.contains(&sqrt_output)
+                    && graph.consumers(sqrt_output) == [recip_id]
+                    && recip.attr(CUDA_RSQRT_ATTR).is_none())
+                .then_some((sqrt_id, recip_id, x)))
+            },
+            |graph, (sqrt_id, recip_id, x)| {
+                let recip = graph.node(recip_id);
+                let mut rsqrt = recip.clone();
+                rsqrt.inputs = vec![Some(x)];
+                rsqrt
+                    .attributes
+                    .insert(CUDA_RSQRT_ATTR.into(), Attribute::Int(1));
+                graph.replace_node(recip_id, rsqrt);
+                graph.remove_node(sqrt_id);
+            },
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -460,93 +526,60 @@ impl OptimizationPass for CudaL2NormalizeFusion {
         if l2_normalize_fusion_disabled() {
             return Ok(());
         }
-        let div_ids: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "Div"
-                    && node.is_default_domain()
-                    && node.inputs.len() == 2
-                    && node.outputs.len() == 1)
-                    .then_some(id)
-            })
-            .collect();
-        let mut changed = false;
-
-        for div_id in div_ids {
-            let Some(div) = graph.try_node(div_id) else {
-                continue;
-            };
-            let (Some(x), Some(nrm)) = (div.inputs[0], div.inputs[1]) else {
-                continue;
-            };
-            // The activation dtype must be one the LpNormalization kernel serves.
-            if !matches!(
-                graph.value(x).dtype,
-                DataType::Float32 | DataType::Float16 | DataType::BFloat16
-            ) {
-                continue;
-            }
-            // `nrm` must be a sole-consumer `Sqrt(sq)`.
-            let Some(sqrt_id) = graph.value(nrm).producer else {
-                continue;
-            };
-            let sqrt = graph.node(sqrt_id);
-            if sqrt.op_type != "Sqrt"
-                || !sqrt.is_default_domain()
-                || sqrt.inputs.len() != 1
-                || sqrt.outputs.len() != 1
-                || graph.value(nrm).is_graph_output
-                || graph.consumers(nrm).len() != 1
-            {
-                continue;
-            }
-            let Some(sq) = sqrt.inputs[0] else {
-                continue;
-            };
-            // `sq` must be a sole-consumer `ReduceSumSquare(x, axis)` over the
-            // *same* `x` the Div divides — the true L2-normalize shape.
-            let Some(rss_id) = graph.value(sq).producer else {
-                continue;
-            };
-            let rss = graph.node(rss_id);
-            if rss.op_type != "ReduceSumSquare"
-                || !rss.is_default_domain()
-                || rss.inputs.first().copied().flatten() != Some(x)
-                || rss.outputs.len() != 1
-                || graph.value(sq).is_graph_output
-                || graph.consumers(sq).len() != 1
-            {
-                continue;
-            }
-            let Some(axis) = Self::reduce_axis(graph, rss) else {
-                continue;
-            };
-
-            // Rewrite the Div into a single fused LpNormalization(p=2) that reads
-            // `x` directly and keeps the Div's output value (downstream untouched);
-            // then drop the now-dead Sqrt and ReduceSumSquare.
-            let mut lpnorm = div.clone();
-            lpnorm.op_type = "LpNormalization".to_string();
-            lpnorm.domain = String::new();
-            lpnorm.version = None;
-            lpnorm.inputs = vec![Some(x)];
-            lpnorm.attributes.clear();
-            lpnorm.attributes.insert("p".into(), Attribute::Int(2));
-            lpnorm
-                .attributes
-                .insert("axis".into(), Attribute::Int(axis));
-            // Private marker: route to the byte-faithful L2-normalize kernel that
-            // reproduces the exported chain's intermediate rounding, so greedy
-            // decode stays token-identical to the unfused graph.
-            lpnorm
-                .attributes
-                .insert("fused_reduce_chain".into(), Attribute::Int(1));
-            graph.replace_node(div_id, lpnorm);
-            graph.remove_node(sqrt_id);
-            graph.remove_node(rss_id);
-            changed = true;
-        }
+        let changed = L2_NORMALIZE.rewrite(
+            graph,
+            |graph, matched| {
+                let div_id = capture_node(matched, "out")?;
+                let sqrt_id = capture_node(matched, "nrm")?;
+                let rss_id = capture_node(matched, "sq")?;
+                let x = capture_value(matched, "x")?;
+                let nrm = capture_value(matched, "nrm")?;
+                let sq = capture_value(matched, "sq")?;
+                // The activation dtype must be one the LpNormalization kernel serves.
+                if !matches!(
+                    graph.value(x).dtype,
+                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
+                ) {
+                    return Ok(None);
+                }
+                if graph.value(nrm).is_graph_output || graph.consumers(nrm).len() != 1 {
+                    return Ok(None);
+                }
+                let rss = graph.node(rss_id);
+                if graph.value(sq).is_graph_output || graph.consumers(sq).len() != 1 {
+                    return Ok(None);
+                }
+                let Some(axis) = Self::reduce_axis(graph, rss) else {
+                    return Ok(None);
+                };
+                Ok(Some((div_id, sqrt_id, rss_id, x, axis)))
+            },
+            |graph, (div_id, sqrt_id, rss_id, x, axis)| {
+                let div = graph.node(div_id);
+                // Rewrite the Div into a single fused LpNormalization(p=2) that reads
+                // `x` directly and keeps the Div's output value (downstream untouched);
+                // then drop the now-dead Sqrt and ReduceSumSquare.
+                let mut lpnorm = div.clone();
+                lpnorm.op_type = "LpNormalization".to_string();
+                lpnorm.domain = String::new();
+                lpnorm.version = None;
+                lpnorm.inputs = vec![Some(x)];
+                lpnorm.attributes.clear();
+                lpnorm.attributes.insert("p".into(), Attribute::Int(2));
+                lpnorm
+                    .attributes
+                    .insert("axis".into(), Attribute::Int(axis));
+                // Private marker: route to the byte-faithful L2-normalize kernel that
+                // reproduces the exported chain's intermediate rounding, so greedy
+                // decode stays token-identical to the unfused graph.
+                lpnorm
+                    .attributes
+                    .insert("fused_reduce_chain".into(), Attribute::Int(1));
+                graph.replace_node(div_id, lpnorm);
+                graph.remove_node(sqrt_id);
+                graph.remove_node(rss_id);
+            },
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -635,79 +668,26 @@ impl CudaLinearAttentionGatingFusion {
             && node.outputs.len() == 2
     }
 
-    /// The single producer of `value`, if `value` is single-consumer (by
-    /// `consumer_id`), not a graph output, and produced by exactly one node.
-    fn sole_producer(graph: &Graph, value: ValueId, consumer_id: NodeId) -> Option<NodeId> {
-        if graph.outputs.contains(&value) {
-            return None;
-        }
-        let consumers = graph.consumers(value);
-        if consumers.len() != 1 || consumers[0] != consumer_id {
-            return None;
-        }
-        graph.value(value).producer
-    }
-
     /// Match `beta = Sigmoid(raw)` where `raw` shares `io_dtype`.
     fn match_beta_sigmoid(
         graph: &Graph,
+        session: &MatchSession<'_>,
         beta: ValueId,
         la_id: NodeId,
         io_dtype: DataType,
-    ) -> Option<BetaSigmoidFold> {
-        let sigmoid_id = Self::sole_producer(graph, beta, la_id)?;
-        let sigmoid = graph.node(sigmoid_id);
-        if sigmoid.op_type != "Sigmoid"
-            || !sigmoid.is_default_domain()
-            || sigmoid.inputs.len() != 1
-            || sigmoid.outputs.len() != 1
-        {
-            return None;
+    ) -> OptimizerResult<Option<BetaSigmoidFold>> {
+        if graph.outputs.contains(&beta) || graph.consumers(beta) != [la_id] {
+            return Ok(None);
         }
-        let raw = sigmoid.inputs[0]?;
-        if graph.value(raw).dtype != io_dtype {
-            return None;
-        }
-        Some(BetaSigmoidFold { sigmoid_id, raw })
-    }
-
-    /// Match the exported `neg_exp_A = Neg(Exp(A_log))` constant chain feeding
-    /// `mul_id`, where `A_log` is an `io_dtype` graph initializer and both ops
-    /// are single-consumer and not graph outputs. Returns the `A_log` value and
-    /// the `[Neg, Exp]` node ids to delete (consumer-first). Some exporters emit
-    /// `neg_exp_A` as a ready initializer (nothing to fold here); others — the
-    /// Qwen3.8 / Qwen3-Next hybrids — emit these two elementwise ops on the
-    /// per-head `A_log` weight, which then run every decode step on a constant.
-    fn match_neg_exp_chain(
-        graph: &Graph,
-        neg_exp_a: ValueId,
-        consumer_id: NodeId,
-        io_dtype: DataType,
-    ) -> Option<(ValueId, [NodeId; 2])> {
-        let neg_id = Self::sole_producer(graph, neg_exp_a, consumer_id)?;
-        let neg = graph.node(neg_id);
-        if neg.op_type != "Neg"
-            || !neg.is_default_domain()
-            || neg.inputs.len() != 1
-            || neg.outputs.len() != 1
-        {
-            return None;
-        }
-        let exp_out = neg.inputs[0]?;
-        let exp_id = Self::sole_producer(graph, exp_out, neg_id)?;
-        let exp = graph.node(exp_id);
-        if exp.op_type != "Exp"
-            || !exp.is_default_domain()
-            || exp.inputs.len() != 1
-            || exp.outputs.len() != 1
-        {
-            return None;
-        }
-        let a_log = exp.inputs[0]?;
-        if !graph.initializers.contains_key(&a_log) || graph.value(a_log).dtype != io_dtype {
-            return None;
-        }
-        Some((a_log, [neg_id, exp_id]))
+        let Some(sigmoid_id) = graph.value(beta).producer else {
+            return Ok(None);
+        };
+        let Some(matched) = session.match_at(&BETA_GATE, sigmoid_id, MatchOptions::default())?
+        else {
+            return Ok(None);
+        };
+        let raw = capture_value(&matched, "raw")?;
+        Ok((graph.value(raw).dtype == io_dtype).then_some(BetaSigmoidFold { sigmoid_id, raw }))
     }
 
     /// Match `decay = [Cast](Mul(neg_exp_A, Softplus(Add(a, dt_bias))))` with an
@@ -716,105 +696,54 @@ impl CudaLinearAttentionGatingFusion {
     /// initializer or the foldable `Neg(Exp(A_log))` constant chain.
     fn match_decay_softplus(
         graph: &Graph,
+        session: &MatchSession<'_>,
         decay: ValueId,
         la_id: NodeId,
         io_dtype: DataType,
-    ) -> Option<DecaySoftplusFold> {
-        let mut dead = Vec::new();
-        // Optional trailing identity `Cast` (never a dtype-changing one).
-        let (mul_out, mul_consumer) = {
-            let producer = Self::sole_producer(graph, decay, la_id)?;
-            let node = graph.node(producer);
-            if node.op_type == "Cast"
-                && node.is_default_domain()
-                && node.inputs.len() == 1
-                && node.outputs.len() == 1
-                && graph.value(node.inputs[0]?).dtype == io_dtype
-            {
-                dead.push(producer);
-                (node.inputs[0]?, producer)
-            } else {
-                (decay, la_id)
+    ) -> OptimizerResult<Option<DecaySoftplusFold>> {
+        let Some(root) = graph.value(decay).producer else {
+            return Ok(None);
+        };
+        for (index, pattern) in DECAY_GATES.iter().enumerate() {
+            let matched =
+                session.match_at_where(pattern, root, MatchOptions::default(), |matched| {
+                    for &node in matched.nodes() {
+                        for output in graph.node(node).output_values() {
+                            let consumers = graph.consumers(output);
+                            if graph.outputs.contains(&output)
+                                || consumers.len() != 1
+                                || (consumers[0] != la_id
+                                    && !matched.nodes().contains(&consumers[0]))
+                            {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    for name in ["bias", "c"] {
+                        let value = capture_value(matched, name)?;
+                        if !graph.initializers.contains_key(&value)
+                            || graph.value(value).dtype != io_dtype
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    let a = capture_value(matched, "a")?;
+                    let product = capture_value(matched, "product")?;
+                    Ok(graph.value(a).dtype == io_dtype
+                        && (graph.node(root).op_type != "Cast"
+                            || graph.value(product).dtype == io_dtype))
+                })?;
+            if let Some(matched) = matched {
+                return Ok(Some(DecaySoftplusFold {
+                    a: capture_value(&matched, "a")?,
+                    dt_bias: capture_value(&matched, "bias")?,
+                    neg_exp_a: capture_value(&matched, "c")?,
+                    fuse_neg_exp: index == 1,
+                    dead: matched.nodes().iter().rev().copied().collect(),
+                }));
             }
-        };
-        // `Mul(neg_exp_A, Softplus(...))` — order-independent.
-        let mul_id = Self::sole_producer(graph, mul_out, mul_consumer)?;
-        let mul = graph.node(mul_id);
-        if mul.op_type != "Mul"
-            || !mul.is_default_domain()
-            || mul.inputs.len() != 2
-            || mul.outputs.len() != 1
-        {
-            return None;
         }
-        let (a0, a1) = (mul.inputs[0]?, mul.inputs[1]?);
-        // The decay coefficient operand is either a precomputed `neg_exp_A`
-        // graph initializer, or the exported `Neg(Exp(A_log))` constant chain
-        // (A_log an initializer) which is folded into the kernel; the other
-        // operand is the `Softplus(...)` result. `dead` stays consumer-first, so
-        // `mul_id` is pushed before the coefficient chain it consumes.
-        dead.push(mul_id);
-        let (neg_exp_a, softplus_out, fuse_neg_exp) = if graph.initializers.contains_key(&a0) {
-            (a0, a1, false)
-        } else if graph.initializers.contains_key(&a1) {
-            (a1, a0, false)
-        } else if let Some((a_log, chain)) = Self::match_neg_exp_chain(graph, a0, mul_id, io_dtype)
-        {
-            dead.extend(chain);
-            (a_log, a1, true)
-        } else if let Some((a_log, chain)) = Self::match_neg_exp_chain(graph, a1, mul_id, io_dtype)
-        {
-            dead.extend(chain);
-            (a_log, a0, true)
-        } else {
-            return None;
-        };
-        // The initializer path still checks the coefficient dtype here; the
-        // chain path already checked `A_log`'s dtype inside `match_neg_exp_chain`.
-        if !fuse_neg_exp && graph.value(neg_exp_a).dtype != io_dtype {
-            return None;
-        }
-        // `Softplus(Add(...))`.
-        let softplus_id = Self::sole_producer(graph, softplus_out, mul_id)?;
-        let softplus = graph.node(softplus_id);
-        if softplus.op_type != "Softplus"
-            || !softplus.is_default_domain()
-            || softplus.inputs.len() != 1
-            || softplus.outputs.len() != 1
-        {
-            return None;
-        }
-        let add_out = softplus.inputs[0]?;
-        dead.push(softplus_id);
-        // `Add(a, dt_bias)` — order-independent.
-        let add_id = Self::sole_producer(graph, add_out, softplus_id)?;
-        let add = graph.node(add_id);
-        if add.op_type != "Add"
-            || !add.is_default_domain()
-            || add.inputs.len() != 2
-            || add.outputs.len() != 1
-        {
-            return None;
-        }
-        let (b0, b1) = (add.inputs[0]?, add.inputs[1]?);
-        let (dt_bias, a) = if graph.initializers.contains_key(&b1) {
-            (b1, b0)
-        } else if graph.initializers.contains_key(&b0) {
-            (b0, b1)
-        } else {
-            return None;
-        };
-        if graph.value(dt_bias).dtype != io_dtype || graph.value(a).dtype != io_dtype {
-            return None;
-        }
-        dead.push(add_id);
-        Some(DecaySoftplusFold {
-            a,
-            dt_bias,
-            neg_exp_a,
-            fuse_neg_exp,
-            dead,
-        })
+        Ok(None)
     }
 }
 
@@ -832,8 +761,8 @@ impl OptimizationPass for CudaLinearAttentionGatingFusion {
             .iter()
             .filter_map(|(id, node)| Self::is_gated_delta_la(node).then_some(id))
             .collect();
-        let mut changed = false;
-
+        let session = MatchSession::new(graph)?;
+        let mut plans = Vec::new();
         for la_id in la_ids {
             let Some(la) = graph.try_node(la_id) else {
                 continue;
@@ -849,18 +778,28 @@ impl OptimizationPass for CudaLinearAttentionGatingFusion {
             // rewrite owns input slots 6/7.
             let decay_foldable = la.inputs.len() == 6;
 
-            let beta_fold =
-                beta_slot.and_then(|beta| Self::match_beta_sigmoid(graph, beta, la_id, io_dtype));
+            let beta_fold = match beta_slot {
+                Some(beta) => Self::match_beta_sigmoid(graph, &session, beta, la_id, io_dtype)?,
+                None => None,
+            };
             let decay_fold = if decay_foldable {
-                decay_slot
-                    .and_then(|decay| Self::match_decay_softplus(graph, decay, la_id, io_dtype))
+                match decay_slot {
+                    Some(decay) => {
+                        Self::match_decay_softplus(graph, &session, decay, la_id, io_dtype)?
+                    }
+                    None => None,
+                }
             } else {
                 None
             };
             if beta_fold.is_none() && decay_fold.is_none() {
                 continue;
             }
-
+            plans.push((la_id, beta_fold, decay_fold));
+        }
+        let changed = !plans.is_empty();
+        for (la_id, beta_fold, decay_fold) in plans {
+            let la = graph.node(la_id);
             let mut new_la = la.clone();
             let mut dead = Vec::new();
             if let Some(fold) = beta_fold {
@@ -886,7 +825,6 @@ impl OptimizationPass for CudaLinearAttentionGatingFusion {
             }
             graph.replace_node(la_id, new_la);
             graph.remove_nodes(&dead);
-            changed = true;
         }
 
         if changed {
@@ -1002,6 +940,8 @@ impl OptimizationPass for CudaDropNormalizationCasts {
         // the loop strictly shrinks the graph and always terminates.
         let mut changed = false;
         loop {
+            let session = MatchSession::new(graph)?;
+            let casts = cast_index(&session)?;
             let candidates: Vec<NodeId> = graph
                 .nodes
                 .iter()
@@ -1009,7 +949,7 @@ impl OptimizationPass for CudaDropNormalizationCasts {
                 .collect();
             let Some(plan) = candidates
                 .into_iter()
-                .find_map(|id| self.plan_fold(graph, id))
+                .find_map(|id| self.plan_fold(graph, id, &casts))
             else {
                 break;
             };
@@ -1102,16 +1042,17 @@ impl CudaDropNormalizationCasts {
         &self,
         graph: &Graph,
         value: ValueId,
+        casts: &CastIndex,
     ) -> Option<(NodeId, ValueId, DataType)> {
         let producer = graph.try_value(value)?.producer?;
-        let node = graph.try_node(producer)?;
-        if node.op_type != "Cast" || !matches!(node.domain.as_str(), "" | "ai.onnx") {
+        let &(source, output) = casts.get(&producer)?;
+        if output != value {
             return None;
         }
+        let node = graph.try_node(producer)?;
         if cast_target(node)? != DataType::Float32 {
             return None;
         }
-        let source = node.inputs.first().copied().flatten()?;
         let source_dtype = graph.try_value(source)?.dtype;
         if source_dtype != DataType::Float16 && source_dtype != DataType::BFloat16 {
             return None;
@@ -1119,7 +1060,12 @@ impl CudaDropNormalizationCasts {
         Some((producer, source, source_dtype))
     }
 
-    fn plan_fold(&self, graph: &Graph, node_id: NodeId) -> Option<NormCastFoldPlan> {
+    fn plan_fold(
+        &self,
+        graph: &Graph,
+        node_id: NodeId,
+        casts: &CastIndex,
+    ) -> Option<NormCastFoldPlan> {
         let node = graph.try_node(node_id)?;
         let activation_indices = Self::activation_input_indices(node)?;
 
@@ -1148,7 +1094,8 @@ impl CudaDropNormalizationCasts {
         let mut narrow_dtype: Option<DataType> = None;
         for &index in activation_indices {
             let value = node.inputs.get(index).copied().flatten()?;
-            let (cast_id, source, source_dtype) = self.fp32_cast_from_narrow(graph, value)?;
+            let (cast_id, source, source_dtype) =
+                self.fp32_cast_from_narrow(graph, value, casts)?;
             if *narrow_dtype.get_or_insert(source_dtype) != source_dtype {
                 return None;
             }
@@ -1171,13 +1118,11 @@ impl CudaDropNormalizationCasts {
             }
             for consumer in &consumers {
                 let cast = graph.try_node(*consumer)?;
-                if cast.op_type != "Cast" || !matches!(cast.domain.as_str(), "" | "ai.onnx") {
-                    return None;
-                }
+                let &(source, cast_output) = casts.get(consumer)?;
+                debug_assert_eq!(source, output);
                 if cast_target(cast)? != narrow_dtype {
                     return None;
                 }
-                let cast_output = cast.outputs.first().copied().flatten()?;
                 output_cast_bypass.push((cast_output, output, *consumer));
             }
             retyped_outputs.push(output);
@@ -1267,55 +1212,42 @@ impl OptimizationPass for CudaSkipRmsNormFusion {
         if !skip_rmsnorm_fusion_enabled() {
             return Ok(());
         }
-        let norm_ids: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "SimplifiedLayerNormalization" && node.is_default_domain())
-                    .then_some(id)
-            })
-            .collect();
+        let changed = SKIP_RMSNORM.rewrite(
+            graph,
+            |graph, matched| {
+                Ok(self.plan_fold(
+                    graph,
+                    capture_node(matched, "out")?,
+                    capture_node(matched, "sum")?,
+                ))
+            },
+            |graph, plan| {
+                // Delete the `Add` first, leaving its output value alive (its other
+                // consumer — the next block's residual add — keeps it referenced) but
+                // producer-less, so the skip node can reclaim it as `sum` output[3].
+                graph.remove_node(plan.add_id);
 
-        let mut plans: Vec<SkipRmsNormFoldPlan> = Vec::new();
-        let mut used_adds: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-        for norm_id in norm_ids {
-            if let Some(plan) = self.plan_fold(graph, norm_id) {
-                // Each residual `Add` may feed only one fold; two norms sharing an
-                // Add would both claim its output as their residual sum.
-                if !used_adds.insert(plan.add_id) {
-                    continue;
-                }
-                plans.push(plan);
-            }
-        }
+                let mean_v = graph.create_value(DataType::Float32, plan.stat_shape.clone());
+                let invstd_v = graph.create_value(DataType::Float32, plan.stat_shape.clone());
 
-        let changed = !plans.is_empty();
-        for plan in plans {
-            // Delete the `Add` first, leaving its output value alive (its other
-            // consumer — the next block's residual add — keeps it referenced) but
-            // producer-less, so the skip node can reclaim it as `sum` output[3].
-            graph.remove_node(plan.add_id);
-
-            let mean_v = graph.create_value(DataType::Float32, plan.stat_shape.clone());
-            let invstd_v = graph.create_value(DataType::Float32, plan.stat_shape.clone());
-
-            let mut skip = Node::new(
-                NodeId(0),
-                "SkipSimplifiedLayerNormalization",
-                vec![Some(plan.a), Some(plan.b), Some(plan.gamma)],
-                vec![plan.normalized_out, mean_v, invstd_v, plan.residual_sum],
-            );
-            skip.domain = MICROSOFT_DOMAIN.to_string();
-            skip.attributes
-                .insert("epsilon".into(), Attribute::Float(plan.epsilon));
-            // Reuse the norm's NodeId (and reclaim `normalized_out`/`residual_sum`
-            // producers) by replacing the norm node in place.
-            graph.replace_node(plan.norm_id, skip);
-            graph
-                .opset_imports
-                .entry(MICROSOFT_DOMAIN.to_string())
-                .or_insert(1);
-        }
+                let mut skip = Node::new(
+                    NodeId(0),
+                    "SkipSimplifiedLayerNormalization",
+                    vec![Some(plan.a), Some(plan.b), Some(plan.gamma)],
+                    vec![plan.normalized_out, mean_v, invstd_v, plan.residual_sum],
+                );
+                skip.domain = MICROSOFT_DOMAIN.to_string();
+                skip.attributes
+                    .insert("epsilon".into(), Attribute::Float(plan.epsilon));
+                // Reuse the norm's NodeId (and reclaim `normalized_out`/`residual_sum`
+                // producers) by replacing the norm node in place.
+                graph.replace_node(plan.norm_id, skip);
+                graph
+                    .opset_imports
+                    .entry(MICROSOFT_DOMAIN.to_string())
+                    .or_insert(1);
+            },
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -1325,7 +1257,12 @@ impl OptimizationPass for CudaSkipRmsNormFusion {
 }
 
 impl CudaSkipRmsNormFusion {
-    fn plan_fold(&self, graph: &Graph, norm_id: NodeId) -> Option<SkipRmsNormFoldPlan> {
+    fn plan_fold(
+        &self,
+        graph: &Graph,
+        norm_id: NodeId,
+        add_id: NodeId,
+    ) -> Option<SkipRmsNormFoldPlan> {
         let norm = graph.try_node(norm_id)?;
         // Only the single normalized output; a norm that also emits stats is left
         // alone (the folded kernel's stats are unused placeholders).
@@ -1352,16 +1289,7 @@ impl CudaSkipRmsNormFusion {
             return None;
         }
 
-        // The norm input must be produced by a dense elementwise residual `Add`.
-        let add_id = graph.try_value(norm_input)?.producer?;
         let add = graph.try_node(add_id)?;
-        if add.op_type != "Add"
-            || !add.is_default_domain()
-            || add.inputs.len() != 2
-            || add.outputs.len() != 1
-        {
-            return None;
-        }
         let a = add.inputs[0]?;
         let b = add.inputs[1]?;
         let residual_sum = add.outputs.first().copied().flatten()?;
@@ -1923,60 +1851,55 @@ impl OptimizationPass for CudaMatMulNBitsBiasFusion {
     }
 
     fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
-        let add_nodes: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "Add"
-                    && matches!(node.domain.as_str(), "" | "ai.onnx")
-                    && node.inputs.len() == 2
-                    && node.outputs.len() == 1
-                    && node.attributes.is_empty())
-                .then_some(id)
-            })
-            .collect();
+        let changed = MATMUL_NBITS_BIAS.rewrite(
+            graph,
+            |graph, matched| {
+                let add_id = capture_node(matched, "out")?;
+                if !graph.node(add_id).attributes.is_empty() {
+                    return Ok(None);
+                }
+                Ok(self.plan_fold(
+                    graph,
+                    add_id,
+                    capture_node(matched, "projection")?,
+                    capture_value(matched, "projection")?,
+                    capture_value(matched, "bias")?,
+                ))
+            },
+            |graph, plan| {
+                // Rewire `add_out`'s consumers (and any graph-output slot) onto the
+                // MatMulNBits output, drop the now-dead Add, then rebuild the
+                // MatMulNBits node with the bias slot populated. Ordering keeps the
+                // arena free of dangling values at every step. The surviving value
+                // inherits the Add output's name so downstream/output binding by
+                // name is unaffected.
+                let downstream_name = graph.value(plan.add_out).name.clone();
+                graph.replace_all_uses(plan.add_out, plan.matmul_out);
+                graph.remove_node(plan.add_id);
+                if downstream_name.is_some() {
+                    graph.value_mut(plan.matmul_out).name = downstream_name;
+                }
 
-        let mut plans: Vec<BiasFoldPlan> = Vec::new();
-        for add_id in add_nodes {
-            if let Some(plan) = self.plan_fold(graph, add_id) {
-                plans.push(plan);
-            }
-        }
-
-        let changed = !plans.is_empty();
-        for plan in plans {
-            // Rewire `add_out`'s consumers (and any graph-output slot) onto the
-            // MatMulNBits output, drop the now-dead Add, then rebuild the
-            // MatMulNBits node with the bias slot populated. Ordering keeps the
-            // arena free of dangling values at every step. The surviving value
-            // inherits the Add output's name so downstream/output binding by
-            // name is unaffected.
-            let downstream_name = graph.value(plan.add_out).name.clone();
-            graph.replace_all_uses(plan.add_out, plan.matmul_out);
-            graph.remove_node(plan.add_id);
-            if downstream_name.is_some() {
-                graph.value_mut(plan.matmul_out).name = downstream_name;
-            }
-
-            let mut fused = graph.node(plan.matmul_id).clone();
-            fused.inputs = vec![
-                plan.matmul_inputs[0],
-                plan.matmul_inputs[1],
-                plan.matmul_inputs[2],
-                // Zero-points, when the source node had them. The folded bias is
-                // an output-side epilogue and does not interact with dequant, so
-                // this input passes straight through.
-                plan.matmul_inputs[3],
-                // Group index: the fold declines any node that has one, so this
-                // slot is always empty here.
-                None,
-                Some(plan.bias),
-            ];
-            fused
-                .attributes
-                .insert(MATMUL_NBITS_FOLDED_BIAS_ATTR.into(), Attribute::Int(1));
-            graph.replace_node(plan.matmul_id, fused);
-        }
+                let mut fused = graph.node(plan.matmul_id).clone();
+                fused.inputs = vec![
+                    plan.matmul_inputs[0],
+                    plan.matmul_inputs[1],
+                    plan.matmul_inputs[2],
+                    // Zero-points, when the source node had them. The folded bias is
+                    // an output-side epilogue and does not interact with dequant, so
+                    // this input passes straight through.
+                    plan.matmul_inputs[3],
+                    // Group index: the fold declines any node that has one, so this
+                    // slot is always empty here.
+                    None,
+                    Some(plan.bias),
+                ];
+                fused
+                    .attributes
+                    .insert(MATMUL_NBITS_FOLDED_BIAS_ATTR.into(), Attribute::Int(1));
+                graph.replace_node(plan.matmul_id, fused);
+            },
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -1995,24 +1918,16 @@ struct BiasFoldPlan {
 }
 
 impl CudaMatMulNBitsBiasFusion {
-    fn plan_fold(&self, graph: &Graph, add_id: NodeId) -> Option<BiasFoldPlan> {
+    fn plan_fold(
+        &self,
+        graph: &Graph,
+        add_id: NodeId,
+        matmul_id: NodeId,
+        matmul_out: ValueId,
+        bias: ValueId,
+    ) -> Option<BiasFoldPlan> {
         let add = graph.try_node(add_id)?;
-        let lhs = add.inputs[0]?;
-        let rhs = add.inputs[1]?;
         let add_out = add.outputs[0]?;
-
-        // Exactly one Add operand must be a foldable MatMulNBits output; the
-        // other is the bias.
-        let (matmul_out, bias) = match (
-            self.matmul_producer(graph, lhs),
-            self.matmul_producer(graph, rhs),
-        ) {
-            (Some(_), Some(_)) => return None,
-            (Some(_), None) => (lhs, rhs),
-            (None, Some(_)) => (rhs, lhs),
-            (None, None) => return None,
-        };
-        let matmul_id = self.matmul_producer(graph, matmul_out)?;
 
         // The GEMV output must feed only this Add and must not escape as a
         // graph output (folding would otherwise drop an observable value).
@@ -2090,12 +2005,6 @@ impl CudaMatMulNBitsBiasFusion {
             add_out,
             bias,
         })
-    }
-
-    fn matmul_producer(&self, graph: &Graph, value: ValueId) -> Option<NodeId> {
-        let producer = graph.try_value(value)?.producer?;
-        let node = graph.try_node(producer)?;
-        (node.op_type == "MatMulNBits" && node.domain == MICROSOFT_DOMAIN).then_some(producer)
     }
 }
 
@@ -2827,78 +2736,55 @@ impl OptimizationPass for CudaSwiGluFusion {
     }
 
     fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
-        let silu_nodes: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| Self::is_silu(node).then_some(id))
-            .collect();
+        let changed = SWIGLU.rewrite(
+            graph,
+            |graph, matched| {
+                let silu_id = capture_node(matched, "silu")?;
+                let silu_output = capture_value(matched, "silu")?;
+                let gate = capture_value(matched, "gate")?;
+                let up = capture_value(matched, "up")?;
+                let mul_id = capture_node(matched, "out")?;
+                let silu = graph.node(silu_id);
+                let mul = graph.node(mul_id);
+                if !Self::is_silu(silu)
+                    || graph.outputs.contains(&silu_output)
+                    || graph.consumers(silu_output) != [mul_id]
+                    || !mul.attributes.is_empty()
+                {
+                    return Ok(None);
+                }
 
-        let mut changed = false;
-        for silu_id in silu_nodes {
-            let Some(silu) = graph.try_node(silu_id) else {
-                continue;
-            };
-            let Some(gate) = silu.inputs[0] else {
-                continue;
-            };
-            let Some(silu_output) = silu.outputs[0] else {
-                continue;
-            };
-            if graph.outputs.contains(&silu_output) {
-                continue;
-            }
-            let consumers = graph.consumers(silu_output);
-            if consumers.len() != 1 {
-                continue;
-            }
-
-            let mul_id = consumers[0];
-            let mul = graph.node(mul_id);
-            if mul.op_type != "Mul"
-                || !matches!(mul.domain.as_str(), "" | "ai.onnx")
-                || mul.inputs.len() != 2
-                || mul.outputs.len() != 1
-                || !mul.attributes.is_empty()
-            {
-                continue;
-            }
-            let up = if mul.inputs[0] == Some(silu_output) {
-                mul.inputs[1]
-            } else if mul.inputs[1] == Some(silu_output) {
-                mul.inputs[0]
-            } else {
-                None
-            };
-            let Some(up) = up else {
-                continue;
-            };
-
-            let gate_value = graph.value(gate);
-            let up_value = graph.value(up);
-            if gate_value.dtype != up_value.dtype
-                || gate_value.shape != up_value.shape
-                || !matches!(
-                    gate_value.dtype,
-                    DataType::Float16 | DataType::Float32 | DataType::BFloat16
-                )
-            {
-                continue;
-            }
-
-            let mut fused = mul.clone();
-            fused.inputs = vec![Some(gate), Some(up)];
-            fused
-                .attributes
-                .insert(SILU_MUL_FUSION_ATTR.into(), Attribute::Int(1));
-            if silu.attr(DECOMPOSED_SILU_ATTR).and_then(Attribute::as_int) == Some(1) {
+                let gate_value = graph.value(gate);
+                let up_value = graph.value(up);
+                if gate_value.dtype != up_value.dtype
+                    || gate_value.shape != up_value.shape
+                    || !matches!(
+                        gate_value.dtype,
+                        DataType::Float16 | DataType::Float32 | DataType::BFloat16
+                    )
+                {
+                    return Ok(None);
+                }
+                let decomposed =
+                    silu.attr(DECOMPOSED_SILU_ATTR).and_then(Attribute::as_int) == Some(1);
+                Ok(Some((silu_id, mul_id, gate, up, decomposed)))
+            },
+            |graph, (silu_id, mul_id, gate, up, decomposed)| {
+                let mul = graph.node(mul_id);
+                let mut fused = mul.clone();
+                fused.inputs = vec![Some(gate), Some(up)];
                 fused
                     .attributes
-                    .insert(DECOMPOSED_SILU_ATTR.into(), Attribute::Int(1));
-            }
-            graph.replace_node(mul_id, fused);
-            graph.remove_node(silu_id);
-            changed = true;
-        }
+                    .insert(SILU_MUL_FUSION_ATTR.into(), Attribute::Int(1));
+                if decomposed {
+                    fused
+                        .attributes
+                        .insert(DECOMPOSED_SILU_ATTR.into(), Attribute::Int(1));
+                }
+                graph.replace_node(mul_id, fused);
+                graph.remove_node(silu_id);
+            },
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -2954,67 +2840,66 @@ impl OptimizationPass for CudaGateUpSwiGluFusion {
     }
 
     fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
-        let mul_nodes: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "Mul"
-                    && matches!(node.domain.as_str(), "" | "ai.onnx")
-                    && node.attr(SILU_MUL_FUSION_ATTR).and_then(Attribute::as_int) == Some(1)
-                    && node.inputs.len() == 2
-                    && node.outputs.len() == 1)
-                    .then_some(id)
-            })
-            .collect();
-
-        let mut plans: Vec<GateUpSwiGluPlan> = Vec::new();
-        for mul_id in mul_nodes {
-            if let Some(plan) = self.plan_fuse(graph, mul_id) {
-                plans.push(plan);
-            }
-        }
-
-        let changed = !plans.is_empty();
-        for plan in plans {
-            // Reuse the `Mul` node's slot (and its already-inferred `[.., N]`
-            // output value) as the fused node so downstream/output binding is
-            // untouched, then drop the two now-dead projection GEMVs. Their
-            // outputs lose their only consumer and are GC'd by `remove_node`,
-            // leaving no dangling values.
-            let mut fused = graph.node(plan.gate_matmul_id).clone();
-            fused.id = plan.mul_id;
-            fused.inputs = vec![
-                Some(plan.activation),
-                Some(plan.gate_weight),
-                Some(plan.gate_scales),
-                Some(plan.up_weight),
-                Some(plan.up_scales),
-            ];
-            // Asymmetric weights carry per-projection zero points at slots 6/7.
-            // Slot 5 is reserved for the RMS-norm gamma that
-            // `CudaSkipRmsNormMatMulFusion` folds in later, so leave it empty
-            // (None) here; symmetric weights add no trailing slots at all and
-            // stay byte-identical to the pre-zero-point contract.
-            if let (Some(gate_zp), Some(up_zp)) = (plan.gate_zero_points, plan.up_zero_points) {
-                fused.inputs.push(None);
-                fused.inputs.push(Some(gate_zp));
-                fused.inputs.push(Some(up_zp));
-            }
-            fused.outputs = graph.node(plan.mul_id).outputs.clone();
-            fused
-                .attributes
-                .insert(GATE_UP_SWIGLU_FUSION_ATTR.into(), Attribute::Int(1));
-            if plan.decomposed_silu {
+        let changed = GATE_UP_SWIGLU.rewrite(
+            graph,
+            |graph, matched| {
+                let mul_id = capture_node(matched, "out")?;
+                if graph
+                    .node(mul_id)
+                    .attr(SILU_MUL_FUSION_ATTR)
+                    .and_then(Attribute::as_int)
+                    != Some(1)
+                {
+                    return Ok(None);
+                }
+                Ok(self.plan_fuse(
+                    graph,
+                    mul_id,
+                    capture_node(matched, "gate")?,
+                    capture_node(matched, "up")?,
+                ))
+            },
+            |graph, plan| {
+                // Reuse the `Mul` node's slot (and its already-inferred `[.., N]`
+                // output value) as the fused node so downstream/output binding is
+                // untouched, then drop the two now-dead projection GEMVs. Their
+                // outputs lose their only consumer and are GC'd by `remove_node`,
+                // leaving no dangling values.
+                let mut fused = graph.node(plan.gate_matmul_id).clone();
+                fused.id = plan.mul_id;
+                fused.inputs = vec![
+                    Some(plan.activation),
+                    Some(plan.gate_weight),
+                    Some(plan.gate_scales),
+                    Some(plan.up_weight),
+                    Some(plan.up_scales),
+                ];
+                // Asymmetric weights carry per-projection zero points at slots 6/7.
+                // Slot 5 is reserved for the RMS-norm gamma that
+                // `CudaSkipRmsNormMatMulFusion` folds in later, so leave it empty
+                // (None) here; symmetric weights add no trailing slots at all and
+                // stay byte-identical to the pre-zero-point contract.
+                if let (Some(gate_zp), Some(up_zp)) = (plan.gate_zero_points, plan.up_zero_points) {
+                    fused.inputs.push(None);
+                    fused.inputs.push(Some(gate_zp));
+                    fused.inputs.push(Some(up_zp));
+                }
+                fused.outputs = graph.node(plan.mul_id).outputs.clone();
                 fused
                     .attributes
-                    .insert(DECOMPOSED_SILU_ATTR.into(), Attribute::Int(1));
-            }
-            graph.replace_node(plan.mul_id, fused);
-            debug_assert_eq!(graph.consumers(plan.gate_out).len(), 0);
-            debug_assert_eq!(graph.consumers(plan.up_out).len(), 0);
-            graph.remove_node(plan.gate_matmul_id);
-            graph.remove_node(plan.up_matmul_id);
-        }
+                    .insert(GATE_UP_SWIGLU_FUSION_ATTR.into(), Attribute::Int(1));
+                if plan.decomposed_silu {
+                    fused
+                        .attributes
+                        .insert(DECOMPOSED_SILU_ATTR.into(), Attribute::Int(1));
+                }
+                graph.replace_node(plan.mul_id, fused);
+                debug_assert_eq!(graph.consumers(plan.gate_out).len(), 0);
+                debug_assert_eq!(graph.consumers(plan.up_out).len(), 0);
+                graph.remove_node(plan.gate_matmul_id);
+                graph.remove_node(plan.up_matmul_id);
+            },
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -3024,18 +2909,18 @@ impl OptimizationPass for CudaGateUpSwiGluFusion {
 }
 
 impl CudaGateUpSwiGluFusion {
-    fn plan_fuse(&self, graph: &Graph, mul_id: NodeId) -> Option<GateUpSwiGluPlan> {
+    fn plan_fuse(
+        &self,
+        graph: &Graph,
+        mul_id: NodeId,
+        gate_matmul_id: NodeId,
+        up_matmul_id: NodeId,
+    ) -> Option<GateUpSwiGluPlan> {
         let mul = graph.try_node(mul_id)?;
         // `CudaSwiGluFusion` always emits `[gate, up]` in this order.
         let gate_out = mul.inputs[0]?;
         let up_out = mul.inputs[1]?;
         if gate_out == up_out {
-            return None;
-        }
-
-        let gate_matmul_id = self.matmul_producer(graph, gate_out)?;
-        let up_matmul_id = self.matmul_producer(graph, up_out)?;
-        if gate_matmul_id == up_matmul_id {
             return None;
         }
 
@@ -3157,12 +3042,6 @@ impl CudaGateUpSwiGluFusion {
             n,
             k,
         })
-    }
-
-    fn matmul_producer(&self, graph: &Graph, value: ValueId) -> Option<NodeId> {
-        let producer = graph.try_value(value)?.producer?;
-        let node = graph.try_node(producer)?;
-        (node.op_type == "MatMulNBits" && node.domain == MICROSOFT_DOMAIN).then_some(producer)
     }
 }
 
@@ -3286,9 +3165,29 @@ impl CudaQkvProjectionFusion {
             })
             .collect();
 
+        let session = MatchSession::new(graph)?;
         let mut plans: Vec<QkvFusionPlan> = Vec::new();
         for gqa_id in gqa_nodes {
-            if let Some(plan) = self.plan_fuse(graph, gqa_id) {
+            let gqa = graph.node(gqa_id);
+            let mut projections = Vec::new();
+            for input in gqa.inputs.iter().take(3) {
+                let Some(input) = input else { break };
+                let Some(matched) = session.match_upstream(
+                    &QUANTIZED_PROJECTION,
+                    *input,
+                    0,
+                    12,
+                    MatchOptions::default(),
+                )?
+                else {
+                    break;
+                };
+                projections.push(matched.nodes()[0]);
+            }
+            let [q_mm, k_mm, v_mm] = projections.as_slice() else {
+                continue;
+            };
+            if let Some(plan) = self.plan_fuse(graph, *q_mm, *k_mm, *v_mm) {
                 plans.push(plan);
             }
         }
@@ -3304,14 +3203,13 @@ impl CudaQkvProjectionFusion {
         Ok(())
     }
 
-    fn plan_fuse(&self, graph: &Graph, gqa_id: NodeId) -> Option<QkvFusionPlan> {
-        let gqa = graph.try_node(gqa_id)?;
-        if gqa.inputs.len() < 3 {
-            return None;
-        }
-        let q_mm = self.trace_back_to_matmul(graph, gqa.inputs[0]?)?;
-        let k_mm = self.trace_back_to_matmul(graph, gqa.inputs[1]?)?;
-        let v_mm = self.trace_back_to_matmul(graph, gqa.inputs[2]?)?;
+    fn plan_fuse(
+        &self,
+        graph: &Graph,
+        q_mm: NodeId,
+        k_mm: NodeId,
+        v_mm: NodeId,
+    ) -> Option<QkvFusionPlan> {
         if q_mm == k_mm || q_mm == v_mm || k_mm == v_mm {
             return None;
         }
@@ -3360,22 +3258,6 @@ impl CudaQkvProjectionFusion {
             k,
             v,
         })
-    }
-
-    /// Walk back from `value` along the primary (`input[0]`) data edge until a
-    /// `MatMulNBits` producer is found, skipping the Q/K post-projection
-    /// norm/scale/reshape glue. Returns `None` on a dead end or if no
-    /// `MatMulNBits` is reached within a small depth bound.
-    fn trace_back_to_matmul(&self, graph: &Graph, mut value: ValueId) -> Option<NodeId> {
-        for _ in 0..12 {
-            let producer = graph.try_value(value)?.producer?;
-            let node = graph.try_node(producer)?;
-            if node.op_type == "MatMulNBits" && node.domain == MICROSOFT_DOMAIN {
-                return Some(producer);
-            }
-            value = node.inputs.first().copied().flatten()?;
-        }
-        None
     }
 
     /// Validate one projection `MatMulNBits` against the capability contract and
@@ -3695,9 +3577,26 @@ impl OptimizationPass for CudaOnDeviceConstantSelect {
             })
             .collect();
 
+        let session = MatchSession::new(graph)?;
+        let mut thresholds = std::collections::HashMap::new();
+        for matched in session.find_matches(&THRESHOLD, MatchOptions::default())? {
+            thresholds.insert(
+                capture_value(&matched, "out")?,
+                capture_value(&matched, "threshold")?,
+            );
+        }
         let mut plans: Vec<SelectPlan> = Vec::new();
         for if_node in candidates {
-            if let Some(plan) = self.plan_select(graph, ctx, if_node) {
+            let Some(then_branch) = graph.subgraphs.get(&(if_node, "then_branch".into())) else {
+                continue;
+            };
+            let Some(else_branch) = graph.subgraphs.get(&(if_node, "else_branch".into())) else {
+                continue;
+            };
+            if !branch_is_pure_constants(then_branch)? || !branch_is_pure_constants(else_branch)? {
+                continue;
+            }
+            if let Some(plan) = self.plan_select(graph, ctx, if_node, &thresholds) {
                 plans.push(plan);
             }
         }
@@ -3757,7 +3656,13 @@ impl OptimizationPass for CudaOnDeviceConstantSelect {
 }
 
 impl CudaOnDeviceConstantSelect {
-    fn plan_select(&self, graph: &Graph, ctx: &PassContext, if_node: NodeId) -> Option<SelectPlan> {
+    fn plan_select(
+        &self,
+        graph: &Graph,
+        ctx: &PassContext,
+        if_node: NodeId,
+        thresholds: &std::collections::HashMap<ValueId, ValueId>,
+    ) -> Option<SelectPlan> {
         let node = graph.try_node(if_node)?;
         let cond = node.inputs.first().copied().flatten()?;
         let then_key = (if_node, "then_branch".into());
@@ -3765,12 +3670,6 @@ impl CudaOnDeviceConstantSelect {
         let then_branch = graph.subgraphs.get(&then_key)?;
         let else_branch = graph.subgraphs.get(&else_key)?;
 
-        // Both branches must be pure constant selections: every node a
-        // `Constant`, zero formal inputs (so no outer captures), and one output
-        // per node — the guarantee that each output is loop-invariant.
-        if !branch_is_pure_constants(then_branch) || !branch_is_pure_constants(else_branch) {
-            return None;
-        }
         let output_count = node.outputs.len();
         if output_count == 0
             || then_branch.outputs.len() != output_count
@@ -3781,7 +3680,9 @@ impl CudaOnDeviceConstantSelect {
 
         // The predicate-false / -true index tie (only needed when a branch is
         // padded): `cond = Greater/GreaterOrEqual(_, T)` with a scalar-int `T`.
-        let threshold = greater_threshold(graph, ctx, cond);
+        let threshold = thresholds
+            .get(&cond)
+            .and_then(|&value| scalar_int(graph, ctx, value));
 
         let mut outputs = Vec::with_capacity(output_count);
         for i in 0..output_count {
@@ -3860,17 +3761,19 @@ impl CudaOnDeviceConstantSelect {
 
 /// Whether every node in `branch` is a producer-less `Constant` with no formal
 /// inputs — a pure, side-effect-free constant selection with no outer captures.
-fn branch_is_pure_constants(branch: &Graph) -> bool {
+fn branch_is_pure_constants(branch: &Graph) -> OptimizerResult<bool> {
     if !branch.inputs.is_empty() {
-        return false;
+        return Ok(false);
     }
-    branch.nodes.iter().all(|(_, node)| {
-        node.op_type == "Constant"
-            && matches!(node.domain.as_str(), "" | "ai.onnx")
-            && node.inputs.is_empty()
-            && node.outputs.len() == 1
-            && matches!(node.attr("value"), Some(Attribute::Tensor(_)))
-    })
+    let session = MatchSession::new(branch)?;
+    let matched = session.find_matches(&CONSTANT, MatchOptions::default())?;
+    Ok(matched.len() == branch.num_nodes()
+        && matched.iter().all(|m| {
+            matches!(
+                branch.node(m.nodes()[0]).attr("value"),
+                Some(Attribute::Tensor(_))
+            )
+        }))
 }
 
 /// Read the `Constant` tensor backing branch output `out`, or `None` if `out` is
@@ -3878,27 +3781,10 @@ fn branch_is_pure_constants(branch: &Graph) -> bool {
 fn branch_constant(branch: &Graph, out: ValueId) -> Option<&TensorData> {
     let producer = branch.try_value(out)?.producer?;
     let node = branch.try_node(producer)?;
-    if node.op_type != "Constant" || !matches!(node.domain.as_str(), "" | "ai.onnx") {
-        return None;
-    }
     match node.attr("value") {
         Some(Attribute::Tensor(tensor)) => Some(tensor),
         _ => None,
     }
-}
-
-/// The scalar-int threshold `T` of a `cond = Greater/GreaterOrEqual(_, T)`, when
-/// `T` is a producer-less constant int initializer (or a `Constant` node).
-fn greater_threshold(graph: &Graph, ctx: &PassContext, cond: ValueId) -> Option<i64> {
-    let producer = graph.try_value(cond)?.producer?;
-    let node = graph.try_node(producer)?;
-    if !matches!(node.op_type.as_str(), "Greater" | "GreaterOrEqual")
-        || !matches!(node.domain.as_str(), "" | "ai.onnx")
-    {
-        return None;
-    }
-    let threshold_value = node.inputs.get(1).copied().flatten()?;
-    scalar_int(graph, ctx, threshold_value)
 }
 
 /// Read a single-element integer value, whether backed by an initializer or a

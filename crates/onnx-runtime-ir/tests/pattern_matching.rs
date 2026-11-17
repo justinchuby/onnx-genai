@@ -604,6 +604,60 @@ fn builder_checks_empty_returns_unused_inputs_and_shared_compiler_limits() {
 }
 
 #[test]
+fn bounded_upstream_search_preserves_slots_depth_and_errors() {
+    let pattern = Pattern::parse_ort("(x,w)=>return MatMul(x,w)").unwrap();
+    let mut graph = Graph::new();
+    let x = input(&mut graph, "x");
+    let w = input(&mut graph, "w");
+    let (matmul, product) = op(&mut graph, "MatMul", &[Some(x), Some(w)], 1);
+    let (_, split) = op(&mut graph, "Split", &[Some(product[0])], 2);
+    let (_, added) = op(&mut graph, "Add", &[Some(x), Some(split[1])], 1);
+    graph.set_outputs(vec![added[0]]);
+    let session = MatchSession::new(&graph).unwrap();
+    let options = MatchOptions::default();
+    assert!(
+        session
+            .match_upstream(&pattern, split[1], 0, 1, options)
+            .unwrap()
+            .is_none()
+    );
+    let matched = session
+        .match_upstream(&pattern, split[1], 0, 2, options)
+        .unwrap()
+        .unwrap();
+    assert_eq!(matched.nodes(), [matmul]);
+    assert_eq!(matched.value("x").unwrap().unwrap().id(), x);
+    assert!(
+        session
+            .match_upstream(&pattern, added[0], 0, 12, options)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        session
+            .match_upstream(&pattern, added[0], 1, 12, options)
+            .unwrap()
+            .is_none()
+    );
+    let mut exhausted = options;
+    exhausted.budget.steps = 0;
+    assert_eq!(
+        session
+            .match_upstream(&pattern, split[1], 0, 12, exhausted)
+            .unwrap_err()
+            .kind,
+        PatternErrorKind::BudgetExceeded
+    );
+    assert_eq!(
+        session
+            .match_upstream(&pattern, ValueId(u32::MAX), 0, 12, options)
+            .unwrap_err()
+            .kind,
+        PatternErrorKind::InvalidGraph
+    );
+}
+
+#[test]
 fn anonymous_calls_have_independent_attribute_and_dimension_scopes() {
     for body in [
         "return act(x), act(y)",

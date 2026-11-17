@@ -394,6 +394,64 @@ impl<'g> MatchSession<'g> {
         self.match_at_where(pattern, root, options, |_| Ok(true))
     }
 
+    /// Find the first matching producer on a bounded, positional input path.
+    ///
+    /// Includes the producer of `value`, then follows `input_slot` of each
+    /// visited node. Stops at a graph input/initializer/missing slot or after
+    /// `max_nodes` producers. Traversal stays in this graph; it does not enter
+    /// bodies or infer algebraic equivalence. All attempts share one budget.
+    pub fn match_upstream(
+        &self,
+        pattern: &Pattern,
+        mut value: ValueId,
+        input_slot: usize,
+        max_nodes: usize,
+        options: MatchOptions,
+    ) -> Result<Option<Match<'g>>> {
+        require_operator_entry(pattern)?;
+        let graph = self.scopes[0].graph;
+        if graph.try_value(value).is_none() {
+            return Err(graph_error(format!(
+                "upstream search value {value:?} is not live; use a value from this session's graph"
+            )));
+        }
+        let mut budget = options.budget;
+        for _ in 0..max_nodes {
+            tick(&mut budget.steps, "upstream traversal budget")?;
+            let Some(producer) = graph.value(value).producer else {
+                return Ok(None);
+            };
+            let mut found = None;
+            self.run(
+                pattern,
+                0,
+                Some(producer),
+                false,
+                options.boundary,
+                &mut budget,
+                0,
+                &mut |matched| {
+                    found = Some(matched);
+                    Ok(false)
+                },
+            )?;
+            if found.is_some() {
+                return Ok(found);
+            }
+            let Some(next) = graph
+                .node(producer)
+                .inputs
+                .get(input_slot)
+                .copied()
+                .flatten()
+            else {
+                return Ok(None);
+            };
+            value = next;
+        }
+        Ok(None)
+    }
+
     /// Rejecting a complete graph candidate tries the next assignment/plan.
     /// Predicate errors propagate without retry. Callbacks must be read-only.
     pub fn match_at_where(
