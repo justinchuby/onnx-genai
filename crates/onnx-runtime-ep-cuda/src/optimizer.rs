@@ -2275,6 +2275,14 @@ impl OptimizationPass for CudaSkipRmsNormMatMulFusion {
         if rmsnorm_fusion_disabled() {
             return Ok(());
         }
+        let projections: std::collections::HashSet<NodeId> = {
+            let session = MatchSession::new(graph)?;
+            session
+                .find_matches(&QUANTIZED_PROJECTION, MatchOptions::default())?
+                .into_iter()
+                .map(|matched| matched.nodes()[0])
+                .collect()
+        };
         let skip_nodes: Vec<NodeId> = graph
             .nodes
             .iter()
@@ -2288,7 +2296,7 @@ impl OptimizationPass for CudaSkipRmsNormMatMulFusion {
         let mut plans: Vec<SkipRmsNormPlan> = Vec::new();
         let mut used_nodes: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
         for skip_id in skip_nodes {
-            if let Some(plan) = self.plan_fusion(graph, skip_id) {
+            if let Some(plan) = self.plan_fusion(graph, skip_id, &projections) {
                 // Keep plans node-disjoint so overlapping rewrites cannot race.
                 if std::iter::once(plan.preceding_id)
                     .chain(std::iter::once(plan.skip_id))
@@ -2390,7 +2398,12 @@ impl OptimizationPass for CudaSkipRmsNormMatMulFusion {
 }
 
 impl CudaSkipRmsNormMatMulFusion {
-    fn plan_fusion(&self, graph: &Graph, skip_id: NodeId) -> Option<SkipRmsNormPlan> {
+    fn plan_fusion(
+        &self,
+        graph: &Graph,
+        skip_id: NodeId,
+        projections: &std::collections::HashSet<NodeId>,
+    ) -> Option<SkipRmsNormPlan> {
         let skip = graph.try_node(skip_id)?;
         // Inputs: [input, skip, gamma, (bias)]. A norm bias would break the
         // warp_half4 byte-identity contract, so require it absent.
@@ -2454,8 +2467,9 @@ impl CudaSkipRmsNormMatMulFusion {
 
         // Identify which data input is produced by a fusable preceding GEMV; the
         // other is the residual.
-        let input_probe = self.preceding_gemv_attributed(graph, input_value, norm_size);
-        let skip_probe = self.preceding_gemv_attributed(graph, skip_value, norm_size);
+        let input_probe =
+            self.preceding_gemv_attributed(graph, input_value, norm_size, projections);
+        let skip_probe = self.preceding_gemv_attributed(graph, skip_value, norm_size, projections);
         if std::env::var_os("ONNX_GENAI_CUDA_DEBUG_RMSNORM_FOLD").is_some() {
             let describe = |r: &Result<NodeId, &'static str>| match r {
                 Ok(_) => "OK".to_string(),
@@ -2471,13 +2485,11 @@ impl CudaSkipRmsNormMatMulFusion {
                 describe(&skip_probe),
             );
         }
-        let (preceding_out, residual) = match (input_probe.is_ok(), skip_probe.is_ok()) {
-            (true, true) => return None,
-            (true, false) => (input_value, skip_value),
-            (false, true) => (skip_value, input_value),
-            (false, false) => return None,
+        let (preceding_id, preceding_out, residual) = match (input_probe, skip_probe) {
+            (Ok(preceding), Err(_)) => (preceding, input_value, skip_value),
+            (Err(_), Ok(preceding)) => (preceding, skip_value, input_value),
+            _ => return None,
         };
-        let preceding_id = self.preceding_gemv(graph, preceding_out, norm_size)?;
         if graph.value(residual).dtype != DataType::Float16 {
             return None;
         }
@@ -2500,7 +2512,7 @@ impl CudaSkipRmsNormMatMulFusion {
             return None;
         }
         for following_id in &following_ids {
-            if !self.following_gemv_is_fusable(graph, *following_id) {
+            if !self.following_gemv_is_fusable(graph, *following_id, projections) {
                 if std::env::var_os("ONNX_GENAI_CUDA_DEBUG_RMSNORM_FOLD").is_some() {
                     let n = graph.node(*following_id);
                     eprintln!(
@@ -2557,11 +2569,7 @@ impl CudaSkipRmsNormMatMulFusion {
     /// optional asymmetric zero point (no group index or existing bias), its
     /// only consumer is the norm, it is not a graph output, and its output width
     /// equals the hidden size (so the residual add is well-shaped).
-    fn preceding_gemv(&self, graph: &Graph, value: ValueId, norm_size: usize) -> Option<NodeId> {
-        self.preceding_gemv_attributed(graph, value, norm_size).ok()
-    }
-
-    /// [`Self::preceding_gemv`] with the decline reason retained.
+    /// Retain the decline reason for diagnostics.
     ///
     /// The reasons are what turns "half the norms do not fold" into an
     /// actionable finding: inferring them from the pre-optimization graph is
@@ -2572,13 +2580,14 @@ impl CudaSkipRmsNormMatMulFusion {
         graph: &Graph,
         value: ValueId,
         norm_size: usize,
+        projections: &std::collections::HashSet<NodeId>,
     ) -> Result<NodeId, &'static str> {
         let producer = graph
             .try_value(value)
             .and_then(|v| v.producer)
             .ok_or("no producer")?;
         let node = graph.try_node(producer).ok_or("producer missing")?;
-        if node.op_type != "MatMulNBits" || node.domain != MICROSOFT_DOMAIN {
+        if !projections.contains(&producer) {
             return Err("producer is not a com.microsoft MatMulNBits");
         }
         if node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some() {
@@ -2622,11 +2631,16 @@ impl CudaSkipRmsNormMatMulFusion {
     /// `MatMulNBits` (an optional asymmetric zero point and/or bias allowed, no
     /// group index), with `K <= N` so the general — not the tall-skinny down —
     /// variant runs.
-    fn following_gemv_is_fusable(&self, graph: &Graph, id: NodeId) -> bool {
+    fn following_gemv_is_fusable(
+        &self,
+        graph: &Graph,
+        id: NodeId,
+        projections: &std::collections::HashSet<NodeId>,
+    ) -> bool {
         let Some(node) = graph.try_node(id) else {
             return false;
         };
-        if node.op_type != "MatMulNBits" || node.domain != MICROSOFT_DOMAIN {
+        if !projections.contains(&id) {
             return false;
         }
         // A node that already carries the RMS prologue cannot take a second one.
@@ -5687,6 +5701,45 @@ mod tests {
     fn node_producing(graph: &Graph, output: ValueId) -> &Node {
         let producer = graph.value(output).producer.unwrap();
         graph.node(producer)
+    }
+
+    #[test]
+    fn skip_rmsnorm_requires_single_output_contrib_projections() {
+        for (output, extra_output) in [
+            ("pre_out", false),
+            ("post_out", false),
+            ("pre_out", true),
+            ("post_out", true),
+        ] {
+            let mut graph =
+                skip_rms_graph(RMSNORM_FUSION_MIN_HIDDEN, RMSNORM_FUSION_MIN_HIDDEN + 256);
+            let value = value_id_by_name(&graph, output);
+            let producer = graph.value(value).producer.unwrap();
+            let mut node = graph.node(producer).clone();
+            if extra_output {
+                let extra = graph.create_value(DataType::Float16, vec![]);
+                node.outputs.push(Some(extra));
+            } else {
+                node.domain = "other".into();
+            }
+            graph.replace_node(producer, node);
+
+            CudaSkipRmsNormMatMulFusion::default()
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            assert!(
+                graph
+                    .nodes
+                    .values()
+                    .any(|node| { node.op_type == "SkipSimplifiedLayerNormalization" })
+            );
+            assert!(graph.nodes.values().all(|node| {
+                node.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_none()
+                    && node.attr(MATMUL_NBITS_FOLDED_BIAS_ATTR).is_none()
+            }));
+            graph.validate().unwrap();
+        }
     }
 
     #[test]

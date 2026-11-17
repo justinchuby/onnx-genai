@@ -73,6 +73,66 @@ impl RecognitionRule {
             anchor,
         })
     }
+
+    /// Visit deterministic matches using an existing prepared graph index.
+    pub fn candidates<'g>(&self, session: &MatchSession<'g>) -> Result<Vec<(NodeId, Match<'g>)>> {
+        let mut candidates = Vec::new();
+        for matched in session.find_matches(&self.pattern, MatchOptions::default())? {
+            let value = matched.captured(&self.anchor)?.ok_or_else(|| {
+                OptimizerError::Fusion(format!(
+                    "recognition rule {:?} has an absent traversal anchor; bind a present operator output",
+                    self.name
+                ))
+            })?;
+            let node = value.value().producer.ok_or_else(|| {
+                OptimizerError::Fusion(format!(
+                    "recognition rule {:?} anchors on a non-produced value; select an operator output",
+                    self.name
+                ))
+            })?;
+            candidates.push((node, matched));
+        }
+        candidates.sort_by_key(|(node, matched)| (*node, matched.selected_alternative()));
+        Ok(candidates)
+    }
+
+    /// Recognize immutable graphs and apply provider-owned plans separately.
+    ///
+    /// Preparation and enumeration are reused until a rewrite is selected.
+    /// After mutation, rebuild the session: captures/indexes never survive a
+    /// graph revision. Continue above the previous anchor, like an ordered
+    /// single-pass provider walk; eligibility predicates read the current graph.
+    pub fn rewrite<P>(
+        &self,
+        graph: &mut Graph,
+        mut prepare: impl FnMut(&Graph, &Match<'_>) -> Result<Option<P>>,
+        mut apply: impl FnMut(&mut Graph, P),
+    ) -> Result<bool> {
+        let mut after = None;
+        let mut changed = false;
+        loop {
+            let next = {
+                let session = MatchSession::new(graph)?;
+                let mut selected = None;
+                for (anchor, matched) in self.candidates(&session)? {
+                    if after.is_some_and(|previous| anchor <= previous) {
+                        continue;
+                    }
+                    if let Some(plan) = prepare(graph, &matched)? {
+                        selected = Some((anchor, plan));
+                        break;
+                    }
+                }
+                selected
+            };
+            let Some((anchor, plan)) = next else {
+                return Ok(changed);
+            };
+            apply(graph, plan);
+            after = Some(anchor);
+            changed = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -145,67 +205,5 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].0, copy);
         assert_eq!(capture_value(&candidates[0].1, "out").unwrap(), out);
-    }
-}
-
-impl RecognitionRule {
-    /// Visit deterministic matches using an existing prepared graph index.
-    pub fn candidates<'g>(&self, session: &MatchSession<'g>) -> Result<Vec<(NodeId, Match<'g>)>> {
-        let mut candidates = Vec::new();
-        for matched in session.find_matches(&self.pattern, MatchOptions::default())? {
-            let value = matched.captured(&self.anchor)?.ok_or_else(|| {
-                OptimizerError::Fusion(format!(
-                    "recognition rule {:?} has an absent traversal anchor; bind a present operator output",
-                    self.name
-                ))
-            })?;
-            let node = value.value().producer.ok_or_else(|| {
-                OptimizerError::Fusion(format!(
-                    "recognition rule {:?} anchors on a non-produced value; select an operator output",
-                    self.name
-                ))
-            })?;
-            candidates.push((node, matched));
-        }
-        candidates.sort_by_key(|(node, matched)| (*node, matched.selected_alternative()));
-        Ok(candidates)
-    }
-
-    /// Recognize immutable graphs and apply provider-owned plans separately.
-    ///
-    /// Preparation and enumeration are reused until a rewrite is selected.
-    /// After mutation, rebuild the session: captures/indexes never survive a
-    /// graph revision. Continue above the previous anchor, like an ordered
-    /// single-pass provider walk; eligibility predicates read the current graph.
-    pub fn rewrite<P>(
-        &self,
-        graph: &mut Graph,
-        mut prepare: impl FnMut(&Graph, &Match<'_>) -> Result<Option<P>>,
-        mut apply: impl FnMut(&mut Graph, P),
-    ) -> Result<bool> {
-        let mut after = None;
-        let mut changed = false;
-        loop {
-            let next = {
-                let session = MatchSession::new(graph)?;
-                let mut selected = None;
-                for (anchor, matched) in self.candidates(&session)? {
-                    if after.is_some_and(|previous| anchor <= previous) {
-                        continue;
-                    }
-                    if let Some(plan) = prepare(graph, &matched)? {
-                        selected = Some((anchor, plan));
-                        break;
-                    }
-                }
-                selected
-            };
-            let Some((anchor, plan)) = next else {
-                return Ok(changed);
-            };
-            apply(graph, plan);
-            after = Some(anchor);
-            changed = true;
-        }
     }
 }
