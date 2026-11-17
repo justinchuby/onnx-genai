@@ -113,7 +113,7 @@ class PublishOrderTests(unittest.TestCase):
             problems,
         )
 
-    def test_dev_dependency_does_not_constrain_publish_order(self):
+    def test_dev_dependency_must_be_in_publish_order(self):
         packages = [
             package(
                 "nested-sys",
@@ -128,8 +128,39 @@ class PublishOrderTests(unittest.TestCase):
             ["nested-sys"], graph, frozenset()
         )
 
+        self.assertEqual(edges, 1)
+        self.assertTrue(
+            any("test-helper, which is omitted" in problem for problem in problems),
+            problems,
+        )
+
+    def test_dev_dependency_must_be_published_first(self):
+        packages = [
+            package(
+                "consumer",
+                "/repo/consumer/Cargo.toml",
+                dependencies=[("test-helper", "dev")],
+            ),
+            package("test-helper", "/repo/test-helper/Cargo.toml"),
+        ]
+        graph = metadata(packages)
+
+        problems, edges = check_publish_order.validate_publish_order(
+            ["consumer", "test-helper"], graph, frozenset()
+        )
+
+        self.assertEqual(edges, 1)
+        self.assertTrue(
+            any("test-helper (#2), which is published later" in p for p in problems),
+            problems,
+        )
+
+        problems, edges = check_publish_order.validate_publish_order(
+            ["test-helper", "consumer"], graph, frozenset()
+        )
+
         self.assertEqual(problems, [])
-        self.assertEqual(edges, 0)
+        self.assertEqual(edges, 1)
 
     def test_duplicate_workspace_package_name_fails_closed(self):
         packages = [

@@ -8,7 +8,8 @@ edge changes: the tracer sat mid-list happily for months, then startup tracing
 gave the loader a dependency on it and the next release died partway through,
 leaving some crates published at the new version and some not.
 
-Dev-dependencies are ignored: they are not resolved when packaging.
+Dev-dependencies are included because Cargo resolves registry versions while
+preparing a package, even though consumers do not build them.
 """
 
 from __future__ import annotations
@@ -30,16 +31,13 @@ WORKFLOW = ROOT / ".github/workflows/publish.yml"
 EXCLUDED_PUBLISHABLE_PACKAGES = frozenset(
     {
         "onnx-genai-capi",
-        "onnx-genai-paged-attention",
         "onnx-runtime-cost-model",
         "onnx-runtime-ep-cpu-plugin",
         "onnx-runtime-ep-cuda-plugin",
         "onnx-runtime-ep-nxrt-abi",
         "onnx-runtime-ep-plugin",
-        "onnx-runtime-hostmon",
         "onnx-runtime-memory-abi",
         "onnx-runtime-memory-host",
-        "onnx-runtime-operator-selection",
     }
 )
 PUBLISH_LINE = re.compile(r"^\s*publish_crate\s+([A-Za-z0-9_-]+)\s*(?:#.*)?$")
@@ -193,8 +191,6 @@ def validate_publish_order(
             problems.append(f"{crate} has no dependency list in Cargo metadata")
             continue
         for dependency in dependencies:
-            if dependency.get("kind") == "dev":
-                continue
             dependency_path = dependency.get("path")
             if not isinstance(dependency_path, str):
                 continue

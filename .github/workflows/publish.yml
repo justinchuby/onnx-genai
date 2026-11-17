@@ -13,6 +13,11 @@ on:
         required: false
         type: boolean
         default: false
+      publish_nxrt_wheels:
+        description: Build and publish the nxrt CPU wheels to PyPI
+        required: false
+        type: boolean
+        default: false
       publish_onnx_genai:
         description: Publish the onnx-genai / onnx-genai-server sdists and wheels to PyPI
         required: false
@@ -167,6 +172,7 @@ jobs:
           publish_crate onnx-runtime-tracer
           publish_crate onnx-genai-runtime-config
           publish_crate onnx-genai-ort-sys
+          publish_crate onnx-runtime-einsum-conformance
           publish_crate onnx-runtime-ir
           publish_crate onnx-model-package
           publish_crate onnx-runtime-shape-inference
@@ -181,9 +187,12 @@ jobs:
           publish_crate onnx-runtime-ep-api
           publish_crate mlas-sys
           publish_crate onnx-runtime-quantization
+          publish_crate onnx-runtime-hostmon
+          publish_crate onnx-runtime-operator-selection
           publish_crate onnx-runtime-ep-cpu
           publish_crate onnx-runtime-eager
           publish_crate onnx-runtime-cuda-memory
+          publish_crate onnx-genai-paged-attention
           publish_crate onnx-runtime-ep-cuda
           publish_crate onnx-genai-metadata
           publish_crate onnx-runtime-session
@@ -232,6 +241,88 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true
+
+  build-nxrt-wheels:
+    name: Build nxrt (${{ matrix.name }})
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_nxrt_wheels)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            archs: x86_64
+          - name: Windows AMD64
+            os: windows-latest
+            archs: AMD64
+          - name: macOS arm64
+            os: macos-14
+            archs: arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      CIBW_ARCHS: ${{ matrix.archs }}
+      CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:2026.07.25-1
+      CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+        delvewheel repair --exclude ext-ms-win-dxcore-l1-1-0.dll
+        -w {dest_dir} -v {wheel}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install Rust stable toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Pull manylinux image with retries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          image="$CIBW_MANYLINUX_X86_64_IMAGE"
+          for attempt in 1 2 3; do
+            docker pull "$image" && exit 0
+            echo "manylinux image pull attempt $attempt failed"
+            sleep $((attempt * 10))
+          done
+          exit 1
+      - name: Build and smoke-test nxrt CPU wheel
+        uses: pypa/cibuildwheel@v4.1.0
+        with:
+          package-dir: crates/onnx-runtime-python
+          output-dir: wheelhouse
+      - name: Upload nxrt CPU wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxrt-wheels-${{ matrix.os }}-${{ matrix.archs }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  publish-nxrt-wheels:
+    name: Publish nxrt CPU wheels to PyPI
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_nxrt_wheels)
+    needs: [build-nxrt-wheels]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download nxrt CPU wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nxrt-wheels-*
+          path: wheelhouse
+          merge-multiple: true
+      - name: Publish nxrt CPU wheels
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheelhouse
           skip-existing: true
 
   publish-onnx-genai-sdist:
