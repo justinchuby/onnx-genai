@@ -47,7 +47,11 @@ pub(super) fn library(
     };
     let names: Vec<_> = compiler.definitions.keys().cloned().collect();
     for name in names {
-        compiler.definition(&name, 0)?;
+        if let DefinitionKind::Interface(inputs, outputs, span) = &compiler.definitions[&name] {
+            validate_interface(inputs, outputs, *span)?;
+        } else {
+            compiler.definition(&name, 0)?;
+        }
     }
     Ok(PatternLibrary {
         patterns: compiler.compiled,
@@ -55,6 +59,12 @@ pub(super) fn library(
 }
 
 type OperatorRegistry<'r> = &'r dyn Fn(&str, &str) -> bool;
+
+struct ExpressionPlan {
+    plan: Plan,
+    outputs: Vec<usize>,
+    ports: Vec<Parameter>,
+}
 
 struct Compiler<'r> {
     definitions: BTreeMap<String, DefinitionKind>,
@@ -103,7 +113,62 @@ impl Compiler<'_> {
         }
         self.heights.insert(name.into(), height);
         let plans = match definition {
-            DefinitionKind::Body(body) => self.body(&body, depth + 1)?,
+            DefinitionKind::Interface(..) => {
+                return Err(invalid(
+                    SourceSpan::default(),
+                    format!(
+                        "interface {name:?} is a tensor contract, not a callable pattern; select an implementation"
+                    ),
+                ));
+            }
+            DefinitionKind::Body(mut body) => {
+                if let Some(interface) = &body.interface {
+                    let Some(DefinitionKind::Interface(inputs, outputs, span)) =
+                        self.definitions.get(interface)
+                    else {
+                        return Err(invalid(
+                            body.span,
+                            format!("unknown interface {interface:?}; declare it with interface"),
+                        ));
+                    };
+                    validate_interface(inputs, outputs, *span)?;
+                    body.call_parameters = Some(inputs.len());
+                    let mut parameters = inputs.clone();
+                    parameters.append(&mut body.parameters);
+                    body.parameters = parameters;
+                    body.output_signature = Some(outputs.clone());
+                }
+                if let Some(labels) = &body.return_labels {
+                    if let Some(signature) = &body.output_signature
+                        && body.interface.is_some()
+                    {
+                        if signature.len() != labels.len() {
+                            return Err(invalid(
+                                body.span,
+                                "return ports differ from the output contract; map every declared label exactly once",
+                            ));
+                        }
+                        let mut returns = Vec::new();
+                        for output in signature {
+                            let index = labels.iter().position(|label| label == &output.name).ok_or_else(||
+                                invalid(body.span, format!("missing return port {:?}; use the declared output labels", output.name)))?;
+                            returns.push(body.returns[index].clone());
+                        }
+                        body.returns = returns;
+                    } else if body.output_signature.is_none() {
+                        body.output_signature = Some(
+                            labels
+                                .iter()
+                                .map(|name| Parameter {
+                                    name: name.clone(),
+                                    annotation: None,
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                self.body(&body, depth + 1)?
+            }
             DefinitionKind::Alternatives(members, span) => {
                 let mut plans: Vec<Plan> = Vec::new();
                 for member in members {
@@ -114,7 +179,7 @@ impl Compiler<'_> {
                         {
                             return Err(unsupported(
                                 span,
-                                "named alternatives need identical ordered unannotated ports in this dialect version; use call-expression alternatives",
+                                "named alternatives need identical interfaces, ordered ports and annotations; use call-expression alternatives for different signatures",
                             ));
                         }
                         plans.push(plan.clone());
@@ -136,7 +201,30 @@ impl Compiler<'_> {
     }
 
     fn body(&mut self, definition: &Definition, depth: usize) -> Result<Vec<Plan>> {
+        if definition.require_outputs {
+            let mut labels: BTreeSet<_> = definition
+                .parameters
+                .iter()
+                .take(
+                    definition
+                        .call_parameters
+                        .unwrap_or(definition.parameters.len()),
+                )
+                .map(|p| p.name.as_str())
+                .collect();
+            if let Some(outputs) = &definition.output_signature {
+                for output in outputs {
+                    if !labels.insert(&output.name) {
+                        return Err(invalid(
+                            definition.span,
+                            "duplicate input/output contract label; give each port a distinct name",
+                        ));
+                    }
+                }
+            }
+        }
         let mut start = Plan::empty();
+        start.interface = definition.interface.clone();
         start.signature = definition.parameters.clone();
         let mut declared = BTreeSet::new();
         for parameter in &definition.parameters {
@@ -158,6 +246,9 @@ impl Compiler<'_> {
             };
             let slot = start.value(value);
             start.names.insert(parameter.name.clone(), slot);
+            start
+                .binding_annotations
+                .insert(parameter.name.clone(), parameter.annotation.clone());
         }
         let mut plans = vec![start];
         for (targets, expression) in &definition.statements {
@@ -169,6 +260,7 @@ impl Compiler<'_> {
                     }
                     if plan.names.contains_key(&target.name)
                         || plan.attribute_names.contains_key(&target.name)
+                        || plan.instance_only.contains(&target.name)
                     {
                         return Err(invalid(
                             expression.span,
@@ -179,10 +271,32 @@ impl Compiler<'_> {
                         ));
                     }
                 }
-                for (mut plan, outputs) in
+                for ExpressionPlan {
+                    mut plan,
+                    outputs,
+                    ports,
+                } in
                     self.expression(plan, expression, targets.len(), &targets[0].name, depth)?
                 {
-                    for (target, output) in targets.iter().zip(outputs) {
+                    if outputs.len() != targets.len() {
+                        if targets.len() != 1
+                            || targets[0].annotation.is_some()
+                            || targets[0].name == "_"
+                            || targets[0].name == "None"
+                        {
+                            return Err(invalid(
+                                expression.span,
+                                "multi-result instance needs one unannotated name, or exact positional output targets",
+                            ));
+                        }
+                        plan.instance_only.insert(targets[0].name.clone());
+                        next.push(plan);
+                        if next.len() > 64 {
+                            return Err(limit(expression.span));
+                        }
+                        continue;
+                    }
+                    for ((target, output), port) in targets.iter().zip(outputs).zip(ports) {
                         if target.name == "None" {
                             plan.values[output] = ValuePlan::Absent;
                             continue;
@@ -197,6 +311,10 @@ impl Compiler<'_> {
                             ));
                         }
                         annotate(&mut plan, target, output, expression.span, false)?;
+                        plan.binding_annotations.insert(
+                            target.name.clone(),
+                            target.annotation.clone().or(port.annotation),
+                        );
                     }
                     next.push(plan);
                     if next.len() > 64 {
@@ -209,8 +327,14 @@ impl Compiler<'_> {
         for expression in &definition.returns {
             let mut next = Vec::new();
             for plan in plans {
-                for (mut plan, outputs) in self.expression(plan, expression, 1, "root", depth)? {
+                for ExpressionPlan {
+                    mut plan,
+                    outputs,
+                    ports,
+                } in self.expression(plan, expression, 1, "root", depth)?
+                {
                     plan.outputs.extend(outputs);
+                    plan.output_signature.extend(ports);
                     next.push(plan);
                     if next.len() > 64 {
                         return Err(limit(expression.span));
@@ -221,24 +345,23 @@ impl Compiler<'_> {
         }
         for plan in &mut plans {
             let body_annotations = std::mem::take(&mut plan.annotations);
-            plan.output_signature = if let Some(signature) = &definition.output_signature {
-                signature.clone()
-            } else {
-                definition
-                    .returns
-                    .iter()
-                    .map(|expression| Parameter {
-                        name: if let ExprKind::Name(name) = &expression.kind {
-                            name.clone()
-                        } else {
-                            "output".into()
-                        },
-                        annotation: None,
-                    })
-                    .collect()
-            };
-            for parameter in &definition.parameters {
+            if let Some(signature) = &definition.output_signature {
+                let mut signature = signature.clone();
+                if !definition.require_outputs {
+                    for (port, inferred) in signature.iter_mut().zip(&plan.output_signature) {
+                        port.annotation = inferred.annotation.clone();
+                    }
+                }
+                plan.output_signature = signature;
+            }
+            for (index, parameter) in definition.parameters.iter().enumerate() {
                 let slot = plan.names[&parameter.name];
+                let discovered = definition
+                    .call_parameters
+                    .is_some_and(|count| index >= count);
+                if definition.interface.is_some() && !discovered {
+                    plan.tensor_formals.insert(slot);
+                }
                 if plan.attribute_types.contains_key(&parameter.name) {
                     if value_used(plan, slot) || plan.tensor_formals.contains(&slot) {
                         return Err(invalid(
@@ -250,17 +373,32 @@ impl Compiler<'_> {
                         ));
                     }
                     annotate(plan, parameter, slot, definition.span, true)?;
-                    plan.parameters
-                        .push(Formal::Attribute(parameter.name.clone()));
+                    if !discovered {
+                        plan.parameters
+                            .push(Formal::Attribute(parameter.name.clone()));
+                    }
                     plan.names.remove(&parameter.name);
                 } else {
                     annotate(plan, parameter, slot, definition.span, false)?;
                     plan.inputs.push(slot);
-                    plan.parameters.push(Formal::Value(slot));
+                    if !discovered {
+                        plan.parameters.push(Formal::Value(slot));
+                    } else if !value_used(plan, slot)
+                        && !matches!(plan.values[slot], ValuePlan::Optional)
+                    {
+                        return Err(invalid(
+                            definition.span,
+                            format!(
+                                "discovered input {:?} is unused; remove it or allow None",
+                                parameter.name
+                            ),
+                        ));
+                    }
                 }
             }
             plan.annotations.extend(body_annotations);
-            if let Some(signature) = &definition.output_signature {
+            let signature = plan.output_signature.clone();
+            if definition.named {
                 if signature.len() != plan.outputs.len() {
                     return Err(invalid(
                         definition.span,
@@ -279,10 +417,37 @@ impl Compiler<'_> {
                         ));
                     }
                     plan.names.insert(parameter.name.clone(), slot);
-                    annotate(plan, parameter, slot, definition.span, false)?;
+                    plan.binding_annotations
+                        .insert(parameter.name.clone(), parameter.annotation.clone());
+                    if definition.require_outputs {
+                        plan.tensor_formals.insert(slot);
+                        plan.required_values.insert(slot);
+                        annotate(plan, parameter, slot, definition.span, false)?;
+                        if parameter
+                            .annotation
+                            .as_ref()
+                            .is_some_and(|constraints| constraints.iter().any(|c| c.name == "None"))
+                        {
+                            return Err(invalid(
+                                definition.span,
+                                "declared outputs cannot be optional; remove None from the output contract",
+                            ));
+                        }
+                    }
                 }
             }
             verify_plan(plan, definition.span)?;
+        }
+        let mut common = plans[0].output_signature.clone();
+        for plan in &plans[1..] {
+            merge_result_ports(&mut common, &plan.output_signature, true, definition.span)?;
+        }
+        for plan in &mut plans {
+            plan.output_signature = common.clone();
+            for port in &common {
+                plan.binding_annotations
+                    .insert(port.name.clone(), port.annotation.clone());
+            }
         }
         Ok(plans)
     }
@@ -294,10 +459,38 @@ impl Compiler<'_> {
         arity: usize,
         instance: &str,
         depth: usize,
-    ) -> Result<Vec<(Plan, Vec<usize>)>> {
+    ) -> Result<Vec<ExpressionPlan>> {
         match &expression.kind {
-            ExprKind::Alternatives(branches) => {
+            ExprKind::AnonymousCall(members, arguments) => {
+                let mut reference: Option<Plan> = None;
                 let mut results = Vec::new();
+                for member in members {
+                    let callee = self.definition(member, depth)?;
+                    for child in callee.plans.iter() {
+                        if reference
+                            .as_ref()
+                            .is_some_and(|first| !same_signature(first, child))
+                        {
+                            return Err(invalid(
+                                expression.span,
+                                "anonymous alternatives need identical interface and ordered ports; use call-expression alternatives for different signatures",
+                            ));
+                        }
+                        reference.get_or_insert_with(|| child.clone());
+                    }
+                    let call = Expr {
+                        kind: ExprKind::Call(member.clone(), arguments.clone(), Vec::new()),
+                        span: expression.span,
+                    };
+                    results.extend(self.expression(plan.clone(), &call, arity, instance, depth)?);
+                    if results.len() > 64 {
+                        return Err(limit(expression.span));
+                    }
+                }
+                Ok(results)
+            }
+            ExprKind::Alternatives(branches) => {
+                let mut results: Vec<ExpressionPlan> = Vec::new();
                 for branch in branches {
                     results.extend(self.expression(
                         plan.clone(),
@@ -308,6 +501,15 @@ impl Compiler<'_> {
                     )?);
                     if results.len() > 64 {
                         return Err(limit(expression.span));
+                    }
+                }
+                let mut contracts = results[0].ports.clone();
+                for result in &results[1..] {
+                    merge_result_ports(&mut contracts, &result.ports, false, expression.span)?;
+                }
+                for result in &mut results {
+                    for (port, contract) in result.ports.iter_mut().zip(&contracts) {
+                        port.annotation = contract.annotation.clone();
                     }
                 }
                 Ok(results)
@@ -322,7 +524,9 @@ impl Compiler<'_> {
                 let callee = self.definition(name, depth)?;
                 let mut results = Vec::new();
                 for child in callee.plans.iter() {
-                    if child.parameters.len() != arguments.len() || child.outputs.len() != arity {
+                    if child.parameters.len() != arguments.len()
+                        || (child.outputs.len() != arity && arity != 1)
+                    {
                         return Err(invalid(
                             expression.span,
                             format!(
@@ -341,6 +545,9 @@ impl Compiler<'_> {
                             Formal::Value(slot) => {
                                 let actual = operand(&mut parent, actual)?;
                                 parent.tensor_formals.insert(actual);
+                                if !matches!(child.values[*slot], ValuePlan::Optional) {
+                                    parent.required_values.insert(actual);
+                                }
                                 remap.insert(*slot, actual);
                             }
                             Formal::Attribute(name) => {
@@ -386,8 +593,41 @@ impl Compiler<'_> {
                         .tensor_formals
                         .extend(child.tensor_formals.iter().map(|slot| remap[slot]));
                     let prefix = format!("{instance}.");
+                    parent.instance_only.extend(
+                        child
+                            .instance_only
+                            .iter()
+                            .map(|name| format!("{prefix}{name}")),
+                    );
+                    parent
+                        .required_values
+                        .extend(child.required_values.iter().map(|slot| remap[slot]));
+                    parent
+                        .discovered_inputs
+                        .extend(child.discovered_inputs.iter().map(|slot| remap[slot]));
+                    let formals: BTreeSet<_> = child
+                        .parameters
+                        .iter()
+                        .filter_map(|formal| match formal {
+                            Formal::Value(slot) => Some(*slot),
+                            Formal::Attribute(_) => None,
+                        })
+                        .collect();
+                    parent.discovered_inputs.extend(
+                        child
+                            .inputs
+                            .iter()
+                            .filter(|slot| !formals.contains(slot))
+                            .map(|slot| remap[slot]),
+                    );
                     for (name, slot) in &child.names {
                         parent.names.insert(format!("{prefix}{name}"), remap[slot]);
+                    }
+                    for (name, annotation) in &child.binding_annotations {
+                        parent.binding_annotations.insert(
+                            format!("{prefix}{name}"),
+                            scoped_annotation(annotation, &prefix),
+                        );
                     }
                     for (name, types) in &child.attribute_types {
                         let mapped = attr_remap
@@ -455,7 +695,19 @@ impl Compiler<'_> {
                     parent.calls += child.calls + 1;
                     verify_limits(&parent, expression.span)?;
                     let outputs = child.outputs.iter().map(|slot| remap[slot]).collect();
-                    results.push((parent, outputs));
+                    let ports = child
+                        .output_signature
+                        .iter()
+                        .map(|port| Parameter {
+                            name: port.name.clone(),
+                            annotation: scoped_annotation(&port.annotation, &prefix),
+                        })
+                        .collect();
+                    results.push(ExpressionPlan {
+                        plan: parent,
+                        outputs,
+                        ports,
+                    });
                 }
                 Ok(results)
             }
@@ -520,6 +772,12 @@ impl Compiler<'_> {
                             AttributePlan::Graphs(patterns)
                         }
                         ExprKind::Name(name) if name != "_" && name != "None" => {
+                            if plan.instance_only.contains(name) {
+                                return Err(invalid(
+                                    expression.span,
+                                    "attribute capture conflicts with a multi-result instance; use a distinct capture name",
+                                ));
+                            }
                             if plan.names.contains_key(name)
                                 && !plan
                                     .signature
@@ -558,12 +816,41 @@ impl Compiler<'_> {
                     rest,
                 });
                 verify_limits(&plan, expression.span)?;
-                Ok(vec![(plan, outputs)])
+                let ports = (0..arity)
+                    .map(|index| Parameter {
+                        name: if arity == 1 {
+                            "output".into()
+                        } else {
+                            format!("output{index}")
+                        },
+                        annotation: None,
+                    })
+                    .collect();
+                Ok(vec![ExpressionPlan {
+                    plan,
+                    outputs,
+                    ports,
+                }])
             }
             _ if arity == 1 => {
                 let mut plan = plan;
                 let value = operand(&mut plan, expression)?;
-                Ok(vec![(plan, vec![value])])
+                let port = if let ExprKind::Name(name) = &expression.kind {
+                    Parameter {
+                        name: name.rsplit('.').next().unwrap().into(),
+                        annotation: plan.binding_annotations.get(name).cloned().flatten(),
+                    }
+                } else {
+                    Parameter {
+                        name: "output".into(),
+                        annotation: None,
+                    }
+                };
+                Ok(vec![ExpressionPlan {
+                    plan,
+                    outputs: vec![value],
+                    ports: vec![port],
+                }])
             }
             _ => Err(unsupported(
                 expression.span,
@@ -573,11 +860,77 @@ impl Compiler<'_> {
     }
 }
 
+fn scoped_annotation(
+    annotation: &Option<Vec<RawConstraint>>,
+    prefix: &str,
+) -> Option<Vec<RawConstraint>> {
+    annotation.as_ref().map(|constraints| {
+        constraints
+            .iter()
+            .cloned()
+            .map(|mut constraint| {
+                if let Some(name) = &mut constraint.element_variable {
+                    *name = format!("{prefix}{name}");
+                }
+                if let Some(dimensions) = &mut constraint.dimensions {
+                    for dimension in dimensions {
+                        if let Dimension::Named(name) = dimension {
+                            *name = format!("{prefix}{name}");
+                        }
+                    }
+                }
+                constraint
+            })
+            .collect()
+    })
+}
+
+fn merge_result_ports(
+    target: &mut [Parameter],
+    source: &[Parameter],
+    require_names: bool,
+    span: SourceSpan,
+) -> Result<()> {
+    if target.len() != source.len() {
+        return Err(invalid(
+            span,
+            "expression alternatives have different result arities; return the same number of tensors",
+        ));
+    }
+    for (first, port) in target.iter_mut().zip(source) {
+        if require_names && first.name != port.name {
+            return Err(invalid(
+                span,
+                "pattern alternatives change inferred output labels; declare a common output signature",
+            ));
+        }
+        match (&first.annotation, &port.annotation) {
+            (Some(a), Some(b)) if a != b => {
+                return Err(invalid(
+                    span,
+                    "expression alternatives have incompatible result annotations; use structurally identical result constraints",
+                ));
+            }
+            (None, _) => first.annotation = port.annotation.clone(),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn operand(plan: &mut Plan, expression: &Expr) -> Result<usize> {
     match &expression.kind {
         ExprKind::Name(name) if name == "_" => Ok(plan.value(ValuePlan::Present)),
         ExprKind::Name(name) if name == "None" => Ok(plan.value(ValuePlan::Absent)),
         ExprKind::Name(name) => {
+            if plan.instance_only.contains(name) {
+                return Err(invalid(
+                    expression.span,
+                    format!(
+                        "instance-only binding {name:?} has multiple results; use {name}.port or positional assignment targets"
+                    ),
+                ));
+            }
             let slot = plan.names.get(name).copied().ok_or_else(|| invalid(expression.span,
                 format!("undefined tensor binding {name:?}; declare it in the header or assign it before use")))?;
             if matches!(plan.values[slot], ValuePlan::Sequence { .. }) {
@@ -852,10 +1205,11 @@ fn verify_plan(plan: &mut Plan, span: SourceSpan) -> Result<()> {
             )
         })
         .collect();
-    if variables
-        .iter()
-        .any(|name| plan.names.contains_key(*name) || plan.attribute_types.contains_key(*name))
-    {
+    if variables.iter().any(|name| {
+        plan.names.contains_key(*name)
+            || plan.attribute_types.contains_key(*name)
+            || plan.instance_only.contains(*name)
+    }) {
         return Err(invalid(
             span,
             "dimension/element variable collides with a tensor or attribute; use separate names",
@@ -954,7 +1308,45 @@ pub(super) fn verify_entry(plan: &Plan) -> Result<()> {
 }
 
 fn same_signature(a: &Plan, b: &Plan) -> bool {
-    a.signature == b.signature && a.output_signature == b.output_signature
+    a.interface == b.interface
+        && a.signature[..a.parameters.len()] == b.signature[..b.parameters.len()]
+        && a.output_signature == b.output_signature
+}
+
+fn validate_interface(inputs: &[Parameter], outputs: &[Parameter], span: SourceSpan) -> Result<()> {
+    if outputs.is_empty() {
+        return Err(invalid(span, "interface needs at least one output port"));
+    }
+    let mut names = BTreeSet::new();
+    let mut plan = Plan::empty();
+    for (ports, output) in [(inputs, false), (outputs, true)] {
+        for port in ports {
+            if !names.insert(&port.name) {
+                return Err(invalid(
+                    span,
+                    format!(
+                        "duplicate interface port {:?}; input/output labels must be distinct",
+                        port.name
+                    ),
+                ));
+            }
+            if let Some(alternatives) = &port.annotation {
+                for raw in alternatives {
+                    let constraint = constraint_from_raw(raw, span)?;
+                    if constraint.absent && output {
+                        return Err(invalid(
+                            span,
+                            "interface outputs cannot be optional; remove None",
+                        ));
+                    }
+                }
+            }
+            let slot = plan.value(ValuePlan::Present);
+            plan.names.insert(port.name.clone(), slot);
+            annotate(&mut plan, port, slot, span, false)?;
+        }
+    }
+    verify_plan(&mut plan, span)
 }
 
 fn dependencies(
@@ -967,6 +1359,12 @@ fn dependencies(
         found: &mut BTreeSet<String>,
     ) {
         match &expression.kind {
+            ExprKind::AnonymousCall(members, arguments) => {
+                found.extend(members.iter().cloned());
+                for argument in arguments {
+                    visit(argument, definitions, found);
+                }
+            }
             ExprKind::Call(name, inputs, attributes) => {
                 if definitions.contains_key(name) {
                     found.insert(name.clone());
@@ -994,6 +1392,7 @@ fn dependencies(
     }
     let mut found = BTreeSet::new();
     match definition {
+        DefinitionKind::Interface(..) => {}
         DefinitionKind::Alternatives(members, _) => found.extend(members.iter().cloned()),
         DefinitionKind::Body(body) => {
             for (_, expression) in &body.statements {

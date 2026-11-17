@@ -1121,6 +1121,13 @@ impl<'g> MatchSession<'g> {
     ) -> Result<bool> {
         let prepared = &self.scopes[scope];
         let graph = prepared.graph;
+        if plan
+            .required_values
+            .iter()
+            .any(|slot| !matches!(state.values[*slot], Some(Some(_))))
+        {
+            return Ok(false);
+        }
         let nodes: HashSet<_> = state.nodes.iter().flatten().copied().collect();
         let mut literals = HashSet::new();
         for (slot, expected) in plan.values.iter().enumerate() {
@@ -1153,7 +1160,7 @@ impl<'g> MatchSession<'g> {
             return Ok(false);
         }
         // Header leaves cannot be produced by constrained operators.
-        for &slot in &plan.inputs {
+        for &slot in plan.inputs.iter().chain(&plan.discovered_inputs) {
             if whole && state.values[slot].is_none() {
                 return Ok(false);
             }
@@ -1167,6 +1174,19 @@ impl<'g> MatchSession<'g> {
             }
         }
         if boundary == BoundaryPolicy::OrtBoundary {
+            // ORT classifies every unproduced handle as an input, including
+            // anonymous wildcard actuals, not just declared header captures.
+            for (slot, producer) in plan.producers.iter().enumerate() {
+                if producer.is_none()
+                    && let Some(Some(value)) = state.values[slot]
+                    && graph
+                        .value(value)
+                        .producer
+                        .is_some_and(|node| nodes.contains(&node))
+                {
+                    return Ok(false);
+                }
+            }
             let exposed: HashSet<_> = plan
                 .outputs
                 .iter()

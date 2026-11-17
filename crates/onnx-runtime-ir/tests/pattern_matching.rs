@@ -36,11 +36,393 @@ fn options(boundary: BoundaryPolicy) -> MatchOptions {
 }
 
 fn registered(domain: &str, op: &str) -> bool {
-    domain.is_empty() && ["Identity", "Sigmoid", "Neg", "Add", "If", "Loop", "Scan"].contains(&op)
+    domain.is_empty()
+        && [
+            "Identity",
+            "Sigmoid",
+            "Neg",
+            "Add",
+            "If",
+            "Loop",
+            "Scan",
+            "Clip",
+            "Split",
+            "Mul",
+            "Softmax",
+            "LeakyRelu",
+            "CastLike",
+        ]
+        .contains(&op)
 }
 
 fn library(source: &str) -> Result<PatternLibrary, PatternError> {
     PatternLibrary::parse_ort(source, &registered)
+}
+
+#[test]
+fn pinned_interfaces_anonymous_alternatives_and_hygienic_scopes() {
+    let fixture = include_str!("fixtures/patterns/interfaces.ortpattern");
+    for call in ["Forms", "(first | second)"] {
+        let source = format!(
+            "{fixture}\npattern P(x,z) {{ a={call}(x); b={call}(z); return Add(a.y,b.y) }}"
+        );
+        let pattern = library(&source).unwrap().pattern("P").unwrap();
+        let mut graph = Graph::new();
+        let x = input(&mut graph, "x");
+        let z = input(&mut graph, "z");
+        graph.value_mut(z).shape = vec![3.into()];
+        let (_, a) = op(&mut graph, "Identity", &[Some(x)], 1);
+        let (_, b) = op(&mut graph, "Identity", &[Some(z)], 1);
+        graph.value_mut(b[0]).shape = vec![3.into()];
+        let (root, outputs) = op(&mut graph, "Add", &[Some(a[0]), Some(b[0])], 1);
+        graph.set_outputs(outputs);
+        let mut attempts = 0;
+        MatchSession::new(&graph)
+            .unwrap()
+            .visit_at(&pattern, root, Default::default(), |matched| {
+                attempts += 1;
+                assert_eq!(matched.value("a.y")?.unwrap().id(), a[0]);
+                assert_eq!(matched.instance("b")?.value("local")?.unwrap().id(), b[0]);
+                assert_eq!(matched.dimension("a.N")?, Some(&DimensionValue::Static(2)));
+                assert_eq!(matched.dimension("b.N")?, Some(&DimensionValue::Static(3)));
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(attempts, 4);
+    }
+}
+
+#[test]
+fn pinned_legacy_ports_aliases_and_implicit_results() {
+    let library = library(include_str!("fixtures/patterns/legacy_ports.ortpattern")).unwrap();
+    assert!(library.pattern("identity").is_err());
+    assert!(library.pattern("mixed").is_err());
+    for entry in ["entry", "use_identity", "use_implicit", "use_mixed"] {
+        let mut graph = Graph::new();
+        let x = input(&mut graph, "x");
+        let a = if entry == "use_identity" {
+            x
+        } else {
+            op(&mut graph, "Identity", &[Some(x)], 1).1[0]
+        };
+        let (root, output) = if entry == "use_mixed" {
+            op(&mut graph, "Add", &[Some(x), Some(a)], 1)
+        } else {
+            op(&mut graph, "Identity", &[Some(a)], 1)
+        };
+        graph.set_outputs(output);
+        if entry == "use_identity" {
+            let anonymous = Pattern::parse_ort("(output)=>return Identity(output)").unwrap();
+            let matched = MatchSession::new(&graph)
+                .unwrap()
+                .match_at(&anonymous, root, Default::default())
+                .unwrap()
+                .unwrap();
+            assert_eq!(matched.value("output").unwrap().unwrap().id(), x);
+        }
+        assert!(
+            MatchSession::new(&graph)
+                .unwrap()
+                .match_at(&library.pattern(entry).unwrap(), root, Default::default())
+                .unwrap()
+                .is_some(),
+            "{entry}"
+        );
+    }
+}
+
+#[test]
+fn legacy_multi_result_instance_preserves_port_order_and_identity() {
+    let source = r"
+        interface Pair(x) -> (left,right)
+        pattern pair implements Pair { a,b=Split(x);return (right=b,left=a) }
+        pattern P(x) { p=pair(x);return Add(p.left,p.right) }
+    ";
+    let pattern = library(source).unwrap().pattern("P").unwrap();
+    let mut graph = Graph::new();
+    let x = input(&mut graph, "x");
+    let (_, values) = op(&mut graph, "Split", &[Some(x)], 2);
+    let (root, outputs) = op(&mut graph, "Add", &[Some(values[0]), Some(values[1])], 1);
+    graph.set_outputs(outputs);
+    let found = MatchSession::new(&graph)
+        .unwrap()
+        .match_at(&pattern, root, Default::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.value("p.left").unwrap().unwrap().id(), values[0]);
+    assert_eq!(found.value("p.right").unwrap().unwrap().id(), values[1]);
+    assert!(found.value("p").is_err());
+    // Pinned Parse orders explicit interface mappings by label; an ordinary
+    // output signature still consumes returned values positionally.
+    let ordinary = source.replace(
+        "pattern pair implements Pair",
+        "pattern pair(x) -> (left,right)",
+    );
+    assert!(
+        MatchSession::new(&graph)
+            .unwrap()
+            .match_at(
+                &library(&ordinary).unwrap().pattern("P").unwrap(),
+                root,
+                Default::default()
+            )
+            .unwrap()
+            .is_none()
+    );
+    let incorrect = source.replace("Add(p.left,p.right)", "Add(p.left,p.left)");
+    assert!(
+        MatchSession::new(&graph)
+            .unwrap()
+            .match_at(
+                &library(&incorrect).unwrap().pattern("P").unwrap(),
+                root,
+                Default::default()
+            )
+            .unwrap()
+            .is_none()
+    );
+    for body in [
+        "return Identity(p)",
+        "p=Identity(x);return Add(p.left,p.right)",
+    ] {
+        let invalid = source.replace("return Add(p.left,p.right)", body);
+        assert!(library(&invalid).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn discovered_inputs_and_attributes_are_not_callable_ports() {
+    let source = r"
+        interface Unary(x:float[N]) -> (y:float[N])
+        pattern scale implements Unary: (alpha:float[N],axis:int) -> {
+            v=Mul(x,alpha); y=Softmax(v,axis=axis);return y
+        }
+        pattern P(x,z) { a=scale(x);b=scale(z);return Add(a.y,b.y) }
+    ";
+    let pattern = library(source).unwrap().pattern("P").unwrap();
+    let mut graph = Graph::new();
+    let x = input(&mut graph, "x");
+    let z = input(&mut graph, "z");
+    let alpha = input(&mut graph, "alpha");
+    let beta = input(&mut graph, "beta");
+    let (_, a) = op(&mut graph, "Mul", &[Some(x), Some(alpha)], 1);
+    let (a_node, a) = op(&mut graph, "Softmax", &[Some(a[0])], 1);
+    graph
+        .node_mut(a_node)
+        .attributes
+        .insert("axis".into(), Attribute::Int(0));
+    let (_, b) = op(&mut graph, "Mul", &[Some(z), Some(beta)], 1);
+    let (b_node, b) = op(&mut graph, "Softmax", &[Some(b[0])], 1);
+    graph
+        .node_mut(b_node)
+        .attributes
+        .insert("axis".into(), Attribute::Int(1));
+    let (root, output) = op(&mut graph, "Add", &[Some(a[0]), Some(b[0])], 1);
+    graph.set_outputs(output);
+    let found = MatchSession::new(&graph)
+        .unwrap()
+        .match_at(&pattern, root, Default::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.value("a.alpha").unwrap().unwrap().id(), alpha);
+    assert_eq!(found.value("b.alpha").unwrap().unwrap().id(), beta);
+    assert!(matches!(
+        found.attribute("a.axis").unwrap(),
+        Some(Attribute::Int(0))
+    ));
+    assert!(matches!(
+        found.attribute("b.axis").unwrap(),
+        Some(Attribute::Int(1))
+    ));
+    assert!(library(&source.replace("a=scale(x)", "a=scale(x,x,x)")).is_err());
+}
+
+#[test]
+fn interface_alias_outputs_and_required_callee_inputs_cannot_bind_absence() {
+    let source = r"
+        interface I(v:float | None) -> (y)
+        pattern P implements I {return (y=v)}
+        pattern Alias=P
+        pattern Wrapped implements I {p=Alias(v);return (y=p.y)}
+        pattern Entry(x,v:float | None) {p=P(v);return Clip(x,p.y)}
+        pattern Nested(x,v:float | None) {p=Wrapped(v);return Clip(x,p.y)}
+        pattern required(v) {return (y=v)}
+        pattern Required(x,v:float | None) {p=required(v);return Clip(x,p.y)}
+    ";
+    let library = library(source).unwrap();
+    for entry in ["Entry", "Nested", "Required"] {
+        for scenario in 0..3 {
+            let mut graph = Graph::new();
+            let x = input(&mut graph, "x");
+            let mut inputs = vec![Some(x)];
+            if scenario == 1 {
+                inputs.push(None);
+            }
+            if scenario == 2 {
+                let min = input(&mut graph, "min");
+                graph.value_mut(min).shape.clear();
+                inputs.push(Some(min));
+            }
+            let (root, output) = op(&mut graph, "Clip", &inputs, 1);
+            graph.set_outputs(output);
+            let found = MatchSession::new(&graph)
+                .unwrap()
+                .match_at(&library.pattern(entry).unwrap(), root, Default::default())
+                .unwrap();
+            assert_eq!(found.is_some(), scenario == 2, "{entry}/{scenario}");
+        }
+    }
+}
+
+#[test]
+fn library_contract_errors_are_construction_errors_not_nonmatches() {
+    for source in [
+        "interface I(x)->(y) pattern P(x){a=I(x);return a.y}",
+        "pattern P implements Missing {return (y=x)}",
+        "interface I(x)->(y) pattern P implements I {a=Identity(x);return (wrong=a)}",
+        "interface I(x)->(y) pattern P implements I {a=Identity(x);return (y=a,y=a)}",
+        "interface I(x)->(x)",
+        "interface I(x:float[x])->(y)",
+        "interface I(x)->(y:float|None)",
+        "interface I(x,alpha:float)->(y) pattern P implements I {y=LeakyRelu(x,alpha=alpha);return y}",
+        "interface I(x)->(y) interface J(x)->(y) pattern P implements I {y=Identity(x);return y} pattern Q implements J {y=Identity(x);return y} pattern Forms=P|Q",
+        "pattern P(x){return Identity(x)} pattern Forms=P|P",
+        "pattern Pair(x){a,b=Split(x);return a,b} pattern P(x){p:float=Pair(x);return Add(p.a,p.b)}",
+        "pattern Pair(x){a,b=Split(x);return a,b} pattern P(x:float[p]){p=Pair(x);return Add(p.a,p.b)}",
+        "interface I(x)->(y) pattern P implements I:(unused:float[])->{y=Identity(x);return y}",
+        "pattern P(x)->(x){return x}",
+        "pattern A(x){y:float[N]=Identity(x);return y} pattern B(x){y:float[M]=Identity(x);return y} pattern Forms=A|B",
+    ] {
+        assert!(library(source).is_err(), "{source}");
+    }
+    let error = library("pattern P(x){return Add(x,Identity(x))}").unwrap_err();
+    assert_eq!(error.kind, PatternErrorKind::Unsupported);
+    assert!(error.message.contains("assign each call"));
+    let error = library(
+        r"
+        pattern A(x)->(y:float[N]){y=Identity(x);return y}
+        pattern B(x)->(y:float[M]){y=Identity(x);return y}
+        pattern P(x){p=A(x)|B(x);return Identity(p)}
+    ",
+    )
+    .unwrap_err();
+    assert!(error.message.contains("incompatible result annotations"));
+    assert!(
+        library(
+            r"
+        pattern A(x:float[])->(y:float[]){y=Identity(x);return y}
+        pattern B(x:float[...])->(y:float[...]){y=Identity(x);return y}
+        pattern Forms=A|B
+    "
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn inferred_results_do_not_add_constraints_from_other_alternatives() {
+    // Pinned InferredExpressionOutputsAllowUnconstrainedBranches expectations.
+    for branches in ["x | Identity(x)", "Identity(x) | x"] {
+        let source = format!(
+            r"
+            pattern Symbolic(x:float[M]) {{ y={branches};return y }}
+            pattern Nested(x) {{ y=Symbolic(x);return y }}
+            pattern Entry(x) {{ y=Nested(x);return Sigmoid(y) }}
+        "
+        );
+        let pattern = library(&source).unwrap().pattern("Entry").unwrap();
+        let mut graph = Graph::new();
+        let x = input(&mut graph, "x");
+        let anonymous = graph.create_symbol(None);
+        graph.value_mut(x).shape = vec![onnx_runtime_ir::Dim::Symbolic(anonymous)];
+        let (_, y) = op(&mut graph, "Identity", &[Some(x)], 1);
+        graph.value_mut(y[0]).shape = vec![onnx_runtime_ir::Dim::Symbolic(anonymous)];
+        let (root, output) = op(&mut graph, "Sigmoid", &[Some(y[0])], 1);
+        graph.set_outputs(output);
+        let mut count = 0;
+        MatchSession::new(&graph)
+            .unwrap()
+            .visit_at(&pattern, root, Default::default(), |matched| {
+                assert_eq!(matched.dimension("y.y.M")?, None);
+                count += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+}
+
+#[test]
+fn annotation_search_order_survives_reordered_and_aliased_calls() {
+    // Pinned AnnotationPrioritySurvivesReorderedAndAliasedCalls expectations.
+    let source = r"
+        pattern F(x:float[M,_]|float[_,M],z:float[_,M]|float[M,_]) {
+            y=CastLike(x,z);return y
+        }
+        pattern Reordered(v,w) {p=F(w,v);return p.y}
+        pattern Aliased(v) {p=F(v,v);return p.y}
+        pattern Alias=F
+        pattern Nested(v,w) {p=Alias(w,v);return p.y}
+    ";
+    let library = library(source).unwrap();
+    for entry in ["F", "Reordered", "Aliased", "Nested"] {
+        let mut graph = Graph::new();
+        let v = input(&mut graph, "v");
+        graph.value_mut(v).shape = vec![2.into(), 3.into()];
+        let w = if entry == "Aliased" {
+            v
+        } else {
+            let w = input(&mut graph, "w");
+            graph.value_mut(w).shape = vec![2.into(), 3.into()];
+            w
+        };
+        let (root, output) = op(&mut graph, "CastLike", &[Some(w), Some(v)], 1);
+        graph.set_outputs(output);
+        let matched = MatchSession::new(&graph)
+            .unwrap()
+            .match_at(&library.pattern(entry).unwrap(), root, Default::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            matched
+                .dimension(if entry == "F" { "M" } else { "p.M" })
+                .unwrap(),
+            Some(&DimensionValue::Static(2)),
+            "{entry}"
+        );
+    }
+}
+
+#[test]
+fn ort_boundary_keeps_anonymous_call_inputs_outside_the_footprint() {
+    let pattern = library(
+        r"
+        pattern Copy(x){return Identity(x)}
+        pattern P(x){a=Identity(x);b=Copy(_);return Add(a,b)}
+    ",
+    )
+    .unwrap()
+    .pattern("P")
+    .unwrap();
+    let mut graph = Graph::new();
+    let x = input(&mut graph, "x");
+    let (_, a) = op(&mut graph, "Identity", &[Some(x)], 1);
+    let (_, b) = op(&mut graph, "Identity", &[Some(a[0])], 1);
+    let (root, output) = op(&mut graph, "Add", &[Some(a[0]), Some(b[0])], 1);
+    graph.set_outputs(output);
+    let session = MatchSession::new(&graph).unwrap();
+    assert!(
+        session
+            .match_at(&pattern, root, Default::default())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        session
+            .match_at(&pattern, root, options(BoundaryPolicy::OrtBoundary))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -882,6 +1264,17 @@ fn unknown_library_calls_and_incompatible_named_alternatives_are_diagnostics() {
     )
     .unwrap();
     assert!(valid.pattern("Either").is_ok());
+    assert!(
+        library(
+            r"
+        interface I(x)->(left,right)
+        pattern P implements I:(left:float[])->{
+            a=Identity(x);return(left=left,right=a)
+        }
+    "
+        )
+        .is_ok()
+    );
     assert!(Pattern::parse_ort("(x:float[]|float[...])=>return Identity(x)").is_err());
     assert!(Pattern::parse_ort("(x:tensor<T>[T])=>return Identity(x)").is_err());
 }

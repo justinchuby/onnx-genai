@@ -106,7 +106,7 @@ impl Pattern {
     }
 }
 
-/// Owning named definitions with forward references, calls and alternatives.
+/// Owning interfaces and named definitions with hygienic calls and alternatives.
 #[derive(Clone, Debug)]
 pub struct PatternLibrary {
     patterns: BTreeMap<String, Pattern>,
@@ -151,6 +151,8 @@ impl PatternLibrary {
 
 #[derive(Clone, Debug)]
 struct Plan {
+    interface: Option<String>,
+    instance_only: std::collections::BTreeSet<String>,
     names: BTreeMap<String, usize>,
     values: Vec<ValuePlan>,
     nodes: Vec<NodePlan>,
@@ -164,13 +166,18 @@ struct Plan {
     calls: usize,
     signature: Vec<syntax::Parameter>,
     output_signature: Vec<syntax::Parameter>,
+    binding_annotations: BTreeMap<String, Option<Vec<syntax::RawConstraint>>>,
     producers: Vec<Option<usize>>,
     tensor_formals: std::collections::BTreeSet<usize>,
+    required_values: std::collections::BTreeSet<usize>,
+    discovered_inputs: std::collections::BTreeSet<usize>,
 }
 
 impl Plan {
     fn empty() -> Self {
         Self {
+            interface: None,
+            instance_only: std::collections::BTreeSet::new(),
             names: BTreeMap::new(),
             values: Vec::new(),
             nodes: Vec::new(),
@@ -184,8 +191,11 @@ impl Plan {
             attribute_conjunctions: Vec::new(),
             signature: Vec::new(),
             output_signature: Vec::new(),
+            binding_annotations: BTreeMap::new(),
             producers: Vec::new(),
             tensor_formals: std::collections::BTreeSet::new(),
+            required_values: std::collections::BTreeSet::new(),
+            discovered_inputs: std::collections::BTreeSet::new(),
         }
     }
     fn value(&mut self, value: ValuePlan) -> usize {

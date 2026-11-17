@@ -1,0 +1,6 @@
+# From PatternCompositionNamedAndAnonymousAlternativesAreOccurrenceLocal.
+# ORT c992a5210bf5bf6a8f8ace36d8c6304ba70f1821; see ORT_LICENSE.
+interface Unary(x:tensor<T>[N]) -> (y:tensor<T>[N])
+pattern first implements Unary { local=Identity(x); return (y=local) }
+pattern second implements Unary { local=Identity(x); return (y=local) }
+pattern Forms = first | second

@@ -31,6 +31,8 @@ they **do not** execute or build the upstream ORT implementation.
 | Inline `(x) => { a=Identity(x); return Neg(a) }` | Present named inputs, SSA assignments, explicit ordered returns, optional separators, `#` comments |
 | Domains | `Identity`, `ai.onnx.Identity`, `ai.onnx::Identity` normalize to the default domain; `vendor.Op` and `vendor::Op` retain their domain |
 | Libraries | `pattern Name(inputs) -> (outputs) { ... }`, forward references, positional calls/results, named aliases/groups and expression alternatives |
+| Interfaces | `interface Unary(x:float[N]) -> (y:float[N])`, `pattern Copy implements Unary { ... }`; non-callable tensor contracts, conjunctive annotations and present outputs |
+| Legacy library forms | `(port=local)` returns, scoped `p.port`, one-name multi-result instances, discovered inputs after `implements I: (...) ->`, and `(First \| Second)(x)` |
 | Capture identity | Repeated tensor names require identical **scoped SSA values**, including output position; different tensor names may alias; distinct pattern operators must map to distinct actual nodes |
 | Wildcard | Each positional `_` is an independent **present** value, never a missing slot |
 | Optional input | `None` requires absence, including a truncated tail; `v:tensor[...] \| None` admits present or absent; repeated optional bindings agree including absence |
@@ -57,12 +59,56 @@ The callback runs during compilation only, not during graph matching. Qualified
 operators do not need this lookup. Inline `Pattern` parsing, like the upstream
 standalone parser, treats unresolved call names as operator names.
 
-Named alternative definitions require identical ordered input/output labels and
-annotations; use expression alternatives for different signatures. Interfaces,
-`implements`, legacy port syntax, legacy instance-only multi-result calls,
-replacement syntax, nested operator operands, and model/function text are not
-supported. Factor nested operands into SSA assignments. Unsupported syntax
+Named alternative definitions require the same interface (or none) and identical
+ordered input/output labels and annotations; use expression alternatives for
+different signatures. `[]` and `[...]` normalize to the same any-rank constraint.
+Result contracts are reconciled without adding an annotation occurrence to
+another alternative's actual plan.
+
+Replacement syntax and model/function text are not supported. Nested **pattern
+calls through assigned results** are supported; operator/call expressions inside
+positional operands are rejected by both this frontend and the pinned ORT parser.
+Factor them into SSA assignments. Unsupported syntax
 returns a `PatternError` with a category, UTF-8 byte span, and remedy.
+
+For example, these library forms share the same execution core:
+
+```text
+interface Pair(x) -> (left, right)
+pattern split implements Pair {
+  a, b = Split(x)
+  return (right=b, left=a)
+}
+pattern join(x) {
+  p = split(x)
+  return Add(p.left, p.right)
+}
+```
+
+Interface return mappings follow the declared port order, not the mapping's
+textual order. As in pinned ORT, an ordinary explicit `->` output signature
+consumes returned values positionally, even with legacy `(label=value)` syntax;
+prefer ordinary positional returns there. A one-name call to a multi-result
+pattern creates an **instance only**:
+`p` cannot be used as a tensor, annotated or rebound; use its named ports or
+`a,b=split(x)`. Calls to single-result patterns expose both the positional tensor
+and scoped result aliases. Unnamed returned operator calls export `output`
+inside named library bodies; anonymous inline patterns do not invent that alias.
+
+An implementation may declare extra discovered captures:
+`pattern scale implements Unary: (alpha:float[N]) -> { y=Mul(x,alpha);return y }`.
+Call it with only `scale(x)`; `alpha` is discovered structurally and available
+under the call's scope. Extra attribute captures are also supported. Separate
+instances keep independent values, attributes, dimensions and type variables.
+Interface inputs cannot become attributes, and interface/declared outputs
+cannot become absent through an optional alias.
+
+The portable call-argument profile is named values/scoped ports and tensor `_`;
+the frontend also permits literal/`None` value actuals as a documented
+superset, not a promise that upstream `PatternCall` accepts them. This is native
+Rust match-language profile, not the C++ binding-view ABI: definition/member
+selection-chain introspection, computed attribute mutation and provider/layer
+metadata are not reproduced.
 
 Native variadics allow **one** undetermined input segment per operator:
 
@@ -200,6 +246,8 @@ inference.
 Default `BoundaryPolicy::Structural` permits intermediate external users.
 `OrtBoundary` also requires non-returned operator outputs not to be graph returns,
 locally consumed outside the match, or lexically captured by unmatched owners.
+Every unproduced pattern handle, including anonymous wildcard call actuals, must
+also bind outside the matched operator footprint under that policy.
 Body operators remain separate from parent footprints. For parity comparisons
 with upstream `MatchAt`, request this policy explicitly.
 

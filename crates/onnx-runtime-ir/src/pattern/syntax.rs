@@ -22,15 +22,21 @@ pub(super) struct RawConstraint {
 
 #[derive(Clone, Debug)]
 pub(super) struct Definition {
+    pub named: bool,
+    pub interface: Option<String>,
     pub parameters: Vec<Parameter>,
     pub statements: Vec<(Vec<Parameter>, Expr)>,
     pub returns: Vec<Expr>,
     pub output_signature: Option<Vec<Parameter>>,
+    pub return_labels: Option<Vec<String>>,
+    pub call_parameters: Option<usize>,
+    pub require_outputs: bool,
     pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug)]
 pub(super) enum DefinitionKind {
+    Interface(Vec<Parameter>, Vec<Parameter>, SourceSpan),
     Body(Definition),
     Alternatives(Vec<String>, SourceSpan),
 }
@@ -49,6 +55,7 @@ pub(super) enum ExprKind {
     Alternatives(Vec<Expr>),
     Spread(String),
     GraphList(Vec<String>),
+    AnonymousCall(Vec<String>, Vec<Expr>),
 }
 
 #[derive(Clone, Debug)]
@@ -72,13 +79,30 @@ pub(super) fn parse_library(
     let mut parser = Parser::new(source, native)?;
     let mut definitions = BTreeMap::new();
     while parser.peek().is_some() {
-        parser.expect("pattern")?;
+        if parser.take(";") {
+            continue;
+        }
+        let interface = parser.take("interface");
+        if !interface {
+            parser.expect("pattern")?;
+        }
         let name = parser.identifier()?;
         let span = parser.span();
-        let definition = if parser.take("=") {
+        let definition = if interface {
+            let inputs = parser.parameters()?;
+            parser.expect("->")?;
+            DefinitionKind::Interface(inputs, parser.parameters()?, span)
+        } else if parser.take("=") {
             let mut members = vec![parser.identifier()?];
             while parser.take("|") {
-                members.push(parser.identifier()?);
+                let member = parser.identifier()?;
+                if members.contains(&member) {
+                    return Err(parser.error(
+                        PatternErrorKind::InvalidPattern,
+                        "duplicate alternative member; list each named member once",
+                    ));
+                }
+                members.push(member);
             }
             parser.take(";");
             DefinitionKind::Alternatives(members, span)
@@ -286,7 +310,7 @@ impl Parser {
             Ok(())
         } else {
             Err(self.error(PatternErrorKind::Unsupported,
-                "unexpected trailing syntax; ONNX models, interfaces and replacements require a different frontend"))
+                "unexpected trailing syntax; use PatternLibrary for named patterns/interfaces; ONNX models and replacements require a different frontend"))
         }
     }
     fn parameters(&mut self) -> Result<Vec<Parameter>> {
@@ -432,6 +456,7 @@ impl Parser {
         } else {
             Some(Vec::new())
         };
+        let prefix = prefix && dimensions.is_some();
         Ok(RawConstraint {
             name,
             dimensions,
@@ -456,8 +481,23 @@ impl Parser {
     }
     fn body(&mut self, named: bool) -> Result<Definition> {
         let span = self.span();
-        let parameters = self.parameters()?;
-        let output_signature = if named && self.take("->") {
+        let interface = if named && self.take("implements") {
+            Some(self.identifier()?)
+        } else {
+            None
+        };
+        let parameters = if interface.is_some() {
+            if self.take(":") {
+                let extra = self.parameters()?;
+                self.expect("->")?;
+                extra
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.parameters()?
+        };
+        let output_signature = if named && interface.is_none() && self.take("->") {
             Some(self.parameters()?)
         } else {
             None
@@ -471,6 +511,9 @@ impl Parser {
         }
         let mut statements = Vec::new();
         while !self.take("return") {
+            if self.take(";") {
+                continue;
+            }
             if self.peek().is_none() || self.peek() == Some("}") {
                 return Err(self.error(
                     PatternErrorKind::Syntax,
@@ -492,19 +535,58 @@ impl Parser {
             }
             self.take(";");
         }
-        let mut returns = vec![self.expression(0)?];
-        while self.take(",") {
-            returns.push(self.expression(0)?);
-        }
+        let explicit_ports = named
+            && self.peek() == Some("(")
+            && self
+                .tokens
+                .get(self.position + 2)
+                .is_some_and(|t| t.text == "=");
+        let (returns, return_labels) = if explicit_ports {
+            self.expect("(")?;
+            let mut labels = Vec::new();
+            let mut returns = Vec::new();
+            loop {
+                let label = self.identifier()?;
+                if labels.contains(&label) {
+                    return Err(self.error(
+                        PatternErrorKind::InvalidPattern,
+                        "duplicate return port; map each output label exactly once",
+                    ));
+                }
+                labels.push(label);
+                self.expect("=")?;
+                let span = self.span();
+                returns.push(Expr {
+                    kind: ExprKind::Name(self.qualified()?),
+                    span,
+                });
+                if self.take(")") {
+                    break;
+                }
+                self.expect(",")?;
+            }
+            (returns, Some(labels))
+        } else {
+            let mut returns = vec![self.expression(0)?];
+            while self.take(",") {
+                returns.push(self.expression(0)?);
+            }
+            (returns, None)
+        };
         self.take(";");
         if braces {
             self.expect("}")?;
         }
         Ok(Definition {
+            named,
+            require_outputs: output_signature.is_some() || interface.is_some(),
+            interface,
             parameters,
             statements,
             returns,
             output_signature,
+            return_labels,
+            call_parameters: None,
             span,
         })
     }
@@ -575,6 +657,44 @@ impl Parser {
         if self.take("(") {
             let expression = self.expression(depth)?;
             self.expect(")")?;
+            if self.peek() == Some("(") {
+                let branches = match expression.kind {
+                    ExprKind::Alternatives(branches) => branches,
+                    kind => vec![Expr {
+                        kind,
+                        span: expression.span,
+                    }],
+                };
+                let mut members = Vec::new();
+                for branch in branches {
+                    let ExprKind::Name(name) = branch.kind else {
+                        return Err(self.error(PatternErrorKind::InvalidPattern,
+                            "anonymous calls require named pattern members, not operator expressions"));
+                    };
+                    if members.contains(&name) {
+                        return Err(self.error(
+                            PatternErrorKind::InvalidPattern,
+                            "duplicate anonymous alternative member; list each member once",
+                        ));
+                    }
+                    members.push(name);
+                }
+                self.expect("(")?;
+                let mut arguments = Vec::new();
+                if !self.take(")") {
+                    loop {
+                        arguments.push(self.expression(depth)?);
+                        if self.take(")") {
+                            break;
+                        }
+                        self.expect(",")?;
+                    }
+                }
+                return Ok(Expr {
+                    kind: ExprKind::AnonymousCall(members, arguments),
+                    span,
+                });
+            }
             return Ok(expression);
         }
         if self.peek() == Some("[")
