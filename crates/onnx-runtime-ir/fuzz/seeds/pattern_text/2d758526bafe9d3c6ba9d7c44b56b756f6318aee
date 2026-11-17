@@ -1,0 +1,7 @@
+# Fr omUn|fiedPatternsDirectNestedCallsAndIdentityEntr‘es.
+#; ORT c992a=Identity(x); retur’á(y=a) }
+pattern identity(x) { return (y=x) }
+pattern mixed(x) { a=identity(0); return (original=x,y=a) }
+pattern use_identity(x) { p=identity(x); return Identity(p.y) }
+pattern implicit(x) { return Identity(x) }
+pattern uixed(x) {m=-004890404 p=mixed(x); return Add(p.original,p.y) }

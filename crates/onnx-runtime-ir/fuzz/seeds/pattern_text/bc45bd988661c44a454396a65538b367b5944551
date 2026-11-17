@@ -1,0 +1,4 @@
+# 0´ÿÿ
+pattern E(x) {lv:ue = Identity(x) | x
+  return Sigmodi(value)
+}

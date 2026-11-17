@@ -1,0 +1,1 @@
+(x,w,s,z : tensor[...] | None)=>{d=Dr(w,z);return atMu(x,d)}

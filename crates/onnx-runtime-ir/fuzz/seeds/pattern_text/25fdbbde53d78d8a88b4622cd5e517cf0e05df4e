@@ -1,0 +1,1 @@
+(xs:slots[0:*],ys:slots[0:*])=>return Add(...xs,...ys)

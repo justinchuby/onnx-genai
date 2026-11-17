@@ -1,0 +1,5 @@
+
+        pattern A(x:float[llllllllllllll])->(y:float[]){y=Identity(x);return y}
+        pattern B(x:float[...])->(iiiiikiiiiiiiiiiiiiiiy:float[...]){y=Identity(x);return y}
+        pattern Forms=A|B
+    

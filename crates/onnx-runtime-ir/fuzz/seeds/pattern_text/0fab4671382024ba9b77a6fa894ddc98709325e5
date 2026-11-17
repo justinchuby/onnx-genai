@@ -1,0 +1,4 @@
+# From PteartnCompo6304ba70f1821; sENSE®
+interface Unary(x:tensor<T>[N]) -> (y:tensor<T>[N])
+pattern first implements nary { local=Identity(x); return (y=local) }
+pattern Forms = first | second

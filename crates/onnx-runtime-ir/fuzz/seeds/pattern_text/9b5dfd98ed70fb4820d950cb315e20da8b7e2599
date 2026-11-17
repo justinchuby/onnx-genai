@@ -1,0 +1,6 @@
+
+ interface I(eeeeeeeeeeeeeeeeeeeeeeeeeQQQ,QQQQQQQQQQeeeeeeQQQ,QQQQQQQQQQQQ,QQQQQQQbbbbQQ,Q,QQQQQJQQQQ,QQQQQQ,QQQQ,QQQvQQPQQQQQQQQQQPQQQQ,QQQUQQQ,QQQQQQQ,QQQQQQQQQQQQQQPQQQQ,QQQQQQQ,QQQQ,QAQQQQQQ,QQQQ,QQQQQQQ,QQQQQ,QJQQQQ,Qeeeeeeeeeeeeeeeeeeeeeeeeeeeeeex)->(left,right)
+        pattern P implements I:(left:float[])->{
+          a=Identity(x);return(lfelet=ft,right=a)
+        }
+    

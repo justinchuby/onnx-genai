@@ -1,0 +1,5 @@
+.
+pattern E(x) {
+ue = Identity(x) | x| x
+  return Sigmoid(value)
+}

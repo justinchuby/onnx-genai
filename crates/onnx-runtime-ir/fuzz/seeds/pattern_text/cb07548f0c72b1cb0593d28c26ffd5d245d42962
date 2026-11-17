@@ -1,0 +1,3 @@
+
+        pattern A(x)->(y:float[N]){y=Identity(x);return y}
+  # ern_Rewripattern )zrea

@@ -1,0 +1,2 @@
+
+        pattern A()->(y:float[N]){y=000000000000|B(x);return Idnt}  

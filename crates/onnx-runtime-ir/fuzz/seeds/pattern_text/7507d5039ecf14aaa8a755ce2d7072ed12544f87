@@ -1,0 +1,2 @@
+#ri
+pattern mix2ed(x) { a=ty(x);return Clip(a,v,v);}

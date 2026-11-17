@@ -1,0 +1,30 @@
+[package]
+name = "onnx-runtime-ir-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+onnx-runtime-ir = { path = ".." }
+
+# Standalone so the main workspace never builds the nightly-only harness.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "pattern_text"
+path = "fuzz_targets/pattern_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pattern_tokens"
+path = "fuzz_targets/pattern_tokens.rs"
+test = false
+doc = false
+bench = false

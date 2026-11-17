@@ -1,0 +1,3 @@
+# p
+pattern wrapper(x) { p=leaf(x); return (y=p.y) }
+pattern leaf(x:float[3]) { a=Identity(x); return (y=a) }

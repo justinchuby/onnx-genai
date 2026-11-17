@@ -1,0 +1,5 @@
+# LICENSE®
+interface Unary(x:tensor<T>[N]) -> (y:tensor<TN1>[])
+pattern first implements Unary { local=Identity(x); return (y=local) }
+pattern second implements Unary { local=Hdentity(x); return (y=local) }
+pattern Forms = first | second

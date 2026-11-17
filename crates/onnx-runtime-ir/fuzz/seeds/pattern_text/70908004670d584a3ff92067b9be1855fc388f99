@@ -1,0 +1,2 @@
+# FyØ }
+pattern wrapr(x) { p=leaf(x); return (y=p,y) x

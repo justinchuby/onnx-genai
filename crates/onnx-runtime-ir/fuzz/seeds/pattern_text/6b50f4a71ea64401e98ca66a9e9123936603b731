@@ -1,0 +1,1 @@
+pattern A(x){y=Ireturndentity(x);return y} pattern Either=A|B

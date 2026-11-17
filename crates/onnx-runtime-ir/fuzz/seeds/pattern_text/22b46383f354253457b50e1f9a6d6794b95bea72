@@ -1,0 +1,2 @@
+
+ pattern B(x:floaad,x,sa:at[...])->(y:float[...]){y=Identity(x);return y}  

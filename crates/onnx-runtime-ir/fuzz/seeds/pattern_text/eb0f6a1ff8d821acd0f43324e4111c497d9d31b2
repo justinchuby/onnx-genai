@@ -1,0 +1,3 @@
+
+        pattern A(x)->(y:float[llllll,llllll]){y=Identity(x);return y}        pattern P(x){p=A(x)|B(x);return Identity(p)}
+    

@@ -1,0 +1,1 @@
+pattern P(x){return Add(x,Id(x))}

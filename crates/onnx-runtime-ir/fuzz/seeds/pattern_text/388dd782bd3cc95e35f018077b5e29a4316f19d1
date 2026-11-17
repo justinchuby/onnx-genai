@@ -1,0 +1,1 @@
+(x,v:tnsor[...]|None)=>return Clip(x=v)

@@ -434,6 +434,13 @@ Tensor comparison accounting includes names, dimensions, string payloads and
 per-string metadata, not just numeric data buffers.
 There is no recursive user pattern or unbounded variadic splitting.
 
+The parser/compiler is fuzzed with cargo-fuzz (`crates/onnx-runtime-ir/fuzz`):
+every input must yield `Ok` or a `PatternError` whose span is a valid,
+character-aligned byte range of the source — never a panic, stack overflow, hang
+or RSS blowup. `.github/workflows/fuzz.yml` runs `fuzz/ci.sh` (replay committed
+seeds, then a bounded coverage-guided smoke per target); run the same script
+locally with nightly Rust and cargo-fuzz. Fuzzing is evidence, not proof.
+
 Plans precompute producer slots. Sessions reuse the existing dense producer/use
 cache and add root/name/body/capture indexes. Forced producer paths are bounded
 by pattern size; multiple connected sinks can require combinatorial assignment

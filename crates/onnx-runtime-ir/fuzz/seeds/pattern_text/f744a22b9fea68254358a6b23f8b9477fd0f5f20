@@ -1,0 +1,1 @@
+(x,p:ints|None)=>{a=Trose(x,perm=p);return Transpose(a,pe=Tran05018568p)}

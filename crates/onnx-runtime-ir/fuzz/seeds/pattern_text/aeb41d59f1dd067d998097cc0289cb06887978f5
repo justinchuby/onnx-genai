@@ -1,0 +1,1 @@
+A(x:float[M0]|float[_,M],y:float[M])=>return Add(x,y)

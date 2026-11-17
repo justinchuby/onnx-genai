@@ -1,0 +1,1 @@
+(x)=>return Clip(x,None,None)

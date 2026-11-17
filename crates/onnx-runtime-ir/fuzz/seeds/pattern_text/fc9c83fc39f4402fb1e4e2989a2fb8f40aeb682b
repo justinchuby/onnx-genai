@@ -1,0 +1,2 @@
+ #r}
+pattern implicit(x) { return 04520,716000}

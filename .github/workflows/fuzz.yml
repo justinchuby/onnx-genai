@@ -1,0 +1,80 @@
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/fuzz.yml
+      - crates/onnx-runtime-ir/Cargo.toml
+      - crates/onnx-runtime-ir/src/**
+      - crates/onnx-runtime-ir/fuzz/**
+  push:
+    branches:
+      - main
+      - ci/**
+    paths:
+      - .github/workflows/fuzz.yml
+      - crates/onnx-runtime-ir/Cargo.toml
+      - crates/onnx-runtime-ir/src/**
+      - crates/onnx-runtime-ir/fuzz/**
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Coverage-guided seconds per target
+        required: false
+        default: "60"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pattern-parser:
+    name: IR pattern parser fuzz
+    # Two targets x (seed replay + 60s smoke) plus a cold nightly/ASan build
+    # is ~10 minutes; 30 bounds a hang without firing on a slow healthy run.
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_FUZZ_VERSION: 0.13.2
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/onnx-runtime-ir/fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ env.CARGO_FUZZ_VERSION }}-${{ hashFiles('crates/onnx-runtime-ir/fuzz/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-${{ env.CARGO_FUZZ_VERSION }}-
+
+      - name: Install cargo-fuzz
+        shell: bash
+        run: |
+          if cargo fuzz --version 2>/dev/null | grep -q "$CARGO_FUZZ_VERSION"; then
+            echo "cargo-fuzz $CARGO_FUZZ_VERSION already installed"
+          else
+            cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked --force
+          fi
+
+      - name: Replay seeds and run bounded coverage-guided fuzzing
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '60' }}
+        run: crates/onnx-runtime-ir/fuzz/ci.sh "$SECONDS_PER_TARGET"
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pattern-fuzz-artifacts
+          path: crates/onnx-runtime-ir/fuzz/artifacts/
+          if-no-files-found: ignore

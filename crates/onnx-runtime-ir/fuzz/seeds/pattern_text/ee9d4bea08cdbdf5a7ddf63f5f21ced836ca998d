@@ -1,0 +1,6 @@
+
+        interface I(x)->(left,right)
+        pattern P implements I:(left:flot[])->{
+          a=Identity(x);return(left=left,tight=a)
+        }
+    

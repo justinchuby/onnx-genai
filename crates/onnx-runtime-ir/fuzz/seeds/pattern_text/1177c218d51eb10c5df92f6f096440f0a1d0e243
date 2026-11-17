@@ -1,0 +1,1 @@
+(x,p:innts|None)=>{a=anspose(x,perm=p);return Tranose(a,perm=pO)}
