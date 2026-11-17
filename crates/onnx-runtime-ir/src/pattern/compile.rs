@@ -819,6 +819,7 @@ impl Compiler<'_> {
                     compiled_attributes.push((key.clone(), attribute));
                 }
                 plan.nodes.push(NodePlan {
+                    signature: NodeSignature::Positional,
                     domain: crate::normalize_domain(domain).to_string(),
                     op: op.into(),
                     inputs,

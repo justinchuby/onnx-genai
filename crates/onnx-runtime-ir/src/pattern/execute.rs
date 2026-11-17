@@ -508,7 +508,7 @@ impl<'g> MatchSession<'g> {
         let mut roots = BTreeSet::new();
         require_operator_entry(pattern)?;
         for plan in pattern.plans.iter() {
-            let node = plan.nodes.last().expect("verified anchor");
+            let node = &plan.nodes[plan.anchor.unwrap_or(plan.nodes.len() - 1)];
             if node.op == "*" {
                 roots.extend(self.scopes[0].graph.nodes.keys());
             } else if let Some(bucket) = self.scopes[0]
@@ -762,7 +762,7 @@ impl<'g> MatchSession<'g> {
             } else if !self.bind_node(
                 plan,
                 scope,
-                plan.nodes.len() - 1,
+                plan.anchor.unwrap_or(plan.nodes.len() - 1),
                 root.expect("operator root"),
                 &mut state,
                 boundary,
@@ -806,6 +806,40 @@ impl<'g> MatchSession<'g> {
         let plan = &pattern.plans[selected];
         let prepared = &self.scopes[scope];
         let graph = prepared.graph;
+        // A connected step selects one present output as its downstream edge.
+        // Defer this choice until the node is bound, then use ordinary binding
+        // and enumeration so failures roll back without a second search engine.
+        for (ordinal, expected) in plan.nodes.iter().enumerate() {
+            if expected.signature != (NodeSignature::Connected { terminal: false }) {
+                continue;
+            }
+            let Some(actual) = state.nodes[ordinal] else {
+                continue;
+            };
+            let slot = expected.outputs[0];
+            if state.values[slot].is_some() {
+                continue;
+            }
+            for output in graph.node(actual).output_values() {
+                let mut branch = state.clone();
+                if bind_value(plan, &mut branch, slot, Some(output))
+                    && !self.enumerate(
+                        pattern,
+                        selected,
+                        scope,
+                        branch,
+                        whole,
+                        boundary,
+                        budget,
+                        depth + 1,
+                        visitor,
+                    )?
+                {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
         if state.nodes.iter().all(Option::is_some) {
             tick(&mut budget.candidates, "candidate budget")?;
             let Some((dimensions, elements)) = annotations(plan, prepared, &state, budget)? else {
@@ -893,6 +927,13 @@ impl<'g> MatchSession<'g> {
                 let index = view.value_index(actual).expect("validated live value");
                 for usage in view.consumers(index) {
                     let expected_input = match plan.nodes[ordinal].rest {
+                        _ if matches!(
+                            plan.nodes[ordinal].signature,
+                            NodeSignature::Connected { .. }
+                        ) =>
+                        {
+                            None
+                        }
                         None => Some(input_slot),
                         Some(rest) if input_slot < rest => Some(input_slot),
                         Some(rest) if input_slot > rest => state.sequences
@@ -964,10 +1005,32 @@ impl<'g> MatchSession<'g> {
             || (expected.op != "*"
                 && (node.op_type != expected.op
                     || crate::normalize_domain(&node.domain) != expected.domain))
-            || node.outputs.len() != expected.outputs.len()
-            || (expected.rest.is_none() && node.inputs.len() > expected.inputs.len())
+            || (expected.signature == NodeSignature::Positional
+                && (node.outputs.len() != expected.outputs.len()
+                    || (expected.rest.is_none() && node.inputs.len() > expected.inputs.len())))
+            || (expected.signature == (NodeSignature::Connected { terminal: true })
+                && node.outputs.len() != 1)
         {
             return Ok(false);
+        }
+        if let NodeSignature::Connected { terminal } = expected.signature {
+            for &slot in &expected.inputs {
+                let Some(Some(value)) = state.values[slot] else {
+                    return Err(PatternError::new(
+                        PatternErrorKind::InvalidPattern,
+                        SourceSpan::default(),
+                        "connected step has no bound predecessor; anchor the chain at its first operator",
+                    ));
+                };
+                if !node.inputs.contains(&Some(value)) {
+                    return Ok(false);
+                }
+            }
+            if terminal && !bind_value(plan, state, expected.outputs[0], node.outputs[0]) {
+                return Ok(false);
+            }
+            state.nodes[ordinal] = Some(actual);
+            return Ok(true);
         }
         let graph_constraints: usize = expected
             .attributes

@@ -258,7 +258,7 @@ owning result borrowing the graph; visitor `true` continues, `false` stops.
 and deliberately permits overlapping results. It searches only the root scope;
 body matching is explicit through graph-attribute references.
 
-The last expanded operator is the anchor regardless of return order. Bound
+For textual patterns, the last expanded operator is the anchor regardless of return order. Bound
 outputs force precise producers first. For another connected sink, the matcher
 uses the highest unmatched pattern operator's lowest eligible input, enumerating
 the exact producer-output/consumer-input edge in ascending raw node ID order.
@@ -270,6 +270,27 @@ and `instance` diagnose unknown/wrong-kind names. Absent optional captures are
 successful `None`, distinct internally from an unbound optional branch variable.
 Returned matches own capture arrays and share immutable plans; no references
 into reusable scratch can escape.
+
+### Compiled connected chains and bounded paths
+
+`Pattern::operator_chain(&[("", "MatMul"), ("", "Add")])` is a Rust-only
+structural constructor for existing generic spine recognizers. It produces a
+plan for the same executor, anchored at the **first** step. Each later step
+consumes any present output of its predecessor at any input position; other
+ports and attributes (including graph bodies) are unconstrained. Intermediate
+nodes may have optional/multiple outputs; the terminal requires exactly one
+present output. `step_0`, `step_1`, etc. capture the selected connecting/output
+values. Multiple connecting values may yield distinct matches with the same
+nodes. Callers selecting a single rewrite should order/deduplicate by node
+identity. Numeric/schema eligibility remains caller-owned.
+
+`MatchSession::match_upstream(pattern, value, input_slot, max_nodes, options)`
+tries a compiled terminal pattern at successive producers, starting with
+`value`'s producer and following one explicitly selected input position. It
+stays in the current graph scope, honors multi-output value identity and shares
+the match budget across traversal and attempts. Neither API adds an ORT textual
+language form or a separate matching backend. Both can backtrack; existing
+step/candidate/depth limits still apply rather than promising linear search.
 
 ## Scopes, facts and safety
 

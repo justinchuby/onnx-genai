@@ -604,6 +604,106 @@ fn builder_checks_empty_returns_unused_inputs_and_shared_compiler_limits() {
 }
 
 #[test]
+fn compiled_chain_uses_arbitrary_ports_and_rolls_back_dead_outputs() {
+    let pattern =
+        Pattern::operator_chain(&[("", "Split"), ("", "Concat"), ("", "Identity")]).unwrap();
+    let mut graph = Graph::new();
+    let x = input(&mut graph, "x");
+    let (split, parts) = op(&mut graph, "Split", &[Some(x)], 2);
+    let mut split_node = graph.node(split).clone();
+    split_node.outputs.insert(1, None);
+    graph.replace_node(split, split_node);
+    let (concat, joined) = op(&mut graph, "Concat", &[None, Some(x), Some(parts[1])], 1);
+    let (last, out) = op(&mut graph, "Identity", &[Some(joined[0])], 1);
+    graph.add_output(out[0]);
+
+    let session = MatchSession::new(&graph).unwrap();
+    let matched = session
+        .match_at(&pattern, split, MatchOptions::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(matched.nodes(), [split, concat, last]);
+    assert_eq!(matched.value("step_0").unwrap().unwrap().id(), parts[1]);
+    assert!(
+        session
+            .match_at(&pattern, split, options(BoundaryPolicy::OrtBoundary))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        session
+            .match_at(
+                &pattern,
+                split,
+                MatchOptions {
+                    budget: MatchBudget {
+                        steps: 0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .kind,
+        PatternErrorKind::BudgetExceeded
+    );
+
+    let (_, escaped) = op(&mut graph, "Identity", &[Some(parts[0])], 1);
+    graph.add_output(escaped[0]);
+    let session = MatchSession::new(&graph).unwrap();
+    assert!(
+        session
+            .match_at(&pattern, split, MatchOptions::default())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        session
+            .match_at(&pattern, split, options(BoundaryPolicy::OrtBoundary))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn compiled_chain_checks_domains_and_terminal_identity() {
+    assert!(Pattern::operator_chain(&[]).is_err());
+    let pattern = Pattern::operator_chain(&[("", "Neg"), ("com.test", "Copy")]).unwrap();
+    let mut graph = Graph::new();
+    let x = input(&mut graph, "x");
+    let (neg, value) = op(&mut graph, "Neg", &[Some(x)], 1);
+    let (copy, out) = op(&mut graph, "Copy", &[Some(value[0])], 1);
+    graph.add_output(out[0]);
+    assert!(
+        MatchSession::new(&graph)
+            .unwrap()
+            .match_at(&pattern, neg, MatchOptions::default())
+            .unwrap()
+            .is_none()
+    );
+    let mut node = graph.node(copy).clone();
+    node.domain = "com.test".into();
+    graph.replace_node(copy, node);
+    assert!(
+        MatchSession::new(&graph)
+            .unwrap()
+            .match_at(&pattern, neg, MatchOptions::default())
+            .unwrap()
+            .is_some()
+    );
+    let mut node = graph.node(copy).clone();
+    node.outputs.push(None);
+    graph.replace_node(copy, node);
+    assert!(
+        MatchSession::new(&graph)
+            .unwrap()
+            .match_at(&pattern, neg, MatchOptions::default())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn bounded_upstream_search_preserves_slots_depth_and_errors() {
     let pattern = Pattern::parse_ort("(x,w)=>return MatMul(x,w)").unwrap();
     let mut graph = Graph::new();
