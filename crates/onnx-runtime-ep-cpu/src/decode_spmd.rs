@@ -5085,10 +5085,12 @@ fn reserve_split_headroom(shards: &mut [NodeShard]) {
 fn current_thread_os_id() -> Option<i64> {
     #[cfg(all(target_os = "linux", not(miri)))]
     {
-        // SAFETY: `gettid` takes no arguments, cannot fail, and returns the
-        // calling thread's kernel id.
-        let tid = unsafe { libc::gettid() };
-        (tid > 0).then_some(i64::from(tid))
+        // Use the syscall rather than glibc's gettid wrapper, which was added
+        // in glibc 2.30 and is unavailable in manylinux_2_28 wheels.
+        // SAFETY: SYS_gettid takes no arguments and returns the calling
+        // thread's kernel id.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        (tid > 0).then_some(tid as i64)
     }
     #[cfg(not(all(target_os = "linux", not(miri))))]
     {

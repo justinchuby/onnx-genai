@@ -97,6 +97,8 @@ WORKFLOW_JOB_INVENTORY: dict[str, tuple[str, ...]] = {
     ),
     "publish.yml": (
         "Build ${{ matrix.package }} (${{ matrix.platform.name }})",
+        "Build nxrt (${{ matrix.name }})",
+        "Publish nxrt CPU wheels to PyPI",
         "Publish nxrt sdist to PyPI",
         "Publish onnx-genai sdists to PyPI",
         "Publish onnx-genai wheels to PyPI",
@@ -134,7 +136,6 @@ WORKFLOW_JOB_INVENTORY: dict[str, tuple[str, ...]] = {
     "wheels.yml": (
         "CPU wheel (${{ matrix.name }})",
         "CUDA wheel scaffold",
-        "Publish nxrt CPU wheels",
     ),
     "wiki-lint.yml": (
         "Notes stand on their own",
