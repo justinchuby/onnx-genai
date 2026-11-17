@@ -604,6 +604,48 @@ fn builder_checks_empty_returns_unused_inputs_and_shared_compiler_limits() {
 }
 
 #[test]
+fn native_optional_values_do_not_require_tensor_metadata() {
+    let source = "(x:value|None)=>return Maybe(x)";
+    assert_eq!(
+        Pattern::parse_ort(source).unwrap_err().kind,
+        PatternErrorKind::Unsupported
+    );
+    let pattern = Pattern::parse_native(source).unwrap();
+    let mut graph = Graph::new();
+    let x = graph.create_value(DataType::Undefined, vec![]);
+    graph.add_input(x);
+    let (root, output) = op(&mut graph, "Maybe", &[Some(x)], 1);
+    graph.add_output(output[0]);
+    assert!(!graph.value_type_is_known(x));
+    let matched = MatchSession::new(&graph)
+        .unwrap()
+        .match_at(&pattern, root, MatchOptions::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(matched.value("x").unwrap().unwrap().id(), x);
+    for inputs in [vec![None], vec![]] {
+        let mut node = graph.node(root).clone();
+        node.inputs = inputs;
+        graph.replace_node(root, node);
+        let matched = MatchSession::new(&graph)
+            .unwrap()
+            .match_at(&pattern, root, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matched.value("x").unwrap().is_none());
+    }
+    for invalid in [
+        "(x:value[2])=>return Maybe(x)",
+        "(x:value<float>)=>return Maybe(x)",
+    ] {
+        assert_eq!(
+            Pattern::parse_native(invalid).unwrap_err().kind,
+            PatternErrorKind::InvalidPattern
+        );
+    }
+}
+
+#[test]
 fn compiled_chain_uses_arbitrary_ports_and_rolls_back_dead_outputs() {
     let pattern =
         Pattern::operator_chain(&[("", "Split"), ("", "Concat"), ("", "Identity")]).unwrap();
@@ -613,16 +655,35 @@ fn compiled_chain_uses_arbitrary_ports_and_rolls_back_dead_outputs() {
     let mut split_node = graph.node(split).clone();
     split_node.outputs.insert(1, None);
     graph.replace_node(split, split_node);
-    let (concat, joined) = op(&mut graph, "Concat", &[None, Some(x), Some(parts[1])], 1);
+    let (concat, joined) = op(
+        &mut graph,
+        "Concat",
+        &[None, Some(x), Some(parts[1]), Some(parts[1])],
+        1,
+    );
     let (last, out) = op(&mut graph, "Identity", &[Some(joined[0])], 1);
     graph.add_output(out[0]);
 
     let session = MatchSession::new(&graph).unwrap();
+    let anchor = pattern.value_capture("step_0").unwrap();
+    assert!(anchor.is_producer_candidate(graph.node(split)));
+    assert!(!anchor.is_producer_candidate(graph.node(concat)));
+    let textual = Pattern::parse_ort("(x)=>{a=Split(x);return Concat(a)}").unwrap();
+    let non_root = textual.value_capture("a").unwrap();
+    assert!(non_root.is_producer_candidate(graph.node(split)));
+    assert!(!non_root.is_producer_candidate(graph.node(concat)));
     let matched = session
         .match_at(&pattern, split, MatchOptions::default())
         .unwrap()
         .unwrap();
     assert_eq!(matched.nodes(), [split, concat, last]);
+    assert_eq!(
+        session
+            .find_matches(&pattern, MatchOptions::default())
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(matched.value("step_0").unwrap().unwrap().id(), parts[1]);
     assert!(
         session

@@ -120,7 +120,7 @@ static SKIP_RMSNORM: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "CUDA residual RMS normalization",
         "(a,b,gamma,rest:slots[0:*])=>{
-            sum=Add(a,b);out=SimplifiedLayerNormalization(sum,gamma,...rest);return out
+            sum=Add(a,b);out=SimplifiedLayerNormalization(sum,gamma,...rest);return out,sum
         }",
         "out",
     )

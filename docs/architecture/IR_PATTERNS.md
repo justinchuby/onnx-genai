@@ -140,7 +140,7 @@ they **do not** execute or build the upstream ORT implementation.
 | Type alternatives | First globally consistent combination in declaration/call order; failed combinations roll back; a rejecting predicate advances graph assignments/plans, not type combinations |
 | `GRAPH` | Named pattern references, ordered formal prefix and exact returns, independent instances, complete body operator coverage (except validated literal Constant producers) |
 | Whole graph | `graph_pattern` plus `match_graph`, including unused positional formals, independent output components, duplicate returns and input passthrough |
-| Native extensions | Explicit `parse_native`: `*` operator, `...xs` ordered input sequences, `values[min:max]` / `slots[min:*]`, `[Body,Body]` GRAPH-list constraints |
+| Native extensions | Explicit `parse_native`: `*` operator, `value` / `value \| None` without tensor metadata requirements, `...xs` ordered input sequences, `values[min:max]` / `slots[min:*]`, `[Body,Body]` GRAPH-list constraints |
 
 Libraries require an operator-registry callback to disambiguate unresolved bare
 calls from misspelled pattern names. This avoids an IR-to-schema dependency:
@@ -377,6 +377,44 @@ It assumes the supplied IR contains all visibility information; an ORT adapter
 must represent otherwise external outputs/uses. Provider/layer annotations and
 replacement-cycle policy are not represented here. EPs retain alias/lifetime,
 side-effect, opset, numerical, shape/layout and kernel-support guards.
+
+### Built-in provider consumers
+
+CPU and CUDA recognition uses shared `RecognitionRule` adapters in
+`onnx-runtime-optimizer`; reusable textual rules are compiled once, and dynamic
+operator chains compile when their `FusionPattern` is constructed. Single-op
+dispatch and ordinary constant folding remain separate.
+
+| Consumer | Migrated recognition |
+|---|---|
+| CPU | SiLU, quantized-matmul bias, gate/up and sibling projections, Conv/BatchNorm/optional Relu |
+| CUDA | SiLU, reciprocal square root, L2 normalization, bias, SwiGLU/gate-up, residual/RMSNorm projection neighborhoods, activation/decay chains, normalization Cast, bounded QKV paths and existing constant/threshold If recognizers |
+| Shared fusion | Connected chains, shared/split-Sub LayerNorm, exact GELU, masked/unmasked SDPA with optional K transpose |
+
+These are recognizers, not numerical-equivalence proofs. Existing constant,
+axis, dtype/layout, broadcast, alias, liveness and kernel eligibility guards
+remain separate. Rules request `OrtBoundary`; intentionally retained additional
+outputs, such as a residual sum, are explicit returns.
+
+Native `value` means any present SSA value, including unknown or non-tensor type
+metadata. `value | None` additionally permits a missing slot; it does not mean an
+ONNX `Optional<T>` container or manufacture tensor facts. This distinction keeps
+optional attention masks recognizable before shape/type inference. Portable
+`tensor[...] | None` retains its stronger known-dense-tensor constraint.
+
+`FusionPattern::new` and `find_match` are fallible. Invalid graphs, unsupported
+metadata and exhausted matcher budgets propagate as errors, not negative
+eligibility. Generic chain steps expose their selected output identity;
+repeated consumer input uses do not duplicate an identical chain match.
+
+The shared pass preserves restart-equivalent candidate order. It retains owned
+eligible plans only for proven-disjoint regions, invalidates overlapping plans
+using their exact removed node footprints **before arena IDs can be reused**,
+and refreshes recognition at affected compatible roots. No borrowed match or
+graph index survives graph mutation. Whole-graph preparation is still required
+for a refresh: with `R` refreshes and recognition cost `C`, the worst-case cost
+remains `O(R * (V + E + C))`. This is not a generally incremental matcher or a
+performance improvement claim.
 
 ### Source fidelity versus execution and pattern semantics
 

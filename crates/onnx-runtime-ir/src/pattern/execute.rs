@@ -72,6 +72,16 @@ pub struct ValueCapture {
     slots: Vec<usize>,
 }
 
+impl ValueCapture {
+    /// Cheap necessary domain/operator filter for this capture's producer.
+    /// This is not a match. Captures without a pattern producer accept any node.
+    pub fn is_producer_candidate(&self, node: &crate::Node) -> bool {
+        self.plans.iter().zip(&self.slots).any(|(plan, &slot)| {
+            plan.producers[slot].is_none_or(|ordinal| plan.nodes[ordinal].operator_matches(node))
+        })
+    }
+}
+
 /// Pre-validated attribute key; lookups borrow the original attribute payload.
 #[derive(Clone, Debug)]
 pub struct AttributeCapture {
@@ -925,7 +935,17 @@ impl<'g> MatchSession<'g> {
                     continue;
                 };
                 let index = view.value_index(actual).expect("validated live value");
+                let mut previous_connected_consumer = None;
                 for usage in view.consumers(index) {
+                    if matches!(
+                        plan.nodes[ordinal].signature,
+                        NodeSignature::Connected { .. }
+                    ) {
+                        if previous_connected_consumer == Some(usage.node) {
+                            continue;
+                        }
+                        previous_connected_consumer = Some(usage.node);
+                    }
                     let expected_input = match plan.nodes[ordinal].rest {
                         _ if matches!(
                             plan.nodes[ordinal].signature,
@@ -1002,9 +1022,7 @@ impl<'g> MatchSession<'g> {
         };
         let expected = &plan.nodes[ordinal];
         if state.nodes.contains(&Some(actual))
-            || (expected.op != "*"
-                && (node.op_type != expected.op
-                    || crate::normalize_domain(&node.domain) != expected.domain))
+            || !expected.operator_matches(node)
             || (expected.signature == NodeSignature::Positional
                 && (node.outputs.len() != expected.outputs.len()
                     || (expected.rest.is_none() && node.inputs.len() > expected.inputs.len())))

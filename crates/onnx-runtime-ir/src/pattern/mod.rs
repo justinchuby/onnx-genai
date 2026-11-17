@@ -110,7 +110,8 @@ impl Pattern {
     }
 
     /// Parse explicitly native extensions: operator `*`, ordered `...xs`
-    /// operands, `values[min:*]`/`slots[min:*]`, and GRAPH-list references.
+    /// operands, `values[min:*]`/`slots[min:*]`, untyped `value` constraints,
+    /// and GRAPH-list references.
     pub fn parse_native(source: &str) -> Result<Self> {
         compile::inline(syntax::parse_inline(source, true)?)
     }
@@ -299,6 +300,13 @@ struct NodePlan {
     instance: String,
     rest: Option<usize>,
     signature: NodeSignature,
+}
+
+impl NodePlan {
+    fn operator_matches(&self, node: &crate::Node) -> bool {
+        self.op == "*"
+            || (node.op_type == self.op && crate::normalize_domain(&node.domain) == self.domain)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

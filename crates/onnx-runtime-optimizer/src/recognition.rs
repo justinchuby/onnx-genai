@@ -1,7 +1,7 @@
 //! Shared structural rules for provider-owned rewrites.
 
 use onnx_runtime_ir::pattern::{
-    Match, MatchOptions, MatchSession, Pattern, PatternError, ValueCapture,
+    BoundaryPolicy, Match, MatchOptions, MatchSession, Pattern, PatternError, ValueCapture,
 };
 use onnx_runtime_ir::{Graph, NodeId, ValueId};
 use std::sync::LazyLock;
@@ -66,6 +66,10 @@ pub struct RecognitionRule {
 impl RecognitionRule {
     pub fn parse(name: &str, text: &str, anchor: &str) -> Result<Self> {
         let pattern = Pattern::parse_native(text)?;
+        Self::from_pattern(name, pattern, anchor)
+    }
+
+    pub fn from_pattern(name: &str, pattern: Pattern, anchor: &str) -> Result<Self> {
         let anchor = pattern.value_capture(anchor)?;
         Ok(Self {
             name: name.into(),
@@ -74,10 +78,22 @@ impl RecognitionRule {
         })
     }
 
-    /// Visit deterministic matches using an existing prepared graph index.
+    pub fn is_anchor_candidate(&self, node: &onnx_runtime_ir::Node) -> bool {
+        self.anchor.is_producer_candidate(node)
+    }
+
+    /// Visit deterministic closed-region matches using a prepared graph index.
+    /// Returned values may escape; intermediate values must remain internal,
+    /// including uses through descendant lexical captures.
     pub fn candidates<'g>(&self, session: &MatchSession<'g>) -> Result<Vec<(NodeId, Match<'g>)>> {
         let mut candidates = Vec::new();
-        for matched in session.find_matches(&self.pattern, MatchOptions::default())? {
+        for matched in session.find_matches(
+            &self.pattern,
+            MatchOptions {
+                boundary: BoundaryPolicy::OrtBoundary,
+                ..Default::default()
+            },
+        )? {
             let value = matched.captured(&self.anchor)?.ok_or_else(|| {
                 OptimizerError::Fusion(format!(
                     "recognition rule {:?} has an absent traversal anchor; bind a present operator output",
