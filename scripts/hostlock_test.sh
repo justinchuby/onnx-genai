@@ -2915,8 +2915,28 @@ chk "and names the path peers are actually using, so the warning is actionable" 
     "$(priv_err status | grep -c '/tmp/onnx-genai-hostlock')" "1"
 chk "and says how to acknowledge it" \
     "$(priv_err status | grep -c 'HOSTLOCK_PRIVATE_OK=1')" "1"
+# Anchored to `PRIVATE lock` -- the announcement's own words -- and not to a bare
+# `PRIVATE`. `--porcelain` prints `lock_dir=$LOCK`, so a bare pattern also matches
+# the lock's own path, and this cell then reds on any checkout whose path contains
+# the substring: a false red about stream separation, decided by where the suite
+# happens to live. Measured at 2 reds in 22 full-suite runs, both from a directory
+# named PRIVATE_OK and none from the other twenty. The three sibling cells above
+# already anchor this way; only this one did not. See #2293.
 chk "the announcement is on stderr, not in the machine-readable output" \
-    "$(env -u HOSTLOCK_PRIVATE_OK HOSTLOCK_CONF="$NOCONF" HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status --porcelain 2>/dev/null | grep -c 'PRIVATE')" "0"
+    "$(env -u HOSTLOCK_PRIVATE_OK HOSTLOCK_CONF="$NOCONF" HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status --porcelain 2>/dev/null | grep -c 'PRIVATE lock')" "0"
+
+# Pin the distinction the anchoring exists for, so it cannot silently regress, and
+# pin it with a path that would have failed the old pattern rather than one that
+# merely passes the new one. The second cell drives the same pattern against the
+# same lock's stderr, so a pattern that matched nothing at all could not satisfy
+# both -- the usual trap for an assertion whose expected value is zero.
+priv_path="$LOCK.PRIVATE-in-the-path"
+mkdir -p "$priv_path"
+chk "a lock_dir containing PRIVATE is not mistaken for the announcement" \
+    "$(env -u HOSTLOCK_PRIVATE_OK HOSTLOCK_CONF="$NOCONF" HOSTLOCK_DIR="$priv_path" scripts/hostlock.sh status --porcelain 2>/dev/null | grep -c 'PRIVATE lock')" "0"
+chk "and that same pattern still sees the announcement on that lock's stderr" \
+    "$(env -u HOSTLOCK_PRIVATE_OK HOSTLOCK_CONF="$NOCONF" HOSTLOCK_DIR="$priv_path" scripts/hostlock.sh status 2>&1 >/dev/null | grep -c 'PRIVATE lock')" "1"
+rm -rf "$priv_path"
 chk "acknowledging it silences it" \
     "$(HOSTLOCK_PRIVATE_OK=1 HOSTLOCK_CONF="$NOCONF" HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status 2>&1 >/dev/null | wc -c)" "0"
 chk "and the acknowledgement is explicit: any other value still warns" \
@@ -4116,7 +4136,7 @@ rm -rf "$ctl_pin"
 # the inert R1 block and the vacuous STALE arm fixed in #1830. Every probe
 # branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "590"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "592"
 
 echo
 echo "passed=${pass} failed=${fail}"
