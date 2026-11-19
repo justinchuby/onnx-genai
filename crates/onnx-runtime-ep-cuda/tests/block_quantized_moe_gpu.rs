@@ -117,6 +117,14 @@ impl HostTensor {
             bytes: values,
         }
     }
+
+    fn raw(dtype: DataType, shape: &[usize], values: Vec<u8>) -> Self {
+        Self {
+            dtype,
+            shape: shape.to_vec(),
+            bytes: values,
+        }
+    }
 }
 
 fn require_cuda() -> CudaExecutionProvider {
@@ -247,8 +255,7 @@ impl Config {
     }
 }
 
-/// Builds the positional input list (`Vec<Option<HostTensor>>`, length 6..=9)
-/// for a MoE case. Omitted optional inputs are `None`.
+/// Builds the canonical 12-slot positional input list for a MoE case.
 fn build_inputs_formats(
     config: &Config,
     seed: u64,
@@ -283,6 +290,12 @@ fn build_inputs_formats(
         None,
         Some(fc2),
         None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     ];
 
     if config.with_bias {
@@ -304,25 +317,20 @@ fn build_inputs_formats(
             inter,
             hidden,
         );
-        inputs.push(Some(fc3));
+        inputs[6] = Some(fc3);
         if config.with_bias {
             let fc3_bias: Vec<f32> = (0..experts * inter)
                 .map(|_| uniform(&mut state, -0.2, 0.2))
                 .collect();
-            inputs.push(Some(HostTensor::f32(&[experts, inter], &fc3_bias)));
-        } else {
-            inputs.push(None);
+            inputs[7] = Some(HostTensor::f32(&[experts, inter], &fc3_bias));
         }
     }
 
     if config.with_router_weights {
-        while inputs.len() < 8 {
-            inputs.push(None);
-        }
         let router_weights: Vec<f32> = (0..rows * experts)
             .map(|_| uniform(&mut state, 0.0, 1.0))
             .collect();
-        inputs.push(Some(HostTensor::f32(&[rows, experts], &router_weights)));
+        inputs[8] = Some(HostTensor::f32(&[rows, experts], &router_weights));
     }
 
     inputs
@@ -341,6 +349,7 @@ fn build_inputs(config: &Config, seed: u64) -> Vec<Option<HostTensor>> {
 fn absent_dtype(index: usize) -> DataType {
     match index {
         2 | 4 | 6 => DataType::Uint8,
+        9..=11 => DataType::Float8E8M0,
         _ => DataType::Float32,
     }
 }
@@ -364,7 +373,7 @@ fn model_node_formats(
                     input.dtype,
                     static_shape(input.shape.iter().copied()),
                 );
-                if matches!(index, 2 | 4 | 6) {
+                if matches!(index, 2 | 4 | 6 | 9 | 10 | 11) {
                     graph.set_initializer(
                         value,
                         WeightRef::Inline(TensorData::from_raw(
@@ -401,24 +410,41 @@ fn model_node_formats(
         "swiglu_fusion".into(),
         Attribute::Int(config.swiglu_fusion as i64),
     );
-    node.attributes.insert(
-        "fc1_format".into(),
-        Attribute::String(fc1_format.as_bytes().to_vec()),
-    );
-    node.attributes.insert(
-        "fc2_format".into(),
-        Attribute::String(fc2_format.as_bytes().to_vec()),
-    );
-    if config.needs_fc3() {
+    for (prefix, weight_index, scale_index, format) in [
+        ("fc1", 2usize, 9usize, Some(fc1_format)),
+        ("fc2", 4, 10, Some(fc2_format)),
+        ("fc3", 6, 11, fc3_format),
+    ] {
+        if inputs[weight_index].is_none() {
+            continue;
+        }
+        let format = format.unwrap_or_else(|| {
+            if inputs[scale_index].is_none() {
+                FORMAT
+            } else if inputs[weight_index]
+                .as_ref()
+                .is_some_and(|weight| weight.dtype == DataType::Int8)
+            {
+                "fp4_planar"
+            } else {
+                "block_fp8"
+            }
+        });
         node.attributes.insert(
-            "fc3_format".into(),
-            Attribute::String(
-                fc3_format
-                    .expect("separate gate requires a test format")
-                    .as_bytes()
-                    .to_vec(),
-            ),
+            format!("{prefix}_format"),
+            Attribute::String(format.as_bytes().to_vec()),
         );
+        if format == "fp4_planar" {
+            node.attributes
+                .insert(format!("{prefix}_block_size_out"), Attribute::Int(1));
+            node.attributes
+                .insert(format!("{prefix}_block_size_in"), Attribute::Int(32));
+        } else if format == "block_fp8" {
+            node.attributes
+                .insert(format!("{prefix}_block_size_out"), Attribute::Int(32));
+            node.attributes
+                .insert(format!("{prefix}_block_size_in"), Attribute::Int(32));
+        }
     }
     node.attributes
         .insert("block_layout_version".into(), Attribute::Int(1));
@@ -436,12 +462,24 @@ fn model_node_formats(
 }
 
 fn model_node(config: &Config, inputs: &[Option<HostTensor>]) -> (Graph, NodeId) {
+    let inferred = |weight: usize, scale: usize| {
+        if inputs[scale].is_none() {
+            FORMAT
+        } else if inputs[weight]
+            .as_ref()
+            .is_some_and(|weight| weight.dtype == DataType::Int8)
+        {
+            "fp4_planar"
+        } else {
+            "block_fp8"
+        }
+    };
     model_node_formats(
         config,
         inputs,
-        FORMAT,
-        FORMAT,
-        config.needs_fc3().then_some(FORMAT),
+        inferred(2, 9),
+        inferred(4, 10),
+        inputs[6].is_some().then(|| inferred(6, 11)),
     )
 }
 
@@ -478,9 +516,12 @@ fn run_cpu_node(
     node: NodeId,
 ) -> Vec<f32> {
     let model = Model::new(graph);
-    let kernel = CpuExecutionProvider::new()
+    let mut kernel = CpuExecutionProvider::new()
         .get_kernel(model.graph.node(node), &[], 1)
         .unwrap();
+    kernel.set_constant_inputs(&[
+        false, false, true, false, true, false, true, false, false, true, true, true,
+    ]);
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
@@ -624,13 +665,6 @@ fn run_gpu_node(
     let output_len = config.rows * config.hidden;
     let mut output_buffer = ep.allocate(output_len * 4, 256)?;
     let output_strides = compute_contiguous_strides(&output_shape);
-    let output_view = TensorMut::new(
-        DevicePtrMut(output_buffer.as_mut_ptr()),
-        DataType::Float32,
-        &output_shape,
-        &output_strides,
-        ep.device_id(),
-    );
     let metadata = views
         .iter()
         .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
@@ -639,17 +673,39 @@ fn run_gpu_node(
     let workspace_bytes = usize::try_from(requirement.bytes)
         .map_err(|_| onnx_runtime_ep_api::EpError::KernelFailed("workspace too large".into()))?;
     let mut workspace = ep.allocate(workspace_bytes, requirement.alignment)?;
-    kernel.execute_with_workspace(
-        &views,
-        &mut [output_view],
+    let mut workspace_view = || {
         Some(WorkspaceView::new(
             DevicePtrMut(workspace.as_mut_ptr()),
             workspace_bytes,
-        )),
-    )?;
+        ))
+    };
+    let mut output_view = || {
+        TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            ep.device_id(),
+        )
+    };
+    kernel.execute_with_workspace(&views, &mut [output_view()], workspace_view())?;
+    let planar = inputs[9].is_some() || inputs[10].is_some() || inputs[11].is_some();
+    if planar {
+        runtime.begin_graph_capture(&[kernel.as_ref()])?;
+        kernel.execute_with_workspace(&views, &mut [output_view()], workspace_view())?;
+        runtime.end_graph_capture()?;
+        for _ in 0..3 {
+            runtime.replay_graph()?;
+        }
+    }
     let mut output = vec![0u8; output_len * 4];
     // SAFETY: the destination exactly covers the f32 output allocation.
     unsafe { runtime.dtoh(&mut output, cuptr(output_buffer.as_ptr()))? };
+    if planar {
+        assert!(runtime.has_graph_executable()?);
+        assert_eq!(runtime.graph_segment_count()?, 1);
+        assert!(runtime.reset_graph()?);
+    }
     drop(views);
     for buffer in buffers.into_iter().flatten() {
         ep.deallocate(buffer)?;
@@ -687,6 +743,90 @@ fn check_case(ep: &CudaExecutionProvider, config: &Config, seed: u64, label: &st
     let expected = run_cpu(config, &inputs);
     let actual = run_gpu(ep, config, &inputs).unwrap();
     assert_close(&actual, &expected, label);
+}
+
+fn build_mixed_planar_inputs(config: &Config) -> Vec<Option<HostTensor>> {
+    assert_eq!(config.hidden, 32);
+    assert_eq!(config.inter, 32);
+    let mut inputs = vec![None; 12];
+    let activations = (0..config.rows * config.hidden)
+        .map(|index| index as f32 / 32.0 - 1.5)
+        .collect::<Vec<_>>();
+    let router = (0..config.rows * config.experts)
+        .map(|index| (index % config.experts) as f32 - 0.5)
+        .collect::<Vec<_>>();
+    inputs[0] = Some(HostTensor::f32(&[config.rows, config.hidden], &activations));
+    inputs[1] = Some(HostTensor::f32(&[config.rows, config.experts], &router));
+    inputs[2] = Some(HostTensor::raw(
+        DataType::Float8E4M3FN,
+        &[config.experts, config.inter, config.hidden],
+        vec![0x38; config.experts * config.inter * config.hidden],
+    ));
+    inputs[4] = Some(HostTensor::raw(
+        DataType::Int8,
+        &[config.experts, config.hidden, config.inter / 2],
+        vec![0x22; config.experts * config.hidden * config.inter / 2],
+    ));
+    inputs[6] = Some(HostTensor::raw(
+        DataType::Float8E4M3FN,
+        &[config.experts, config.inter, config.hidden],
+        vec![0x30; config.experts * config.inter * config.hidden],
+    ));
+    inputs[9] = Some(HostTensor::raw(
+        DataType::Float8E8M0,
+        &[config.experts, 1, 1],
+        vec![127; config.experts],
+    ));
+    inputs[10] = Some(HostTensor::raw(
+        DataType::Float8E8M0,
+        &[config.experts, config.hidden, 1],
+        vec![126; config.experts * config.hidden],
+    ));
+    inputs[11] = Some(HostTensor::raw(
+        DataType::Float8E8M0,
+        &[config.experts, 1, 1],
+        vec![128; config.experts],
+    ));
+    if config.with_bias {
+        inputs[3] = Some(HostTensor::f32(
+            &[config.experts, config.inter],
+            &vec![0.125; config.experts * config.inter],
+        ));
+        inputs[5] = Some(HostTensor::f32(
+            &[config.experts, config.hidden],
+            &vec![-0.25; config.experts * config.hidden],
+        ));
+        inputs[7] = Some(HostTensor::f32(
+            &[config.experts, config.inter],
+            &vec![0.5; config.experts * config.inter],
+        ));
+    }
+    inputs
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn mixed_planar_fp8_fp4_production_moe_matches_cpu_and_replays_graph() {
+    let ep = require_cuda();
+    let config = Config {
+        rows: 3,
+        hidden: 32,
+        inter: 32,
+        experts: 2,
+        k: 2,
+        activation: "silu",
+        swiglu_fusion: 0,
+        with_bias: true,
+        with_router_weights: false,
+        normalize: true,
+    };
+    let inputs = build_mixed_planar_inputs(&config);
+    let expected = run_cpu(&config, &inputs);
+    let actual = run_gpu(&ep, &config, &inputs).unwrap();
+    assert_close(&actual, &expected, "mixed-planar-production-moe");
 }
 
 #[cfg_attr(

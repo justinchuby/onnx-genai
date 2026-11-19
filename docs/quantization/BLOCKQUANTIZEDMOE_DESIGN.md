@@ -1,11 +1,9 @@
 # `pkg.nxrt::BlockQuantizedMoE` — Operator Design Note (mixed-projection ABI)
 
-**Status:** Mixed-projection ABI — CPU oracle and native CUDA decode/prefill
-execution implemented for the verified GLM-5.2 UD-IQ1_S formats. This
-supersedes the frozen single-`format` v1 ABI: each projection (`fc1`/`fc2`/`fc3`)
-now carries its **own** native block format, because real GLM-5.2 GGUF routed
-experts pack gate/up and down at different qtypes and block widths. There is no
-backward-compatibility layer — the old single-`format` attribute is removed.
+**Status:** Canonical v1 mixed-projection and planar-scale ABI — CPU oracle and
+CUDA production execution implemented. Each projection (`fc1`/`fc2`/`fc3`)
+carries its own native or planar FP8/FP4 format and, for planar formats, its
+own auxiliary scale tensor. There is no backward-compatibility layer.
 **Author:** Ripley (architect); mixed-projection revision by Sebastian (systems/perf)
 **Date:** 2026-07-18; revised 2026-08-27
 **Scope:** ABI, dispatch semantics, decode reuse, determinism, shape inference,
@@ -89,10 +87,10 @@ Three existing contracts are the load-bearing precedents this ABI mirrors:
 
 ## 1. Operator ABI (mixed-projection)
 
-The CPU reference oracle implements this schema. The positional inputs are
-unchanged from the frozen v1 layout; the **attribute surface changed**: the
-single `format` attribute is replaced by three per-projection format attributes
-`fc1_format`, `fc2_format`, `fc3_format` (see §1.3). This is a breaking change
+The CPU reference oracle and CUDA production kernel implement this schema. The
+canonical v1 layout has exactly 12 positional inputs: the original 0–8 slots
+plus one auxiliary-scale slot per projection. The single `format` attribute is
+replaced by `fc1_format`, `fc2_format`, and `fc3_format`. This is a clean break
 with no compatibility shim.
 
 - **Domain:** `pkg.nxrt`
@@ -100,7 +98,7 @@ with no compatibility shim.
   [weight.rs:101-105](../../crates/onnx-runtime-ep-api/src/weight.rs#L101-L105))
 - **Version:** 1
 
-### 1.1 Weight-representation deviation from QMoE (the key structural change)
+### 1.1 Weight representations
 
 `QMoE` carries **separate `*_scales` (and optional `*_zero_points`) inputs**
 because affine-int dequant is `w = (q - zp) * scale`
@@ -108,16 +106,13 @@ because affine-int dequant is `w = (q - zp) * scale`
 IQ/MXFP4 blocks are **self-describing**: each serialized llama.cpp block embeds
 its own scale bytes, and the codebook grids are **compile-time constants**, not
 tensors ([block_quantized_matmul.rs:11-13](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L11-L13),
-[lib.rs:7](../../crates/onnx-runtime-quantization/src/lib.rs#L7)). `BlockQuantizedMatMul`
-therefore has **no scales input and no codebook input** — only `packed_B` with
-layout `[N, blocks, block_bytes]`
+[lib.rs:7](../../crates/onnx-runtime-quantization/src/lib.rs#L7)). For those formats, `BlockQuantizedMatMul` omits its auxiliary-scale slot and
+uses only `packed_B` with layout `[N, blocks, block_bytes]`
 ([block_quantized_matmul.rs:202-207](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L202-L207)).
 
-**Consequence for v1:** `BlockQuantizedMoE` **drops** the QMoE `*_scales`,
-`*_zero_points`, and any codebook inputs. Each expert weight tensor is a single
-packed `uint8` blob per projection, expert-major. This is the deliberate,
-justified deviation from the QMoE precedent — its reason is the block format
-itself, not a stylistic choice.
+Planar `block_fp8` and `fp4_planar` are not self-describing. They require a
+separate `Float8E8M0` scale grid for each projection. The scale is mandatory
+for a planar projection and forbidden for a self-describing projection.
 
 ### 1.2 Input list
 
@@ -131,22 +126,21 @@ scales. `packed_*` tensors are `uint8`; all float tensors are `float32`
 |---:|---|---|---|---|---|
 | 0 | `input` (hidden states) | f32 | **required** | `[rows, H]` or `[B,S,H]` | idx 0 ([qmoe.rs:107](../../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L107)) |
 | 1 | `router_logits` | f32 | **required** | `[rows, E]` | idx 1 ([qmoe.rs:108,298](../../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L108)) |
-| 2 | `fc1_experts_weights` (gate/up, packed) | u8 | **required** | `[E, fc1_out, blocks1, block_bytes]` | idx 2 |
+| 2 | `fc1_experts_weights` (gate/up, packed) | format-dependent | **required** | native `[E,N,blocks,bytes]`, FP8 `[E,N,K]`, or FP4 `[E,N,K/2]` | idx 2 |
 | 3 | `fc1_experts_bias` | f32 | optional | `[E, fc1_out]` | idx 4 (bias) |
-| 4 | `fc2_experts_weights` (down, packed) | u8 | **required** | `[E, H, blocks2, block_bytes]` | idx 5 |
+| 4 | `fc2_experts_weights` (down, packed) | format-dependent | **required** | native, FP8, or FP4 planar shape | idx 5 |
 | 5 | `fc2_experts_bias` | f32 | optional | `[E, H]` | idx 7 |
-| 6 | `fc3_experts_weights` (separate gate, packed) | u8 | optional | `[E, inter, blocks3, block_bytes]` | idx 8 |
+| 6 | `fc3_experts_weights` (separate gate, packed) | format-dependent | optional | native, FP8, or FP4 planar shape | idx 8 |
 | 7 | `fc3_experts_bias` | f32 | optional | `[E, inter]` | idx 10 |
 | 8 | `router_weights` (aggregation weights) | f32 | optional | `[rows, E]` | idx 14 ([qmoe.rs:293-294](../../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L293-L294)) |
+| 9 | `fc1_experts_aux_scale` | Float8E8M0 | required iff fc1 is planar | per-format scale grid | — |
+| 10 | `fc2_experts_aux_scale` | Float8E8M0 | required iff fc2 is planar | per-format scale grid | — |
+| 11 | `fc3_experts_aux_scale` | Float8E8M0 | required iff fc3 is planar | per-format scale grid | — |
 
 Notes:
 
-- **Contiguous packing chosen over QMoE's sparse layout.** QMoE interleaves
-  bias/scales/zero_points across indices 2–14 with FP4/FP8 modes reserved at
-  15+ ([qmoe.rs:130-160](../../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L130-L160)).
-  Because IQ formats carry no scales/zero_points, v1 has no such reserved gaps;
-  a dense 0–8 ordering is clearer. This is a deviation flagged for sign-off
-  (Decision 1).
+- Slots 0–8 remain dense and format-independent. Slots 9–11 are the canonical
+  per-projection planar auxiliary scales.
 - `fc1` follows the QMoE/MoE convention: when SwiGLU is **fused**,
   `fc1_out = 2 * inter`; otherwise `fc1_out = inter`
   ([moe.rs:287-298](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L287-L298)).
@@ -189,9 +183,10 @@ reuse `BlockQuantizedMatMul`'s `BlockFormat::parse`
 
 | Attribute | Type | Default | Source precedent |
 |---|---|---|---|
-| `fc1_format` | string enum | *required* | `BlockFormat::parse` — IQ formats plus `q2_k, q3_k, q5_k, q6_k, q8_0` ([block_quantized_matmul.rs](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs)) |
+| `fc1_format` | string enum | *required* | native IQ/K/Q8 formats plus `block_fp8` and `fp4_planar` |
 | `fc2_format` | string enum | *required* | same enum as `fc1_format` |
 | `fc3_format` | string enum | required **iff** `fc3_experts_weights` wired; forbidden otherwise | same enum as `fc1_format` |
+| `fc{1,2,3}_block_size_out/in` | int | required for planar projection | `block_fp8`: positive 2D block; `fp4_planar`: exactly `[1,32]` |
 | `block_layout_version` | int | 1 | must equal 1 ([block_quantized_matmul.rs:157-162](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L157-L162)) |
 | `k` (top_k) | int | 1 | `MoeAttributes.k`, must be `>0` and `<= E` ([moe.rs:59-62](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L59-L62), [qmoe.rs:192-197](../../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L192-L197)) |
 | `activation_type` | string | `relu` | `relu, gelu, silu, swiglu, identity` ([moe.rs:63-80](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L63-L80)) |
@@ -423,6 +418,11 @@ Staged exactly like QMoE Phase 1/2
 - Add `BlockQuantizedMoE` to the CUDA registry next to `qmoe`/`qmoe_gemm`/
   `qmoe_grouping` (existing CUDA QMoE surface). Reuse the CUDA
   `block_quantized_matmul` decoder.
+- CUDA accepts independent planar FP8/FP4 formats per projection, validates
+  every immutable weight/scale bank on device before admission, and launches
+  the production routed-MoE path. Mixing a planar projection with a
+  self-describing interleaved projection is rejected. Warmed planar execution
+  is CUDA-graph capturable and reuses pointer-stable constants.
 - All-f32. Each projection launch carries its own format id, elements/block,
   bytes/block, row stride, and expert stride. Mixed IQ/K-quant/Q8 combinations
   are claimed and executed directly from packed bytes.
@@ -524,10 +524,9 @@ P1 #9 freezes its semantics. This is offered for sign-off as Decision 4.
 
 Each item lists a recommended default. Sign-off requested before kernel work.
 
-1. **Weight-input ordering — dense 0–8 vs. QMoE-index-preserving.**
-   *Recommend:* the dense 0–8 layout in §1.2 (no scales/zero_points, so QMoE's
-   reserved gaps are meaningless). *Alt:* keep QMoE's exact indices for
-   mechanical transcode. **Default: dense 0–8.**
+1. **Weight-input ordering.**
+   **Resolved:** dense data/bias/router slots 0–8 plus planar auxiliary-scale
+   slots 9–11, exactly as specified in §1.2.
 
 2. **Router input: logits vs. pre-normalized weights.**
    *Recommend:* name the required input `router_logits` and apply softmax

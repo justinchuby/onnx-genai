@@ -47,6 +47,7 @@
 #![forbid(unsafe_code)]
 
 mod arena;
+pub mod block_quant_schema;
 mod device;
 mod domain;
 mod dtype;

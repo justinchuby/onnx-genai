@@ -25,6 +25,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::block_quant_schema::{
+    BLOCK_QUANTIZED_MOE_INPUT_COUNT as INPUT_COUNT, BLOCK_QUANTIZED_MOE_INPUT_NAMES as INPUT_NAMES,
+    BQMOE_FC1_SCALE, BQMOE_FC1_WEIGHT, BQMOE_FC2_SCALE, BQMOE_FC2_WEIGHT, BQMOE_FC3_SCALE,
+    BQMOE_FC3_WEIGHT, PlanarBlockGeometry, planar_geometry_from_node, require_layout_v1,
+};
 use onnx_runtime_ir::{DataType, Node, Shape};
 
 use super::block_quantized_matmul::{
@@ -32,25 +37,15 @@ use super::block_quantized_matmul::{
     dequantize_weight_kn,
 };
 use super::moe::{MoeAttributes, routing_weights, run_expert_grouped};
+use super::planar_block_quant::{
+    PlanarLayout, dequantize_planar_kn, validate_planar_expert_bank_values,
+};
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
 const OP: &str = "BlockQuantizedMoE";
-const LAYOUT_VERSION: i64 = 1;
 
 pub static BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS: AtomicUsize = AtomicUsize::new(0);
 pub static BLOCK_QUANT_MOE_DENSE_EXPANSIONS: AtomicUsize = AtomicUsize::new(0);
-
-const INPUT_NAMES: [&str; 9] = [
-    "input",
-    "router_logits",
-    "fc1_experts_weights",
-    "fc1_experts_bias",
-    "fc2_experts_weights",
-    "fc2_experts_bias",
-    "fc3_experts_weights",
-    "fc3_experts_bias",
-    "router_weights",
-];
 
 #[cfg(test)]
 static BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS: std::sync::atomic::AtomicUsize =
@@ -64,9 +59,15 @@ static BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS: std::sync::atomic::AtomicUsize =
 /// of the mixed-projection ABI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectionFormats {
-    fc1: BlockFormat,
-    fc2: BlockFormat,
-    fc3: Option<BlockFormat>,
+    fc1: ProjectionFormat,
+    fc2: ProjectionFormat,
+    fc3: Option<ProjectionFormat>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectionFormat {
+    Interleaved(BlockFormat),
+    Planar(PlanarBlockGeometry),
 }
 
 /// One property-typed packed-projection layout contract, shared by the claim
@@ -157,7 +158,7 @@ pub struct BlockQuantizedMoEFactory;
 pub struct BlockQuantizedMoEKernel {
     attributes: MoeAttributes,
     formats: ProjectionFormats,
-    constant_inputs: [bool; 9],
+    constant_inputs: [bool; INPUT_COUNT],
     weight_identities: [DenseWeightIdentity; 3],
     weight_cache: DenseWeightCache,
 }
@@ -177,7 +178,7 @@ impl KernelFactory for BlockQuantizedMoEFactory {
         Ok(Box::new(BlockQuantizedMoEKernel {
             attributes,
             formats,
-            constant_inputs: [false; 9],
+            constant_inputs: [false; INPUT_COUNT],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
             weight_cache: DenseWeightCache::new(),
         }))
@@ -196,14 +197,19 @@ pub(crate) fn unsupported_reason(
 
 impl Kernel for BlockQuantizedMoEKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
-        for (index, is_constant) in constant_inputs.iter().copied().enumerate().take(9) {
+        for (index, is_constant) in constant_inputs
+            .iter()
+            .copied()
+            .enumerate()
+            .take(INPUT_COUNT)
+        {
             self.constant_inputs[index] = is_constant;
         }
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity(OP, inputs, outputs, 5, 9, 1)?;
-        for &index in &[0, 1, 2, 4] {
+        check_arity(OP, inputs, outputs, INPUT_COUNT, INPUT_COUNT, 1)?;
+        for &index in &[0, 1, BQMOE_FC1_WEIGHT, BQMOE_FC2_WEIGHT] {
             if inputs[index].is_absent() {
                 return Err(error(format!(
                     "required input {index} ('{}') is absent",
@@ -214,16 +220,19 @@ impl Kernel for BlockQuantizedMoEKernel {
         for &index in &[0, 1] {
             require_dtype(index, &inputs[index], DataType::Float32)?;
         }
-        for &index in &[2, 4] {
-            require_dtype(index, &inputs[index], DataType::Uint8)?;
-        }
         for &index in &[3, 5, 7, 8] {
             if let Some(input) = optional_input(inputs, index) {
                 require_dtype(index, input, DataType::Float32)?;
             }
         }
-        if let Some(input) = optional_input(inputs, 6) {
-            require_dtype(6, input, DataType::Uint8)?;
+        validate_projection_dtypes(inputs, BQMOE_FC1_WEIGHT, BQMOE_FC1_SCALE, self.formats.fc1)?;
+        validate_projection_dtypes(inputs, BQMOE_FC2_WEIGHT, BQMOE_FC2_SCALE, self.formats.fc2)?;
+        if let Some(format) = self.formats.fc3 {
+            validate_projection_dtypes(inputs, BQMOE_FC3_WEIGHT, BQMOE_FC3_SCALE, format)?;
+        } else if optional_input(inputs, BQMOE_FC3_SCALE).is_some() {
+            return Err(error(
+                "fc3_experts_aux_scale requires fc3_experts_weights and fc3_format",
+            ));
         }
         if outputs[0].dtype != DataType::Float32 {
             return Err(error(format!(
@@ -241,6 +250,7 @@ impl Kernel for BlockQuantizedMoEKernel {
             inter,
             fc1_size,
         } = dimensions;
+        validate_runtime_planar_values(inputs, dimensions, self.formats)?;
 
         let input = to_dense_f32(&inputs[0])?;
         let router_logits = to_dense_f32(&inputs[1])?;
@@ -274,6 +284,7 @@ impl Kernel for BlockQuantizedMoEKernel {
                 self.constant_inputs[2].then_some(&self.weight_identities[0]),
                 1,
                 &inputs[2],
+                optional_input(inputs, BQMOE_FC1_SCALE),
                 expert,
                 fc1_size,
                 hidden,
@@ -284,6 +295,7 @@ impl Kernel for BlockQuantizedMoEKernel {
                 self.constant_inputs[4].then_some(&self.weight_identities[1]),
                 2,
                 &inputs[4],
+                optional_input(inputs, BQMOE_FC2_SCALE),
                 expert,
                 hidden,
                 inter,
@@ -299,6 +311,7 @@ impl Kernel for BlockQuantizedMoEKernel {
                         self.constant_inputs[6].then_some(&self.weight_identities[2]),
                         3,
                         packed,
+                        optional_input(inputs, BQMOE_FC3_SCALE),
                         expert,
                         inter,
                         hidden,
@@ -354,12 +367,37 @@ impl BlockQuantizedMoEKernel {
         identity: Option<&DenseWeightIdentity>,
         role: u8,
         packed: &TensorView,
+        scale: Option<&TensorView>,
         expert: usize,
         out_features: usize,
         in_features: usize,
         experts: usize,
-        format: BlockFormat,
+        format: ProjectionFormat,
     ) -> Result<Arc<Vec<f32>>> {
+        let ProjectionFormat::Interleaved(format) = format else {
+            let ProjectionFormat::Planar(geometry) = format else {
+                unreachable!()
+            };
+            let scale = scale.ok_or_else(|| error("planar projection scale is missing"))?;
+            let layout = PlanarLayout::new(
+                geometry.format,
+                out_features,
+                in_features,
+                geometry.block_out,
+                geometry.block_in,
+            )?;
+            let packed = tensor_expert_bytes(packed, expert)?;
+            let scale = tensor_expert_bytes(scale, expert)?;
+            let weight_kn = dequantize_planar_kn(&layout, &packed, &scale)?;
+            return Ok(Arc::new(transpose_kn_to_nk(
+                &weight_kn,
+                out_features,
+                in_features,
+            )));
+        };
+        if scale.is_some() {
+            return Err(error("interleaved projection must omit its aux scale"));
+        }
         let layout = ProjectionLayout::new(format, out_features, in_features, experts);
         // Validate the packed projection's total byte footprint against the
         // shared layout contract before slicing any expert bank.
@@ -445,8 +483,6 @@ fn validate_runtime_shapes(
             attributes.k
         )));
     }
-    require_exact_rank(2, inputs[2].shape, 4)?;
-    require_exact_rank(4, inputs[4].shape, 4)?;
     if inputs[2].shape[0] != experts || inputs[4].shape[0] != experts {
         return Err(error(format!(
             "expert weight counts must equal router num_experts {experts}"
@@ -478,15 +514,23 @@ fn validate_runtime_shapes(
             "fc1_experts_weights dimension 1 must be {expected_fc1}, got {fc1_size}"
         )));
     }
-    validate_packed_shape(
-        2,
-        inputs[2].shape,
-        ProjectionLayout::new(formats.fc1, fc1_size, hidden, experts),
+    validate_projection_shape(
+        inputs,
+        BQMOE_FC1_WEIGHT,
+        BQMOE_FC1_SCALE,
+        formats.fc1,
+        experts,
+        fc1_size,
+        hidden,
     )?;
-    validate_packed_shape(
-        4,
-        inputs[4].shape,
-        ProjectionLayout::new(formats.fc2, hidden, inter, experts),
+    validate_projection_shape(
+        inputs,
+        BQMOE_FC2_WEIGHT,
+        BQMOE_FC2_SCALE,
+        formats.fc2,
+        experts,
+        hidden,
+        inter,
     )?;
     validate_bias(inputs, 3, experts, fc1_size)?;
     validate_bias(inputs, 5, experts, hidden)?;
@@ -498,15 +542,19 @@ fn validate_runtime_shapes(
         ));
     }
     if attributes.uses_separate_gate(has_fc3) {
-        let fc3 = optional_input(inputs, 6)
+        let _fc3 = optional_input(inputs, 6)
             .ok_or_else(|| error("unfused swiglu requires input 6 fc3_experts_weights"))?;
         let fc3_format = formats
             .fc3
             .ok_or_else(|| error("fc3_experts_weights requires the fc3_format attribute"))?;
-        validate_packed_shape(
-            6,
-            fc3.shape,
-            ProjectionLayout::new(fc3_format, inter, hidden, experts),
+        validate_projection_shape(
+            inputs,
+            BQMOE_FC3_WEIGHT,
+            BQMOE_FC3_SCALE,
+            fc3_format,
+            experts,
+            inter,
+            hidden,
         )?;
         validate_bias(inputs, 7, experts, inter)?;
     } else {
@@ -534,6 +582,66 @@ fn validate_runtime_shapes(
         inter,
         fc1_size,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_projection_shape(
+    inputs: &[TensorView],
+    weight_index: usize,
+    scale_index: usize,
+    format: ProjectionFormat,
+    experts: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Result<()> {
+    match format {
+        ProjectionFormat::Interleaved(format) => {
+            if optional_input(inputs, scale_index).is_some() {
+                return Err(error(format!(
+                    "{} must be omitted for interleaved format",
+                    INPUT_NAMES[scale_index]
+                )));
+            }
+            validate_packed_shape(
+                weight_index,
+                inputs[weight_index].shape,
+                ProjectionLayout::new(format, out_features, in_features, experts),
+            )
+        }
+        ProjectionFormat::Planar(geometry) => {
+            let scale = optional_input(inputs, scale_index).ok_or_else(|| {
+                error(format!(
+                    "{} is required for {}",
+                    INPUT_NAMES[scale_index],
+                    geometry.format.capability_str()
+                ))
+            })?;
+            let layout = PlanarLayout::new(
+                geometry.format,
+                out_features,
+                in_features,
+                geometry.block_out,
+                geometry.block_in,
+            )?;
+            let [weight_rows, weight_cols] = layout.packed_shape();
+            let expected_weight = [experts, weight_rows, weight_cols];
+            if inputs[weight_index].shape != expected_weight {
+                return Err(error(format!(
+                    "{} must have shape {expected_weight:?}, got {:?}",
+                    INPUT_NAMES[weight_index], inputs[weight_index].shape
+                )));
+            }
+            let [scale_rows, scale_cols] = layout.scale_shape();
+            let expected_scale = [experts, scale_rows, scale_cols];
+            if scale.shape != expected_scale {
+                return Err(error(format!(
+                    "{} must have shape {expected_scale:?}, got {:?}",
+                    INPUT_NAMES[scale_index], scale.shape
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_packed_shape(index: usize, shape: &[usize], layout: ProjectionLayout) -> Result<()> {
@@ -631,6 +739,60 @@ fn packed_expert_bytes<'a>(
     Ok(Cow::Owned(dense))
 }
 
+fn tensor_expert_bytes<'a>(tensor: &'a TensorView<'_>, expert: usize) -> Result<Cow<'a, [u8]>> {
+    tensor.validate()?;
+    if tensor.dtype.byte_size() != 1 || tensor.shape.len() != 3 {
+        return Err(error(format!(
+            "planar expert tensor must be rank-3 with one-byte elements, got dtype {:?} shape {:?}",
+            tensor.dtype, tensor.shape
+        )));
+    }
+    let experts = tensor.shape[0];
+    if expert >= experts {
+        return Err(error(format!(
+            "expert index {expert} is out of range for {experts} experts"
+        )));
+    }
+    let per_expert = checked_product(&tensor.shape[1..], "planar expert byte count")?;
+    if tensor.is_contiguous() {
+        let len = tensor.byte_size();
+        let start = expert
+            .checked_mul(per_expert)
+            .ok_or_else(|| error("planar expert byte offset overflow"))?;
+        let end = start
+            .checked_add(per_expert)
+            .ok_or_else(|| error("planar expert byte range overflow"))?;
+        // SAFETY: validation proves the contiguous one-byte view covers `len`
+        // readable bytes, and the expert range is derived from its shape.
+        let bytes = unsafe { std::slice::from_raw_parts(tensor.data_ptr::<u8>(), len) };
+        return bytes
+            .get(start..end)
+            .map(Cow::Borrowed)
+            .ok_or_else(|| error("planar expert byte range exceeds tensor"));
+    }
+    let mut dense = Vec::with_capacity(per_expert);
+    let origin = tensor.data_ptr::<u8>();
+    for row in 0..tensor.shape[1] {
+        for col in 0..tensor.shape[2] {
+            let offset = crate::strided::elem_offset(tensor.strides, &[expert, row, col]);
+            // SAFETY: the executor validates the backing range and every index
+            // here is within the tensor shape.
+            dense.push(unsafe { *origin.offset(offset) });
+        }
+    }
+    Ok(Cow::Owned(dense))
+}
+
+fn transpose_kn_to_nk(weight_kn: &[f32], out_features: usize, in_features: usize) -> Vec<f32> {
+    let mut weight_nk = vec![0.0f32; weight_kn.len()];
+    for input in 0..in_features {
+        for output in 0..out_features {
+            weight_nk[output * in_features + input] = weight_kn[input * out_features + output];
+        }
+    }
+    weight_nk
+}
+
 fn dequantize_expert_slice(
     format: BlockFormat,
     packed: &[u8],
@@ -638,13 +800,7 @@ fn dequantize_expert_slice(
     in_features: usize,
 ) -> Result<Vec<f32>> {
     let weight_kn = dequantize_weight_kn(format, in_features, out_features, packed)?;
-    let mut weight_nk = vec![0.0f32; weight_kn.len()];
-    for input in 0..in_features {
-        for output in 0..out_features {
-            weight_nk[output * in_features + input] = weight_kn[input * out_features + output];
-        }
-    }
-    Ok(weight_nk)
+    Ok(transpose_kn_to_nk(&weight_kn, out_features, in_features))
 }
 
 /// Decode one expert projection with the authoritative CPU GGUF decoder and
@@ -678,6 +834,12 @@ fn validate_attributes(node: &Node) -> Result<()> {
                 | "fc2_format"
                 | "fc3_format"
                 | "block_layout_version"
+                | "fc1_block_size_out"
+                | "fc1_block_size_in"
+                | "fc2_block_size_out"
+                | "fc2_block_size_in"
+                | "fc3_block_size_out"
+                | "fc3_block_size_in"
         ) {
             return Err(error(format!(
                 "attribute '{name}' is not part of the BlockQuantizedMoE ABI"
@@ -687,37 +849,55 @@ fn validate_attributes(node: &Node) -> Result<()> {
     Ok(())
 }
 
-fn parse_format_attr(node: &Node, name: &str) -> Result<BlockFormat> {
-    node.attr(name)
-        .ok_or_else(|| error(format!("missing required string attribute '{name}'")))?
-        .as_str()
-        .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
-        .and_then(BlockFormat::parse)
-}
-
-fn optional_format_attr(node: &Node, name: &str) -> Result<Option<BlockFormat>> {
-    match node.attr(name) {
-        None => Ok(None),
-        Some(attr) => attr
+fn parse_projection_format(
+    node: &Node,
+    format_attr: &str,
+    block_out_attr: &str,
+    block_in_attr: &str,
+) -> Result<ProjectionFormat> {
+    if let Some(geometry) =
+        planar_geometry_from_node(node, OP, format_attr, block_out_attr, block_in_attr)
+            .map_err(error)?
+    {
+        Ok(ProjectionFormat::Planar(geometry))
+    } else {
+        let format = node
+            .attr(format_attr)
+            .ok_or_else(|| error(format!("missing required string attribute '{format_attr}'")))?
             .as_str()
-            .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
-            .and_then(BlockFormat::parse)
-            .map(Some),
+            .ok_or_else(|| error(format!("attribute '{format_attr}' must be a UTF-8 string")))
+            .and_then(BlockFormat::parse)?;
+        Ok(ProjectionFormat::Interleaved(format))
     }
 }
 
 /// Parse the per-projection formats. `fc3_format` must be present exactly when
 /// the `fc3_experts_weights` input (index 6) is wired on the node.
 fn parse_projection_formats(node: &Node) -> Result<ProjectionFormats> {
-    let fc1 = parse_format_attr(node, "fc1_format")?;
-    let fc2 = parse_format_attr(node, "fc2_format")?;
+    let fc1 = parse_projection_format(
+        node,
+        "fc1_format",
+        "fc1_block_size_out",
+        "fc1_block_size_in",
+    )?;
+    let fc2 = parse_projection_format(
+        node,
+        "fc2_format",
+        "fc2_block_size_out",
+        "fc2_block_size_in",
+    )?;
     let fc3_wired = node.inputs.get(6).is_some_and(Option::is_some);
-    let fc3_attr = optional_format_attr(node, "fc3_format")?;
+    let fc3_attr = node.attr("fc3_format");
     match (fc3_wired, fc3_attr) {
-        (true, Some(fc3)) => Ok(ProjectionFormats {
+        (true, Some(_)) => Ok(ProjectionFormats {
             fc1,
             fc2,
-            fc3: Some(fc3),
+            fc3: Some(parse_projection_format(
+                node,
+                "fc3_format",
+                "fc3_block_size_out",
+                "fc3_block_size_in",
+            )?),
         }),
         (true, None) => Err(error(
             "fc3_experts_weights is wired but the required fc3_format attribute is missing",
@@ -739,12 +919,7 @@ fn validate_metadata(
 ) -> Result<ValidatedMetadata> {
     validate_attributes(node)?;
     let attributes = MoeAttributes::from_block_quantized_node(node)?;
-    let layout_version = optional_int_attr(node, "block_layout_version")?.unwrap_or(1);
-    if layout_version != LAYOUT_VERSION {
-        return Err(error(format!(
-            "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
-        )));
-    }
+    require_layout_v1(node, OP).map_err(error)?;
     let formats = parse_projection_formats(node)?;
     if let Some((shapes, dtypes)) = claim_metadata {
         validate_claim_metadata(node, shapes, dtypes, &attributes, formats).map_err(error)?;
@@ -762,9 +937,9 @@ fn validate_claim_metadata(
     attributes: &MoeAttributes,
     formats: ProjectionFormats,
 ) -> std::result::Result<(), String> {
-    if !(5..=9).contains(&node.inputs.len()) {
+    if node.inputs.len() != INPUT_COUNT {
         return Err(format!(
-            "expected 5 to 9 positional inputs, got {}",
+            "expected exactly {INPUT_COUNT} positional inputs, got {}",
             node.inputs.len()
         ));
     }
@@ -800,10 +975,17 @@ fn validate_claim_metadata(
             }
             continue;
         }
-        let expected = if matches!(index, 2 | 4 | 6) {
-            DataType::Uint8
-        } else {
-            DataType::Float32
+        let expected = match index {
+            BQMOE_FC1_WEIGHT => projection_weight_dtype(formats.fc1),
+            BQMOE_FC2_WEIGHT => projection_weight_dtype(formats.fc2),
+            BQMOE_FC3_WEIGHT => formats
+                .fc3
+                .map(projection_weight_dtype)
+                .unwrap_or(DataType::Undefined),
+            BQMOE_FC1_SCALE | BQMOE_FC2_SCALE | BQMOE_FC3_SCALE => {
+                projection_scale_dtype_for_index(index, formats).unwrap_or(DataType::Undefined)
+            }
+            _ => DataType::Float32,
         };
         if dtypes[index] != expected {
             return Err(format!(
@@ -824,15 +1006,22 @@ fn validate_claim_metadata(
             shapes[1].len()
         ));
     }
-    for &index in &[2, 4] {
-        if shapes[index].len() != 4 {
-            return Err(format!(
-                "input {index} ('{}') rank {} unsupported; expected 4",
-                INPUT_NAMES[index],
-                shapes[index].len()
-            ));
-        }
-    }
+    validate_claim_projection(
+        node,
+        shapes,
+        dtypes,
+        BQMOE_FC1_WEIGHT,
+        BQMOE_FC1_SCALE,
+        formats.fc1,
+    )?;
+    validate_claim_projection(
+        node,
+        shapes,
+        dtypes,
+        BQMOE_FC2_WEIGHT,
+        BQMOE_FC2_SCALE,
+        formats.fc2,
+    )?;
     for &index in &[3, 5, 7, 8] {
         if node.inputs.get(index).is_some_and(Option::is_some) && shapes[index].len() != 2 {
             return Err(format!(
@@ -842,13 +1031,88 @@ fn validate_claim_metadata(
             ));
         }
     }
-    if node.inputs.get(6).is_some_and(Option::is_some) && shapes[6].len() != 4 {
-        return Err(format!(
-            "input 6 ('fc3_experts_weights') rank {} unsupported; expected 4",
-            shapes[6].len()
-        ));
+    if let Some(format) = formats.fc3 {
+        validate_claim_projection(
+            node,
+            shapes,
+            dtypes,
+            BQMOE_FC3_WEIGHT,
+            BQMOE_FC3_SCALE,
+            format,
+        )?;
     }
     validate_partial_claim_shapes(node, shapes, attributes, formats)?;
+    Ok(())
+}
+
+fn projection_weight_dtype(format: ProjectionFormat) -> DataType {
+    match format {
+        ProjectionFormat::Interleaved(_) => DataType::Uint8,
+        ProjectionFormat::Planar(geometry) => geometry.format.weight_dtype(),
+    }
+}
+
+fn projection_scale_dtype_for_index(index: usize, formats: ProjectionFormats) -> Option<DataType> {
+    let format = match index {
+        BQMOE_FC1_SCALE => Some(formats.fc1),
+        BQMOE_FC2_SCALE => Some(formats.fc2),
+        BQMOE_FC3_SCALE => formats.fc3,
+        _ => None,
+    }?;
+    match format {
+        ProjectionFormat::Planar(geometry) => Some(geometry.format.scale_dtype()),
+        ProjectionFormat::Interleaved(_) => None,
+    }
+}
+
+fn validate_claim_projection(
+    node: &Node,
+    shapes: &[Shape],
+    dtypes: &[DataType],
+    weight_index: usize,
+    scale_index: usize,
+    format: ProjectionFormat,
+) -> std::result::Result<(), String> {
+    let (weight_rank, scale_required) = match format {
+        ProjectionFormat::Interleaved(_) => (4, false),
+        ProjectionFormat::Planar(_) => (3, true),
+    };
+    if shapes[weight_index].len() != weight_rank {
+        return Err(format!(
+            "input {weight_index} ('{}') rank {} unsupported; expected {weight_rank}",
+            INPUT_NAMES[weight_index],
+            shapes[weight_index].len()
+        ));
+    }
+    let scale_wired = node.inputs[scale_index].is_some();
+    if scale_wired != scale_required {
+        return Err(if scale_required {
+            format!(
+                "input {scale_index} ('{}') is required for planar format",
+                INPUT_NAMES[scale_index]
+            )
+        } else {
+            format!(
+                "input {scale_index} ('{}') must be omitted for interleaved format",
+                INPUT_NAMES[scale_index]
+            )
+        });
+    }
+    if scale_required {
+        if dtypes[scale_index] != DataType::Float8E8M0 {
+            return Err(format!(
+                "input {scale_index} ('{}') dtype {:?} unsupported; expected Float8E8M0",
+                INPUT_NAMES[scale_index], dtypes[scale_index]
+            ));
+        }
+        if shapes[scale_index].len() != 3 {
+            return Err(format!(
+                "input {scale_index} ('{}') rank {} unsupported; expected 3",
+                INPUT_NAMES[scale_index],
+                shapes[scale_index].len()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -885,22 +1149,6 @@ fn validate_partial_claim_shapes(
             "fc2 output width {fc2_hidden} must equal hidden size {hidden}"
         ));
     }
-    if let Some(block_bytes) = shapes[2][3].as_static()
-        && block_bytes != formats.fc1.block_bytes()
-    {
-        return Err(format!(
-            "fc1 block byte width {block_bytes} must equal {}",
-            formats.fc1.block_bytes()
-        ));
-    }
-    if let Some(block_bytes) = shapes[4][3].as_static()
-        && block_bytes != formats.fc2.block_bytes()
-    {
-        return Err(format!(
-            "fc2 block byte width {block_bytes} must equal {}",
-            formats.fc2.block_bytes()
-        ));
-    }
     let fc1_size = shapes[2][1].as_static();
     let inter = fc1_size.and_then(|fc1_size| {
         if attributes.swiglu_fusion == 0 {
@@ -915,8 +1163,24 @@ fn validate_partial_claim_shapes(
     if inter == Some(0) {
         return Err("inferred inter dimension must be non-zero".into());
     }
-    check_static_packed_shape(shapes, 2, experts, fc1_size, hidden, formats.fc1)?;
-    check_static_packed_shape(shapes, 4, experts, hidden, inter, formats.fc2)?;
+    check_static_projection_shape(
+        shapes,
+        BQMOE_FC1_WEIGHT,
+        BQMOE_FC1_SCALE,
+        experts,
+        fc1_size,
+        hidden,
+        formats.fc1,
+    )?;
+    check_static_projection_shape(
+        shapes,
+        BQMOE_FC2_WEIGHT,
+        BQMOE_FC2_SCALE,
+        experts,
+        hidden,
+        inter,
+        formats.fc2,
+    )?;
     check_static_optional_shape(node, shapes, 3, experts, fc1_size)?;
     check_static_optional_shape(node, shapes, 5, experts, hidden)?;
 
@@ -928,13 +1192,69 @@ fn validate_partial_claim_shapes(
         let fc3_format = formats
             .fc3
             .ok_or_else(|| "fc3_experts_weights requires the fc3_format attribute".to_string())?;
-        check_static_packed_shape(shapes, 6, experts, inter, hidden, fc3_format)?;
+        check_static_projection_shape(
+            shapes,
+            BQMOE_FC3_WEIGHT,
+            BQMOE_FC3_SCALE,
+            experts,
+            inter,
+            hidden,
+            fc3_format,
+        )?;
         check_static_optional_shape(node, shapes, 7, experts, inter)?;
     } else if has_fc3 || node.inputs.get(7).is_some_and(Option::is_some) {
         return Err("fc3 inputs are only valid for unfused swiglu or silu gated-GLU".into());
     }
     check_static_optional_shape(node, shapes, 8, rows, experts)?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_static_projection_shape(
+    shapes: &[Shape],
+    weight_index: usize,
+    scale_index: usize,
+    experts: Option<usize>,
+    out_features: Option<usize>,
+    in_features: Option<usize>,
+    format: ProjectionFormat,
+) -> std::result::Result<(), String> {
+    match format {
+        ProjectionFormat::Interleaved(format) => check_static_packed_shape(
+            shapes,
+            weight_index,
+            experts,
+            out_features,
+            in_features,
+            format,
+        ),
+        ProjectionFormat::Planar(geometry) => {
+            check_static_axis(shapes, weight_index, 0, experts, "expert count")?;
+            check_static_axis(shapes, weight_index, 1, out_features, "output width")?;
+            check_static_axis(
+                shapes,
+                weight_index,
+                2,
+                in_features.map(|width| width / geometry.format.pack_factor()),
+                "packed input width",
+            )?;
+            check_static_axis(shapes, scale_index, 0, experts, "expert count")?;
+            check_static_axis(
+                shapes,
+                scale_index,
+                1,
+                out_features.map(|width| width.div_ceil(geometry.block_out)),
+                "scale row count",
+            )?;
+            check_static_axis(
+                shapes,
+                scale_index,
+                2,
+                in_features.map(|width| width.div_ceil(geometry.block_in)),
+                "scale column count",
+            )
+        }
+    }
 }
 
 fn check_static_packed_shape(
@@ -1036,6 +1356,129 @@ fn validate_bias(inputs: &[TensorView], index: usize, experts: usize, width: usi
     Ok(())
 }
 
+fn validate_projection_dtypes(
+    inputs: &[TensorView],
+    weight_index: usize,
+    scale_index: usize,
+    format: ProjectionFormat,
+) -> Result<()> {
+    match format {
+        ProjectionFormat::Interleaved(_) => {
+            require_dtype(weight_index, &inputs[weight_index], DataType::Uint8)?;
+            if optional_input(inputs, scale_index).is_some() {
+                return Err(error(format!(
+                    "{} must be omitted for interleaved format",
+                    INPUT_NAMES[scale_index]
+                )));
+            }
+        }
+        ProjectionFormat::Planar(geometry) => {
+            require_dtype(
+                weight_index,
+                &inputs[weight_index],
+                geometry.format.weight_dtype(),
+            )?;
+            let scale = optional_input(inputs, scale_index).ok_or_else(|| {
+                error(format!(
+                    "{} is required for {}",
+                    INPUT_NAMES[scale_index],
+                    geometry.format.capability_str()
+                ))
+            })?;
+            require_dtype(scale_index, scale, geometry.format.scale_dtype())?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_planar_values(
+    inputs: &[TensorView],
+    dimensions: Dimensions,
+    formats: ProjectionFormats,
+) -> Result<()> {
+    for (weight_index, scale_index, format, out_features, in_features) in [
+        (
+            BQMOE_FC1_WEIGHT,
+            BQMOE_FC1_SCALE,
+            formats.fc1,
+            dimensions.fc1_size,
+            dimensions.hidden,
+        ),
+        (
+            BQMOE_FC2_WEIGHT,
+            BQMOE_FC2_SCALE,
+            formats.fc2,
+            dimensions.hidden,
+            dimensions.inter,
+        ),
+    ]
+    .into_iter()
+    .chain(formats.fc3.into_iter().map(|format| {
+        (
+            BQMOE_FC3_WEIGHT,
+            BQMOE_FC3_SCALE,
+            format,
+            dimensions.inter,
+            dimensions.hidden,
+        )
+    })) {
+        let ProjectionFormat::Planar(geometry) = format else {
+            continue;
+        };
+        let layout = PlanarLayout::new(
+            geometry.format,
+            out_features,
+            in_features,
+            geometry.block_out,
+            geometry.block_in,
+        )?;
+        let packed = tensor_bytes(&inputs[weight_index])?;
+        let scale = tensor_bytes(
+            optional_input(inputs, scale_index)
+                .ok_or_else(|| error(format!("{} is required", INPUT_NAMES[scale_index])))?,
+        )?;
+        validate_planar_expert_bank_values(
+            &layout,
+            dimensions.experts,
+            packed.as_ref(),
+            scale.as_ref(),
+        )?;
+    }
+    Ok(())
+}
+
+fn tensor_bytes<'a>(tensor: &'a TensorView<'_>) -> Result<Cow<'a, [u8]>> {
+    tensor.validate()?;
+    if tensor.dtype.byte_size() != 1 {
+        return Err(error(format!(
+            "planar tensor dtype {:?} must have one-byte elements",
+            tensor.dtype
+        )));
+    }
+    if tensor.is_contiguous() {
+        let len = tensor.byte_size();
+        // SAFETY: validation proves the contiguous tensor covers `len` bytes.
+        return Ok(Cow::Borrowed(unsafe {
+            std::slice::from_raw_parts(tensor.data_ptr::<u8>(), len)
+        }));
+    }
+    let elements = checked_product(tensor.shape, "planar tensor element count")?;
+    let mut dense = Vec::with_capacity(elements);
+    let origin = tensor.data_ptr::<u8>();
+    let mut index = vec![0usize; tensor.shape.len()];
+    for linear in 0..elements {
+        let mut value = linear;
+        for axis in (0..tensor.shape.len()).rev() {
+            index[axis] = value % tensor.shape[axis];
+            value /= tensor.shape[axis];
+        }
+        let offset = crate::strided::elem_offset(tensor.strides, &index);
+        // SAFETY: each generated logical index is within the validated view.
+        dense.push(unsafe { *origin.offset(offset) });
+    }
+    Ok(Cow::Owned(dense))
+}
+
 fn require_exact_rank(index: usize, shape: &[usize], expected: usize) -> Result<()> {
     if shape.len() != expected {
         return Err(error(format!(
@@ -1070,15 +1513,6 @@ fn checked_product(shape: &[usize], name: &str) -> Result<usize> {
             .checked_mul(dimension)
             .ok_or_else(|| error(format!("{name} overflow")))
     })
-}
-
-fn optional_int_attr(node: &Node, name: &str) -> Result<Option<i64>> {
-    node.attr(name)
-        .map(|attr| {
-            attr.as_int()
-                .ok_or_else(|| error(format!("attribute '{name}' must be an integer")))
-        })
-        .transpose()
 }
 
 fn error(message: impl Into<String>) -> EpError {
@@ -1139,7 +1573,9 @@ mod tests {
     ) -> (Graph, NodeId) {
         let mut graph = Graph::new();
         graph.opset_imports.insert("pkg.nxrt".into(), 1);
-        let inputs = shapes
+        let mut padded_shapes = shapes.to_vec();
+        padded_shapes.resize(INPUT_COUNT, None);
+        let inputs = padded_shapes
             .iter()
             .enumerate()
             .map(|(index, input)| {
@@ -1285,6 +1721,7 @@ mod tests {
         if router_weights.is_some() {
             shapes.push(Some((DataType::Float32, vec![1, experts])));
         }
+        shapes.resize(INPUT_COUNT, None);
         let (graph, node) = model_node(&shapes, attrs);
         let kernel = CpuExecutionProvider::new()
             .get_kernel(
@@ -1317,6 +1754,11 @@ mod tests {
         ];
         if let Some(router) = &router {
             views.push(router.view());
+        } else {
+            views.push(TensorView::absent(DataType::Undefined));
+        }
+        while views.len() < INPUT_COUNT {
+            views.push(TensorView::absent(DataType::Undefined));
         }
         let mut output = Owned::f32(&[1, H], &[0.0; H]);
         kernel
@@ -1343,7 +1785,7 @@ mod tests {
         let logits_values = [4.0, -4.0];
         let fc1_values = identity_projection([2, 4]);
         let fc2_values = identity_projection([2, 2]);
-        let shapes = vec![
+        let mut shapes = vec![
             Some((DataType::Float32, vec![1, H])),
             Some((DataType::Float32, vec![1, experts])),
             Some((DataType::Uint8, vec![experts, fc1_out, 1, 17])),
@@ -1353,6 +1795,7 @@ mod tests {
             None,
             None,
         ];
+        shapes.resize(INPUT_COUNT, None);
         let (graph, node) = model_node(&shapes, &attrs("identity", 1, false, 0));
         let ValidatedMetadata {
             attributes,
@@ -1361,7 +1804,7 @@ mod tests {
         let mut kernel = BlockQuantizedMoEKernel {
             attributes,
             formats,
-            constant_inputs: [false; 9],
+            constant_inputs: [false; INPUT_COUNT],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
             weight_cache: DenseWeightCache::new(),
         };
@@ -1380,6 +1823,10 @@ mod tests {
             TensorView::absent(DataType::Float32),
             TensorView::absent(DataType::Uint8),
             TensorView::absent(DataType::Float32),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
         ];
         let mut output = Owned::f32(&[1, H], &[0.0; H]);
 
@@ -1453,7 +1900,7 @@ mod tests {
         let logits_values: Vec<f32> = (0..ROWS).flat_map(|_| [4.0f32, -4.0]).collect();
         let fc1_values = identity_projection([2, 4]);
         let fc2_values = identity_projection([2, 2]);
-        let shapes = vec![
+        let mut shapes = vec![
             Some((DataType::Float32, vec![ROWS, H])),
             Some((DataType::Float32, vec![ROWS, experts])),
             Some((DataType::Uint8, vec![experts, fc1_out, 1, 17])),
@@ -1463,6 +1910,7 @@ mod tests {
             None,
             None,
         ];
+        shapes.resize(INPUT_COUNT, None);
         let (graph, node) = model_node(&shapes, &attrs("identity", 1, false, 0));
         let ValidatedMetadata {
             attributes,
@@ -1471,7 +1919,7 @@ mod tests {
         let mut kernel = BlockQuantizedMoEKernel {
             attributes,
             formats,
-            constant_inputs: [false; 9],
+            constant_inputs: [false; INPUT_COUNT],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
             // The default ceiling, pinned rather than inherited: `new()` reads
             // `ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES` through a process-wide
@@ -1497,6 +1945,10 @@ mod tests {
             TensorView::absent(DataType::Float32),
             TensorView::absent(DataType::Uint8),
             TensorView::absent(DataType::Float32),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
         ];
         let mut output = Owned::f32(&[ROWS, H], &vec![0.0; ROWS * H]);
 
@@ -1536,6 +1988,7 @@ mod tests {
                 Some(&kernel.weight_identities[0]),
                 1,
                 &fc1.view(),
+                None,
                 0,
                 fc1_out,
                 H,
@@ -1548,6 +2001,7 @@ mod tests {
                 Some(&kernel.weight_identities[0]),
                 1,
                 &fc1.view(),
+                None,
                 0,
                 fc1_out,
                 H,
@@ -1568,6 +2022,7 @@ mod tests {
                 Some(&kernel.weight_identities[0]),
                 1,
                 &fc1.view(),
+                None,
                 1,
                 fc1_out,
                 H,
@@ -1615,7 +2070,7 @@ mod tests {
             let mut kernel = BlockQuantizedMoEKernel {
                 attributes,
                 formats,
-                constant_inputs: [false; 9],
+                constant_inputs: [false; INPUT_COUNT],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
                 weight_cache: DenseWeightCache::new(),
             };
@@ -1639,6 +2094,10 @@ mod tests {
                 TensorView::absent(DataType::Float32),
                 fc3.view(),
                 TensorView::absent(DataType::Float32),
+                TensorView::absent(DataType::Undefined),
+                TensorView::absent(DataType::Undefined),
+                TensorView::absent(DataType::Undefined),
+                TensorView::absent(DataType::Undefined),
             ];
             let mut output = Owned::f32(&[1, H], &[0.0; H]);
             kernel
@@ -1646,17 +2105,23 @@ mod tests {
                 .expect("execute gated BlockQuantizedMoE with runtime fc3");
 
             let expert_bytes = H * 17;
+            let ProjectionFormat::Interleaved(fc1_format) = formats.fc1 else {
+                unreachable!()
+            };
+            let ProjectionFormat::Interleaved(fc2_format) = formats.fc2 else {
+                unreachable!()
+            };
             let dense_fc1 =
-                dequantize_expert_slice(formats.fc1, &fc1_values[..expert_bytes], H, H).unwrap();
+                dequantize_expert_slice(fc1_format, &fc1_values[..expert_bytes], H, H).unwrap();
             let dense_fc2 =
-                dequantize_expert_slice(formats.fc2, &fc2_values[..expert_bytes], H, H).unwrap();
-            let dense_fc3 = dequantize_expert_slice(
-                formats.fc3.expect("fc3_format present for gated path"),
-                &fc3_values[..expert_bytes],
-                H,
-                H,
-            )
-            .unwrap();
+                dequantize_expert_slice(fc2_format, &fc2_values[..expert_bytes], H, H).unwrap();
+            let ProjectionFormat::Interleaved(fc3_format) =
+                formats.fc3.expect("fc3_format present for gated path")
+            else {
+                unreachable!()
+            };
+            let dense_fc3 =
+                dequantize_expert_slice(fc3_format, &fc3_values[..expert_bytes], H, H).unwrap();
             let expected = run_expert_grouped(
                 &input_values,
                 1,
@@ -1728,8 +2193,8 @@ mod tests {
                 attributes,
                 formats,
             } = validate_metadata(graph.node(node), None).expect("valid block format");
-            assert_eq!(formats.fc1, expected_format);
-            assert_eq!(formats.fc2, expected_format);
+            assert_eq!(formats.fc1, ProjectionFormat::Interleaved(expected_format));
+            assert_eq!(formats.fc2, ProjectionFormat::Interleaved(expected_format));
             let input_values: Vec<f32> = (0..hidden)
                 .map(|index| ((index * 7 % 23) as f32 - 11.0) / 16.0)
                 .collect();
@@ -1746,12 +2211,16 @@ mod tests {
                 TensorView::absent(DataType::Float32),
                 TensorView::absent(DataType::Uint8),
                 TensorView::absent(DataType::Float32),
+                TensorView::absent(DataType::Undefined),
+                TensorView::absent(DataType::Undefined),
+                TensorView::absent(DataType::Undefined),
+                TensorView::absent(DataType::Undefined),
             ];
 
             let uncached = BlockQuantizedMoEKernel {
                 attributes,
                 formats,
-                constant_inputs: [false; 9],
+                constant_inputs: [false; INPUT_COUNT],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
                 weight_cache: DenseWeightCache::new(),
             };
@@ -1763,7 +2232,7 @@ mod tests {
             let mut cached = BlockQuantizedMoEKernel {
                 attributes,
                 formats,
-                constant_inputs: [false; 9],
+                constant_inputs: [false; INPUT_COUNT],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
                 weight_cache: DenseWeightCache::new(),
             };
@@ -2083,8 +2552,182 @@ mod tests {
         assert_close(&actual, &[1.0; H]);
     }
 
-    fn claim_fixture() -> (Graph, NodeId, Vec<Shape>, Vec<DataType>) {
+    fn one_byte_tensor(dtype: DataType, shape: &[usize], fill: u8) -> Owned {
+        Owned {
+            bytes: vec![fill; shape.iter().product()],
+            shape: shape.to_vec(),
+            strides: onnx_runtime_ir::compute_contiguous_strides(shape),
+            dtype,
+        }
+    }
+
+    #[test]
+    fn planar_fp8_and_fp4_projections_execute_through_production_moe() {
+        let mut spec = attrs("identity", 1, true, 0);
+        spec[0] = ("fc1_format", Attribute::String(b"block_fp8".to_vec()));
+        spec[1] = ("fc2_format", Attribute::String(b"fp4_planar".to_vec()));
+        spec.extend([
+            ("fc1_block_size_out", Attribute::Int(H as i64)),
+            ("fc1_block_size_in", Attribute::Int(H as i64)),
+            ("fc2_block_size_out", Attribute::Int(1)),
+            ("fc2_block_size_in", Attribute::Int(H as i64)),
+        ]);
         let shapes = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Float8E4M3FN, vec![E, H, H])),
+            None,
+            Some((DataType::Int8, vec![E, H, H / 2])),
+            None,
+            None,
+            None,
+            None,
+            Some((DataType::Float8E8M0, vec![E, 1, 1])),
+            Some((DataType::Float8E8M0, vec![E, H, 1])),
+            None,
+        ];
+        let (graph, node) = model_node(&shapes, &spec);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(
+                graph.node(node),
+                &shapes
+                    .iter()
+                    .map(|input| {
+                        input
+                            .as_ref()
+                            .map_or_else(Vec::new, |(_, shape)| shape.clone())
+                    })
+                    .collect::<Vec<_>>(),
+                1,
+            )
+            .expect("planar BlockQuantizedMoE kernel");
+        let input = Owned::f32(&[1, H], &[1.0; H]);
+        let logits = Owned::f32(&[1, E], &[4.0, -4.0]);
+        let fc1 = one_byte_tensor(DataType::Float8E4M3FN, &[E, H, H], 0x38);
+        let fc2 = one_byte_tensor(DataType::Int8, &[E, H, H / 2], 0x22);
+        let fc1_scale = one_byte_tensor(DataType::Float8E8M0, &[E, 1, 1], 127);
+        let fc2_scale = one_byte_tensor(DataType::Float8E8M0, &[E, H, 1], 127);
+        let views = [
+            input.view(),
+            logits.view(),
+            fc1.view(),
+            TensorView::absent(DataType::Undefined),
+            fc2.view(),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            fc1_scale.view(),
+            fc2_scale.view(),
+            TensorView::absent(DataType::Undefined),
+        ];
+        let before =
+            BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut output = Owned::zeros_f32(&[1, H]);
+        kernel
+            .execute(&views, &mut [output.view_mut()])
+            .expect("execute planar BlockQuantizedMoE");
+        assert_close(&output.to_f32(), &[1024.0; H]);
+        assert!(
+            BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                > before,
+            "production BlockQuantizedMoE execute path must be reached"
+        );
+    }
+
+    #[test]
+    fn planar_moe_rejects_missing_scale_and_reserved_values() {
+        let mut spec = attrs("identity", 1, true, 0);
+        spec[0] = ("fc1_format", Attribute::String(b"block_fp8".to_vec()));
+        spec.extend([
+            ("fc1_block_size_out", Attribute::Int(H as i64)),
+            ("fc1_block_size_in", Attribute::Int(H as i64)),
+        ]);
+        let mut shapes = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Float8E4M3FN, vec![E, H, H])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let (graph, node) = model_node(&shapes, &spec);
+        let claim_shapes = shapes
+            .iter()
+            .map(|input| {
+                input
+                    .as_ref()
+                    .map_or_else(Vec::new, |(_, shape)| static_shape(shape.iter().copied()))
+            })
+            .collect::<Vec<_>>();
+        let dtypes = shapes
+            .iter()
+            .map(|input| {
+                input
+                    .as_ref()
+                    .map_or(DataType::Undefined, |(dtype, _)| *dtype)
+            })
+            .collect::<Vec<_>>();
+        let rejected = CpuExecutionProvider::new().supports_op(
+            graph.node(node),
+            1,
+            &claim_shapes,
+            &dtypes,
+            &[],
+        );
+        assert!(rejected.reason().unwrap().contains("required for planar"));
+
+        shapes[BQMOE_FC1_SCALE] = Some((DataType::Float8E8M0, vec![E, 1, 1]));
+        let (graph, node) = model_node(&shapes, &spec);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(
+                graph.node(node),
+                &shapes
+                    .iter()
+                    .map(|input| {
+                        input
+                            .as_ref()
+                            .map_or_else(Vec::new, |(_, shape)| shape.clone())
+                    })
+                    .collect::<Vec<_>>(),
+                1,
+            )
+            .unwrap();
+        let input = Owned::f32(&[1, H], &[1.0; H]);
+        let logits = Owned::f32(&[1, E], &[4.0, -4.0]);
+        let fc1 = one_byte_tensor(DataType::Float8E4M3FN, &[E, H, H], 0x7f);
+        let fc2 = Owned::u8(&[E, H, 1, 17], &packed_matrix(E, H, |_, _, _| 0));
+        let fc1_scale = one_byte_tensor(DataType::Float8E8M0, &[E, 1, 1], 127);
+        let views = [
+            input.view(),
+            logits.view(),
+            fc1.view(),
+            TensorView::absent(DataType::Undefined),
+            fc2.view(),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            fc1_scale.view(),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+        ];
+        let mut output = Owned::zeros_f32(&[1, H]);
+        let error = kernel
+            .execute(&views, &mut [output.view_mut()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved E4M3"), "{error}");
+    }
+
+    fn claim_fixture() -> (Graph, NodeId, Vec<Shape>, Vec<DataType>) {
+        let mut shapes = vec![
             Some((DataType::Float32, vec![1, H])),
             Some((DataType::Float32, vec![1, E])),
             Some((DataType::Uint8, vec![E, H, 1, 17])),
@@ -2094,6 +2737,7 @@ mod tests {
             None,
             None,
         ];
+        shapes.resize(INPUT_COUNT, None);
         let (graph, node) = model_node(&shapes, &attrs("identity", 1, false, 0));
         let claim_shapes = shapes
             .iter()
@@ -2158,12 +2802,12 @@ mod tests {
         shapes.truncate(4);
         dtypes.truncate(4);
         let rejected = ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]);
-        assert!(rejected.reason().unwrap().contains("5 to 9"));
+        assert!(rejected.reason().unwrap().contains("exactly 12"));
     }
 
     #[test]
     fn block_quantized_moe_claim_gate_rejects_static_optional_and_fc3_errors_with_symbolic_dims() {
-        let inputs = vec![
+        let mut inputs = vec![
             Some((DataType::Float32, vec![1, H])),
             Some((DataType::Float32, vec![1, E])),
             Some((DataType::Uint8, vec![E, H, 1, 17])),
@@ -2174,6 +2818,7 @@ mod tests {
             Some((DataType::Float32, vec![E, H])),
             Some((DataType::Float32, vec![1, E])),
         ];
+        inputs.resize(INPUT_COUNT, None);
         let (graph, node) = model_node(
             &inputs,
             &with_fc3_format(attrs("swiglu", 1, false, 0), "mxfp4"),
@@ -2255,14 +2900,14 @@ mod tests {
             attributes,
             formats,
         } = validate_metadata(graph.node(node), None).expect("valid mixed-format metadata");
-        assert_eq!(formats.fc1, fc1_format);
-        assert_eq!(formats.fc2, fc2_format);
+        assert_eq!(formats.fc1, ProjectionFormat::Interleaved(fc1_format));
+        assert_eq!(formats.fc2, ProjectionFormat::Interleaved(fc2_format));
         assert!(formats.fc3.is_none());
 
         let kernel = BlockQuantizedMoEKernel {
             attributes,
             formats,
-            constant_inputs: [false; 9],
+            constant_inputs: [false; INPUT_COUNT],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
             weight_cache: DenseWeightCache::new(),
         };
@@ -2283,6 +2928,10 @@ mod tests {
             TensorView::absent(DataType::Float32),
             TensorView::absent(DataType::Uint8),
             TensorView::absent(DataType::Float32),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
         ];
         let mut output = Owned::f32(&[1, HID], &vec![0.0; HID]);
         kernel
@@ -2368,14 +3017,14 @@ mod tests {
             attributes,
             formats,
         } = validate_metadata(graph.node(node), None).expect("valid mixed gated metadata");
-        assert_eq!(formats.fc1, fc1_format);
-        assert_eq!(formats.fc2, fc2_format);
-        assert_eq!(formats.fc3, Some(fc3_format));
+        assert_eq!(formats.fc1, ProjectionFormat::Interleaved(fc1_format));
+        assert_eq!(formats.fc2, ProjectionFormat::Interleaved(fc2_format));
+        assert_eq!(formats.fc3, Some(ProjectionFormat::Interleaved(fc3_format)));
 
         let kernel = BlockQuantizedMoEKernel {
             attributes,
             formats,
-            constant_inputs: [false; 9],
+            constant_inputs: [false; INPUT_COUNT],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
             weight_cache: DenseWeightCache::new(),
         };
@@ -2394,6 +3043,10 @@ mod tests {
             TensorView::absent(DataType::Float32),
             fc3_view.view(),
             TensorView::absent(DataType::Float32),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
+            TensorView::absent(DataType::Undefined),
         ];
         let mut output = Owned::f32(&[1, HID], &vec![0.0; HID]);
         kernel

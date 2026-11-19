@@ -100,6 +100,8 @@ def main() -> None:
         formats[format_name] += 1
         assert attrs["block_layout_version"] == 1
         assert attrs["K"] > 0 and attrs["N"] > 0
+        assert len(node.input) == 4
+        assert node.input[2] == "", "interleaved formats must omit aux_scale_B"
         if len(samples) < 3:
             samples.append(
                 {
