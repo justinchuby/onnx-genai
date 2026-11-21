@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 
 use onnx_runtime_ep_api::{
     EpError, ExternalMmapRegion, Kernel, KernelFactory, Result, TensorBacking, TensorMut,
@@ -419,44 +419,23 @@ impl Kernel for QMoEKernel {
 
             let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
             let ordered: Vec<RoutedExpert> = tasks.into_iter().collect();
-            let cache_operation = self.host_cache.begin_operation()?;
-
-            // Eviction-neutrality guard for the prefetch pipeline.
-            //
-            // The pipeline holds the current expert `n`'s lease (an `Arc`) while
-            // the worker admits expert `n+1`, so entry `n` has
-            // `strong_count >= 2` and is excluded from the eviction candidate set
-            // during that admission. The serial loop has already dropped `n`
-            // before leasing `n+1`, so it *can* evict `n`. Because the host cache
-            // evicts by ascending `(frequency, last_used)`, the just-loaded,
-            // low-frequency expert `n` is frequently exactly the victim serial
-            // picks — yet the pipeline cannot evict it without letting real host
-            // memory exceed the configured budget. The two paths then retain
-            // different experts, diverging hits/misses/evictions/bytes-read and
-            // sometimes reading *more* mmap bytes than serial.
-            //
-            // We therefore engage the pipeline only where it is *provably*
-            // eviction-neutral — where no host-cache eviction can occur while a
-            // prefetch is in flight, so the pinned in-flight expert can never be
-            // a victim:
-            //
-            //   * `budget == 0`: the host cache is disabled; every lease streams
-            //     its expert from mmap in deterministic ascending order, so there
-            //     is no admission/eviction state to perturb; or
-            //   * `budget >= experts * expanded_bytes`: the whole layer's expert
-            //     set fits resident, so the cache admits without ever evicting.
-            //
-            // In both regimes admission/eviction and every counter are
-            // byte-identical to serial, so output *and* cache statistics match
-            // exactly and bytes-read can never regress. Under an intermediate
-            // (partial-cache) budget the pipeline transparently falls back to the
-            // serial route-first loop, which is byte- and stat-identical to the
-            // pre-prefetch baseline.
-            let budget = cache_operation.budget_bytes;
-            let prefetch_is_eviction_neutral = budget == 0
-                || (experts as u128)
-                    .checked_mul(expanded_bytes as u128)
-                    .is_some_and(|resident| resident <= budget as u128);
+            let cache_operation = self.host_cache.begin_operation(
+                ExpertCacheKey::new(
+                    self.layer_id,
+                    0,
+                    self.bits,
+                    self.block_size,
+                    &fc1,
+                    &fc2,
+                    fc3.as_ref(),
+                ),
+                experts,
+                expanded_bytes,
+            )?;
+            // Every bank with an active operation or retained entry participates
+            // in the capacity proof. The operation freezes that registry until
+            // its worker finishes, so another layer cannot invalidate the proof
+            // by registering and admitting a previously unseen bank midway.
             let compute = |expert: usize,
                            expert_tasks: &[(usize, usize, f32)],
                            weights: &DequantizedExpert,
@@ -478,7 +457,10 @@ impl Kernel for QMoEKernel {
                 )
             };
 
-            if self.prefetch_experts && ordered.len() > 1 && prefetch_is_eviction_neutral {
+            if self.prefetch_experts
+                && ordered.len() > 1
+                && cache_operation.prefetch_eligibility().allows_pipeline()
+            {
                 // Single-ahead prefetch pipeline: a dedicated worker leases
                 // (and, on a miss, dequantizes) expert `n+1` while the main
                 // thread computes expert `n`, overlapping the host-side
@@ -488,9 +470,6 @@ impl Kernel for QMoEKernel {
                 // and every counter stay byte-identical to the serial path —
                 // only the wall-clock overlaps.
                 use std::sync::mpsc;
-                let layer_id = self.layer_id;
-                let bits = self.bits;
-                let block_size = self.block_size;
                 let host_cache = &cache_operation;
                 let fc1_ref = &fc1;
                 let fc2_ref = &fc2;
@@ -503,15 +482,7 @@ impl Kernel for QMoEKernel {
                         while let Ok(index) = req_rx.recv() {
                             let expert = ordered_ref[index].0;
                             let leased = lease_route_first_expert(
-                                host_cache,
-                                layer_id,
-                                bits,
-                                block_size,
-                                expert,
-                                expanded_bytes,
-                                fc1_ref,
-                                fc2_ref,
-                                fc3_ref,
+                                host_cache, expert, fc1_ref, fc2_ref, fc3_ref,
                             );
                             if res_tx.send(leased).is_err() {
                                 break;
@@ -539,11 +510,7 @@ impl Kernel for QMoEKernel {
                 for (expert, expert_tasks) in &ordered {
                     let weights = lease_route_first_expert(
                         &cache_operation,
-                        self.layer_id,
-                        self.bits,
-                        self.block_size,
                         *expert,
-                        expanded_bytes,
                         &fc1,
                         &fc2,
                         fc3.as_ref(),
@@ -719,7 +686,25 @@ impl Deref for ExpertLease {
     }
 }
 
+/// Identity is derived from the canonical expert key, with expert zero as the
+/// bank representative; the cardinality completes its capacity bound.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ExpertBankKey {
+    representative: ExpertCacheKey,
+    experts: usize,
+}
+
+struct ExpertBank {
+    key: ExpertBankKey,
+    expanded_bytes: usize,
+}
+
+type ExpertBanks = BTreeMap<ExpertBankKey, Weak<ExpertBank>>;
+
 struct HostCacheEntry {
+    // Retained payloads keep their bank in the shared capacity proof even after
+    // the operation (or compiled kernel) that created them has finished.
+    _bank: Arc<ExpertBank>,
     weights: Arc<DequantizedExpert>,
     expanded_bytes: usize,
     frequency: u64,
@@ -751,12 +736,13 @@ const HISTORY_EXPIRY_WINDOW: u64 = HISTORY_DECAY_WINDOW * 256;
 const MAX_ADMISSION_HISTORY_ENTRIES: usize = 4096;
 
 impl HostExpertCache {
-    fn lease<F>(
+    fn lease_registered<F>(
         &mut self,
         key: ExpertCacheKey,
         expanded_bytes: usize,
         budget_bytes: usize,
         load: F,
+        bank: Arc<ExpertBank>,
     ) -> Result<ExpertLease>
     where
         F: FnOnce() -> Result<DequantizedExpert>,
@@ -888,6 +874,7 @@ impl HostExpertCache {
         self.entries.insert(
             key,
             HostCacheEntry {
+                _bank: bank,
                 weights: Arc::clone(&weights),
                 expanded_bytes,
                 frequency: candidate_frequency,
@@ -899,6 +886,29 @@ impl HostExpertCache {
             weights,
             read_from_mmap: true,
         })
+    }
+
+    #[cfg(test)]
+    fn lease<F>(
+        &mut self,
+        key: ExpertCacheKey,
+        expanded_bytes: usize,
+        budget_bytes: usize,
+        load: F,
+    ) -> Result<ExpertLease>
+    where
+        F: FnOnce() -> Result<DequantizedExpert>,
+    {
+        let mut representative = key.clone();
+        representative.expert = 0;
+        let bank = Arc::new(ExpertBank {
+            key: ExpertBankKey {
+                representative,
+                experts: usize::MAX,
+            },
+            expanded_bytes,
+        });
+        self.lease_registered(key, expanded_bytes, budget_bytes, load, bank)
     }
 
     fn prune_history(&mut self, now: u64) {
@@ -1033,6 +1043,7 @@ struct WeightOffloadHostCacheInner {
     // governor lease, so capacity cannot be handed back while values remain.
     cache: Mutex<HostExpertCache>,
     budget: RwLock<HostCacheBudget>,
+    banks: RwLock<ExpertBanks>,
     // Cold-path adopters serialize without holding data locks during governor
     // callbacks. Cache operations and observers never acquire this gate.
     adoption: Mutex<()>,
@@ -1044,24 +1055,91 @@ pub struct WeightOffloadHostCache {
     inner: Arc<WeightOffloadHostCacheInner>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HostPrefetchEligibility {
+    Streaming,
+    FullyResident,
+    InsufficientCapacity {
+        required_bytes: u128,
+        budget_bytes: usize,
+    },
+    CapacityOverflow,
+}
+
+impl HostPrefetchEligibility {
+    fn allows_pipeline(&self) -> bool {
+        matches!(self, Self::Streaming | Self::FullyResident)
+    }
+}
+
+enum HostBankSnapshot<'a> {
+    // A frozen zero budget cannot admit anything, so no registry lock is needed.
+    Streaming,
+    Registered(RwLockReadGuard<'a, ExpertBanks>),
+}
+
 /// Freeze one budget for a complete routed operation, including its prefetch
 /// worker. Workers borrow this view and do not reacquire the budget lock, so a
 /// queued adopting writer cannot deadlock a worker needed by the reader.
 struct HostCacheOperation<'a> {
     _budget_guard: RwLockReadGuard<'a, HostCacheBudget>,
+    banks: HostBankSnapshot<'a>,
+    bank: Arc<ExpertBank>,
     cache: &'a Mutex<HostExpertCache>,
     budget_bytes: usize,
 }
 
 impl HostCacheOperation<'_> {
-    fn lease<F>(&self, key: ExpertCacheKey, expanded_bytes: usize, load: F) -> Result<ExpertLease>
+    fn prefetch_eligibility(&self) -> HostPrefetchEligibility {
+        let HostBankSnapshot::Registered(banks) = &self.banks else {
+            return HostPrefetchEligibility::Streaming;
+        };
+        let Some(required_bytes) =
+            banks
+                .values()
+                .filter_map(Weak::upgrade)
+                .try_fold(0u128, |sum, bank| {
+                    sum.checked_add(
+                        (bank.key.experts as u128).checked_mul(bank.expanded_bytes as u128)?,
+                    )
+                })
+        else {
+            return HostPrefetchEligibility::CapacityOverflow;
+        };
+        if required_bytes <= self.budget_bytes as u128 {
+            HostPrefetchEligibility::FullyResident
+        } else {
+            HostPrefetchEligibility::InsufficientCapacity {
+                required_bytes,
+                budget_bytes: self.budget_bytes,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn registered_bank_count(&self) -> usize {
+        match &self.banks {
+            HostBankSnapshot::Streaming => 0,
+            HostBankSnapshot::Registered(banks) => banks.len(),
+        }
+    }
+
+    fn lease<F>(&self, expert: usize, load: F) -> Result<ExpertLease>
     where
         F: FnOnce() -> Result<DequantizedExpert>,
     {
+        let mut key = self.bank.key.representative.clone();
+        key.expert = expert;
         self.cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .lease(key, expanded_bytes, self.budget_bytes, load)
+            .lease_registered(
+                key,
+                self.bank.expanded_bytes,
+                self.budget_bytes,
+                load,
+                Arc::clone(&self.bank),
+            )
     }
 }
 
@@ -1076,6 +1154,7 @@ impl WeightOffloadHostCache {
             inner: Arc::new(WeightOffloadHostCacheInner {
                 cache: Mutex::new(HostExpertCache::default()),
                 budget: RwLock::new(HostCacheBudget::Local(budget_bytes)),
+                banks: RwLock::new(BTreeMap::new()),
                 adoption: Mutex::new(()),
             }),
         })
@@ -1108,6 +1187,7 @@ impl WeightOffloadHostCache {
                     authority: governor.authority_id(onnx_runtime_memory_api::Tier::Host),
                     lease,
                 }),
+                banks: RwLock::new(BTreeMap::new()),
                 adoption: Mutex::new(()),
             }),
         })
@@ -1202,15 +1282,87 @@ impl WeightOffloadHostCache {
         Ok(granted)
     }
 
-    fn begin_operation(&self) -> Result<HostCacheOperation<'_>> {
+    fn begin_operation(
+        &self,
+        mut representative: ExpertCacheKey,
+        experts: usize,
+        expanded_bytes: usize,
+    ) -> Result<HostCacheOperation<'_>> {
+        representative.expert = 0;
+        let key = ExpertBankKey {
+            representative,
+            experts,
+        };
         let budget = self
             .inner
             .budget
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let budget_bytes = budget.effective_bytes()?;
+        if budget_bytes == 0 {
+            return Ok(HostCacheOperation {
+                _budget_guard: budget,
+                banks: HostBankSnapshot::Streaming,
+                bank: Arc::new(ExpertBank {
+                    key,
+                    expanded_bytes,
+                }),
+                cache: &self.inner.cache,
+                budget_bytes,
+            });
+        }
+        // Lock order is budget -> bank registry -> payload cache. Registration
+        // is cold; readers for known banks share the lock and compute concurrently.
+        let mut banks = self
+            .inner
+            .banks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bank = if let Some(bank) = banks.get(&key).and_then(Weak::upgrade) {
+            bank
+        } else {
+            drop(banks);
+            let mut registry = self
+                .inner
+                .banks
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.retain(|_, bank| bank.strong_count() != 0);
+            let bank = registry
+                .get(&key)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let bank = Arc::new(ExpertBank {
+                        key: key.clone(),
+                        expanded_bytes,
+                    });
+                    registry.insert(key, Arc::downgrade(&bank));
+                    bank
+                });
+            drop(registry);
+            // Our strong reference keeps this registration live across the
+            // write-to-read transition; another registrar cannot prune it.
+            banks = self
+                .inner
+                .banks
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            bank
+        };
+        if bank.expanded_bytes != expanded_bytes {
+            return Err(error(format!(
+                "host expert bank layer {} ({} experts, {}-bit, block {}) changed expanded bytes from {} to {expanded_bytes} for the same source identity; use a distinct source layout",
+                bank.key.representative.layer_id,
+                bank.key.experts,
+                bank.key.representative.bits,
+                bank.key.representative.block_size,
+                bank.expanded_bytes,
+            )));
+        }
         Ok(HostCacheOperation {
             _budget_guard: budget,
+            banks: HostBankSnapshot::Registered(banks),
+            bank,
             cache: &self.inner.cache,
             budget_bytes,
         })
@@ -1221,7 +1373,9 @@ impl WeightOffloadHostCache {
     where
         F: FnOnce() -> Result<DequantizedExpert>,
     {
-        self.begin_operation()?.lease(key, expanded_bytes, load)
+        let expert = key.expert;
+        self.begin_operation(key, usize::MAX, expanded_bytes)?
+            .lease(expert, load)
     }
 
     #[cfg(test)]
@@ -1286,20 +1440,14 @@ pub(crate) fn default_weight_offload_host_cache() -> &'static WeightOffloadHostC
     CACHE.get_or_init(|| WeightOffloadHostCache::new(0).expect("zero host-cache budget is valid"))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn lease_route_first_expert(
     host_cache: &HostCacheOperation<'_>,
-    layer_id: u32,
-    bits: usize,
-    block_size: usize,
     expert: usize,
-    expanded_bytes: usize,
     fc1: &QuantizedExperts<'_>,
     fc2: &QuantizedExperts<'_>,
     fc3: Option<&QuantizedExperts<'_>>,
 ) -> Result<Arc<DequantizedExpert>> {
-    let key = ExpertCacheKey::new(layer_id, expert, bits, block_size, fc1, fc2, fc3);
-    let lease = host_cache.lease(key, expanded_bytes, || {
+    let lease = host_cache.lease(expert, || {
         DequantizedExpert::load(expert, fc1, fc2, fc3, true)
     })?;
     if lease.read_from_mmap {
@@ -3430,7 +3578,7 @@ mod tests {
         // Use owned test threads so a regression can time out without an
         // unwinding scoped join preventing this test process from finishing.
         let reader = std::thread::spawn(move || {
-            let operation = reader_cache.begin_operation().unwrap();
+            let operation = reader_cache.begin_operation(cache_key(0), 2, 4).unwrap();
             ready_tx.send(operation.budget_bytes).unwrap();
             compute_rx.recv().unwrap();
             std::thread::scope(|scope| {
@@ -3440,9 +3588,7 @@ mod tests {
                             for _ in 0..2 {
                                 drop(
                                     operation
-                                        .lease(cache_key(expert), 4, || {
-                                            Ok(adoption_expert(expert as f32))
-                                        })
+                                        .lease(expert, || Ok(adoption_expert(expert as f32)))
                                         .unwrap(),
                                 );
                             }
@@ -3550,6 +3696,7 @@ mod tests {
                     authority: books.authority,
                     lease,
                 }),
+                banks: RwLock::new(BTreeMap::new()),
                 adoption: Mutex::new(()),
             }),
         };
@@ -3764,6 +3911,217 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(cache.history.len(), 1);
+    }
+
+    #[test]
+    fn shared_bank_rejects_inconsistent_expanded_size_with_source_context() {
+        let _guard = hold_metrics_test_lock();
+        metrics().reset();
+        let cache = WeightOffloadHostCache::new(8).unwrap();
+        {
+            let operation = cache.begin_operation(cache_key(0), 1, 4).unwrap();
+            for _ in 0..2 {
+                drop(operation.lease(0, || Ok(adoption_expert(1.0))).unwrap());
+            }
+        }
+        let failure = cache
+            .begin_operation(cache_key(0), 1, 8)
+            .err()
+            .expect("reject inconsistent source metadata");
+        let message = failure.to_string();
+        assert!(message.contains("layer 7"), "{message}");
+        assert!(message.contains("from 4 to 8"), "{message}");
+        assert!(message.contains("distinct source layout"), "{message}");
+    }
+
+    #[test]
+    fn zero_budget_prefetch_needs_no_bank_registry_lock() {
+        let _guard = hold_metrics_test_lock();
+        let cache = WeightOffloadHostCache::new(0).unwrap();
+        let first = cache.begin_operation(cache_key(0), 2, 4).unwrap();
+        assert!(first.prefetch_eligibility().allows_pipeline());
+        let registry = cache
+            .inner
+            .banks
+            .try_write()
+            .expect("streaming must not lock the registry");
+        assert!(registry.is_empty());
+        let mut foreign = cache_key(0);
+        foreign.layer_id = 99;
+        let second = cache.begin_operation(foreign, 2, 4).unwrap();
+        assert!(second.prefetch_eligibility().allows_pipeline());
+        assert_eq!(second.registered_bank_count(), 0);
+    }
+
+    #[test]
+    fn shared_bank_prefetch_proof_counts_retained_foreign_payloads() {
+        let _guard = hold_metrics_test_lock();
+        metrics().reset();
+        for (budget, expected) in [(0, true), (8, false), (12, true)] {
+            let cache = WeightOffloadHostCache::new(budget).unwrap();
+            let mut foreign = cache_key(0);
+            foreign.layer_id = 99;
+            {
+                let operation = cache.begin_operation(foreign, 1, 4).unwrap();
+                for _ in 0..2 {
+                    drop(operation.lease(0, || Ok(adoption_expert(1.0))).unwrap());
+                }
+            }
+            let operation = cache.begin_operation(cache_key(0), 2, 4).unwrap();
+            assert_eq!(
+                operation.prefetch_eligibility().allows_pipeline(),
+                expected,
+                "budget={budget}"
+            );
+            if budget == 8 {
+                assert_eq!(
+                    operation.prefetch_eligibility(),
+                    HostPrefetchEligibility::InsufficientCapacity {
+                        required_bytes: 12,
+                        budget_bytes: 8,
+                    }
+                );
+            }
+            assert_eq!(
+                operation.registered_bank_count(),
+                if budget == 0 { 0 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn shared_bank_prefetch_proof_freezes_new_registrations_but_not_worker_leases() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let _guard = hold_metrics_test_lock();
+        metrics().reset();
+        let cache = WeightOffloadHostCache::new(8).unwrap();
+        let operation = cache.begin_operation(cache_key(0), 2, 4).unwrap();
+        assert!(operation.prefetch_eligibility().allows_pipeline());
+        assert!(cache.inner.banks.try_write().is_err());
+        let timeout = Duration::from_secs(5);
+        std::thread::scope(|scope| {
+            // Known-bank operations share the proof; they do not serialize on
+            // a global operation mutex.
+            let (known_tx, known_rx) = mpsc::channel();
+            let known_cache = &cache;
+            scope.spawn(move || {
+                let known = known_cache.begin_operation(cache_key(1), 2, 4).unwrap();
+                known_tx
+                    .send(known.prefetch_eligibility().allows_pipeline())
+                    .unwrap();
+            });
+            assert!(known_rx.recv_timeout(timeout).unwrap());
+            let (started_tx, started_rx) = mpsc::channel();
+            let (registered_tx, registered_rx) = mpsc::channel();
+            let cache_ref = &cache;
+            scope.spawn(move || {
+                let mut foreign = cache_key(0);
+                foreign.layer_id = 99;
+                started_tx.send(()).unwrap();
+                let foreign = cache_ref.begin_operation(foreign, 1, 4).unwrap();
+                registered_tx
+                    .send(foreign.prefetch_eligibility().allows_pipeline())
+                    .unwrap();
+            });
+            started_rx.recv_timeout(timeout).unwrap();
+            let (worker_tx, worker_rx) = mpsc::channel();
+            std::thread::scope(|workers| {
+                let borrowed = &operation;
+                workers.spawn(move || {
+                    for _ in 0..2 {
+                        drop(borrowed.lease(0, || Ok(adoption_expert(1.0))).unwrap());
+                    }
+                    worker_tx.send(()).unwrap();
+                });
+                worker_rx.recv_timeout(timeout).expect(
+                    "borrowed worker must not reacquire the registry behind a pending writer",
+                );
+            });
+            assert!(matches!(
+                registered_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            drop(operation);
+            assert!(
+                !registered_rx.recv_timeout(timeout).unwrap(),
+                "the retained original bank must participate after registration"
+            );
+        });
+    }
+
+    #[test]
+    fn shared_bank_registry_prunes_dead_sources_and_retains_live_entries() {
+        let _guard = hold_metrics_test_lock();
+        metrics().reset();
+        let cache = WeightOffloadHostCache::new(8).unwrap();
+        {
+            let retained = cache.begin_operation(cache_key(0), 1, 4).unwrap();
+            for _ in 0..2 {
+                drop(retained.lease(0, || Ok(adoption_expert(1.0))).unwrap());
+            }
+        }
+        for layer_id in 100..132 {
+            let mut key = cache_key(0);
+            key.layer_id = layer_id;
+            let operation = cache.begin_operation(key, 1, 4).unwrap();
+            assert_eq!(operation.registered_bank_count(), 2);
+            assert!(operation.prefetch_eligibility().allows_pipeline());
+        }
+        // Clearing payloads also ends their metadata lifetime. The next cold
+        // registration removes all expired weak entries.
+        cache.clear();
+        let mut key = cache_key(0);
+        key.layer_id = 200;
+        let operation = cache.begin_operation(key, 1, 4).unwrap();
+        assert_eq!(operation.registered_bank_count(), 1);
+    }
+
+    #[test]
+    fn foreign_bank_invalidates_layer_only_prefetch_capacity_proof() {
+        let _guard = hold_metrics_test_lock();
+        metrics().reset();
+        let run = |hold_current: bool| {
+            let mut cache = HostExpertCache::default();
+            let weights = || {
+                Ok(DequantizedExpert {
+                    fc1: vec![1.0],
+                    fc2: Vec::new(),
+                    fc3: None,
+                    _residency: None,
+                })
+            };
+            let mut foreign = cache_key(0);
+            foreign.layer_id = 99;
+            let mut disposable = cache_key(0);
+            disposable.layer_id = 100;
+            for _ in 0..2 {
+                drop(cache.lease(disposable.clone(), 4, 8, weights).unwrap());
+            }
+            for _ in 0..4 {
+                drop(cache.lease(foreign.clone(), 4, 8, weights).unwrap());
+            }
+            drop(cache.lease(cache_key(0), 4, 8, weights).unwrap());
+            for _ in 0..2 {
+                drop(cache.lease(cache_key(1), 4, 8, weights).unwrap());
+            }
+            cache.trim_to_budget(4).unwrap();
+            assert!(cache.entries.contains_key(&foreign));
+            let current = cache.lease(cache_key(0), 4, 8, weights).unwrap();
+            assert!(cache.entries.contains_key(&cache_key(0)));
+            let current = if hold_current {
+                Some(current)
+            } else {
+                drop(current);
+                None
+            };
+            drop(cache.lease(cache_key(1), 4, 8, weights).unwrap());
+            let admitted = cache.entries.contains_key(&cache_key(1));
+            drop(current);
+            admitted
+        };
+        assert!(run(false), "serial admits the next expert");
+        assert!(!run(true), "prefetch's live Arc prevents the serial victim");
     }
 
     #[test]
