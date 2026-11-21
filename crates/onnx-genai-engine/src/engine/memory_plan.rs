@@ -152,6 +152,8 @@ holder_registry! {
     /// [`Holder::PipelineComponentPool`] exists for, on the other co-resident
     /// session the engine loads next to the decoder.
     DraftModelPool = 12,
+    /// Live f32 weight copies owned by native CPU kernels.
+    CpuDerivedWeights = 13,
 }
 
 impl Holder {
@@ -160,7 +162,9 @@ impl Holder {
     pub(crate) const fn role(self) -> MemoryRole {
         match self {
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => MemoryRole::KvCache,
-            Holder::WeightResidency | Holder::WeightOffloadHostCache => MemoryRole::Weights,
+            Holder::WeightResidency
+            | Holder::WeightOffloadHostCache
+            | Holder::CpuDerivedWeights => MemoryRole::Weights,
             // Rolling state that is destroyed as it is updated: it cannot be
             // rewound, recomputed or shared, so it is not a `Weights`-style
             // demotion candidate and not step-scoped `Workspace` either. It
@@ -185,6 +189,7 @@ impl Holder {
             Holder::DraftKvPool => "draft model KV page pool",
             Holder::WeightResidency => "device weight residency cache",
             Holder::WeightOffloadHostCache => "host weight-offload expert cache",
+            Holder::CpuDerivedWeights => "CPU derived weight buffers",
             Holder::RecurrentState => "recurrent state",
             Holder::RecurrentPrefixSnapshot => "recurrent prefix snapshots",
             Holder::NativeKvCache => "native decode KV tensors",
@@ -207,7 +212,7 @@ impl Holder {
             // Charging it to `Device` would let it exhaust host RAM while the
             // device ledger still reported headroom.
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
-            Holder::WeightOffloadHostCache => Tier::Host,
+            Holder::WeightOffloadHostCache | Holder::CpuDerivedWeights => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
             | Holder::RecurrentPrefixSnapshot

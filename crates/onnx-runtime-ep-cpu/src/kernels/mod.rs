@@ -21,9 +21,7 @@
 //! strides and byte offset) into a dense row-major buffer. This keeps the
 //! per-kernel `unsafe` surface to the two element accessors in this module.
 
-use onnx_runtime_ep_api::{
-    EpError, KernelFactory, OpKey, OpRegistry, Result, TensorMut, TensorView,
-};
+use onnx_runtime_ep_api::{EpError, OpKey, OpRegistry, Result, TensorMut, TensorView};
 use onnx_runtime_ir::DataType;
 
 use crate::strided::{elem_offset, next_index, numel};
@@ -40,31 +38,6 @@ pub struct CpuOpDescriptor {
     /// Supported element types for the "T" type-constraint. Derived from the
     /// kernel's actual dtype dispatch — fail closed (f32-only) when unknown.
     pub supported_dtypes: &'static [DataType],
-}
-
-/// Wrapper around `OpRegistry` that records every registered key.
-struct RecordingOpRegistry {
-    inner: OpRegistry,
-    keys: Vec<(String, String, u64)>,
-}
-
-impl RecordingOpRegistry {
-    fn new() -> Self {
-        Self {
-            inner: OpRegistry::new(),
-            keys: Vec::new(),
-        }
-    }
-
-    fn register(&mut self, key: OpKey, factory: Box<dyn KernelFactory>) {
-        self.keys
-            .push((key.op_type.clone(), key.domain.clone(), key.since_version));
-        self.inner.register(key, factory);
-    }
-
-    fn into_parts(self) -> (OpRegistry, Vec<(String, String, u64)>) {
-        (self.inner, self.keys)
-    }
 }
 
 // ── Dtype categories ─────────────────────────────────────────────────────────
@@ -967,21 +940,14 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
 /// `lookup` picks the highest applicable version, so future opset-specialized
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
-    let (reg, _keys) = build_cpu_registry_recorded_inner(
-        qmoe::default_weight_offload_host_cache().clone(),
-        einsum::EinsumScratchRetention::default(),
-    );
-    reg
+    build_cpu_registry_with_resources(crate::CpuMemoryResources::default())
 }
 
 /// Build the CPU registry AND return all registered op keys (for kernel-registry
 /// type-constraint advertisement). The keys are derived from the exact same
 /// registration calls — not hand-maintained.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, _) = build_cpu_registry_recorded_inner(
-        qmoe::default_weight_offload_host_cache().clone(),
-        einsum::EinsumScratchRetention::default(),
-    );
+    let reg = build_cpu_registry();
     let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
@@ -1020,44 +986,18 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     descriptors
 }
 
-/// Build the CPU registry AND return keys, with a custom weight-offload cache.
-pub fn build_cpu_registry_with_descriptors_and_cache(
-    host_cache: qmoe::WeightOffloadHostCache,
-) -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, _) =
-        build_cpu_registry_recorded_inner(host_cache, einsum::EinsumScratchRetention::default());
-    let descriptors = descriptors_from_registry(&reg);
-    (reg, descriptors)
-}
-
-pub(crate) fn build_cpu_registry_with_weight_offload_cache(
-    host_cache: qmoe::WeightOffloadHostCache,
+/// Build all factories against one immutable set of session memory resources.
+pub(crate) fn build_cpu_registry_with_resources(
+    resources: crate::CpuMemoryResources,
 ) -> OpRegistry {
-    let (reg, _keys) =
-        build_cpu_registry_recorded_inner(host_cache, einsum::EinsumScratchRetention::default());
-    reg
-}
-
-pub(crate) fn build_cpu_registry_with_weight_offload_cache_and_einsum_retention(
-    host_cache: qmoe::WeightOffloadHostCache,
-    einsum_scratch_retention: einsum::EinsumScratchRetention,
-) -> OpRegistry {
-    let (reg, _keys) = build_cpu_registry_recorded_inner(host_cache, einsum_scratch_retention);
-    reg
-}
-
-fn build_cpu_registry_recorded_inner(
-    host_cache: qmoe::WeightOffloadHostCache,
-    einsum_scratch_retention: einsum::EinsumScratchRetention,
-) -> (OpRegistry, Vec<(String, String, u64)>) {
-    let mut rec = RecordingOpRegistry::new();
-    // CNN ops go directly into the inner registry (they use &mut OpRegistry).
-    register_cnn_ops(&mut rec.inner);
-    // CNN ops are feature-gated f32/FLOAT_DTYPES ops. They are registered into
-    // the real OpRegistry but not individually recorded here — this is fine for
-    // f16/bf16 routing since CNN ops don't support f16/bf16.
-    //
-    // All subsequent registrations go through the recording wrapper.
+    let crate::CpuMemoryResources {
+        host_cache,
+        derived_weights,
+        dense_weight_cache_bytes,
+        einsum_scratch_retention,
+    } = resources;
+    let mut rec = OpRegistry::new();
+    register_cnn_ops(&mut rec);
     rec.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
     rec.register(
         OpKey::new("Einsum", "", 12),
@@ -1069,11 +1009,17 @@ fn build_cpu_registry_recorded_inner(
     );
     rec.register(
         OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
-        Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory),
+        Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory::new(
+            derived_weights.clone(),
+            dense_weight_cache_bytes,
+        )),
     );
     rec.register(
         OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
-        Box::new(block_quantized_moe::BlockQuantizedMoEFactory),
+        Box::new(block_quantized_moe::BlockQuantizedMoEFactory::new(
+            derived_weights,
+            dense_weight_cache_bytes,
+        )),
     );
     rec.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
@@ -1689,7 +1635,7 @@ fn build_cpu_registry_recorded_inner(
         OpKey::new("Hardmax", "", 13),
         Box::new(hardmax::HardmaxFactory),
     );
-    rec.into_parts()
+    rec
 }
 
 // ---------------------------------------------------------------------------
@@ -3011,3 +2957,5 @@ mod tests {
         );
     }
 }
+
+pub(crate) mod dense_weight_cache;

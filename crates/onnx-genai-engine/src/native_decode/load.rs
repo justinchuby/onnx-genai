@@ -77,8 +77,7 @@ pub fn native_cuda_provider_construction_attempts() -> u64 {
 }
 
 pub(crate) struct NativeDecodeLoadOptions<'a> {
-    pub(crate) host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
-    pub(crate) einsum_scratch_retention: onnx_runtime_ep_cpu::EinsumScratchRetention,
+    pub(crate) cpu_resources: onnx_runtime_ep_cpu::CpuMemoryResources,
     #[cfg(feature = "native-cuda")]
     pub(crate) cuda_offload_policy: Option<onnx_runtime_ep_cuda::DeviceOffloadPolicy>,
     #[cfg(feature = "native-cuda")]
@@ -250,7 +249,7 @@ impl NativeDecodeSession {
         Self::load_with_cuda_options_and_io(path, device, options, io, None, None, None)
     }
 
-    pub(crate) fn load_with_weight_offload_host_cache(
+    pub(crate) fn load_with_resources(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         options: NativeDecodeLoadOptions<'_>,
@@ -288,12 +287,10 @@ impl NativeDecodeSession {
             // `onnx-runtime-optimizer::constant_folding` for the tradeoff.
             .option("optimization", "basic");
         if device == NativeDecodeDevice::Cpu {
-            let ep = onnx_runtime_ep_cpu::CpuExecutionProvider::
-                initialized_with_weight_offload_host_cache_and_einsum_retention(
-                    options.host_cache,
-                    options.einsum_scratch_retention,
-                )
-                .context("initialize native CPU execution provider")?;
+            let ep = onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(
+                options.cpu_resources,
+            )
+            .context("initialize native CPU execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
         #[cfg(feature = "native-cuda")]
@@ -546,7 +543,7 @@ impl NativeDecodeSession {
             .model(path)
             .device(preference)
             // See the identical `.option("optimization", "basic")` rationale
-            // in `load_with_weight_offload_host_cache` above.
+            // in `load_with_resources` above.
             .option("optimization", "basic");
         #[cfg(feature = "native-cuda")]
         if let (NativeDecodeDevice::Cuda { index }, Some(governor)) = (&device, cuda_governor) {

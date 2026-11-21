@@ -21,6 +21,9 @@
 //! routing or activation implementation. It is row-streamed f32 computation,
 //! not an integer/quantized-domain dot product.
 
+use super::dense_weight_cache::{
+    DenseWeightCache, DenseWeightCacheStatus, DenseWeightLoad, DenseWeightSpec,
+};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,8 +33,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node, Shape};
 
 use super::block_quantized_matmul::{
-    BlockFormat, DenseWeightCache, DenseWeightCacheStatus, DenseWeightIdentity,
-    dequantize_weight_kn,
+    BlockFormat, DenseWeightIdentity, DenseWeightLayout, decode_dense_weight_into,
 };
 use super::moe::{
     ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
@@ -156,7 +158,19 @@ impl ProjectionLayout {
     }
 }
 
-pub struct BlockQuantizedMoEFactory;
+pub struct BlockQuantizedMoEFactory {
+    memory: crate::DerivedWeightMemory,
+    cache_bytes: usize,
+}
+
+impl BlockQuantizedMoEFactory {
+    pub(super) fn new(memory: crate::DerivedWeightMemory, cache_bytes: usize) -> Self {
+        Self {
+            memory,
+            cache_bytes,
+        }
+    }
+}
 
 pub struct BlockQuantizedMoEKernel {
     attributes: MoeAttributes,
@@ -183,7 +197,7 @@ impl KernelFactory for BlockQuantizedMoEFactory {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-            weight_cache: DenseWeightCache::new(),
+            weight_cache: DenseWeightCache::new(self.memory.clone(), self.cache_bytes),
         }))
     }
 }
@@ -298,63 +312,52 @@ impl Kernel for BlockQuantizedMoEKernel {
             self.weight_cache.byte_limit()
         };
         let use_dense = dense_bytes <= cache_budget;
-        onnx_runtime_ep_api::record_kernel_variant!(
-            if use_dense {
-                "block_moe.dense_resident_set"
-            } else {
-                "block_moe.streamed_rows"
-            },
-            "dense expert set requires {dense_bytes} bytes; dense cache budget is {cache_budget} bytes"
-        );
+        let mut dense_experts = 0usize;
+        let mut streamed_experts = 0usize;
+        let mut grant_refusal = None;
         #[cfg(test)]
-        if use_dense && !tasks.is_empty() {
-            BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        let mut counted_dense = false;
         for (expert, expert_tasks) in tasks {
             let mut grouped_input = Vec::with_capacity(expert_tasks.len() * hidden);
             for &(row, _) in &expert_tasks {
                 grouped_input.extend_from_slice(&input[row * hidden..(row + 1) * hidden]);
             }
-            let expert_output = if use_dense {
-                let fc1 = self.dequantize_expert_cached(
-                    self.constant_inputs[2].then_some(&self.weight_identities[0]),
-                    1,
-                    &inputs[2],
+            let dense = if use_dense {
+                match self.dequantize_expert_group(
+                    inputs,
                     expert,
-                    fc1_size,
-                    hidden,
-                    experts,
-                    self.formats.fc1,
-                )?;
-                let fc2 = self.dequantize_expert_cached(
-                    self.constant_inputs[4].then_some(&self.weight_identities[1]),
-                    2,
-                    &inputs[4],
-                    expert,
-                    hidden,
-                    inter,
-                    experts,
-                    self.formats.fc2,
-                )?;
-                let fc3 = optional_input(inputs, 6)
-                    .map(|packed| {
-                        let fc3_format = self.formats.fc3.ok_or_else(|| {
-                            error("fc3_experts_weights present but fc3_format is missing")
-                        })?;
-                        self.dequantize_expert_cached(
-                            self.constant_inputs[6].then_some(&self.weight_identities[2]),
-                            3,
-                            packed,
-                            expert,
-                            inter,
-                            hidden,
-                            experts,
-                            fc3_format,
-                        )
-                    })
-                    .transpose()?;
-
+                    Dimensions {
+                        rows,
+                        hidden,
+                        experts,
+                        inter,
+                        fc1_size,
+                    },
+                )? {
+                    DenseWeightLoad::Ready(loaded) => {
+                        #[cfg(test)]
+                        if !counted_dense {
+                            BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.fetch_add(1, Ordering::Relaxed);
+                            counted_dense = true;
+                        }
+                        dense_experts += 1;
+                        Some(loaded.weights)
+                    }
+                    DenseWeightLoad::Declined(reason) => {
+                        grant_refusal = Some(reason);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if dense.is_none() {
+                streamed_experts += 1;
+            }
+            let expert_output = if let Some(weights) = dense {
+                let fc1 = &weights[0];
+                let fc2 = &weights[1];
+                let fc3 = weights.get(2);
                 run_expert_grouped(
                     &grouped_input,
                     expert_tasks.len(),
@@ -366,7 +369,7 @@ impl Kernel for BlockQuantizedMoEKernel {
                     fc2_bias
                         .as_deref()
                         .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
-                    fc3.as_ref().map(|weight| weight.as_slice()),
+                    fc3.map(|weight| weight.as_slice()),
                     fc3_bias
                         .as_deref()
                         .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
@@ -431,6 +434,19 @@ impl Kernel for BlockQuantizedMoEKernel {
                 }
             }
         }
+        // One annotation describes the whole node; a mixed operation must not
+        // report only the final expert's path.
+        if streamed_experts == 0 {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "block_moe.dense_resident_set",
+                "{dense_experts} dense expert sets, {dense_bytes} bytes per set; cache budget {cache_budget} bytes"
+            );
+        } else {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "block_moe.streamed_rows",
+                "{streamed_experts} row-streamed and {dense_experts} dense expert sets; {dense_bytes} dense bytes per set, cache budget {cache_budget} bytes; last Host grant refusal: {grant_refusal:?}"
+            );
+        }
         write_dense_f32(&mut outputs[0], &output)
     }
 
@@ -440,57 +456,94 @@ impl Kernel for BlockQuantizedMoEKernel {
 }
 
 impl BlockQuantizedMoEKernel {
-    #[allow(clippy::too_many_arguments)]
-    fn dequantize_expert_cached(
+    fn dequantize_expert_group(
         &self,
-        identity: Option<&DenseWeightIdentity>,
-        role: u8,
-        packed: &TensorView,
+        inputs: &[TensorView],
         expert: usize,
-        out_features: usize,
-        in_features: usize,
-        experts: usize,
-        format: BlockFormat,
-    ) -> Result<Arc<Vec<f32>>> {
-        let layout = ProjectionLayout::new(format, out_features, in_features, experts);
-        // Validate the packed projection's total byte footprint against the
-        // shared layout contract before slicing any expert bank.
-        expert_byte_count(packed, &layout)?;
-        if let Some(identity) = identity {
-            let resolved = identity.resolve(
-                packed,
-                format,
-                in_features,
-                out_features,
-                role,
-                Some(expert),
-                || packed_expert_bytes(packed, &layout, expert),
-            )?;
-            let mut resolved_payload = resolved.payload;
-            let (weight, status) =
-                self.weight_cache
-                    .get_or_insert_with(resolved.key.as_ref(), || {
-                        BLOCK_QUANT_MOE_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
-                        let packed = match resolved_payload.take() {
-                            Some(packed) => packed,
-                            None => packed_expert_bytes(packed, &layout, expert)?,
-                        };
-                        dequantize_expert_slice(format, &packed, out_features, in_features)
-                    })?;
-            if matches!(status, DenseWeightCacheStatus::Hit) {
-                BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(weight)
-        } else {
-            BLOCK_QUANT_MOE_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
-            let packed = packed_expert_bytes(packed, &layout, expert)?;
-            Ok(Arc::new(dequantize_expert_slice(
-                format,
-                &packed,
-                out_features,
-                in_features,
-            )?))
+        dims: Dimensions,
+    ) -> Result<DenseWeightLoad> {
+        let mut projections = vec![
+            (2, dims.fc1_size, dims.hidden, self.formats.fc1, 1u8),
+            (4, dims.hidden, dims.inter, self.formats.fc2, 2u8),
+        ];
+        if optional_input(inputs, 6).is_some() {
+            projections.push((
+                6,
+                dims.inter,
+                dims.hidden,
+                self.formats.fc3.ok_or_else(|| {
+                    error("fc3_experts_weights present but fc3_format is missing")
+                })?,
+                3,
+            ));
         }
+        let mut sources = Vec::with_capacity(projections.len());
+        let mut keys = Vec::with_capacity(projections.len());
+        let mut sizes = Vec::with_capacity(projections.len());
+        for (slot, out_features, in_features, format, role) in projections {
+            let packed = &inputs[slot];
+            let layout = ProjectionLayout::new(format, out_features, in_features, dims.experts);
+            expert_byte_count(packed, &layout)?;
+            let resolved = if self.constant_inputs[slot] {
+                Some(self.weight_identities[usize::from(role - 1)].resolve(
+                    packed,
+                    format,
+                    in_features,
+                    out_features,
+                    role,
+                    Some(expert),
+                    || packed_expert_bytes(packed, &layout, expert),
+                )?)
+            } else {
+                None
+            };
+            let bytes = out_features
+                .checked_mul(in_features)
+                .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| error("dense expert projection byte count overflow"))?;
+            keys.push(resolved.as_ref().map(|resolved| Arc::clone(&resolved.key)));
+            sizes.push(bytes);
+            sources.push((
+                packed,
+                layout,
+                format,
+                out_features,
+                in_features,
+                resolved.and_then(|resolved| resolved.payload),
+            ));
+        }
+        let specs: Vec<_> = keys
+            .iter()
+            .zip(&sizes)
+            .map(|(key, bytes)| match key.as_deref() {
+                Some(key) => DenseWeightSpec::cached(key),
+                None => Ok(DenseWeightSpec::transient(*bytes)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let loaded = self.weight_cache.load_group(&specs, |index, output| {
+            BLOCK_QUANT_MOE_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+            let (packed, layout, format, out_features, in_features, payload) = &mut sources[index];
+            let bytes = match payload.take() {
+                Some(bytes) => bytes,
+                None => packed_expert_bytes(packed, layout, expert)?,
+            };
+            decode_dense_weight_into(
+                *format,
+                *in_features,
+                *out_features,
+                &bytes,
+                output,
+                DenseWeightLayout::Nk,
+            )
+        })?;
+        if let DenseWeightLoad::Ready(loaded) = &loaded {
+            for status in &loaded.statuses {
+                if *status == DenseWeightCacheStatus::Hit {
+                    BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(loaded)
     }
 }
 
@@ -772,14 +825,19 @@ fn dequantize_expert_slice(
     out_features: usize,
     in_features: usize,
 ) -> Result<Vec<f32>> {
-    let weight_kn = dequantize_weight_kn(format, in_features, out_features, packed)?;
-    let mut weight_nk = vec![0.0f32; weight_kn.len()];
-    for input in 0..in_features {
-        for output in 0..out_features {
-            weight_nk[output * in_features + input] = weight_kn[input * out_features + output];
-        }
-    }
-    Ok(weight_nk)
+    let elements = out_features
+        .checked_mul(in_features)
+        .ok_or_else(|| error("expert oracle weight element count overflow"))?;
+    let mut output = vec![0.0; elements];
+    decode_dense_weight_into(
+        format,
+        in_features,
+        out_features,
+        packed,
+        &mut output,
+        DenseWeightLayout::Nk,
+    )?;
+    Ok(output)
 }
 
 /// Decode one expert projection with the authoritative CPU GGUF decoder and
@@ -1224,9 +1282,8 @@ fn error(message: impl Into<String>) -> EpError {
 mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
-    use crate::kernels::block_quantized_matmul::{
-        DEFAULT_DENSE_WEIGHT_CACHE_BYTES, packed_for_format,
-    };
+    use crate::kernels::block_quantized_matmul::packed_for_format;
+    use crate::kernels::dense_weight_cache::DEFAULT_DENSE_WEIGHT_CACHE_BYTES;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
     use onnx_runtime_ir::{Attribute, Dim, Graph, NodeId, SymbolId, static_shape};
@@ -1472,7 +1529,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-            weight_cache: DenseWeightCache::new(),
+            weight_cache: DenseWeightCache::default(),
         };
         kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
 
@@ -1640,30 +1697,27 @@ mod tests {
         // The shared buffer itself, rather than a count that stands in for it:
         // two resolutions of the same expert projection hand back one
         // allocation, so every row block reads the same immutable pack.
-        let first = kernel
-            .dequantize_expert_cached(
-                Some(&kernel.weight_identities[0]),
-                1,
-                &fc1.view(),
-                0,
-                fc1_out,
-                H,
-                experts,
-                kernel.formats.fc1,
+        let resolve_fc1 = |expert| match kernel
+            .dequantize_expert_group(
+                &views,
+                expert,
+                Dimensions {
+                    rows: ROWS,
+                    hidden: H,
+                    experts,
+                    inter: H,
+                    fc1_size: fc1_out,
+                },
             )
-            .expect("resolve expert 0 fc1");
-        let again = kernel
-            .dequantize_expert_cached(
-                Some(&kernel.weight_identities[0]),
-                1,
-                &fc1.view(),
-                0,
-                fc1_out,
-                H,
-                experts,
-                kernel.formats.fc1,
-            )
-            .expect("resolve expert 0 fc1 again");
+            .expect("resolve complete expert projection set")
+        {
+            DenseWeightLoad::Ready(mut loaded) => loaded.weights.remove(0),
+            DenseWeightLoad::Declined(reason) => {
+                panic!("standalone cache unexpectedly declined: {reason}")
+            }
+        };
+        let first = resolve_fc1(0);
+        let again = resolve_fc1(0);
         assert!(
             Arc::ptr_eq(&first, &again),
             "row blocks must share one immutable expansion, not copies of it"
@@ -1672,22 +1726,11 @@ mod tests {
         // Negative control: the counter is not simply stuck. A different
         // expert is a different pack, and says so both ways.
         let builds_before = kernel.weight_cache.activity().1;
-        let other = kernel
-            .dequantize_expert_cached(
-                Some(&kernel.weight_identities[0]),
-                1,
-                &fc1.view(),
-                1,
-                fc1_out,
-                H,
-                experts,
-                kernel.formats.fc1,
-            )
-            .expect("resolve expert 1 fc1");
+        let other = resolve_fc1(1);
         assert_eq!(
             kernel.weight_cache.activity().1,
-            builds_before + 1,
-            "an unseen expert must build"
+            builds_before + 2,
+            "an unseen expert must build both projections exactly once"
         );
         assert!(
             !Arc::ptr_eq(&first, &other),
@@ -1726,7 +1769,7 @@ mod tests {
                 formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-                weight_cache: DenseWeightCache::new(),
+                weight_cache: DenseWeightCache::default(),
             };
             kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
             assert!(
@@ -1869,6 +1912,70 @@ mod tests {
     }
 
     #[test]
+    fn provider_moe_factories_share_atomic_projection_group_grants() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let shapes = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            None,
+            None,
+        ];
+        let (graph, node) = model_node(&shapes, &attrs("identity", 1, false, 0));
+        let bytes = (2 * H * H * 4) as u64;
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes, 0));
+        let provider = CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
+            derived_weights: crate::DerivedWeightMemory::governed(&governor, HolderId::new(13))
+                .unwrap(),
+            dense_weight_cache_bytes: bytes as usize,
+            ..Default::default()
+        });
+        let mut first = provider.get_kernel(graph.node(node), &[], 1).unwrap();
+        let mut second = provider.get_kernel(graph.node(node), &[], 1).unwrap();
+        first.set_constant_inputs(&[false, false, true, false, true]);
+        second.set_constant_inputs(&[false, false, true, false, true]);
+        let input = Owned::f32(&[1, H], &[0.125; H]);
+        let logits = Owned::f32(&[1, E], &[4., -4.]);
+        let fc1 = Owned::u8(&[E, H, 1, 17], &identity_projection([2, 4]));
+        let fc2 = Owned::u8(&[E, H, 1, 17], &identity_projection([2, 2]));
+        let views = [
+            input.view(),
+            logits.view(),
+            fc1.view(),
+            TensorView::absent(DataType::Float32),
+            fc2.view(),
+        ];
+        let mut expected = Owned::zeros_f32(&[1, H]);
+        let mut actual = Owned::zeros_f32(&[1, H]);
+        first.execute(&views, &mut [expected.view_mut()]).unwrap();
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes,
+            "both projection buffers retain their exact slices"
+        );
+        second.execute(&views, &mut [actual.view_mut()]).unwrap();
+        assert_eq!(actual.bytes, expected.bytes);
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes,
+            "second expert kernel must stream rather than claim another full grant"
+        );
+        drop(first);
+        assert_eq!(governor.used(Tier::Host), 0);
+        second.execute(&views, &mut [actual.view_mut()]).unwrap();
+        assert_eq!(actual.bytes, expected.bytes);
+        assert_eq!(governor.used(Tier::Host), bytes);
+        drop(provider);
+        drop(second);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
     fn streamed_experts_preserve_grouped_routing_mixed_formats_biases_and_gates() {
         let formats = [
             "mxfp4", "iq4_nl", "iq4_xs", "iq3_s", "iq3_xxs", "iq2_s", "iq2_xs", "iq2_xxs", "iq1_s",
@@ -1936,6 +2043,16 @@ mod tests {
                 (fc1_size * hidden + hidden * inter + if has_fc3 { inter * hidden } else { 0 }) * 4;
             let reference = make_kernel(dense_bytes);
             let streamed = make_kernel(dense_bytes - 1);
+            let governor = onnx_runtime_memory_governor::LedgerGovernor::new(
+                onnx_runtime_memory_governor::LeaseLedger::new(0, (dense_bytes - 1) as u64, 0),
+            );
+            let memory = crate::DerivedWeightMemory::governed(
+                &governor,
+                onnx_runtime_memory_governor::HolderId::new(13),
+            )
+            .unwrap();
+            let mut denied = make_kernel(dense_bytes);
+            denied.weight_cache = DenseWeightCache::with_limit_and_memory(dense_bytes, memory);
             let input = Owned::f32(
                 &[rows, hidden],
                 &(0..rows * hidden)
@@ -1989,6 +2106,27 @@ mod tests {
                     .execute(&views, &mut [expected.view_mut()])
                     .unwrap();
                 streamed.execute(&views, &mut [actual.view_mut()]).unwrap();
+                let mut denied_output = Owned::zeros_f32(&[rows, hidden]);
+                denied
+                    .execute(&views, &mut [denied_output.view_mut()])
+                    .unwrap();
+                assert_eq!(
+                    denied_output.bytes, actual.bytes,
+                    "global grant refusal must use the existing streamed expert computation"
+                );
+                assert_eq!(
+                    denied.weight_cache.activity(),
+                    (0, 0),
+                    "no partial fc1/fc2/fc3 expansion before whole-group grant"
+                );
+                assert_eq!(
+                    onnx_runtime_memory_governor::MemoryGovernor::used(
+                        &governor,
+                        onnx_runtime_memory_api::Tier::Host
+                    ),
+                    0
+                );
+
                 for (index, (got, want)) in actual
                     .to_f32()
                     .into_iter()
@@ -2094,7 +2232,7 @@ mod tests {
                 formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-                weight_cache: DenseWeightCache::new(),
+                weight_cache: DenseWeightCache::default(),
             };
             let mut expected = Owned::f32(&[1, hidden], &vec![0.0; hidden]);
             uncached
@@ -2106,7 +2244,7 @@ mod tests {
                 formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-                weight_cache: DenseWeightCache::new(),
+                weight_cache: DenseWeightCache::default(),
             };
             cached.set_constant_inputs(&[false, false, true, false, true]);
             let mut actual = Owned::f32(&[1, hidden], &vec![0.0; hidden]);
@@ -2605,7 +2743,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-            weight_cache: DenseWeightCache::new(),
+            weight_cache: DenseWeightCache::default(),
         };
 
         let input_values: Vec<f32> = (0..HID)
@@ -2718,7 +2856,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-            weight_cache: DenseWeightCache::new(),
+            weight_cache: DenseWeightCache::default(),
         };
         let input_values: Vec<f32> = (0..HID).map(|index| (index as f32) / 256.0 + 0.1).collect();
         let input = Owned::f32(&[1, HID], &input_values);

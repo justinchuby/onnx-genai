@@ -1075,8 +1075,10 @@ impl WorkflowRuntime {
             Some(RefCell::new(native_component::NativeComponentSet::load(
                 &directory.model_paths,
                 device,
-                onnx_runtime_ep_cpu::EinsumScratchRetention::new(
-                    memory_strategy_plan.f32_weight_cache_admitted,
+                resource_governor.cpu_memory_resources(
+                    onnx_runtime_ep_cpu::EinsumScratchRetention::new(
+                        memory_strategy_plan.f32_weight_cache_admitted,
+                    ),
                 ),
             )?))
         } else {
