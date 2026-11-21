@@ -325,9 +325,15 @@ operands. This borrow decision does not depend on `ONNX_GENAI_WEIGHT_OFFLOAD` or
 mmap catalog eligibility; the latter still controls route-first paging, metrics
 and cache identity. Device-only operands fail before CPU reads, with instructions
 to move the named tensor to CPU. Borrowing removes duplicate source buffers;
-QMoE's selected expert dense expansions and their transient grants remain
-separate convergence work. Huge-model paging still needs bounded transient
-weight storage and compressed-domain kernels.
+QMoE's uncached dense FC1/FC2/(optional FC3) set now obtains a complete Host
+grant before allocation; refusal selects row-decoded f32 projections shared with
+the block-quantized kernels. Retained experts remain paid by their standing host
+cache partition. Cold prefetch preflights a scoped allowance for its two live
+expert slots; refusal runs serially, and fully cached operations skip this grant.
+The allowance outlives both the worker and its payloads. Default standalone CPU
+resources remain ungoverned. This covers dense weight payloads, not row scratch,
+activation/output buffers or allocator metadata; compressed-domain compute and
+removing idle standing reservations remain follow-up work.
 
 `MOE_SUPPORT.md` already requires expert-major contiguous external data so each expert
 slice can be computed from the initializer descriptor without materializing the tensor

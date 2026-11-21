@@ -412,3 +412,41 @@ expansions, other derived caches, scratch/activation buffers, the physical
 relationship between CPU Device and Host books, process-wide capacity and GPU
 asynchronous lifetimes remain open. Default standalone CPU resources remain
 ungoverned. CPU tests and CUDA compilation do not prove CUDA execution behavior.
+
+
+### QMoE transient expert working sets
+
+QMoE factories now receive the existing `derived_weights` Host source alongside
+their retained-expert cache. A cache lookup returns Hit, Filled or Transient;
+unadmitted lookups do not execute a dense builder under the payload lock.
+Transient resolution occurs after leaving that lock and preflights the complete
+FC1/FC2/(optional FC3) set. Its shared owner holds the grant until all projections
+and the last payload owner have dropped. Cache-admitted sets remain funded by
+the existing standing partition and are not charged twice.
+
+Capacity refusal chooses NBits row decoding. The common row-projection driver
+keeps one decoded row per worker shard and reuses it across the grouped tokens;
+block-format and NBits decoders retain their own canonical format math and
+per-shard scratch. Routing, activation/gates, biases and contribution order use
+the existing shared MoE implementation. Allocation/configuration errors retain
+their typed causes instead of being treated as capacity refusals.
+
+Cold prefetch obtains a scoped grant for the fixed driver's two simultaneous
+transient expert sets; if unavailable, it runs the same serial path. Fully cached
+operations retain their prefetch path without querying the issuer. This grant
+lasts through worker completion and payload destruction. It is an execution
+working set, not another cache entitlement or a parallel quota ledger.
+
+Budget adoption now waits on an operation-lifetime gate while the budget lock
+is used only for brief coherent inspection/publication. A transient issuer can
+inspect cache state while an adopter waits without recursively taking a budget
+reader behind its writer. Workers borrow the existing lifecycle/registry proof.
+Tests preserve the old adoption/refund, bank registry, frequency/pinning and
+prefetch guards, and add complete-set quotas, active-owner refunds, realistic
+rounding/gated projections, shared Host pressure, scoped two-slot grant peaks,
+warm issuer bypass, and callback progress during adoption.
+
+The idle standing QMoE partition still needs conversion to per-payload ownership.
+Other derived caches, scratch/activation accounting, CPU Device/Host physical
+capacity relationships, process-global capacity and asynchronous GPU validation
+remain open. These host checks do not establish CUDA runtime behavior.

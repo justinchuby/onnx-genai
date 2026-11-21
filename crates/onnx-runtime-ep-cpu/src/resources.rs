@@ -9,7 +9,8 @@ use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryLease};
 use crate::{EinsumScratchRetention, WeightOffloadHostCache};
 
 /// Session memory resources supplied before the CPU registry is constructed.
-/// Block-quantized factories share `derived_weights`; QMoE uses `host_cache`
+/// Block-quantized factories and transient QMoE expansions share `derived_weights`;
+/// retained QMoE experts use `host_cache`
 /// and Einsum uses its scratch-retention verdict. Other allocations are not
 /// covered by the derived-weight grant source. The default is the standalone,
 /// ungoverned policy; engines supply their Host authority explicitly.
@@ -53,8 +54,8 @@ impl Default for CpuMemoryResources {
 /// Grant source for owned f32 copies derived from packed weights.
 ///
 /// A governed source retains a zero-byte anchor, rather than a standing cache
-/// allowance. Each live buffer claims its exact bytes against the same Host
-/// books as other holders, and keeps those bytes until its last owner drops.
+/// allowance. Each owned expansion claims its payload bytes against the same
+/// Host books as other holders, and keeps them until its last owner drops.
 #[derive(Clone, Default)]
 pub struct DerivedWeightMemory {
     anchor: Option<Arc<MemoryLease>>,
