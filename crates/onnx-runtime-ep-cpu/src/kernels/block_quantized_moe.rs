@@ -1224,7 +1224,9 @@ fn error(message: impl Into<String>) -> EpError {
 mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
-    use crate::kernels::block_quantized_matmul::DEFAULT_DENSE_WEIGHT_CACHE_BYTES;
+    use crate::kernels::block_quantized_matmul::{
+        DEFAULT_DENSE_WEIGHT_CACHE_BYTES, packed_for_format,
+    };
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
     use onnx_runtime_ir::{Attribute, Dim, Graph, NodeId, SymbolId, static_shape};
@@ -1332,48 +1334,6 @@ mod tests {
                 if output == input { scales[expert] } else { 0 }
             },
         )
-    }
-
-    /// Build a decodable packed projection tensor `[experts, out_features,
-    /// ceil(in_features/qk), block_bytes]` for an arbitrary native format. Each
-    /// block is filled with a deterministic byte pattern plus the format's own
-    /// scale header so every decoder accepts it. This is the fixture that lets a
-    /// single projection carry its own qtype/block width independently of the
-    /// other projections (the whole point of the mixed-projection ABI).
-    fn packed_for_format(
-        format: BlockFormat,
-        experts: usize,
-        out_features: usize,
-        in_features: usize,
-    ) -> Vec<u8> {
-        let block_bytes = format.block_bytes();
-        let blocks_per_row = in_features.div_ceil(format.qk());
-        let mut packed = vec![0u8; experts * out_features * blocks_per_row * block_bytes];
-        for (block_index, block) in packed.chunks_exact_mut(block_bytes).enumerate() {
-            for (index, byte) in block.iter_mut().enumerate() {
-                *byte = block_index.wrapping_mul(29).wrapping_add(index * 17) as u8;
-            }
-            match format {
-                BlockFormat::Mxfp4 => block[0] = 127,
-                BlockFormat::Iq1M => block[48..56].fill(0),
-                BlockFormat::Q2K => {
-                    block[80..82].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes());
-                    block[82..84].copy_from_slice(&half::f16::from_f32(0.0625).to_le_bytes());
-                }
-                BlockFormat::Q3K => {
-                    block[108..110].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes())
-                }
-                BlockFormat::Q5K => {
-                    block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes());
-                    block[2..4].copy_from_slice(&half::f16::from_f32(0.0625).to_le_bytes());
-                }
-                BlockFormat::Q6K => {
-                    block[208..210].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes())
-                }
-                _ => block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes()),
-            }
-        }
-        packed
     }
 
     fn run(

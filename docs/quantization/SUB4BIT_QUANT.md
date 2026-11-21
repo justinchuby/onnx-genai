@@ -255,15 +255,24 @@ indices are semantic formats, not merely bit widths. A future schema can add
 standardized layouts without changing the meaning of old models.
 
 The CPU v1 implementation registers this op in `pkg.nxrt`, accepts f32/f16/bf16
-`A`, native uint8 `packed_B`, and an optional same-dtype bias. It currently
-dequantizes to f32 and uses the shared CPU GEMM. For constant `packed_B`, the
-dense expansion is stored in a per-kernel bounded LRU cache
+`A`, native uint8 `packed_B`, and an optional same-dtype bias. It computes in
+f32. When the complete dense weight fits the existing cache budget, it uses the
+shared CPU GEMM. Otherwise it decodes one row per worker shard and reuses that
+row across the flattened token batch, using the same bounded projection helper
+as `BlockQuantizedMoE`. Zero budget selects streaming, avoiding full f32 weight
+expansion and constant-identity hashing. Contiguous packed weights are borrowed;
+strided weights materialize only compressed bytes. Bias, arbitrary leading
+activation dimensions and f32/f16/bf16 output storage retain their contracts.
+For a fitting constant `packed_B`, the dense expansion is stored in a
+per-kernel bounded LRU cache
 (`ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES`, default 256 MiB), so repeated decode
 does not expand the same immutable weight every token. This is explicitly
 cached-dense reuse, not direct quantized-domain compute. MXFP4 and IQ4_NL,
 IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, and IQ1_M are implemented
 using the pinned llama.cpp layouts and dequantization math
-[L1][L2][L3][L4][L5][L6][L7][L8][L9][L13].
+[L1][L2][L3][L4][L5][L6][L7][L8][L9][L13]. The same decoder surface supports
+Q2_K, Q3_K, Q5_K, Q6_K and Q8_0; see the
+[block-format layout design](BLOCKQUANTIZEDMOE_DESIGN.md#3-block-format-decode-reuse).
 
 The cache budget is **per compiled kernel instance**, not per session, model, or
 process. Each `(session, node, resolved input shapes)` kernel owns an independent
