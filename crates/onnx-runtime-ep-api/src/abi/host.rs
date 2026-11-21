@@ -277,7 +277,7 @@ pub(super) struct HostValueInfo {
     type_info: HostTypeInfo,
     initializer: Option<Box<HostOrtValue>>,
     producer: Option<*const ort::OrtNode>,
-    is_initializer: bool,
+    is_constant_initializer: bool,
 }
 
 #[repr(C)]
@@ -388,6 +388,13 @@ impl HostSupportInfo {
     }
 }
 
+/// Model metadata and lexical bindings inherited by one projected scope.
+struct HostGraphScope<'a> {
+    opsets: &'a HashMap<String, u64>,
+    values: &'a HashMap<String, *const ort::OrtValueInfo>,
+    ir_version: Option<i64>,
+}
+
 impl HostGraph {
     pub(super) fn new(graph: &Graph) -> std::result::Result<Self, String> {
         let order = graph.topological_order().map_err(|err| {
@@ -399,8 +406,11 @@ impl HostGraph {
             graph.inputs.clone(),
             graph.outputs.clone(),
             0,
-            &HashMap::new(),
-            &HashMap::new(),
+            HostGraphScope {
+                opsets: &HashMap::new(),
+                values: &HashMap::new(),
+                ir_version: None,
+            },
         )
     }
 
@@ -423,8 +433,11 @@ impl HostGraph {
             claim.input_values.clone(),
             claim.output_values.clone(),
             0,
-            &HashMap::new(),
-            &HashMap::new(),
+            HostGraphScope {
+                opsets: &HashMap::new(),
+                values: &HashMap::new(),
+                ir_version: None,
+            },
         )
     }
 
@@ -434,8 +447,7 @@ impl HostGraph {
         graph_inputs: Vec<ValueId>,
         graph_outputs: Vec<ValueId>,
         depth: usize,
-        inherited_opsets: &HashMap<String, u64>,
-        inherited_values: &HashMap<String, *const ort::OrtValueInfo>,
+        inherited: HostGraphScope<'_>,
     ) -> std::result::Result<Self, String> {
         if depth > super::MAX_GRAPH_NESTING {
             return Err(format!(
@@ -443,7 +455,8 @@ impl HostGraph {
                 super::MAX_GRAPH_NESTING
             ));
         }
-        let mut scope_opsets = inherited_opsets.clone();
+        let ir_version = graph.ir_version.or(inherited.ir_version);
+        let mut scope_opsets = inherited.opsets.clone();
         scope_opsets.extend(graph.opset_imports.clone());
         let mut values: HashMap<ValueId, Box<HostValueInfo>> = HashMap::new();
         for (value_id, value) in graph.values.iter() {
@@ -461,12 +474,12 @@ impl HostGraph {
                     type_info: HostTypeInfo::for_value(graph, value)?,
                     initializer,
                     producer: None,
-                    is_initializer: graph.initializers.contains_key(&value_id),
+                    is_constant_initializer: graph.is_constant_initializer(value_id),
                 }),
             );
         }
 
-        let mut lexical_values = inherited_values.clone();
+        let mut lexical_values = inherited.values.clone();
         for (id, value) in graph.values.iter() {
             if let Some(name) = &value.name
                 && (value.producer.is_some()
@@ -574,8 +587,11 @@ impl HostGraph {
                         body.inputs.clone(),
                         body.outputs.clone(),
                         depth + 1,
-                        &scope_opsets,
-                        &lexical_values,
+                        HostGraphScope {
+                            opsets: &scope_opsets,
+                            values: &lexical_values,
+                            ir_version,
+                        },
                     )
                     .map_err(|reason| format!("node {node_id:?} subgraph {attribute}: {reason}"))?,
                 );
@@ -621,7 +637,7 @@ impl HostGraph {
             .collect::<std::result::Result<Vec<_>, String>>()?;
         opsets.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(Self {
-            ir_version: graph.ir_version.unwrap_or(0),
+            ir_version: ir_version.unwrap_or(0),
             opsets,
             parent: ptr::null(),
             values,
@@ -677,7 +693,7 @@ impl HostNode {
                 type_info: HostTypeInfo::for_value(graph, value)?,
                 initializer: None,
                 producer: None,
-                is_initializer: false,
+                is_constant_initializer: false,
             }));
         }
         for value in owned_values.iter().take(claim.input_values.len()) {
@@ -1414,7 +1430,7 @@ unsafe extern "C" fn host_value_info_is_constant_initializer(
     }
     // SAFETY: out is checked non-null.
     unsafe {
-        *out = value_from_ptr(value_info).is_initializer;
+        *out = value_from_ptr(value_info).is_constant_initializer;
     }
     ptr::null_mut()
 }
@@ -2214,6 +2230,40 @@ mod tests {
     use onnx_runtime_ir::{Node, static_shape};
 
     #[test]
+    fn initializer_constness_uses_ir_mutability_semantics() {
+        for (version, expected) in [(Some(3), true), (Some(11), false), (None, false)] {
+            let mut graph = Graph::new();
+            graph.ir_version = version;
+            let value = graph.create_named_value("default", DataType::Float32, static_shape([1]));
+            graph.add_input(value);
+            graph.add_output(value);
+            graph.set_initializer(
+                value,
+                onnx_runtime_ir::WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                    DataType::Float32,
+                    vec![1],
+                    2f32.to_le_bytes().to_vec(),
+                )),
+            );
+            let host = HostGraph::new(&graph).unwrap();
+            let mut constant = !expected;
+            assert!(
+                unsafe {
+                    host_value_info_is_constant_initializer(
+                        value_ptr(&host.values[&value]),
+                        &mut constant,
+                    )
+                }
+                .is_null()
+            );
+            assert_eq!(
+                constant, expected,
+                "IR {version:?} must not turn an overridable default into a cached constant"
+            );
+        }
+    }
+
+    #[test]
     fn graph_metadata_distinguishes_unknown_rank_scalar_and_named_symbols() {
         let mut graph = Graph::new();
         let unknown = graph.create_named_value("unknown", DataType::Float32, vec![]);
@@ -2360,6 +2410,7 @@ mod tests {
         body.add_output(y);
         body.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![y]));
         let mut graph = Graph::new();
+        graph.ir_version = Some(11);
         graph.opset_imports.insert(String::new(), 24);
         let cond = graph.create_named_value("cond", DataType::Bool, vec![]);
         let result = graph.create_named_value("result", DataType::Float32, static_shape([2]));
@@ -2393,6 +2444,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, ["else_branch", "then_branch"]);
         for body in graphs {
+            let mut ir_version = 0;
+            assert!(unsafe { host_graph_ir_version(body, &mut ir_version) }.is_null());
+            assert_eq!(ir_version, 11, "nested bodies inherit the model IR version");
             let mut reported_parent = ptr::null();
             assert!(unsafe { host_graph_get_parent_node(body, &mut reported_parent) }.is_null());
             assert_eq!(reported_parent, parent);
