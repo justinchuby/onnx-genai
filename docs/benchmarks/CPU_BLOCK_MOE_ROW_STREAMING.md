@@ -1,7 +1,7 @@
 # CPU block-MoE row streaming
 
 The complete f32 projection set of one selected expert must fit
-`ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES` to use dense execution. Otherwise the
+`ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES` to use dense execution. Otherwise the
 CPU EP decodes one row per worker shard and reuses it for all grouped tokens.
 The default dense/cache path remains available for fitting experts. The change
 also removes duplicate CPU weight-contract exports; EP API owns those contracts.
@@ -70,7 +70,7 @@ Select the resulting executable in `target/release/deps/` (not its `.d` file):
 ```sh
 RAYON_NUM_THREADS=4 \
 ONNX_GENAI_HOST_ALLOC_CACHE_FLOOR_BYTES=1048576 \
-ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES=0 \
+ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES=0 \
 /path/to/bounded_expert_bench streamed 1 1024 4096 4 /tmp/streamed.f32
 ```
 

@@ -235,7 +235,7 @@ GPU/CPU execution splits, capture lifetime and asynchronous release ordering.
 
 `BlockQuantizedMoE` now admits dense execution only when the complete selected
 expert projection set (including an optional third projection) fits
-`ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES`. Otherwise it decodes one weight row per
+`ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES`. Otherwise it decodes one weight row per
 explicit Rayon shard and applies that row to every token routed to the expert.
 Routing, activation, gates and accumulation share the existing implementation;
 format metadata and the canonical decoder remain the only format authority.
@@ -463,3 +463,62 @@ independent of unresolved activation shapes. Its returned state belongs to the
 executor. CPU transpose warming uses the same prepack policy and memo mechanism
 as concrete kernels, so both static and symbolic graphs retain their load-time
 warm path and release its ownership with the session.
+
+
+### NBits f32 expansions join owned dense weights
+
+`MatMulNBitsFactory::new` captures `CpuMemoryResources`, rather than only a
+retention boolean. Every complete f32 expansion, including nonconstant and KN
+transient operands, uses the same generic owned-dense cache component as block
+formats. Cache keys remain representation-specific; the NBits key is local to
+one immutable kernel slot and is never a shared raw address. A retained payload
+keeps its exact Host grant through its last Arc, including after kernel drop.
+Idle cache ceilings reserve nothing. Cold fills are single-flight; warm hits
+claim no new capacity, and disabled/oversize retention does not serialize
+transient operations through the cache fill gate.
+
+The common per-kernel f32 retention ceiling is `CpuWeightCacheLimits::dense_bytes`
+(default 256 MiB, read from `ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES`). The old
+block-only environment knob is removed without an alias; benchmark commands and
+current documentation use the common name. Retention and execution grants remain
+distinct: NBits may use an admitted temporary full expansion even when retention
+is off. Existing packed native and fused GEBP routes keep their legality and
+priority, with the NT retention decision derived from the actual ceiling.
+
+A resolved Local/NUMA/SPMD placement owns the allocation-peak rule and the actual
+placement operation. NUMA/SPMD first-touch copies need two simultaneously live
+f32 matrices, so construction preflights 2B and leaves only B charged to the
+final payload. The shared cache rejects underspecified peaks, nonexact final
+buffers and failed builders without publishing a partial entry or leaking a
+grant. This is a weight-buffer admission bound, not an RSS measurement.
+
+Full-grant capacity refusal selects the shared row-decoded projection driver.
+NBits retains its serial M=1 dot order; batched projection uses serial per-column
+GEMM inside bounded worker shards. The driver accepts an explicit scheduler;
+NBits M=1 reuses its deferred flat/NUMA/SPMD dispatch rather than bypassing the
+configured budget with ambient Rayon. The isolated SPMD parity fixture now
+includes a refused dense grant and asserts that it actually reaches the active
+scheduler. Unit output axes avoid a redundant layout copy. One affine decoder
+serves NK, KN and refused
+grant paths for 2/4/8 bits and group indices. Contiguous packed/scales/zero-point
+operands borrow independently, including offsets; only strided or widened
+operands materialize. The byte borrowing helper is shared with QMoE.
+
+Host tests cover actual KV competition, independent source/retention policy,
+active payloads after kernel drop, construction-peak refunds, refusal before a
+full builder, rollback on invalid builders/group indices, all bit widths and
+zero-point modes, strided operands, lower precision, bias and multiple rows.
+This does not finish compact native/MLAS packing grants, pressure reclamation,
+row scratch/activation accounting, CPU Device/Host capacity reconciliation,
+process-global capacity or asynchronous GPU validation. Standalone default
+resources remain local and ungoverned. No throughput or GPU execution claim.
+
+The NBits planning exports are now `nbits_decode_f32_retention_candidate`,
+`planned_nbits_node_retained_bytes` and `planned_nbits_retained_bytes`; engine
+callers and fixtures use those names without old aliases. Their comments state
+the estimate's limits: compact native packs, transients, scratch and runtime
+shape-instance counts are not included. They never authorize physical bytes.
+The optional MLAS Apple route test also checks the resolved platform policy,
+including the native int8 fallback, rather than assuming linkage guarantees
+QNBit/KAI execution. The unchanged main branch reproduces its former failure
+in an isolated build directory; the original numerical guard is retained.

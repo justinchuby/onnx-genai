@@ -33,7 +33,7 @@ use super::matmul_nbits::dequantize_nbits_row;
 use super::moe::{
     ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
 };
-use super::{check_arity, contiguous_u8_slice, to_dense_bytes, to_dense_f32, write_dense_f32};
+use super::{check_arity, quantized_input_bytes, to_dense_f32, write_dense_f32};
 use crate::DerivedWeightMemory;
 use crate::resources::{DenseWeightGrant, WeightAdmission};
 use crate::weight_offload::{
@@ -1951,16 +1951,11 @@ impl ExpertProjection for QuantizedExpertProjection<'_, '_> {
             self.out_features(),
             bias,
             || |row, output: &mut [f32]| self.source.decode_expert_row(self.expert, row, output),
+            |input, row, output, rows, k| {
+                super::matmul::gemm_bt_serial(input, row, output, rows, k, 1)
+            },
+            super::decoded_projection::rayon_decoded_columns,
         )
-    }
-}
-
-/// Borrow contiguous packed input; strided storage needs only a packed copy.
-fn quantized_input_bytes<'a>(view: &'a TensorView<'_>) -> Result<Cow<'a, [u8]>> {
-    if view.is_contiguous() {
-        Ok(Cow::Borrowed(contiguous_u8_slice(view)?))
-    } else {
-        Ok(Cow::Owned(to_dense_bytes(view)?))
     }
 }
 

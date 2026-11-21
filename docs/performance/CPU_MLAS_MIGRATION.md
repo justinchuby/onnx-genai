@@ -672,6 +672,25 @@ requires an aarch64 runner; that limit is stated in the test's own comments.
 default build links no MLAS on any target, so this could not reach a user. It
 only ever blocked research builds.
 
+## Native compact NBits operand ownership
+
+The native 2-bit direct GEMV/GEMM and non-VNNI x86 accuracy-4 packed-nibble
+kernels consume the original ONNX wire layout. In flat execution they now
+borrow contiguous host `u8` values, `f32` scales, and optional `u8` zero points,
+including nonzero tensor offsets. Constant and dynamic operands both borrow
+only for the duration of the call; no source slice is retained in a cache.
+This removes the otherwise identical resident copy for constants and the
+repeated temporary copy for dynamic operands. It does not change arithmetic,
+ISA selection, activation quantization, or the broader MLAS graduation status.
+
+Half/bfloat scales and strided inputs still require preparation. Constants
+reuse that prepared allocation; dynamic inputs own it only during execution.
+An active NUMA/SPMD placement scope also retains the existing first-touch
+preparation, even on a pool with one node. Layout-transforming int4/int8 packs
+are separate work and are not made borrowed by this change. The compact owned
+packs still need governor admission and pressure reclamation; the f32 expansion
+cache's owned Host grants do not govern these other allocations.
+
 ## Opting *in*, for research only
 
 MLAS is off everywhere by default. To reach the reference deliberately:
@@ -705,11 +724,15 @@ compare families, not whole-model claims.
 Carried forward from [`ABSORBING_MLAS.md`](ABSORBING_MLAS.md), unchanged:
 
 - **Any resident buffer must be governed** (#1056): declared to the memory plan
-  before allocation, in the bytes actually allocated, and declinable. Use
-  `GovernedWeightCache<T>`.
+  before allocation, in the bytes actually allocated, and declinable. Dense
+  expansions use `DenseWeightCache` with `DerivedWeightMemory`; each payload
+  owns its Host grant until the final reader drops it. Compact retained packs
+  remain outstanding work; an estimate alone does not fund an allocation.
 - **Anything cached per kernel instance is retained at least twice** — the
   executor's `KernelCache` is shape-keyed, so prefill and decode are separate
-  instances. Prefer a process-global cache keyed on weight identity.
+  instances. Share eligible weights through the owning `CpuMemoryResources`
+  cache using explicit immutable source identity, rather than a process-global
+  raw-address cache. Borrow unchanged source layouts when placement permits.
 - **The memory-cheapest technique wins ties.** The MLAS int4 route holds a packed
   copy at ~2× the int4 bytes; on a 14B model that is 16.7 GB and the memory plan
   declines it (#1051), so the model that most needs the speed is the one that

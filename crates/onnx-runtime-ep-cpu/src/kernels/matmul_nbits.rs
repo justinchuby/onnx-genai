@@ -20,7 +20,6 @@ use std::borrow::Cow;
 use std::cell::Cell;
 #[cfg(feature = "mlas")]
 use std::collections::HashMap;
-#[cfg(feature = "mlas")]
 use std::sync::Arc;
 #[cfg(feature = "mlas")]
 use std::sync::LazyLock;
@@ -35,9 +34,13 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node};
 use rayon::prelude::*;
 
+use super::dense_weight_cache::{
+    DenseWeight, DenseWeightCache, DenseWeightKey, DenseWeightLoad, DenseWeightSpec,
+};
 use super::int4_nibble;
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
+use crate::CpuMemoryResources;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
@@ -663,8 +666,21 @@ fn hand_int8_decode_has_native_dot() -> bool {
     }
 }
 
+// This key names the immutable f32 NK slot of one kernel, not a process-wide
+// weight address. Only the existing all-constant operand proof enables retention.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct NBitsDenseKey {
+    bytes: usize,
+}
+impl DenseWeightKey for NBitsDenseKey {
+    fn dense_bytes(&self) -> Result<usize> {
+        Ok(self.bytes)
+    }
+}
+
 pub struct MatMulNBitsKernel {
-    retain_caches: bool,
+    #[cfg(feature = "mlas")]
+    retain_mlas_packs: bool,
     k: usize,
     n: usize,
     bits: usize,
@@ -675,7 +691,7 @@ pub struct MatMulNBitsKernel {
     flops: Option<u64>,
     weight_prepacked: bool,
     constant_inputs: [bool; 5],
-    weight_nk: OnceLock<Vec<f32>>,
+    dense_weights: DenseWeightCache<NBitsDenseKey>,
     int8_weight: OnceLock<Int8Weight>,
     packed_int4_weight: OnceLock<PackedInt4Weight>,
     packed_int4_n16_weight: OnceLock<PackedN16SdotWeight>,
@@ -1208,6 +1224,30 @@ struct PackedNBitsWeight {
     zero_points: Option<Vec<u8>>,
 }
 
+/// Call-scoped wire-layout operands shared by owned and borrowed execution.
+/// No source tensor reference is retained in a kernel cache.
+#[derive(Clone, Copy)]
+struct PackedNBitsView<'a> {
+    values: &'a [u8],
+    scales: &'a [f32],
+    zero_points: Option<&'a [u8]>,
+}
+
+/// Ownership is necessary only when conversion or explicit placement requires it.
+enum PackedNBitsOperand<'a> {
+    View(PackedNBitsView<'a>),
+    Owned(PackedNBitsWeight),
+}
+
+impl PackedNBitsOperand<'_> {
+    fn view(&self) -> PackedNBitsView<'_> {
+        match self {
+            Self::View(view) => *view,
+            Self::Owned(weight) => weight.view(),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BorrowedScales<'a> {
     F32(&'a [f32]),
@@ -1373,6 +1413,16 @@ impl PackedNBitsBlock<'_> {
 }
 
 impl PackedNBitsWeight {
+    fn view(&self) -> PackedNBitsView<'_> {
+        PackedNBitsView {
+            values: &self.values,
+            scales: &self.scales,
+            zero_points: self.zero_points.as_deref(),
+        }
+    }
+}
+
+impl PackedNBitsView<'_> {
     fn row(&self, output: usize, block_count: usize, layout: NBitsLayout) -> PackedNBitsRow<'_> {
         let packed_row_size = block_count * layout.packed_block_size();
         let packed_start = output * packed_row_size;
@@ -1393,7 +1443,7 @@ impl PackedNBitsWeight {
 
 /// Dense `u8` weight for the 8-bit `MatMulNBits` decode (`m == 1`) path.
 ///
-/// Unlike [`weight_nk`](MatMulNBitsKernel::weight_nk) — which fully expands each
+/// Unlike [the dense f32 cache](MatMulNBitsKernel::dense_weights) — which fully expands each
 /// weight to `f32` (4 bytes/elem) — this keeps the quantized weight at one byte
 /// per element and dequantizes on the fly inside the GEMV, cutting the weight
 /// memory traffic (which dominates decode) ~4x while keeping the activations in
@@ -1405,17 +1455,13 @@ struct PackedU8Weight {
     scaled_zero_points: Vec<f32>,
 }
 
+#[derive(Default)]
 pub struct MatMulNBitsFactory {
-    retain_caches: bool,
+    resources: CpuMemoryResources,
 }
 impl MatMulNBitsFactory {
-    pub fn new(retain_caches: bool) -> Self {
-        Self { retain_caches }
-    }
-}
-impl Default for MatMulNBitsFactory {
-    fn default() -> Self {
-        Self::new(true)
+    pub fn new(resources: CpuMemoryResources) -> Self {
+        Self { resources }
     }
 }
 
@@ -1465,7 +1511,8 @@ impl KernelFactory for MatMulNBitsFactory {
         let flops = super::flops::matmul_nbits_flops(rows, n as u64, k as u64);
 
         Ok(Box::new(MatMulNBitsKernel {
-            retain_caches: self.retain_caches,
+            #[cfg(feature = "mlas")]
+            retain_mlas_packs: self.resources.cache_retention().is_admitted(),
             k,
             n,
             bits: bits as usize,
@@ -1474,7 +1521,14 @@ impl KernelFactory for MatMulNBitsFactory {
             flops,
             weight_prepacked: weight_prepacked == 1,
             constant_inputs: [false; 5],
-            weight_nk: OnceLock::new(),
+            dense_weights: DenseWeightCache::new(
+                self.resources.weight_memory().clone(),
+                if self.resources.cache_retention().is_admitted() {
+                    self.resources.weight_cache_limits().dense_bytes
+                } else {
+                    0
+                },
+            ),
             int8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
             packed_int4_n16_weight: OnceLock::new(),
@@ -1783,28 +1837,14 @@ impl Kernel for MatMulNBitsKernel {
             }
         }
         if self.bits == 2 && !self.weight_prepacked && group_indices.is_none() {
-            let owned_weight;
-            let packed_weight = if can_prepack {
-                if let Some(weight) = self.packed_nbits_weight.get() {
-                    weight
-                } else {
-                    let weight = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
-                    let weight = numa_place_nbits(weight, self.n);
-                    let _ = self.packed_nbits_weight.set(weight);
-                    self.packed_nbits_weight
-                        .get()
-                        .expect("constant MatMulNBits packed weight was just initialized")
-                }
-            } else {
-                let built = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
-                owned_weight = numa_place_nbits(built, self.n);
-                &owned_weight
-            };
+            let operand =
+                self.resolve_nbits_operand(&inputs[1], &inputs[2], zero_points, can_prepack)?;
+            let packed_weight = operand.view();
             if m == 1 {
                 with_decode_pool_lazy(|| {
                     packed_nbits_gemv(
                         &activations,
-                        packed_weight,
+                        &packed_weight,
                         result,
                         self.k,
                         self.n,
@@ -1815,7 +1855,7 @@ impl Kernel for MatMulNBitsKernel {
             } else {
                 packed_nbits_gemm(
                     &activations,
-                    packed_weight,
+                    &packed_weight,
                     result,
                     m,
                     self.k,
@@ -1941,28 +1981,14 @@ impl Kernel for MatMulNBitsKernel {
             // `i8`. Decode reads each weight exactly once, so that expansion
             // doubles the only stream that matters. This route consumes the
             // wire layout at 0.5 B/weight instead -- see `int4_nibble`.
-            let owned_weight;
-            let packed_weight = if can_prepack {
-                if let Some(weight) = self.packed_nbits_weight.get() {
-                    weight
-                } else {
-                    let weight = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
-                    let weight = numa_place_nbits(weight, self.n);
-                    let _ = self.packed_nbits_weight.set(weight);
-                    self.packed_nbits_weight
-                        .get()
-                        .expect("constant MatMulNBits packed nibble weight was just initialized")
-                }
-            } else {
-                let built = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
-                owned_weight = numa_place_nbits(built, self.n);
-                &owned_weight
-            };
+            let operand =
+                self.resolve_nbits_operand(&inputs[1], &inputs[2], zero_points, can_prepack)?;
+            let packed_weight = operand.view();
             record_int4_route(Int4Route::PackedNibble);
             with_decode_pool(|| {
                 int4_nibble_matmul(
                     &activations,
-                    packed_weight,
+                    &packed_weight,
                     result,
                     m,
                     self.k,
@@ -2186,41 +2212,27 @@ impl Kernel for MatMulNBitsKernel {
                 })?;
             }
         } else if m == 1 {
-            let owned_weight;
-            let weight_nk = if can_prepack && self.retain_caches {
-                if let Some(weight) = self.weight_nk.get() {
-                    weight
-                } else {
-                    let weight =
-                        mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
-                            self.dequantize_weight(
-                                &inputs[1],
-                                &inputs[2],
-                                zero_points,
-                                group_indices,
-                                WeightLayout::Nk,
-                            )
-                        })?;
-                    let weight = numa_place_nk(weight, self.n);
-                    let _ = self.weight_nk.set(weight);
-                    self.weight_nk
-                        .get()
-                        .expect("constant MatMulNBits prepack was just initialized")
-                }
-            } else {
-                let built = self.dequantize_weight(
+            match self.load_dense_weight(
+                &inputs[1],
+                &inputs[2],
+                zero_points,
+                group_indices,
+                can_prepack,
+                WeightLayout::Nk,
+            )? {
+                Some(weight) => with_decode_pool_lazy(|| {
+                    gemv_nk(&activations, weight.as_slice(), result, self.k, self.n);
+                })?,
+                None => self.project_dense_rows(
                     &inputs[1],
                     &inputs[2],
                     zero_points,
                     group_indices,
-                    WeightLayout::Nk,
-                )?;
-                owned_weight = numa_place_nk(built, self.n);
-                &owned_weight
-            };
-            with_decode_pool_lazy(|| {
-                gemv_nk(&activations, weight_nk, result, self.k, self.n);
-            })?;
+                    &activations,
+                    m,
+                    result,
+                )?,
+            }
         } else {
             // Prefill / batched (m > 1) fallback for cases not owned by the
             // 4-bit int8 path above (notably 8-bit weights, and generic
@@ -2252,7 +2264,7 @@ impl Kernel for MatMulNBitsKernel {
             // materialize ~51 MB per prefill for a 3584x3584 8-bit node. The
             // fused pack allocates only per-strip scratch, so consult it first
             // whenever NT would not keep the weight resident.
-            let nt_keeps_weight_resident = can_prepack && self.retain_caches;
+            let nt_keeps_weight_resident = self.can_retain_dense(can_prepack, &self.dense_key()?);
             #[cfg(target_arch = "x86_64")]
             let used_gebp_first = !nt_keeps_weight_resident
                 && self.try_int8_prefill_gebp(
@@ -2316,17 +2328,27 @@ impl Kernel for MatMulNBitsKernel {
                 #[cfg(not(target_arch = "x86_64"))]
                 let used_gebp = false;
                 if !used_gebp {
-                    let weight_kn =
-                        mm_profile::time_prepack("dequant-kn", self.nbits_weight_bytes(), || {
-                            self.dequantize_weight(
-                                &inputs[1],
-                                &inputs[2],
-                                zero_points,
-                                group_indices,
-                                WeightLayout::Kn,
-                            )
-                        })?;
-                    gemm(&activations, &weight_kn, result, m, self.k, self.n)?;
+                    match self.load_dense_weight(
+                        &inputs[1],
+                        &inputs[2],
+                        zero_points,
+                        group_indices,
+                        false,
+                        WeightLayout::Kn,
+                    )? {
+                        Some(weight) => {
+                            gemm(&activations, weight.as_slice(), result, m, self.k, self.n)?
+                        }
+                        None => self.project_dense_rows(
+                            &inputs[1],
+                            &inputs[2],
+                            zero_points,
+                            group_indices,
+                            &activations,
+                            m,
+                            result,
+                        )?,
+                    }
                 }
             }
         }
@@ -2354,6 +2376,42 @@ impl Kernel for MatMulNBitsKernel {
 }
 
 impl MatMulNBitsKernel {
+    /// The compact kernels consume ONNX wire bytes and f32 scales unchanged.
+    /// Borrow them when no conversion or NUMA/SPMD first-touch placement is
+    /// required; otherwise retain the existing prepared constant/temporary path.
+    fn resolve_nbits_operand<'a>(
+        &'a self,
+        packed: &TensorView<'a>,
+        scales: &TensorView<'a>,
+        zero_points: Option<&TensorView<'a>>,
+        can_prepack: bool,
+    ) -> Result<PackedNBitsOperand<'a>> {
+        if numa_decode_active().is_none()
+            && spmd_decode_active().is_none()
+            && let Some(view) = borrow_nbits_wire(packed, scales, zero_points)
+        {
+            return Ok(PackedNBitsOperand::View(view));
+        }
+        if can_prepack {
+            if let Some(weight) = self.packed_nbits_weight.get() {
+                return Ok(PackedNBitsOperand::View(weight.view()));
+            }
+            let weight = self.prepack_nbits_weight(packed, scales, zero_points)?;
+            let _ = self
+                .packed_nbits_weight
+                .set(numa_place_nbits(weight, self.n));
+            Ok(PackedNBitsOperand::View(
+                self.packed_nbits_weight
+                    .get()
+                    .expect("constant MatMulNBits packed weight was just initialized")
+                    .view(),
+            ))
+        } else {
+            let weight = self.prepack_nbits_weight(packed, scales, zero_points)?;
+            Ok(PackedNBitsOperand::Owned(numa_place_nbits(weight, self.n)))
+        }
+    }
+
     fn prepack_nbits_weight(
         &self,
         packed: &TensorView,
@@ -2507,7 +2565,7 @@ impl MatMulNBitsKernel {
     #[cfg(feature = "mlas")]
     fn mlas_sqnbit_owns_fp32_compute(&self, can_prepack: bool, has_zero_points: bool) -> bool {
         mlas_qnbit_enabled()
-            && self.retain_caches
+            && self.retain_mlas_packs
             && can_prepack
             && mlas_sys::sqnbit_packed_b_size(
                 self.n,
@@ -2768,8 +2826,8 @@ impl MatMulNBitsKernel {
     /// decode path uses, and run a **transposed-B ("NT") dense GEMM** so each
     /// weight row is streamed once and reused across all `m` activation rows.
     /// Returns `Ok(true)` when it handled the GEMM, `Ok(false)` when the host
-    /// GEMM backend has no NT variant (the caller then uses the previous
-    /// direct-`Kn` dense path).
+    /// GEMM backend has no NT variant or the complete expansion is declined.
+    /// The caller can then try fused GEBP before the granted KN/row fallback.
     ///
     /// This replaces the strided-scatter `Kn` dequant (each K step writing at
     /// stride N) that dominated large-model time-to-first-token (#959, #1091).
@@ -2799,34 +2857,20 @@ impl MatMulNBitsKernel {
             return Ok(false);
         }
 
-        let owned_weight;
-        let weight_nk: &[f32] = if can_prepack && self.retain_caches {
-            if let Some(weight) = self.weight_nk.get() {
-                weight
-            } else {
-                let weight =
-                    mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
-                        self.dequantize_weight(
-                            packed,
-                            scales,
-                            zero_points,
-                            group_indices,
-                            WeightLayout::Nk,
-                        )
-                    })?;
-                let weight = numa_place_nk(weight, self.n);
-                let _ = self.weight_nk.set(weight);
-                self.weight_nk
-                    .get()
-                    .expect("constant MatMulNBits Nk prepack was just initialized")
-            }
-        } else {
-            let built = mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
-                self.dequantize_weight(packed, scales, zero_points, group_indices, WeightLayout::Nk)
-            })?;
-            owned_weight = numa_place_nk(built, self.n);
-            &owned_weight
+        let Some(weight) = self.load_dense_weight(
+            packed,
+            scales,
+            zero_points,
+            group_indices,
+            can_prepack,
+            WeightLayout::Nk,
+        )?
+        else {
+            // Let the caller try its fused dequant-GEBP before row decoding;
+            // a refused complete buffer must not hide a bounded fast path.
+            return Ok(false);
         };
+        let weight_nk = weight.as_slice();
 
         // C[m, n] = A[m, k] * B_nk[n, k]^T -- reads the Nk weight as the
         // transposed operand without materializing a Kn copy. Bit-identical to
@@ -3512,6 +3556,120 @@ impl MatMulNBitsKernel {
         })
     }
 
+    fn can_retain_dense(&self, can_prepack: bool, key: &NBitsDenseKey) -> bool {
+        can_prepack && key.bytes <= self.dense_weights.byte_limit()
+    }
+
+    fn dense_key(&self) -> Result<NBitsDenseKey> {
+        let bytes = self.k.checked_mul(self.n).and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| error(format!("MatMulNBits f32 weight byte count overflows for K={}, N={}; use addressable dimensions", self.k, self.n)))?;
+        Ok(NBitsDenseKey { bytes })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_dense_weight(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        group_indices: Option<&TensorView>,
+        can_prepack: bool,
+        layout: WeightLayout,
+    ) -> Result<Option<Arc<DenseWeight>>> {
+        let key = self.dense_key()?;
+        let retain = matches!(layout, WeightLayout::Nk) && self.can_retain_dense(can_prepack, &key);
+        let placement = if matches!(layout, WeightLayout::Nk) {
+            DenseWeightPlacement::active()
+        } else {
+            DenseWeightPlacement::Local
+        };
+        // The resolved placement owns both the peak rule and the actual copy.
+        let peak = placement.build_peak(key.bytes)?;
+        let spec = if retain {
+            DenseWeightSpec::cached(&key)?
+        } else {
+            DenseWeightSpec::transient(key.bytes)
+        }
+        .with_build_peak(peak);
+        match self.dense_weights.load_group_owned(&[spec], |_| {
+            let built = mm_profile::time_prepack(
+                if matches!(layout, WeightLayout::Nk) {
+                    "dequant-nk"
+                } else {
+                    "dequant-kn"
+                },
+                self.nbits_weight_bytes(),
+                || self.dequantize_weight(packed, scales, zero_points, group_indices, layout),
+            )?;
+            Ok(placement.place(built, self.n))
+        })? {
+            DenseWeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
+            DenseWeightLoad::Declined(_) => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_dense_rows(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        group_indices: Option<&TensorView>,
+        activations: &[f32],
+        m: usize,
+        result: &mut [f32],
+    ) -> Result<()> {
+        let rows = NBitsDenseRows::new(self, packed, scales, zero_points, group_indices)?;
+        let output = super::decoded_projection::linear_decoded_grouped(
+            "MatMulNBits",
+            activations,
+            m,
+            self.k,
+            self.n,
+            None,
+            || {
+                |feature, output: &mut [f32]| {
+                    rows.decode_row(feature, output);
+                    Ok(())
+                }
+            },
+            |input, row, output, rows, k| {
+                if rows == 1 {
+                    output[0] = dot_f32(input, row);
+                    Ok(())
+                } else {
+                    super::matmul::gemm_bt_serial(input, row, output, rows, k, 1)
+                }
+            },
+            |columns, rows, compute| {
+                if rows != 1 {
+                    return super::decoded_projection::rayon_decoded_columns(
+                        columns, rows, compute,
+                    );
+                }
+                // The same scheduler as a full-weight GEMV: deferred flat
+                // installs and resident NUMA/SPMD scopes keep their budget.
+                let failure = std::sync::Mutex::new(None);
+                with_decode_pool_lazy(|| {
+                    parallel_output_rows(columns, self.k, |start, output| {
+                        if let Err(error) = compute(start, output) {
+                            failure
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get_or_insert(error);
+                        }
+                    })
+                })?;
+                match failure.into_inner().unwrap_or_else(|p| p.into_inner()) {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            },
+        )?;
+        result.copy_from_slice(&output);
+        Ok(())
+    }
+
     fn dequantize_weight(
         &self,
         packed: &TensorView,
@@ -3520,157 +3678,124 @@ impl MatMulNBitsKernel {
         group_indices: Option<&TensorView>,
         layout: WeightLayout,
     ) -> Result<Vec<f32>> {
-        let packed = to_dense_bytes(packed)?;
-        let scales = to_dense_compute_f32(scales)?;
-        let packed_zero_points = zero_points.map(to_dense_bytes).transpose()?;
+        let rows = NBitsDenseRows::new(self, packed, scales, zero_points, group_indices)?;
+        let elements = self.dense_key()?.bytes / 4;
+        let mut output =
+            super::decoded_projection::zeroed_f32("MatMulNBits", "dense weight", elements)?;
+        match layout {
+            WeightLayout::Nk => output
+                .par_chunks_mut(self.k)
+                .enumerate()
+                .for_each(|(feature, output)| rows.decode_row(feature, output)),
+            WeightLayout::Kn => {
+                output
+                    .par_chunks_mut(self.n)
+                    .enumerate()
+                    .for_each(|(depth, output)| {
+                        for (feature, value) in output.iter_mut().enumerate() {
+                            *value = rows.value(feature, depth);
+                        }
+                    })
+            }
+        }
+        Ok(output)
+    }
+}
+
+/// The same affine decoder serves complete dense weights and refused-grant
+/// row projections; group indices select scales/zero points, not packed bytes.
+struct NBitsDenseRows<'a> {
+    packed: Cow<'a, [u8]>,
+    scales: Cow<'a, [f32]>,
+    zero_points: Option<Cow<'a, [u8]>>,
+    group_indices: Option<Vec<i64>>,
+    k_blocks: usize,
+    zp_row_bytes: usize,
+    layout: NBitsLayout,
+}
+impl<'a> NBitsDenseRows<'a> {
+    fn new(
+        kernel: &MatMulNBitsKernel,
+        packed: &'a TensorView,
+        scales: &'a TensorView,
+        zero_points: Option<&'a TensorView>,
+        group_indices: Option<&'a TensorView>,
+    ) -> Result<Self> {
         let group_indices = group_indices.map(to_dense_i64).transpose()?;
-        let k_blocks = self.k.div_ceil(self.block_size);
+        let k_blocks = kernel.k.div_ceil(kernel.block_size);
         if let Some(indices) = &group_indices {
+            if indices.len() != kernel.k {
+                return Err(error(format!(
+                    "g_idx has {} entries for K={}; supply one group index per K element",
+                    indices.len(),
+                    kernel.k
+                )));
+            }
             for (index, &group) in indices.iter().enumerate() {
                 if group < 0 || group as usize >= k_blocks {
                     return Err(error(format!(
-                        "g_idx[{index}]={group} is outside 0..{k_blocks}"
+                        "g_idx[{index}]={group} is outside 0..{k_blocks}; supply valid scale/zero-point group indices"
                     )));
                 }
             }
         }
-
-        let blob_size = self.block_size * self.bits / 8;
-        let zp_row_bytes = (k_blocks * self.bits).div_ceil(8);
-        let quantized_mask = if self.bits == 8 {
-            u8::MAX
+        Ok(Self {
+            packed: super::quantized_input_bytes(packed)?,
+            scales: to_dense_f32_widen("MatMulNBits scales", scales)?,
+            zero_points: zero_points.map(super::quantized_input_bytes).transpose()?,
+            group_indices,
+            k_blocks,
+            zp_row_bytes: (k_blocks * kernel.bits).div_ceil(8),
+            layout: NBitsLayout {
+                bits: kernel.bits,
+                block_size: kernel.block_size,
+            },
+        })
+    }
+    fn packed_row(&self, feature: usize) -> PackedNBitsRow<'_> {
+        let row_bytes = self.k_blocks * self.layout.packed_block_size();
+        let start = feature * row_bytes;
+        PackedNBitsRow {
+            values: &self.packed[start..start + row_bytes],
+            scales: &self.scales[feature * self.k_blocks..(feature + 1) * self.k_blocks],
+            zero_points: self
+                .zero_points
+                .as_ref()
+                .map(|v| &v[feature * self.zp_row_bytes..(feature + 1) * self.zp_row_bytes]),
+            layout: self.layout,
+        }
+    }
+    fn value(&self, feature: usize, depth: usize) -> f32 {
+        let row = self.packed_row(feature);
+        match &self.group_indices {
+            None => row.dequantized_value(depth),
+            Some(groups) => {
+                let group = groups[depth] as usize;
+                let bit = (depth % self.layout.block_size) * self.layout.bits;
+                let byte = row.values
+                    [(depth / self.layout.block_size) * self.layout.packed_block_size() + bit / 8];
+                let quant = (byte >> (bit % 8)) & self.layout.mask();
+                (quant as f32 - self.layout.zero_point(row.zero_points, group) as f32)
+                    * row.scales[group]
+            }
+        }
+    }
+    fn decode_row(&self, feature: usize, output: &mut [f32]) {
+        if self.group_indices.is_none() {
+            let row = self.packed_row(feature);
+            dequantize_nbits_row(
+                row.values,
+                row.scales,
+                row.zero_points,
+                output,
+                self.layout.bits,
+                self.layout.block_size,
+            );
         } else {
-            (1u8 << self.bits) - 1
-        };
-        let default_zero_point = 1u8 << (self.bits - 1);
-        let mut weight_kn = vec![0.0f32; self.k * self.n];
-
-        // Fast path: the natural `Nk` ([n, k]) layout with no per-column group
-        // indices writes each output row contiguously and independently, so it
-        // parallelizes cleanly across the pool. This is the layout the batched
-        // prefill GEMM consumes (via `trans_b`), and dequantizing the whole
-        // weight was previously a single-threaded scalar loop that dominated the
-        // first (cache-cold) prefill. Each `par_chunks_mut(k)` chunk is one
-        // output row; the row-major `Kn` transpose and the grouped path keep the
-        // original serial scatter below.
-        if matches!(layout, WeightLayout::Nk) && group_indices.is_none() {
-            let bits = self.bits;
-            let block_size = self.block_size;
-            weight_kn
-                .par_chunks_mut(self.k)
-                .enumerate()
-                .for_each(|(output, row)| {
-                    let packed_start = output * k_blocks * blob_size;
-                    let scale_start = output * k_blocks;
-                    let zero_point_start = output * zp_row_bytes;
-                    let packed_row = &packed[packed_start..packed_start + k_blocks * blob_size];
-                    let scale_row = &scales[scale_start..scale_start + k_blocks];
-                    let zero_point_row = packed_zero_points
-                        .as_ref()
-                        .map(|points| &points[zero_point_start..zero_point_start + zp_row_bytes]);
-                    dequantize_nbits_row(
-                        packed_row,
-                        scale_row,
-                        zero_point_row,
-                        row,
-                        bits,
-                        block_size,
-                    );
-                });
-            return Ok(weight_kn);
-        }
-
-        // Parallel `Kn` fast path: the transposed ([k, n]) layout the dense
-        // prefill GEMM consumes. Element `weight_kn[depth * n + output]` means
-        // one depth-row `[depth * n .. (depth + 1) * n)` is contiguous, so we can
-        // parallelize across depth-rows with `par_chunks_mut(n)` and fill every
-        // output within a row. This is byte-identical to the serial scatter
-        // below (same `dequantize_nbits_value`, same indices) but distributes the
-        // f32 materialization across the pool. Previously this `Kn` transpose was
-        // the single-threaded phase that dominated the cache-cold first prefill
-        // (~5 s on qwen0.5b-q4, ~43 s/GB), the load-time gap versus ORT (#959).
-        // The grouped path keeps the original serial scatter below.
-        if matches!(layout, WeightLayout::Kn) && group_indices.is_none() {
-            let bits = self.bits;
-            let block_size = self.block_size;
-            let n = self.n;
-            weight_kn
-                .par_chunks_mut(n)
-                .enumerate()
-                .for_each(|(depth, row)| {
-                    for (output, slot) in row.iter_mut().enumerate() {
-                        let packed_start = output * k_blocks * blob_size;
-                        let scale_start = output * k_blocks;
-                        let zero_point_start = output * zp_row_bytes;
-                        let packed_row = &packed[packed_start..packed_start + k_blocks * blob_size];
-                        let scale_row = &scales[scale_start..scale_start + k_blocks];
-                        let zero_point_row = packed_zero_points.as_ref().map(|points| {
-                            &points[zero_point_start..zero_point_start + zp_row_bytes]
-                        });
-                        *slot = dequantize_nbits_value(
-                            packed_row,
-                            scale_row,
-                            zero_point_row,
-                            depth,
-                            bits,
-                            block_size,
-                        );
-                    }
-                });
-            return Ok(weight_kn);
-        }
-
-        for output in 0..self.n {
-            if group_indices.is_none() {
-                let packed_start = output * k_blocks * blob_size;
-                let scale_start = output * k_blocks;
-                let zero_point_start = output * zp_row_bytes;
-                let packed_row = &packed[packed_start..packed_start + k_blocks * blob_size];
-                let scale_row = &scales[scale_start..scale_start + k_blocks];
-                let zero_point_row = packed_zero_points
-                    .as_ref()
-                    .map(|points| &points[zero_point_start..zero_point_start + zp_row_bytes]);
-                for depth in 0..self.k {
-                    let index = match layout {
-                        WeightLayout::Kn => depth * self.n + output,
-                        WeightLayout::Nk => output * self.k + depth,
-                    };
-                    weight_kn[index] = dequantize_nbits_value(
-                        packed_row,
-                        scale_row,
-                        zero_point_row,
-                        depth,
-                        self.bits,
-                        self.block_size,
-                    );
-                }
-                continue;
-            }
-            for depth in 0..self.k {
-                let block = depth / self.block_size;
-                let within_block = depth % self.block_size;
-                let bit_offset = within_block * self.bits;
-                let byte = packed[(output * k_blocks + block) * blob_size + bit_offset / 8];
-                let quantized = (byte >> (bit_offset % 8)) & quantized_mask;
-                let group = group_indices
-                    .as_ref()
-                    .map_or(block, |indices| indices[depth] as usize);
-                let zero_point = packed_zero_points
-                    .as_ref()
-                    .map_or(default_zero_point, |points| {
-                        let bit_offset = group * self.bits;
-                        let byte = points[output * zp_row_bytes + bit_offset / 8];
-                        (byte >> (bit_offset % 8)) & quantized_mask
-                    });
-                let index = match layout {
-                    WeightLayout::Kn => depth * self.n + output,
-                    WeightLayout::Nk => output * self.k + depth,
-                };
-                weight_kn[index] =
-                    (quantized as f32 - zero_point as f32) * scales[output * k_blocks + group];
+            for (depth, value) in output.iter_mut().enumerate() {
+                *value = self.value(feature, depth);
             }
         }
-        Ok(weight_kn)
     }
 }
 
@@ -3719,7 +3844,7 @@ fn configured_decode_threads() -> Option<usize> {
 ///
 /// It honors `ONNX_GENAI_CPU_DECODE_THREADS` when set (`0` opts out), but when
 /// the variable is unset it uses a *different, higher* default than the flat
-/// pool: [`default_persistent_threads`] instead of the flat pool's eight-worker
+/// pool: `default_persistent_threads` instead of the flat pool's eight-worker
 /// ceiling. Compact placement budgets the dispatcher and spawned workers
 /// together so at least half the process's logical CPU capacity stays available
 /// even in a one-CPU-per-core cpuset; explicit spread may use one worker per
@@ -3873,25 +3998,17 @@ pub fn decode_thread_budget() -> Option<usize> {
     })
 }
 
-/// Predict whether an `m == 1` (decode) `MatMulNBits` node with **constant**
-/// weights will materialize the resident dequantized-f32 `weight_nk` cache
-/// (the ~8x expansion of #971), given its static attributes and the host's
-/// selected decode dot-kernel.
+/// Whether static attributes and the selected dot kernel make a constant
+/// decode weight a candidate for the legacy f32 retention family.
 ///
-/// This is the single authority the engine's memory plan consults so its
-/// footprint accounting cannot silently drift from the kernel's own dispatch
-/// (the #947 failure mode). It mirrors the branch order of
-/// [`MatMulNBitsKernel::execute`] exactly: any earlier packed / on-the-fly path
-/// that claims the node returns `false`; only the terminal generic `m == 1`
-/// branch that populates `weight_nk` returns `true`. A control test
-/// (`predictor_matches_actual_resident_cache`) runs real kernels and asserts
-/// this function agrees with the weight actually cached, so a change to the
-/// dispatch that this predictor does not track fails the build.
-///
-/// `n`/`k` are the canonical output/reduction dims and are only consulted on the
-/// MLAS path (whose SQNBit interception depends on the shape).
+/// This mirrors the dispatch branch order: earlier packed/on-the-fly routes
+/// are excluded. It does not inspect the provider's retention ceiling or the
+/// available Host capacity, and does not promise a cached allocation. Real
+/// kernel tests pin the classification with retention admitted and sufficient
+/// capacity; separate tests cover declined retention and refused Host grants.
+/// `n`/`k` are only consulted for the MLAS route's shape capability probe.
 #[allow(clippy::too_many_arguments)]
-pub fn matmul_nbits_decode_caches_dequant_f32(
+pub fn nbits_decode_f32_retention_candidate(
     bits: usize,
     block_size: usize,
     accuracy_level: i64,
@@ -4040,8 +4157,8 @@ fn mlas_sqnbit_scale_zp_bytes(block_size: usize, n: usize, k: usize, has_zero_po
 /// [`mlas_sys::SQNBitPackedB`] retains ([`mlas_sqnbit_scale_zp_bytes`]), so it
 /// equals the buffer the kernel actually allocates for one instance and cannot
 /// drift from it. It is the *per-copy* figure; the session holds
-/// [`MLAS_PACKED_DECODE_INSTANTIATIONS`] of these (see
-/// [`matmul_nbits_resident_side_cache_bytes`]).
+/// `MLAS_PACKED_DECODE_INSTANTIATIONS` of these (see
+/// [`planned_nbits_node_retained_bytes`]).
 ///
 /// It deliberately does **not** consult the provider retention verdict: the
 /// accounting states what admitting the route would cost, and the plan then
@@ -4079,30 +4196,18 @@ fn mlas_sqnbit_packed_b_cache_bytes(
     })
 }
 
-/// Resident side-buffer bytes a single **constant-weight** `MatMulNBits` node
-/// holds for the session *beside* the on-disk weights, given its static
-/// attributes: either the MLAS SQNBit CompFp32 packed buffer (the packed
-/// weight plus its retained scale/zero-point copies, shared across the node's
-/// compiled kernel instances) when the node takes that route, the fully-expanded
-/// f32 `weight_nk` cache (`N * K * 4`, #971) when it takes the generic decode
-/// path, or zero for a truly zero-copy path (borrowed int4, 2-bit, int8,
-/// accuracy-4 direct).
+/// Nominal per-node cost for the legacy planned retention families: a shared
+/// MLAS SQNBit CompFp32 pack, or one candidate f32 expansion. This is an
+/// admission estimate, not a reservation or live-memory counter.
 ///
-/// For the MLAS route the figure is [`MLAS_PACKED_DECODE_INSTANTIATIONS`] times
-/// the per-copy cost. That multiplier is `1` since #1056: although the
-/// shape-keyed kernel cache still compiles a separate `MatMulNBits` instance for
-/// the prefill (`m > 1`) and decode (`m == 1`) activation shapes, both instances
-/// now share one packed buffer through the weight-identity store (see the
-/// constant's docs), so the session holds a single resident copy. The generic
-/// f32 `weight_nk` cache is likewise a decode-only (`m == 1`) materialization
-/// held once, so no multiplier applies there either.
-///
-/// This is the single per-node authority [`resident_dequant_f32_cache_bytes`]
-/// sums over the graph so the memory plan's footprint accounting tracks what the
-/// kernel actually retains. The MLAS packed buffer is checked first because its
-/// route pre-empts the f32 cache in [`MatMulNBitsKernel::execute`].
+/// Compact native packs and decoder/activation scratch are outside this
+/// estimate; zero does not imply a zero-copy execution. MLAS packs share the
+/// `MLAS_PACKED_DECODE_INSTANTIATIONS` count. F32 expansions belong to each
+/// compiled kernel: dynamic prefill/decode instances may retain separate
+/// payloads, and policy/physical refusal may retain none. Owned Host grants,
+/// not this estimate, authorize their actual live bytes.
 #[allow(clippy::too_many_arguments)]
-pub fn matmul_nbits_resident_side_cache_bytes(
+pub fn planned_nbits_node_retained_bytes(
     bits: usize,
     block_size: usize,
     accuracy_level: i64,
@@ -4125,7 +4230,7 @@ pub fn matmul_nbits_resident_side_cache_bytes(
     ) {
         return per_copy.saturating_mul(MLAS_PACKED_DECODE_INSTANTIATIONS);
     }
-    if matmul_nbits_decode_caches_dequant_f32(
+    if nbits_decode_f32_retention_candidate(
         bits,
         block_size,
         accuracy_level,
@@ -4141,26 +4246,14 @@ pub fn matmul_nbits_resident_side_cache_bytes(
     }
 }
 
-/// Total resident side-buffer bytes this CPU EP will hold for `graph` beside the
-/// on-disk weights, i.e. the extra footprint the memory plan must budget for.
+/// Sum of nominal NBits retention candidates for a graph's constant weights.
 ///
-/// For every constant-weight `MatMulNBits` node this sums
-/// [`matmul_nbits_resident_side_cache_bytes`]: the fully-expanded f32 `weight_nk`
-/// cache (`N * K * 4`, #971) when the node takes the generic decode path, or the
-/// MLAS SQNBit CompFp32 packed buffer when it takes the `accuracy_level == 0`
-/// MLAS route -- the packed weight plus its retained scale/zero-point copies,
-/// counted [`MLAS_PACKED_DECODE_INSTANTIATIONS`] (`1`) time: the prefill and
-/// decode kernel instances share one packed buffer via the weight-identity
-/// store (#1056), so the weight is resident once.
-/// Nodes on a truly zero-copy path (borrowed int4, 2-bit, int8) contribute
-/// nothing, and non-constant-weight nodes never retain a session buffer (they
-/// rebuild a transient one per call) and are excluded.
-///
-/// The name is kept for API stability; the total now covers the MLAS packed
-/// buffer too, so a model whose int4 `accuracy_level == 0` nodes route to MLAS
-/// is no longer accounted as zero (the ledger blind spot that made the packed
-/// weight invisible).
-pub fn resident_dequant_f32_cache_bytes(graph: &Graph) -> u64 {
+/// This combines [`planned_nbits_node_retained_bytes`] for planning before
+/// provider construction. It excludes compact native packs, transient buffers,
+/// scratch and the runtime number of shape-keyed kernel instances. Actual f32
+/// payloads still acquire owned Host grants; this estimate never reserves or
+/// promises capacity and cannot replace live accounting.
+pub fn planned_nbits_retained_bytes(graph: &Graph) -> u64 {
     let mut total = 0_u64;
     for node in graph.nodes.values() {
         if !LazyWeightBoundary::MatMulNBits.matches(&node.domain, &node.op_type) {
@@ -4200,7 +4293,7 @@ pub fn resident_dequant_f32_cache_bytes(graph: &Graph) -> u64 {
         let (n, k) = (n as u64, k as u64);
         let has_zero_points = matches!(node.inputs.get(3), Some(Some(_)));
         let has_g_idx = matches!(node.inputs.get(4), Some(Some(_)));
-        total = total.saturating_add(matmul_nbits_resident_side_cache_bytes(
+        total = total.saturating_add(planned_nbits_node_retained_bytes(
             bits,
             block_size,
             accuracy_level,
@@ -4218,7 +4311,7 @@ pub fn resident_dequant_f32_cache_bytes(graph: &Graph) -> u64 {
 /// packed buffers plus their owned scale and zero-point copies, summed across
 /// every distinct packed allocation. Since #1056 a node's prefill and decode
 /// kernel instances share one packed buffer, so each weight is counted once --
-/// matching what [`resident_dequant_f32_cache_bytes`] now *predicts*. This is
+/// matching what [`planned_nbits_retained_bytes`] now *predicts*. This is
 /// the *actual* runtime figure that prediction must equal; the `matmul_nbits`
 /// accounting tests compare the two directly. Zero on a build without the
 /// `mlas` feature.
@@ -4470,7 +4563,7 @@ fn performance_core_count() -> Option<usize> {
 /// Resolve the persistent-pool worker count from the raw `ONNX_GENAI_CPU_DECODE_THREADS`
 /// value and the host's logical CPU count. `Some("0")` opts out (`None`); an
 /// explicit positive count is honored (clamped to `available`); an unset or
-/// unparseable value falls back to [`default_persistent_threads`].
+/// unparseable value falls back to `default_persistent_threads`.
 #[cfg(test)]
 fn resolve_persistent_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
     resolve_persistent_decode_threads_with_override(None, raw, available, None)
@@ -4545,7 +4638,7 @@ fn resolve_decode_threads_with_override(
     (threads > 0).then(|| threads.min(available))
 }
 
-/// Default worker count for the **dense-f32** decode pool ([`DENSE_DECODE_POOL`]).
+/// Default worker count for the **dense-f32** decode pool (`DENSE_DECODE_POOL`).
 ///
 /// The dense path runs the multi-threaded MLAS GEMM, which scales past the flat
 /// pool's eight-worker ceiling but is memory-bandwidth-bound, so it plateaus
@@ -4682,7 +4775,7 @@ fn report_decode_affinity_failure(message: &str) {
 
 /// Run an M=1 decode kernel *without* installing the decode pool up front.
 ///
-/// [`with_decode_pool`] pays a Rayon `install` per call: the pool's workers are
+/// `with_decode_pool` pays a Rayon `install` per call: the pool's workers are
 /// woken, one runs the kernel, and the rest find nothing to do and go back to
 /// sleep. When the flat fan-out inside then routes to the task runtime -- which
 /// is the whole point of [`flat_fan_out`] -- not one of those workers performs
@@ -4700,13 +4793,13 @@ fn report_decode_affinity_failure(message: &str) {
 /// # Invariant
 ///
 /// Only call this around a kernel whose *sole* parallelism is
-/// [`parallel_output_rows`]. A kernel that reaches Rayon by any other route
+/// `parallel_output_rows`. A kernel that reaches Rayon by any other route
 /// (`packed_nbits_gemm`, `borrowed_affine_int4_matmul_prefill`, `int8_matmul`
 /// and `kai_sdot_matmul_m1` all call `par_chunks_mut` directly) would silently
 /// run that work on the global pool instead of the bounded, pinned decode pool.
 /// `packed_nbits_gemv`, `gemv_nk` and the `m == 1` half of the borrowed int4
 /// path were audited against this; every other call site keeps
-/// [`with_decode_pool`].
+/// `with_decode_pool`.
 ///
 /// Routing is unchanged: while deferred, [`deferred_decode_width`] reports the
 /// width the pool *would* have had, which is exactly what
@@ -4792,7 +4885,7 @@ fn with_decode_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> 
 thread_local! {
     /// Per-worker-thread flag marking that the current thread is executing
     /// inside a [`with_decode_pool_scope`] installation. Set on the decode-pool
-    /// worker that runs the wrapped forward pass so the inner [`with_decode_pool`]
+    /// worker that runs the wrapped forward pass so the inner `with_decode_pool`
     /// calls run inline instead of re-installing.
     static IN_DECODE_POOL: Cell<bool> = const { Cell::new(false) };
 
@@ -4800,7 +4893,7 @@ thread_local! {
     /// pass inside a `numa-split` [`with_decode_pool_scope`] installation. Set on
     /// the dispatcher worker that runs the forward so each M=1 projection fans
     /// its output rows out across the per-node sub-pools (see
-    /// [`parallel_output_rows`] and [`crate::decode_numa`]).
+    /// `parallel_output_rows` and [`crate::decode_numa`]).
     static IN_NUMA_SCOPE: Cell<bool> = const { Cell::new(false) };
 
     /// Per-thread flag marking that the current thread is running the forward
@@ -4915,7 +5008,7 @@ where
     parallel_output_rows_repeated(result, k, 1, compute);
 }
 
-/// [`parallel_output_rows`] for a kernel that issues `calls` of them
+/// `parallel_output_rows` for a kernel that issues `calls` of them
 /// back-to-back, one per activation row.
 ///
 /// `calls` is not bookkeeping -- it is half of the executor choice. See
@@ -4993,7 +5086,7 @@ where
 /// out across the active decode workers, running `compute(row_index, row_slice)`
 /// on each whole row.
 ///
-/// This is the row-block analogue of [`parallel_output_rows`] for decode kernels
+/// This is the row-block analogue of `parallel_output_rows` for decode kernels
 /// (e.g. `GroupQueryAttention`) whose parallel unit is a full contiguous row
 /// rather than a GEMV scalar output. It exists so those kernels use the *same*
 /// decode pool as the `MatMulNBits` projections instead of a second thread pool:
@@ -5210,14 +5303,33 @@ fn numa_place_u8(weight: PackedU8Weight, n: usize) -> PackedU8Weight {
 
 /// Node-local first-touch for the dequantized `[N, K]` weight (see
 /// [`numa_place_int4`]).
-fn numa_place_nk(weight: Vec<f32>, n: usize) -> Vec<f32> {
-    if let Some(numa) = numa_decode_active() {
-        return numa.place_rows(&weight, n);
+enum DenseWeightPlacement {
+    Local,
+    Numa(&'static crate::decode_numa::NumaDecodePools),
+    Spmd(&'static crate::decode_spmd::SpmdDecodePools),
+}
+impl DenseWeightPlacement {
+    fn active() -> Self {
+        if let Some(numa) = numa_decode_active() {
+            Self::Numa(numa)
+        } else if let Some(spmd) = spmd_decode_active() {
+            Self::Spmd(spmd)
+        } else {
+            Self::Local
+        }
     }
-    if let Some(spmd) = spmd_decode_active() {
-        return spmd.place_rows(&weight, n);
+    fn build_peak(&self, bytes: usize) -> Result<usize> {
+        bytes
+            .checked_mul(if matches!(self, Self::Local) { 1 } else { 2 })
+            .ok_or_else(|| error("MatMulNBits f32 placement peak overflows; reduce K/N"))
     }
-    weight
+    fn place(&self, weight: Vec<f32>, n: usize) -> Vec<f32> {
+        match self {
+            Self::Local => weight,
+            Self::Numa(pool) => pool.place_rows(&weight, n),
+            Self::Spmd(pool) => pool.place_rows(&weight, n),
+        }
+    }
 }
 
 /// RAII guard that marks the current thread as running a `numa-split` decode
@@ -5306,7 +5418,7 @@ impl Drop for DecodeResidencyGuard {
 ///
 /// Wrapping an entire single-token CPU decode forward in one installation lets
 /// the many inner `MatMulNBits` projections execute inline on already-woken
-/// decode-pool workers (see [`with_decode_pool`]), eliminating the per-op
+/// decode-pool workers (see `with_decode_pool`), eliminating the per-op
 /// external-thread-to-pool crossing that fragments end-to-end decode throughput.
 ///
 /// `model_uses_spmd_pool` says whether this model's decode actually dispatches
@@ -5318,7 +5430,7 @@ impl Drop for DecodeResidencyGuard {
 /// pool's pinned, *spinning* workers then provide no benefit and actively steal
 /// cores from (and contend with) that GEMM. Such models therefore skip the
 /// spinning SPMD/numa pools (unless the pool was explicitly forced on) and use
-/// the bounded, non-spinning [`DENSE_DECODE_POOL`] instead. This keys off a
+/// the bounded, non-spinning `DENSE_DECODE_POOL` instead. This keys off a
 /// structural graph property (quantized vs dense), never off a specific model,
 /// so it generalizes across every f32 and quantized model (RULES §2).
 ///
@@ -5460,10 +5572,10 @@ fn with_auto_calibrated_decode_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R
     result
 }
 
-/// Install `f` on the bounded, non-spinning [`DENSE_DECODE_POOL`] used by the
+/// Install `f` on the bounded, non-spinning `DENSE_DECODE_POOL` used by the
 /// dense-f32 decode path. The multi-threaded MLAS GEMM behind each dense
 /// `MatMul` tiles its work across this pool's Rayon workers; the decode-residency
-/// flag makes any inner [`with_decode_pool`] calls run inline. When the pool
+/// flag makes any inner `with_decode_pool` calls run inline. When the pool
 /// opts out (`ONNX_GENAI_CPU_DECODE_THREADS=0`) or fails to build, `f` runs on
 /// the global Rayon pool, preserving correctness.
 fn with_dense_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
@@ -7157,7 +7269,7 @@ unsafe fn n16_sdot_bits8_quad_neon(
 #[allow(clippy::too_many_arguments)]
 fn packed_nbits_gemv(
     activation: &[f32],
-    weight: &PackedNBitsWeight,
+    weight: &PackedNBitsView<'_>,
     result: &mut [f32],
     k: usize,
     n: usize,
@@ -7172,7 +7284,7 @@ fn packed_nbits_gemv(
 #[allow(clippy::too_many_arguments)]
 fn packed_nbits_gemm(
     activations: &[f32],
-    weight: &PackedNBitsWeight,
+    weight: &PackedNBitsView<'_>,
     result: &mut [f32],
     m: usize,
     k: usize,
@@ -7203,7 +7315,7 @@ fn packed_nbits_gemm(
 #[allow(clippy::too_many_arguments)]
 fn packed_nbits_output_row(
     activation: &[f32],
-    weight: &PackedNBitsWeight,
+    weight: &PackedNBitsView<'_>,
     result: &mut [f32],
     k: usize,
     n: usize,
@@ -7291,6 +7403,27 @@ fn contiguous_host_addr(view: &TensorView) -> Option<usize> {
         return None;
     }
     Some(view.data_ptr::<u8>() as usize)
+}
+
+/// Every operand must already have the dtype and contiguous host layout
+/// consumed by the compact kernels. Half scales and strided inputs are prepared
+/// together instead, so constant conversion is still amortized across calls.
+fn borrow_nbits_wire<'a>(
+    packed: &TensorView<'a>,
+    scales: &TensorView<'a>,
+    zero_points: Option<&TensorView<'a>>,
+) -> Option<PackedNBitsView<'a>> {
+    if packed.dtype != DataType::Uint8
+        || scales.dtype != DataType::Float32
+        || zero_points.is_some_and(|points| points.dtype != DataType::Uint8)
+    {
+        return None;
+    }
+    Some(PackedNBitsView {
+        values: contiguous_host_slice(packed)?,
+        scales: contiguous_host_slice(scales)?,
+        zero_points: borrow_optional_packed_zero_points(zero_points)?,
+    })
 }
 
 fn borrowed_scales<'a>(view: &TensorView<'a>) -> Option<BorrowedScales<'a>> {
@@ -9104,7 +9237,7 @@ pub(crate) fn reset_int4_routes() {
 /// weight is the untouched ONNX packed tensor.
 fn int4_nibble_matmul(
     activations: &[f32],
-    weight: &PackedNBitsWeight,
+    weight: &PackedNBitsView<'_>,
     result: &mut [f32],
     m: usize,
     k: usize,
@@ -9144,7 +9277,7 @@ fn int4_nibble_matmul(
 
 fn int4_nibble_row(
     prepared: &int4_nibble::NibbleActivation,
-    weight: &PackedNBitsWeight,
+    weight: &PackedNBitsView<'_>,
     result: &mut [f32],
     k_blocks: usize,
     block_size: usize,
@@ -9155,9 +9288,9 @@ fn int4_nibble_row(
         let outputs_len = outputs.len();
         int4_nibble::nibble_outputs(
             prepared,
-            &weight.values,
-            &weight.scales,
-            weight.zero_points.as_deref(),
+            weight.values,
+            weight.scales,
+            weight.zero_points,
             output_start..output_start + outputs_len,
             outputs,
             k_blocks,
@@ -10970,9 +11103,643 @@ mod tests {
         (graph, node)
     }
 
+    fn governed_dense_resources(
+        bytes: usize,
+        retention: usize,
+    ) -> (
+        onnx_runtime_memory_governor::LedgerGovernor,
+        crate::CpuMemoryResources,
+    ) {
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let memory = crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let resources = crate::CpuMemoryResources::new(
+            memory,
+            crate::CpuWeightCacheLimits {
+                dense_bytes: retention,
+                expert_bytes: 0,
+            },
+        )
+        .unwrap();
+        (governor, resources)
+    }
+    fn governed_dense_node(k: usize, n: usize, bits: usize, block: usize) -> Node {
+        let mut node = Node::new(NodeId(0), "MatMulNBits", vec![], vec![]);
+        node.domain = "com.microsoft".into();
+        for (name, value) in [("K", k), ("N", n), ("bits", bits), ("block_size", block)] {
+            node.attributes
+                .insert(name.into(), Attribute::Int(value as i64));
+        }
+        node
+    }
+
+    #[test]
+    fn dense_nbits_grants_compete_with_host_kv_and_live_arcs_outlast_the_kernel() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let _probe = lock_dispatch_probe();
+        let (k, n, block) = (67, 5, 16);
+        let bytes = k * n * 4;
+        let weights: Vec<f32> = (0..k * n).map(|i| (i % 17) as f32 / 9.0 - 1.0).collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block, false);
+        let b = Owned::u8(&[n, k.div_ceil(block), block / 2], &packed);
+        let scales = Owned::f32(&[n, k.div_ceil(block)], &scales);
+        let groups = Owned::i32(
+            &[k],
+            &(0..k).map(|i| (i / block) as i32).collect::<Vec<_>>(),
+        );
+        let a = Owned::f32(
+            &[1, k],
+            &(0..k).map(|i| (i % 7) as f32 / 7.0).collect::<Vec<_>>(),
+        );
+        let (governor, resources) = governed_dense_resources(bytes, bytes);
+        let provider = crate::CpuExecutionProvider::with_resources(resources);
+        let mut kernel = provider
+            .get_kernel(&governed_dense_node(k, n, 4, block), &[], 1)
+            .unwrap();
+        kernel.set_constant_inputs(&[false, true, true, true, true]);
+        assert_eq!(
+            governor.used(Tier::Host),
+            0,
+            "an idle retention ceiling reserves nothing"
+        );
+        let kv = governor
+            .reserve(
+                Tier::Host,
+                bytes as u64,
+                MemoryRole::KvCache,
+                HolderId::new(7),
+            )
+            .unwrap();
+        let run = |kernel: &dyn Kernel| {
+            let mut y = Owned::zeros_f32(&[1, n]);
+            kernel
+                .execute(
+                    &[
+                        a.view(),
+                        b.view(),
+                        scales.view(),
+                        TensorView::absent(DataType::Uint8),
+                        groups.view(),
+                    ],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            y
+        };
+        let row_output = run(kernel.as_ref());
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        assert!(cached_dense_weight(kernel.as_any().downcast_ref().unwrap()).is_none());
+        drop(kv);
+        let dense_output = run(kernel.as_ref());
+        assert_eq!(
+            row_output.bytes, dense_output.bytes,
+            "M=1 must keep the original serial dot order"
+        );
+        let live = cached_dense_weight(kernel.as_any().downcast_ref().unwrap()).unwrap();
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(kernel);
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes as u64,
+            "active payload owns its charge after kernel/cache drop"
+        );
+        drop(live);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn dense_nbits_refusal_matches_the_grouped_affine_oracle_for_all_bit_widths() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let _probe = lock_dispatch_probe();
+        let (k, n, block) = (67usize, 5usize, 16usize);
+        let blocks = k.div_ceil(block);
+        let weights: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 13 % 43) as f32 - 19.0) / 17.0)
+            .collect();
+        let groups: Vec<i32> = (0..k).map(|i| ((i * 7 + 3) % blocks) as i32).collect();
+        let g = Owned::i32(&[k], &groups);
+        let mut max_error = 0.0f64;
+        for bits in [2, 4, 8] {
+            for affine in [false, true] {
+                let (packed, scales, points) = match bits {
+                    2 => quantize_2bit(&weights, n, k, block, affine),
+                    4 => {
+                        let (b, s, z, _) = quantize(&weights, n, k, block, affine);
+                        (b, s, z)
+                    }
+                    _ => {
+                        let (b, s, z, _) = quantize_8bit(&weights, n, k, block, affine);
+                        (b, s, z)
+                    }
+                };
+                let b = Owned::u8(&[n, blocks, block * bits / 8], &packed);
+                let scale = Owned::f32(&[n, blocks], &scales);
+                let zp_width = (blocks * bits).div_ceil(8);
+                let zp = points.as_ref().map(|v| Owned::u8(&[n, zp_width], v));
+                for m in [1, 3] {
+                    let input: Vec<f32> = (0..m * k)
+                        .map(|i| ((i * 11 % 31) as f32 - 13.0) / 19.0)
+                        .collect();
+                    let a = Owned::f32(&[m, k], &input);
+                    let mut oracle = vec![0.0f64; m * n];
+                    for row in 0..m {
+                        for col in 0..n {
+                            for depth in 0..k {
+                                let bit = (depth % block) * bits;
+                                let q = (packed[(col * blocks + depth / block)
+                                    * (block * bits / 8)
+                                    + bit / 8]
+                                    >> (bit % 8))
+                                    & ((1u16 << bits) - 1) as u8;
+                                let group = groups[depth] as usize;
+                                let zbit = group * bits;
+                                let z = points.as_ref().map_or(1u8 << (bits - 1), |v| {
+                                    (v[col * zp_width + zbit / 8] >> (zbit % 8))
+                                        & ((1u16 << bits) - 1) as u8
+                                });
+                                // Weight arithmetic is f32, accumulation oracle is f64.
+                                let weight = (q as f32 - z as f32) * scales[col * blocks + group];
+                                oracle[row * n + col] +=
+                                    input[row * k + depth] as f64 * weight as f64;
+                            }
+                        }
+                    }
+                    let mut reference = None;
+                    for (capacity, retention) in
+                        [(k * n * 4, k * n * 4), (0, k * n * 4), (k * n * 4, 0)]
+                    {
+                        let (governor, resources) = governed_dense_resources(capacity, retention);
+                        let mut kernel = MatMulNBitsFactory::new(resources)
+                            .create(&governed_dense_node(k, n, bits, block), &[])
+                            .unwrap();
+                        kernel.set_constant_inputs(&[false, true, true, true, true]);
+                        let mut y = Owned::zeros_f32(&[m, n]);
+                        kernel
+                            .execute(
+                                &[
+                                    a.view(),
+                                    b.view(),
+                                    scale.view(),
+                                    zp.as_ref().map_or_else(
+                                        || TensorView::absent(DataType::Uint8),
+                                        Owned::view,
+                                    ),
+                                    g.view(),
+                                ],
+                                &mut [y.view_mut()],
+                            )
+                            .unwrap();
+                        let result = y.to_f32();
+                        for (&got, &expected) in result.iter().zip(&oracle) {
+                            let error = (got as f64 - expected).abs();
+                            max_error = max_error.max(error);
+                            assert!(
+                                error <= 2e-5 * (1.0 + expected.abs()),
+                                "bits={bits} affine={affine} m={m} capacity={capacity}: {got} vs {expected}"
+                            );
+                        }
+                        let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                        assert_eq!(
+                            governor.used(Tier::Host),
+                            concrete.dense_weights.stats().1 as u64
+                        );
+                        if capacity == 0 {
+                            assert_eq!(concrete.dense_weights.stats(), (0, 0));
+                            assert_eq!(
+                                concrete.dense_weights.activity().1,
+                                0,
+                                "a refused Host grant must never invoke the full f32 builder"
+                            );
+                        }
+                        if retention == 0 {
+                            assert_eq!(concrete.dense_weights.stats(), (0, 0));
+                            assert_eq!(
+                                governor.used(Tier::Host),
+                                0,
+                                "a temporary full payload returns its grant at operation completion"
+                            );
+                        }
+                        if m == 1 {
+                            if let Some(reference) = &reference {
+                                assert_eq!(&y.bytes, reference);
+                            } else {
+                                reference = Some(y.bytes);
+                            }
+                        }
+                        drop(kernel);
+                        assert_eq!(governor.used(Tier::Host), 0);
+                    }
+                }
+            }
+        }
+        eprintln!("NBits dense/row grouped affine maximum absolute f64-oracle error: {max_error}");
+    }
+
+    #[test]
+    fn dense_nbits_refusal_preserves_lower_precision_and_bias() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block) = (33usize, 3usize, 16usize);
+        let blocks = k.div_ceil(block);
+        let b = Owned::u8(&[n, blocks, block / 2], &vec![0x3c; n * blocks * block / 2]);
+        let groups = Owned::i32(
+            &[k],
+            &(0..k)
+                .map(|i| ((i + 2) % blocks) as i32)
+                .collect::<Vec<_>>(),
+        );
+        let make = |dtype, shape: &[usize], values: &[f32]| match dtype {
+            DataType::Float16 => Owned::f16(shape, values),
+            DataType::BFloat16 => Owned::bf16(shape, values),
+            _ => Owned::f32(shape, values),
+        };
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let scales = make(dtype, &[n, blocks], &vec![0.0625; n * blocks]);
+            let bias = make(dtype, &[n], &[0.125, -0.25, 0.375]);
+            for m in [1, 3] {
+                let a = make(
+                    dtype,
+                    &[m, k],
+                    &(0..m * k)
+                        .map(|i| (i % 7) as f32 / 4.0 - 0.75)
+                        .collect::<Vec<_>>(),
+                );
+                let mut reference = None;
+                for capacity in [k * n * 4, 0] {
+                    let (_, resources) = governed_dense_resources(capacity, k * n * 4);
+                    let mut kernel = MatMulNBitsFactory::new(resources)
+                        .create(&governed_dense_node(k, n, 4, block), &[])
+                        .unwrap();
+                    kernel.set_constant_inputs(&[false, true, true, true, true]);
+                    let mut y = make(dtype, &[m, n], &vec![0.0; m * n]);
+                    kernel
+                        .execute(
+                            &[
+                                a.view(),
+                                b.view(),
+                                scales.view(),
+                                TensorView::absent(DataType::Uint8),
+                                groups.view(),
+                                bias.view(),
+                            ],
+                            &mut [y.view_mut()],
+                        )
+                        .unwrap();
+                    if let Some(reference) = &reference {
+                        assert_eq!(&y.bytes, reference, "dtype={dtype:?}, m={m}");
+                    } else {
+                        reference = Some(y.bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_nbits_invalid_groups_refund_full_grants_and_remain_actionable_when_refused() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block) = (33usize, 3usize, 16usize);
+        let blocks = k.div_ceil(block);
+        let b = Owned::u8(&[n, blocks, block / 2], &vec![0x78; n * blocks * block / 2]);
+        let scale = Owned::f32(&[n, blocks], &vec![0.0625; n * blocks]);
+        let a = Owned::f32(&[1, k], &vec![0.25; k]);
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        for capacity in [k * n * 4, 0] {
+            let (governor, resources) = governed_dense_resources(capacity, k * n * 4);
+            let mut kernel = MatMulNBitsFactory::new(resources)
+                .create(&governed_dense_node(k, n, 4, block), &[])
+                .unwrap();
+            kernel.set_constant_inputs(&[false, true, true, true, true]);
+            for invalid in [-1, blocks as i32] {
+                let mut indices = vec![0; k];
+                indices[7] = invalid;
+                let groups = Owned::i32(&[k], &indices);
+                let mut y = Owned::zeros_f32(&[1, n]);
+                let failure = kernel
+                    .execute(
+                        &[
+                            a.view(),
+                            b.view(),
+                            scale.view(),
+                            TensorView::absent(DataType::Uint8),
+                            groups.view(),
+                        ],
+                        &mut [y.view_mut()],
+                    )
+                    .unwrap_err();
+                assert!(
+                    failure
+                        .to_string()
+                        .contains(&format!("g_idx[7]={invalid} is outside 0..{blocks}")),
+                    "{failure}"
+                );
+                assert_eq!(governor.used(Tier::Host), 0);
+                let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                assert_eq!(concrete.dense_weights.stats(), (0, 0));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(feature = "mlas")))]
+    fn dense_nbits_refusal_keeps_fused_gebp_reachable() {
+        let _probe = lock_dispatch_probe();
+        if !int8_prefill_gebp_enabled() {
+            return;
+        }
+        if !std::arch::is_x86_feature_detected!("avx2")
+            || !std::arch::is_x86_feature_detected!("fma")
+        {
+            return;
+        }
+        let (k, n, block, m) = (96usize, 20usize, 32usize, 3usize);
+        let blocks = k.div_ceil(block);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        let (packed, scales, _, dequant) = quantize_8bit(&weights, n, k, block, false);
+        let input: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+            .collect();
+        let a = Owned::f32(&[m, k], &input);
+        let b = Owned::u8(&[n, blocks, block], &packed);
+        let scales = Owned::f32(&[n, blocks], &scales);
+        let (_, resources) = governed_dense_resources(0, k * n * 4);
+        let mut kernel = MatMulNBitsFactory::new(resources)
+            .create(&governed_dense_node(k, n, 8, block), &[])
+            .unwrap();
+        kernel.set_constant_inputs(&[false, true, true]);
+        let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+        let mut y = Owned::zeros_f32(&[m, n]);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert!(
+            INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed) > before,
+            "refused dense grant hid the existing bounded fused GEBP"
+        );
+        let expected = reference(&input, &dequant, m, k, n);
+        assert_close(&y.to_f32(), &expected);
+        let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+        assert_eq!(concrete.dense_weights.activity().1, 0);
+    }
+
+    #[test]
+    fn dense_nbits_decoder_borrows_contiguous_operands_independently_with_offsets() {
+        let (k, n, block) = (67usize, 3usize, 16usize);
+        let weights: Vec<f32> = (0..k * n).map(|i| (i % 23) as f32 / 13.0 - 1.0).collect();
+        let (packed, scales, points, expected) = quantize(&weights, n, k, block, true);
+        let points = points.unwrap();
+        for mask in 0..8 {
+            let steps: [usize; 3] = std::array::from_fn(|i| 1 + ((mask >> i) & 1));
+            let pad_bytes = |values: &[u8], step: usize| {
+                let mut bytes = vec![0; 1 + values.len() * step];
+                for (i, &v) in values.iter().enumerate() {
+                    bytes[1 + i * step] = v;
+                }
+                Owned::u8(&[bytes.len()], &bytes)
+            };
+            let b = pad_bytes(&packed, steps[0]);
+            let z = pad_bytes(&points, steps[2]);
+            let mut floats = vec![0.0; 1 + scales.len() * steps[1]];
+            for (i, &v) in scales.iter().enumerate() {
+                floats[1 + i * steps[1]] = v;
+            }
+            let scale = Owned::f32(&[floats.len()], &floats);
+            let shapes = [[packed.len()], [scales.len()], [points.len()]];
+            let strides = [[steps[0] as i64], [steps[1] as i64], [steps[2] as i64]];
+            let mut bv = b.view();
+            bv.shape = &shapes[0];
+            bv.strides = &strides[0];
+            bv.byte_offset = 1;
+            let mut sv = scale.view();
+            sv.shape = &shapes[1];
+            sv.strides = &strides[1];
+            sv.byte_offset = 4;
+            let mut zv = z.view();
+            zv.shape = &shapes[2];
+            zv.strides = &strides[2];
+            zv.byte_offset = 1;
+            let kernel = test_kernel(k, n, block);
+            let source = NBitsDenseRows::new(&kernel, &bv, &sv, Some(&zv), None).unwrap();
+            assert_eq!(matches!(source.packed, Cow::Borrowed(_)), steps[0] == 1);
+            assert_eq!(matches!(source.scales, Cow::Borrowed(_)), steps[1] == 1);
+            assert_eq!(
+                matches!(source.zero_points.as_ref().unwrap(), Cow::Borrowed(_)),
+                steps[2] == 1
+            );
+            let mut row = vec![0.0; k];
+            for col in 0..n {
+                source.decode_row(col, &mut row);
+                assert_eq!(&row, &expected[col * k..(col + 1) * k]);
+            }
+            if steps[0] == 1 {
+                assert_eq!(source.packed.as_ptr(), bv.data_ptr::<u8>());
+            }
+            if steps[1] == 1 {
+                assert_eq!(source.scales.as_ptr(), sv.data_ptr::<f32>());
+            }
+        }
+    }
+
+    #[test]
+    fn compact_nbits_wire_borrows_offsets_and_prepares_strided_operands_once() {
+        let (k, n, block) = (33usize, 3usize, 16usize);
+        let blocks = k.div_ceil(block);
+        let values = vec![0x39; n * blocks * block / 4];
+        let scales = vec![0.125; n * blocks];
+        let points = vec![0x12; n * blocks.div_ceil(4)];
+        for mask in 0..8 {
+            let steps: [usize; 3] = std::array::from_fn(|i| 1 + ((mask >> i) & 1));
+            let padded_bytes = |data: &[u8], step: usize| {
+                let mut bytes = vec![0; 1 + data.len() * step];
+                for (i, &value) in data.iter().enumerate() {
+                    bytes[1 + i * step] = value;
+                }
+                Owned::u8(&[bytes.len()], &bytes)
+            };
+            let b = padded_bytes(&values, steps[0]);
+            let z = padded_bytes(&points, steps[2]);
+            let mut floats = vec![0.0; 1 + scales.len() * steps[1]];
+            for (i, &value) in scales.iter().enumerate() {
+                floats[1 + i * steps[1]] = value;
+            }
+            let scale = Owned::f32(&[floats.len()], &floats);
+            let shapes = [[values.len()], [scales.len()], [points.len()]];
+            let strides = steps.map(|step| [step as i64]);
+            let mut bv = b.view();
+            bv.shape = &shapes[0];
+            bv.strides = &strides[0];
+            bv.byte_offset = 1;
+            let mut sv = scale.view();
+            sv.shape = &shapes[1];
+            sv.strides = &strides[1];
+            sv.byte_offset = 4;
+            let mut zv = z.view();
+            zv.shape = &shapes[2];
+            zv.strides = &strides[2];
+            zv.byte_offset = 1;
+            let kernel = test_kernel(k, n, block);
+            let first = kernel
+                .resolve_nbits_operand(&bv, &sv, Some(&zv), true)
+                .unwrap();
+            let first = first.view();
+            assert_eq!(first.values, values);
+            assert_eq!(first.scales, scales);
+            assert_eq!(first.zero_points.unwrap(), points);
+            assert_eq!(kernel.packed_nbits_weight.get().is_none(), mask == 0);
+            if mask == 0 {
+                assert_eq!(first.values.as_ptr(), bv.data_ptr::<u8>());
+                assert_eq!(first.scales.as_ptr(), sv.data_ptr::<f32>());
+                assert_eq!(first.zero_points.unwrap().as_ptr(), zv.data_ptr::<u8>());
+            }
+            let second = kernel
+                .resolve_nbits_operand(&bv, &sv, Some(&zv), true)
+                .unwrap();
+            assert_eq!(first.values.as_ptr(), second.view().values.as_ptr());
+            assert_eq!(first.scales.as_ptr(), second.view().scales.as_ptr());
+        }
+    }
+
+    #[test]
+    fn compact_nbits_wire_half_scales_preserve_constant_preparation_and_dynamic_ownership() {
+        let kernel = test_kernel(32, 3, 16);
+        let b = Owned::u8(&[3, 2, 4], &[0x39; 24]);
+        let scale_values = [0.125; 6];
+        for scales in [
+            Owned::f16(&[3, 2], &scale_values),
+            Owned::bf16(&[3, 2], &scale_values),
+        ] {
+            let dynamic = kernel
+                .resolve_nbits_operand(&b.view(), &scales.view(), None, false)
+                .unwrap();
+            assert!(matches!(dynamic, PackedNBitsOperand::Owned(_)));
+            assert_eq!(dynamic.view().scales, scale_values);
+            assert!(kernel.packed_nbits_weight.get().is_none());
+        }
+        let half = Owned::f16(&[3, 2], &scale_values);
+        let first = kernel
+            .resolve_nbits_operand(&b.view(), &half.view(), None, true)
+            .unwrap();
+        let second = kernel
+            .resolve_nbits_operand(&b.view(), &half.view(), None, true)
+            .unwrap();
+        assert_eq!(first.view().scales.as_ptr(), second.view().scales.as_ptr());
+        assert!(kernel.packed_nbits_weight.get().is_some());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compact_nbits_accuracy4_nibble_route_borrows_wire_operands() {
+        let _probe = lock_dispatch_probe();
+        let block = 32;
+        if !int4_nibble::supported(block) || selected_dot_kernel().uses_vnni_int4_direct() {
+            return;
+        }
+        // This driver is selected after the MLAS research route. Test the native
+        // compact kernel directly as well so the reference feature cannot hide it.
+        let (k, n, m) = (45usize, 5usize, 3usize);
+        let weights: Vec<f32> = (0..k * n).map(|i| (i % 17) as f32 / 9.0 - 1.0).collect();
+        for asymmetric in [false, true] {
+            let (bytes, scale_values, points, _) = quantize(&weights, n, k, block, asymmetric);
+            let b = Owned::u8(&[n, 2, block / 2], &bytes);
+            let scales = Owned::f32(&[n, 2], &scale_values);
+            let z = points.as_ref().map(|p| Owned::u8(&[n, 1], p));
+            let kernel = accuracy4_kernel(k, n, block);
+            let zv = z.as_ref().map(Owned::view);
+            let operand = kernel
+                .resolve_nbits_operand(&b.view(), &scales.view(), zv.as_ref(), false)
+                .unwrap();
+            let borrowed = operand.view();
+            assert_eq!(borrowed.values.as_ptr(), b.view().data_ptr::<u8>());
+            let owned = kernel
+                .prepack_nbits_weight(&b.view(), &scales.view(), zv.as_ref())
+                .unwrap();
+            let activations = vec![0.25; m * k];
+            let mut actual = vec![0.0; m * n];
+            let mut control = actual.clone();
+            int4_nibble_matmul(&activations, &borrowed, &mut actual, m, k, n, block);
+            int4_nibble_matmul(&activations, &owned.view(), &mut control, m, k, n, block);
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                control.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert!(prepack_cache_ptr(&kernel).is_none());
+        }
+    }
+
+    #[test]
+    fn compact_nbits_wire_dynamic_execution_reads_each_calls_source() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block) = (33usize, 5usize, 16usize);
+        let blocks = k.div_ceil(block);
+        for constant in [false, true] {
+            let mut kernel = test_kernel(k, n, block);
+            kernel.bits = 2;
+            kernel.set_constant_inputs(&[false, constant, constant, constant]);
+            for m in [1, 4] {
+                let a = Owned::f32(&[m, k], &vec![0.25; m * k]);
+                for byte in [0x39u8, 0x93] {
+                    // Constant inputs use a fresh kernel when the value changes;
+                    // dynamic inputs reuse the same kernel across both values.
+                    let mut constant_kernel = test_kernel(k, n, block);
+                    constant_kernel.bits = 2;
+                    constant_kernel.set_constant_inputs(&[false, true, true, true]);
+                    let active = if constant { &constant_kernel } else { &kernel };
+                    let bytes = vec![byte; n * blocks * block / 4];
+                    let scale_values = vec![0.125; n * blocks];
+                    let points = vec![0x12; n * blocks.div_ceil(4)];
+                    let b = Owned::u8(&[n, blocks, block / 4], &bytes);
+                    let scales = Owned::f32(&[n, blocks], &scale_values);
+                    let z = Owned::u8(&[n, blocks.div_ceil(4)], &points);
+                    let mut y = Owned::zeros_f32(&[m, n]);
+                    let inputs = [a.view(), b.view(), scales.view(), z.view()];
+                    for _ in 0..2 {
+                        active.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                        let dequantized = dequantize_2bit_reference(
+                            &bytes,
+                            &scale_values,
+                            Some(&points),
+                            n,
+                            k,
+                            block,
+                        );
+                        assert_close(
+                            &y.to_f32(),
+                            &reference(&vec![0.25; m * k], &dequantized, m, k, n),
+                        );
+                        assert!(prepack_cache_ptr(active).is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    fn cached_dense_weight(kernel: &MatMulNBitsKernel) -> Option<Arc<DenseWeight>> {
+        kernel.dense_weights.test_get(&kernel.dense_key().unwrap())
+    }
+    fn set_test_dense_retention(kernel: &mut MatMulNBitsKernel, enabled: bool) {
+        #[cfg(feature = "mlas")]
+        {
+            kernel.retain_mlas_packs = enabled;
+        }
+        kernel.dense_weights = DenseWeightCache::new(
+            crate::DerivedWeightMemory::default(),
+            if enabled {
+                super::super::dense_weight_cache::configured_dense_weight_cache_bytes()
+            } else {
+                0
+            },
+        );
+    }
+
     fn test_kernel(k: usize, n: usize, block_size: usize) -> MatMulNBitsKernel {
         MatMulNBitsKernel {
-            retain_caches: true,
+            #[cfg(feature = "mlas")]
+            retain_mlas_packs: true,
             k,
             n,
             bits: 4,
@@ -10981,7 +11748,7 @@ mod tests {
             flops: None,
             weight_prepacked: false,
             constant_inputs: [false; 5],
-            weight_nk: OnceLock::new(),
+            dense_weights: DenseWeightCache::default(),
             int8_weight: OnceLock::new(),
             packed_u8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
@@ -11231,7 +11998,7 @@ mod tests {
 
     /// Control that could falsify the #971 footprint predictor: for a matrix of
     /// bits=4 decode configurations, run a real constant-weight kernel and assert
-    /// [`matmul_nbits_decode_caches_dequant_f32`] agrees with whether the kernel
+    /// [`nbits_decode_f32_retention_candidate`] agrees with whether the kernel
     /// actually materialized the resident f32 `weight_nk`. If the dispatch in
     /// `execute` changes which path a config takes and the predictor is not
     /// updated to match, this test fails — the engine's accounting cannot silently
@@ -11282,7 +12049,7 @@ mod tests {
                     let mut y = Owned::zeros_f32(&[1, n]);
                     kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
 
-                    let predicted = matmul_nbits_decode_caches_dequant_f32(
+                    let predicted = nbits_decode_f32_retention_candidate(
                         4,
                         block_size,
                         accuracy_level,
@@ -11294,7 +12061,7 @@ mod tests {
                     );
                     assert_eq!(
                         predicted,
-                        kernel.weight_nk.get().is_some(),
+                        cached_dense_weight(&kernel).is_some(),
                         "predictor disagreed with actual weight_nk residency \
                          (accuracy_level={accuracy_level}, asymmetric={asymmetric}, \
                          has_g_idx={has_g_idx})",
@@ -11327,7 +12094,7 @@ mod tests {
         // 2-bit, accuracy_level==4, 8-bit) is gated on `group_indices.is_none()`,
         // so a present g_idx falls through to the `m == 1` `weight_nk` cache.
         assert!(
-            matmul_nbits_decode_caches_dequant_f32(4, block_size, 0, n, k, false, true, false),
+            nbits_decode_f32_retention_candidate(4, block_size, 0, n, k, false, true, false),
             "test premise: this config must be a caching config",
         );
         // Natural per-block group indices ([0,0,..,1,1,..]): in range 0..k_blocks
@@ -11338,7 +12105,7 @@ mod tests {
             let (b, scales_t, a_t, _) = cache_probe_inputs(&weights, &a, n, k, block_size, false);
             let g_idx_t = Owned::i32(&[k], &g_idx);
             let mut kernel = test_kernel(k, n, block_size);
-            kernel.retain_caches = enabled;
+            set_test_dense_retention(&mut kernel, enabled);
             kernel.set_constant_inputs(&[true; 5]);
             let mut y = Owned::zeros_f32(&[1, n]);
             kernel
@@ -11355,7 +12122,7 @@ mod tests {
                     &mut [y.view_mut()],
                 )
                 .unwrap();
-            let cached = kernel.weight_nk.get().is_some();
+            let cached = cached_dense_weight(&kernel).is_some();
             (y.bytes, cached)
         };
 
@@ -11452,7 +12219,7 @@ mod tests {
                     .as_any()
                     .downcast_ref::<MatMulNBitsKernel>()
                     .unwrap();
-                assert_eq!(concrete.weight_nk.get().is_some(), admitted);
+                assert_eq!(cached_dense_weight(concrete).is_some(), admitted);
                 if let Some(expected) = &reference {
                     assert_eq!(&y.bytes, expected);
                 } else {
@@ -11466,11 +12233,11 @@ mod tests {
     /// route: MLAS SQNBit (`mlas_shards` or serialized `mlas_packed`) when
     /// available, otherwise the hand GEMV/int8 caches. Returning a raw address
     /// lets tests assert the cache is *reused* (stable) across calls, not merely
-    /// populated. The address is stable because every cache is a `OnceLock` that
-    /// stores its value in place.
+    /// populated. Compact packs stay in their OnceLock; f32 payloads keep a
+    /// stable Arc allocation while retained in the owned dense cache.
     fn prepack_cache_ptr(kernel: &MatMulNBitsKernel) -> Option<*const ()> {
-        if let Some(w) = kernel.weight_nk.get() {
-            return Some(w as *const _ as *const ());
+        if let Some(w) = cached_dense_weight(kernel) {
+            return Some(Arc::as_ptr(&w).cast());
         }
         if let Some(w) = kernel.int8_weight.get() {
             return Some(w as *const _ as *const ());
@@ -11549,7 +12316,7 @@ mod tests {
         /// the strict-increase (`>`) comparisons rather than exact deltas.
         fn assert_fast_route(self, kernel: &MatMulNBitsKernel, symmetric: bool) {
             assert!(
-                kernel.weight_nk.get().is_none(),
+                cached_dense_weight(kernel).is_none(),
                 "constant-weight int4 accuracy_level=0 must not expand the weight to a resident f32 cache (#979)"
             );
             // Footprint, not field-emptiness (#1027). Asserting only that
@@ -11558,7 +12325,7 @@ mod tests {
             // holding a packed buffer ~2x the int4 bytes beside the mapped
             // weight. The memory plan budgets exactly the byte total this
             // function returns, so assert the route's real resident footprint.
-            let accounted = matmul_nbits_resident_side_cache_bytes(
+            let accounted = planned_nbits_node_retained_bytes(
                 kernel.bits,
                 kernel.block_size,
                 kernel.accuracy_level,
@@ -12623,12 +13390,13 @@ mod tests {
         }
 
         assert_close(&output.to_f32(), &expected);
-        assert!(
+        assert_eq!(
             kernel.packed_nbits_weight.get().is_some(),
-            "bits=2 must cache the packed direct-decode weight"
+            scale_dtype != DataType::Float32,
+            "bits=2 must borrow wire operands, caching only required conversions"
         );
         assert!(
-            kernel.weight_nk.get().is_none(),
+            cached_dense_weight(&kernel).is_none(),
             "bits=2 direct decode must not materialize an f32 weight matrix"
         );
     }
@@ -13312,7 +14080,7 @@ mod tests {
                 "sessions={sessions}: the expanded-i8 weight was built as well"
             );
             assert!(
-                kernel.weight_nk.get().is_none(),
+                cached_dense_weight(kernel).is_none(),
                 "sessions={sessions}: the f32 expansion was built as well"
             );
         }
@@ -13391,7 +14159,7 @@ mod tests {
         kernel.set_constant_inputs(&[false, true, true]);
         let a = Owned::f32(&[1, k], &activations);
         let b = Owned::u8(&[n, 2, 16], &packed);
-        let scales = Owned::f32(&[n, 2], &scales);
+        let scales = Owned::f16(&[n, 2], &scales);
         let mut y = Owned::zeros_f32(&[1, n]);
         kernel
             .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
@@ -13405,7 +14173,7 @@ mod tests {
         let reused =
             prepack_cache_ptr(&kernel).expect("selected accuracy-4 weight cache must be reused");
         assert_eq!(reused, cached);
-        assert!(kernel.weight_nk.get().is_none());
+        assert!(cached_dense_weight(&kernel).is_none());
         // On a host whose hand int8 decode has no native dot product, MLAS
         // SQNBit CompInt8 owns accuracy-4 decode instead (see
         // `hand_int8_decode_has_native_dot`). The invariant under test -- one
@@ -14385,27 +15153,21 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn matmulnbits_arm64_kai_qsi4_asymmetric_qwen_shape_is_reachable() {
+    fn matmulnbits_arm64_asymmetric_decode_respects_route_policy() {
         let _probe = lock_dispatch_probe();
         if !std::arch::is_aarch64_feature_detected!("dotprod") {
             return;
         }
         let (k, n, block_size) = (1024usize, 1024usize, 128usize);
-        // "Reachable" is a per-OS policy statement, not a universal one:
-        // production disables the KAI SDOT route on macOS/iOS
-        // (`arm64_kai_sdot_direct_enabled`), so on Apple silicon without MLAS
-        // there is no fast int4 route for this shape to reach. The KAI kernel's
-        // numerics stay covered there by
-        // `matmulnbits_arm64_kai_qsi4_block128_qwen_shapes_match_reference`,
-        // which calls it directly instead of through dispatch.
+        // A compiled reference is not a routing capability. Apple policy
+        // disables KAI/MLAS QNBit decode by default; those hosts must still
+        // execute the correct native int8 fallback, without an f32 expansion.
+        let direct = selected_dot_kernel().supports_int4_direct(block_size, true);
         assert_eq!(
-            selected_dot_kernel().supports_int4_direct(block_size, true),
+            direct,
             DotKernel::arm64_kai_sdot_direct_enabled(),
-            "int4-direct dispatch support must follow the documented per-OS KAI policy"
+            "int4-direct dispatch support must follow the per-OS KAI policy"
         );
-        if !DotKernel::arm64_kai_sdot_direct_enabled() && !cfg!(feature = "mlas") {
-            return;
-        }
         let blocks = k.div_ceil(block_size);
         let activations: Vec<f32> = (0..k)
             .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
@@ -14437,23 +15199,42 @@ mod tests {
         let reached_mlas = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before_mlas;
         #[cfg(not(feature = "mlas"))]
         let reached_mlas = false;
-        assert!(
-            reached_kai || reached_mlas,
-            "real Qwen bits=4/block128/asymmetric shape reached neither MLAS QNBit nor KAI SDOT",
-        );
-        assert!(
-            kernel.packed_kai_qsi4_weight.get().is_some() || {
-                #[cfg(feature = "mlas")]
-                {
-                    kernel.mlas_shards.get().is_some()
+        if direct {
+            assert!(
+                reached_kai || reached_mlas,
+                "a supported direct int4 route must reach KAI or MLAS QNBit"
+            );
+        } else {
+            assert!(
+                !reached_kai,
+                "KAI executed despite the resolved platform policy"
+            );
+        }
+        if reached_kai || reached_mlas {
+            assert!(
+                kernel.packed_kai_qsi4_weight.get().is_some() || {
+                    #[cfg(feature = "mlas")]
+                    {
+                        kernel.mlas_shards.get().is_some() || kernel.mlas_packed.get().is_some()
+                    }
+                    #[cfg(not(feature = "mlas"))]
+                    {
+                        false
+                    }
                 }
-                #[cfg(not(feature = "mlas"))]
-                {
-                    false
-                }
-            }
+            );
+            assert!(kernel.int8_weight.get().is_none());
+        } else {
+            assert!(!direct);
+            assert!(
+                kernel.int8_weight.get().is_some(),
+                "a disabled direct route must use the native int8 representation"
+            );
+        }
+        assert!(
+            cached_dense_weight(&kernel).is_none(),
+            "accuracy-4 decode must not fall through to a full f32 expansion"
         );
-        assert!(kernel.int8_weight.get().is_none());
         assert_qai8dxp_close(&y.to_f32(), &expected);
     }
 
@@ -17612,7 +18393,7 @@ mod tests {
             .unwrap();
         assert_close(&y.to_f32(), &reference(&a.to_f32(), &dequantized, m, k, n));
         assert!(
-            kernel.weight_nk.get().is_none(),
+            cached_dense_weight(&kernel).is_none(),
             "batched asymmetric INT4 must not expand the weight to f32"
         );
     }
@@ -18026,7 +18807,7 @@ mod tests {
                     );
                 }
                 assert!(
-                    kernel.weight_nk.get().is_none(),
+                    cached_dense_weight(&kernel).is_none(),
                     "asymmetric={asymmetric} m={m}: the GEBP prefill must keep the \
                      weight borrowed, not materialize the f32 cache"
                 );
@@ -18109,7 +18890,7 @@ mod tests {
                      INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED"
                 );
                 assert!(
-                    kernel.weight_nk.get().is_none(),
+                    cached_dense_weight(&kernel).is_none(),
                     "asymmetric={asymmetric} m={m}: must keep the weight borrowed"
                 );
             }
@@ -18153,7 +18934,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            kernel.weight_nk.get().is_none(),
+            cached_dense_weight(&kernel).is_none(),
             "Muse-style decode must not expand the INT4 initializer to f32"
         );
         let rounded_a: Vec<f32> = a_values
@@ -18222,7 +19003,7 @@ mod tests {
             "the second activation must reuse the first call's routing decision and cache identity, not build a new one"
         );
         assert!(
-            kernel.weight_nk.get().is_none(),
+            cached_dense_weight(&kernel).is_none(),
             "symmetric decode must never expand the weight to f32 across activations (#979)"
         );
         assert_close(&y2.to_f32(), &reference(&a2_values, &dequantized, 1, k, n));
@@ -18374,7 +19155,7 @@ mod tests {
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
         assert!(
-            kernel.weight_nk.get().is_none(),
+            cached_dense_weight(&kernel).is_none(),
             "dynamic B must use the fallback rather than populate the prepack cache"
         );
     }
@@ -18641,7 +19422,7 @@ mod tests {
              the borrowed path's block dot is aarch64-only, so pre-empting MLAS here means a scalar GEMV"
         );
         assert!(
-            kernel.weight_nk.get().is_none(),
+            cached_dense_weight(&kernel).is_none(),
             "and it must still never expand the weight to f32 (#979)"
         );
     }
@@ -18720,7 +19501,7 @@ mod tests {
     ///      constant weight -- **share one packed allocation** (#1056), so the
     ///      per-node predictor equals a **single** copy, not two;
     ///   3. the graph walker the plan calls
-    ///      ([`resident_dequant_f32_cache_bytes`]) equals that same actual
+    ///      ([`planned_nbits_retained_bytes`]) equals that same actual
     ///      session footprint.
     ///
     /// It also guards the #979 direction: the total must be non-zero and never
@@ -18739,7 +19520,7 @@ mod tests {
             // This host has no MLAS SQNBit kernel for the shape, so the node
             // stays on the borrowed zero-copy path and holds no side buffer.
             assert_eq!(
-                matmul_nbits_resident_side_cache_bytes(4, block_size, 0, n, k, false, false, false),
+                planned_nbits_node_retained_bytes(4, block_size, 0, n, k, false, false, false),
                 0
             );
             return;
@@ -18821,7 +19602,7 @@ mod tests {
         // a single shared copy, because the two instances point at one buffer.
         let session_actual = per_copy_predicted;
         let node_predicted =
-            matmul_nbits_resident_side_cache_bytes(4, block_size, 0, n, k, false, false, false);
+            planned_nbits_node_retained_bytes(4, block_size, 0, n, k, false, false, false);
         assert_eq!(
             node_predicted, session_actual,
             "per-node accounting must equal the one shared packed buffer's actual bytes (#1056)"
@@ -18855,7 +19636,7 @@ mod tests {
             )),
         );
         assert_eq!(
-            resident_dequant_f32_cache_bytes(&graph),
+            planned_nbits_retained_bytes(&graph),
             session_actual,
             "the memory plan's graph accounting must equal the actual session footprint"
         );
@@ -18900,7 +19681,7 @@ mod tests {
 
         let run = |retain_caches| {
             let mut kernel = test_kernel(k, n, block_size);
-            kernel.retain_caches = retain_caches;
+            set_test_dense_retention(&mut kernel, retain_caches);
             kernel.set_constant_inputs(&[false, true, true]);
             let a = Owned::f32(&[1, k], &a_values);
             let b = Owned::u8(&[n, 8, 16], &packed);
@@ -19511,6 +20292,83 @@ mod tests {
         bytes
     }
 
+    fn compact_nbits_decode_fixture_bytes() -> Vec<u8> {
+        let (k, n, block) = (33usize, 17usize, 16usize);
+        let blocks = k.div_ceil(block);
+        let mut kernel = test_kernel(k, n, block);
+        kernel.bits = 2;
+        kernel.set_constant_inputs(&[false, true, true]);
+        let a = Owned::f32(&[1, k], &vec![0.25; k]);
+        let b = Owned::u8(&[n, blocks, block / 4], &vec![0x39; n * blocks * block / 4]);
+        let scales = Owned::f32(&[n, blocks], &vec![0.125; n * blocks]);
+        let mut output = Owned::zeros_f32(&[1, n]);
+        with_decode_pool_scope(true, || {
+            let placement = spmd_decode_active().is_some() || numa_decode_active().is_some();
+            let before = SPMD_TEST_DISPATCHES.load(Ordering::Relaxed);
+            let persistent = spmd_decode_active().is_some();
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scales.view()],
+                    &mut [output.view_mut()],
+                )
+                .unwrap();
+            assert_eq!(kernel.packed_nbits_weight.get().is_some(), placement);
+            assert_eq!(
+                SPMD_TEST_DISPATCHES.load(Ordering::Relaxed) - before,
+                usize::from(persistent)
+            );
+            if placement {
+                let cached = kernel.packed_nbits_weight.get().unwrap();
+                assert_ne!(cached.values.as_ptr(), b.view().data_ptr::<u8>());
+            }
+        });
+        output.bytes
+    }
+
+    fn refused_dense_decode_fixture_bytes() -> Vec<u8> {
+        let (k, n, block) = (33usize, 17usize, 16usize);
+        let blocks = k.div_ceil(block);
+        let (_, resources) = governed_dense_resources(0, k * n * 4);
+        let mut kernel = MatMulNBitsFactory::new(resources)
+            .create(&governed_dense_node(k, n, 4, block), &[])
+            .unwrap();
+        kernel.set_constant_inputs(&[false, true, true, true, true]);
+        let a = Owned::f32(&[1, k], &vec![0.25; k]);
+        let b = Owned::u8(&[n, blocks, block / 2], &vec![0x3c; n * blocks * block / 2]);
+        let scales = Owned::f32(&[n, blocks], &vec![0.0625; n * blocks]);
+        let groups = Owned::i32(&[k], &vec![0; k]);
+        let mut output = Owned::zeros_f32(&[1, n]);
+        let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+        with_decode_pool_scope(true, || {
+            let persistent = spmd_decode_active().is_some();
+            let before = SPMD_TEST_DISPATCHES.load(Ordering::Relaxed);
+            concrete
+                .execute(
+                    &[
+                        a.view(),
+                        b.view(),
+                        scales.view(),
+                        TensorView::absent(DataType::Uint8),
+                        groups.view(),
+                    ],
+                    &mut [output.view_mut()],
+                )
+                .unwrap();
+            assert_eq!(
+                SPMD_TEST_DISPATCHES.load(Ordering::Relaxed) - before,
+                usize::from(persistent),
+                "a refused dense grant must use the active decode scheduler, not the ambient Rayon pool"
+            );
+        });
+        let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+        assert_eq!(
+            concrete.dense_weights.activity().1,
+            0,
+            "refused fixture must not build the dense weight"
+        );
+        output.bytes
+    }
+
     /// Portable, deterministic decode-worker count for the SPMD parity children.
     ///
     /// The invariant this test exercises is that persistent-SPMD row-sharding is
@@ -19820,7 +20678,9 @@ mod tests {
             "the forced/auto children must build the persistent pool and the off child must not"
         );
         SPMD_TEST_DISPATCHES.store(0, std::sync::atomic::Ordering::Relaxed);
-        let bytes = real_int4_decode_fixture_bytes();
+        let mut bytes = real_int4_decode_fixture_bytes();
+        bytes.extend(refused_dense_decode_fixture_bytes());
+        bytes.extend(compact_nbits_decode_fixture_bytes());
         if persistent || auto {
             // Forced always dispatches; `auto`'s warmup step routes the fixture's
             // single decode scope through the pool. Either way every real int4 op

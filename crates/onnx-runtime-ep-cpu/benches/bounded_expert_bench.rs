@@ -60,7 +60,7 @@ fn main() {
     assert_eq!(
         args.len(),
         6,
-        "usage: bounded_expert_bench <streamed|cold|warm> <rows> <hidden> <intermediate> <iterations> <output-file>; set ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES and RAYON_NUM_THREADS before launching"
+        "usage: bounded_expert_bench <streamed|cold|warm> <rows> <hidden> <intermediate> <iterations> <output-file>; set ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES and RAYON_NUM_THREADS before launching"
     );
     let mode = &args[0];
     assert!(matches!(mode.as_str(), "streamed" | "cold" | "warm"));
@@ -77,7 +77,7 @@ fn main() {
             && inter.is_multiple_of(32)
             && iterations > 0
     );
-    let budget = std::env::var("ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES")
+    let budget = std::env::var("ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES")
         .expect("set the explicit cache budget")
         .parse::<usize>()
         .unwrap();

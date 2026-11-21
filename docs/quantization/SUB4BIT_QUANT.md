@@ -265,7 +265,7 @@ strided weights materialize only compressed bytes. Bias, arbitrary leading
 activation dimensions and f32/f16/bf16 output storage retain their contracts.
 For a fitting constant `packed_B`, the dense expansion is stored in a
 per-kernel bounded LRU cache
-(`ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES`, default 256 MiB), so repeated decode
+(`ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES`, default 256 MiB), so repeated decode
 does not expand the same immutable weight every token. This is explicitly
 cached-dense reuse, not direct quantized-domain compute. MXFP4 and IQ4_NL,
 IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, and IQ1_M are implemented
@@ -276,12 +276,12 @@ Q2_K, Q3_K, Q5_K, Q6_K and Q8_0; see the
 
 The retention ceiling is **per compiled kernel instance**. Each
 `(session, node, resolved input shapes)` kernel owns its LRU; 256 MiB is not a
-model-wide allowance. `CpuMemoryResources::dense_weight_cache_bytes` supplies
-this immutable policy (the default reads the environment variable above).
+model-wide allowance. `CpuWeightCacheLimits::dense_bytes`, supplied to `CpuMemoryResources::new`,
+sets this immutable policy (the default reads the environment variable above).
 A zero ceiling selects row streaming, avoiding full dense expansion.
 
-Engine CPU providers additionally share `CpuMemoryResources::derived_weights`,
-a Host/Weights grant source created before registry construction. Every owned
+Engine CPU providers receive a Host/Weights `DerivedWeightMemory` source through
+`CpuMemoryResources::new` before registry construction. Every owned
 f32 expansion, including nonconstant transient weights, acquires its full grant
 before allocation. A MoE expert preflights all FC1/FC2/(optional FC3) projections
 together, then splits the grant into exact independently owned buffers. This
@@ -296,9 +296,21 @@ Warm hits do not claim capacity again. Cold fills serialize per kernel; decoding
 and accountant callbacks run outside the payload lock. Providers constructed
 with default standalone resources remain ungoverned; callers can supply
 `DerivedWeightMemory::governed` through `CpuExecutionProvider::with_resources`.
-This covers block-quantized f32 payload bytes, not allocator metadata, row
-scratch, activations, packed materialization, QMoE or other derived caches. It
-does not impose a process RSS ceiling or deduplicate separate compiled kernels.
+The same owned cache component serves complete f32 `MatMulNBits` expansions.
+Its per-kernel key names the immutable NK slot, not a process-wide weight address;
+only the existing constant-operand proof enables retention. Dynamic weights and
+KN transients receive grants too. A zero retention ceiling still permits a
+transient NBits expansion when its Host grant fits; a refused full grant selects
+per-shard row decoding. M=1 preserves its original serial dot order. Group
+indices, bias and f32/f16/bf16 I/O keep their semantics. NUMA/SPMD placement
+reserves both simultaneously live f32 buffers before copying and releases the
+scratch share when placement completes.
+
+This covers owned f32 weight payloads; QMoE uses the same source with its expert
+working-set policy. It does not cover allocator metadata, row scratch,
+activations, strided packed materialization or remaining compact/MLAS packs.
+It does not impose a process RSS ceiling, unify CPU Device/Host physical books,
+or deduplicate separate compiled kernels.
 
 For MXFP4 interoperability, also support a lowering between this GGUF-native
 layout and ORT's current `QMoE(quant_type="fp4")` representation, which uses

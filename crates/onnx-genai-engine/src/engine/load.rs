@@ -1059,7 +1059,7 @@ impl Engine {
             0
         } else {
             match onnx_runtime_loader::load_model(&model_directory.model_path) {
-                Ok(graph) => onnx_runtime_ep_cpu::resident_dequant_f32_cache_bytes(&graph)
+                Ok(graph) => onnx_runtime_ep_cpu::planned_nbits_retained_bytes(&graph)
                     .saturating_add(onnx_runtime_ep_cpu::weight_transpose_cache_predicted_bytes(
                         &graph,
                     ))
