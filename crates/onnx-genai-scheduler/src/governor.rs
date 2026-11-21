@@ -293,9 +293,32 @@ pub struct GovernorSnapshot {
     pub disk_spill: Option<TierSnapshot>,
 }
 
-/// Resource-governor configuration failures.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// A memory-grant failure shared by pressure observers without erasing its
+/// concrete cause or repeating the operation in the source chain.
+#[derive(Debug, Clone)]
+pub struct MemoryGrantFailure {
+    operation: &'static str,
+    source: std::sync::Arc<onnx_runtime_memory_api::MemoryError>,
+}
+
+impl std::fmt::Display for MemoryGrantFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "cannot {}: {}", self.operation, self.source)
+    }
+}
+
+impl std::error::Error for MemoryGrantFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Resource-governor configuration and memory-grant failures.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ResourceError {
+    #[error(transparent)]
+    MemoryGrant(MemoryGrantFailure),
+
     #[error(
         "cannot satisfy lowered resource limit: requested {requested_bytes} B, but at least \
          {minimum_bytes} B is required; {reason}; raise the limit to at least \
@@ -390,6 +413,18 @@ pub enum ResourceError {
         operation: &'static str,
         reason: String,
     },
+}
+
+impl ResourceError {
+    pub fn memory_grant(
+        operation: &'static str,
+        source: onnx_runtime_memory_api::MemoryError,
+    ) -> Self {
+        Self::MemoryGrant(MemoryGrantFailure {
+            operation,
+            source: std::sync::Arc::new(source),
+        })
+    }
 }
 
 /// Resolve a limit against a tier's detected total capacity.
@@ -821,6 +856,30 @@ fn resolve_limits(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_grant_context_keeps_the_concrete_cause_when_pressure_observers_clone_it() {
+        use std::error::Error;
+        let failure = ResourceError::memory_grant(
+            "construct CPU weight authority",
+            onnx_runtime_memory_api::MemoryError::InvalidRequest {
+                tier: "host",
+                requested: 17,
+                reason: "test grant source rejected holder; use the owning holder",
+            },
+        );
+        let cloned = failure.clone();
+        let source = failure.source().expect("typed memory cause");
+        assert!(source.is::<onnx_runtime_memory_api::MemoryError>());
+        assert!(std::ptr::eq(source, cloned.source().unwrap()));
+        let message = failure.to_string();
+        assert!(
+            message.contains("construct CPU weight authority"),
+            "{message}"
+        );
+        assert!(message.contains("17 bytes"), "{message}");
+        assert!(message.contains("owning holder"), "{message}");
+    }
+
     use super::*;
 
     fn capacities() -> CapacityProviders {
@@ -1137,6 +1196,6 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert_eq!(error, ResourceError::MissingDiskCapacityProvider);
+        assert!(matches!(error, ResourceError::MissingDiskCapacityProvider));
     }
 }

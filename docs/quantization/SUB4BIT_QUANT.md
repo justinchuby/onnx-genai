@@ -256,8 +256,8 @@ standardized layouts without changing the meaning of old models.
 
 The CPU v1 implementation registers this op in `pkg.nxrt`, accepts f32/f16/bf16
 `A`, native uint8 `packed_B`, and an optional same-dtype bias. It computes in
-f32. When the complete dense weight fits the existing cache budget, it uses the
-shared CPU GEMM. Otherwise it decodes one row per worker shard and reuses that
+f32. When the complete dense weight fits the per-kernel cache policy and its
+Host grant is admitted, it uses the shared CPU GEMM. Otherwise it decodes one row per worker shard and reuses that
 row across the flattened token batch, using the same bounded projection helper
 as `BlockQuantizedMoE`. Zero budget selects streaming, avoiding full f32 weight
 expansion and constant-identity hashing. Contiguous packed weights are borrowed;
@@ -274,15 +274,31 @@ using the pinned llama.cpp layouts and dequantization math
 Q2_K, Q3_K, Q5_K, Q6_K and Q8_0; see the
 [block-format layout design](BLOCKQUANTIZEDMOE_DESIGN.md#3-block-format-decode-reuse).
 
-The cache budget is **per compiled kernel instance**, not per session, model, or
-process. Each `(session, node, resolved input shapes)` kernel owns an independent
-LRU with that ceiling. Consequently, a model containing many block-quantized
-projections can retain close to the aggregate size of all of their f32 dense
-expansions (or up to the per-kernel limit for each active kernel); the default
-does **not** impose a model-wide 256 MiB cap. Accounting covers resident dense
-f32 payload bytes, not key/`Arc` metadata, and an in-flight `Arc` remains alive
-after eviction until the current compute finishes, so short-lived aggregate
-memory can be higher. Set the environment variable to `0` to disable retention.
+The retention ceiling is **per compiled kernel instance**. Each
+`(session, node, resolved input shapes)` kernel owns its LRU; 256 MiB is not a
+model-wide allowance. `CpuMemoryResources::dense_weight_cache_bytes` supplies
+this immutable policy (the default reads the environment variable above).
+A zero ceiling selects row streaming, avoiding full dense expansion.
+
+Engine CPU providers additionally share `CpuMemoryResources::derived_weights`,
+a Host/Weights grant source created before registry construction. Every owned
+f32 expansion, including nonconstant transient weights, acquires its full grant
+before allocation. A MoE expert preflights all FC1/FC2/(optional FC3) projections
+together, then splits the grant into exact independently owned buffers. This
+bound is for one expert's complete projection set, not every expert in the bank.
+Decoding writes directly into the final KN or NK layout without a full-matrix
+transpose temporary. Capacity refusal selects the existing row-streaming path;
+allocator and invalid-request errors retain their typed memory causes.
+
+Cache membership and allocation ownership are separate: eviction frees the
+retention slot, but an in-flight `Arc` keeps its grant until the last owner drops.
+Warm hits do not claim capacity again. Cold fills serialize per kernel; decoding
+and accountant callbacks run outside the payload lock. Providers constructed
+with default standalone resources remain ungoverned; callers can supply
+`DerivedWeightMemory::governed` through `CpuExecutionProvider::with_resources`.
+This covers block-quantized f32 payload bytes, not allocator metadata, row
+scratch, activations, packed materialization, QMoE or other derived caches. It
+does not impose a process RSS ceiling or deduplicate separate compiled kernels.
 
 For MXFP4 interoperability, also support a lowering between this GGUF-native
 layout and ORT's current `QMoE(quant_type="fp4")` representation, which uses

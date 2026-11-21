@@ -1395,6 +1395,9 @@ mod tests {
     #[cfg(feature = "native-backend")]
     #[test]
     fn engine_governors_keep_disabled_host_cache_budgets_governed() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor as _;
+
         let first = EngineResourceGovernor::new_with_capacities(
             ResourceLimits {
                 host_ram_limit: ResourceLimit::Bytes(400),
@@ -1418,16 +1421,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            first.weight_offload_host_cache().configured_budget_bytes(),
-            0
-        );
-        assert_eq!(first.weight_offload_host_cache().budget(), (0, true));
-        assert_eq!(
-            second.weight_offload_host_cache().configured_budget_bytes(),
-            0
-        );
-        assert_eq!(second.weight_offload_host_cache().budget(), (0, true));
+        for governor in [&first, &second] {
+            let resources = governor.cpu_memory_resources(Default::default());
+            assert_eq!(resources.host_cache.configured_budget_bytes(), 0);
+            assert_eq!(resources.host_cache.budget(), (0, true));
+            assert!(resources.derived_weights.is_governed());
+            assert_eq!(governor.memory().used(Tier::Host), 0);
+        }
     }
 
     #[test]

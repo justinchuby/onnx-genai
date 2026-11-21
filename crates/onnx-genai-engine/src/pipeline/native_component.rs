@@ -218,12 +218,11 @@ impl NativeComponentSet {
     pub(crate) fn load(
         model_paths: &BTreeMap<String, PathBuf>,
         device: &NativeDecodeDevice,
-        einsum_scratch_retention: onnx_runtime_ep_cpu::EinsumScratchRetention,
+        cpu_resources: onnx_runtime_ep_cpu::CpuMemoryResources,
     ) -> anyhow::Result<Self> {
         let mut components = HashMap::with_capacity(model_paths.len());
         for (component, path) in model_paths {
-            let session =
-                load_native_component(component, path, device, einsum_scratch_retention.clone())?;
+            let session = load_native_component(component, path, device, cpu_resources.clone())?;
             let output_names = session.outputs().iter().map(|io| io.name.clone()).collect();
             components.insert(
                 component.clone(),
@@ -756,7 +755,7 @@ fn load_native_component(
     component: &str,
     path: &Path,
     device: &NativeDecodeDevice,
-    einsum_scratch_retention: onnx_runtime_ep_cpu::EinsumScratchRetention,
+    cpu_resources: onnx_runtime_ep_cpu::CpuMemoryResources,
 ) -> anyhow::Result<InferenceSession> {
     let mut builder = InferenceSession::builder().model(path);
     match device {
@@ -764,9 +763,7 @@ fn load_native_component(
             builder = builder
                 .device(DevicePreference::Cpu)
                 .execution_provider(Arc::new(
-                    onnx_runtime_ep_cpu::CpuExecutionProvider::with_einsum_scratch_retention(
-                        einsum_scratch_retention,
-                    ),
+                    onnx_runtime_ep_cpu::CpuExecutionProvider::with_resources(cpu_resources),
                 ));
         }
         #[cfg(feature = "native-cuda")]

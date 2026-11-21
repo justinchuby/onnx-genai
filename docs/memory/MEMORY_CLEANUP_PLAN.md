@@ -377,3 +377,38 @@ exact shared-capacity boundary, retained metadata, expiry/pruning, concurrent
 known-bank operations, cold-registration exclusion and worker progress. The
 standing partition still does not account for transient decoded or scratch
 allocations; model-wide grant convergence remains open.
+
+
+### Owned grants for block-quantized CPU derived weights
+
+Native CPU registry construction now consumes one `CpuMemoryResources` bundle:
+QMoE host-cache ownership, block-derived Host grants, the per-kernel dense
+retention ceiling and the Einsum scratch-retention verdict. This replaces the
+combinatorial provider constructors; all engine and pipeline callers use the
+same resource bundle without compatibility aliases. The engine constructs the
+Host/Weights source before compiling kernels and shares it across components.
+Native decode CUDA also receives the composite governor so Host-NUMA grants use
+its Host books rather than the Device-only authority.
+
+BlockQuantizedMatMul and BlockQuantizedMoE distinguish retention policy from
+physical payload ownership. A zero-byte anchor supplies sibling grants without
+reserving an unused standing allowance. Missing projections are admitted as one
+group before any dense allocation, then `MemoryLease::split_off` transfers exact
+shares into each buffer without changing the ledger. Partial eviction returns
+only the dropped buffers' shares; active owners remain charged after eviction.
+Nonconstant dense expansions use the same grants. Capacity refusal uses bounded
+row decoding; allocation/configuration errors preserve their typed causes.
+
+A separate cold-fill gate preserves single-flight reuse while grants, decoding
+and releases happen outside the cache payload lock. MoE decodes directly into
+its final NK layout, avoiding an uncharged complete transpose temporary. Warm
+cache hits do not invoke the accountant. Tests exercise shared Host pressure,
+complete-group refusal, partial replacement at exact quota, active owners after
+LRU eviction, failure rollback, concurrent fills and numerical equivalence
+across formats, dtypes, mutable/constant weights and packed storage layouts.
+
+This is a scoped convergence step. QMoE's standing partition and transient
+expansions, other derived caches, scratch/activation buffers, the physical
+relationship between CPU Device and Host books, process-wide capacity and GPU
+asynchronous lifetimes remain open. Default standalone CPU resources remain
+ungoverned. CPU tests and CUDA compilation do not prove CUDA execution behavior.

@@ -1699,6 +1699,31 @@ impl MemoryLease {
         ))
     }
 
+    /// Transfer `bytes` of this grant to an independent owner without claiming
+    /// or releasing capacity. Both leases keep the same tier, role, holder and
+    /// accounting authority. Dropping either returns only its remaining share.
+    ///
+    /// This preflights a group once and then attaches an exact grant to each
+    /// allocation, so partially evicting the group returns the freed bytes.
+    /// An oversized split leaves this lease and the ledger unchanged.
+    pub fn split_off(&mut self, bytes: u64) -> Result<Self, MemoryError> {
+        if bytes > self.bytes {
+            return Err(MemoryError::InvalidRequest {
+                tier: self.tier.name(),
+                requested: bytes,
+                reason: "split amount exceeds the owned grant; split no more than MemoryLease::bytes()",
+            });
+        }
+        self.bytes -= bytes;
+        Ok(Self::new(
+            self.tier,
+            bytes,
+            self.role,
+            self.holder,
+            Arc::clone(&self.accounting),
+        ))
+    }
+
     /// Transfer a sibling lease into this long-lived owner without changing
     /// the ledger's total charge.
     ///

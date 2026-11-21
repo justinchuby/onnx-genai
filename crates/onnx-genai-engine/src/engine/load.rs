@@ -1253,16 +1253,15 @@ impl Engine {
             .flatten();
         let native_session = {
             let _span = onnx_genai_ort::prof_span!("engine.native_session_load");
-            crate::native_decode::NativeDecodeSession::load_with_weight_offload_host_cache(
+            crate::native_decode::NativeDecodeSession::load_with_resources(
                 &model_directory.model_path,
                 native_device.clone(),
                 crate::native_decode::NativeDecodeLoadOptions {
-                    host_cache: governor.weight_offload_host_cache(),
-                    einsum_scratch_retention,
+                    cpu_resources: governor.cpu_memory_resources(einsum_scratch_retention),
                     #[cfg(feature = "native-cuda")]
                     cuda_offload_policy,
                     #[cfg(feature = "native-cuda")]
-                    cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
+                    cuda_memory_governor: std::sync::Arc::new(governor.memory().clone()),
                     #[cfg(feature = "native-cuda")]
                     process_memory_manager: governor.process_memory_manager(),
                     io: metadata.decoder_io(),

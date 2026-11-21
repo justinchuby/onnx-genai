@@ -195,6 +195,8 @@ pub struct EngineResourceGovernor {
     plan: Arc<std::sync::Mutex<ModelMemoryPlan>>,
     #[cfg(feature = "native-backend")]
     weight_offload_host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
+    #[cfg(feature = "native-backend")]
+    derived_weight_memory: onnx_runtime_ep_cpu::DerivedWeightMemory,
 }
 
 impl EngineResourceGovernor {
@@ -516,9 +518,19 @@ impl EngineResourceGovernor {
             &memory,
             Holder::WeightOffloadHostCache.id(),
         )
-        .map_err(|reason| ResourceError::BudgetArithmeticOverflow {
-            operation: "leasing the native weight-offload host-cache budget",
-            reason: reason.to_string(),
+        .map_err(|source| {
+            ResourceError::memory_grant("lease the native weight-offload host-cache budget", source)
+        })?;
+        #[cfg(feature = "native-backend")]
+        let derived_weight_memory = onnx_runtime_ep_cpu::DerivedWeightMemory::governed(
+            &memory,
+            Holder::CpuDerivedWeights.id(),
+        )
+        .map_err(|source| {
+            ResourceError::memory_grant(
+                "construct the native CPU derived-weight grant source",
+                source,
+            )
         })?;
         Ok(Self {
             inner,
@@ -528,6 +540,8 @@ impl EngineResourceGovernor {
             plan: Arc::new(std::sync::Mutex::new(plan)),
             #[cfg(feature = "native-backend")]
             weight_offload_host_cache,
+            #[cfg(feature = "native-backend")]
+            derived_weight_memory,
         })
     }
 
@@ -699,8 +713,16 @@ impl EngineResourceGovernor {
     }
 
     #[cfg(feature = "native-backend")]
-    pub(crate) fn weight_offload_host_cache(&self) -> onnx_runtime_ep_cpu::WeightOffloadHostCache {
-        self.weight_offload_host_cache.clone()
+    pub(crate) fn cpu_memory_resources(
+        &self,
+        einsum_scratch_retention: onnx_runtime_ep_cpu::EinsumScratchRetention,
+    ) -> onnx_runtime_ep_cpu::CpuMemoryResources {
+        onnx_runtime_ep_cpu::CpuMemoryResources {
+            host_cache: self.weight_offload_host_cache.clone(),
+            derived_weights: self.derived_weight_memory.clone(),
+            einsum_scratch_retention,
+            ..Default::default()
+        }
     }
 }
 

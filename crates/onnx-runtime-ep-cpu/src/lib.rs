@@ -62,6 +62,7 @@ pub mod nchwc_layout;
 pub mod optimizer;
 pub(crate) mod persistent_pool_width;
 pub mod provider;
+mod resources;
 pub mod strided;
 pub mod task_runtime;
 #[cfg(test)]
@@ -78,6 +79,7 @@ pub use optimizer::{
     cpu_optimization_passes,
 };
 pub use provider::CpuExecutionProvider;
+pub use resources::{CpuMemoryResources, DerivedWeightMemory};
 pub use weight_offload::placement::{
     GpuLayersOverrideReport, HostFallbackReason, IqFormat, LayerPlacement, LayerWeightRegions,
     Placement, PlacementError, PlacementPlan, QuantTileFormat, RegionPlacement, SnappedTileSize,
