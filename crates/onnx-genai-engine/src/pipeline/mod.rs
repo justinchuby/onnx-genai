@@ -1076,7 +1076,7 @@ impl WorkflowRuntime {
                 &directory.model_paths,
                 device,
                 resource_governor.cpu_memory_resources(
-                    onnx_runtime_ep_cpu::EinsumScratchRetention::new(
+                    onnx_runtime_ep_cpu::CpuCacheRetention::new(
                         memory_strategy_plan.f32_weight_cache_admitted,
                     ),
                 ),

@@ -18,6 +18,7 @@ onnx-runtime-ir = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 
 [dev-dependencies]
+onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-session = { workspace = true }
 libloading = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }

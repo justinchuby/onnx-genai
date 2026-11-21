@@ -6,12 +6,13 @@ use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryLease};
 
-use crate::{EinsumScratchRetention, WeightOffloadHostCache};
+use crate::{CpuCacheRetention, WeightOffloadHostCache};
 
 /// Session memory resources supplied before the CPU registry is constructed.
 /// Block-quantized factories and transient QMoE expansions share `derived_weights`;
 /// retained QMoE experts use `host_cache`
-/// and Einsum uses its scratch-retention verdict. Other allocations are not
+/// and planned legacy caches use the immutable `cache_retention` verdict.
+/// That verdict admits retention without supplying physical grants. Other allocations are not
 /// covered by the derived-weight grant source. The default is the standalone,
 /// ungoverned policy; engines supply their Host authority explicitly.
 ///
@@ -36,7 +37,7 @@ pub struct CpuMemoryResources {
     pub derived_weights: DerivedWeightMemory,
     /// Per-kernel retention/eligibility policy, separate from shared physical grants.
     pub dense_weight_cache_bytes: usize,
-    pub einsum_scratch_retention: EinsumScratchRetention,
+    pub cache_retention: CpuCacheRetention,
 }
 
 impl Default for CpuMemoryResources {
@@ -46,7 +47,7 @@ impl Default for CpuMemoryResources {
             derived_weights: DerivedWeightMemory::default(),
             dense_weight_cache_bytes:
                 crate::kernels::dense_weight_cache::configured_dense_weight_cache_bytes(),
-            einsum_scratch_retention: EinsumScratchRetention::default(),
+            cache_retention: CpuCacheRetention::default(),
         }
     }
 }

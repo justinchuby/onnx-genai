@@ -166,10 +166,11 @@ Guarding the *view* dtype is not sufficient; the **key** needs the
 discriminator. Fixed by adding `tag: u16` to `WeightTransposeKey`, with
 `the_two_16_bit_formats_do_not_share_a_cache_entry` as the regression.
 
-Related standing trap: tests depending on the cache verdict must use
-`weight_transpose::CacheEnabledScope` (thread-local RAII), never
-`set_cache_enabled` (process-global) — the documented #983/#1033/#1056 "passes
-alone, fails in company" failure.
+At measurement time, tests isolated admission with a thread-local override to
+avoid the #983/#1033/#1056 "passes alone, fails in company" failure. Those
+overrides and the process-global admission setters have since been removed.
+Current callers supply immutable `CpuMemoryResources::cache_retention` before
+provider construction.
 
 ## 9. Still divergent, deliberately
 

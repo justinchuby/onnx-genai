@@ -286,12 +286,15 @@ impl NativeDecodeSession {
             // `MAX_WEIGHT_FOLD_ELEMS` in
             // `onnx-runtime-optimizer::constant_folding` for the tradeoff.
             .option("optimization", "basic");
-        if device == NativeDecodeDevice::Cpu {
-            let ep = onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(
+        let cpu: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = Arc::new(
+            onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(
                 options.cpu_resources,
             )
-            .context("initialize native CPU execution provider")?;
-            builder = builder.execution_provider(Arc::new(ep));
+            .context("initialize session CPU execution provider and fallback resources")?,
+        );
+        builder = builder.fallback_execution_provider(Arc::clone(&cpu));
+        if device == NativeDecodeDevice::Cpu {
+            builder = builder.execution_provider(Arc::clone(&cpu));
         }
         #[cfg(feature = "native-cuda")]
         if let NativeDecodeDevice::Cuda { index } = device {
@@ -319,6 +322,7 @@ impl NativeDecodeSession {
                 registration_name,
                 provider_name.clone(),
                 provider_name,
+                Arc::clone(&cpu),
             )
             .context("initialize native plugin execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
@@ -545,6 +549,16 @@ impl NativeDecodeSession {
             // See the identical `.option("optimization", "basic")` rationale
             // in `load_with_resources` above.
             .option("optimization", "basic");
+        let cpu: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = Arc::new(
+            onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(
+                Default::default(),
+            )
+            .context("initialize standalone CPU execution provider and fallback")?,
+        );
+        builder = builder.fallback_execution_provider(Arc::clone(&cpu));
+        if device == NativeDecodeDevice::Cpu {
+            builder = builder.execution_provider(Arc::clone(&cpu));
+        }
         #[cfg(feature = "native-cuda")]
         if let (NativeDecodeDevice::Cuda { index }, Some(governor)) = (&device, cuda_governor) {
             let policy = cuda_offload_policy
@@ -578,6 +592,7 @@ impl NativeDecodeSession {
                 registration_name,
                 provider_name.clone(),
                 provider_name,
+                Arc::clone(&cpu),
             )
             .context("initialize native plugin execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));

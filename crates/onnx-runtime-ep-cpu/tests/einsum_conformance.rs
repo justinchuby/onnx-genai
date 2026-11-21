@@ -9,7 +9,7 @@ use onnx_runtime_einsum_conformance::{
 };
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, KernelFactory, TensorMut, TensorView};
 use onnx_runtime_ep_cpu::kernels::einsum::{
-    EinsumExecutionMode, EinsumFactory, EinsumScratchRetention, benchmark_execute_route,
+    CpuCacheRetention, EinsumExecutionMode, EinsumFactory, benchmark_execute_route,
     benchmark_last_workspace_bytes,
 };
 use onnx_runtime_ir::{Attribute, DataType, DeviceId, Node, NodeId, compute_contiguous_strides};
@@ -162,7 +162,7 @@ impl BackendAdapter for CpuAdapter {
             "equation".into(),
             Attribute::String(request.case.equation.as_bytes().to_vec()),
         );
-        let kernel = EinsumFactory::with_execution_mode(EinsumScratchRetention::default(), mode)
+        let kernel = EinsumFactory::with_execution_mode(CpuCacheRetention::default(), mode)
             .create(&node, &request.case.input_shapes)
             .map_err(|error| AdapterError(error.to_string()))?;
         let inputs = request

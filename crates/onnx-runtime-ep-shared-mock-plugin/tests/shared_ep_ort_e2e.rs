@@ -1479,6 +1479,12 @@ fn whole_graph_control_flow_executes_through_native_plugin_session() {
         Some("nxrt_mock_compile_only".into()),
         "nxrt_shared_mock_ep",
         "cpu",
+        std::sync::Arc::new(
+            onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(
+                Default::default(),
+            )
+            .expect("initialize configured plugin CPU fallback"),
+        ),
     )
     .unwrap();
     let bytes =

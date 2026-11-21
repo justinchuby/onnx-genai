@@ -420,6 +420,7 @@ pub(crate) struct Executor {
     /// dropped afterwards — no use-after-free regardless of field drop order.
     pub(super) weights: Arc<WeightStore>,
     pub(super) ep: Arc<dyn ExecutionProvider>,
+    pub(super) fallback_ep: Option<Arc<dyn ExecutionProvider>>,
     /// Opt-in mixed-provider coordinator. When present, ordinary tensor runs
     /// dispatch through its per-provider child executors; the legacy fields
     /// remain an inert empty scaffold so default single-EP behavior is unchanged.
@@ -1296,6 +1297,7 @@ pub(crate) struct ChildExecutor {
     pub(super) inherited_opsets: HashMap<String, u64>,
     pub(super) weights: Arc<WeightStore>,
     pub(super) ep: Arc<dyn ExecutionProvider>,
+    pub(super) fallback_ep: Option<Arc<dyn ExecutionProvider>>,
     pub(super) formal_names: Vec<String>,
     pub(super) capture_names: Vec<String>,
     pub(super) input_names: Vec<String>,

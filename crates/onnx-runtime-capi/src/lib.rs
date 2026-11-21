@@ -119,7 +119,8 @@ fn guard<F: FnOnce() -> FfiResult>(f: F) -> *mut OrtStatus {
 fn map_session_error(err: &SessionError) -> OrtErrorCode {
     use onnx_runtime_session::SessionError as E;
     match err {
-        E::InputNotFound { .. }
+        E::InvalidFallbackProvider { .. }
+        | E::InputNotFound { .. }
         | E::DtypeMismatch { .. }
         | E::ShapeMismatch { .. }
         | E::UnknownOption { .. }
@@ -901,6 +902,14 @@ mod tests {
     #[test]
     fn session_error_mapping_covers_structural_and_shape_variants() {
         use onnx_runtime_session::SessionError as E;
+
+        assert_eq!(
+            map_session_error(&E::InvalidFallbackProvider {
+                provider: "test_accelerator".into(),
+                device: onnx_runtime_ir::DeviceId::cuda(0),
+            }),
+            OrtErrorCode::InvalidArgument
+        );
 
         assert_eq!(
             map_session_error(&E::UnsupportedModel {

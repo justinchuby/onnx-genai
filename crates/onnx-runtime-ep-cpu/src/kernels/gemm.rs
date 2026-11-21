@@ -32,7 +32,19 @@ pub struct GemmKernel {
 
 /// Factory reading `alpha`/`beta` (default 1.0) and `transA`/`transB`
 /// (default 0).
-pub struct GemmFactory;
+pub struct GemmFactory {
+    retain_caches: bool,
+}
+impl GemmFactory {
+    pub fn new(retain_caches: bool) -> Self {
+        Self { retain_caches }
+    }
+}
+impl Default for GemmFactory {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
 
 impl KernelFactory for GemmFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -45,7 +57,7 @@ impl KernelFactory for GemmFactory {
             beta,
             trans_a,
             trans_b,
-            prepack: MatMulPrepack::default(),
+            prepack: MatMulPrepack::new(self.retain_caches),
         }))
     }
 }
@@ -1106,7 +1118,6 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         // Thread-local admit: never mutates the process-global the concurrent
         // `transposed_b` tests read (#1056 isolation).
-        let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
 
         // Distinctive geometry so a stray same-shaped entry cannot alias it.
         let (n, k) = (37usize, 91usize);
@@ -1242,7 +1253,7 @@ mod tests {
         // Returns the kernel so residency is probed while the installer is
         // still alive: entries are evicted when the owning prepack drops, so
         // that none can outlive the weight whose address keys it (#1726).
-        let run = || -> (Vec<f32>, GemmKernel) {
+        let run = |retain_caches| -> (Vec<f32>, GemmKernel) {
             let a = Owned::f32(&[m, k], &a_data);
             let mut y = Owned::zeros_f32(&[m, n]);
             let mut kernel = GemmKernel {
@@ -1250,7 +1261,7 @@ mod tests {
                 beta: 1.0,
                 trans_a: false,
                 trans_b: true,
-                prepack: MatMulPrepack::default(),
+                prepack: MatMulPrepack::new(retain_caches),
             };
             kernel.set_constant_inputs(&[false, true]);
             kernel
@@ -1264,8 +1275,7 @@ mod tests {
         // `transposed_b(&b, n, k)`) rather than a global byte total, so a
         // concurrent test caching an unrelated weight cannot mask a leak.
         let declined = {
-            let _decline = crate::kernels::weight_transpose::CacheEnabledScope::new(false);
-            let (out, kernel) = run();
+            let (out, kernel) = run(false);
             assert!(
                 !crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
                 "a declined transpose cache must retain nothing for this weight"
@@ -1278,8 +1288,7 @@ mod tests {
         // way) and now this weight *is* resident, confirming the two paths
         // differ only in retention, not in numerics.
         let admitted = {
-            let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
-            let (out, kernel) = run();
+            let (out, kernel) = run(true);
             assert!(
                 crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
                 "an admitted transpose cache must retain this weight while the \
@@ -1303,7 +1312,14 @@ mod half_decode_route_tests {
     /// `Gemm` at `m == 1` run through the real kernel. Returns the output and
     /// the number of decode-GEMV calls it made, so a test asserts *which*
     /// kernel ran and not only that the numbers are plausible.
-    fn decode_gemm(k: usize, n: usize, a: &[f32], b: &[f32], trans_b: bool) -> (Vec<f32>, u64) {
+    fn decode_gemm(
+        retain_caches: bool,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        trans_b: bool,
+    ) -> (Vec<f32>, u64) {
         let a_t = Owned::f16(&[1, k], a);
         let b_t = if trans_b {
             Owned::f16(&[n, k], b)
@@ -1316,7 +1332,7 @@ mod half_decode_route_tests {
             beta: 1.0,
             trans_a: false,
             trans_b,
-            prepack: MatMulPrepack::default(),
+            prepack: MatMulPrepack::new(retain_caches),
         };
         kernel.set_constant_inputs(&[false, true]);
         super::reset_half_decode_gemv_calls();
@@ -1394,7 +1410,7 @@ mod half_decode_route_tests {
         // *admitted* route, so it must not inherit whatever verdict another
         // test left on the process-global, and must not write that global
         // itself (which would race every concurrent reader).
-        let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
+
         for &(k, n) in &[(259usize, 131usize), (512, 512), (777, 333)] {
             let a = operand(k, 0.25);
             let b_kn = operand(k * n, 1.75);
@@ -1406,9 +1422,9 @@ mod half_decode_route_tests {
             }
 
             matmul::reset_half_decode_transposed_calls();
-            let (gemm_kn, gemm_kn_calls) = decode_gemm(k, n, &a, &b_kn, false);
+            let (gemm_kn, gemm_kn_calls) = decode_gemm(true, k, n, &a, &b_kn, false);
             let transposed_after_kn = matmul::half_decode_transposed_calls();
-            let (gemm_nk, gemm_nk_calls) = decode_gemm(k, n, &a, &b_nk, true);
+            let (gemm_nk, gemm_nk_calls) = decode_gemm(true, k, n, &a, &b_nk, true);
             let (mm_kn, mm_calls) = decode_matmul(k, n, &a, &b_kn);
 
             assert_eq!(
@@ -1450,14 +1466,12 @@ mod half_decode_route_tests {
     /// nothing.
     #[test]
     fn a_declined_transpose_cache_falls_back_to_reading_in_place() {
-        use crate::kernels::weight_transpose::CacheEnabledScope;
         let (k, n) = (263usize, 137usize);
         let a = operand(k, 0.5);
         let b_kn = operand(k * n, 2.25);
 
-        let _decline = CacheEnabledScope::new(false);
         matmul::reset_half_decode_transposed_calls();
-        let (out, calls) = decode_gemm(k, n, &a, &b_kn, false);
+        let (out, calls) = decode_gemm(false, k, n, &a, &b_kn, false);
 
         assert_eq!(calls, 1, "the decode GEMV must still serve the call");
         assert_eq!(
@@ -1502,7 +1516,7 @@ mod half_decode_route_tests {
             let a = operand(k, 0.25);
             let b = operand(k * n, -0.5);
 
-            let (gemm_out, gemm_gemv) = decode_gemm(k, n, &a, &b, false);
+            let (gemm_out, gemm_gemv) = decode_gemm(true, k, n, &a, &b, false);
             assert_eq!(
                 gemm_gemv, 1,
                 "k={k} n={n}: Gemm must serve an m == 1 f16 decode with the GEMV"
@@ -1547,7 +1561,7 @@ mod half_decode_route_tests {
                     nk[j * k + p] = kn[p * n + j];
                 }
             }
-            let (out, gemv) = decode_gemm(k, n, &a, &nk, true);
+            let (out, gemv) = decode_gemm(true, k, n, &a, &nk, true);
             assert_eq!(gemv, 1, "k={k} n={n}: a transB decode must reach the GEMV");
 
             let worst = worst_rel(&out, &reference(k, n, &a, &kn));

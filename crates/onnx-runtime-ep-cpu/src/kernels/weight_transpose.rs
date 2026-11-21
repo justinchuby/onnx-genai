@@ -36,90 +36,9 @@
 //! code could not be tested off macOS.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use rayon::prelude::*;
-
-/// Admission verdict for the process-global weight-transpose caches (#1056).
-///
-/// The transpose cache is a resident, session-lifetime, weight-scaled buffer:
-/// one full `K x N` copy per transposed constant weight. Like the resident
-/// dequant f32 cache (#987) and the MLAS SQNBit packed buffer (#1051), it must
-/// be *declinable* — when the memory-strategy plan cannot fit its predicted
-/// bytes, the kernels must compute the transpose per call and cache nothing,
-/// trading decode speed for footprint instead of overrunning the budget.
-///
-/// Defaults to enabled so the out-of-box path is unchanged; the engine flips it
-/// once, at load, from the plan's verdict (see `onnx-genai-engine`'s
-/// `set_weight_transpose_cache_enabled` beside the other two buffers' gates).
-static WEIGHT_TRANSPOSE_CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
-
-/// Admit (or decline) the process-global weight-transpose caches. See
-/// [`WEIGHT_TRANSPOSE_CACHE_ENABLED`].
-///
-/// This is the **production** entry point: the engine calls it exactly once, at
-/// load, from the plan's verdict. It writes a process-global that every worker
-/// thread reads, which is correct for production but toxic for a parallel test
-/// harness — a test that flipped it would race every other test in the process
-/// (this is the #983 / #1033 / #1056 "passes alone, fails in company" trap).
-/// Tests must therefore never call this; they use [`CacheEnabledScope`], a
-/// thread-local override that leaves this global untouched.
-pub fn set_cache_enabled(enabled: bool) {
-    WEIGHT_TRANSPOSE_CACHE_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-thread_local! {
-    /// Test-only, per-thread override of the admission verdict. `None` means
-    /// "defer to the process-global"; `Some(v)` forces `v` on **this thread
-    /// only**, so one test's decline cannot leak into another test running
-    /// concurrently on a different worker thread. Set exclusively through
-    /// [`CacheEnabledScope`], which restores the previous value on drop (even on
-    /// panic). Production never touches this.
-    static CACHE_ENABLED_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Whether the process-global weight-transpose caches are currently admitted.
-///
-/// A thread-local override (set only by tests via [`CacheEnabledScope`]) wins
-/// over the process-global when present, so the decline path can be exercised
-/// on one thread without disturbing the rest of the parallel test harness.
-pub fn cache_enabled() -> bool {
-    if let Some(forced) = CACHE_ENABLED_OVERRIDE.with(|c| c.get()) {
-        return forced;
-    }
-    WEIGHT_TRANSPOSE_CACHE_ENABLED.load(Ordering::Relaxed)
-}
-
-/// RAII, thread-local scoping of the admission verdict for tests (#1056).
-///
-/// Constructing one forces [`cache_enabled`] to `enabled` on the current thread;
-/// dropping it restores whatever was in effect before — including on panic, so a
-/// failing test can never leave the flag flipped for the tests that follow.
-/// Because the override is thread-local, a test scoping a decline here does not
-/// race the `transposed_b` tests running concurrently on other threads, which
-/// was the failure this type exists to prevent.
-#[cfg(test)]
-pub(crate) struct CacheEnabledScope {
-    prev: Option<bool>,
-}
-
-#[cfg(test)]
-impl CacheEnabledScope {
-    /// Force the admission verdict to `enabled` on this thread until dropped.
-    pub(crate) fn new(enabled: bool) -> Self {
-        let prev = CACHE_ENABLED_OVERRIDE.with(|c| c.replace(Some(enabled)));
-        Self { prev }
-    }
-}
-
-#[cfg(test)]
-impl Drop for CacheEnabledScope {
-    fn drop(&mut self) {
-        CACHE_ENABLED_OVERRIDE.with(|c| c.set(self.prev));
-    }
-}
 
 /// Total identity of one cached weight transpose.
 ///
@@ -375,39 +294,10 @@ static WEIGHT_TRANSPOSE_F16: LazyLock<TransposeCache<u16>> = LazyLock::new(Trans
 /// Process-global cache of transposed f32 weights (Accelerate GEMV / thin-M).
 static WEIGHT_TRANSPOSE_F32: LazyLock<TransposeCache<f32>> = LazyLock::new(TransposeCache::default);
 
-/// Compute the `[n, k]` transpose of `src[k, n]` **without** touching the
-/// process-global cache — the declined path (#1056).
-///
-/// Honours the same fail-closed length contract as
-/// [`TransposeCache::get_or_insert_transpose`] (returns `None` on a length
-/// mismatch, an empty vector for a zero-element matrix) so a caller cannot tell
-/// admitted from declined except by cost: the returned `Arc` is freshly
-/// allocated on every call and freed when the caller drops it, so nothing
-/// survives the kernel call and the cache's byte total stays put.
-fn transpose_uncached<T: Copy + Default + Send + Sync>(
-    src: &[T],
-    k: usize,
-    n: usize,
-) -> Option<Arc<Vec<T>>> {
-    let key = WeightTransposeKey::new(src.as_ptr(), k, n);
-    if key.numel() != Some(src.len()) {
-        return None;
-    }
-    if src.is_empty() {
-        return Some(Arc::new(Vec::new()));
-    }
-    Some(Arc::new(transpose_row_major(src, k, n)))
-}
-
-/// Cached `B_T[N,K]` for an f32 weight `B[K,N]`, or `None` when `src.len()` is
-/// not exactly `k * n`. See [`TransposeCache::get_or_insert_transpose`].
-///
-/// When the cache is declined ([`cache_enabled`] is `false`) the transpose is
-/// computed per call and not retained (#1056).
+/// Cached `B_T[N,K]` for an f32 weight `B[K,N]`, or `None` when
+/// `src.len()` differs from `k * n`. The caller must admit retention before
+/// accessing this shared store; declined prepack instances transpose locally.
 pub fn cached_transpose_f32(src: &[f32], k: usize, n: usize) -> Option<Arc<Vec<f32>>> {
-    if !cache_enabled() {
-        return transpose_uncached(src, k, n);
-    }
     WEIGHT_TRANSPOSE_F32.get_or_insert_transpose(src, k, n)
 }
 
@@ -440,7 +330,7 @@ pub(crate) fn f32_cache_evict(ptr: *const f32, k: usize, n: usize) {
 /// Cached `B_T[N,K]` for an f16 weight `B[K,N]` held as raw `u16` bit patterns,
 /// or `None` when `src.len()` is not exactly `k * n`.
 ///
-/// When the cache is declined ([`cache_enabled`] is `false`) the transpose is
+/// When the owning prepack declines retention, the transpose is
 /// computed per call and not retained (#1056).
 pub fn cached_transpose_f16(src: &[u16], k: usize, n: usize) -> Option<Arc<Vec<u16>>> {
     cached_transpose_half(src, k, n, 0)
@@ -463,9 +353,6 @@ pub(crate) fn cached_transpose_half_reporting(
     n: usize,
     tag: u16,
 ) -> Option<(Arc<Vec<u16>>, bool)> {
-    if !cache_enabled() {
-        return transpose_uncached(src, k, n).map(|transposed| (transposed, false));
-    }
     WEIGHT_TRANSPOSE_F16.get_or_insert_transpose_reporting(src, k, n, tag)
 }
 
@@ -475,9 +362,6 @@ pub(crate) fn cached_transpose_f32_reporting(
     k: usize,
     n: usize,
 ) -> Option<(Arc<Vec<f32>>, bool)> {
-    if !cache_enabled() {
-        return transpose_uncached(src, k, n).map(|transposed| (transposed, false));
-    }
     WEIGHT_TRANSPOSE_F32.get_or_insert_transpose_reporting(src, k, n, 0)
 }
 

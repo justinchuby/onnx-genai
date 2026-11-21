@@ -1363,8 +1363,15 @@ impl HeterogeneousExecutor {
                 ))
             })?;
             let extraction = extract_subgraph(&graph, partition);
-            let executor =
-                Executor::build(extraction.graph, Arc::clone(weights), Arc::clone(provider))?;
+            let executor = Executor::build(
+                extraction.graph,
+                Arc::clone(weights),
+                Arc::clone(provider),
+                providers
+                    .iter()
+                    .find(|entry| entry.provider.device_type() == DeviceType::Cpu)
+                    .map(|entry| Arc::clone(&entry.provider)),
+            )?;
             partition_executors.push(PartitionExecutor {
                 partition: partition.clone(),
                 input_feeds: extraction.input_feeds,

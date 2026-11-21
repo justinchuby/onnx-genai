@@ -994,18 +994,22 @@ pub(crate) fn build_cpu_registry_with_resources(
         host_cache,
         derived_weights,
         dense_weight_cache_bytes,
-        einsum_scratch_retention,
+        cache_retention,
     } = resources;
+    let retain_caches = cache_retention.is_admitted();
     let mut rec = OpRegistry::new();
     register_cnn_ops(&mut rec);
-    rec.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
+    rec.register(
+        OpKey::new("MatMul", "", 1),
+        Box::new(matmul::MatMulFactory::new(retain_caches)),
+    );
     rec.register(
         OpKey::new("Einsum", "", 12),
-        Box::new(einsum::EinsumFactory::new(einsum_scratch_retention)),
+        Box::new(einsum::EinsumFactory::new(cache_retention)),
     );
     rec.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
-        Box::new(matmul_nbits::MatMulNBitsFactory),
+        Box::new(matmul_nbits::MatMulNBitsFactory::new(retain_caches)),
     );
     rec.register(
         OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
@@ -1077,7 +1081,9 @@ pub(crate) fn build_cpu_registry_with_resources(
     // (domain, op_type). It reuses the shared MatMul GEMM + broadcast-Add.
     rec.register(
         OpKey::new("FusedMatMulBias", "com.microsoft", 1),
-        Box::new(fused_matmul_bias::FusedMatMulBiasFactory),
+        Box::new(fused_matmul_bias::FusedMatMulBiasFactory::new(
+            retain_caches,
+        )),
     );
     // The optimizer's `MatMul + Add(bias) + Relu` fusion emits `FusedGemm` in
     // the contrib domain; bind its kernel there so dispatch resolves the fused
@@ -1344,7 +1350,10 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(constant::ConstantFactory),
     );
     // GEMM.
-    rec.register(OpKey::new("Gemm", "", 1), Box::new(gemm::GemmFactory));
+    rec.register(
+        OpKey::new("Gemm", "", 1),
+        Box::new(gemm::GemmFactory::new(retain_caches)),
+    );
     // Linear quantization evolved at opsets 10, 13, 19, 21, 23, and 25. The
     // implementation accepts the newest parameter set for all these revisions.
     for version in [10, 13, 19, 21, 23, 25] {
@@ -1363,7 +1372,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("QLinearMatMul", "", 10),
-        Box::new(qlinear_matmul::QLinearMatMulFactory),
+        Box::new(qlinear_matmul::QLinearMatMulFactory::new(retain_caches)),
     );
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.

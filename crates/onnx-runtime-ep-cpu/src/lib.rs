@@ -98,7 +98,7 @@ pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};
 // Each provider/session owns an immutable retention verdict; all admitted
 // sessions share only the governed process byte ceiling and live-byte accounting.
 pub use kernels::einsum::{
-    EinsumScratchRetention, einsum_scratch_budget_predicted_bytes, einsum_scratch_live_bytes,
+    CpuCacheRetention, einsum_scratch_budget_predicted_bytes, einsum_scratch_live_bytes,
     einsum_scratch_process_cap_bytes,
 };
 pub use kernels::matmul_nbits::bound_process_to_decode_budget;
@@ -107,7 +107,6 @@ pub use kernels::matmul_nbits::with_decode_pool_scope;
 pub use kernels::matmul_nbits::{
     matmul_nbits_decode_caches_dequant_f32, matmul_nbits_resident_side_cache_bytes,
     mlas_sqnbit_packed_live_bytes, resident_dequant_f32_cache_bytes,
-    set_mlas_sqnbit_packing_enabled, set_resident_dequant_f32_cache_enabled,
 };
 // #1056: a resident, session-lifetime, weight-scaled buffer must be reportable
 // in bytes. The entry-count accessor stays for the benchmarks that assert reuse.
@@ -115,29 +114,26 @@ pub use kernels::group_query_attention::{present_inplace_count, present_inplace_
 pub use kernels::matmul::weight_transpose_cache_bytes;
 // #1056: the transpose cache is now *governed*, not just reported: the plan
 // budgets `weight_transpose_cache_predicted_bytes` and, when it does not fit,
-// declines it via `set_weight_transpose_cache_enabled` (kernels then transpose
+// declines it through CpuCacheRetention (kernels then transpose
 // per call and retain nothing).
-pub use kernels::matmul::{
-    set_weight_transpose_cache_enabled, weight_transpose_cache_predicted_bytes,
-};
+pub use kernels::matmul::weight_transpose_cache_predicted_bytes;
 // #1056: the per-kernel `MatMulPrepack::dense` widened-f32 cache is the fourth
 // resident, weight-scaled buffer brought under the plan. The plan budgets
 // `matmul_dense_cache_predicted_bytes` and, when it does not fit, declines it via
-// `set_matmul_dense_cache_enabled` (kernels then widen per call and retain
+// CpuCacheRetention (kernels then widen per call and retain
 // nothing, byte-identical output).
-pub use kernels::matmul::{matmul_dense_cache_predicted_bytes, set_matmul_dense_cache_enabled};
+pub use kernels::matmul::matmul_dense_cache_predicted_bytes;
 // #1133: the QLinearMatMul per-thread `i32` accumulator scratch was bounded by a
 // per-buffer constant but parked on every worker thread, so the real ceiling was
 // `32 MiB x threads`. It is now a process-wide, declinable budget: the plan
 // budgets `qlinear_accumulator_budget_predicted_bytes` and declines it via
-// `set_qlinear_accumulator_budget_admitted` (kernels then reallocate per call,
+// CpuCacheRetention (kernels then reallocate per call,
 // byte-identical). The constant-`B` MLAS pre-pack (`packed_b`, ungoverned since
 // `ac394fd6`) is the second buffer in the same kernel brought under the plan.
 pub use kernels::qlinear_matmul::{
     qlinear_accumulator_budget_predicted_bytes, qlinear_accumulator_live_bytes,
     qlinear_accumulator_process_cap_bytes, qlinear_packed_b_live_bytes,
-    qlinear_packed_b_predicted_bytes, set_qlinear_accumulator_budget_admitted,
-    set_qlinear_accumulator_process_cap_bytes, set_qlinear_packed_b_enabled,
+    qlinear_packed_b_predicted_bytes, set_qlinear_accumulator_process_cap_bytes,
 };
 
 #[cfg(test)]

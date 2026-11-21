@@ -360,7 +360,7 @@ fn unique_chain_graph() -> Graph {
 /// Reference execution: the whole graph on a single CPU EP.
 fn reference(graph: &Graph, inputs: &[(&str, &Tensor)]) -> Vec<Tensor> {
     let ep = cpu_slot(0).provider;
-    let mut exec = Executor::build(graph.clone(), weights(), ep).unwrap();
+    let mut exec = Executor::build(graph.clone(), weights(), ep, None).unwrap();
     exec.run(inputs).unwrap()
 }
 
@@ -727,7 +727,7 @@ fn kept_function_declined_by_assignment_ep_is_inlined_and_runs() {
     let x = Tensor::from_f32(&[4], &[-2.0, 4.0, -5.0, 100.0]).unwrap();
     let hetero = execute(&plan, &graph, &store, &providers, &[("x", &x)]).unwrap();
     let mut reference_exec =
-        Executor::build(reference_graph, reference_store, cpu_slot(0).provider).unwrap();
+        Executor::build(reference_graph, reference_store, cpu_slot(0).provider, None).unwrap();
     let reference = reference_exec.run(&[("x", &x)]).unwrap();
     assert_byte_identical(&hetero, &reference);
 }

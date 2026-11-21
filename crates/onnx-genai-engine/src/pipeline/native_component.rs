@@ -757,14 +757,20 @@ fn load_native_component(
     device: &NativeDecodeDevice,
     cpu_resources: onnx_runtime_ep_cpu::CpuMemoryResources,
 ) -> anyhow::Result<InferenceSession> {
-    let mut builder = InferenceSession::builder().model(path);
+    let cpu: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = Arc::new(
+        onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(cpu_resources)
+            .with_context(|| {
+                format!("initialize CPU fallback resources for workflow component '{component}'")
+            })?,
+    );
+    let mut builder = InferenceSession::builder()
+        .model(path)
+        .fallback_execution_provider(Arc::clone(&cpu));
     match device {
         NativeDecodeDevice::Cpu => {
             builder = builder
                 .device(DevicePreference::Cpu)
-                .execution_provider(Arc::new(
-                    onnx_runtime_ep_cpu::CpuExecutionProvider::with_resources(cpu_resources),
-                ));
+                .execution_provider(Arc::clone(&cpu));
         }
         #[cfg(feature = "native-cuda")]
         NativeDecodeDevice::Cuda { index } => {
