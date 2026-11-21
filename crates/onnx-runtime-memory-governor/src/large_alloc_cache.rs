@@ -41,7 +41,7 @@
 //!
 //! That reasoning is glibc's, though, and this crate also builds for musl,
 //! Windows and macOS, whose allocators draw the line elsewhere and do not
-//! document a stable equivalent. So the floor is **calibrated at construction by
+//! document a stable equivalent. So the floor is **calibrated when first needed by
 //! measuring this exact effect** rather than hardcoding any one allocator's
 //! constant, with a documented per-platform fallback if the measurement is
 //! inconclusive and an environment override that beats both.
@@ -102,8 +102,8 @@
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, HostAllocator, MemoryError};
 
@@ -356,6 +356,14 @@ fn budget_for_allowance(allowance: Option<u64>) -> usize {
     usize::try_from(capped).unwrap_or(usize::MAX)
 }
 
+/// Per-cycle checked deadline for allocator calibration. A cycle already in
+/// flight may complete after this deadline.
+pub(crate) const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Lowest candidate measured by the probe. With the fallback this bounds every
+/// possible calibrated floor, so smaller requests need no probe to be declined.
+const CALIBRATION_START_BYTES: usize = 256 * 1024;
+
 /// Measure the size at which the system allocator stops recycling and starts
 /// costing a fresh kernel mapping.
 ///
@@ -382,24 +390,19 @@ fn budget_for_allowance(allowance: Option<u64>) -> usize {
 ///
 /// # Cost and failure
 ///
-/// The ladder is geometric and bounded, and the whole probe is budgeted at a few
-/// milliseconds; it runs once per cache. If the ladder is exhausted without a
-/// clear cliff — a plausible outcome on a heavily contended machine, or with an
+/// The ladder is geometric and bounded by [`PROBE_BUDGET`], checked between
+/// cycles; automatic calibration runs once per process. If the ladder is
+/// exhausted without a clear cliff — a plausible outcome on a heavily contended machine, or with an
 /// allocator that recycles everything — the answer is [`FALLBACK_FLOOR_BYTES`],
 /// which is never worse than the previous hardcoded behaviour.
-/// Hard stop, so a pathological machine cannot make construction hang.
+/// Hard stop, so a pathological machine cannot make first use hang.
 ///
 /// Checked between cycles rather than inside one, so the probe can exceed this
 /// by whatever the cycle in flight costs. That matters more than it sounds: the
 /// ladder's top rung touches 256 MiB, measured at ~20 ms on an idle Apple M
 /// series machine, so the real ceiling is this budget plus the largest rung
 /// reached — not this budget.
-pub(crate) const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
-
 pub fn calibrate_floor_bytes() -> usize {
-    /// Below this there is no question: these are small allocations, which this
-    /// crate has already measured as best left to the system allocator.
-    const LADDER_START: usize = 256 * 1024;
     /// Past this the cache is unconditionally worthwhile on every allocator
     /// examined, so there is nothing left to learn by probing further.
     const LADDER_END: usize = 256 * 1024 * 1024;
@@ -419,7 +422,7 @@ pub fn calibrate_floor_bytes() -> usize {
     }
 
     let started = std::time::Instant::now();
-    let mut size = LADDER_START;
+    let mut size = CALIBRATION_START_BYTES;
     while size <= LADDER_END {
         if started.elapsed() > PROBE_BUDGET {
             return FALLBACK_FLOOR_BYTES;
@@ -512,8 +515,9 @@ pub struct LargeAllocCache<A: DeviceAllocator = HostAllocator> {
     shards: [Mutex<Shard>; SHARDS],
     budget_bytes: usize,
     /// Smallest retained size, measured against the allocator actually linked
-    /// in rather than assumed. See [`calibrate_floor_bytes`].
-    floor_bytes: usize,
+    /// in rather than assumed. Pending until a retention decision needs it;
+    /// explicit configuration starts resolved. See [`calibrate_floor_bytes`].
+    floor_bytes: OnceLock<usize>,
     retained_bytes: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -523,39 +527,40 @@ pub struct LargeAllocCache<A: DeviceAllocator = HostAllocator> {
 
 impl Default for LargeAllocCache<HostAllocator> {
     fn default() -> Self {
-        Self::with_floor(HostAllocator, default_budget_bytes(), floor_from_env())
+        Self::with_floor_source(HostAllocator, default_budget_bytes(), floor_from_env())
     }
 }
 
-/// Read the retention floor from the environment, else measure it.
+/// Capture an explicit retention floor now; leave automatic measurement pending.
 ///
 /// `ONNX_GENAI_HOST_ALLOC_CACHE_FLOOR_BYTES` overrides the probe outright, for a
 /// deployment whose allocator this crate guesses wrong or which wants the old
 /// behaviour back verbatim.
-fn floor_from_env() -> usize {
+fn floor_from_env() -> Option<usize> {
     if let Ok(raw) = std::env::var("ONNX_GENAI_HOST_ALLOC_CACHE_FLOOR_BYTES")
         && let Ok(explicit) = raw.trim().parse::<usize>()
     {
-        return explicit;
+        return Some(explicit);
     }
-    calibrated_floor_bytes()
+    None
 }
 
 /// [`calibrate_floor_bytes`], measured once per process.
 ///
 /// The answer is a property of the linked allocator, which cannot change while
-/// the process runs, but the probe is on the construction path of every
-/// execution provider — and a test suite builds hundreds of those. Measuring
-/// once keeps that from being hundreds of probes.
+/// the process runs. Cache construction defers this call until a request can
+/// require a retention decision, or a caller explicitly resolves the floor.
+/// The shared result still ensures at most one automatic probe per process.
 pub fn calibrated_floor_bytes() -> usize {
-    static FLOOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static FLOOR: OnceLock<usize> = OnceLock::new();
     *FLOOR.get_or_init(calibrate_floor_bytes)
 }
 
 impl<A: DeviceAllocator> LargeAllocCache<A> {
-    /// Construct with an explicit budget and a calibrated floor.
+    /// Construct with an explicit budget and a floor measured on first use.
+    /// Disabled retention and requests below every possible floor need no probe.
     pub fn new(inner: A, budget_bytes: usize) -> Self {
-        Self::with_floor(inner, budget_bytes, calibrated_floor_bytes())
+        Self::with_floor_source(inner, budget_bytes, None)
     }
 
     /// Construct with both bounds given explicitly.
@@ -564,11 +569,15 @@ impl<A: DeviceAllocator> LargeAllocCache<A> {
     /// they run on; a caller that has measured its own workload may know better
     /// than the probe.
     pub fn with_floor(inner: A, budget_bytes: usize, floor_bytes: usize) -> Self {
+        Self::with_floor_source(inner, budget_bytes, Some(floor_bytes))
+    }
+
+    fn with_floor_source(inner: A, budget_bytes: usize, floor: Option<usize>) -> Self {
         Self {
             inner,
             shards: std::array::from_fn(|_| Mutex::new(Shard::default())),
             budget_bytes,
-            floor_bytes,
+            floor_bytes: floor.map_or_else(OnceLock::new, OnceLock::from),
             retained_bytes: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -584,14 +593,31 @@ impl<A: DeviceAllocator> LargeAllocCache<A> {
     /// with would disagree.
     fn cacheable(&self, bytes: usize, align: usize) -> bool {
         self.budget_bytes > 0
-            && (self.floor_bytes..=MAX_CACHED_BYTES).contains(&bytes)
+            && bytes > 0
+            && bytes <= MAX_CACHED_BYTES
             && align.is_power_of_two()
+            && match self.floor_bytes() {
+                Some(floor) => bytes >= floor,
+                None => {
+                    // Both the measured ladder and its fallback are at or
+                    // above this bound. Explicit lower floors stay honored by
+                    // the resolved arm above; no duplicate platform policy.
+                    bytes >= CALIBRATION_START_BYTES.min(FALLBACK_FLOOR_BYTES)
+                        && bytes >= self.resolve_floor_bytes()
+                }
+            }
     }
 
-    /// The smallest size this instance retains, after calibration and any
-    /// environment override.
-    pub fn floor_bytes(&self) -> usize {
-        self.floor_bytes
+    /// Inspect the smallest retained size without performing calibration.
+    /// `None` means automatic calibration has not yet been needed.
+    pub fn floor_bytes(&self) -> Option<usize> {
+        self.floor_bytes.get().copied()
+    }
+
+    /// Resolve the retention floor now. This explicitly permits the one-time
+    /// allocator probe, even if this instance has retention disabled.
+    pub fn resolve_floor_bytes(&self) -> usize {
+        *self.floor_bytes.get_or_init(calibrated_floor_bytes)
     }
 
     /// The retention cap in force for this instance.
@@ -710,6 +736,93 @@ mod tests {
 
     fn cache() -> LargeAllocCache<HostAllocator> {
         LargeAllocCache::with_floor(HostAllocator, DEFAULT_CACHE_BUDGET_BYTES, TEST_FLOOR)
+    }
+
+    #[test]
+    fn automatic_floor_stays_pending_for_requests_outside_the_candidate_band() {
+        let cache = LargeAllocCache::new(HostAllocator, DEFAULT_CACHE_BUDGET_BYTES);
+        assert!(
+            cache.floor_bytes.get().is_none(),
+            "construction must defer the floor"
+        );
+        let bytes = CALIBRATION_START_BYTES.min(FALLBACK_FLOOR_BYTES) - 1;
+        let ptr = cache.allocate(bytes, 64).unwrap();
+        // SAFETY: the pointer came from this cache with this exact layout.
+        unsafe { cache.deallocate(ptr, bytes, 64) };
+        assert!(!cache.cacheable(0, 64));
+        assert!(!cache.cacheable(MAX_CACHED_BYTES + 1, 64));
+        assert!(!cache.cacheable(MAX_CACHED_BYTES, 3));
+        assert!(
+            cache.floor_bytes.get().is_none(),
+            "ineligible requests need no calibration"
+        );
+        assert_eq!(cache.stats().misses, 0);
+        assert_eq!(cache.stats().retained_bytes, 0);
+
+        // A candidate must resolve the real floor, not silently use the lower
+        // bound as if it were the measured answer. No large allocation needed.
+        assert!(cache.cacheable(MAX_CACHED_BYTES, 64));
+        assert_eq!(
+            cache.floor_bytes.get().copied(),
+            Some(calibrated_floor_bytes())
+        );
+        let floor = cache.floor_bytes().unwrap();
+        assert!(cache.cacheable(floor, 64));
+        assert!(!cache.cacheable(floor - 1, 64));
+    }
+
+    #[test]
+    fn disabled_retention_leaves_the_floor_pending_through_allocation_and_release() {
+        let cache = LargeAllocCache::new(HostAllocator, 0);
+        for _ in 0..3 {
+            let bytes = CALIBRATION_START_BYTES * 2;
+            let ptr = cache.allocate(bytes, 64).unwrap();
+            // SAFETY: this is the sole allocation handle, with its exact layout.
+            unsafe { cache.deallocate(ptr, bytes, 64) };
+        }
+        assert!(cache.floor_bytes.get().is_none());
+        assert_eq!(cache.stats().hits, 0);
+        assert_eq!(cache.stats().misses, 0);
+        assert_eq!(cache.stats().retained, 0);
+        assert_eq!(cache.stats().rejected, 0);
+        assert_eq!(cache.stats().retained_bytes, 0);
+        assert_eq!(
+            cache.floor_bytes(),
+            None,
+            "inspection must not trigger calibration"
+        );
+    }
+
+    #[test]
+    fn explicit_resolution_uses_the_shared_calibration_even_when_retention_is_disabled() {
+        let cache = LargeAllocCache::new(HostAllocator, 0);
+        assert_eq!(cache.floor_bytes(), None);
+        assert_eq!(cache.resolve_floor_bytes(), calibrated_floor_bytes());
+        assert_eq!(cache.floor_bytes(), Some(calibrated_floor_bytes()));
+    }
+
+    #[test]
+    fn explicit_floor_below_the_probe_ladder_preserves_recycling() {
+        let bytes = 4096;
+        let cache = LargeAllocCache::with_floor(HostAllocator, bytes * 2, bytes);
+        assert_eq!(cache.floor_bytes.get().copied(), Some(bytes));
+        let first = cache.allocate(bytes, 64).unwrap();
+        // SAFETY: the pointer is live and uniquely owned, with this layout.
+        unsafe { cache.deallocate(first, bytes, 64) };
+        let second = cache.allocate(bytes, 64).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(cache.stats().hits, 1);
+        // SAFETY: allocation handed this pointer back with the same layout.
+        unsafe { cache.deallocate(second, bytes, 64) };
+        let zero_floor = LargeAllocCache::with_floor(HostAllocator, bytes, 0);
+        assert!(
+            !zero_floor.cacheable(0, 64),
+            "zero-sized layouts must never be retained"
+        );
+        assert!(
+            zero_floor.cacheable(1, 64),
+            "explicit floors stay authoritative"
+        );
     }
 
     /// The point of the module: the second request for a layout that was just
@@ -1152,8 +1265,8 @@ mod tests {
         );
     }
 
-    /// The probe is on the construction path of every EP, so its cost is paid by
-    /// every session.
+    /// The first eligible retention decision can invoke the probe, so its
+    /// one-time cost must remain bounded.
     ///
     /// Takes the **minimum** of several calibrations rather than timing one.
     /// Contention can only make a sample slower, never faster, so the minimum
@@ -1171,7 +1284,7 @@ mod tests {
     /// reached 311 ms without anything being wrong. With the minimum taken
     /// instead, a failure here means calibration itself got slower.
     #[test]
-    fn calibration_is_cheap_enough_to_run_at_construction() {
+    fn calibration_has_bounded_first_use_cost() {
         const ROUNDS: usize = 5;
         let budget = PROBE_BUDGET * 5;
 
@@ -1358,7 +1471,7 @@ mod tests {
     #[test]
     fn the_configured_floor_decides_what_is_retained() {
         let high = LargeAllocCache::with_floor(HostAllocator, DEFAULT_CACHE_BUDGET_BYTES, 1 << 20);
-        assert_eq!(high.floor_bytes(), 1 << 20);
+        assert_eq!(high.floor_bytes(), Some(1 << 20));
         let below = (1 << 20) - 4096;
         let ptr = high.allocate(below, 64).expect("allocation succeeds");
         // SAFETY: `ptr` came from `allocate` with this layout.
