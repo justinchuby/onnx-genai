@@ -4539,3 +4539,25 @@ All questions consolidated from source documents, with decisions.
 - [SCHEDULING.md](../genai/SCHEDULING.md) — Adaptive scheduling, EP negotiation protocol
 - `crates/onnx-runtime-ep-api/src/provider.rs` — ExecutionProvider trait
 - `crates/onnx-genai-scheduler/src/governor.rs` — DeviceGovernor implementation (originally ResourceGovernor)
+
+### Ordinary-lease pressure capability
+
+`MemoryGovernor::pressure_registry(tier)` optionally exposes one
+`PressureRegistry` for the physical authority/tier books used by that governor
+and its leases. Built-in `LedgerGovernor` admission releases its claim gate before
+asking registered idle holders, and retries actual accounting for reserve,
+lease growth and sibling replacement. Registrations are weak, cancellable owned
+tokens. Callback reports are advisory; they cannot create a grant. Recursive
+pressure on the same authority/tier is bounded, while other claims may still
+succeed from available capacity. Callback errors retain their causes.
+
+CPU derived weights enroll one responder for their idle cache membership rather
+than implementing their own authority-admission retry loop. This lets Host KV
+leases reclaim unused expanded weights through the same books. Process-managed
+allocations also consult the shared capability and avoid a duplicate physical
+pressure pass. Authorities without the capability keep their existing bounded
+admission; the capability must not be inferred from a device/vendor identity.
+
+This synchronous bridge does not replace the ticketed host arbitration protocol,
+merge independent Host/Device ledgers, fund unregistered allocations under the
+process quota, or authorize revoking live holder leases.

@@ -524,35 +524,87 @@ QNBit/KAI execution. The unchanged main branch reproduces its former failure
 in an isolated build directory; the original numerical guard is retained.
 
 
-### Idle derived-weight reclamation across CPU caches
+### Idle derived-weight reclamation through the physical authority
 
-A governed `DerivedWeightMemory` clone now carries one ownership domain:
-its zero-byte Host anchor and weak registrations for the dense and shared QMoE
-expert caches. On a real capacity refusal, the requester snapshots live caches
-in rotating order, releases the registration lock, and makes one bounded pass.
-Each cache retires idle entries in its existing LRU/frequency order until the
-reported shortfall is reached (whole payload granularity). It drops retired
-payloads outside its data lock before the requester retries the actual grant.
-An allocator/configuration error propagates without eviction; a request larger
-than a reported total Host ceiling cannot flush the caches pointlessly.
+A governed `DerivedWeightMemory` keeps its zero-byte Host anchor and weak
+registrations for the dense and shared QMoE expert caches. Its responder enrolls
+with the supplying governor's optional authority/tier `PressureRegistry`; the
+registration keeps neither the callback nor its authority alive. Source clones
+share ownership of this enrollment. `supports_pressure_reclaim()` distinguishes
+a funded source with this capability from a third-party authority that only
+funds payloads. Lack of this optional capability preserves normal grants and
+bounded refusal, without inventing a second CPU admission policy.
 
-Only entries with no active `Arc` reader can fund pressure relief. Partial-hit
-projection groups and selected-expert prefetch keep their pins, and caller-owned
-payloads keep their Host grants even after their cache disappears. Ordinary QMoE
-frequency pinning remains a retention policy; it cannot make an inactive payload
-immune to physical Host pressure. A failed bounded pass preserves the typed
-capacity refusal and the existing row/serial fallback. No callback takes a cold
-fill gate, and no governance callback runs under cache/registration data locks.
+Ordinary `reserve`, existing lease `grow`, and replacement `reserve_sibling`
+requests now enter the same physical-accounting admission. On a real refusal,
+the ledger drops its claim gate, snapshots weak responders in rotating order,
+and makes one bounded pass for the reported shortfall. A holder releases idle
+whole objects under its own policy, outside registration/data locks. Admission
+retries the actual books even when a callback reports zero; a claimed release
+never authorizes allocation by itself. Oversized requests above the reported
+total ceiling and hard arithmetic errors cannot flush the caches pointlessly.
+Same-authority/tier recursive pressure declines rather than recursing; a later
+round remains enabled in release as well as debug builds.
 
-This is scoped to caches sharing the same `DerivedWeightMemory` instance through
-clones. Constructing another source, even over identical physical books, does
-not authorize it to evict that domain's caches. Registrations are weak and dead
-ones are pruned on registration/pressure; they keep neither kernels nor weight
-payloads alive. Warm hits never enter the reclamation mechanism.
+The CPU responder retains LRU/frequency policy and protects active `Arc` readers,
+partial-hit projection groups and selected-expert prefetch pins. Ordinary QMoE
+frequency pins guide retention, but cannot make an inactive payload immune to
+physical Host pressure. Different CPU sources explicitly enrolled with the same
+physical Host authority can fund one another and KV growth. Distinct authorities
+or tiers cannot reclaim one another's idle weights. Cache membership/eviction
+metrics remain separate from the owned grants that return only on the final
+payload owner. Warm hits enter neither admission nor pressure.
 
-This is demand-driven CPU derived-weight admission, not a process-wide pressure
-coordinator: a raw Host KV governor request does not call it. Routing external
-KV/allocator/process pressure through the existing process memory manager remains
-work, as do compact native/MLAS owned-pack admission, scratch accounting and the
-CPU Device/Host physical-capacity reconciliation. There is no new throughput,
-RSS, NUMA-performance or CUDA-runtime claim.
+Process allocation transactions use that same registry when the governor exposes
+it; they do not pre-drive or repeat a pressure-capable authority's bounded
+physical admission. Ungoverned/third-party allocator contexts can still use their
+existing process-level callbacks. Process-quota shortage is a separate constraint.
+`PressureResponder` now returns a typed result. CPU callback failures retain their
+`EpError` cause through `MemoryError::ReclaimFailed`; failures cannot be relabelled
+as ordinary capacity. A failed process transaction refunds its new quota before
+returning that cause. Existing KV ownership is unchanged on failed growth.
+
+This is synchronous, bounded admission pressure, not the scheduler's ticketed
+host arbitration protocol or a complete process-wide RAM quota. CPU Device/Host
+physical-capacity reconciliation, cross-engine host-book unification, compact
+native/MLAS owned-pack admission, scratch/activation accounting and process-wide
+coverage remain work. CUDA callbacks/runtime lifetime have not been exercised on
+this host. No throughput, RSS or NUMA-performance claim is made.
+
+
+### Owned native NBits preparation
+
+All eight native NBits cache slots now use the same `DerivedWeightMemory`
+source as dense expansions and QMoE experts. A `NativePackedWeight` payload type
+fixes its physical layout and construction recipe; admission cannot pair an
+expanded/tiled payload with a cheaper wire-layout charge. The six layouts cover
+wire bytes, direct int4, expanded int8, direct u8, N16 SDOT and KAI qsi4/qsi8.
+Runtime geometry determines padding, values and metadata sizes with checked
+arithmetic. Invalid dtype, inaccessible Host operands, unsupported layout
+geometry and size overflow fail before payload preparation.
+
+Before allocating, the authority grants a bound for the entire transformation:
+input gathering, portable half-scale widening, simultaneous input/output buffers,
+tile-padded scales/sums/zero-point offsets and first-touch placement overlap.
+Once construction destroys its temporary inputs, the prepared value keeps only
+its exact payload grant. Data fields drop before returning that grant. Dynamic
+preparations release at call end; retained constants release at kernel drop.
+Capacity refusal cannot allocate an uncharged copy. All native representations
+share one cold-fill admission mechanism, with warm lock-free cache reads and a
+single gate preventing duplicate retained preparations. Pressure responders do
+not take that cold-fill gate.
+
+Unchanged contiguous Host Uint8/Float32 wire operands still borrow directly,
+including with zero Host headroom. Numeric accumulation, ISA selection,
+quantization and placement algorithms are unchanged. Tests compare the actual
+six payload allocations with their charged bytes over tail/tile geometries,
+scales dtypes and symmetric/affine inputs, including failure/refund and warm
+reuse under a full Host budget. Real u8 decode and wire 2-bit execution exercise
+the governed factory path; raw transformed-layout builders also execute on hosts
+without their corresponding instruction-set route. That does not prove x86 ISA
+execution or multi-node NUMA placement on this Apple host.
+
+Optional MLAS-owned packs and scratch/activation allocations still need their
+own integration. Retained native OnceLock entries are not yet idle-reclaimable.
+Physical Host/Device book reconciliation and process-wide limits remain work.
+No speedup, placement performance or CUDA runtime claim is made.

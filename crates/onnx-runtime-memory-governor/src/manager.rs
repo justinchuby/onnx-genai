@@ -35,7 +35,7 @@ use onnx_runtime_memory_api::{
     RegisteredMechanism, RegisteredProviderContext, ReleaseAccounting, ResidualOwnership,
 };
 
-use crate::{HolderId, MemoryGovernor, MemoryLease, PressureResponder};
+use crate::{HolderId, MemoryGovernor, MemoryLease, PressureRegistration, PressureResponder};
 use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 
 static NEXT_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
@@ -444,6 +444,7 @@ struct HolderRecord {
     authority: ProcessAuthorityId,
     label: Arc<str>,
     responder: Option<Weak<dyn PressureResponder>>,
+    _pressure_registration: Option<PressureRegistration>,
 }
 
 impl fmt::Debug for HolderRecord {
@@ -453,7 +454,10 @@ impl fmt::Debug for HolderRecord {
             .field("id", &self.id)
             .field("authority", &self.authority)
             .field("label", &self.label)
-            .field("has_responder", &self.responder.is_some())
+            .field(
+                "has_responder",
+                &(self.responder.is_some() || self._pressure_registration.is_some()),
+            )
             .finish()
     }
 }
@@ -532,7 +536,25 @@ impl ManagerInner {
             .ok_or(AllocationTransactionError::Unregistered("authority"))
     }
 
-    fn pressure(&self, authority: ProcessAuthorityId, tier: Tier, want: u64) -> u64 {
+    fn pressure(
+        &self,
+        authority: ProcessAuthorityId,
+        tier: Tier,
+        want: u64,
+    ) -> Result<u64, MemoryError> {
+        let governor = self
+            .lock_state()
+            .authorities
+            .get(&authority)
+            .and_then(|record| record.governor.clone());
+        if let Some(governor) = governor
+            && let Some(registry) = governor.pressure_registry(tier)
+        {
+            registry.validate(governor.authority_id(tier), tier)?;
+            return registry.reclaim(want);
+        }
+        // Ungoverned/third-party authorities may expose only the process-level
+        // callback. Governed shared registries never enroll a second copy here.
         let responders = {
             let state = self.lock_state();
             state
@@ -542,9 +564,15 @@ impl ManagerInner {
                 .filter_map(|holder| holder.responder.as_ref()?.upgrade())
                 .collect::<Vec<_>>()
         };
-        responders.into_iter().fold(0_u64, |released, responder| {
-            released.saturating_add(responder.on_pressure(tier, want.saturating_sub(released)))
-        })
+        let mut released = 0u64;
+        for responder in responders {
+            if released >= want {
+                break;
+            }
+            released = released
+                .saturating_add(responder.on_pressure(tier, want.saturating_sub(released))?);
+        }
+        Ok(released)
     }
 }
 
@@ -848,11 +876,43 @@ impl ProcessMemoryManager {
         self.ensure_manager(authority.manager, "authority")?;
         let raw = self.inner.next()?;
         let holder = HolderId::new(raw);
+        let registry = authority
+            .record
+            .governor
+            .as_ref()
+            .and_then(|governor| governor.pressure_registry(authority.device().tier));
+        let registration = match (&responder, registry) {
+            (Some(responder), Some(registry)) => {
+                let governor = authority
+                    .record
+                    .governor
+                    .as_ref()
+                    .expect("registry came from the authority governor");
+                registry
+                    .validate(
+                        governor.authority_id(authority.device().tier),
+                        authority.device().tier,
+                    )
+                    .map_err(AllocationTransactionError::Memory)?;
+                Some(
+                    registry
+                        .register(responder)
+                        .map_err(AllocationTransactionError::Memory)?,
+                )
+            }
+            _ => None,
+        };
+        let fallback = if registration.is_none() {
+            responder.as_ref().map(Arc::downgrade)
+        } else {
+            None
+        };
         let record = Arc::new(HolderRecord {
             id: holder,
             authority: authority.record.id,
             label: label.into(),
-            responder: responder.as_ref().map(Arc::downgrade),
+            responder: fallback,
+            _pressure_registration: registration,
         });
         self.inner
             .lock_state()
@@ -2005,22 +2065,42 @@ impl ScopedMemoryBinding {
         request: &AllocationRequest,
     ) -> Result<(Option<ProcessQuotaLease>, Option<MemoryLease>), AllocationTransactionError> {
         let authority = self.manager.authority(self.authority.id)?;
+        let authority_handles_pressure = authority
+            .governor
+            .as_ref()
+            .and_then(|governor| governor.pressure_registry(request.tier))
+            .is_some();
         let mut pressured = false;
         loop {
-            let authority_short = request.charge_mode == AllocationChargeMode::Managed
-                && authority.governor.as_ref().is_some_and(|governor| {
-                    governor.available(request.tier) < request.authority_reserve_bytes
-                });
-            let process_short =
-                self.manager.book.quota.available(request.tier) < request.process_reserve_bytes;
-            if !pressured && (authority_short || process_short) {
-                self.manager.pressure(
-                    authority.id,
-                    request.tier,
+            // A pressure-capable governor owns its physical admission round;
+            // do not pre-drive it or repeat it after its bounded refusal.
+            let authority_shortfall = if request.charge_mode == AllocationChargeMode::Managed
+                && !authority_handles_pressure
+            {
+                authority.governor.as_ref().map_or(0, |governor| {
                     request
                         .authority_reserve_bytes
-                        .max(request.process_reserve_bytes),
-                );
+                        .saturating_sub(governor.available(request.tier))
+                })
+            } else {
+                0
+            };
+            let process_possible =
+                request.process_reserve_bytes <= self.manager.book.quota.limit(request.tier);
+            let process_shortfall = request
+                .process_reserve_bytes
+                .saturating_sub(self.manager.book.quota.available(request.tier));
+            if !pressured
+                && process_possible
+                && (authority_shortfall != 0 || process_shortfall != 0)
+            {
+                self.manager
+                    .pressure(
+                        authority.id,
+                        request.tier,
+                        authority_shortfall.max(process_shortfall),
+                    )
+                    .map_err(AllocationTransactionError::Memory)?;
                 pressured = true;
             }
 
@@ -2033,12 +2113,13 @@ impl ScopedMemoryBinding {
                     request.role,
                 ) {
                     Ok(lease) => Some(lease),
-                    Err(error) if !pressured && is_capacity_error(&error) => {
-                        self.manager.pressure(
-                            authority.id,
-                            request.tier,
-                            request.process_reserve_bytes,
-                        );
+                    Err(error) if !pressured && process_possible && is_capacity_error(&error) => {
+                        let shortfall = request
+                            .process_reserve_bytes
+                            .saturating_sub(self.manager.book.quota.available(request.tier));
+                        self.manager
+                            .pressure(authority.id, request.tier, shortfall)
+                            .map_err(AllocationTransactionError::Memory)?;
                         pressured = true;
                         continue;
                     }
@@ -2059,13 +2140,21 @@ impl ScopedMemoryBinding {
                         request.holder.record.id,
                     ) {
                         Ok(lease) => Some(lease),
-                        Err(error) if !pressured && is_capacity_error(&error) => {
+                        Err(error)
+                            if !pressured
+                                && !authority_handles_pressure
+                                && is_capacity_error(&error) =>
+                        {
                             drop(process_lease);
-                            self.manager.pressure(
-                                authority.id,
-                                request.tier,
-                                request.authority_reserve_bytes,
-                            );
+                            self.manager
+                                .pressure(
+                                    authority.id,
+                                    request.tier,
+                                    request
+                                        .authority_reserve_bytes
+                                        .saturating_sub(governor.available(request.tier)),
+                                )
+                                .map_err(AllocationTransactionError::Memory)?;
                             pressured = true;
                             continue;
                         }
