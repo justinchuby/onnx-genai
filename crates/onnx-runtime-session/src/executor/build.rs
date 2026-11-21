@@ -1207,6 +1207,13 @@ impl Executor {
                 .iter()
                 .map(|input| {
                     let value = (*input)?;
+                    // Producer-backed initializer storage is writable, not an
+                    // immutable model constant, even when it has default bytes.
+                    if !exec.graph.is_constant_initializer(value)
+                        || exec.graph.value(value).producer.is_some()
+                    {
+                        return None;
+                    }
                     let weight = exec.graph.initializers.get(&value)?;
                     let buffer = exec.buffers.get(&value)?;
                     if !buffer.device().is_host_accessible() {

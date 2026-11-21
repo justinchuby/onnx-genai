@@ -8606,6 +8606,56 @@ fn symbolic_cpu_session_prepares_constants_at_load_with_own_retention_policy() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn static_constant_preparation_never_caches_producer_backed_initializer_defaults() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 5]));
+    let source = graph.create_named_value("source", DataType::Float16, static_shape([5, 7]));
+    let b = graph.create_named_value("b", DataType::Float16, static_shape([5, 7]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([1, 7]));
+    for (value, bits) in [(source, [0u8, 0x3c]), (b, [0u8, 0x34])] {
+        graph.initializers.insert(
+            value,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Float16,
+                vec![5, 7],
+                bits.repeat(35),
+            )),
+        );
+    }
+    graph.add_input(x);
+    graph.add_output(y);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(source)],
+        vec![b],
+    ));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "MatMul",
+        vec![Some(x), Some(b)],
+        vec![y],
+    ));
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        None,
+    )
+    .unwrap();
+    assert!(executor.static_constant_states.is_empty());
+    let input = Tensor::from_f32(&[1, 5], &[1.; 5]).unwrap();
+    let actual = executor.run(&[("x", &input)]).unwrap();
+    assert_eq!(
+        actual[0].to_vec_f32(),
+        vec![5.; 7],
+        "Identity must replace the defaults before MatMul; warming the writable default would return stale rows"
+    );
+}
+
 #[test]
 fn configured_cpu_fallback_is_used_and_non_cpu_fallback_is_rejected() {
     let make_graph = || {
