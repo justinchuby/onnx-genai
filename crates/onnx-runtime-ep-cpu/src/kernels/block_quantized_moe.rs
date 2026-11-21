@@ -14,10 +14,12 @@
 //! bytes/block, logical K/N, per-row and per-expert bank strides, expert count).
 //! The GLM-5.2 IQ/K-quant/Q8 layouts are decoded by the CPU parity oracle.
 //!
-//! This CPU kernel is memory-format-only: it keeps expert weights in the native
-//! block-quantized wire layout at the operator boundary, then dequantizes each
-//! routed expert projection to dense f32 with that projection's own decoder and
-//! runs the dense grouped MoE path. It does not perform quantized-domain compute.
+//! The expert's complete f32 projection set is cached when it fits the dense
+//! cache budget. Otherwise, compressed rows are decoded into one reusable row
+//! per worker shard and applied to every routed token in that expert group.
+//! This bounds temporary decoded weight storage without introducing a second
+//! routing or activation implementation. It is row-streamed f32 computation,
+//! not an integer/quantized-domain dot product.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -31,7 +33,9 @@ use super::block_quantized_matmul::{
     BlockFormat, DenseWeightCache, DenseWeightCacheStatus, DenseWeightIdentity,
     dequantize_weight_kn,
 };
-use super::moe::{MoeAttributes, routing_weights, run_expert_grouped};
+use super::moe::{
+    ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
+};
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
 const OP: &str = "BlockQuantizedMoE";
@@ -267,71 +271,159 @@ impl Kernel for BlockQuantizedMoEKernel {
         }
 
         let mut output = vec![0.0f32; rows * hidden];
+        // A dense resident set must fit as a whole: separately admitting
+        // projections can evict an Arc still held by this expert call and
+        // hide its live expansion outside the cache's resident-byte count.
+        let dense_bytes = fc1_size
+            .checked_mul(hidden)
+            .and_then(|count| {
+                hidden
+                    .checked_mul(inter)
+                    .and_then(|down| count.checked_add(down))
+            })
+            .and_then(|count| {
+                if optional_input(inputs, 6).is_some() {
+                    inter
+                        .checked_mul(hidden)
+                        .and_then(|up| count.checked_add(up))
+                } else {
+                    Some(count)
+                }
+            })
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| error("expert dense resident-set byte count overflow"))?;
+        let cache_budget = if tasks.is_empty() {
+            0
+        } else {
+            self.weight_cache.byte_limit()
+        };
+        let use_dense = dense_bytes <= cache_budget;
+        onnx_runtime_ep_api::record_kernel_variant!(
+            if use_dense {
+                "block_moe.dense_resident_set"
+            } else {
+                "block_moe.streamed_rows"
+            },
+            "dense expert set requires {dense_bytes} bytes; dense cache budget is {cache_budget} bytes"
+        );
         #[cfg(test)]
-        BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if use_dense && !tasks.is_empty() {
+            BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         for (expert, expert_tasks) in tasks {
-            let fc1 = self.dequantize_expert_cached(
-                self.constant_inputs[2].then_some(&self.weight_identities[0]),
-                1,
-                &inputs[2],
-                expert,
-                fc1_size,
-                hidden,
-                experts,
-                self.formats.fc1,
-            )?;
-            let fc2 = self.dequantize_expert_cached(
-                self.constant_inputs[4].then_some(&self.weight_identities[1]),
-                2,
-                &inputs[4],
-                expert,
-                hidden,
-                inter,
-                experts,
-                self.formats.fc2,
-            )?;
-            let fc3 = optional_input(inputs, 6)
-                .map(|packed| {
-                    let fc3_format = self.formats.fc3.ok_or_else(|| {
-                        error("fc3_experts_weights present but fc3_format is missing")
-                    })?;
-                    self.dequantize_expert_cached(
-                        self.constant_inputs[6].then_some(&self.weight_identities[2]),
-                        3,
-                        packed,
-                        expert,
-                        inter,
-                        hidden,
-                        experts,
-                        fc3_format,
-                    )
-                })
-                .transpose()?;
-
             let mut grouped_input = Vec::with_capacity(expert_tasks.len() * hidden);
             for &(row, _) in &expert_tasks {
                 grouped_input.extend_from_slice(&input[row * hidden..(row + 1) * hidden]);
             }
-            let expert_output = run_expert_grouped(
-                &grouped_input,
-                expert_tasks.len(),
-                fc1.as_slice(),
-                fc1_bias
-                    .as_deref()
-                    .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
-                fc2.as_slice(),
-                fc2_bias
-                    .as_deref()
-                    .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
-                fc3.as_ref().map(|weight| weight.as_slice()),
-                fc3_bias
-                    .as_deref()
-                    .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
-                fc1_size,
-                hidden,
-                inter,
-                &self.attributes,
-            )?;
+            let expert_output = if use_dense {
+                let fc1 = self.dequantize_expert_cached(
+                    self.constant_inputs[2].then_some(&self.weight_identities[0]),
+                    1,
+                    &inputs[2],
+                    expert,
+                    fc1_size,
+                    hidden,
+                    experts,
+                    self.formats.fc1,
+                )?;
+                let fc2 = self.dequantize_expert_cached(
+                    self.constant_inputs[4].then_some(&self.weight_identities[1]),
+                    2,
+                    &inputs[4],
+                    expert,
+                    hidden,
+                    inter,
+                    experts,
+                    self.formats.fc2,
+                )?;
+                let fc3 = optional_input(inputs, 6)
+                    .map(|packed| {
+                        let fc3_format = self.formats.fc3.ok_or_else(|| {
+                            error("fc3_experts_weights present but fc3_format is missing")
+                        })?;
+                        self.dequantize_expert_cached(
+                            self.constant_inputs[6].then_some(&self.weight_identities[2]),
+                            3,
+                            packed,
+                            expert,
+                            inter,
+                            hidden,
+                            experts,
+                            fc3_format,
+                        )
+                    })
+                    .transpose()?;
+
+                run_expert_grouped(
+                    &grouped_input,
+                    expert_tasks.len(),
+                    fc1.as_slice(),
+                    fc1_bias
+                        .as_deref()
+                        .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
+                    fc2.as_slice(),
+                    fc2_bias
+                        .as_deref()
+                        .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
+                    fc3.as_ref().map(|weight| weight.as_slice()),
+                    fc3_bias
+                        .as_deref()
+                        .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                    fc1_size,
+                    hidden,
+                    inter,
+                    &self.attributes,
+                )?
+            } else {
+                let fc1 = packed_projection(
+                    &inputs[2],
+                    self.formats.fc1,
+                    expert,
+                    fc1_size,
+                    hidden,
+                    experts,
+                )?;
+                let fc2 = packed_projection(
+                    &inputs[4],
+                    self.formats.fc2,
+                    expert,
+                    hidden,
+                    inter,
+                    experts,
+                )?;
+                let fc3 = optional_input(inputs, 6)
+                    .map(|packed| {
+                        packed_projection(
+                            packed,
+                            self.formats
+                                .fc3
+                                .ok_or_else(|| error("fc3 format missing for streamed expert"))?,
+                            expert,
+                            inter,
+                            hidden,
+                            experts,
+                        )
+                    })
+                    .transpose()?;
+                run_expert_projections(
+                    &grouped_input,
+                    expert_tasks.len(),
+                    &fc1,
+                    fc1_bias
+                        .as_deref()
+                        .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
+                    &fc2,
+                    fc2_bias
+                        .as_deref()
+                        .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
+                    fc3.as_ref(),
+                    fc3_bias
+                        .as_deref()
+                        .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                    &self.attributes,
+                )?
+            };
             for (grouped_row, (row, route_weight)) in expert_tasks.into_iter().enumerate() {
                 for feature in 0..hidden {
                     output[row * hidden + feature] +=
@@ -555,6 +647,49 @@ fn validate_packed_shape(index: usize, shape: &[usize], layout: ProjectionLayout
         )));
     }
     Ok(())
+}
+
+struct PackedExpertProjection<'a> {
+    bytes: Cow<'a, [u8]>,
+    format: BlockFormat,
+    out_features: usize,
+    in_features: usize,
+}
+impl ExpertProjection for PackedExpertProjection<'_> {
+    fn out_features(&self) -> usize {
+        self.out_features
+    }
+    fn in_features(&self) -> usize {
+        self.in_features
+    }
+    fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
+        super::block_quantized_matmul::linear_packed_grouped(
+            self.format,
+            &self.bytes,
+            input,
+            rows,
+            self.in_features,
+            self.out_features,
+            bias,
+        )
+    }
+}
+fn packed_projection<'a>(
+    packed: &'a TensorView<'_>,
+    format: BlockFormat,
+    expert: usize,
+    out_features: usize,
+    in_features: usize,
+    experts: usize,
+) -> Result<PackedExpertProjection<'a>> {
+    let layout = ProjectionLayout::new(format, out_features, in_features, experts);
+    expert_byte_count(packed, &layout)?;
+    Ok(PackedExpertProjection {
+        bytes: packed_expert_bytes(packed, &layout, expert)?,
+        format,
+        out_features,
+        in_features,
+    })
 }
 
 fn expert_byte_count(packed: &TensorView, layout: &ProjectionLayout) -> Result<usize> {
@@ -1221,6 +1356,20 @@ mod tests {
             match format {
                 BlockFormat::Mxfp4 => block[0] = 127,
                 BlockFormat::Iq1M => block[48..56].fill(0),
+                BlockFormat::Q2K => {
+                    block[80..82].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes());
+                    block[82..84].copy_from_slice(&half::f16::from_f32(0.0625).to_le_bytes());
+                }
+                BlockFormat::Q3K => {
+                    block[108..110].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes())
+                }
+                BlockFormat::Q5K => {
+                    block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes());
+                    block[2..4].copy_from_slice(&half::f16::from_f32(0.0625).to_le_bytes());
+                }
+                BlockFormat::Q6K => {
+                    block[208..210].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes())
+                }
                 _ => block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes()),
             }
         }
@@ -1673,6 +1822,238 @@ mod tests {
             )
             .expect("dense gated MoE reference");
             assert_close(&output.to_f32(), &expected);
+        }
+    }
+
+    #[test]
+    fn zero_budget_streaming_reads_fresh_and_strided_expert_bytes() {
+        let shapes = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+        ];
+        let (graph, node) = model_node(&shapes, &attrs("identity", 1, true, 0));
+        let ValidatedMetadata {
+            attributes,
+            formats,
+        } = validate_metadata(graph.node(node), None).unwrap();
+        let mut kernel = BlockQuantizedMoEKernel {
+            attributes,
+            formats,
+            constant_inputs: [false; 9],
+            weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            weight_cache: DenseWeightCache::with_limit(0),
+        };
+        kernel.set_constant_inputs(&[false, false, true, false, true]);
+        let values = (0..H).map(|i| i as f32 / 32. + 0.25).collect::<Vec<_>>();
+        let input = Owned::f32(&[1, H], &values);
+        let logits = Owned::f32(&[1, E], &[4., -4.]);
+        let packed = identity_projection([2, 2]);
+        let mut fc1 = Owned::u8(&[E, H, 1, 17], &packed);
+        let fc2 = Owned::u8(&[E, H, 1, 17], &packed);
+        for changed in [false, true] {
+            if changed {
+                // SAFETY: this mutable view owns the same live Uint8 allocation;
+                // all immutable input views from the previous call are dropped.
+                unsafe {
+                    *fc1.view_mut().data_ptr_mut::<u8>().add(1) = 4;
+                }
+            }
+            let views = [
+                input.view(),
+                logits.view(),
+                fc1.view(),
+                TensorView::absent(DataType::Float32),
+                fc2.view(),
+            ];
+            let mut output = Owned::f32(&[1, H], &[0.; H]);
+            kernel.execute(&views, &mut [output.view_mut()]).unwrap();
+            let mut expected = values.clone();
+            if changed {
+                expected[0] *= 2.;
+            }
+            assert_close(&output.to_f32(), &expected);
+        }
+        let mut padded = packed.iter().flat_map(|&b| [b, 0xa5]).collect::<Vec<_>>();
+        padded[2] = 4;
+        let shape = [E, H, 1, 17];
+        let strides = onnx_runtime_ir::compute_contiguous_strides(&shape)
+            .into_iter()
+            .map(|stride| stride * 2)
+            .collect::<Vec<_>>();
+        let strided = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(padded.as_ptr().cast()),
+            DataType::Uint8,
+            &shape,
+            &strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        let views = [
+            input.view(),
+            logits.view(),
+            strided,
+            TensorView::absent(DataType::Float32),
+            fc2.view(),
+        ];
+        let mut output = Owned::f32(&[1, H], &[0.; H]);
+        kernel.execute(&views, &mut [output.view_mut()]).unwrap();
+        let mut expected = values.clone();
+        expected[0] *= 2.;
+        assert_close(&output.to_f32(), &expected);
+        assert_eq!(kernel.weight_cache.activity(), (0, 0));
+        for identity in &kernel.weight_identities {
+            assert_eq!(identity.stats(), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn streamed_experts_preserve_grouped_routing_mixed_formats_biases_and_gates() {
+        let formats = [
+            "mxfp4", "iq4_nl", "iq4_xs", "iq3_s", "iq3_xxs", "iq2_s", "iq2_xs", "iq2_xxs", "iq1_s",
+            "iq1_m", "q2_k", "q3_k", "q5_k", "q6_k", "q8_0",
+        ];
+        let cases = [
+            ("identity", 0, false),
+            ("relu", 0, false),
+            ("gelu", 0, false),
+            ("silu", 0, false),
+            ("silu", 0, true),
+            ("swiglu", 0, true),
+            ("swiglu", 1, false),
+            ("swiglu", 2, false),
+        ];
+        let (rows, hidden, inter, experts) = (3, 256, 256, 2);
+        for (case, (activation, fusion, has_fc3)) in cases.into_iter().enumerate() {
+            let fc1_size = if fusion != 0 { 2 * inter } else { inter };
+            let f1 = BlockFormat::parse(formats[case]).unwrap();
+            let f2 = BlockFormat::parse(formats[case + 5]).unwrap();
+            let f3 = BlockFormat::parse(formats[(case + 10) % formats.len()]).unwrap();
+            let mut spec = attrs(activation, 2, true, fusion);
+            spec[0] = (
+                "fc1_format",
+                Attribute::String(formats[case].as_bytes().to_vec()),
+            );
+            spec[1] = (
+                "fc2_format",
+                Attribute::String(formats[case + 5].as_bytes().to_vec()),
+            );
+            if has_fc3 {
+                spec = with_fc3_format(spec, formats[(case + 10) % formats.len()]);
+            }
+            let l1 = ProjectionLayout::new(f1, fc1_size, hidden, experts);
+            let l2 = ProjectionLayout::new(f2, hidden, inter, experts);
+            let l3 = ProjectionLayout::new(f3, inter, hidden, experts);
+            let shapes = vec![
+                Some((DataType::Float32, vec![rows, hidden])),
+                Some((DataType::Float32, vec![rows, experts])),
+                Some((DataType::Uint8, l1.packed_shape().to_vec())),
+                Some((DataType::Float32, vec![experts, fc1_size])),
+                Some((DataType::Uint8, l2.packed_shape().to_vec())),
+                Some((DataType::Float32, vec![experts, hidden])),
+                has_fc3.then(|| (DataType::Uint8, l3.packed_shape().to_vec())),
+                has_fc3.then(|| (DataType::Float32, vec![experts, inter])),
+                Some((DataType::Float32, vec![rows, experts])),
+            ];
+            let (graph, node) = model_node(&shapes, &spec);
+            let ValidatedMetadata {
+                attributes,
+                formats,
+            } = validate_metadata(graph.node(node), None).unwrap();
+            let make_kernel = |budget| {
+                let mut kernel = BlockQuantizedMoEKernel {
+                    attributes,
+                    formats,
+                    constant_inputs: [false; 9],
+                    weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+                    weight_cache: DenseWeightCache::with_limit(budget),
+                };
+                kernel.set_constant_inputs(&[false, false, true, false, true, false, has_fc3]);
+                kernel
+            };
+            let dense_bytes =
+                (fc1_size * hidden + hidden * inter + if has_fc3 { inter * hidden } else { 0 }) * 4;
+            let reference = make_kernel(dense_bytes);
+            let streamed = make_kernel(dense_bytes - 1);
+            let input = Owned::f32(
+                &[rows, hidden],
+                &(0..rows * hidden)
+                    .map(|i| (i % 17) as f32 / 1000. - 0.008)
+                    .collect::<Vec<_>>(),
+            );
+            let logits = Owned::f32(&[rows, experts], &[2., 1., 0., 3., -1., 2.]);
+            let router = Owned::f32(&[rows, experts], &[0.2, 0.8, 0.4, 0.6, 0.75, 0.25]);
+            let w1 = Owned::u8(
+                &l1.packed_shape(),
+                &packed_for_format(f1, experts, fc1_size, hidden),
+            );
+            let w2 = Owned::u8(
+                &l2.packed_shape(),
+                &packed_for_format(f2, experts, hidden, inter),
+            );
+            let w3 = has_fc3.then(|| {
+                Owned::u8(
+                    &l3.packed_shape(),
+                    &packed_for_format(f3, experts, inter, hidden),
+                )
+            });
+            let bias = |width| {
+                Owned::f32(
+                    &[experts, width],
+                    &(0..experts * width)
+                        .map(|i| (i % 7) as f32 / 100.)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let b1 = bias(fc1_size);
+            let b2 = bias(hidden);
+            let b3 = has_fc3.then(|| bias(inter));
+            let views = [
+                input.view(),
+                logits.view(),
+                w1.view(),
+                b1.view(),
+                w2.view(),
+                b2.view(),
+                w3.as_ref()
+                    .map_or_else(|| TensorView::absent(DataType::Uint8), Owned::view),
+                b3.as_ref()
+                    .map_or_else(|| TensorView::absent(DataType::Float32), Owned::view),
+                router.view(),
+            ];
+            for _ in 0..2 {
+                let mut expected = Owned::f32(&[rows, hidden], &vec![0.; rows * hidden]);
+                let mut actual = Owned::f32(&[rows, hidden], &vec![0.; rows * hidden]);
+                reference
+                    .execute(&views, &mut [expected.view_mut()])
+                    .unwrap();
+                streamed.execute(&views, &mut [actual.view_mut()]).unwrap();
+                for (index, (got, want)) in actual
+                    .to_f32()
+                    .into_iter()
+                    .zip(expected.to_f32())
+                    .enumerate()
+                {
+                    assert!(
+                        (got - want).abs() <= 1e-5 + 1e-4 * want.abs(),
+                        "case {case} element {index}: {got} vs {want}"
+                    );
+                }
+            }
+            assert_eq!(
+                streamed.weight_cache.activity(),
+                (0, 0),
+                "streamed expert must not build or retain full f32 projections"
+            );
+            assert_eq!(streamed.weight_cache.stats(), (0, 0));
+            for identity in &streamed.weight_identities {
+                assert_eq!(identity.stats(), (0, 0, 0));
+            }
+            assert!(
+                reference.weight_cache.activity().1 > 0,
+                "dense control must actually expand projections"
+            );
         }
     }
 

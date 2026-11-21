@@ -1093,23 +1093,91 @@ pub(super) fn run_expert_grouped(
     inter: usize,
     attributes: &MoeAttributes,
 ) -> Result<Vec<f32>> {
+    let fc1 = DenseExpertProjection {
+        weights: fc1_weights,
+        out_features: fc1_size,
+        in_features: hidden,
+    };
+    let fc2 = DenseExpertProjection {
+        weights: fc2_weights,
+        out_features: hidden,
+        in_features: inter,
+    };
+    let fc3 = fc3_weights.map(|weights| DenseExpertProjection {
+        weights,
+        out_features: inter,
+        in_features: hidden,
+    });
+    run_expert_projections(
+        input,
+        rows,
+        &fc1,
+        fc1_bias,
+        &fc2,
+        fc2_bias,
+        fc3.as_ref(),
+        fc3_bias,
+        attributes,
+    )
+}
+
+/// A projection owns its representation/compute decision; routing, gating and
+/// expert accumulation remain shared by dense and compressed execution.
+pub(super) trait ExpertProjection {
+    fn out_features(&self) -> usize;
+    fn in_features(&self) -> usize;
+    fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>>;
+}
+struct DenseExpertProjection<'a> {
+    weights: &'a [f32],
+    out_features: usize,
+    in_features: usize,
+}
+impl ExpertProjection for DenseExpertProjection<'_> {
+    fn out_features(&self) -> usize {
+        self.out_features
+    }
+    fn in_features(&self) -> usize {
+        self.in_features
+    }
+    fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
+        linear_grouped(
+            input,
+            rows,
+            self.weights,
+            bias,
+            self.out_features,
+            self.in_features,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_expert_projections<P: ExpertProjection>(
+    input: &[f32],
+    rows: usize,
+    fc1: &P,
+    fc1_bias: Option<&[f32]>,
+    fc2: &P,
+    fc2_bias: Option<&[f32]>,
+    fc3: Option<&P>,
+    fc3_bias: Option<&[f32]>,
+    attributes: &MoeAttributes,
+) -> Result<Vec<f32>> {
+    let fc1_size = fc1.out_features();
+    let inter = fc2.in_features();
     // A single routed token used to fall through to `run_expert`'s scalar dot
     // loop. That loop is ~50x slower per MAC than the GEMM, and decode - one
     // token, top-k experts - is the shape that matters most, so the grouped
     // path now serves `rows == 1` too. `run_expert` is retained as the
     // portable reference the tests compare against.
-    let mut fc1_out = linear_grouped(input, rows, fc1_weights, fc1_bias, fc1_size, hidden)?;
+    let mut fc1_out = fc1.apply(input, rows, fc1_bias)?;
     let activated = match attributes.activation {
         Activation::Swiglu => {
             let (gate_part, linear_part) = if attributes.swiglu_fusion == 0 {
-                let linear = linear_grouped(
-                    input,
-                    rows,
-                    fc3_weights.expect("validated unfused swiglu FC3"),
-                    fc3_bias,
-                    inter,
-                    hidden,
-                )?;
+                let linear = fc3
+                    .expect("validated unfused swiglu FC3")
+                    .apply(input, rows, fc3_bias)?;
                 (fc1_out, linear)
             } else {
                 let mut gate = Vec::with_capacity(rows * inter);
@@ -1133,15 +1201,10 @@ pub(super) fn run_expert_grouped(
                 .map(|(g, l)| attributes.swiglu(g, l))
                 .collect()
         }
-        Activation::Silu if fc3_weights.is_some() => {
-            let linear_part = linear_grouped(
-                input,
-                rows,
-                fc3_weights.expect("validated SiLU gated FC3"),
-                fc3_bias,
-                inter,
-                hidden,
-            )?;
+        Activation::Silu if fc3.is_some() => {
+            let linear_part = fc3
+                .expect("validated SiLU gated FC3")
+                .apply(input, rows, fc3_bias)?;
             fc1_out
                 .into_iter()
                 .zip(linear_part)
@@ -1155,7 +1218,7 @@ pub(super) fn run_expert_grouped(
             fc1_out
         }
     };
-    linear_grouped(&activated, rows, fc2_weights, fc2_bias, hidden, inter)
+    fc2.apply(&activated, rows, fc2_bias)
 }
 
 /// `output[rows, out_features] = input[rows, in_features] * weightsᵀ (+ bias)`.
@@ -1193,6 +1256,7 @@ fn linear_grouped(
                 0.0,
                 &mut output,
                 out_features,
+                true,
             );
         }
     }

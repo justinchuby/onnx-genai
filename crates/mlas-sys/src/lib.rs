@@ -37,6 +37,7 @@ unsafe extern "C" {
         beta: f32,
         c: *mut f32,
         ldc: usize,
+        multithread: c_int,
     );
 
     #[allow(clippy::too_many_arguments)]
@@ -1751,12 +1752,15 @@ pub fn sgemm_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32
             0.0,
             c.as_mut_ptr(),
             n,
+            1,
         );
     }
 }
 
 /// General entry point mirroring the C shim, exposing transpose flags and
-/// alpha/beta. Leading dimensions default to the natural row-major strides.
+/// alpha/beta and an explicit threading choice. Pass `false` inside an outer
+/// parallel region to keep MLAS on the calling thread. Leading dimensions are
+/// supplied in row-major element strides.
 #[allow(clippy::too_many_arguments)]
 pub fn sgemm(
     trans_a: bool,
@@ -1772,6 +1776,7 @@ pub fn sgemm(
     beta: f32,
     c: &mut [f32],
     ldc: usize,
+    multithread: bool,
 ) {
     ensure_threading();
     unsafe {
@@ -1789,6 +1794,7 @@ pub fn sgemm(
             beta,
             c.as_mut_ptr(),
             ldc,
+            multithread as c_int,
         );
     }
 }
@@ -2460,6 +2466,7 @@ mod tests {
                         0.0,
                         &mut serial[e * m * n..],
                         n,
+                        true,
                     );
                 }
                 assert_eq!(
@@ -2661,6 +2668,7 @@ mod tests {
             2.0,
             &mut c_mlas,
             n,
+            true,
         );
         ref_sgemm(false, false, m, n, k, 0.5, &a, k, &b, n, 2.0, &mut c_ref, n);
         assert_close(&c_mlas, &c_ref, 1e-3, "alpha_beta");
@@ -2688,6 +2696,7 @@ mod tests {
             0.0,
             &mut c_mlas,
             n,
+            true,
         );
         ref_sgemm(
             false, true, m, n, k, 1.0, &a, k, &b_t, k, 0.0, &mut c_ref, n,
@@ -2717,6 +2726,7 @@ mod tests {
             0.0,
             &mut c_mlas,
             n,
+            true,
         );
         ref_sgemm(
             true, false, m, n, k, 1.0, &a_t, m, &b, n, 0.0, &mut c_ref, n,

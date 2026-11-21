@@ -221,7 +221,7 @@ Upstream comparison, inspected at fixed revisions:
 | Capability | Current nxrt position | Next integration boundary |
 |---|---|---|
 | Reuse an expert across a token batch | CPU `BlockQuantizedMoE` already groups routed tokens and resolves each projection once per expert group | Preserve grouping and numerical tests; do not add a parallel batching authority |
-| Compute cold experts from compressed weights | CPU native-block kernels currently decode routed projections to f32 and execute dense math | Evaluate a bounded compressed-weight compute path against the dense oracle on CPU; qualify formats from projection metadata and measure memory/time before dispatch changes |
+| Compute cold experts from compressed weights | CPU `BlockQuantizedMoE` decodes rows when a complete expert f32 projection set exceeds the existing dense-cache budget; fitting sets retain dense GEMM/cache | All 15 formats reuse canonical decoders; this bounds decoded-weight scratch per call. Quantized-domain dots and GPU overlap remain separate work |
 | Use CPU and GPU experts within one layer | Static engine placement is advisory; native sessions still own one EP | Requires an executable partition and synchronization contract, plus real-device numerical and failure tests |
 | Overlap expert loading and compute | CPU QMoE has a guarded route-first prefetch path; CUDA has separate stream/fence and residency authorities | Reuse their ownership and budget guards; do not copy callbacks into a second unaccounted scheduler |
 | Choose a memory tier | Governor owns capacity; placement chooses residency within its grant | Keep byte budgets and explainable eligibility canonical; use measured cost-model rates rather than model or GPU identity guesses |
@@ -229,3 +229,33 @@ Upstream comparison, inspected at fixed revisions:
 This comparison adds no upstream code dependency and makes no throughput claim.
 The real-CUDA validation requirements above still apply to changes in mapping,
 GPU/CPU execution splits, capture lifetime and asynchronous release ordering.
+
+
+### CPU bounded expert working set
+
+`BlockQuantizedMoE` now admits dense execution only when the complete selected
+expert projection set (including an optional third projection) fits
+`ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES`. Otherwise it decodes one weight row per
+explicit Rayon shard and applies that row to every token routed to the expert.
+Routing, activation, gates and accumulation share the existing implementation;
+format metadata and the canonical decoder remain the only format authority.
+Zero budget selects streaming without hashing constant identities or building
+dense cache entries. Contiguous packed weights are borrowed; strided inputs copy
+only the selected expert's compressed bytes. Mutable inputs are read each call.
+
+For a projection with input width K and N output features, at most
+`min(Rayon workers, N) * (K + 256)` f32 values are live as decoded-weight scratch.
+This excludes grouped activations, output-sized intermediate storage, compressed
+strided copies and other concurrent calls. The cache budget is an eligibility
+rule, not a process-wide working-memory grant; evicted Arcs can still be held by
+other calls. No second memory governor or environment knob was added.
+
+[CPU measurement and reproduction](../benchmarks/CPU_BLOCK_MOE_ROW_STREAMING.md)
+records the measured memory/time effect and unchanged warm-cache control. This
+is streamed f32 compute, not ggml integer-domain dot products or LLM throughput.
+
+The measurements also exposed an independent startup cost: the existing host
+allocation-cache floor calibration touches approximately 512 MiB when the floor
+is not configured. Every measurement arm explicitly sets the same 1 MiB floor
+to isolate expert memory. Startup calibration remains unchanged and should be
+addressed in a separate allocator-lifecycle change.

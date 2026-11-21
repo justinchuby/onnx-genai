@@ -34,7 +34,12 @@ struct Paths {
 }
 
 fn main() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Build-script executables can be reused across worktrees sharing a target
+    // directory. Resolve the current source root when Cargo runs the script.
+    let root = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("Cargo must set CARGO_MANIFEST_DIR when building the MLAS source tree"),
+    );
     let vendor = root.join("vendor/mlas/onnxruntime");
     let lib = vendor.join("core/mlas/lib");
     let asm = lib.join("x86_64");

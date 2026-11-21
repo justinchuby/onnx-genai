@@ -15,6 +15,26 @@
 //! [`onnx_runtime_ep_api::Kernel`] trait, so neither the EP contract nor the
 //! session observes which one ran. See [`kernels::matmul`] for the hot spot.
 //!
+//! ## Shared weight contracts
+//!
+//! Weight capabilities, leases and binding contracts belong to the common EP API:
+//!
+//! ```
+//! use onnx_runtime_ep_api::{ExecutionProviderCapabilities, WeightHandle};
+//! let _: Option<WeightHandle> = None;
+//! let _ = ExecutionProviderCapabilities::default();
+//! ```
+//!
+//! The CPU crate does not provide a second contract surface:
+//!
+//! ```compile_fail
+//! use onnx_runtime_ep_cpu::WeightHandle;
+//! ```
+//!
+//! ```compile_fail
+//! use onnx_runtime_ep_cpu::weight_offload::weight_handle::WeightHandle;
+//! ```
+//!
 //! ## `unsafe`
 //!
 //! The default (Generic) path is `unsafe`-minimal: the only `unsafe` is the raw

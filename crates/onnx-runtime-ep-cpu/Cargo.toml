@@ -153,5 +153,9 @@ name = "matmul_nbits_prefill_ab"
 name = "native_vs_mlas"
 harness = false
 
+[[bench]]
+name = "bounded_expert_bench"
+harness = false
+
 [lints]
 workspace = true

@@ -1296,7 +1296,7 @@ pub(crate) fn gemm_nt_with_backend(
             // C[m, n] = A[m, k] * B_nk[n, k]^T. `trans_b` with `ldb = k` reads
             // the Nk weight as the transposed operand without materializing a
             // Kn copy.
-            mlas_sys::sgemm(false, true, m, n, k, 1.0, a, k, b_nk, k, 0.0, c, n);
+            mlas_sys::sgemm(false, true, m, n, k, 1.0, a, k, b_nk, k, 0.0, c, n, true);
             Ok(())
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1472,6 +1472,42 @@ fn micro_kernel(
             *cv += acc_row[jj];
         }
     }
+}
+
+/// Compute one transposed-B product without entering the Rayon scheduler.
+/// Used inside an already partitioned operation to keep scratch ownership and
+/// task counts bounded rather than nesting parallel matrix multiplies.
+pub(crate) fn gemm_bt_serial(
+    a: &[f32],
+    bt: &[f32],
+    c: &mut [f32],
+    rows: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
+    if rows.checked_mul(k) != Some(a.len())
+        || n.checked_mul(k) != Some(bt.len())
+        || rows.checked_mul(n) != Some(c.len())
+    {
+        return Err(EpError::KernelFailed(format!(
+            "serial transposed GEMM geometry mismatch: A={} B={} C={} for rows={rows}, k={k}, n={n}; supply exact contiguous matrix extents",
+            a.len(),
+            bt.len(),
+            c.len()
+        )));
+    }
+    if rows == 0 || n == 0 {
+        return Ok(());
+    }
+    if k == 0 {
+        c.fill(0.0);
+        return Ok(());
+    }
+    #[cfg(feature = "mlas")]
+    mlas_sys::sgemm(false, true, rows, n, k, 1.0, a, k, bt, k, 0.0, c, n, false);
+    #[cfg(not(feature = "mlas"))]
+    gemm_bt_block(a, bt, c, rows, k, n);
+    Ok(())
 }
 
 /// Layout-aware 2-D GEMM: `c[m,n] = a[m,k] * bt[n,k]ᵀ` (overwrite), i.e.

@@ -192,7 +192,8 @@ extern "C" void mlas_sgemm(
     size_t ldb,
     float beta,
     float* C,
-    size_t ldc)
+    size_t ldc,
+    int multithread)
 {
     MLAS_SGEMM_DATA_PARAMS data;
     data.A = A;
@@ -210,7 +211,7 @@ extern "C" void mlas_sgemm(
         transB ? CblasTrans : CblasNoTrans,
         M, N, K,
         &data, 1,
-        kMlasParallelSentinel,
+        multithread ? kMlasParallelSentinel : nullptr,
         /*BackendKernelSelectorConfig=*/nullptr);
 }
 
