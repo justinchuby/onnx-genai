@@ -20,10 +20,11 @@ mod config;
 
 pub use config::{EvictOrderProbe, WEIGHT_OFFLOAD_EVICT_ORDER_ENV, evict_order_probe_from_env};
 use config::{
-    pin_checksum_keys, pin_refill_every, retain_slotted_enabled, slot_bypass_retain_enabled,
-    static_pin_config, static_pin_keys, sync_before_fill_enabled, zero_copy_budget_bytes,
-    zero_copy_copy_instead, zero_copy_debug, zero_copy_hybrid_from_env_value, zero_copy_max_binds,
-    zero_copy_no_readonly, zero_copy_prefault,
+    PIN_PROBE_GRANULE_BYTES, evict_order_from_env_value, pin_checksum_keys, pin_refill_every,
+    retain_slotted_enabled, slot_bypass_retain_enabled, static_pin_config, static_pin_keys,
+    sync_before_fill_enabled, zero_copy_budget_bytes, zero_copy_copy_instead, zero_copy_debug,
+    zero_copy_hybrid_from_env_value, zero_copy_max_binds, zero_copy_no_readonly,
+    zero_copy_prefault,
 };
 
 use std::any::Any;
@@ -7334,6 +7335,7 @@ impl ResidencyInner {
 
 #[cfg(test)]
 mod tests {
+    use super::config::WEIGHT_PIN_REFILL_EVERY_ENV;
     use super::*;
     use crate::test_support::EnvVarGuard;
 

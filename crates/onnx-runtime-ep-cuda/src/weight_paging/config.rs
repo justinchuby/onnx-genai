@@ -367,7 +367,7 @@ pub(super) fn static_pin_keys() -> Option<&'static HashSet<u64>> {
 /// hash and report the retained device copy at this granularity so a divergence
 /// can be pinned to a specific granule / byte offset within the tensor (#945
 /// experiment 3, the within-tensor bisection).
-const PIN_PROBE_GRANULE_BYTES: usize = 2 * 1024 * 1024;
+pub(super) const PIN_PROBE_GRANULE_BYTES: usize = 2 * 1024 * 1024;
 
 /// #945 experiment 2/3 — granule-level checksums of a pinned page. Comma-separated
 /// `u64` weight keys whose retained device copy is hashed on admission and
@@ -386,7 +386,7 @@ const WEIGHT_PIN_CHECKSUM_ENV: &str = "ONNX_GENAI_WEIGHT_PIN_CHECKSUM";
 /// for the retained-page-staleness hypothesis. A **null (unset) value performs no
 /// re-fill and reproduces the baseline byte-for-byte**, so a positive reading here
 /// cannot be an artifact of the knob's mere presence (measurement discipline #1).
-const WEIGHT_PIN_REFILL_EVERY_ENV: &str = "ONNX_GENAI_WEIGHT_PIN_REFILL_EVERY";
+pub(super) const WEIGHT_PIN_REFILL_EVERY_ENV: &str = "ONNX_GENAI_WEIGHT_PIN_REFILL_EVERY";
 
 /// Parsed checksum-probe key allow-list, cached once per process. `None` when the
 /// variable is unset/empty (the shipped path).
