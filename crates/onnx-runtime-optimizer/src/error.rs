@@ -12,6 +12,9 @@ pub type Result<T> = std::result::Result<T, OptimizerError>;
 /// Crate-level error for the optimization pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum OptimizerError {
+    /// Recognition failed rather than simply declining an ineligible match.
+    #[error("IR pattern recognition failed: {0}")]
+    Pattern(#[from] onnx_runtime_ir::pattern::PatternError),
     /// A pass left the graph in a structurally invalid state. Raised by the
     /// default [`OptimizationPass::postconditions`](crate::OptimizationPass::postconditions)
     /// check (debug builds).

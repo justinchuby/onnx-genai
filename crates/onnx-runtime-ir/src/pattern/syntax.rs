@@ -374,6 +374,28 @@ impl Parser {
     fn constraint(&mut self) -> Result<RawConstraint> {
         let immutable = self.take("const");
         let name = self.identifier()?;
+        if name == "value" {
+            if !self.native {
+                return Err(self.error(
+                    PatternErrorKind::Unsupported,
+                    "untyped value annotations are a native extension; use parse_native, not parse_ort",
+                ));
+            }
+            if matches!(self.peek(), Some("[" | "<")) {
+                return Err(self.error(
+                    PatternErrorKind::InvalidPattern,
+                    "value has no dtype or shape contract; use tensor annotations or a metadata predicate",
+                ));
+            }
+            return Ok(RawConstraint {
+                name,
+                sequence: None,
+                element_variable: None,
+                dimensions: None,
+                prefix: false,
+                immutable,
+            });
+        }
         if ["values", "slots"].contains(&name.as_str()) {
             if !self.native {
                 return Err(self.error(

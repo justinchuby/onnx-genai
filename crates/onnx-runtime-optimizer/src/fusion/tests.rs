@@ -114,6 +114,57 @@ fn does_not_fuse_when_intermediate_has_second_consumer() {
 }
 
 #[test]
+fn ir_boundary_preserves_intermediates_captured_by_nested_graphs() {
+    let mut graph = matmul_add_graph();
+    let mut body = Graph::new();
+    let capture = val(&mut body, "m");
+    let body_out = val(&mut body, "body_out");
+    body.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(capture)],
+        vec![body_out],
+    ));
+    body.add_output(body_out);
+    let outer_out = val(&mut graph, "outer_out");
+    let mut owner = Node::new(NodeId(0), "Region", vec![], vec![outer_out]);
+    owner
+        .attributes
+        .insert("body".into(), Attribute::Graph(Box::new(body)));
+    graph.insert_node(owner);
+    graph.add_output(outer_out);
+
+    OpFusion::new()
+        .run(&mut graph, &PassContext::new())
+        .unwrap();
+
+    assert!(graph.nodes.values().any(|node| node.op_type == "MatMul"));
+    assert!(
+        graph
+            .nodes
+            .values()
+            .all(|node| node.op_type != "FusedMatMulBias")
+    );
+    graph.validate().unwrap();
+}
+
+#[test]
+fn ir_preparation_errors_are_not_reported_as_no_match() {
+    assert!(FusionPattern::new("empty", &[], "Invalid").is_err());
+    let pattern = FusionPattern::new("bias", &["MatMul", "Add"], "FusedMatMulBias").unwrap();
+    let mut graph = matmul_add_graph();
+    graph.set_inputs(graph.inputs.iter().copied().skip(1).collect());
+    let error = pattern.find_match(&graph).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::OptimizerError::Pattern(onnx_runtime_ir::pattern::PatternError {
+            kind: onnx_runtime_ir::pattern::PatternErrorKind::InvalidGraph,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn no_match_returns_none() {
     let mut g = Graph::new();
     g.opset_imports.insert(String::new(), 17);
@@ -122,8 +173,8 @@ fn no_match_returns_none() {
     let out = val(&mut g, "out");
     g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(a)], vec![out]));
     g.add_output(out);
-    let p = FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias");
-    assert!(p.find_match(&g).is_none());
+    let p = FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias").unwrap();
+    assert!(p.find_match(&g).unwrap().is_none());
 }
 
 /// Build the canonical 9-op LayerNorm decomposition over `x`.
@@ -142,7 +193,15 @@ fn layernorm_graph() -> Graph {
     let scale = val(&mut g, "scale");
     let bias = val(&mut g, "bias");
     g.add_input(x);
-    g.add_input(two);
+    g.value_mut(two).shape = vec![];
+    g.set_initializer(
+        two,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            vec![],
+            2.0f32.to_le_bytes().to_vec(),
+        )),
+    );
     g.set_initializer(
         eps,
         WeightRef::Inline(TensorData::from_raw(
@@ -306,7 +365,15 @@ fn layernorm_split_graph(reverse_num_sub: bool) -> Graph {
     let scale = val(&mut g, "scale");
     let bias = val(&mut g, "bias");
     g.add_input(x);
-    g.add_input(two);
+    g.value_mut(two).shape = vec![];
+    g.set_initializer(
+        two,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            vec![],
+            2.0f32.to_le_bytes().to_vec(),
+        )),
+    );
     g.set_initializer(
         eps,
         WeightRef::Inline(TensorData::from_raw(
@@ -477,7 +544,7 @@ fn does_not_fuse_partial_layernorm() {
     g.insert_node(Node::new(NodeId(0), "Neg", vec![Some(diff)], vec![side]));
     g.add_output(side);
     assert!(
-        p.find_match(&g).is_none(),
+        p.find_match(&g).unwrap().is_none(),
         "external consumer on `diff` blocks the fusion"
     );
 }
@@ -518,8 +585,8 @@ fn fuses_two_independent_matmul_adds() {
 #[test]
 fn find_match_reports_correct_shape() {
     let g = matmul_add_graph();
-    let p = FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias");
-    let m = p.find_match(&g).expect("should match");
+    let p = FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias").unwrap();
+    let m = p.find_match(&g).unwrap().expect("should match");
     assert_eq!(m.nodes.len(), 2);
     assert_eq!(m.external_inputs.len(), 3);
     assert_eq!(p.pattern_name(), "MatMul+Bias");
@@ -1577,10 +1644,51 @@ fn declines_gelu_when_interior_escapes() {
 
 fn run_restart_reference(patterns: &[FusionPattern], graph: &mut Graph) {
     for pattern in patterns {
-        while let Some(matched) = pattern.find_match(graph) {
+        while let Some(matched) = pattern.find_match(graph).unwrap() {
             pattern.apply_fusion(graph, &matched).unwrap();
         }
     }
+}
+
+#[test]
+fn cached_overlapping_regions_cannot_rebind_reused_node_ids() {
+    let mut graph = Graph::new();
+    let x = val(&mut graph, "x");
+    graph.add_input(x);
+    let high_output = val(&mut graph, "high");
+    let low_output = val(&mut graph, "low");
+    let out = val(&mut graph, "out");
+    let low = graph.insert_node(Node::new(
+        NodeId(0),
+        "Link",
+        vec![Some(high_output)],
+        vec![low_output],
+    ));
+    let high = graph.insert_node(Node::new(
+        NodeId(0),
+        "Link",
+        vec![Some(x)],
+        vec![high_output],
+    ));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Link",
+        vec![Some(low_output)],
+        vec![out],
+    ));
+    graph.add_output(out);
+    assert!(low < high);
+    graph.validate().unwrap();
+    let pattern = FusionPattern::new("LinkPair", &["Link", "Link"], "Joined").unwrap();
+    let mut actual = graph.clone();
+    let mut replacements = Vec::new();
+    OpFusion::with_patterns(vec![pattern.clone()])
+        .run_with_fusion_observer(&mut actual, |_, _, _, _, _, id| replacements.push(id))
+        .unwrap();
+    assert_eq!(replacements, [low]);
+    run_restart_reference(&[pattern], &mut graph);
+    actual.validate().unwrap();
+    assert_fusion_graphs_byte_identical(actual, graph, 0);
 }
 
 fn serialized_graph_bytes(mut graph: Graph) -> Vec<u8> {
@@ -1773,7 +1881,7 @@ impl DifferentialGraphBuilder {
 
     fn add_layernorm(&mut self, split_diff: bool) {
         let x = self.input("ln_x", &[4]);
-        let two = self.input("ln_two", &[4]);
+        let two = self.scalar("ln_two", 2.0);
         let eps = self.scalar("ln_eps", 1e-12);
         let scale = self.input("ln_scale", &[4]);
         let bias = self.input("ln_bias", &[4]);
@@ -2005,6 +2113,7 @@ fn differential_patterns() -> Vec<FusionPattern> {
     // revisit after every fusion until the chain reaches its fixpoint.
     patterns.push(
         FusionPattern::new("ResumableChain", &["ChainStart", "ChainLink"], "ChainStart")
+            .unwrap()
             .with_replacement_domain(""),
     );
     patterns
@@ -2185,6 +2294,7 @@ fn affected_candidate_starts_revisits_newly_eligible_lower_ids() {
         &["AdversaryStart", "AdversaryMiddle", "AdversaryTail"],
         "AdversaryMiddle",
     )
+    .unwrap()
     .with_replacement_domain("");
     let patterns = vec![pattern.clone()];
     let mut reclaimable_low_slot_trials = 0;
@@ -2200,10 +2310,12 @@ fn affected_candidate_starts_revisits_newly_eligible_lower_ids() {
         assert!(
             pattern
                 .try_match_at(&case.graph, case.lower_start)
+                .unwrap()
                 .is_none()
         );
         let first_match = pattern
             .try_match_at(&case.graph, case.later_start)
+            .unwrap()
             .expect("later start must be the first eligible match");
         assert_eq!(
             first_match.nodes,
@@ -2297,7 +2409,7 @@ fn assert_overlapping_structural_candidates(graph: &Graph, patterns: &[FusionPat
         assert!(
             starts
                 .iter()
-                .all(|&start| pattern.try_match_at(graph, start).is_some()),
+                .all(|&start| pattern.try_match_at(graph, start).unwrap().is_some()),
             "both MatMul starts must be eligible for the shared structural tail"
         );
         saw_gemm_overlap |= has_relu;
@@ -2328,7 +2440,7 @@ fn resumable_scan_matches_restart_reference_on_randomized_graphs() {
 
         for pattern in &patterns[..REGISTERED_PATTERNS] {
             assert!(
-                pattern.find_match(&graph).is_some(),
+                pattern.find_match(&graph).unwrap().is_some(),
                 "{} was not exercised on trial {trial}",
                 pattern.pattern_name()
             );
@@ -2366,4 +2478,193 @@ fn resumable_scan_matches_restart_reference_on_randomized_graphs() {
         saw_non_topological_ids,
         "randomized insertion must decouple NodeId from topological order"
     );
+}
+
+#[test]
+fn layernorm_requires_square_and_scalar_rank_preserving_coefficients() {
+    for case in [
+        "cube",
+        "runtime_power",
+        "vector_epsilon",
+        "expanding_epsilon",
+        "bad_payload",
+        "overflow_epsilon",
+    ] {
+        let mut graph = layernorm_graph();
+        let name = if matches!(case, "cube" | "runtime_power") {
+            "two"
+        } else {
+            "eps"
+        };
+        let value = graph
+            .values
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some(name))
+            .unwrap()
+            .0;
+        let (dims, data) = match case {
+            "cube" => (vec![], 3.0f32.to_le_bytes().to_vec()),
+            "runtime_power" => {
+                graph.initializers.remove(&value);
+                graph.add_input(value);
+                (vec![], vec![])
+            }
+            "vector_epsilon" => (
+                vec![4],
+                [1e-12f32, 0.5, 0.25, 0.125]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            ),
+            "expanding_epsilon" => (vec![1, 1], 1e-12f32.to_le_bytes().to_vec()),
+            "overflow_epsilon" => (vec![usize::MAX, 2], 1e-12f32.to_le_bytes().to_vec()),
+            "bad_payload" => (
+                vec![],
+                [1e-12f32, 0.5]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            ),
+            _ => unreachable!(),
+        };
+        if case != "runtime_power" {
+            graph.value_mut(value).shape = dims.iter().copied().map(Into::into).collect();
+            graph.set_initializer(
+                value,
+                WeightRef::Inline(TensorData::from_raw(DataType::Float32, dims, data)),
+            );
+        }
+        OpFusion::new()
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            graph.num_nodes(),
+            9,
+            "{case} must retain its original computation"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.op_type != "LayerNormalization"),
+            "{case}"
+        );
+        graph.validate().unwrap();
+    }
+}
+
+#[test]
+fn scalar_coefficients_keep_singleton_broadcasts_without_expanding_rank() {
+    let mut graph = layernorm_graph();
+    for name in ["two", "eps"] {
+        let value = graph
+            .values
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some(name))
+            .unwrap()
+            .0;
+        let WeightRef::Inline(tensor) = graph.initializers.get_mut(&value).unwrap() else {
+            unreachable!()
+        };
+        tensor.dims = vec![1];
+        graph.value_mut(value).shape = vec![1.into()];
+    }
+    OpFusion::new()
+        .run(&mut graph, &PassContext::new())
+        .unwrap();
+    assert_eq!(graph.num_nodes(), 1);
+    assert_eq!(
+        graph.nodes.values().next().unwrap().op_type,
+        "LayerNormalization"
+    );
+    graph.validate().unwrap();
+}
+
+fn shaped_layernorm_graph(shape: &[usize], axes: &[i64]) -> Graph {
+    let mut graph = layernorm_graph();
+    let rank = shape.len() as i64;
+    let normalized: Vec<usize> = axes
+        .iter()
+        .map(|&axis| if axis < 0 { axis + rank } else { axis } as usize)
+        .collect();
+    let start = *normalized.iter().min().unwrap();
+    let mut reduced = shape.to_vec();
+    for &axis in &normalized {
+        reduced[axis] = 1;
+    }
+    let values: Vec<_> = graph.values.keys().collect();
+    for id in values {
+        let dims = if let Some(WeightRef::Inline(tensor)) = graph.initializers.get(&id) {
+            tensor.dims.as_slice()
+        } else {
+            match graph.value(id).name.as_deref().unwrap() {
+                "mean" | "var" | "vare" | "std" => &reduced,
+                "scale" | "bias" => &shape[start..],
+                _ => shape,
+            }
+        };
+        let shape = static_shape(dims.iter().copied());
+        graph.value_mut(id).shape = shape;
+    }
+    for node in graph
+        .nodes
+        .values_mut()
+        .filter(|node| node.op_type == "ReduceMean")
+    {
+        node.attributes
+            .insert("axes".into(), Attribute::Ints(axes.to_vec()));
+    }
+    graph
+}
+
+#[test]
+fn layernorm_only_reduces_a_complete_suffix_with_matching_affine_tensors() {
+    for (axes, expected) in [
+        (vec![1, -1], true),
+        (vec![2, 1], true),
+        (vec![0, 2], false),
+        (vec![1], false),
+    ] {
+        let mut graph = shaped_layernorm_graph(&[2, 3, 4], &axes);
+        OpFusion::new()
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            graph.num_nodes(),
+            if expected { 1 } else { 9 },
+            "axes {axes:?}"
+        );
+        if expected {
+            assert_eq!(
+                graph
+                    .nodes
+                    .values()
+                    .next()
+                    .unwrap()
+                    .attr("axis")
+                    .and_then(Attribute::as_int),
+                Some(-2)
+            );
+        }
+        graph.validate().unwrap();
+    }
+    for affine in ["scale", "bias"] {
+        let mut graph = shaped_layernorm_graph(&[2, 3, 4], &[-1]);
+        let value = graph
+            .values
+            .iter()
+            .find(|(_, value)| value.name.as_deref() == Some(affine))
+            .unwrap()
+            .0;
+        graph.value_mut(value).shape = vec![];
+        OpFusion::new()
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            graph.num_nodes(),
+            9,
+            "broadcast-only {affine} cannot satisfy the fused kernel signature"
+        );
+        graph.validate().unwrap();
+    }
 }

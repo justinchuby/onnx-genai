@@ -31,7 +31,7 @@ pub use builder::{
 };
 pub use execute::{
     AttributeCapture, BindingView, BoundaryPolicy, DimensionValue, Match, MatchBudget,
-    MatchOptions, MatchSession, ScopedValue, ValueCapture,
+    MatchBudgetScope, MatchOptions, MatchSession, ScopedValue, ValueCapture,
 };
 
 use std::collections::BTreeMap;
@@ -110,9 +110,63 @@ impl Pattern {
     }
 
     /// Parse explicitly native extensions: operator `*`, ordered `...xs`
-    /// operands, `values[min:*]`/`slots[min:*]`, and GRAPH-list references.
+    /// operands, `values[min:*]`/`slots[min:*]`, untyped `value` constraints,
+    /// and GRAPH-list references.
     pub fn parse_native(source: &str) -> Result<Self> {
         compile::inline(syntax::parse_inline(source, true)?)
+    }
+
+    /// Compile a forward connected operator chain, anchored at its first node.
+    ///
+    /// Each `(domain, op)` step consumes any present output of its predecessor
+    /// in any input position. Other ports and attributes are unconstrained;
+    /// only the terminal node requires exactly one present output. Captures
+    /// `step_0`, `step_1`, ... identify the selected connecting/output values.
+    /// Distinct steps require distinct nodes. This Rust-only structural
+    /// constructor uses the same executor, boundaries and budgets as text.
+    pub fn operator_chain(operators: &[(&str, &str)]) -> Result<Self> {
+        if operators.is_empty() || operators.len() > 64 {
+            return Err(PatternError::new(
+                PatternErrorKind::InvalidPattern,
+                SourceSpan::default(),
+                "operator chain needs 1..=64 steps; supply a bounded nonempty sequence",
+            ));
+        }
+        let mut plan = Plan::empty();
+        for (index, &(domain, op)) in operators.iter().enumerate() {
+            if op.is_empty() {
+                return Err(PatternError::new(
+                    PatternErrorKind::InvalidPattern,
+                    SourceSpan::default(),
+                    format!(
+                        "operator chain step {index} has an empty operator; supply its ONNX name"
+                    ),
+                ));
+            }
+            let slot = plan.value(ValuePlan::Present);
+            let name = format!("step_{index}");
+            plan.names.insert(name.clone(), slot);
+            plan.required_values.insert(slot);
+            plan.producers.push(Some(index));
+            plan.nodes.push(NodePlan {
+                domain: crate::normalize_domain(domain).into(),
+                op: op.into(),
+                inputs: index.checked_sub(1).into_iter().collect(),
+                outputs: vec![slot],
+                attributes: Vec::new(),
+                instance: name,
+                rest: None,
+                signature: NodeSignature::Connected {
+                    terminal: index + 1 == operators.len(),
+                },
+            });
+        }
+        plan.anchor = Some(0);
+        plan.outputs.push(operators.len() - 1);
+        Ok(Self {
+            plans: vec![plan].into(),
+            operator_entry: true,
+        })
     }
 }
 
@@ -161,6 +215,7 @@ impl PatternLibrary {
 
 #[derive(Clone, Debug)]
 struct Plan {
+    anchor: Option<usize>,
     interface: Option<String>,
     instance_only: std::collections::BTreeSet<String>,
     names: BTreeMap<String, usize>,
@@ -186,6 +241,7 @@ struct Plan {
 impl Plan {
     fn empty() -> Self {
         Self {
+            anchor: None,
             interface: None,
             instance_only: std::collections::BTreeSet::new(),
             names: BTreeMap::new(),
@@ -243,6 +299,20 @@ struct NodePlan {
     attributes: Vec<(String, AttributePlan)>,
     instance: String,
     rest: Option<usize>,
+    signature: NodeSignature,
+}
+
+impl NodePlan {
+    fn operator_matches(&self, node: &crate::Node) -> bool {
+        self.op == "*"
+            || (node.op_type == self.op && crate::normalize_domain(&node.domain) == self.domain)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeSignature {
+    Positional,
+    Connected { terminal: bool },
 }
 
 #[derive(Clone, Debug)]

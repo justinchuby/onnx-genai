@@ -1,9 +1,53 @@
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
+use onnx_runtime_optimizer::RecognitionRule;
+use onnx_runtime_optimizer::recognition::{
+    MATMUL_NBITS_BIAS, SILU_DECOMPOSITION, capture_node, capture_value,
+};
 use onnx_runtime_optimizer::{
     OpFusion, OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
 };
+use std::sync::LazyLock;
+
+static GATE_UP: LazyLock<RecognitionRule> = LazyLock::new(|| {
+    RecognitionRule::parse(
+        "CPU gate/up",
+        "(x,gs:slots[0:*],us:slots[0:*]) => {
+            gate=com.microsoft.MatMulNBits(x,...gs);
+            up=com.microsoft.MatMulNBits(x,...us);
+            activation=Swish(gate)|com.microsoft.Silu(gate);
+            out=Mul(activation,up)|Mul(up,activation); return out
+        }",
+        "activation",
+    )
+    .expect("built-in CPU gate/up pattern must compile; fix its textual definition")
+});
+
+static CONV_BN: LazyLock<RecognitionRule> = LazyLock::new(|| {
+    RecognitionRule::parse(
+        "CPU Conv/BatchNormalization",
+        "(args:slots[0:*],scale,bias,mean,var) => {
+            conv=Conv(...args);
+            bn=BatchNormalization(conv,scale,bias,mean,var);
+            out=Relu(bn)|bn; return out
+        }",
+        "bn",
+    )
+    .expect("built-in Conv/BatchNormalization pattern must compile; fix its textual definition")
+});
+
+static SIBLING_PROJECTION: LazyLock<RecognitionRule> = LazyLock::new(|| {
+    RecognitionRule::parse(
+        "CPU sibling projection",
+        "(activation,args:slots[1:*])=>{
+            out=MatMul(activation,...args)|com.microsoft.FusedMatMulBias(activation,...args);
+            return out
+        }",
+        "out",
+    )
+    .expect("built-in sibling projection pattern must compile; fix its textual definition")
+});
 
 const PROJECTION_FUSION_ENV: &str = "ONNX_GENAI_PROJECTION_FUSION";
 const MICROSOFT_DOMAIN: &str = "com.microsoft";
@@ -91,58 +135,29 @@ impl OptimizationPass for CpuSiluFusion {
     }
 
     fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
-        let sigmoid_ids: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "Sigmoid"
-                    && node.is_default_domain()
-                    && node.inputs.len() == 1
-                    && node.outputs.len() == 1)
-                    .then_some(id)
-            })
-            .collect();
-        let mut changed = false;
-
-        for sigmoid_id in sigmoid_ids {
-            let Some(sigmoid) = graph.try_node(sigmoid_id) else {
-                continue;
-            };
-            let Some(x) = sigmoid.inputs[0] else {
-                continue;
-            };
-            let Some(sigmoid_output) = sigmoid.outputs[0] else {
-                continue;
-            };
-            if graph.outputs.contains(&sigmoid_output) {
-                continue;
-            }
-            let consumers = graph.consumers(sigmoid_output);
-            if consumers.len() != 1 {
-                continue;
-            }
-            let mul_id = consumers[0];
-            let mul = graph.node(mul_id);
-            if mul.op_type != "Mul"
-                || !mul.is_default_domain()
-                || mul.inputs.len() != 2
-                || mul.outputs.len() != 1
-                || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
-                    || (mul.inputs[1] == Some(x) && mul.inputs[0] == Some(sigmoid_output)))
-            {
-                continue;
-            }
-
-            let mut fused = mul.clone();
-            fused.op_type = "Swish".to_string();
-            fused.domain.clear();
-            fused.version = Some(24);
-            fused.inputs = vec![Some(x)];
-            fused.attributes.clear();
-            graph.replace_node(mul_id, fused);
-            graph.remove_node(sigmoid_id);
-            changed = true;
-        }
+        let changed = SILU_DECOMPOSITION.rewrite(
+            graph,
+            |graph, matched| {
+                let sigmoid_id = capture_node(matched, "sigmoid")?;
+                let sigmoid_output = capture_value(matched, "sigmoid")?;
+                let mul_id = capture_node(matched, "out")?;
+                let x = capture_value(matched, "x")?;
+                Ok((!graph.outputs.contains(&sigmoid_output)
+                    && graph.consumers(sigmoid_output) == [mul_id])
+                .then_some((sigmoid_id, mul_id, x)))
+            },
+            |graph, (sigmoid_id, mul_id, x)| {
+                let mul = graph.node(mul_id);
+                let mut fused = mul.clone();
+                fused.op_type = "Swish".to_string();
+                fused.domain.clear();
+                fused.version = Some(24);
+                fused.inputs = vec![Some(x)];
+                fused.attributes.clear();
+                graph.replace_node(mul_id, fused);
+                graph.remove_node(sigmoid_id);
+            },
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -161,24 +176,24 @@ impl OptimizationPass for ProjectionFusion {
             return Ok(());
         }
 
-        let activation_nodes: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                (is_silu_like_activation(node) && node.inputs.len() == 1 && node.outputs.len() == 1)
-                    .then_some(id)
-            })
-            .collect();
-
-        let mut changed = false;
-        for activation_id in activation_nodes {
-            let Some(candidate) = GateUpCandidate::match_from_activation(graph, activation_id, ctx)
-            else {
-                continue;
-            };
-            candidate.apply(graph);
-            changed = true;
-        }
+        let changed = GATE_UP.rewrite(
+            graph,
+            |graph, matched| {
+                let activation_id = capture_node(matched, "activation")?;
+                let gate_output = capture_value(matched, "gate")?;
+                let up_output = capture_value(matched, "up")?;
+                let mul_id = capture_node(matched, "out")?;
+                Ok(GateUpCandidate::prepare(
+                    graph,
+                    activation_id,
+                    gate_output,
+                    up_output,
+                    mul_id,
+                    ctx,
+                ))
+            },
+            |graph, candidate| candidate.apply(graph),
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -234,25 +249,27 @@ impl OptimizationPass for MatMulNBitsBiasFusion {
     }
 
     fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
-        let add_nodes: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "Add"
-                    && matches!(node.domain.as_str(), "" | "ai.onnx")
-                    && node.inputs.len() == 2
-                    && node.outputs.len() == 1)
-                    .then_some(id)
-            })
-            .collect();
-
-        let mut changed = false;
-        for add_id in add_nodes {
-            if let Some(fusion) = MatMulNBitsBias::match_from_add(graph, add_id) {
-                fusion.apply(graph);
-                changed = true;
-            }
-        }
+        let changed = MATMUL_NBITS_BIAS.rewrite(
+            graph,
+            |graph, matched| {
+                let add_id = capture_node(matched, "out")?;
+                let matmul_output = capture_value(matched, "projection")?;
+                let matmul_id = capture_node(matched, "projection")?;
+                let bias = capture_value(matched, "bias")?;
+                let add_output = capture_value(matched, "out")?;
+                Ok(
+                    MatMulNBitsBias::eligible(graph, add_id, matmul_id, matmul_output, bias)
+                        .then_some(MatMulNBitsBias {
+                            matmul_id,
+                            add_id,
+                            matmul_output,
+                            add_output,
+                            bias,
+                        }),
+                )
+            },
+            |graph, fusion| fusion.apply(graph),
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -270,57 +287,15 @@ struct MatMulNBitsBias {
 }
 
 impl MatMulNBitsBias {
-    fn match_from_add(graph: &Graph, add_id: NodeId) -> Option<Self> {
-        let add = graph.try_node(add_id)?;
-        let lhs = add.inputs[0]?;
-        let rhs = add.inputs[1]?;
-        let add_output = add.outputs[0]?;
-
-        // Try each operand as the MatMulNBits side; the other is the bias.
-        for (matmul_output, bias) in [(lhs, rhs), (rhs, lhs)] {
-            if matmul_output == bias {
-                continue;
-            }
-            let Some(matmul_id) = graph.value(matmul_output).producer else {
-                continue;
-            };
-            if !Self::matmul_is_biasable(graph, matmul_id, matmul_output, add_id) {
-                continue;
-            }
-            let n = match graph.value(matmul_output).shape.last() {
-                Some(&Dim::Static(n)) => n,
-                _ => continue,
-            };
-            if !Self::bias_is_row_vector(graph, bias, n) {
-                continue;
-            }
-            return Some(Self {
-                matmul_id,
-                add_id,
-                matmul_output,
-                add_output,
-                bias,
-            });
-        }
-        None
-    }
-
-    /// The producer is a bias-free `MatMulNBits` whose sole consumer is this
-    /// `Add` and whose output is not exposed as a graph output.
-    fn matmul_is_biasable(
+    fn eligible(
         graph: &Graph,
+        add_id: NodeId,
         matmul_id: NodeId,
         matmul_output: ValueId,
-        add_id: NodeId,
+        bias: ValueId,
     ) -> bool {
-        let Some(matmul) = graph.try_node(matmul_id) else {
-            return false;
-        };
-        if matmul.op_type != "MatMulNBits"
-            || matmul.domain != MICROSOFT_DOMAIN
-            || matmul.outputs.len() != 1
-            || matmul.outputs[0] != Some(matmul_output)
-        {
+        let matmul = graph.node(matmul_id);
+        if matmul_output == bias {
             return false;
         }
         // A bias input (contrib index 5) already present means nothing to fold.
@@ -329,7 +304,12 @@ impl MatMulNBitsBias {
         }
         // The intermediate MatMulNBits result must be private to this Add so it
         // can be dropped once the bias is folded in.
-        !graph.outputs.contains(&matmul_output) && graph.consumers(matmul_output) == [add_id]
+        !graph.outputs.contains(&matmul_output)
+            && graph.consumers(matmul_output) == [add_id]
+            && match graph.value(matmul_output).shape.last() {
+                Some(&Dim::Static(n)) => Self::bias_is_row_vector(graph, bias, n),
+                _ => false,
+            }
     }
 
     /// The bias must be a rank-1 `[N]` float tensor so it broadcasts over the
@@ -493,13 +473,18 @@ struct GateUpCandidate {
 }
 
 impl GateUpCandidate {
-    fn match_from_activation(
+    fn prepare(
         graph: &Graph,
         activation_id: NodeId,
+        gate_output: ValueId,
+        up_output: ValueId,
+        mul_id: NodeId,
         ctx: &PassContext,
     ) -> Option<Self> {
         let activation = graph.try_node(activation_id)?;
-        let gate_output = activation.inputs[0]?;
+        if !is_silu_like_activation(activation) {
+            return None;
+        }
         let activation_output = activation.outputs[0]?;
         if graph.outputs.contains(&gate_output)
             || graph.outputs.contains(&activation_output)
@@ -508,26 +493,9 @@ impl GateUpCandidate {
             return None;
         }
 
-        let activation_consumers = graph.consumers(activation_output);
-        if activation_consumers.len() != 1 {
+        if graph.consumers(activation_output) != [mul_id] {
             return None;
         }
-        let mul_id = activation_consumers[0];
-        let mul = graph.try_node(mul_id)?;
-        if mul.op_type != "Mul"
-            || !matches!(mul.domain.as_str(), "" | "ai.onnx")
-            || mul.inputs.len() != 2
-            || mul.outputs.len() != 1
-        {
-            return None;
-        }
-        let up_output = if mul.inputs[0] == Some(activation_output) {
-            mul.inputs[1]?
-        } else if mul.inputs[1] == Some(activation_output) {
-            mul.inputs[0]?
-        } else {
-            return None;
-        };
         if up_output == gate_output
             || graph.outputs.contains(&up_output)
             || graph.consumers(up_output) != [mul_id]
@@ -703,23 +671,24 @@ impl OptimizationPass for ConvBatchNormActivationFusion {
     }
 
     fn run(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
-        let bn_nodes: Vec<NodeId> = graph
-            .nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "BatchNormalization"
-                    && matches!(node.domain.as_str(), "" | "ai.onnx"))
-                .then_some(id)
-            })
-            .collect();
-
-        let mut changed = false;
-        for bn_id in bn_nodes {
-            if let Some(fusion) = ConvBnFusion::match_from_bn(graph, bn_id, ctx) {
-                fusion.apply(graph);
-                changed = true;
-            }
-        }
+        let changed = CONV_BN.rewrite(
+            graph,
+            |graph, matched| {
+                let bn_id = capture_node(matched, "bn")?;
+                let conv_id = capture_node(matched, "conv")?;
+                let bn_output = capture_value(matched, "bn")?;
+                let output = capture_value(matched, "out")?;
+                let relu = if output != bn_output {
+                    let relu_id = capture_node(matched, "out")?;
+                    (!graph.outputs.contains(&bn_output) && graph.consumers(bn_output) == [relu_id])
+                        .then_some((relu_id, output))
+                } else {
+                    None
+                };
+                Ok(ConvBnFusion::prepare(graph, bn_id, conv_id, relu, ctx))
+            },
+            |graph, fusion| fusion.apply(graph),
+        )?;
 
         if changed {
             graph.validate().map_err(OptimizerError::from)?;
@@ -745,24 +714,19 @@ struct ConvBnFusion {
 }
 
 impl ConvBnFusion {
-    fn match_from_bn(graph: &Graph, bn_id: NodeId, ctx: &PassContext) -> Option<Self> {
+    fn prepare(
+        graph: &Graph,
+        bn_id: NodeId,
+        conv_id: NodeId,
+        relu: Option<(NodeId, ValueId)>,
+        ctx: &PassContext,
+    ) -> Option<Self> {
         let bn = graph.try_node(bn_id)?;
-        // Inference BatchNormalization: X, scale, B, mean, var -> Y only. Skip the
-        // training form (which also emits running-stat outputs).
-        if bn.inputs.len() != 5 || bn.outputs.len() != 1 {
-            return None;
-        }
         let conv_output = bn.inputs[0]?;
         let bn_output = bn.outputs[0]?;
 
-        let conv_id = graph.value(conv_output).producer?;
         let conv = graph.try_node(conv_id)?;
-        if conv.op_type != "Conv"
-            || !matches!(conv.domain.as_str(), "" | "ai.onnx")
-            || conv.outputs.len() != 1
-            || conv.outputs[0] != Some(conv_output)
-            || conv.attr("activation").is_some()
-        {
+        if conv.attr("activation").is_some() {
             return None;
         }
         // The Conv result must be private to this BN so it can be rewritten away.
@@ -836,23 +800,6 @@ impl ConvBnFusion {
         for c in 0..out_ch {
             new_bias[c] = (bias_vals[c] - mean[c]) * a[c] + beta[c];
         }
-
-        // Optionally fold a trailing Relu when BN feeds exactly one Relu.
-        let relu = (!graph.outputs.contains(&bn_output))
-            .then(|| {
-                let consumers = graph.consumers(bn_output);
-                let relu_id = *consumers.first()?;
-                if consumers.len() != 1 {
-                    return None;
-                }
-                let relu = graph.try_node(relu_id)?;
-                (relu.op_type == "Relu"
-                    && matches!(relu.domain.as_str(), "" | "ai.onnx")
-                    && relu.inputs.len() == 1
-                    && relu.outputs.len() == 1)
-                    .then_some((relu_id, relu.outputs[0]?))
-            })
-            .flatten();
 
         Some(Self {
             conv_id,
@@ -1046,7 +993,7 @@ impl OptimizationPass for SiblingProjectionMerge {
         // Find groups of 2+ sibling FusedMatMulBias or plain MatMul sharing the
         // same activation input.
         loop {
-            let group = find_mergeable_sibling_group(graph, ctx);
+            let group = find_mergeable_sibling_group(graph, ctx)?;
             if group.is_none() {
                 break;
             }
@@ -1084,25 +1031,25 @@ struct SiblingProjection {
     k: usize,
 }
 
-fn find_mergeable_sibling_group(graph: &Graph, ctx: &PassContext) -> Option<SiblingGroup> {
+fn find_mergeable_sibling_group(
+    graph: &Graph,
+    ctx: &PassContext,
+) -> OptimizerResult<Option<SiblingGroup>> {
     // Build a map: activation value → list of FusedMatMulBias/MatMul consuming it.
-    let mut activation_to_projs: std::collections::HashMap<ValueId, Vec<NodeId>> =
-        std::collections::HashMap::new();
-
-    for (id, node) in graph.nodes.iter() {
-        let is_fused = node.op_type == "FusedMatMulBias" && node.domain == MICROSOFT_DOMAIN;
-        let is_plain = node.op_type == "MatMul" && node.is_default_domain();
-        if !is_fused && !is_plain {
-            continue;
-        }
-        if node.outputs.len() != 1 {
-            continue;
-        }
-        if let Some(Some(activation)) = node.inputs.first() {
-            activation_to_projs.entry(*activation).or_default().push(id);
-        }
+    let mut activation_to_projs = std::collections::BTreeMap::<ValueId, Vec<NodeId>>::new();
+    let session = onnx_runtime_ir::pattern::MatchSession::new(graph)?;
+    for (id, matched) in SIBLING_PROJECTION.candidates(&session)? {
+        let activation = capture_value(&matched, "activation")?;
+        activation_to_projs.entry(activation).or_default().push(id);
     }
+    Ok(select_sibling_group(graph, ctx, activation_to_projs))
+}
 
+fn select_sibling_group(
+    graph: &Graph,
+    ctx: &PassContext,
+    activation_to_projs: std::collections::BTreeMap<ValueId, Vec<NodeId>>,
+) -> Option<SiblingGroup> {
     // Look for groups of 2+ siblings of the SAME op type.
     for (activation, mut candidates) in activation_to_projs {
         if candidates.len() < 2 {
@@ -1486,6 +1433,39 @@ mod tests {
         assert_eq!(fused.version, Some(24));
         assert_eq!(fused.inputs, vec![Some(x)]);
         assert_eq!(graph.opset_imports[""], 21);
+    }
+
+    #[test]
+    fn cpu_silu_rule_rejects_near_miss_identity_domain_and_output_slots() {
+        for case in 0..3 {
+            let (mut graph, _) = silu_decomposition_graph(24, false);
+            let (sigmoid_id, mut sigmoid) = graph
+                .nodes
+                .iter()
+                .find(|(_, node)| node.op_type == "Sigmoid")
+                .map(|(id, node)| (id, node.clone()))
+                .unwrap();
+            match case {
+                0 => {
+                    let other =
+                        graph.create_named_value("other", DataType::Float32, static_shape([2]));
+                    graph.add_input(other);
+                    sigmoid.inputs[0] = Some(other);
+                }
+                1 => {
+                    sigmoid.domain = "custom".into();
+                    graph.opset_imports.insert("custom".into(), 1);
+                }
+                _ => {
+                    let second = graph.create_value(DataType::Float32, static_shape([2]));
+                    sigmoid.outputs.push(Some(second));
+                }
+            }
+            graph.replace_node(sigmoid_id, sigmoid);
+            CpuSiluFusion.run(&mut graph, &PassContext::new()).unwrap();
+            assert_eq!(count(&graph, "Sigmoid"), 1, "case {case}");
+            assert_eq!(count(&graph, "Mul"), 1, "case {case}");
+        }
     }
 
     #[test]

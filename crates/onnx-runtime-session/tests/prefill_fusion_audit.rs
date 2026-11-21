@@ -135,11 +135,12 @@ fn prefill_fusion_audit() {
         ("Gelu (Erf)", FusionPattern::gelu()),
         (
             "MatMul+Bias+Relu",
-            FusionPattern::new("MatMul+Bias+Relu", &["MatMul", "Add", "Relu"], "FusedGemm"),
+            FusionPattern::new("MatMul+Bias+Relu", &["MatMul", "Add", "Relu"], "FusedGemm")
+                .unwrap(),
         ),
         (
             "MatMul+Bias",
-            FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias"),
+            FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias").unwrap(),
         ),
     ];
 

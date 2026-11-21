@@ -819,6 +819,7 @@ impl Compiler<'_> {
                     compiled_attributes.push((key.clone(), attribute));
                 }
                 plan.nodes.push(NodePlan {
+                    signature: NodeSignature::Positional,
                     domain: crate::normalize_domain(domain).to_string(),
                     op: op.into(),
                     inputs,
@@ -1064,7 +1065,7 @@ fn annotate(
     if constraints.iter().all(|c| c.absent) {
         return Err(invalid(
             span,
-            "None alone is not an annotation; include a concrete tensor alternative",
+            "None alone is not an annotation; include a present-value alternative",
         ));
     }
     if constraints.iter().any(|c| c.absent) {
@@ -1082,7 +1083,7 @@ fn annotate(
 
 fn constraint_from_raw(raw: &RawConstraint, span: SourceSpan) -> Result<Constraint> {
     let element = match raw.name.as_str() {
-        "None" | "tensor" => None,
+        "None" | "tensor" | "value" => None,
         name => Some(element_type(name).ok_or_else(|| unsupported(span,
             format!("tensor annotation {name:?} is unsupported; use an ONNX tensor element name or a metadata predicate")))?),
     };
@@ -1103,7 +1104,7 @@ fn constraint_from_raw(raw: &RawConstraint, span: SourceSpan) -> Result<Constrai
         ));
     }
     Ok(Constraint {
-        tensor: raw.name != "None",
+        tensor: raw.name != "None" && raw.name != "value",
         absent: raw.name == "None",
         immutable: raw.immutable,
         element,

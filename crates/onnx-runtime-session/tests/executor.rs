@@ -3063,3 +3063,125 @@ fn shared_provider_concurrent_pending_executors_finalize_and_drain_independently
     drop(second);
     assert_eq!(scoped_count(&drains, second_id), 1);
 }
+
+#[test]
+fn decomposed_layernorm_suffix_fusion_matches_cpu_execution() {
+    use onnx_runtime_optimizer::{FusionPattern, OpFusion, OptimizationPass, PassContext};
+    for (axes, padded_affine) in [(vec![-1], false), (vec![1, 2], false), (vec![1, 2], true)] {
+        let shape = [2, 3, 4];
+        let start = if axes.len() == 1 { 2 } else { 1 };
+        let width: usize = shape[start..].iter().product();
+        let mut reduced = shape;
+        reduced[start..].fill(1);
+        let data: Vec<f32> = (0..24)
+            .map(|i| (i as f32 * 0.31).sin() + (i % 5) as f32)
+            .collect();
+        let scale: Vec<f32> = (0..width).map(|i| 1.0 + i as f32 * 0.03).collect();
+        let bias: Vec<f32> = (0..width).map(|i| (i % 3) as f32 * 0.2).collect();
+        let epsilon = 1e-5;
+        let mut graph = Graph::new();
+        let x = input(&mut graph, "x", DataType::Float32, &shape);
+        let two = f32_init(&mut graph, "two", &[], &[2.0]);
+        let eps = f32_init(&mut graph, "eps", &[], &[epsilon]);
+        let mut affine_shape = shape[start..].to_vec();
+        if padded_affine {
+            affine_shape.insert(0, 1);
+        }
+        let gamma = f32_init(&mut graph, "gamma", &affine_shape, &scale);
+        let beta = f32_init(&mut graph, "beta", &affine_shape, &bias);
+        let attrs = [
+            ("axes", Attribute::Ints(axes)),
+            ("keepdims", Attribute::Int(1)),
+        ];
+        let mean = op(
+            &mut graph,
+            "ReduceMean",
+            &[x],
+            DataType::Float32,
+            &reduced,
+            &attrs,
+        );
+        let diff = op(
+            &mut graph,
+            "Sub",
+            &[x, mean],
+            DataType::Float32,
+            &shape,
+            &[],
+        );
+        let square = op(
+            &mut graph,
+            "Pow",
+            &[diff, two],
+            DataType::Float32,
+            &shape,
+            &[],
+        );
+        let var = op(
+            &mut graph,
+            "ReduceMean",
+            &[square],
+            DataType::Float32,
+            &reduced,
+            &attrs,
+        );
+        let vare = op(
+            &mut graph,
+            "Add",
+            &[var, eps],
+            DataType::Float32,
+            &reduced,
+            &[],
+        );
+        let std = op(
+            &mut graph,
+            "Sqrt",
+            &[vare],
+            DataType::Float32,
+            &reduced,
+            &[],
+        );
+        let norm = op(
+            &mut graph,
+            "Div",
+            &[diff, std],
+            DataType::Float32,
+            &shape,
+            &[],
+        );
+        let scaled = op(
+            &mut graph,
+            "Mul",
+            &[norm, gamma],
+            DataType::Float32,
+            &shape,
+            &[],
+        );
+        let out = op(
+            &mut graph,
+            "Add",
+            &[scaled, beta],
+            DataType::Float32,
+            &shape,
+            &[],
+        );
+        graph.add_output(out);
+        let mut fused = graph.clone();
+        OpFusion::with_patterns(vec![FusionPattern::layernorm()])
+            .run(&mut fused, &PassContext::new())
+            .unwrap();
+        assert_eq!(fused.num_nodes(), 1);
+        assert_eq!(
+            fused.nodes.values().next().unwrap().op_type,
+            "LayerNormalization"
+        );
+        let x = Tensor::from_f32(&shape, &data).unwrap();
+        let mut original = InferenceSession::from_graph(graph).unwrap();
+        let mut optimized = InferenceSession::from_graph(fused).unwrap();
+        let expected = ref_layernorm_last(&data, data.len() / width, width, &scale, &bias, epsilon);
+        let original = original.run(&[("x", &x)]).unwrap();
+        let optimized = optimized.run(&[("x", &x)]).unwrap();
+        assert_close(&original[0].to_vec_f32(), &expected);
+        assert_close(&optimized[0].to_vec_f32(), &expected);
+    }
+}

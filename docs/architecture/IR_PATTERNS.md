@@ -140,7 +140,7 @@ they **do not** execute or build the upstream ORT implementation.
 | Type alternatives | First globally consistent combination in declaration/call order; failed combinations roll back; a rejecting predicate advances graph assignments/plans, not type combinations |
 | `GRAPH` | Named pattern references, ordered formal prefix and exact returns, independent instances, complete body operator coverage (except validated literal Constant producers) |
 | Whole graph | `graph_pattern` plus `match_graph`, including unused positional formals, independent output components, duplicate returns and input passthrough |
-| Native extensions | Explicit `parse_native`: `*` operator, `...xs` ordered input sequences, `values[min:max]` / `slots[min:*]`, `[Body,Body]` GRAPH-list constraints |
+| Native extensions | Explicit `parse_native`: `*` operator, `value` / `value \| None` without tensor metadata requirements, `...xs` ordered input sequences, `values[min:max]` / `slots[min:*]`, `[Body,Body]` GRAPH-list constraints |
 
 Libraries require an operator-registry callback to disambiguate unresolved bare
 calls from misspelled pattern names. This avoids an IR-to-schema dependency:
@@ -258,7 +258,7 @@ owning result borrowing the graph; visitor `true` continues, `false` stops.
 and deliberately permits overlapping results. It searches only the root scope;
 body matching is explicit through graph-attribute references.
 
-The last expanded operator is the anchor regardless of return order. Bound
+For textual patterns, the last expanded operator is the anchor regardless of return order. Bound
 outputs force precise producers first. For another connected sink, the matcher
 uses the highest unmatched pattern operator's lowest eligible input, enumerating
 the exact producer-output/consumer-input edge in ascending raw node ID order.
@@ -270,6 +270,27 @@ and `instance` diagnose unknown/wrong-kind names. Absent optional captures are
 successful `None`, distinct internally from an unbound optional branch variable.
 Returned matches own capture arrays and share immutable plans; no references
 into reusable scratch can escape.
+
+### Compiled connected chains and bounded paths
+
+`Pattern::operator_chain(&[("", "MatMul"), ("", "Add")])` is a Rust-only
+structural constructor for existing generic spine recognizers. It produces a
+plan for the same executor, anchored at the **first** step. Each later step
+consumes any present output of its predecessor at any input position; other
+ports and attributes (including graph bodies) are unconstrained. Intermediate
+nodes may have optional/multiple outputs; the terminal requires exactly one
+present output. `step_0`, `step_1`, etc. capture the selected connecting/output
+values. Multiple connecting values may yield distinct matches with the same
+nodes. Callers selecting a single rewrite should order/deduplicate by node
+identity. Numeric/schema eligibility remains caller-owned.
+
+`MatchSession::match_upstream(pattern, value, input_slot, max_nodes, options)`
+tries a compiled terminal pattern at successive producers, starting with
+`value`'s producer and following one explicitly selected input position. It
+stays in the current graph scope, honors multi-output value identity and shares
+the match budget across traversal and attempts. Neither API adds an ORT textual
+language form or a separate matching backend. Both can backtrack; existing
+step/candidate/depth limits still apply rather than promising linear search.
 
 ## Scopes, facts and safety
 
@@ -357,6 +378,51 @@ must represent otherwise external outputs/uses. Provider/layer annotations and
 replacement-cycle policy are not represented here. EPs retain alias/lifetime,
 side-effect, opset, numerical, shape/layout and kernel-support guards.
 
+### Built-in provider consumers
+
+CPU and CUDA recognition uses shared `RecognitionRule` adapters in
+`onnx-runtime-optimizer`; reusable textual rules are compiled once, and dynamic
+operator chains compile when their `FusionPattern` is constructed. Single-op
+dispatch and ordinary constant folding remain separate.
+
+| Consumer | Migrated recognition |
+|---|---|
+| CPU | SiLU, quantized-matmul bias, gate/up and sibling projections, Conv/BatchNorm/optional Relu |
+| CUDA | SiLU, reciprocal square root, L2 normalization, bias, SwiGLU/gate-up, residual/RMSNorm projection neighborhoods, activation/decay chains, normalization Cast, bounded QKV paths and existing constant/threshold If recognizers |
+| Shared fusion | Connected chains, shared/split-Sub LayerNorm, exact GELU, masked/unmasked SDPA with optional K transpose |
+
+These are recognizers, not numerical-equivalence proofs. Existing constant,
+axis, dtype/layout, broadcast, alias, liveness and kernel eligibility guards
+remain separate. Rules request `OrtBoundary`; intentionally retained additional
+outputs, such as a residual sum, are explicit returns.
+
+LayerNorm eligibility proves a square with immutable exponent 2, exact scalar
+coefficient payloads, rank-preserving broadcasts, and matching kept-dimension
+reductions over a complete normalized suffix. The affine tensors must represent
+that suffix's coefficient array; harmless leading singleton dimensions are
+accepted without allowing rank expansion. This does not turn an arbitrary
+reduction or a dynamic exponent into LayerNorm.
+
+Native `value` means any present SSA value, including unknown or non-tensor type
+metadata. `value | None` additionally permits a missing slot; it does not mean an
+ONNX `Optional<T>` container or manufacture tensor facts. This distinction keeps
+optional attention masks recognizable before shape/type inference. Portable
+`tensor[...] | None` retains its stronger known-dense-tensor constraint.
+
+`FusionPattern::new` and `find_match` are fallible. Invalid graphs, unsupported
+metadata and exhausted matcher budgets propagate as errors, not negative
+eligibility. Generic chain steps expose their selected output identity;
+repeated consumer input uses do not duplicate an identical chain match.
+
+The shared pass preserves restart-equivalent candidate order. It retains owned
+eligible plans only for proven-disjoint regions, invalidates overlapping plans
+using their exact removed node footprints **before arena IDs can be reused**,
+and refreshes recognition at affected compatible roots. No borrowed match or
+graph index survives graph mutation. Whole-graph preparation is still required
+for a refresh: with `R` refreshes and recognition cost `C`, the worst-case cost
+remains `O(R * (V + E + C))`. This is not a generally incremental matcher or a
+performance improvement claim.
+
 ### Source fidelity versus execution and pattern semantics
 
 The IR shares the existing generated ONNX schema with the loader instead of
@@ -439,7 +505,12 @@ expanded calls. Definition and graph nesting are limited to **32**, expression
 nesting to 64 and combined assignment/body search depth to 96. These deliberately
 stricter depth limits are not the upstream 64-definition ceiling.
 `MatchBudget` bounds shared steps, completed candidates, and tensor/attribute/
-sequence comparison bytes across an entire public call, including nested bodies.
+sequence comparison bytes. `MatchBudgetScope::Search` (the default) shares these
+limits across the complete public query. `Root` resets them only between roots
+in `find_matches`; alternatives, nested bodies and predicates at each root still
+share one budget. Trusted built-in full-graph scans select `Root`, so model size
+alone cannot exhaust a small single-query candidate cap. Total work and retained
+matches still scale with the graph; this does not make discovery allocation-free.
 Tensor comparison accounting includes names, dimensions, string payloads and
 per-string metadata, not just numeric data buffers.
 There is no recursive user pattern or unbounded variadic splitting.

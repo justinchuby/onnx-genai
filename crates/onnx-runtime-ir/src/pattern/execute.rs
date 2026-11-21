@@ -15,7 +15,8 @@ pub enum BoundaryPolicy {
     OrtBoundary,
 }
 
-/// Per-call bounds, shared by alternatives, nested bodies and predicates.
+/// Bounds shared by alternatives, nested bodies and predicates within the
+/// budget scope selected by [`MatchOptions::budget_scope`].
 #[derive(Clone, Copy, Debug)]
 pub struct MatchBudget {
     pub steps: usize,
@@ -33,10 +34,24 @@ impl Default for MatchBudget {
     }
 }
 
+/// How a multi-root search accounts for its configured limits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MatchBudgetScope {
+    /// One aggregate budget for the complete query, including every root.
+    #[default]
+    Search,
+    /// Reset only when moving to another root. Alternatives, nested bodies and
+    /// predicates still share that root's limits. Suitable for full-graph
+    /// scans with trusted built-in rules, without a fixed model-size ceiling.
+    Root,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MatchOptions {
     pub boundary: BoundaryPolicy,
     pub budget: MatchBudget,
+    /// Budget lifetime for `find_matches`; anchored/whole-graph calls have one root.
+    pub budget_scope: MatchBudgetScope,
 }
 
 /// A borrowed value whose identity includes its owning graph.
@@ -70,6 +85,16 @@ impl<'g> ScopedValue<'g> {
 pub struct ValueCapture {
     plans: Arc<[Plan]>,
     slots: Vec<usize>,
+}
+
+impl ValueCapture {
+    /// Cheap necessary domain/operator filter for this capture's producer.
+    /// This is not a match. Captures without a pattern producer accept any node.
+    pub fn is_producer_candidate(&self, node: &crate::Node) -> bool {
+        self.plans.iter().zip(&self.slots).any(|(plan, &slot)| {
+            plan.producers[slot].is_none_or(|ordinal| plan.nodes[ordinal].operator_matches(node))
+        })
+    }
 }
 
 /// Pre-validated attribute key; lookups borrow the original attribute payload.
@@ -394,6 +419,64 @@ impl<'g> MatchSession<'g> {
         self.match_at_where(pattern, root, options, |_| Ok(true))
     }
 
+    /// Find the first matching producer on a bounded, positional input path.
+    ///
+    /// Includes the producer of `value`, then follows `input_slot` of each
+    /// visited node. Stops at a graph input/initializer/missing slot or after
+    /// `max_nodes` producers. Traversal stays in this graph; it does not enter
+    /// bodies or infer algebraic equivalence. All attempts share one budget.
+    pub fn match_upstream(
+        &self,
+        pattern: &Pattern,
+        mut value: ValueId,
+        input_slot: usize,
+        max_nodes: usize,
+        options: MatchOptions,
+    ) -> Result<Option<Match<'g>>> {
+        require_operator_entry(pattern)?;
+        let graph = self.scopes[0].graph;
+        if graph.try_value(value).is_none() {
+            return Err(graph_error(format!(
+                "upstream search value {value:?} is not live; use a value from this session's graph"
+            )));
+        }
+        let mut budget = options.budget;
+        for _ in 0..max_nodes {
+            tick(&mut budget.steps, "upstream traversal budget")?;
+            let Some(producer) = graph.value(value).producer else {
+                return Ok(None);
+            };
+            let mut found = None;
+            self.run(
+                pattern,
+                0,
+                Some(producer),
+                false,
+                options.boundary,
+                &mut budget,
+                0,
+                &mut |matched| {
+                    found = Some(matched);
+                    Ok(false)
+                },
+            )?;
+            if found.is_some() {
+                return Ok(found);
+            }
+            let Some(next) = graph
+                .node(producer)
+                .inputs
+                .get(input_slot)
+                .copied()
+                .flatten()
+            else {
+                return Ok(None);
+            };
+            value = next;
+        }
+        Ok(None)
+    }
+
     /// Rejecting a complete graph candidate tries the next assignment/plan.
     /// Predicate errors propagate without retry. Callbacks must be read-only.
     pub fn match_at_where(
@@ -450,7 +533,7 @@ impl<'g> MatchSession<'g> {
         let mut roots = BTreeSet::new();
         require_operator_entry(pattern)?;
         for plan in pattern.plans.iter() {
-            let node = plan.nodes.last().expect("verified anchor");
+            let node = &plan.nodes[plan.anchor.unwrap_or(plan.nodes.len() - 1)];
             if node.op == "*" {
                 roots.extend(self.scopes[0].graph.nodes.keys());
             } else if let Some(bucket) = self.scopes[0]
@@ -464,6 +547,9 @@ impl<'g> MatchSession<'g> {
         let mut budget = options.budget;
         let mut matches = Vec::new();
         for root in roots {
+            if options.budget_scope == MatchBudgetScope::Root {
+                budget = options.budget;
+            }
             self.run(
                 pattern,
                 0,
@@ -704,7 +790,7 @@ impl<'g> MatchSession<'g> {
             } else if !self.bind_node(
                 plan,
                 scope,
-                plan.nodes.len() - 1,
+                plan.anchor.unwrap_or(plan.nodes.len() - 1),
                 root.expect("operator root"),
                 &mut state,
                 boundary,
@@ -748,6 +834,40 @@ impl<'g> MatchSession<'g> {
         let plan = &pattern.plans[selected];
         let prepared = &self.scopes[scope];
         let graph = prepared.graph;
+        // A connected step selects one present output as its downstream edge.
+        // Defer this choice until the node is bound, then use ordinary binding
+        // and enumeration so failures roll back without a second search engine.
+        for (ordinal, expected) in plan.nodes.iter().enumerate() {
+            if expected.signature != (NodeSignature::Connected { terminal: false }) {
+                continue;
+            }
+            let Some(actual) = state.nodes[ordinal] else {
+                continue;
+            };
+            let slot = expected.outputs[0];
+            if state.values[slot].is_some() {
+                continue;
+            }
+            for output in graph.node(actual).output_values() {
+                let mut branch = state.clone();
+                if bind_value(plan, &mut branch, slot, Some(output))
+                    && !self.enumerate(
+                        pattern,
+                        selected,
+                        scope,
+                        branch,
+                        whole,
+                        boundary,
+                        budget,
+                        depth + 1,
+                        visitor,
+                    )?
+                {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
         if state.nodes.iter().all(Option::is_some) {
             tick(&mut budget.candidates, "candidate budget")?;
             let Some((dimensions, elements)) = annotations(plan, prepared, &state, budget)? else {
@@ -833,8 +953,25 @@ impl<'g> MatchSession<'g> {
                     continue;
                 };
                 let index = view.value_index(actual).expect("validated live value");
+                let mut previous_connected_consumer = None;
                 for usage in view.consumers(index) {
+                    if matches!(
+                        plan.nodes[ordinal].signature,
+                        NodeSignature::Connected { .. }
+                    ) {
+                        if previous_connected_consumer == Some(usage.node) {
+                            continue;
+                        }
+                        previous_connected_consumer = Some(usage.node);
+                    }
                     let expected_input = match plan.nodes[ordinal].rest {
+                        _ if matches!(
+                            plan.nodes[ordinal].signature,
+                            NodeSignature::Connected { .. }
+                        ) =>
+                        {
+                            None
+                        }
                         None => Some(input_slot),
                         Some(rest) if input_slot < rest => Some(input_slot),
                         Some(rest) if input_slot > rest => state.sequences
@@ -903,13 +1040,33 @@ impl<'g> MatchSession<'g> {
         };
         let expected = &plan.nodes[ordinal];
         if state.nodes.contains(&Some(actual))
-            || (expected.op != "*"
-                && (node.op_type != expected.op
-                    || crate::normalize_domain(&node.domain) != expected.domain))
-            || node.outputs.len() != expected.outputs.len()
-            || (expected.rest.is_none() && node.inputs.len() > expected.inputs.len())
+            || !expected.operator_matches(node)
+            || (expected.signature == NodeSignature::Positional
+                && (node.outputs.len() != expected.outputs.len()
+                    || (expected.rest.is_none() && node.inputs.len() > expected.inputs.len())))
+            || (expected.signature == (NodeSignature::Connected { terminal: true })
+                && node.outputs.len() != 1)
         {
             return Ok(false);
+        }
+        if let NodeSignature::Connected { terminal } = expected.signature {
+            for &slot in &expected.inputs {
+                let Some(Some(value)) = state.values[slot] else {
+                    return Err(PatternError::new(
+                        PatternErrorKind::InvalidPattern,
+                        SourceSpan::default(),
+                        "connected step has no bound predecessor; anchor the chain at its first operator",
+                    ));
+                };
+                if !node.inputs.contains(&Some(value)) {
+                    return Ok(false);
+                }
+            }
+            if terminal && !bind_value(plan, state, expected.outputs[0], node.outputs[0]) {
+                return Ok(false);
+            }
+            state.nodes[ordinal] = Some(actual);
+            return Ok(true);
         }
         let graph_constraints: usize = expected
             .attributes
