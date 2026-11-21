@@ -28,6 +28,14 @@
 //!
 //! # How it goes fast
 //!
+//! ARM64 uses a pack-free NEON register tile: up to four rows share each
+//! eight-column B load. Tile rows are bounded by rows per worker so reuse
+//! does not reduce available parallelism. Single-row and narrow-column work
+//! keeps the compiler-vectorized portable route. No dot-product extension or
+//! resident packed copy is required; all multiplication accumulates in i32.
+//!
+//! On x86:
+//!
 //! `vpmaddwd` (`_mm256_madd_epi16`) multiplies eight *pairs* of `i16` and sums
 //! each pair into an `i32`: 16 multiply-accumulates per instruction, against
 //! four for the widen-and-`vpmulld` shape LLVM produces from the scalar loop.
@@ -212,7 +220,7 @@ pub(crate) fn qgemm(
 }
 
 /// The `sum_k (a_ik - za_i) * b_kj` half. Dispatches to the AVX2 kernel when
-/// the host has it and falls back to the portable loop otherwise.
+/// the host has it, or row-reusing NEON on ARM64; otherwise uses the portable loop.
 fn accumulate_products(
     a: Operand<'_>,
     b: Operand<'_>,
@@ -228,11 +236,155 @@ fn accumulate_products(
         unsafe { accumulate_products_avx2(a, b, a_zero_points, m, k, n, products) };
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: the runtime probe establishes NEON availability.
+        unsafe { accumulate_products_neon(a, b, a_zero_points, m, k, n, products) };
+        return;
+    }
     accumulate_products_scalar(a, b, a_zero_points, m, k, n, products);
 }
 
+/// Four rows reuse each borrowed eight-byte B load. Accumulators stay in
+/// registers across K; no packed weight copy or scratch panel is allocated.
+/// Widen B to i32 before multiplying so every signedness and wrapping sum has
+/// exactly the portable loop's semantics, without saturating intermediates.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn accumulate_products_neon(
+    a: Operand<'_>,
+    b: Operand<'_>,
+    a_zero_points: &[i32],
+    m: usize,
+    k: usize,
+    n: usize,
+    products: &mut [i32],
+) {
+    use std::arch::aarch64::*;
+
+    let workers = if m * n * k >= PARALLEL_MIN_WORK {
+        rayon::current_num_threads()
+    } else {
+        1
+    };
+    // Reuse B across rows only when the tile leaves at least one task per
+    // worker. A single row has no reuse to amortize the strided tile traversal;
+    // the compiler-vectorized contiguous loop is the better route there.
+    let rows_per_tile = (m / workers).clamp(1, 4);
+    if rows_per_tile == 1 || n < 8 {
+        accumulate_products_scalar(a, b, a_zero_points, m, k, n, products);
+        return;
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn tile<const ROWS: usize>(
+        a: Operand<'_>,
+        b: Operand<'_>,
+        a_zero_points: &[i32],
+        k: usize,
+        n: usize,
+        row_start: usize,
+        out: &mut [i32],
+    ) {
+        // Reuse requires at least two rows that actually contribute. Keep
+        // the portable loop's zero-activation skip when a tile is empty or
+        // has only one active row, rather than scanning B for zero products.
+        let contributing = (0..ROWS)
+            .filter(|&row| {
+                let global = row_start + row;
+                (0..k).any(|inner| a.at(global * k + inner) != a_zero_points[global])
+            })
+            .take(2)
+            .count();
+        if contributing < 2 {
+            let start = row_start * k;
+            accumulate_products_scalar(
+                Operand {
+                    bytes: &a.bytes[start..start + ROWS * k],
+                    signed: a.signed,
+                },
+                b,
+                &a_zero_points[row_start..row_start + ROWS],
+                ROWS,
+                k,
+                n,
+                out,
+            );
+            return;
+        }
+        // SAFETY: called only under the feature proof above. Every vector
+        // accesses eight columns within one row; ragged columns are scalar.
+        unsafe {
+            for col in (0..n / 8 * 8).step_by(8) {
+                let mut lo = [vdupq_n_s32(0); 4];
+                let mut hi = [vdupq_n_s32(0); 4];
+                for row in 0..ROWS {
+                    lo[row] = vld1q_s32(out.as_ptr().add(row * n + col));
+                    hi[row] = vld1q_s32(out.as_ptr().add(row * n + col + 4));
+                }
+                for inner in 0..k {
+                    let raw = vld1_u8(b.bytes.as_ptr().add(inner * n + col));
+                    let wide = if b.signed {
+                        vmovl_s8(vreinterpret_s8_u8(raw))
+                    } else {
+                        vreinterpretq_s16_u16(vmovl_u8(raw))
+                    };
+                    let bl = vmovl_s16(vget_low_s16(wide));
+                    let bh = vmovl_high_s16(wide);
+                    for row in 0..ROWS {
+                        let global_row = row_start + row;
+                        let av = a
+                            .at(global_row * k + inner)
+                            .wrapping_sub(a_zero_points[global_row]);
+                        lo[row] = vmlaq_n_s32(lo[row], bl, av);
+                        hi[row] = vmlaq_n_s32(hi[row], bh, av);
+                    }
+                }
+                for row in 0..ROWS {
+                    vst1q_s32(out.as_mut_ptr().add(row * n + col), lo[row]);
+                    vst1q_s32(out.as_mut_ptr().add(row * n + col + 4), hi[row]);
+                }
+            }
+            for row in 0..ROWS {
+                let global_row = row_start + row;
+                for col in n / 8 * 8..n {
+                    let mut acc = out[row * n + col];
+                    for inner in 0..k {
+                        let av = a
+                            .at(global_row * k + inner)
+                            .wrapping_sub(a_zero_points[global_row]);
+                        acc = acc.wrapping_add(av.wrapping_mul(b.at(inner * n + col)));
+                    }
+                    out[row * n + col] = acc;
+                }
+            }
+        }
+    }
+    // SAFETY: NEON is established by this function's caller; chunks below
+    // contain one through four complete output rows.
+    let block = |row_start: usize, out: &mut [i32]| unsafe {
+        match out.len() / n {
+            1 => tile::<1>(a, b, a_zero_points, k, n, row_start, out),
+            2 => tile::<2>(a, b, a_zero_points, k, n, row_start, out),
+            3 => tile::<3>(a, b, a_zero_points, k, n, row_start, out),
+            4 => tile::<4>(a, b, a_zero_points, k, n, row_start, out),
+            _ => unreachable!(),
+        }
+    };
+    if workers > 1 {
+        products
+            .par_chunks_mut(rows_per_tile * n)
+            .enumerate()
+            .for_each(|(index, out)| block(index * rows_per_tile, out));
+    } else {
+        for (index, out) in products.chunks_mut(rows_per_tile * n).enumerate() {
+            block(index * rows_per_tile, out);
+        }
+    }
+}
+
 /// Portable reference: the loop shape this module replaces, on bytes instead of
-/// widened `i32`. Also the oracle the AVX2 kernel is proven bit-equal against.
+/// widened `i32`. Also the oracle both SIMD kernels are proven bit-equal against.
 fn accumulate_products_scalar(
     a: Operand<'_>,
     b: Operand<'_>,
@@ -955,8 +1107,8 @@ mod tests {
             .collect()
     }
 
-    /// `qgemm` with the AVX2 arm forced off, so the portable path is covered on
-    /// a host that has AVX2.
+    /// `qgemm` with SIMD dispatch forced off, so the portable path is covered
+    /// even on a host with AVX2 or NEON.
     fn portable(
         a: Operand<'_>,
         b: Operand<'_>,
@@ -1029,6 +1181,96 @@ mod tests {
                 for b_signed in [false, true] {
                     check(m, k, n, a_signed, b_signed);
                 }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn neon_tiles_match_portable_with_ragged_rows_columns_and_seeded_accumulators() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        for m in 1..=9 {
+            for n in 1..=19 {
+                for k in [0, 1, 3, 33] {
+                    let a_bytes = bytes(m * k, 7);
+                    let b_bytes = bytes(k * n, 13);
+                    for a_signed in [false, true] {
+                        for b_signed in [false, true] {
+                            let a = Operand {
+                                bytes: &a_bytes,
+                                signed: a_signed,
+                            };
+                            let b = Operand {
+                                bytes: &b_bytes,
+                                signed: b_signed,
+                            };
+                            // Arbitrary i32 zero points also prove no accidental
+                            // narrowing of the centered activation in SIMD.
+                            let az: Vec<_> = (0..m)
+                                .map(|r| [i32::MIN, i32::MAX, -128, 255][r % 4])
+                                .collect();
+                            let mut expected = vec![i32::MAX - 17; m * n];
+                            let mut actual = expected.clone();
+                            pool.install(|| {
+                                accumulate_products_scalar(a, b, &az, m, k, n, &mut expected);
+                                // SAFETY: host NEON probe above; all operand and
+                                // accumulator slices have the declared extents.
+                                unsafe {
+                                    accumulate_products_neon(a, b, &az, m, k, n, &mut actual)
+                                };
+                            });
+                            assert_eq!(
+                                actual, expected,
+                                "{m}x{k}x{n}, signed={a_signed}/{b_signed}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn neon_preserves_zero_activation_rows_and_existing_output() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let (m, k, n) = (9, 67, 23);
+        let b_bytes = bytes(k * n, 13);
+        let b = Operand {
+            bytes: &b_bytes,
+            signed: true,
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        for signed in [false, true] {
+            for active_rows in [&[][..], &[8][..], &[0, 1, 8][..]] {
+                let mut a_bytes = vec![0x80; m * k];
+                for &row in active_rows {
+                    a_bytes[row * k + 3] = 0xff;
+                }
+                let a = Operand {
+                    bytes: &a_bytes,
+                    signed,
+                };
+                let az = vec![if signed { -128 } else { 128 }; m];
+                let mut expected = vec![i32::MAX; m * n];
+                let mut actual = expected.clone();
+                pool.install(|| {
+                    accumulate_products_scalar(a, b, &az, m, k, n, &mut expected);
+                    // SAFETY: NEON probe above; slices cover all extents.
+                    unsafe { accumulate_products_neon(a, b, &az, m, k, n, &mut actual) };
+                });
+                assert_eq!(actual, expected, "signed={signed}, active={active_rows:?}");
             }
         }
     }
@@ -1194,33 +1436,35 @@ mod tests {
     /// disjoint, so this is a claim about the code, not about floating point.
     #[test]
     fn the_thread_count_cannot_change_the_result() {
-        let (m, k, n) = (6usize, 300usize, 1100usize);
-        let a_bytes = bytes(m * k, 0x4242);
-        let b_bytes = bytes(k * n, 0x2424);
-        let a = Operand {
-            bytes: &a_bytes,
-            signed: true,
-        };
-        let b = Operand {
-            bytes: &b_bytes,
-            signed: false,
-        };
-        let az = zero_points(m, true, 5);
-        let bz = zero_points(n, false, 6);
-        let mut reference = vec![0i32; m * n];
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap()
-            .install(|| qgemm(a, b, &az, &bz, m, k, n, &mut reference));
-        for threads in [2usize, 3, 8] {
-            let mut got = vec![0i32; m * n];
+        for m in [5usize, 6, 9, 17] {
+            let (k, n) = (300usize, 1100usize);
+            let a_bytes = bytes(m * k, 0x4242);
+            let b_bytes = bytes(k * n, 0x2424);
+            let a = Operand {
+                bytes: &a_bytes,
+                signed: true,
+            };
+            let b = Operand {
+                bytes: &b_bytes,
+                signed: false,
+            };
+            let az = zero_points(m, true, 5);
+            let bz = zero_points(n, false, 6);
+            let mut reference = vec![0i32; m * n];
             rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
+                .num_threads(1)
                 .build()
                 .unwrap()
-                .install(|| qgemm(a, b, &az, &bz, m, k, n, &mut got));
-            assert_eq!(got, reference, "{threads} threads changed the result");
+                .install(|| qgemm(a, b, &az, &bz, m, k, n, &mut reference));
+            for threads in [2usize, 3, 8] {
+                let mut got = vec![0i32; m * n];
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| qgemm(a, b, &az, &bz, m, k, n, &mut got));
+                assert_eq!(got, reference, "{threads} threads changed the result");
+            }
         }
     }
 
@@ -1257,13 +1501,16 @@ mod tests {
     /// ratio means anything. This measures the kernel alone, which is what a
     /// blocking or threshold change actually moves.
     ///
-    /// `portable` is the control arm. It is the same arithmetic with none of
-    /// the blocking, so it must not move when a SIMD constant is retuned; if it
-    /// does, the box was busy and the run says nothing.
+    /// Measures only `sum_k (a - za) * b`, not the row sums, B zero-point
+    /// correction or requantization. Both routes accumulate into identical
+    /// buffers in the same explicit pool. `native_control` repeats the native
+    /// route as an A/A null; `portable` is the compiler-vectorized byte loop.
+    /// A microkernel result is not an end-to-end or MLAS graduation claim.
     ///
     /// Run: `cargo test -p onnx-runtime-ep-cpu --lib --release bench_qgemm_ab \
     ///   -- --ignored --nocapture`. Knobs: `QGEMM_AB_ITERS`, `QGEMM_AB_THREADS`
-    /// (comma-separated), `QGEMM_AB_SHAPES` (`mxkxn`, comma-separated).
+    /// (comma-separated), `QGEMM_AB_SHAPES` (`mxkxn`, comma-separated),
+    /// `QGEMM_AB_TYPES` (`u8xu8,u8xi8,i8xu8,i8xi8`).
     #[test]
     #[ignore = "manual perf harness; run explicitly"]
     fn bench_qgemm_ab() {
@@ -1279,13 +1526,22 @@ mod tests {
                 .collect()
         };
         let iters: usize = std::env::var("QGEMM_AB_ITERS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(21);
+            .unwrap_or_else(|_| "21".into())
+            .parse()
+            .expect("QGEMM_AB_ITERS must be a positive integer");
+        assert!(iters > 0, "QGEMM_AB_ITERS must be greater than zero");
         let threads: Vec<usize> = parse("QGEMM_AB_THREADS", "1,2,4,8,16")
             .iter()
-            .filter_map(|value| value.parse().ok())
+            .map(|value| {
+                value
+                    .parse()
+                    .expect("QGEMM_AB_THREADS must contain positive integers")
+            })
             .collect();
+        assert!(
+            threads.iter().all(|&count| count > 0),
+            "QGEMM_AB_THREADS entries must be greater than zero"
+        );
         // Qwen2.5-14B-style quantized shapes: decode (m=1), a short prefill
         // (m=4, the last shape the pack-free kernel takes) and prefill (m=128).
         let shapes: Vec<(usize, usize, usize)> = parse(
@@ -1293,56 +1549,134 @@ mod tests {
             "1x2048x2048,1x5120x5120,4x2048x2048,128x2048x2048,128x5120x5120",
         )
         .iter()
-        .filter_map(|spec| {
-            let mut parts = spec.split('x').filter_map(|value| value.parse().ok());
-            Some((parts.next()?, parts.next()?, parts.next()?))
+        .map(|spec| {
+            let parts: Vec<usize> = spec
+                .split('x')
+                .map(|value| {
+                    value
+                        .parse()
+                        .expect("QGEMM_AB_SHAPES must contain mxkxn positive integer triples")
+                })
+                .collect();
+            assert!(
+                parts.len() == 3 && parts.iter().all(|&v| v > 0),
+                "QGEMM_AB_SHAPES: expected mxkxn with positive extents, got {spec:?}"
+            );
+            (parts[0], parts[1], parts[2])
         })
         .collect();
 
-        println!("shape,threads,arm,p50_ms,gmacs");
-        for &(m, k, n) in &shapes {
-            let a_bytes = bytes(m * k, 0x1111_2222);
-            let b_bytes = bytes(k * n, 0x3333_4444);
-            let a = Operand {
-                bytes: &a_bytes,
-                signed: false,
-            };
-            let b = Operand {
-                bytes: &b_bytes,
-                signed: false,
-            };
-            let az = zero_points(m, false, 1);
-            let bz = zero_points(n, false, 2);
-            let mut products = vec![0i32; m * n];
-            for &count in &threads {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(count)
-                    .build()
-                    .unwrap();
-                for arm in ["native", "portable"] {
-                    // The control is serial by construction and quadratically
-                    // slower, so it is measured once per shape, not per thread.
-                    if arm == "portable" && (count != threads[0] || m * k * n > 1 << 26) {
-                        continue;
-                    }
-                    let mut samples = Vec::with_capacity(iters);
-                    for _ in 0..iters {
-                        products.iter_mut().for_each(|value| *value = 0);
-                        let start = Instant::now();
-                        match arm {
-                            "native" => {
-                                pool.install(|| qgemm(a, b, &az, &bz, m, k, n, &mut products))
+        // CPU time includes every process thread, so spin and oversubscription
+        // remain visible alongside elapsed latency. Unsupported platforms are
+        // explicit rather than silently labelling wall time as CPU time.
+        fn cpu_ms() -> Option<f64> {
+            #[cfg(unix)]
+            {
+                let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+                // SAFETY: getrusage initializes the supplied rusage on success.
+                let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+                assert_eq!(
+                    status,
+                    0,
+                    "QGEMM A/B: getrusage failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: successful getrusage initialized this structure.
+                let usage = unsafe { usage.assume_init() };
+                Some(
+                    (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64 * 1e3
+                        + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1e3,
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        }
+
+        let types: Vec<_> = parse("QGEMM_AB_TYPES", "u8xu8")
+            .into_iter()
+            .map(|label| {
+                let (a_signed, b_signed) = match label.as_str() {
+                    "u8xu8" => (false, false),
+                    "u8xi8" => (false, true),
+                    "i8xu8" => (true, false),
+                    "i8xi8" => (true, true),
+                    _ => panic!("QGEMM_AB_TYPES: expected u8xu8,u8xi8,i8xu8,i8xi8; got {label:?}"),
+                };
+                (label, a_signed, b_signed)
+            })
+            .collect();
+        println!("shape,dtypes,threads,arm,wall_p50_ms,cpu_p50_ms,wall_gmacs");
+        for (dtypes, a_signed, b_signed) in types {
+            for &(m, k, n) in &shapes {
+                let a_bytes = bytes(m * k, 0x1111_2222);
+                let b_bytes = bytes(k * n, 0x3333_4444);
+                let a = Operand {
+                    bytes: &a_bytes,
+                    signed: a_signed,
+                };
+                let b = Operand {
+                    bytes: &b_bytes,
+                    signed: b_signed,
+                };
+                let az = zero_points(m, a_signed, 1);
+                let mut products = vec![0i32; m * n];
+                for &count in &threads {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(count)
+                        .build()
+                        .unwrap();
+                    // Both arms run the same accumulation contract in the same
+                    // pool. In particular, the portable control must not escape
+                    // to Rayon's ambient pool while native uses `count` workers.
+                    let mut native = vec![0i32; m * n];
+                    let mut portable = vec![0i32; m * n];
+                    pool.install(|| {
+                        accumulate_products(a, b, &az, m, k, n, &mut native);
+                        accumulate_products_scalar(a, b, &az, m, k, n, &mut portable);
+                    });
+                    assert_eq!(native, portable, "{m}x{k}x{n}, {count} workers");
+                    let mut samples: [Vec<f64>; 3] =
+                        std::array::from_fn(|_| Vec::with_capacity(iters));
+                    let mut cpu_samples: [Vec<f64>; 3] =
+                        std::array::from_fn(|_| Vec::with_capacity(iters));
+                    for iteration in 0..iters {
+                        // Rotate first arm. The third arm repeats native as an
+                        // A/A control for order, thermal and pool-wakeup effects.
+                        for offset in 0..3 {
+                            let arm = (iteration + offset) % 3;
+                            products.fill(0);
+                            let cpu_start = cpu_ms();
+                            let start = Instant::now();
+                            pool.install(|| {
+                                if arm != 1 {
+                                    accumulate_products(a, b, &az, m, k, n, &mut products);
+                                } else {
+                                    accumulate_products_scalar(a, b, &az, m, k, n, &mut products);
+                                }
+                            });
+                            samples[arm].push(start.elapsed().as_secs_f64() * 1e3);
+                            if let (Some(start), Some(end)) = (cpu_start, cpu_ms()) {
+                                cpu_samples[arm].push(end - start);
                             }
-                            _ => {
-                                accumulate_products_scalar(a, b, &az, m, k, n, &mut products);
-                            }
+                            std::hint::black_box(&products);
                         }
-                        samples.push(start.elapsed().as_secs_f64() * 1e3);
                     }
-                    samples.sort_by(f64::total_cmp);
-                    let p50 = samples[samples.len() / 2];
-                    let gmacs = (m * k * n) as f64 / (p50 * 1e-3) / 1e9;
-                    println!("{m}x{k}x{n},{count},{arm},{p50:.4},{gmacs:.2}");
+                    for (index, arm) in ["native", "portable", "native_control"]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        samples[index].sort_by(f64::total_cmp);
+                        cpu_samples[index].sort_by(f64::total_cmp);
+                        let p50 = samples[index][iters / 2];
+                        let cpu = cpu_samples[index]
+                            .get(iters / 2)
+                            .map(|v| format!("{v:.4}"))
+                            .unwrap_or_else(|| "unavailable".into());
+                        let gmacs = (m * k * n) as f64 / (p50 * 1e-3) / 1e9;
+                        println!("{m}x{k}x{n},{dtypes},{count},{arm},{p50:.4},{cpu},{gmacs:.2}");
+                    }
                 }
             }
         }

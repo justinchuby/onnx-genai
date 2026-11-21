@@ -338,7 +338,8 @@ pub const PLAN: &[PlanEntry] = &[
         planned: Backend::Mlas,
         gate: RouteGate::WhereverLinked,
         dtypes: "u8xu8, u8xi8 integer GEMM with i32 accumulation",
-        isa: "MLAS QGemm dispatch (AVX2 / AVX-VNNI / AVX-512 VNNI, NEON udot/sdot)",
+        isa: "native AVX2 or row-reusing NEON with portable fallback; \
+              MLAS QGemm dispatch (AVX2 / AVX-VNNI / AVX-512 VNNI, NEON udot/sdot)",
         threads: "MLAS partitions; requantization runs inside MLAS the way ORT does (#1125)",
         shape_gate: "all shapes where MLAS reports the zero-point/signedness combination exact; \
                      otherwise the native i32 reference runs",
