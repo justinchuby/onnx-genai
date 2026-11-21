@@ -657,7 +657,7 @@ fn unavailable_cuda_error_is_actionable() {
 fn auto_default_providers_are_macos_only() {
     // MLX/Metal auto-selection is gated to macOS; every other platform keeps
     // the plain CPU default regardless of environment.
-    assert!(super::auto_default_execution_providers().is_none());
+    assert!(super::options::auto_default_execution_providers().is_none());
 }
 
 #[cfg(not(feature = "cuda"))]

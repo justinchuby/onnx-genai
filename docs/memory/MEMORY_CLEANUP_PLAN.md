@@ -135,3 +135,24 @@ PyPI metadata, and checked all three bundled headers byte-for-byte against the
 verified Microsoft NuGet package. Bootstrap rejects digest mismatches and unsafe
 archive paths before extraction. The EP capacity callback remains explicitly
 unsupported; no device-global capacity is inferred from a process budget.
+
+## Pre-merge self-review
+
+Reviewed the complete PR again before merging, including allocation-contract
+imports, reservation trait users, configuration initialization, artifact hashes,
+ZIP extraction, cache completeness, loader version selection and API 32's optional
+factory callback.
+
+- Fixed the runtime smoke test to select CPU explicitly. A default EP could be
+  influenced by ambient GPU/MLX settings and would not prove CPU-only execution.
+- Scoped non-macOS EP test imports/helpers to their test platform and removed a
+  test-only forwarding import. This resolves the strict macOS lint findings
+  without changing runtime selection or skipping any runnable test.
+- `cargo clippy --offline -p onnx-genai-ort --all-targets -- -D warnings` passed.
+- `cargo test --offline -p onnx-genai-ort --test runtime_upgrade --test execution_provider`
+  passed: CPU inference and CPU-provider enumeration both executed successfully.
+- Publish-order, documented-environment-variable, documented-command and
+  feature-gate checks passed. Existing GPU-dependent validation remains deferred.
+
+Merge is conditional on the required checks for the final reviewed commit;
+branch protection is not bypassed.

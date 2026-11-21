@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use onnx_genai_ort::{Environment, Session, SessionOptions, Value};
+use onnx_genai_ort::{Environment, Session, SessionOptions, Value, ep_selection};
 
 #[test]
 fn pinned_runtime_executes_cpu_identity_model() {
@@ -10,7 +10,7 @@ fn pinned_runtime_executes_cpu_identity_model() {
     let session = Session::new(
         &env,
         &path,
-        SessionOptions::default().with_intra_op_threads(1),
+        SessionOptions::with_execution_provider(ep_selection("cpu")).with_intra_op_threads(1),
     )
     .expect("CPU identity session");
     let input = Value::from_slice_f32(&[1.0, -2.5, 0.0], &[3]).expect("input tensor");
