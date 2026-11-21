@@ -142,3 +142,28 @@ pub fn extract_native_libraries(
     }
     Ok(())
 }
+
+/// Publish the standard loader/linker names beside a versioned Unix runtime.
+/// PyPI wheels contain only the versioned file, unlike the release archives.
+#[cfg(unix)]
+pub fn ensure_runtime_links(
+    lib_dir: &Path,
+    versioned: &str,
+    aliases: &[&str],
+) -> Result<(), String> {
+    let runtime = lib_dir.join(versioned);
+    if !runtime.is_file() {
+        return Err(format!(
+            "cannot publish ONNX Runtime library names: {} is missing; remove the incomplete cache and retry",
+            runtime.display()
+        ));
+    }
+    for alias in aliases {
+        let path = lib_dir.join(alias);
+        if !path.exists() {
+            std::os::unix::fs::symlink(versioned, &path)
+                .map_err(|e| format!("cannot create ONNX Runtime link {} -> {versioned}: {e}; check directory permissions or remove the incomplete cache", path.display()))?;
+        }
+    }
+    Ok(())
+}

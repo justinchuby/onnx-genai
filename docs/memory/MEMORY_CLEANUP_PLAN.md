@@ -156,3 +156,23 @@ factory callback.
 
 Merge is conditional on the required checks for the final reviewed commit;
 branch protection is not bypassed.
+
+
+### CI follow-up review
+
+- Fixed a real bootstrap regression: PyPI wheels contain versioned Unix runtime
+  files only. Publish both major and unversioned relative links, including repair
+  of already-populated caches; regression coverage exercises Linux/macOS names,
+  idempotence, incomplete-cache errors and old-cache repair.
+- Full CPU ORT integration execution exposed three unary assignment tests missing
+  the shared plugin lock. Add the lock at their test boundaries so rejection
+  tests retain their zero-compile/zero-execution counter assertions.
+- ORT 1.32 now executes the 512-wide quantization block previously rejected by
+  older runtimes. Require numerical parity for this case and correct the docs.
+- Remove Windows ARM64's stale Visual Studio 2022 generator override; retain the
+  native build script's existing Ninja/installed-toolchain discovery.
+- Validation: eight bootstrap tests plus one real C API test; strict sys Clippy;
+  all 65 runnable CPU plugin ORT integration tests passed with
+  `NXRT_REQUIRE_ORT_TESTS=1` (one pre-existing ignored test). Workflow integrity,
+  required-tier coverage and whitespace checks passed. Windows verification
+  remains delegated to the actual CI runner, not inferred from this Mac.

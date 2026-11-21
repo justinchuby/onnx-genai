@@ -315,19 +315,16 @@ fn ensure_major_version_runtime_link(lib_dir: &Path) {
         );
     }
 
-    if major_path.exists() {
-        configure_macos_install_names(lib_dir, &major_path, &versioned_path);
-        return;
-    }
-
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&versioned_name, &major_path).unwrap_or_else(|err| {
-        panic!(
-            "Failed to create ONNX Runtime major-version symlink {} -> {}: {err}",
-            major_path.display(),
-            versioned_name
-        )
-    });
+    {
+        let unversioned = if target_os() == "macos" {
+            "libonnxruntime.dylib"
+        } else {
+            "libonnxruntime.so"
+        };
+        build_support::ensure_runtime_links(lib_dir, &versioned_name, &[major_name, unversioned])
+            .unwrap_or_else(|message| panic!("{message}"));
+    }
 
     configure_macos_install_names(lib_dir, &major_path, &versioned_path);
 }

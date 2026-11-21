@@ -187,3 +187,50 @@ fn bundled_headers_match_the_runtime_api() {
     assert!(root.join("onnxruntime_ep_c_api.h").is_file());
     assert!(root.join("onnxruntime_error_code.h").is_file());
 }
+
+#[cfg(unix)]
+#[test]
+fn wheel_runtime_is_discoverable_through_standard_library_names() {
+    for (versioned, major, unversioned) in [
+        (
+            "libonnxruntime.1.32.0.dylib",
+            "libonnxruntime.1.dylib",
+            "libonnxruntime.dylib",
+        ),
+        (
+            "libonnxruntime.so.1.32.0",
+            "libonnxruntime.so.1",
+            "libonnxruntime.so",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let name = format!("onnxruntime/capi/{versioned}");
+        let wheel = fixture.wheel(&[(&name, b"native runtime")]);
+        let lib = fixture.0.join("lib");
+        extract_native_libraries(&wheel, &lib, versioned).unwrap();
+        assert!(
+            !lib.join(unversioned).exists(),
+            "wheel starts without the standard name"
+        );
+        build_support::ensure_runtime_links(&lib, versioned, &[major, unversioned]).unwrap();
+        for alias in [major, unversioned] {
+            assert_eq!(
+                std::fs::read_link(lib.join(alias)).unwrap(),
+                Path::new(versioned)
+            );
+            assert_eq!(std::fs::read(lib.join(alias)).unwrap(), b"native runtime");
+        }
+        // A cache produced before this fix may have only the major alias.
+        std::fs::remove_file(lib.join(unversioned)).unwrap();
+        build_support::ensure_runtime_links(&lib, versioned, &[major, unversioned]).unwrap();
+        assert!(lib.join(unversioned).is_file());
+        build_support::ensure_runtime_links(&lib, versioned, &[major, unversioned]).unwrap();
+    }
+    let fixture = Fixture::new();
+    let error =
+        build_support::ensure_runtime_links(&fixture.0, "missing.so", &["libonnxruntime.so"])
+            .unwrap_err();
+    assert!(error.contains("missing.so"));
+    assert!(error.contains("retry"));
+    assert!(!fixture.0.join("libonnxruntime.so").exists());
+}

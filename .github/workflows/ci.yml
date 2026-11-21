@@ -947,7 +947,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
-      CMAKE_GENERATOR: "Visual Studio 17 2022"
+      # Let the native build scripts discover Ninja/installed Visual Studio;
+      # windows-11-arm no longer guarantees Visual Studio 2022.
       # ARM64 Windows has the affinity backend, so the placement falsifiers are
       # answerable here and their silence would be a defect, not a platform fact.
       NXRT_REQUIRE_PLACEMENT_TESTS: "1"
