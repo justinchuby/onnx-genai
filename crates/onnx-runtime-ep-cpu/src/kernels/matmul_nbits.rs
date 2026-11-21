@@ -1224,6 +1224,30 @@ struct PackedNBitsWeight {
     zero_points: Option<Vec<u8>>,
 }
 
+/// Call-scoped wire-layout operands shared by owned and borrowed execution.
+/// No source tensor reference is retained in a kernel cache.
+#[derive(Clone, Copy)]
+struct PackedNBitsView<'a> {
+    values: &'a [u8],
+    scales: &'a [f32],
+    zero_points: Option<&'a [u8]>,
+}
+
+/// Ownership is necessary only when conversion or explicit placement requires it.
+enum PackedNBitsOperand<'a> {
+    View(PackedNBitsView<'a>),
+    Owned(PackedNBitsWeight),
+}
+
+impl PackedNBitsOperand<'_> {
+    fn view(&self) -> PackedNBitsView<'_> {
+        match self {
+            Self::View(view) => *view,
+            Self::Owned(weight) => weight.view(),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BorrowedScales<'a> {
     F32(&'a [f32]),
@@ -1389,6 +1413,16 @@ impl PackedNBitsBlock<'_> {
 }
 
 impl PackedNBitsWeight {
+    fn view(&self) -> PackedNBitsView<'_> {
+        PackedNBitsView {
+            values: &self.values,
+            scales: &self.scales,
+            zero_points: self.zero_points.as_deref(),
+        }
+    }
+}
+
+impl PackedNBitsView<'_> {
     fn row(&self, output: usize, block_count: usize, layout: NBitsLayout) -> PackedNBitsRow<'_> {
         let packed_row_size = block_count * layout.packed_block_size();
         let packed_start = output * packed_row_size;
@@ -1803,28 +1837,14 @@ impl Kernel for MatMulNBitsKernel {
             }
         }
         if self.bits == 2 && !self.weight_prepacked && group_indices.is_none() {
-            let owned_weight;
-            let packed_weight = if can_prepack {
-                if let Some(weight) = self.packed_nbits_weight.get() {
-                    weight
-                } else {
-                    let weight = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
-                    let weight = numa_place_nbits(weight, self.n);
-                    let _ = self.packed_nbits_weight.set(weight);
-                    self.packed_nbits_weight
-                        .get()
-                        .expect("constant MatMulNBits packed weight was just initialized")
-                }
-            } else {
-                let built = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
-                owned_weight = numa_place_nbits(built, self.n);
-                &owned_weight
-            };
+            let operand =
+                self.resolve_nbits_operand(&inputs[1], &inputs[2], zero_points, can_prepack)?;
+            let packed_weight = operand.view();
             if m == 1 {
                 with_decode_pool_lazy(|| {
                     packed_nbits_gemv(
                         &activations,
-                        packed_weight,
+                        &packed_weight,
                         result,
                         self.k,
                         self.n,
@@ -1835,7 +1855,7 @@ impl Kernel for MatMulNBitsKernel {
             } else {
                 packed_nbits_gemm(
                     &activations,
-                    packed_weight,
+                    &packed_weight,
                     result,
                     m,
                     self.k,
@@ -1961,28 +1981,14 @@ impl Kernel for MatMulNBitsKernel {
             // `i8`. Decode reads each weight exactly once, so that expansion
             // doubles the only stream that matters. This route consumes the
             // wire layout at 0.5 B/weight instead -- see `int4_nibble`.
-            let owned_weight;
-            let packed_weight = if can_prepack {
-                if let Some(weight) = self.packed_nbits_weight.get() {
-                    weight
-                } else {
-                    let weight = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
-                    let weight = numa_place_nbits(weight, self.n);
-                    let _ = self.packed_nbits_weight.set(weight);
-                    self.packed_nbits_weight
-                        .get()
-                        .expect("constant MatMulNBits packed nibble weight was just initialized")
-                }
-            } else {
-                let built = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
-                owned_weight = numa_place_nbits(built, self.n);
-                &owned_weight
-            };
+            let operand =
+                self.resolve_nbits_operand(&inputs[1], &inputs[2], zero_points, can_prepack)?;
+            let packed_weight = operand.view();
             record_int4_route(Int4Route::PackedNibble);
             with_decode_pool(|| {
                 int4_nibble_matmul(
                     &activations,
-                    packed_weight,
+                    &packed_weight,
                     result,
                     m,
                     self.k,
@@ -2370,6 +2376,42 @@ impl Kernel for MatMulNBitsKernel {
 }
 
 impl MatMulNBitsKernel {
+    /// The compact kernels consume ONNX wire bytes and f32 scales unchanged.
+    /// Borrow them when no conversion or NUMA/SPMD first-touch placement is
+    /// required; otherwise retain the existing prepared constant/temporary path.
+    fn resolve_nbits_operand<'a>(
+        &'a self,
+        packed: &TensorView<'a>,
+        scales: &TensorView<'a>,
+        zero_points: Option<&TensorView<'a>>,
+        can_prepack: bool,
+    ) -> Result<PackedNBitsOperand<'a>> {
+        if numa_decode_active().is_none()
+            && spmd_decode_active().is_none()
+            && let Some(view) = borrow_nbits_wire(packed, scales, zero_points)
+        {
+            return Ok(PackedNBitsOperand::View(view));
+        }
+        if can_prepack {
+            if let Some(weight) = self.packed_nbits_weight.get() {
+                return Ok(PackedNBitsOperand::View(weight.view()));
+            }
+            let weight = self.prepack_nbits_weight(packed, scales, zero_points)?;
+            let _ = self
+                .packed_nbits_weight
+                .set(numa_place_nbits(weight, self.n));
+            Ok(PackedNBitsOperand::View(
+                self.packed_nbits_weight
+                    .get()
+                    .expect("constant MatMulNBits packed weight was just initialized")
+                    .view(),
+            ))
+        } else {
+            let weight = self.prepack_nbits_weight(packed, scales, zero_points)?;
+            Ok(PackedNBitsOperand::Owned(numa_place_nbits(weight, self.n)))
+        }
+    }
+
     fn prepack_nbits_weight(
         &self,
         packed: &TensorView,
@@ -7227,7 +7269,7 @@ unsafe fn n16_sdot_bits8_quad_neon(
 #[allow(clippy::too_many_arguments)]
 fn packed_nbits_gemv(
     activation: &[f32],
-    weight: &PackedNBitsWeight,
+    weight: &PackedNBitsView<'_>,
     result: &mut [f32],
     k: usize,
     n: usize,
@@ -7242,7 +7284,7 @@ fn packed_nbits_gemv(
 #[allow(clippy::too_many_arguments)]
 fn packed_nbits_gemm(
     activations: &[f32],
-    weight: &PackedNBitsWeight,
+    weight: &PackedNBitsView<'_>,
     result: &mut [f32],
     m: usize,
     k: usize,
@@ -7273,7 +7315,7 @@ fn packed_nbits_gemm(
 #[allow(clippy::too_many_arguments)]
 fn packed_nbits_output_row(
     activation: &[f32],
-    weight: &PackedNBitsWeight,
+    weight: &PackedNBitsView<'_>,
     result: &mut [f32],
     k: usize,
     n: usize,
@@ -7361,6 +7403,27 @@ fn contiguous_host_addr(view: &TensorView) -> Option<usize> {
         return None;
     }
     Some(view.data_ptr::<u8>() as usize)
+}
+
+/// Every operand must already have the dtype and contiguous host layout
+/// consumed by the compact kernels. Half scales and strided inputs are prepared
+/// together instead, so constant conversion is still amortized across calls.
+fn borrow_nbits_wire<'a>(
+    packed: &TensorView<'a>,
+    scales: &TensorView<'a>,
+    zero_points: Option<&TensorView<'a>>,
+) -> Option<PackedNBitsView<'a>> {
+    if packed.dtype != DataType::Uint8
+        || scales.dtype != DataType::Float32
+        || zero_points.is_some_and(|points| points.dtype != DataType::Uint8)
+    {
+        return None;
+    }
+    Some(PackedNBitsView {
+        values: contiguous_host_slice(packed)?,
+        scales: contiguous_host_slice(scales)?,
+        zero_points: borrow_optional_packed_zero_points(zero_points)?,
+    })
 }
 
 fn borrowed_scales<'a>(view: &TensorView<'a>) -> Option<BorrowedScales<'a>> {
@@ -9174,7 +9237,7 @@ pub(crate) fn reset_int4_routes() {
 /// weight is the untouched ONNX packed tensor.
 fn int4_nibble_matmul(
     activations: &[f32],
-    weight: &PackedNBitsWeight,
+    weight: &PackedNBitsView<'_>,
     result: &mut [f32],
     m: usize,
     k: usize,
@@ -9214,7 +9277,7 @@ fn int4_nibble_matmul(
 
 fn int4_nibble_row(
     prepared: &int4_nibble::NibbleActivation,
-    weight: &PackedNBitsWeight,
+    weight: &PackedNBitsView<'_>,
     result: &mut [f32],
     k_blocks: usize,
     block_size: usize,
@@ -9225,9 +9288,9 @@ fn int4_nibble_row(
         let outputs_len = outputs.len();
         int4_nibble::nibble_outputs(
             prepared,
-            &weight.values,
-            &weight.scales,
-            weight.zero_points.as_deref(),
+            weight.values,
+            weight.scales,
+            weight.zero_points,
             output_start..output_start + outputs_len,
             outputs,
             k_blocks,
@@ -11482,6 +11545,179 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compact_nbits_wire_borrows_offsets_and_prepares_strided_operands_once() {
+        let (k, n, block) = (33usize, 3usize, 16usize);
+        let blocks = k.div_ceil(block);
+        let values = vec![0x39; n * blocks * block / 4];
+        let scales = vec![0.125; n * blocks];
+        let points = vec![0x12; n * blocks.div_ceil(4)];
+        for mask in 0..8 {
+            let steps: [usize; 3] = std::array::from_fn(|i| 1 + ((mask >> i) & 1));
+            let padded_bytes = |data: &[u8], step: usize| {
+                let mut bytes = vec![0; 1 + data.len() * step];
+                for (i, &value) in data.iter().enumerate() {
+                    bytes[1 + i * step] = value;
+                }
+                Owned::u8(&[bytes.len()], &bytes)
+            };
+            let b = padded_bytes(&values, steps[0]);
+            let z = padded_bytes(&points, steps[2]);
+            let mut floats = vec![0.0; 1 + scales.len() * steps[1]];
+            for (i, &value) in scales.iter().enumerate() {
+                floats[1 + i * steps[1]] = value;
+            }
+            let scale = Owned::f32(&[floats.len()], &floats);
+            let shapes = [[values.len()], [scales.len()], [points.len()]];
+            let strides = steps.map(|step| [step as i64]);
+            let mut bv = b.view();
+            bv.shape = &shapes[0];
+            bv.strides = &strides[0];
+            bv.byte_offset = 1;
+            let mut sv = scale.view();
+            sv.shape = &shapes[1];
+            sv.strides = &strides[1];
+            sv.byte_offset = 4;
+            let mut zv = z.view();
+            zv.shape = &shapes[2];
+            zv.strides = &strides[2];
+            zv.byte_offset = 1;
+            let kernel = test_kernel(k, n, block);
+            let first = kernel
+                .resolve_nbits_operand(&bv, &sv, Some(&zv), true)
+                .unwrap();
+            let first = first.view();
+            assert_eq!(first.values, values);
+            assert_eq!(first.scales, scales);
+            assert_eq!(first.zero_points.unwrap(), points);
+            assert_eq!(kernel.packed_nbits_weight.get().is_none(), mask == 0);
+            if mask == 0 {
+                assert_eq!(first.values.as_ptr(), bv.data_ptr::<u8>());
+                assert_eq!(first.scales.as_ptr(), sv.data_ptr::<f32>());
+                assert_eq!(first.zero_points.unwrap().as_ptr(), zv.data_ptr::<u8>());
+            }
+            let second = kernel
+                .resolve_nbits_operand(&bv, &sv, Some(&zv), true)
+                .unwrap();
+            assert_eq!(first.values.as_ptr(), second.view().values.as_ptr());
+            assert_eq!(first.scales.as_ptr(), second.view().scales.as_ptr());
+        }
+    }
+
+    #[test]
+    fn compact_nbits_wire_half_scales_preserve_constant_preparation_and_dynamic_ownership() {
+        let kernel = test_kernel(32, 3, 16);
+        let b = Owned::u8(&[3, 2, 4], &[0x39; 24]);
+        let scale_values = [0.125; 6];
+        for scales in [
+            Owned::f16(&[3, 2], &scale_values),
+            Owned::bf16(&[3, 2], &scale_values),
+        ] {
+            let dynamic = kernel
+                .resolve_nbits_operand(&b.view(), &scales.view(), None, false)
+                .unwrap();
+            assert!(matches!(dynamic, PackedNBitsOperand::Owned(_)));
+            assert_eq!(dynamic.view().scales, scale_values);
+            assert!(kernel.packed_nbits_weight.get().is_none());
+        }
+        let half = Owned::f16(&[3, 2], &scale_values);
+        let first = kernel
+            .resolve_nbits_operand(&b.view(), &half.view(), None, true)
+            .unwrap();
+        let second = kernel
+            .resolve_nbits_operand(&b.view(), &half.view(), None, true)
+            .unwrap();
+        assert_eq!(first.view().scales.as_ptr(), second.view().scales.as_ptr());
+        assert!(kernel.packed_nbits_weight.get().is_some());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compact_nbits_accuracy4_nibble_route_borrows_wire_operands() {
+        let _probe = lock_dispatch_probe();
+        let block = 32;
+        if !int4_nibble::supported(block) || selected_dot_kernel().uses_vnni_int4_direct() {
+            return;
+        }
+        // This driver is selected after the MLAS research route. Test the native
+        // compact kernel directly as well so the reference feature cannot hide it.
+        let (k, n, m) = (45usize, 5usize, 3usize);
+        let weights: Vec<f32> = (0..k * n).map(|i| (i % 17) as f32 / 9.0 - 1.0).collect();
+        for asymmetric in [false, true] {
+            let (bytes, scale_values, points, _) = quantize(&weights, n, k, block, asymmetric);
+            let b = Owned::u8(&[n, 2, block / 2], &bytes);
+            let scales = Owned::f32(&[n, 2], &scale_values);
+            let z = points.as_ref().map(|p| Owned::u8(&[n, 1], p));
+            let kernel = accuracy4_kernel(k, n, block);
+            let zv = z.as_ref().map(Owned::view);
+            let operand = kernel
+                .resolve_nbits_operand(&b.view(), &scales.view(), zv.as_ref(), false)
+                .unwrap();
+            let borrowed = operand.view();
+            assert_eq!(borrowed.values.as_ptr(), b.view().data_ptr::<u8>());
+            let owned = kernel
+                .prepack_nbits_weight(&b.view(), &scales.view(), zv.as_ref())
+                .unwrap();
+            let activations = vec![0.25; m * k];
+            let mut actual = vec![0.0; m * n];
+            let mut control = actual.clone();
+            int4_nibble_matmul(&activations, &borrowed, &mut actual, m, k, n, block);
+            int4_nibble_matmul(&activations, &owned.view(), &mut control, m, k, n, block);
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                control.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert!(prepack_cache_ptr(&kernel).is_none());
+        }
+    }
+
+    #[test]
+    fn compact_nbits_wire_dynamic_execution_reads_each_calls_source() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block) = (33usize, 5usize, 16usize);
+        let blocks = k.div_ceil(block);
+        for constant in [false, true] {
+            let mut kernel = test_kernel(k, n, block);
+            kernel.bits = 2;
+            kernel.set_constant_inputs(&[false, constant, constant, constant]);
+            for m in [1, 4] {
+                let a = Owned::f32(&[m, k], &vec![0.25; m * k]);
+                for byte in [0x39u8, 0x93] {
+                    // Constant inputs use a fresh kernel when the value changes;
+                    // dynamic inputs reuse the same kernel across both values.
+                    let mut constant_kernel = test_kernel(k, n, block);
+                    constant_kernel.bits = 2;
+                    constant_kernel.set_constant_inputs(&[false, true, true, true]);
+                    let active = if constant { &constant_kernel } else { &kernel };
+                    let bytes = vec![byte; n * blocks * block / 4];
+                    let scale_values = vec![0.125; n * blocks];
+                    let points = vec![0x12; n * blocks.div_ceil(4)];
+                    let b = Owned::u8(&[n, blocks, block / 4], &bytes);
+                    let scales = Owned::f32(&[n, blocks], &scale_values);
+                    let z = Owned::u8(&[n, blocks.div_ceil(4)], &points);
+                    let mut y = Owned::zeros_f32(&[m, n]);
+                    let inputs = [a.view(), b.view(), scales.view(), z.view()];
+                    for _ in 0..2 {
+                        active.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                        let dequantized = dequantize_2bit_reference(
+                            &bytes,
+                            &scale_values,
+                            Some(&points),
+                            n,
+                            k,
+                            block,
+                        );
+                        assert_close(
+                            &y.to_f32(),
+                            &reference(&vec![0.25; m * k], &dequantized, m, k, n),
+                        );
+                        assert!(prepack_cache_ptr(active).is_none());
+                    }
+                }
+            }
+        }
+    }
+
     fn cached_dense_weight(kernel: &MatMulNBitsKernel) -> Option<Arc<DenseWeight>> {
         kernel.dense_weights.test_get(&kernel.dense_key().unwrap())
     }
@@ -13154,9 +13390,10 @@ mod tests {
         }
 
         assert_close(&output.to_f32(), &expected);
-        assert!(
+        assert_eq!(
             kernel.packed_nbits_weight.get().is_some(),
-            "bits=2 must cache the packed direct-decode weight"
+            scale_dtype != DataType::Float32,
+            "bits=2 must borrow wire operands, caching only required conversions"
         );
         assert!(
             cached_dense_weight(&kernel).is_none(),
@@ -13922,7 +14159,7 @@ mod tests {
         kernel.set_constant_inputs(&[false, true, true]);
         let a = Owned::f32(&[1, k], &activations);
         let b = Owned::u8(&[n, 2, 16], &packed);
-        let scales = Owned::f32(&[n, 2], &scales);
+        let scales = Owned::f16(&[n, 2], &scales);
         let mut y = Owned::zeros_f32(&[1, n]);
         kernel
             .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
@@ -20055,6 +20292,39 @@ mod tests {
         bytes
     }
 
+    fn compact_nbits_decode_fixture_bytes() -> Vec<u8> {
+        let (k, n, block) = (33usize, 17usize, 16usize);
+        let blocks = k.div_ceil(block);
+        let mut kernel = test_kernel(k, n, block);
+        kernel.bits = 2;
+        kernel.set_constant_inputs(&[false, true, true]);
+        let a = Owned::f32(&[1, k], &vec![0.25; k]);
+        let b = Owned::u8(&[n, blocks, block / 4], &vec![0x39; n * blocks * block / 4]);
+        let scales = Owned::f32(&[n, blocks], &vec![0.125; n * blocks]);
+        let mut output = Owned::zeros_f32(&[1, n]);
+        with_decode_pool_scope(true, || {
+            let placement = spmd_decode_active().is_some() || numa_decode_active().is_some();
+            let before = SPMD_TEST_DISPATCHES.load(Ordering::Relaxed);
+            let persistent = spmd_decode_active().is_some();
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scales.view()],
+                    &mut [output.view_mut()],
+                )
+                .unwrap();
+            assert_eq!(kernel.packed_nbits_weight.get().is_some(), placement);
+            assert_eq!(
+                SPMD_TEST_DISPATCHES.load(Ordering::Relaxed) - before,
+                usize::from(persistent)
+            );
+            if placement {
+                let cached = kernel.packed_nbits_weight.get().unwrap();
+                assert_ne!(cached.values.as_ptr(), b.view().data_ptr::<u8>());
+            }
+        });
+        output.bytes
+    }
+
     fn refused_dense_decode_fixture_bytes() -> Vec<u8> {
         let (k, n, block) = (33usize, 17usize, 16usize);
         let blocks = k.div_ceil(block);
@@ -20410,6 +20680,7 @@ mod tests {
         SPMD_TEST_DISPATCHES.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut bytes = real_int4_decode_fixture_bytes();
         bytes.extend(refused_dense_decode_fixture_bytes());
+        bytes.extend(compact_nbits_decode_fixture_bytes());
         if persistent || auto {
             // Forced always dispatches; `auto`'s warmup step routes the fixture's
             // single decode scope through the pool. Either way every real int4 op
