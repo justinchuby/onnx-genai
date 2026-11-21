@@ -65,7 +65,9 @@
 //! * **G3** The governor never frees anyone's memory. It asks holders through
 //!   [`PressureResponder`] and they decide what to give back; a holder that
 //!   returns zero is respected and the *new* request fails instead.
-//! * **G4** A failed reservation leaves every existing lease untouched.
+//! * **G4** A failed raw claim leaves accounting untouched. Admission pressure
+//!   may ask registered holders to retire idle allocations, but never revokes a
+//!   live lease; failure cannot grant bytes based on a reclamation estimate.
 //!
 //! G3 is the general form of a bug this project already shipped once, where an
 //! eviction pass deleted the very session it was writing to in order to satisfy
@@ -96,6 +98,9 @@ pub mod large_alloc_cache;
 pub mod manager;
 pub mod shareability;
 pub mod shared_prefix;
+
+mod pressure;
+pub use pressure::{PressureRegistration, PressureRegistry};
 
 pub use large_alloc_cache::{
     DEFAULT_CACHE_BUDGET_BYTES, FALLBACK_FLOOR_BYTES, LargeAllocCache, LargeAllocCacheStats,
@@ -206,6 +211,7 @@ pub struct LeaseLedger {
     mapped_allowance_reserved: [AtomicU64; 3],
     mapped_growth_reserved: [AtomicU64; 3],
     claim_gates: [Mutex<()>; 3],
+    pressure: [PressureRegistry; 3],
 }
 
 impl LeaseLedger {
@@ -224,8 +230,11 @@ impl LeaseLedger {
         host_bytes: u64,
         disk_bytes: u64,
     ) -> Arc<Self> {
+        let authority_id = MemoryAuthorityId::new(device);
         Arc::new(Self {
-            authority_id: MemoryAuthorityId::new(device),
+            authority_id,
+            pressure: [Tier::Device, Tier::Host, Tier::Disk]
+                .map(|tier| PressureRegistry::new(authority_id, tier)),
             limits: [
                 AtomicU64::new(device_bytes),
                 AtomicU64::new(host_bytes),
@@ -236,6 +245,11 @@ impl LeaseLedger {
             mapped_growth_reserved: std::array::from_fn(|_| AtomicU64::new(0)),
             claim_gates: std::array::from_fn(|_| Mutex::new(())),
         })
+    }
+
+    /// The same pressure capability used by initial, growth and sibling claims.
+    pub fn pressure_registry(&self, tier: Tier) -> PressureRegistry {
+        self.pressure[tier.index()].clone()
     }
 
     /// Bytes currently leased on `tier`.
@@ -288,8 +302,44 @@ impl LeaseLedger {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Claim `bytes` on `tier`, or fail without changing anything (G1, G4).
+    /// Claim bytes, asking registered idle holders on capacity refusal. Actual
+    /// grants always recheck the books; callbacks run outside the claim gate.
     fn try_claim(&self, tier: Tier, bytes: u64, role: MemoryRole) -> Result<(), MemoryError> {
+        let mut reason = match self.try_claim_raw(tier, bytes, role) {
+            Ok(()) => return Ok(()),
+            Err(reason @ MemoryError::TierExhausted { .. }) => reason,
+            Err(reason) => return Err(reason),
+        };
+        let shortfall = |reason: &MemoryError| match reason {
+            MemoryError::TierExhausted {
+                limit, available, ..
+            } if bytes != 0 && bytes <= *limit => Some(bytes.saturating_sub(*available).max(1)),
+            _ => None,
+        };
+        let Some(mut want) = shortfall(&reason) else {
+            return Err(reason);
+        };
+        let Some(round) = self.pressure[tier.index()].round() else {
+            return Err(reason);
+        };
+        for responder in &round.responders {
+            responder.on_pressure(tier, want)?;
+            // Reported reclaimed bytes never authorize allocation. Recheck the
+            // actual books, including callbacks that under-report or race frees.
+            match self.try_claim_raw(tier, bytes, role) {
+                Ok(()) => return Ok(()),
+                Err(failure @ MemoryError::TierExhausted { .. }) => reason = failure,
+                Err(failure) => return Err(failure),
+            }
+            let Some(remaining) = shortfall(&reason) else {
+                break;
+            };
+            want = remaining;
+        }
+        Err(reason)
+    }
+
+    fn try_claim_raw(&self, tier: Tier, bytes: u64, role: MemoryRole) -> Result<(), MemoryError> {
         let _gate = self.claim_gate(tier);
         let index = tier.index();
         let mut used = self.used[index].load(Ordering::Acquire);
@@ -1764,8 +1814,12 @@ impl MemoryLease {
         if extra == 0 {
             return Ok(());
         }
+        let next = self.bytes.checked_add(extra).ok_or(MemoryError::InvalidRequest {
+            tier: self.tier.name(), requested: extra,
+            reason: "growing the lease would overflow its owned bytes; use an addressable lease size",
+        })?;
         self.accounting.try_claim(self.tier, extra, self.role)?;
-        self.bytes = self.bytes.saturating_add(extra);
+        self.bytes = next;
         Ok(())
     }
 
@@ -1840,11 +1894,16 @@ impl Drop for MemoryLease {
 /// that cannot release anything returns zero and keeps its state; the requester
 /// is refused instead (G3).
 pub trait PressureResponder: Send + Sync {
-    /// Release up to `want` bytes on `tier` and report how many were freed.
+    /// Callbacks can be reentrant from any lease claim. They must not acquire
+    /// cold-fill/allocator gates held by the requesting operation. The shared
+    /// registry and ledger claim gate are released before invocation.
+    ///
+    /// Ask to release `want` bytes on `tier`; whole-object release may exceed
+    /// the target. Report what was freed, or preserve the typed failure.
     ///
     /// Returning less than `want` — including zero — is a legitimate answer and
     /// must never be treated as permission to take the memory anyway.
-    fn on_pressure(&self, tier: Tier, want: u64) -> u64;
+    fn on_pressure(&self, tier: Tier, want: u64) -> Result<u64, MemoryError>;
 }
 
 /// The authority that grants leases.
@@ -1861,8 +1920,16 @@ pub trait MemoryGovernor {
     /// only when they deliberately share one physical-memory ledger.
     fn authority_id(&self, tier: Tier) -> MemoryAuthorityId;
 
-    /// Reserve `bytes` on `tier` for `role`, or fail without disturbing any
-    /// existing lease.
+    /// Optional authority/tier pressure capability. Return clones of one stable
+    /// registry per tier, using the same books as reserve and every granted
+    /// lease's grow/sibling accounting. None means
+    /// the authority cannot automatically reclaim idle holders.
+    fn pressure_registry(&self, _tier: Tier) -> Option<PressureRegistry> {
+        None
+    }
+
+    /// Reserve bytes for the role. A pressure-capable authority may ask idle
+    /// holders to release; it never revokes a live lease or grants on estimates.
     fn reserve(
         &self,
         tier: Tier,
@@ -2024,6 +2091,9 @@ impl LedgerGovernor {
 }
 
 impl MemoryGovernor for LedgerGovernor {
+    fn pressure_registry(&self, tier: Tier) -> Option<PressureRegistry> {
+        Some(self.ledger.pressure_registry(tier))
+    }
     fn authority_id(&self, _tier: Tier) -> MemoryAuthorityId {
         self.ledger.authority_id
     }

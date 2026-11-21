@@ -149,6 +149,13 @@ impl DeviceMemoryAuthority {
 }
 
 impl MemoryGovernor for DeviceMemoryAuthority {
+    fn pressure_registry(
+        &self,
+        tier: Tier,
+    ) -> Option<onnx_runtime_memory_governor::PressureRegistry> {
+        self.governor.pressure_registry(tier)
+    }
+
     fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
         self.governor.authority_id(tier)
     }
@@ -327,6 +334,13 @@ impl EngineMemoryAccounting {
 }
 
 impl MemoryGovernor for EngineMemoryGovernor {
+    fn pressure_registry(
+        &self,
+        tier: Tier,
+    ) -> Option<onnx_runtime_memory_governor::PressureRegistry> {
+        self.governor(tier).pressure_registry(tier)
+    }
+
     fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
         self.governor(tier).authority_id(tier)
     }
@@ -398,6 +412,73 @@ impl MemoryGovernor for EngineMemoryGovernor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_kv_growth_uses_the_host_pressure_capability_without_touching_device_or_other_engine_books()
+     {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Idle {
+            payload: Mutex<Option<(Vec<u8>, MemoryLease)>>,
+            calls: AtomicUsize,
+        }
+        impl onnx_runtime_memory_governor::PressureResponder for Idle {
+            fn on_pressure(&self, tier: Tier, _want: u64) -> Result<u64, MemoryError> {
+                assert_eq!(tier, Tier::Host);
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                let retired = self.payload.lock().unwrap().take();
+                let bytes = retired.as_ref().map_or(0, |payload| payload.0.len() as u64);
+                drop(retired);
+                Ok(bytes)
+            }
+        }
+        let device = DeviceMemoryAuthority::new(DeviceCompatibilityDomain::Host, 100);
+        let first = EngineMemoryGovernor::new(device.clone(), 16, 8);
+        let second = EngineMemoryGovernor::new(device, 16, 8);
+        let idle = Arc::new(Idle {
+            payload: Mutex::new(Some((
+                vec![1; 16],
+                first
+                    .reserve(Tier::Host, 16, MemoryRole::Weights, HolderId::new(1))
+                    .unwrap(),
+            ))),
+            calls: AtomicUsize::new(0),
+        });
+        let registry = first.pressure_registry(Tier::Host).unwrap();
+        registry
+            .validate(first.authority_id(Tier::Host), Tier::Host)
+            .unwrap();
+        assert!(
+            registry
+                .validate(second.authority_id(Tier::Host), Tier::Host)
+                .is_err()
+        );
+        let responder: Arc<dyn onnx_runtime_memory_governor::PressureResponder> = idle.clone();
+        let _registration = registry.register(&responder).unwrap();
+        let other = second
+            .reserve(Tier::Host, 16, MemoryRole::KvCache, HolderId::new(2))
+            .unwrap();
+        let device = first
+            .reserve(Tier::Device, 100, MemoryRole::Weights, HolderId::new(3))
+            .unwrap();
+        let mut kv = first
+            .reserve(Tier::Host, 0, MemoryRole::KvCache, HolderId::new(2))
+            .unwrap();
+        kv.grow(8).unwrap();
+        assert_eq!(kv.bytes(), 8);
+        assert_eq!(idle.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(first.used(Tier::Host), 8);
+        assert_eq!(second.used(Tier::Host), 16);
+        assert_eq!(first.used(Tier::Device), 100);
+        drop(kv);
+        drop(other);
+        drop(device);
+        assert_eq!(first.used(Tier::Host), 0);
+        assert_eq!(second.used(Tier::Host), 0);
+        assert_eq!(first.used(Tier::Device), 0);
+    }
 
     #[test]
     fn per_tier_governor_identity_matches_the_lease_accounting_books() {

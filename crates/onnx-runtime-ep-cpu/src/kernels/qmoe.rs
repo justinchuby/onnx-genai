@@ -4261,6 +4261,12 @@ mod tests {
         }
         struct Governor(Arc<Books>);
         impl MemoryGovernor for Governor {
+            fn pressure_registry(
+                &self,
+                tier: Tier,
+            ) -> Option<onnx_runtime_memory_governor::PressureRegistry> {
+                Some(self.0.ledger.pressure_registry(tier))
+            }
             fn authority_id(&self, _tier: Tier) -> MemoryAuthorityId {
                 self.0.authority_id().unwrap()
             }
@@ -4558,7 +4564,7 @@ mod tests {
         use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
         let _guard = hold_metrics_test_lock();
         let governor = LedgerGovernor::new(LeaseLedger::new(0, 12, 0));
-        let kv = governor
+        let mut kv = governor
             .reserve(Tier::Host, 8, MemoryRole::KvCache, HolderId::new(1))
             .unwrap();
         let cache = WeightOffloadHostCache::new(
@@ -4596,8 +4602,16 @@ mod tests {
             ExpertLease::Filled(_)
         ));
         assert_eq!(governor.used(Tier::Host), 12);
+        kv.grow(4).unwrap();
+        assert_eq!(kv.bytes(), 12);
+        assert_eq!(
+            cache.inner.cache.lock().unwrap().owned_bytes,
+            0,
+            "KV growth must reclaim the inactive expert through the common Host authority"
+        );
+        assert_eq!(governor.used(Tier::Host), 12);
         drop(kv);
-        assert_eq!(governor.used(Tier::Host), 4);
+        assert_eq!(governor.used(Tier::Host), 0);
         cache.clear();
         assert_eq!(governor.used(Tier::Host), 0);
     }

@@ -142,6 +142,15 @@ pub enum MemoryError {
         /// What the backing allocator said.
         reason: String,
     },
+    /// An idle-memory holder failed while servicing a pressure callback.
+    /// Keep its typed cause rather than misclassifying the failure as capacity.
+    #[error("cannot reclaim {requested} bytes of {tier} memory: {source}")]
+    ReclaimFailed {
+        tier: &'static str,
+        requested: u64,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// A well-formed capacity transfer or backing claim could not make enough
     /// governed bytes available.
     #[error(

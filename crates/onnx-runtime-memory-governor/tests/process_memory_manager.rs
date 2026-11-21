@@ -1391,6 +1391,7 @@ struct ReentrantReclaimer {
     manager: ProcessMemoryManager,
     allocation: Mutex<Option<onnx_runtime_memory_governor::ManagedAllocation>>,
     calls: AtomicUsize,
+    want: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -1454,10 +1455,16 @@ fn device_loss_broadcasts_to_all_sibling_contexts_without_manager_locks() {
 }
 
 impl onnx_runtime_memory_governor::PressureResponder for ReentrantReclaimer {
-    fn on_pressure(&self, _tier: Tier, _want: u64) -> u64 {
+    fn on_pressure(
+        &self,
+        _tier: Tier,
+        want: u64,
+    ) -> Result<u64, onnx_runtime_memory_api::MemoryError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        self.want.store(want, Ordering::Relaxed);
         let _ = self.manager.snapshot().expect("reentrant snapshot");
-        self.allocation
+        Ok(self
+            .allocation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
@@ -1465,7 +1472,7 @@ impl onnx_runtime_memory_governor::PressureResponder for ReentrantReclaimer {
                 let bytes = allocation.len() as u64;
                 allocation.release_now().expect("holder release");
                 bytes
-            })
+            }))
     }
 }
 
@@ -1483,6 +1490,7 @@ fn pressure_callback_is_reentrant_and_runs_without_manager_locks() {
         manager: fixture.manager.clone(),
         allocation: Mutex::new(None),
         calls: AtomicUsize::new(0),
+        want: AtomicU64::new(0),
     });
     let reclaiming_holder =
         fixture
@@ -1524,6 +1532,152 @@ fn pressure_callback_is_reentrant_and_runs_without_manager_locks() {
         .expect("pressure made room");
     assert_eq!(reclaimer.calls.load(Ordering::Relaxed), 1);
     replacement.release_now().unwrap();
+}
+
+#[test]
+fn pressure_uses_one_shared_round_for_either_quota_or_authority_shortfall() {
+    for (authority_limit, process_limits) in [
+        (256, unlimited()),
+        (
+            1024,
+            ProcessMemoryLimits {
+                host_bytes: 256,
+                ..unlimited()
+            },
+        ),
+        (
+            256,
+            ProcessMemoryLimits {
+                host_bytes: 256,
+                ..unlimited()
+            },
+        ),
+    ] {
+        let fixture = Fixture::new(DeviceKey::HOST, authority_limit, process_limits);
+        let reclaimer = Arc::new(ReentrantReclaimer {
+            manager: fixture.manager.clone(),
+            allocation: Mutex::new(None),
+            calls: AtomicUsize::new(0),
+            want: AtomicU64::new(0),
+        });
+        let holder = fixture
+            .manager
+            .register_holder(&fixture.authority, "idle weights", Some(reclaimer.clone()))
+            .unwrap();
+        let binding = fixture.manager.bind_registered(&fixture.mechanism).unwrap();
+        let held = binding
+            .allocate(
+                AllocationRequest::managed(200, 64, Tier::Host, MemoryRole::Weights, holder, 200),
+                AllocationPublication::exclusive(200, 200, 200),
+            )
+            .unwrap();
+        *reclaimer.allocation.lock().unwrap() = Some(held);
+        assert!(
+            binding
+                .allocate(
+                    AllocationRequest::managed(
+                        300,
+                        64,
+                        Tier::Host,
+                        MemoryRole::KvCache,
+                        fixture.holder.clone(),
+                        300
+                    ),
+                    AllocationPublication::exclusive(300, 300, 300)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            reclaimer.calls.load(Ordering::Relaxed),
+            0,
+            "an impossible process/authority request cannot flush the cache"
+        );
+        assert_eq!(fixture.governor.used(Tier::Host), 200);
+        assert_eq!(fixture.manager.process_used(Tier::Host), 200);
+        let replacement = binding
+            .allocate(
+                AllocationRequest::managed(
+                    100,
+                    64,
+                    Tier::Host,
+                    MemoryRole::KvCache,
+                    fixture.holder.clone(),
+                    100,
+                ),
+                AllocationPublication::exclusive(100, 100, 100),
+            )
+            .unwrap();
+        assert_eq!(reclaimer.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            reclaimer.want.load(Ordering::Relaxed),
+            44,
+            "manager must not pre-drive a full-request authority eviction pass"
+        );
+        assert_eq!(fixture.governor.used(Tier::Host), 100);
+        assert_eq!(fixture.manager.process_used(Tier::Host), 100);
+        replacement.release_now().unwrap();
+        assert_eq!(fixture.manager.process_used(Tier::Host), 0);
+    }
+}
+
+#[test]
+fn pressure_callback_failure_preserves_its_cause_and_refunds_new_process_quota() {
+    use std::error::Error;
+    struct Broken;
+    impl onnx_runtime_memory_governor::PressureResponder for Broken {
+        fn on_pressure(&self, tier: Tier, want: u64) -> Result<u64, MemoryError> {
+            Err(MemoryError::ReclaimFailed {
+                tier: tier.name(),
+                requested: want,
+                source: Box::new(std::io::Error::other(
+                    "fixture reclaimer failed; restore its allocator",
+                )),
+            })
+        }
+    }
+    let fixture = Fixture::new(DeviceKey::HOST, 32, unlimited());
+    let broken: Arc<dyn onnx_runtime_memory_governor::PressureResponder> = Arc::new(Broken);
+    let _holder = fixture
+        .manager
+        .register_holder(&fixture.authority, "broken cache", Some(broken.clone()))
+        .unwrap();
+    let held = fixture.allocate(32);
+    let binding = fixture.manager.bind_registered(&fixture.mechanism).unwrap();
+    let error = binding
+        .allocate(
+            AllocationRequest::managed(
+                1,
+                64,
+                Tier::Host,
+                MemoryRole::KvCache,
+                fixture.holder.clone(),
+                1,
+            ),
+            AllocationPublication::exclusive(1, 1, 1),
+        )
+        .unwrap_err();
+    match error {
+        AllocationTransactionError::Memory(source) => {
+            assert!(matches!(
+                source,
+                MemoryError::ReclaimFailed { requested: 1, .. }
+            ));
+            assert!(
+                source
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .is_some()
+            );
+            assert!(source.to_string().contains("restore its allocator"));
+        }
+        other => panic!("pressure cause lost: {other}"),
+    }
+    assert_eq!(fixture.allocator.allocations.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.governor.used(Tier::Host), 32);
+    assert_eq!(fixture.manager.process_used(Tier::Host), 32);
+    held.release_now().unwrap();
+    assert_eq!(fixture.manager.process_used(Tier::Host), 0);
 }
 
 #[test]

@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
-use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryLease};
+use onnx_runtime_memory_governor::{
+    HolderId, MemoryGovernor, MemoryLease, PressureRegistration, PressureResponder,
+};
 
 use crate::CpuCacheRetention;
 use crate::kernels::qmoe::WeightOffloadHostCache;
@@ -124,12 +126,18 @@ impl CpuMemoryResources {
 /// A governed source retains a zero-byte anchor, rather than a standing cache
 /// allowance. Each owned expansion claims its payload bytes against the same
 /// Host books as other holders, and keeps them until its last owner drops.
-/// Clones share weak idle-cache registrations. A capacity refusal can reclaim
-/// inactive dense/expert entries from that domain before retrying the grant;
-/// allocator/configuration errors and warm cache hits do not trigger eviction.
+/// Clones share weak idle-cache registrations, enrolled with the supplying
+/// authority's optional pressure capability. Any Host claimant can then reclaim
+/// inactive entries; actual grants, growth and retries remain authority-owned.
+/// Allocator/configuration errors and warm hits do not trigger CPU eviction.
 #[derive(Clone, Default)]
 pub struct DerivedWeightMemory {
-    domain: Option<Arc<DerivedWeightDomain>>,
+    owner: Option<Arc<DerivedWeightSource>>,
+}
+
+struct DerivedWeightSource {
+    domain: Arc<DerivedWeightDomain>,
+    _registration: Option<PressureRegistration>,
 }
 
 struct DerivedWeightDomain {
@@ -190,24 +198,45 @@ impl DerivedWeightMemory {
                 reason: "derived-weight anchor uses different Host books than its governor; return reserve leases from the requested tier's authority",
             });
         }
+        let domain = Arc::new(DerivedWeightDomain {
+            anchor,
+            idle_caches: Mutex::new(IdleCacheRegistry::default()),
+        });
+        let registration = if let Some(registry) = governor.pressure_registry(Tier::Host) {
+            registry.validate(governor.authority_id(Tier::Host), Tier::Host)?;
+            let responder: Arc<dyn PressureResponder> = domain.clone();
+            Some(registry.register(&responder)?)
+        } else {
+            None
+        };
         Ok(Self {
-            domain: Some(Arc::new(DerivedWeightDomain {
-                anchor,
-                idle_caches: Mutex::new(IdleCacheRegistry::default()),
+            owner: Some(Arc::new(DerivedWeightSource {
+                domain,
+                _registration: registration,
             })),
         })
     }
 
     pub fn is_governed(&self) -> bool {
-        self.domain.is_some()
+        self.owner.is_some()
+    }
+
+    /// Whether the supplying authority can reclaim these idle weights for any
+    /// Host claimant, including KV lease growth. Third-party authorities without
+    /// a pressure capability still fund payloads, but cannot reclaim them here.
+    pub fn supports_pressure_reclaim(&self) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|owner| owner._registration.is_some())
     }
 
     pub(crate) fn register_idle_cache<T: IdleWeightCache + 'static>(&self, cache: &Arc<T>) {
-        let Some(domain) = &self.domain else {
+        let Some(owner) = &self.owner else {
             return;
         };
         let cache: Arc<dyn IdleWeightCache> = cache.clone();
-        let mut registry = domain
+        let mut registry = owner
+            .domain
             .idle_caches
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -216,63 +245,53 @@ impl DerivedWeightMemory {
     }
 
     pub(crate) fn try_grant(&self, bytes: usize) -> Result<WeightAdmission> {
-        let Some(domain) = &self.domain else {
+        let Some(owner) = &self.owner else {
             return Ok(WeightAdmission::Granted(DenseWeightGrant::Local));
         };
         let requested = u64::try_from(bytes).map_err(|_| EpError::KernelFailed(
             "derived dense weight byte count exceeds u64; use dimensions addressable by the Host memory governor".into()
         ))?;
-        let reserve = || match domain.anchor.reserve_sibling(requested) {
+        // Admission/retry belongs to the actual accounting authority, including
+        // ordinary KV reserve/grow/sibling requests. Do not run a second CPU-only
+        // pressure pass after that authority declines.
+        match owner.domain.anchor.reserve_sibling(requested) {
             Ok(lease) => Ok(WeightAdmission::Granted(DenseWeightGrant::Governed(lease))),
             Err(
                 failure @ (MemoryError::TierExhausted { .. }
                 | MemoryError::CapacityUnavailable { .. }),
             ) => Ok(WeightAdmission::Declined(failure)),
             Err(failure) => Err(EpError::Memory(failure)),
-        };
-        let mut reason = match reserve()? {
-            granted @ WeightAdmission::Granted(_) => return Ok(granted),
-            WeightAdmission::Declined(reason) => reason,
-        };
-        // Reclaim cannot make a payload larger than the entire tier fit.
-        // Apply the same classification to the initial refusal and retries,
-        // including a limit lowered concurrently with cache reclamation.
-        let shortfall = |reason: &MemoryError| match reason {
-            _ if requested == 0 => None,
-            MemoryError::TierExhausted { limit, .. } if requested > *limit => None,
-            MemoryError::TierExhausted { available, .. }
-            | MemoryError::CapacityUnavailable { available, .. } => Some(
-                bytes
-                    .saturating_sub((*available).min(requested) as usize)
-                    .max(1),
-            ),
-            _ => unreachable!("only capacity refusals enter idle-weight reclamation"),
-        };
-        let Some(mut want) = shortfall(&reason) else {
-            return Ok(WeightAdmission::Declined(reason));
-        };
-        // Snapshot once, then release the registration lock before any cache,
-        // payload destructor or governor callback is entered. One bounded pass
-        // cannot spin indefinitely against concurrent cache fills.
-        let caches = domain
+        }
+    }
+}
+
+impl PressureResponder for DerivedWeightDomain {
+    fn on_pressure(&self, tier: Tier, want: u64) -> std::result::Result<u64, MemoryError> {
+        if tier != Tier::Host || want == 0 {
+            return Ok(0);
+        }
+        let caches = self
             .idle_caches
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .snapshot();
+        let mut released = 0u64;
         for cache in caches {
-            if cache.reclaim_idle(want)? == 0 {
-                continue;
-            }
-            match reserve()? {
-                granted @ WeightAdmission::Granted(_) => return Ok(granted),
-                WeightAdmission::Declined(failure) => reason = failure,
-            }
-            let Some(remaining) = shortfall(&reason) else {
+            let remaining = usize::try_from(want.saturating_sub(released)).unwrap_or(usize::MAX);
+            let bytes =
+                cache
+                    .reclaim_idle(remaining)
+                    .map_err(|source| MemoryError::ReclaimFailed {
+                        tier: tier.name(),
+                        requested: want,
+                        source: Box::new(source),
+                    })?;
+            released = released.saturating_add(bytes as u64);
+            if released >= want {
                 break;
-            };
-            want = remaining;
+            }
         }
-        Ok(WeightAdmission::Declined(reason))
+        Ok(released)
     }
 }
 
@@ -397,9 +416,10 @@ mod tests {
             // bytes: the shared registry must not be locked across callbacks.
             assert!(
                 self.source
-                    .domain
+                    .owner
                     .as_ref()
                     .unwrap()
+                    .domain
                     .idle_caches
                     .try_lock()
                     .is_ok()
@@ -466,9 +486,10 @@ mod tests {
         ));
         assert!(
             source
-                .domain
+                .owner
                 .as_ref()
                 .unwrap()
+                .domain
                 .idle_caches
                 .lock()
                 .unwrap()
@@ -476,6 +497,113 @@ mod tests {
                 .is_empty()
         );
         drop(held);
+        drop(kv);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn derived_source_validates_optional_pressure_capabilities_without_losing_grant_ownership() {
+        struct View {
+            books: LedgerGovernor,
+            registry: Option<onnx_runtime_memory_governor::PressureRegistry>,
+        }
+        impl MemoryGovernor for View {
+            fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
+                self.books.authority_id(tier)
+            }
+            fn pressure_registry(
+                &self,
+                _tier: Tier,
+            ) -> Option<onnx_runtime_memory_governor::PressureRegistry> {
+                self.registry.clone()
+            }
+            fn reserve(
+                &self,
+                tier: Tier,
+                bytes: u64,
+                role: MemoryRole,
+                holder: HolderId,
+            ) -> std::result::Result<MemoryLease, MemoryError> {
+                self.books.reserve(tier, bytes, role, holder)
+            }
+            fn available(&self, tier: Tier) -> u64 {
+                self.books.available(tier)
+            }
+            fn used(&self, tier: Tier) -> u64 {
+                self.books.used(tier)
+            }
+        }
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 16, 0));
+        let foreign = LedgerGovernor::new(LeaseLedger::new(0, 16, 0));
+        for registry in [
+            books.pressure_registry(Tier::Device).unwrap(),
+            foreign.pressure_registry(Tier::Host).unwrap(),
+        ] {
+            let view = View {
+                books: books.clone(),
+                registry: Some(registry),
+            };
+            let failure = DerivedWeightMemory::governed(&view, HolderId::new(13))
+                .err()
+                .expect("miswired pressure capability must be rejected");
+            assert!(matches!(failure, MemoryError::InvalidRequest { .. }));
+            assert!(failure.to_string().contains("pressure registry"));
+            assert_eq!(books.used(Tier::Host), 0);
+            assert_eq!(foreign.used(Tier::Host), 0);
+        }
+        let view = View {
+            books: books.clone(),
+            registry: None,
+        };
+        let source = DerivedWeightMemory::governed(&view, HolderId::new(13)).unwrap();
+        assert!(source.is_governed());
+        assert!(!source.supports_pressure_reclaim());
+        let WeightAdmission::Granted(grant) = source.try_grant(8).unwrap() else {
+            panic!(
+                "unsupported pressure is not permission to reject an otherwise funded allocation"
+            );
+        };
+        assert_eq!(books.used(Tier::Host), 8);
+        drop(grant);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn idle_reclaim_hard_errors_preserve_the_cpu_cause_and_never_become_capacity_refusals() {
+        use std::error::Error;
+        struct Broken;
+        impl IdleWeightCache for Broken {
+            fn reclaim_idle(&self, _want: usize) -> Result<usize> {
+                Err(EpError::KernelFailed(
+                    "fixture idle cache failed; restore its accounting".into(),
+                ))
+            }
+        }
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 16, 0));
+        let source = DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let broken = Arc::new(Broken);
+        source.register_idle_cache(&broken);
+        let kv = governor
+            .reserve(Tier::Host, 16, MemoryRole::KvCache, HolderId::new(2))
+            .unwrap();
+        match source.try_grant(4) {
+            Err(EpError::Memory(failure)) => {
+                assert!(matches!(
+                    failure,
+                    MemoryError::ReclaimFailed { requested: 4, .. }
+                ));
+                assert!(
+                    failure
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<EpError>()
+                        .is_some()
+                );
+                assert!(failure.to_string().contains("restore its accounting"));
+            }
+            _ => panic!("reclaimer failure was discarded or misclassified as capacity"),
+        }
+        assert_eq!(governor.used(Tier::Host), 16);
         drop(kv);
         assert_eq!(governor.used(Tier::Host), 0);
     }
@@ -560,6 +688,7 @@ mod tests {
                     .unwrap();
             let idle = Arc::new(EmptyIdleCache::default());
             source.register_idle_cache(&idle);
+            assert!(!source.supports_pressure_reclaim());
             match (kind, source.try_grant(16)) {
                 (
                     FailureKind::Allocator,
@@ -581,8 +710,8 @@ mod tests {
             assert_eq!(books.attempts.load(Ordering::Relaxed), 1);
             assert_eq!(
                 idle.0.load(Ordering::Relaxed),
-                usize::from(matches!(kind, FailureKind::Capacity)),
-                "hard errors must not evict cache payloads; an empty cache is visited at most once on refusal"
+                0,
+                "an authority without pressure support must not be followed by a CPU-only eviction pass"
             );
         }
     }

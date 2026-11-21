@@ -608,6 +608,64 @@ mod tests {
     }
 
     #[test]
+    fn kv_lease_pressure_reclaims_idle_cpu_weights_across_sources_on_the_same_authority() {
+        let (governor, first_source) = memory(36);
+        let second_source = DerivedWeightMemory::governed(&governor, HolderId::new(14)).unwrap();
+        assert!(first_source.supports_pressure_reclaim());
+        assert!(second_source.supports_pressure_reclaim());
+        let mut kv = governor
+            .reserve(Tier::Host, 4, MemoryRole::KvCache, HolderId::new(2))
+            .unwrap();
+        let a = DenseWeightCache::<DenseWeightCacheKey>::new(first_source, 16);
+        let b = DenseWeightCache::<DenseWeightCacheKey>::new(second_source, 16);
+        let pa = Owned::u8(&[4], &[1; 4]);
+        let pb = Owned::u8(&[4], &[2; 4]);
+        let ka = key(&pa);
+        let kb = key(&pb);
+        drop(ready(
+            a.load_group(&[cached(&ka)], |_, row| {
+                row.fill(1.0);
+                Ok(())
+            })
+            .unwrap(),
+        ));
+        drop(ready(
+            b.load_group(&[cached(&kb)], |_, row| {
+                row.fill(2.0);
+                Ok(())
+            })
+            .unwrap(),
+        ));
+        let active = b.test_get(&kb).unwrap();
+        assert_eq!(governor.used(Tier::Host), 36);
+        kv.grow(8).unwrap();
+        assert_eq!(a.stats(), (0, 0));
+        assert_eq!(b.stats(), (1, 16));
+        assert_eq!(kv.bytes(), 12);
+        assert_eq!(governor.used(Tier::Host), 28);
+        assert!(matches!(
+            kv.grow(16),
+            Err(MemoryError::TierExhausted { .. })
+        ));
+        assert_eq!(
+            kv.bytes(),
+            12,
+            "failed growth cannot alter the live KV lease"
+        );
+        assert_eq!(active.as_slice(), &[2.0; 4]);
+        drop(active);
+        kv.grow(16).unwrap();
+        assert_eq!(b.stats(), (0, 0));
+        assert_eq!(kv.bytes(), 28);
+        assert_eq!(governor.used(Tier::Host), 28);
+        let sibling = kv.reserve_sibling(8).unwrap();
+        assert_eq!(governor.used(Tier::Host), 36);
+        drop(sibling);
+        drop(kv);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
     fn shared_pressure_concurrent_cold_fills_keep_active_payloads_and_do_not_take_foreign_fill_gates()
      {
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -668,8 +726,8 @@ mod tests {
     }
 
     #[test]
-    fn shared_pressure_keeps_partial_hit_groups_pinned_and_respects_source_domains() {
-        let (governor, source) = memory(48);
+    fn shared_pressure_keeps_partial_hit_groups_pinned_and_respects_authorities() {
+        let (governor, source) = memory(32);
         let a = DenseWeightCache::<DenseWeightCacheKey>::new(source.clone(), 64);
         let other = DenseWeightCache::<DenseWeightCacheKey>::new(source, 64);
         let p = [
@@ -693,7 +751,7 @@ mod tests {
                 })
                 .unwrap(),
         ));
-        let foreign_source = DerivedWeightMemory::governed(&governor, HolderId::new(14)).unwrap();
+        let (foreign_governor, foreign_source) = memory(16);
         let foreign = DenseWeightCache::<DenseWeightCacheKey>::new(foreign_source.clone(), 16);
         drop(ready(
             foreign
@@ -715,7 +773,8 @@ mod tests {
         assert!(Arc::ptr_eq(&hit, &loaded.weights[0]));
         assert_eq!(other.stats(), (0, 0));
         assert_eq!(foreign.stats(), (1, 16));
-        assert_eq!(governor.used(Tier::Host), 48);
+        assert_eq!(governor.used(Tier::Host), 32);
+        assert_eq!(foreign_governor.used(Tier::Host), 16);
         drop(loaded);
         drop(hit);
         let pins = foreign.test_get(&keys[2]).unwrap();
@@ -724,13 +783,14 @@ mod tests {
                 foreign_source.try_grant(16).unwrap(),
                 WeightAdmission::Declined(_)
             ),
-            "separate sources cannot evict one another even when their physical books coincide"
+            "another authority cannot evict idle entries from these books"
         );
         drop(pins);
         assert_eq!(a.stats(), (2, 32));
         drop(a);
         drop(foreign);
         assert_eq!(governor.used(Tier::Host), 0);
+        assert_eq!(foreign_governor.used(Tier::Host), 0);
     }
 
     #[test]
@@ -1116,6 +1176,12 @@ mod tests {
     }
     struct ObservingGovernor(Arc<ObservingBooks>);
     impl MemoryGovernor for ObservingGovernor {
+        fn pressure_registry(
+            &self,
+            tier: Tier,
+        ) -> Option<onnx_runtime_memory_governor::PressureRegistry> {
+            self.0.governor.pressure_registry(tier)
+        }
         fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
             self.0.governor.authority_id(tier)
         }
@@ -1170,7 +1236,11 @@ mod tests {
                 .unwrap(),
         ));
         assert_eq!(cache.stats(), (1, 16));
-        assert!(books.observations.load(Ordering::Relaxed) >= 4);
+        assert_eq!(
+            books.observations.load(Ordering::Relaxed),
+            3,
+            "two issuer requests and one retired payload refund; the authority retries its own books internally"
+        );
         assert!(
             !books.blocked.load(Ordering::Relaxed),
             "accounting callbacks must run outside the payload lock"
