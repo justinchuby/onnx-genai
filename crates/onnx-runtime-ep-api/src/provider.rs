@@ -1259,6 +1259,18 @@ pub trait ExecutionProvider: Send + Sync {
         None
     }
 
+    /// Prepare immutable, host-accessible initializer inputs at model load,
+    /// even when activation shapes are unresolved. No runtime inputs are supplied.
+    /// Returned state is owned by this executor until teardown, so providers can
+    /// retain warmed constants without process-global lifetime or admission flags.
+    fn prepare_static_constants(
+        &self,
+        _node: &Node,
+        _constants: &[Option<crate::KernelConstantInput<'_>>],
+    ) -> Result<Option<Arc<dyn Any + Send + Sync>>> {
+        Ok(None)
+    }
+
     /// Optional executor-to-EP capabilities. Stock EPs advertise none and
     /// continue receiving resident [`crate::TensorView`] inputs.
     fn capabilities(&self) -> ExecutionProviderCapabilities {

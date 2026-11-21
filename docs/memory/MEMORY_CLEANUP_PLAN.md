@@ -383,7 +383,7 @@ allocations; model-wide grant convergence remains open.
 
 Native CPU registry construction now consumes one `CpuMemoryResources` bundle:
 QMoE host-cache ownership, block-derived Host grants, the per-kernel dense
-retention ceiling and the Einsum scratch-retention verdict. This replaces the
+retention ceiling and the immutable CPU cache-retention verdict. This replaces the
 combinatorial provider constructors; all engine and pipeline callers use the
 same resource bundle without compatibility aliases. The engine constructs the
 Host/Weights source before compiling kernels and shares it across components.
@@ -450,3 +450,35 @@ The idle standing QMoE partition still needs conversion to per-payload ownership
 Other derived caches, scratch/activation accounting, CPU Device/Host physical
 capacity relationships, process-global capacity and asynchronous GPU validation
 remain open. These host checks do not establish CUDA runtime behavior.
+
+
+### Provider-scoped CPU cache retention
+
+`CpuMemoryResources::cache_retention` carries an immutable `CpuCacheRetention`
+verdict captured before registry construction. MatMul, Gemm, FusedMatMulBias,
+MatMulNBits, QLinearMatMul and Einsum use it for the cache families already
+included in the memory plan. The six process-global admission setters have
+been removed. Loading a second model cannot alter the first model's decisions.
+Standalone providers default to admitted retention. ISA and compact native
+packing eligibility remain governed by their existing format/shape contracts.
+
+Session builders accept an initialized CPU `fallback_execution_provider`.
+CUDA whole-session fallback, heterogeneous partitions, plugin bridges,
+control-flow child plans and decode/verify siblings carry that configured
+provider instead of recreating default CPU resources. Non-CPU fallback
+providers fail with an actionable configuration error. Native engine and
+workflow callers supply their configured provider; standalone sessions can
+still auto-detect a default CPU provider.
+
+This is admission policy, not a new physical quota or grant. Existing shared
+transpose/MLAS stores and process scratch ceilings remain shared. Block-derived
+and transient QMoE payloads retain their separate owned Host grants. Remaining
+work includes idle retained QMoE reservations, actual grants for other legacy
+packed caches, and the CPU Device/Host physical-capacity relationship. No GPU
+execution or throughput claim follows from these changes.
+
+Load-time constant preparation is a provider hook over immutable host operands,
+independent of unresolved activation shapes. Its returned state belongs to the
+executor. CPU transpose warming uses the same prepack policy and memo mechanism
+as concrete kernels, so both static and symbolic graphs retain their load-time
+warm path and release its ownership with the session.

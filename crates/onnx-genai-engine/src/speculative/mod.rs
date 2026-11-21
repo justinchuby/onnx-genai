@@ -365,11 +365,12 @@ impl LmHead for MtpLmHead {
 pub(crate) enum DraftProjectionDevice {
     /// Project on the CPU int4 `MatMulNBits` kernel (used by unit tests and the
     /// native CPU backend).
-    Cpu,
+    Cpu { retain_caches: bool },
     /// Project on the native CUDA int4 `MatMulNBits` kernel at the given ordinal.
     Cuda {
         #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
         index: u32,
+        retain_caches: bool,
     },
 }
 
@@ -758,10 +759,23 @@ fn build_quantized_draft_lm_head(
     projection_graph.insert_node(projection_node);
     projection_graph.add_output(logits_value);
 
+    let retain_caches = match projection {
+        DraftProjectionDevice::Cpu { retain_caches }
+        | DraftProjectionDevice::Cuda { retain_caches, .. } => retain_caches,
+    };
+    let cpu: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = Arc::new(
+        onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(
+            onnx_runtime_ep_cpu::CpuMemoryResources {
+                cache_retention: onnx_runtime_ep_cpu::CpuCacheRetention::new(retain_caches),
+                ..Default::default()
+            },
+        )
+        .context("initialize draft projection CPU and fallback cache policy")?,
+    );
     let provider: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = match projection {
-        DraftProjectionDevice::Cpu => Arc::new(onnx_runtime_ep_cpu::CpuExecutionProvider::new()),
+        DraftProjectionDevice::Cpu { .. } => Arc::clone(&cpu),
         #[cfg(feature = "native-cuda")]
-        DraftProjectionDevice::Cuda { index } => Arc::new(
+        DraftProjectionDevice::Cuda { index, .. } => Arc::new(
             onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index)
                 .context("initialize CUDA EP for int4 draft LM-head projection")?,
         ),
@@ -775,6 +789,7 @@ fn build_quantized_draft_lm_head(
         store,
         Path::new("."),
         provider,
+        Some(cpu),
     )
     .context("build int4 draft LM-head projection session")?;
     Ok((
@@ -2691,7 +2706,9 @@ mod tests {
             Arc::new(WeightStore::new()),
             "lm_head.weight",
             k,
-            DraftProjectionDevice::Cpu,
+            DraftProjectionDevice::Cpu {
+                retain_caches: true,
+            },
         )?;
         assert_eq!(vocab, n);
         assert_eq!(lm_head.vocab_size(), n);

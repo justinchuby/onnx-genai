@@ -9,7 +9,6 @@ use rayon::prelude::*;
 use super::{check_arity, qgemm_native, to_dense_bytes, write_dense_bytes};
 use crate::strided::numel;
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Borrow a tensor's bytes when they are already dense, copy them when they are
 /// not.
@@ -92,7 +91,6 @@ pub(crate) static ACCUMULATOR_BUDGET:
         MAX_RETAINED_ACCUMULATOR_BYTES as u64,
         MAX_PROCESS_ACCUMULATOR_BYTES as u64,
     );
-static ACCUMULATOR_RETENTION_ADMITTED: AtomicBool = AtomicBool::new(true);
 
 thread_local! {
     /// Per-thread scratch for the `i32` accumulator that the integer GEMM writes
@@ -114,15 +112,6 @@ thread_local! {
     /// threads (see [`MAX_PROCESS_ACCUMULATOR_BYTES`]).
     static ACCUMULATOR: std::cell::RefCell<Vec<i32>> =
         const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Tell the CPU EP whether the memory plan admitted the process-wide
-/// accumulator scratch budget (#1056). When declined, the kernel parks nothing
-/// and reallocates the `i32` accumulator per call -- byte-identical output, only
-/// slower -- instead of retaining up to [`MAX_PROCESS_ACCUMULATOR_BYTES`] across
-/// the worker pool for the life of the process.
-pub fn set_qlinear_accumulator_budget_admitted(admitted: bool) {
-    ACCUMULATOR_RETENTION_ADMITTED.store(admitted, Ordering::Relaxed);
 }
 
 /// Bytes the parked accumulator scratch currently holds, summed across every
@@ -165,28 +154,6 @@ pub fn qlinear_accumulator_budget_predicted_bytes(graph: &Graph) -> u64 {
     } else {
         0
     }
-}
-
-/// Whether the constant-`B` pre-pack is admitted. Stored inverted so an unset
-/// process (the atomic's `false` default meaning "not disabled") keeps the fast
-/// packed route, matching the sibling `set_mlas_sqnbit_packing_enabled` gate.
-static QLINEAR_PACKED_B_DISABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Tell the CPU EP whether the memory plan admitted the constant-`B` MLAS
-/// pre-pack (#1056). The pre-pack is a session-lifetime, weight-scaled buffer
-/// (`packed_b`); it merged ungoverned in `ac394fd6`. When declined, the kernel
-/// densifies `B` and takes the unpacked GEMM per call -- byte-identical output,
-/// only slower -- and retains no packed copy. Available regardless of the
-/// `mlas` feature so the engine can wire it unconditionally; without `mlas`
-/// there is no packing and the flag is inert.
-pub fn set_qlinear_packed_b_enabled(enabled: bool) {
-    QLINEAR_PACKED_B_DISABLED.store(!enabled, std::sync::atomic::Ordering::Release);
-}
-
-#[cfg(feature = "mlas")]
-fn qlinear_packed_b_enabled() -> bool {
-    !QLINEAR_PACKED_B_DISABLED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Heap bytes the constant-`B` pre-packs currently hold across all kernels --
@@ -346,8 +313,8 @@ struct QgemmPackKey {
     flip_b: bool,
 }
 
-#[derive(Default)]
 pub struct QLinearMatMulKernel {
+    retain_caches: bool,
     /// Which operands the graph guarantees are constant initializers. Only
     /// index 3 (`B`) is consulted; the rest are carried so the array lines up
     /// with the operand list.
@@ -360,15 +327,40 @@ pub struct QLinearMatMulKernel {
     packed_b: std::sync::OnceLock<Option<(QgemmPackKey, mlas_sys::QgemmPackedB)>>,
 }
 
-pub struct QLinearMatMulFactory;
+pub struct QLinearMatMulFactory {
+    retain_caches: bool,
+}
+impl QLinearMatMulFactory {
+    pub fn new(retain_caches: bool) -> Self {
+        Self { retain_caches }
+    }
+}
+impl Default for QLinearMatMulFactory {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+impl Default for QLinearMatMulKernel {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
 
 impl KernelFactory for QLinearMatMulFactory {
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(QLinearMatMulKernel::default()))
+        Ok(Box::new(QLinearMatMulKernel::new(self.retain_caches)))
     }
 }
 
 impl QLinearMatMulKernel {
+    fn new(retain_caches: bool) -> Self {
+        Self {
+            retain_caches,
+            constant_inputs: [false; 8],
+            #[cfg(feature = "mlas")]
+            packed_b: std::sync::OnceLock::new(),
+        }
+    }
     /// The identity a pack for this call would have, or `None` when `B` must
     /// not be packed at all.
     ///
@@ -383,7 +375,7 @@ impl QLinearMatMulKernel {
         geometry: &Geometry,
         plan: &QgemmPlan,
     ) -> Option<QgemmPackKey> {
-        if !qlinear_packed_b_enabled() {
+        if !self.retain_caches {
             return None;
         }
         if !self.constant_inputs[3] {
@@ -732,7 +724,11 @@ impl Kernel for QLinearMatMulKernel {
         // shape reuses one already-faulted mapping instead of buying a new one.
         // Taking it out of the thread-local returns its reservation to the
         // process-wide budget; it is re-reserved at the end iff it still fits.
-        let mut products: Vec<i32> = ACCUMULATOR.with(|cell| cell.take());
+        let mut products: Vec<i32> = if self.retain_caches {
+            ACCUMULATOR.with(|cell| cell.take())
+        } else {
+            Vec::new()
+        };
         let _ =
             ACCUMULATOR_BUDGET.release((products.capacity() * std::mem::size_of::<i32>()) as u64);
         let mut b_zero_points: Vec<i32> = Vec::new();
@@ -908,7 +904,7 @@ impl Kernel for QLinearMatMulKernel {
         // `MAX_PROCESS_ACCUMULATOR_BYTES`. A refused buffer is dropped and
         // recomputed next call (byte-identical), so the process footprint no
         // longer scales with the thread count.
-        if ACCUMULATOR_RETENTION_ADMITTED.load(Ordering::Relaxed)
+        if self.retain_caches
             && ACCUMULATOR_BUDGET
                 .try_park((products.capacity() * std::mem::size_of::<i32>()) as u64)
         {
@@ -1670,6 +1666,73 @@ mod tests {
         output
     }
 
+    #[test]
+    fn provider_cache_retention_decline_preserves_peer_parked_scratch() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        std::thread::spawn(|| {
+            let (a, b) = (
+                Owned::u8(&[2, 3], &[130, 132, 134, 136, 138, 140]),
+                Owned::u8(&[3, 2], &[120, 121, 122, 123, 124, 125]),
+            );
+            let (a_scale, a_zero) = (Owned::f32(&[], &[0.5]), Owned::u8(&[], &[128]));
+            let (b_scale, b_zero) = (Owned::f32(&[], &[0.25]), Owned::u8(&[], &[127]));
+            let (y_scale, y_zero) = (Owned::f32(&[], &[64.0]), Owned::u8(&[], &[100]));
+            let inputs = [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ]
+            .map(|value| value.view());
+            let node = Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]);
+            for admitted_first in [true, false] {
+                let make = |admitted| {
+                    crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
+                        cache_retention: crate::CpuCacheRetention::new(admitted),
+                        ..Default::default()
+                    })
+                };
+                let first = make(admitted_first);
+                let second = make(!admitted_first);
+                let (admitted, declined) = if admitted_first {
+                    (&first, &second)
+                } else {
+                    (&second, &first)
+                };
+                let admitted = admitted
+                    .get_kernel(&node, &[vec![2, 3], vec![], vec![], vec![3, 2]], 10)
+                    .unwrap();
+                let declined = declined
+                    .get_kernel(&node, &[vec![2, 3], vec![], vec![], vec![3, 2]], 10)
+                    .unwrap();
+                let mut expected = Owned::zeros(DataType::Uint8, &[2, 2]);
+                admitted
+                    .execute(&inputs, &mut [expected.view_mut()])
+                    .unwrap();
+                let parked = ACCUMULATOR.with(|slot| {
+                    let slot = slot.borrow();
+                    (slot.as_ptr(), slot.capacity())
+                });
+                assert!(parked.1 >= 4);
+                let mut actual = Owned::zeros(DataType::Uint8, &[2, 2]);
+                declined.execute(&inputs, &mut [actual.view_mut()]).unwrap();
+                assert_eq!(actual.bytes, expected.bytes);
+                assert_eq!(
+                    ACCUMULATOR.with(|slot| {
+                        let slot = slot.borrow();
+                        (slot.as_ptr(), slot.capacity())
+                    }),
+                    parked,
+                    "declined provider must neither consume nor replace a peer's parked scratch"
+                );
+            }
+            // This dedicated worker exits with no parked reservation.
+            ACCUMULATOR.with(|slot| {
+                let buffer = slot.take();
+                ACCUMULATOR_BUDGET.release((buffer.capacity() * std::mem::size_of::<i32>()) as u64);
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
     /// The parked accumulator scratch must be bounded across the **whole
     /// process**, not per thread. This is the defect the review named: a per-
     /// thread cap is silent about the `x threads` multiplier, so the real
@@ -1727,7 +1790,6 @@ mod tests {
             &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
         ];
 
-        ACCUMULATOR_RETENTION_ADMITTED.store(true, Ordering::Relaxed);
         ACCUMULATOR_BUDGET.reset_for_test();
 
         let kernel = QLinearMatMulKernel::default();

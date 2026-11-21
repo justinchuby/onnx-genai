@@ -125,7 +125,7 @@ pub fn route_telemetry_count(route: usize) -> usize {
 
 /// Process-wide byte accounting for typed Einsum scratch retained between
 /// calls. Admission is deliberately absent here: each compiled session owns an
-/// immutable [`EinsumScratchRetention`] verdict. The only process-global state
+/// immutable [`CpuCacheRetention`] verdict. The only process-global state
 /// is the aggregate byte ceiling shared by those independent sessions.
 static EINSUM_SCRATCH_BUDGET: GovernedAccumulatorBudget = GovernedAccumulatorBudget::new(
     DEFAULT_PER_THREAD_ACCUMULATOR_BYTES,
@@ -168,7 +168,7 @@ struct EinsumScratchSlots {
     active: Vec<(u64, Arc<EinsumScratchSlot>)>,
 }
 
-struct EinsumScratchRetentionInner {
+struct CpuCacheRetentionInner {
     admitted: bool,
     budget: &'static GovernedAccumulatorBudget,
     // Every entry owns a non-empty, byte-reserved buffer. TLS has exactly one
@@ -178,7 +178,7 @@ struct EinsumScratchRetentionInner {
     slots: Mutex<EinsumScratchSlots>,
 }
 
-impl EinsumScratchRetentionInner {
+impl CpuCacheRetentionInner {
     fn register<T: Send + 'static>(self: &Arc<Self>, buffer: Vec<T>) -> Option<EinsumTlsScratch> {
         let mut accumulator = GovernedAccumulator::new();
         if !accumulator.try_park(buffer, self.budget) {
@@ -230,14 +230,14 @@ impl EinsumScratchRetentionInner {
 }
 
 struct EinsumTlsScratch {
-    owner: Weak<EinsumScratchRetentionInner>,
+    owner: Weak<CpuCacheRetentionInner>,
     slot: Weak<EinsumScratchSlot>,
     registration: u64,
     element_type: TypeId,
 }
 
 impl EinsumTlsScratch {
-    fn belongs_to(&self, owner: &Arc<EinsumScratchRetentionInner>) -> bool {
+    fn belongs_to(&self, owner: &Arc<CpuCacheRetentionInner>) -> bool {
         self.owner.ptr_eq(&Arc::downgrade(owner))
     }
 
@@ -254,33 +254,34 @@ impl Drop for EinsumTlsScratch {
     }
 }
 
-/// Immutable session-owned decision for retaining CPU Einsum scratch.
+/// Immutable provider/session decision for the memory plan’s CPU caches.
 ///
-/// A CPU provider clones this handle into its Einsum factory and every compiled
-/// kernel. Different providers therefore cannot overwrite one another's memory
-/// strategy. The handle owns every parked slot strongly, while TLS keeps weak
+/// Factories capture this verdict for planned dense/transpose/NBits/QLinear
+/// caches and Einsum scratch; it is eligibility, not a physical allocation grant.
+/// Different providers cannot overwrite one another’s memory strategy.
+/// For Einsum, the handle owns parked scratch slots strongly, while TLS keeps weak
 /// references; dropping the last provider/session/kernel handle immediately
 /// releases inactive-worker allocations and their process-budget reservations.
 #[derive(Clone)]
-pub struct EinsumScratchRetention {
-    inner: Arc<EinsumScratchRetentionInner>,
+pub struct CpuCacheRetention {
+    inner: Arc<CpuCacheRetentionInner>,
 }
 
-impl std::fmt::Debug for EinsumScratchRetention {
+impl std::fmt::Debug for CpuCacheRetention {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EinsumScratchRetention")
+        f.debug_struct("CpuCacheRetention")
             .field("admitted", &self.inner.admitted)
             .finish_non_exhaustive()
     }
 }
 
-impl Default for EinsumScratchRetention {
+impl Default for CpuCacheRetention {
     fn default() -> Self {
         Self::new(true)
     }
 }
 
-impl EinsumScratchRetention {
+impl CpuCacheRetention {
     /// Create one immutable retention verdict for one provider/session.
     pub fn new(admitted: bool) -> Self {
         Self::with_budget(admitted, &EINSUM_SCRATCH_BUDGET)
@@ -288,7 +289,7 @@ impl EinsumScratchRetention {
 
     fn with_budget(admitted: bool, budget: &'static GovernedAccumulatorBudget) -> Self {
         Self {
-            inner: Arc::new(EinsumScratchRetentionInner {
+            inner: Arc::new(CpuCacheRetentionInner {
                 admitted,
                 budget,
                 slots: Mutex::new(EinsumScratchSlots::default()),
@@ -819,7 +820,7 @@ pub fn einsum_scratch_budget_predicted_bytes(graph: &onnx_runtime_ir::Graph) -> 
 pub struct EinsumKernel {
     plan: EinsumShapePlan,
     matmul: MatMulKernel,
-    scratch_retention: EinsumScratchRetention,
+    scratch_retention: CpuCacheRetention,
     mode: EinsumExecutionMode,
     flops: Option<u64>,
     last_workspace_bytes: AtomicUsize,
@@ -829,12 +830,12 @@ pub struct EinsumKernel {
 
 /// Factory for [`EinsumKernel`].
 pub struct EinsumFactory {
-    scratch_retention: EinsumScratchRetention,
+    scratch_retention: CpuCacheRetention,
     mode: Option<EinsumExecutionMode>,
 }
 
 impl EinsumFactory {
-    pub fn new(scratch_retention: EinsumScratchRetention) -> Self {
+    pub fn new(scratch_retention: CpuCacheRetention) -> Self {
         Self {
             scratch_retention,
             mode: None,
@@ -847,7 +848,7 @@ impl EinsumFactory {
     /// benchmark adapters while keeping the ordinary provider configuration
     /// compatible with [`EINSUM_MODE_ENV`].
     pub fn with_execution_mode(
-        scratch_retention: EinsumScratchRetention,
+        scratch_retention: CpuCacheRetention,
         mode: EinsumExecutionMode,
     ) -> Self {
         Self {
@@ -859,7 +860,7 @@ impl EinsumFactory {
 
 impl Default for EinsumFactory {
     fn default() -> Self {
-        Self::new(EinsumScratchRetention::default())
+        Self::new(CpuCacheRetention::default())
     }
 }
 
@@ -883,7 +884,7 @@ impl KernelFactory for EinsumFactory {
         };
         Ok(Box::new(EinsumKernel {
             plan,
-            matmul: MatMulKernel::default(),
+            matmul: MatMulKernel::with_cache_retention(self.scratch_retention.is_admitted()),
             scratch_retention: self.scratch_retention.clone(),
             mode,
             flops,
@@ -3216,12 +3217,12 @@ mod tests {
         ScratchTestGuard { _guard: guard }
     }
 
-    fn test_retention(admitted: bool) -> EinsumScratchRetention {
-        EinsumScratchRetention::with_budget(admitted, &TEST_SCRATCH_BUDGET)
+    fn test_retention(admitted: bool) -> CpuCacheRetention {
+        CpuCacheRetention::with_budget(admitted, &TEST_SCRATCH_BUDGET)
     }
 
     fn with_test_scratch<T>(
-        retention: &EinsumScratchRetention,
+        retention: &CpuCacheRetention,
         len: usize,
         execute: impl FnOnce(&mut Vec<f32>) -> Result<T>,
     ) -> Result<T> {
@@ -3232,7 +3233,7 @@ mod tests {
         equation: &str,
         shapes: &[Vec<usize>],
         mode: ExecutionMode,
-        scratch_retention: EinsumScratchRetention,
+        scratch_retention: CpuCacheRetention,
     ) -> Box<dyn Kernel> {
         let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
         node.attributes.insert(
@@ -3244,7 +3245,7 @@ mod tests {
         Box::new(EinsumKernel {
             flops: None,
             plan,
-            matmul: MatMulKernel::default(),
+            matmul: MatMulKernel::with_cache_retention(scratch_retention.is_admitted()),
             scratch_retention,
             mode,
             last_workspace_bytes: AtomicUsize::new(0),
@@ -3253,7 +3254,7 @@ mod tests {
     }
 
     fn kernel(equation: &str, shapes: &[Vec<usize>], mode: ExecutionMode) -> Box<dyn Kernel> {
-        kernel_with_retention(equation, shapes, mode, EinsumScratchRetention::default())
+        kernel_with_retention(equation, shapes, mode, CpuCacheRetention::default())
     }
 
     fn kernel_for_opset(
@@ -3268,7 +3269,7 @@ mod tests {
             "equation".into(),
             Attribute::String(equation.as_bytes().to_vec()),
         );
-        EinsumFactory::with_execution_mode(EinsumScratchRetention::default(), mode)
+        EinsumFactory::with_execution_mode(CpuCacheRetention::default(), mode)
             .create(&node, shapes)
             .unwrap()
     }
@@ -3647,7 +3648,7 @@ mod tests {
         node.attributes
             .insert("equation".into(), Attribute::String(b"ij->i".to_vec()));
         let provider = crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-            einsum_scratch_retention: retention,
+            cache_retention: retention,
             ..Default::default()
         });
         let kernel = provider
@@ -4297,11 +4298,11 @@ mod tests {
             let first_retention = test_retention(admitted_first);
             let second_retention = test_retention(!admitted_first);
             let first = crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-                einsum_scratch_retention: first_retention.clone(),
+                cache_retention: first_retention.clone(),
                 ..Default::default()
             });
             let second = crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-                einsum_scratch_retention: second_retention.clone(),
+                cache_retention: second_retention.clone(),
                 ..Default::default()
             });
             let (admitted_provider, admitted_retention, declined_provider, declined_retention) =
@@ -4409,7 +4410,7 @@ mod tests {
         let dtypes = vec![DataType::Float32; arity];
         assert!(unsupported_reason_for_opset(&large, 12, &shapes, &dtypes).is_none());
         let kernel = EinsumFactory::with_execution_mode(
-            EinsumScratchRetention::default(),
+            CpuCacheRetention::default(),
             EinsumExecutionMode::Optimized,
         )
         .create(&large, &vec![vec![1]; arity])
@@ -4439,7 +4440,7 @@ mod tests {
             usize::try_from(DEFAULT_PER_THREAD_ACCUMULATOR_BYTES).unwrap() - 8192
         );
 
-        let retention = EinsumScratchRetention::default();
+        let retention = CpuCacheRetention::default();
         let kernel = kernel_with_retention(
             "ab,bc,cd->ad",
             &[vec![ROWS, 1], vec![1, 1], vec![1, COLUMNS]],

@@ -154,6 +154,13 @@ mod error {
     /// Errors produced by the session layer.
     #[derive(Debug, thiserror::Error)]
     pub enum SessionError {
+        #[error(
+            "fallback_execution_provider '{provider}' is bound to {device:?}; pass a CPU provider initialized with this session's memory resources"
+        )]
+        InvalidFallbackProvider {
+            provider: String,
+            device: onnx_runtime_ir::DeviceId,
+        },
         #[error("session not initialized")]
         NotInitialized,
 
@@ -513,6 +520,7 @@ pub struct SessionBuilder {
     model_bytes: Option<Vec<u8>>,
     device: DevicePreference,
     execution_provider: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
+    fallback_execution_provider: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
     memory_limit: Option<usize>,
     enable_profiling: bool,
     warmup_shapes: Vec<WarmupShape>,
@@ -546,6 +554,16 @@ impl SessionBuilder {
         execution_provider: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
     ) -> Self {
         self.execution_provider = Some(execution_provider);
+        self
+    }
+
+    /// CPU provider used for heterogeneous placement and whole-session fallback.
+    /// Its configured factories/resources are shared with every executor sibling.
+    pub fn fallback_execution_provider(
+        mut self,
+        provider: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+    ) -> Self {
+        self.fallback_execution_provider = Some(provider);
         self
     }
 
@@ -796,6 +814,7 @@ impl SessionBuilder {
             ep_context_config,
             model_metadata,
             ep,
+            self.fallback_execution_provider,
         )?;
         if !self.warmup_shapes.is_empty() {
             let mut span = trace_span("session.warmup", "session");
@@ -1192,6 +1211,7 @@ impl InferenceSession {
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
             executor::auto_detect_cpu_ep()?,
+            None,
         )
     }
 
@@ -1204,11 +1224,14 @@ impl InferenceSession {
     /// draft LM-head projection reuses the target model's already-loaded int4
     /// `MatMulNBits` initializers zero-copy on the native CUDA EP, without
     /// re-exporting a sidecar or dequantising the weight host-side.
+    /// `fallback` supplies the initialized CPU provider and its session resources;
+    /// `None` selects the standalone CPU defaults if fallback is needed.
     pub fn from_graph_with_provider(
         graph: onnx_runtime_ir::Graph,
         weights: std::sync::Arc<onnx_runtime_loader::WeightStore>,
         model_dir: &Path,
         provider: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+        fallback: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
     ) -> Result<Self> {
         Self::from_parts(
             graph,
@@ -1217,6 +1240,7 @@ impl InferenceSession {
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
             provider,
+            fallback,
         )
     }
 
@@ -1227,6 +1251,7 @@ impl InferenceSession {
         ep_context_config: EpContextDumpConfig,
         model_metadata: ModelMetadata,
         ep: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+        fallback_provider: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
     ) -> Result<Self> {
         // Establish the canonical-domain invariant for programmatically built
         // graphs (the loader already normalizes at proto-materialization time):
@@ -1285,7 +1310,7 @@ impl InferenceSession {
 
         let exec = {
             let mut span = trace_span("session.executor_build", "session");
-            let exec = executor::Executor::build(graph, weights, ep)?;
+            let exec = executor::Executor::build(graph, weights, ep, fallback_provider)?;
             if let Some(span) = span.as_mut() {
                 span.set_args(Args::new().with("cache_entries", exec.cache_stats().entries as u64));
             }
@@ -2168,6 +2193,7 @@ mod device_binding_tests {
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
             std::sync::Arc::new(ep),
+            None,
         )
         .unwrap();
         let mut input = session
@@ -2247,6 +2273,7 @@ mod device_binding_tests {
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
             std::sync::Arc::new(ep),
+            None,
         )
         .unwrap();
 
@@ -2356,6 +2383,7 @@ mod device_binding_tests {
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
             std::sync::Arc::new(ep),
+            None,
         )
         .unwrap();
 
@@ -2514,6 +2542,7 @@ mod device_binding_tests {
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
             std::sync::Arc::new(ep),
+            None,
         )
         .unwrap();
 

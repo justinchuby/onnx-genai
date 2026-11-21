@@ -34,11 +34,25 @@ pub struct FusedMatMulBiasKernel {
 }
 
 /// Factory for [`FusedMatMulBiasKernel`] (no attributes).
-pub struct FusedMatMulBiasFactory;
+pub struct FusedMatMulBiasFactory {
+    retain_caches: bool,
+}
+impl FusedMatMulBiasFactory {
+    pub fn new(retain_caches: bool) -> Self {
+        Self { retain_caches }
+    }
+}
+impl Default for FusedMatMulBiasFactory {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
 
 impl KernelFactory for FusedMatMulBiasFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(FusedMatMulBiasKernel::default()))
+        Ok(Box::new(FusedMatMulBiasKernel {
+            prepack: MatMulPrepack::new(self.retain_caches),
+        }))
     }
 }
 
@@ -301,7 +315,6 @@ mod route_tests {
         reset_half_decode_gemv_calls, reset_half_decode_transposed_calls,
     };
     use crate::kernels::testutil::Owned;
-    use crate::kernels::weight_transpose::CacheEnabledScope;
 
     fn f16_weight(k: usize, n: usize) -> Vec<f32> {
         (0..k * n)
@@ -314,7 +327,6 @@ mod route_tests {
     /// walk that runs 1.56-2.98x slower.
     #[test]
     fn fused_bias_decode_reaches_the_transposed_half_gemv() {
-        let _admit = CacheEnabledScope::new(true);
         let (k, n) = (128usize, 64usize);
         let b_vals = f16_weight(k, n);
         let a = Owned::f16(
@@ -352,7 +364,6 @@ mod route_tests {
     /// close: the GEMV and the f32 fallback accumulate in the same order.
     #[test]
     fn every_bias_shape_survives_the_new_route() {
-        let _admit = CacheEnabledScope::new(true);
         let (k, n) = (96usize, 32usize);
         let b_vals = f16_weight(k, n);
         let a_vals: Vec<f32> = (0..k).map(|i| (i as f32 * 0.02).cos()).collect();
@@ -432,7 +443,6 @@ mod route_tests {
         // Thread-local admission, never the process-global setter (#1056):
         // this test runs under the parallel harness alongside others that read
         // the same caches.
-        let _admit = CacheEnabledScope::new(true);
 
         // Odd `k` so a tail-handling bug cannot hide behind a round shape.
         let (k, n) = (67usize, 16usize);

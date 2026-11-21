@@ -653,6 +653,7 @@ fn executor_build_rejects_foreign_provider_device_before_compilation() {
         graph,
         Arc::new(WeightStore::new()),
         Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+        None,
     ) {
         Ok(_) => panic!("a foreign-device artifact template must fail before compilation"),
         Err(error) => error,
@@ -841,6 +842,7 @@ fn deferred_validation_bound_fixture_for_provider(
         graph,
         Arc::new(WeightStore::new()),
         Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+        None,
     )
     .unwrap();
     let mut bindings = vec![
@@ -893,6 +895,7 @@ fn deferred_device_validation_is_request_local_and_checked_after_sync() {
         graph,
         Arc::new(WeightStore::new()),
         ep as Arc<dyn ExecutionProvider>,
+        None,
     )
     .unwrap();
     let input = Tensor::from_f32(&[2], &[3.0, 7.0]).unwrap();
@@ -1228,6 +1231,7 @@ fn device_bound_validation_is_deferred_until_a_partial_host_read() {
         graph,
         Arc::new(WeightStore::new()),
         Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+        None,
     )
     .unwrap();
     let mut bindings = vec![
@@ -1360,6 +1364,7 @@ fn route_residency_boundary_fires_once_per_top_level_run_after_sync() {
         graph,
         Arc::new(WeightStore::new()),
         Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+        None,
     )
     .unwrap();
     let input = Tensor::from_f32(&[2], &[3.0, 7.0]).unwrap();
@@ -1447,6 +1452,7 @@ fn route_residency_boundary_skips_nested_control_flow_runs() {
         graph,
         Arc::new(WeightStore::new()),
         Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+        None,
     )
     .unwrap();
     let cond_t = Tensor::from_raw(DataType::Bool, vec![1], &[1u8]).unwrap();
@@ -1492,6 +1498,7 @@ fn device_validation_reset_failure_is_not_ignored_after_a_run() {
         graph,
         Arc::new(WeightStore::new()),
         Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+        None,
     )
     .unwrap();
     let input = Tensor::from_f32(&[1], &[5.0]).unwrap();
@@ -1700,6 +1707,7 @@ fn zero_copy_output_move_reallocates_and_preserves_producer_less_output() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -1771,6 +1779,7 @@ fn compute_in_place_chain_is_byte_identical_and_fires() {
         inplace_chain_graph(false, false),
         Arc::clone(&weights),
         Arc::clone(&ep),
+        None,
     )
     .unwrap();
     let enabled_output = enabled.run(&[("input", &values)]).unwrap()[0]
@@ -1785,7 +1794,8 @@ fn compute_in_place_chain_is_byte_identical_and_fires() {
     // `prepare_run_buffers`.
     assert_eq!(enabled.compute_in_place_alias_count, 1);
 
-    let mut disabled = Executor::build(inplace_chain_graph(false, false), weights, ep).unwrap();
+    let mut disabled =
+        Executor::build(inplace_chain_graph(false, false), weights, ep, None).unwrap();
     disabled.compute_in_place_enabled = false;
     let disabled_output = disabled.run(&[("input", &values)]).unwrap()[0]
         .as_bytes()
@@ -1802,6 +1812,7 @@ fn compute_in_place_refuses_live_and_graph_output_inputs() {
             inplace_chain_graph(keep_input_output, keep_input_live),
             Arc::new(WeightStore::new()),
             auto_detect_cpu_ep().unwrap(),
+            None,
         )
         .unwrap();
         let outputs = executor.run(&[("input", &values)]).unwrap();
@@ -1873,13 +1884,14 @@ fn compute_in_place_preserves_control_flow_captures() {
         inplace_capture_if_graph(),
         Arc::clone(&weights),
         Arc::clone(&ep),
+        None,
     )
     .unwrap();
     let enabled_output = enabled.run(&[("x", &values), ("cond", &cond)]).unwrap()[0]
         .as_bytes()
         .to_vec();
 
-    let mut disabled = Executor::build(inplace_capture_if_graph(), weights, ep).unwrap();
+    let mut disabled = Executor::build(inplace_capture_if_graph(), weights, ep, None).unwrap();
     disabled.compute_in_place_enabled = false;
     let disabled_output = disabled.run(&[("x", &values), ("cond", &cond)]).unwrap()[0]
         .as_bytes()
@@ -2038,6 +2050,7 @@ fn compute_in_place_multilayer_decode_residual_is_byte_identical_and_fires() {
         decode_shaped_residual_graph(),
         Arc::clone(&weights),
         Arc::clone(&ep),
+        None,
     )
     .unwrap();
     let enabled_output = enabled.run(&[("x", &values)]).unwrap()[0]
@@ -2050,7 +2063,7 @@ fn compute_in_place_multilayer_decode_residual_is_byte_identical_and_fires() {
         enabled.compute_in_place_alias_count,
     );
 
-    let mut disabled = Executor::build(decode_shaped_residual_graph(), weights, ep).unwrap();
+    let mut disabled = Executor::build(decode_shaped_residual_graph(), weights, ep, None).unwrap();
     disabled.compute_in_place_enabled = false;
     let disabled_output = disabled.run(&[("x", &values)]).unwrap()[0]
         .as_bytes()
@@ -2075,7 +2088,7 @@ fn activation_memory_planner_reports_static_decode_graph_savings() {
     let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
     let weights = Arc::new(WeightStore::new());
     let ep = auto_detect_cpu_ep().unwrap();
-    let mut exec = Executor::build(decode_shaped_residual_graph(), weights, ep).unwrap();
+    let mut exec = Executor::build(decode_shaped_residual_graph(), weights, ep, None).unwrap();
 
     assert_eq!(
         exec.activation_memory_plan_stats(),
@@ -2104,7 +2117,7 @@ fn activation_memory_planner_uses_runtime_view_edges() {
     let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
     let weights = Arc::new(WeightStore::new());
     let ep = auto_detect_cpu_ep().unwrap();
-    let mut exec = Executor::build(view_shaped_activation_graph(), weights, ep).unwrap();
+    let mut exec = Executor::build(view_shaped_activation_graph(), weights, ep, None).unwrap();
 
     assert_eq!(
         exec.activation_memory_plan_stats(),
@@ -2195,6 +2208,7 @@ fn build_identity_capture_fixture() -> (Executor, Vec<KernelKey>, HashMap<ValueI
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().expect("CPU EP"),
+        None,
     )
     .expect("representative static graph");
     let resolved = executor
@@ -2507,6 +2521,7 @@ fn ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().expect("CPU EP"),
+        None,
     )
     .expect("representative static graph");
     let mut resolved = executor
@@ -5744,7 +5759,8 @@ fn prepare_reserves_static_nested_qmoe_workspace_and_child_reuses_it() {
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut ep = WeightDeliveryEp::new(false, deliveries);
     ep.workspace_bytes = 4096;
-    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep), None).unwrap();
     let cond = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
     let requirement = executor
         .prepare_with_device_bindings(&[("cond", &cond)], &mut [])
@@ -5785,7 +5801,8 @@ fn prepare_reserves_static_index_share_workspace() {
     let mut ep = WeightDeliveryEp::new(false, Arc::clone(&deliveries));
     ep.support_index_share_workspace = true;
     ep.workspace_bytes = 768;
-    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep), None).unwrap();
     let q_tensor = Tensor::zeros(DataType::Float32, vec![1, 2, 3, 4]).unwrap();
     let k_tensor = Tensor::zeros(DataType::Float32, vec![1, 1, 3, 4]).unwrap();
     let v_tensor = Tensor::zeros(DataType::Float32, vec![1, 1, 3, 4]).unwrap();
@@ -5841,7 +5858,7 @@ fn inference_session_fallback_workspace_grows_retries_and_reuses() {
     let mut ep = WeightDeliveryEp::new(false, deliveries);
     ep.workspace_bytes_per_row = 1024;
     let fail_size = Arc::clone(&ep.fail_allocation_size);
-    let exec = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let exec = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep), None).unwrap();
     let mut session = crate::InferenceSession {
         inputs,
         outputs,
@@ -5945,7 +5962,7 @@ fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut ep = WeightDeliveryEp::new(false, deliveries);
     ep.workspace_bytes_per_row = 1024;
-    let exec = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let exec = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep), None).unwrap();
     let mut session = crate::InferenceSession {
         inputs,
         outputs,
@@ -6149,7 +6166,7 @@ fn qmoe_expert_region_candidates_partition_expert_major_bank_without_changing_ha
     let (graph, weights, _path) = qmoe_expert_region_fixture();
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ep = WeightDeliveryEp::new(true, deliveries);
-    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+    let executor = Executor::build(graph, weights, Arc::new(ep), None).unwrap();
 
     // Existing behavior unchanged: still exactly one lazy weight handle per
     // initializer (fc1 packed + fc1 scales), each with exactly one region.
@@ -6204,7 +6221,7 @@ fn qmoe_expert_region_candidates_record_reason_for_non_rank3_layout() {
 
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ep = WeightDeliveryEp::new(true, deliveries);
-    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+    let executor = Executor::build(graph, weights, Arc::new(ep), None).unwrap();
 
     // Rank-2 dims cannot derive an expert-major layout, but the value must
     // still be recorded (not silently dropped) with an explicit
@@ -6239,7 +6256,7 @@ fn qmoe_dispatch_acquires_exactly_one_routed_residency_guard_per_node() {
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ep = WeightDeliveryEp::new(true, deliveries);
     let calls = Arc::clone(&ep.routed_residency_calls);
-    let mut executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+    let mut executor = Executor::build(graph, weights, Arc::new(ep), None).unwrap();
 
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     let input = Tensor::from_f32(&[1, 4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -6274,7 +6291,8 @@ fn non_qmoe_dispatch_never_acquires_a_routed_residency_guard() {
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ep = WeightDeliveryEp::new(true, deliveries);
     let calls = Arc::clone(&ep.routed_residency_calls);
-    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep), None).unwrap();
 
     let values = Tensor::from_f32(&[1, 4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
     let _ = executor.run(&[("input", &values)]).unwrap();
@@ -6305,7 +6323,7 @@ fn claim_time_optional_input_dtype_is_undefined_not_silently_float32() {
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut ep = WeightDeliveryEp::new(false, deliveries);
     ep.optional_input_contract = true;
-    let executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep));
+    let executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep), None);
     assert!(
         executor.is_ok(),
         "an omitted optional input must reach supports_op as DataType::Undefined"
@@ -6322,7 +6340,7 @@ fn executor_opens_per_op_span_only_when_tracing_enabled() {
         let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ep: Arc<dyn ExecutionProvider> =
             Arc::new(WeightDeliveryEp::new(false, Arc::clone(&deliveries)));
-        let mut executor = Executor::build(graph, weights, ep).unwrap();
+        let mut executor = Executor::build(graph, weights, ep, None).unwrap();
         let (trace, events) = TraceContext::in_memory();
         trace.set_enabled(false);
         executor.set_trace_context(trace);
@@ -6341,7 +6359,7 @@ fn executor_opens_per_op_span_only_when_tracing_enabled() {
         let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ep: Arc<dyn ExecutionProvider> =
             Arc::new(WeightDeliveryEp::new(false, Arc::clone(&deliveries)));
-        let mut executor = Executor::build(graph, weights, ep).unwrap();
+        let mut executor = Executor::build(graph, weights, ep, None).unwrap();
         let (trace, events) = TraceContext::in_memory();
         executor.set_trace_context(trace);
         let _ = executor.run(&[]).unwrap();
@@ -6514,6 +6532,7 @@ fn sealed_bqmoe_cuda_session_for_provider(
         Arc::new(WeightStore::new()),
         std::path::Path::new("."),
         cuda,
+        None,
     )
     .unwrap();
     let mut bindings = vec![
@@ -6582,6 +6601,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         sealed_bqmoe_session_graph(),
         Arc::new(WeightStore::new()),
         Arc::new(CpuExecutionProvider::new()),
+        None,
     )
     .unwrap();
     let expected = cpu.run(&[("x", &input), ("router", &router)]).unwrap()[0].to_vec_f32();
@@ -6593,6 +6613,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         sealed_bqmoe_session_graph(),
         Arc::new(WeightStore::new()),
         Arc::clone(&cuda) as Arc<dyn ExecutionProvider>,
+        None,
     )
     .unwrap();
     let first = executor.run(&[("x", &input), ("router", &router)]).unwrap()[0].to_vec_f32();
@@ -6743,6 +6764,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         sealed_bqmoe_session_graph(),
         Arc::new(WeightStore::new()),
         Arc::new(CudaExecutionProvider::new_default().unwrap()),
+        None,
     )
     .unwrap();
     preparation_control
@@ -6952,6 +6974,7 @@ fn sealed_bqmoe_supported_observer_accumulates_eager_and_replay() {
         Arc::new(WeightStore::new()),
         std::path::Path::new("."),
         cuda,
+        None,
     )
     .unwrap();
     let mut bindings = vec![
@@ -7874,9 +7897,14 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
         let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
         let runtime = Arc::clone(cuda.runtime());
         let dense_before = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);
-        let mut session =
-            crate::InferenceSession::from_graph_with_provider(graph, store, &root, cuda.clone())
-                .unwrap();
+        let mut session = crate::InferenceSession::from_graph_with_provider(
+            graph,
+            store,
+            &root,
+            cuda.clone(),
+            None,
+        )
+        .unwrap();
         let assert_traffic = |phase: &str,
                               traffic: onnx_runtime_ep_api::BlockQuantizedMoeTraffic,
                               routes: u64,
@@ -8258,7 +8286,7 @@ fn executor_selects_lazy_or_resident_weight_delivery_from_ep_capability() {
         let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ep: Arc<dyn ExecutionProvider> =
             Arc::new(WeightDeliveryEp::new(lazy, Arc::clone(&deliveries)));
-        let mut executor = Executor::build(graph, weights, ep).unwrap();
+        let mut executor = Executor::build(graph, weights, ep, None).unwrap();
         let outputs = executor.run(&[]).unwrap();
 
         assert_eq!(outputs[0].as_bytes(), &[1, 2, 3, 4]);
@@ -8282,7 +8310,7 @@ fn executor_prefetches_next_lazy_weight_before_current_node_runs() {
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ep: Arc<dyn ExecutionProvider> =
         Arc::new(WeightDeliveryEp::new(true, Arc::clone(&deliveries)));
-    let mut executor = Executor::build(graph, weights, ep).unwrap();
+    let mut executor = Executor::build(graph, weights, ep, None).unwrap();
     let outputs = executor.run(&[]).unwrap();
 
     assert_eq!(outputs[0].as_bytes(), &[5, 6, 7, 8]);
@@ -8310,7 +8338,7 @@ fn non_host_lazy_only_initializer_skips_eager_device_residency() {
             Arc::clone(&allocations),
             Arc::clone(&host_uploads),
         ));
-        let mut executor = Executor::build(graph, weights, ep).unwrap();
+        let mut executor = Executor::build(graph, weights, ep, None).unwrap();
 
         assert_eq!(
             allocations.load(Ordering::Relaxed),
@@ -8364,7 +8392,7 @@ fn initializer_shared_with_resident_consumer_uses_one_device_copy() {
         Arc::clone(&allocations),
         Arc::clone(&host_uploads),
     ));
-    let mut executor = Executor::build(graph, weights, ep).unwrap();
+    let mut executor = Executor::build(graph, weights, ep, None).unwrap();
 
     assert!(
         !executor.weight_handles.contains_key(&weight),
@@ -8513,6 +8541,199 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
         );
     }
     assert!(!first.contains("more unsupported node"));
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn symbolic_cpu_session_prepares_constants_at_load_with_own_retention_policy() {
+    for admitted in [false, true] {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let batch = graph.create_symbol(None);
+        let x = graph.create_named_value(
+            "x",
+            DataType::Float32,
+            vec![Dim::Symbolic(batch), Dim::Static(5)],
+        );
+        let b = graph.create_named_value("b", DataType::Float16, static_shape([5, 7]));
+        let y = graph.create_named_value(
+            "y",
+            DataType::Float32,
+            vec![Dim::Symbolic(batch), Dim::Static(7)],
+        );
+        graph.initializers.insert(
+            b,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Float16,
+                vec![5, 7],
+                [0u8, 0x3c].repeat(35),
+            )),
+        );
+        graph.add_input(x);
+        graph.add_output(y);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(x), Some(b)],
+            vec![y],
+        ));
+        let cpu = CpuExecutionProvider::initialized_with_resources(
+            onnx_runtime_ep_cpu::CpuMemoryResources {
+                cache_retention: onnx_runtime_ep_cpu::CpuCacheRetention::new(admitted),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut executor =
+            Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(cpu), None).unwrap();
+        assert!(executor.has_symbols);
+        assert_eq!(
+            executor.cache.stats().entries,
+            0,
+            "activation specialization must still wait for the request"
+        );
+        assert_eq!(
+            executor.static_constant_states.len(),
+            usize::from(admitted),
+            "constant warming must already obey this provider's verdict at load"
+        );
+        for rows in [1usize, 2, 1] {
+            let input = Tensor::from_f32(&[rows, 5], &vec![1.; rows * 5]).unwrap();
+            let output = executor.run(&[("x", &input)]).unwrap();
+            assert_eq!(output[0].to_vec_f32(), vec![5.; rows * 7]);
+            assert_eq!(executor.static_constant_states.len(), usize::from(admitted));
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn static_constant_preparation_never_caches_producer_backed_initializer_defaults() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 5]));
+    let source = graph.create_named_value("source", DataType::Float16, static_shape([5, 7]));
+    let b = graph.create_named_value("b", DataType::Float16, static_shape([5, 7]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([1, 7]));
+    for (value, bits) in [(source, [0u8, 0x3c]), (b, [0u8, 0x34])] {
+        graph.initializers.insert(
+            value,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Float16,
+                vec![5, 7],
+                bits.repeat(35),
+            )),
+        );
+    }
+    graph.add_input(x);
+    graph.add_output(y);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(source)],
+        vec![b],
+    ));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "MatMul",
+        vec![Some(x), Some(b)],
+        vec![y],
+    ));
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        None,
+    )
+    .unwrap();
+    assert!(executor.static_constant_states.is_empty());
+    let input = Tensor::from_f32(&[1, 5], &[1.; 5]).unwrap();
+    let actual = executor.run(&[("x", &input)]).unwrap();
+    assert_eq!(
+        actual[0].to_vec_f32(),
+        vec![5.; 7],
+        "Identity must replace the defaults before MatMul; warming the writable default would return stale rows"
+    );
+}
+
+#[test]
+fn configured_cpu_fallback_is_used_and_non_cpu_fallback_is_rejected() {
+    let make_graph = || {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let x = graph.create_named_value("x", DataType::Float32, vec![Dim::Static(1)]);
+        let y = graph.create_named_value("y", DataType::Float32, vec![Dim::Static(1)]);
+        graph.add_input(x);
+        graph.add_output(y);
+        graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![y]));
+        graph
+    };
+    let cuda: Arc<dyn ExecutionProvider> = Arc::new(WeightDeliveryEp::with_device(
+        false,
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+        onnx_runtime_ir::DeviceId::cuda(0),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let cpu: Arc<dyn ExecutionProvider> = Arc::new(
+        CpuExecutionProvider::initialized_with_resources(onnx_runtime_ep_cpu::CpuMemoryResources {
+            cache_retention: onnx_runtime_ep_cpu::CpuCacheRetention::new(false),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let mut exec = Executor::build_with_mode(
+        make_graph(),
+        Arc::new(WeightStore::new()),
+        Arc::clone(&cuda),
+        false,
+        false,
+        Some(Arc::clone(&cpu)),
+    )
+    .unwrap();
+    assert!(
+        Arc::ptr_eq(&exec.ep, &cpu),
+        "fallback must use the exact configured provider and its resources"
+    );
+    assert!(Arc::ptr_eq(exec.fallback_ep.as_ref().unwrap(), &cpu));
+    let input = Tensor::from_f32(&[1], &[-3.0]).unwrap();
+    let result = exec.run(&[("x", &input)]).unwrap();
+    assert_eq!(result[0].to_vec_f32(), vec![0.0]);
+    let mut child = ChildExecutor::new(
+        "configured-fallback-child",
+        make_graph(),
+        exec.graph.opset_imports.clone(),
+        Arc::new(WeightStore::new()),
+        Arc::clone(&cuda),
+        Some(Arc::clone(&cpu)),
+    )
+    .unwrap();
+    let child_output = child.run(&[&input], &HashMap::new()).unwrap();
+    assert_eq!(child_output[0].to_vec_f32(), vec![0.0]);
+    assert!(Arc::ptr_eq(&child.compiled[0].exec.ep, &cpu));
+    assert!(Arc::ptr_eq(
+        child.compiled[0].exec.fallback_ep.as_ref().unwrap(),
+        &cpu
+    ));
+    let error = Executor::build_with_mode(
+        make_graph(),
+        Arc::new(WeightStore::new()),
+        Arc::clone(&cuda),
+        false,
+        false,
+        Some(cuda),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(
+        error,
+        SessionError::InvalidFallbackProvider { .. }
+    ));
+    let message = error.to_string();
+    assert!(
+        message.contains("fallback_execution_provider") && message.contains("CPU provider"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -9582,6 +9803,7 @@ fn sequence_executor_preserves_element_arc_identity() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     let output = executor.run(&[]).unwrap();
@@ -9797,6 +10019,7 @@ fn compress_runs_with_image_sized_condition_including_empty_and_full() {
             graph,
             Arc::new(WeightStore::new()),
             auto_detect_cpu_ep().unwrap(),
+            None,
         )
         .unwrap();
 
@@ -10153,6 +10376,7 @@ fn child_executor_binds_formals_captures_and_inline_initializers_in_output_order
         opsets,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     let mut outer_scope = HashMap::new();
@@ -10200,6 +10424,7 @@ fn unary_child(name: &str) -> ChildExecutor {
         opsets,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap()
 }
@@ -10279,6 +10504,7 @@ fn captured_add_child(name: &str) -> ChildExecutor {
         opsets,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap()
 }
@@ -10371,7 +10597,7 @@ fn aligned_external_initializer_is_borrowed_zero_copy() {
     g.add_output(y);
 
     let ep = auto_detect_cpu_ep().unwrap();
-    let exec = Executor::build(g, Arc::new(store), ep).unwrap();
+    let exec = Executor::build(g, Arc::new(store), ep, None).unwrap();
 
     let weight = &exec.graph.initializers[&w];
     let src = exec.weights().bytes(weight).unwrap();
@@ -10430,7 +10656,7 @@ fn device_unaligned_external_initializer_is_borrowed_at_dtype_alignment() {
     g.add_output(y);
 
     let ep = auto_detect_cpu_ep().unwrap();
-    let mut exec = Executor::build(g, Arc::new(store), ep).unwrap();
+    let mut exec = Executor::build(g, Arc::new(store), ep, None).unwrap();
 
     let weight = &exec.graph.initializers[&w];
     let src = exec.weights().bytes(weight).unwrap();
@@ -10502,8 +10728,13 @@ fn unaligned_external_qmoe_keeps_route_first_enabled_and_matches_legacy() {
     unsafe { std::env::set_var(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV, "0") };
     let (legacy_graph, legacy_weights) =
         onnx_runtime_loader::load_model_with_weights(&fixture).unwrap();
-    let mut legacy =
-        Executor::build(legacy_graph, legacy_weights, auto_detect_cpu_ep().unwrap()).unwrap();
+    let mut legacy = Executor::build(
+        legacy_graph,
+        legacy_weights,
+        auto_detect_cpu_ep().unwrap(),
+        None,
+    )
+    .unwrap();
     let legacy_output = legacy.run(&[("X", &input), ("router", &router)]).unwrap();
 
     // SAFETY: guarded above; the offload kernel captures the flag at build.
@@ -10515,6 +10746,7 @@ fn unaligned_external_qmoe_keeps_route_first_enabled_and_matches_legacy() {
         offload_graph,
         offload_weights,
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     for (&value, weight) in &offload.graph.initializers {
@@ -10589,7 +10821,7 @@ fn producer_backed_initializer_is_not_borrowed() {
     );
 
     let ep = auto_detect_cpu_ep().unwrap();
-    let exec = Executor::build(g, Arc::new(store), ep).unwrap();
+    let exec = Executor::build(g, Arc::new(store), ep, None).unwrap();
 
     let weight = &exec.graph.initializers[&w];
     let src = exec.weights().bytes(weight).unwrap();
@@ -10654,6 +10886,7 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     // Warm-decode capture-shape seeding is a device-graph-capture concern
@@ -10795,6 +11028,7 @@ fn quarantined_op_type_is_forced_to_a_capture_recording_failed_seam() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -10865,6 +11099,7 @@ fn set_graph_slot_is_non_resetting_and_per_slot_isolated() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -11049,6 +11284,7 @@ fn decode_plan_memo_rebuilds_and_replays() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     exec.set_decode_memo_enabled(true);
@@ -11109,6 +11345,7 @@ fn decode_plan_memo_is_token_exact_over_128_steps() {
         off_graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     // Memo is default-ON now; explicitly disable it for the reference run.
@@ -11120,6 +11357,7 @@ fn decode_plan_memo_is_token_exact_over_128_steps() {
         on_graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     on.set_decode_memo_enabled(true);
@@ -11196,6 +11434,7 @@ fn decode_plan_memo_fires_on_persistent_kv_bindings() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     exec.set_decode_memo_enabled(true);
@@ -11366,6 +11605,7 @@ fn decode_view_plan_fires_and_is_token_exact_over_128_steps() {
         off_graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     // Memo is default-ON now; explicitly disable it for the reference run.
@@ -11378,6 +11618,7 @@ fn decode_view_plan_fires_and_is_token_exact_over_128_steps() {
         on_graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     on.set_decode_memo_enabled(true);
@@ -11427,6 +11668,7 @@ fn decode_view_plan_rebuilds_on_source_buffer_move() {
         off_graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     let mut off_kv = stage2_kv_binding(&off);
@@ -11436,6 +11678,7 @@ fn decode_view_plan_rebuilds_on_source_buffer_move() {
         on_graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     on.set_decode_memo_enabled(true);
@@ -11533,6 +11776,7 @@ fn kernel_prebinding_fast_path_fires_on_static_graph() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -11604,6 +11848,7 @@ fn kernel_prebinding_fallback_fires_on_shape_change() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -11738,6 +11983,7 @@ fn run_scan_inline_graph(steps: usize, inline: bool) -> (Vec<Vec<u8>>, u64) {
         scan_inline_test_graph(steps),
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     exec.scan_inline_single_trip_enabled = inline;
@@ -11873,6 +12119,7 @@ fn build_main_exec(graph: Graph) -> Executor {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap()
 }
@@ -12091,6 +12338,7 @@ fn an_external_buffer_is_used_in_place_rather_than_copied() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -12151,6 +12399,7 @@ fn an_undersized_external_buffer_is_refused_with_the_size_it_needed() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -12196,6 +12445,7 @@ fn a_null_external_buffer_is_refused() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -12236,6 +12486,7 @@ fn an_external_buffer_can_be_bound_as_an_output_only() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -12307,6 +12558,7 @@ fn an_external_output_binding_for_a_producer_less_value_is_seeded_every_run() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -12360,6 +12612,7 @@ fn an_external_buffer_bound_to_nothing_is_refused() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -12396,6 +12649,7 @@ fn a_misaligned_external_buffer_is_refused() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -12696,6 +12950,7 @@ fn executor_pin_fixed_capacity_kv_admits_gqa() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -12746,6 +13001,7 @@ fn minimal_workspace_executor() -> Executor {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap()
 }
@@ -12973,6 +13229,7 @@ fn prepare_workspace_resolves_reshape_flatten_chain_exactly() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     exec.value_shapes
@@ -13035,6 +13292,7 @@ fn sequence_promotion_never_retains_a_borrowed_input_alias() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
 
@@ -13127,7 +13385,8 @@ fn dropping_an_executor_with_a_parked_input_buffer_leaks_nothing() {
     let mut ep = CpuExecutionProvider::new().with_memory(counting.clone());
     ep.initialize(&Default::default()).unwrap();
 
-    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep), None).unwrap();
     let vid = executor.input_index["input"];
 
     let tensor = Tensor::from_f32(&[64], &vec![1.0f32; 64]).unwrap();
@@ -13413,6 +13672,7 @@ fn prepare_workspace_resolves_deepseek_additive_mask_query_axis_exactly() {
         graph,
         Arc::new(WeightStore::new()),
         auto_detect_cpu_ep().unwrap(),
+        None,
     )
     .unwrap();
     for value in [
@@ -13462,17 +13722,22 @@ fn prepare_workspace_resolves_deepseek_additive_mask_query_axis_exactly() {
 /// Asserted over the source because the failure has no observable signal to
 /// probe for. Reversing the order in `Executor::drop` fails this test.
 #[test]
-fn weight_derived_caches_are_cleared_before_their_buffers_are_freed() {
+fn weight_derived_cache_owners_are_released_before_their_buffers_are_freed() {
     let source = include_str!("mod.rs");
     let drop_body = source
         .split_once("impl Drop for Executor {")
         .expect("Executor has a Drop impl")
         .1;
+    assert!(
+        !drop_body.contains("clear_weight_transpose_caches()"),
+        "dropping one executor must not clear another session's warmed transposes"
+    );
     let free = drop_body
         .find("self.buffers.drain()")
         .expect("the drop body frees the executor's buffers");
     for clear in [
-        "clear_weight_transpose_caches()",
+        "self.cache.entries.clear()",
+        "self.static_constant_states.clear()",
         "clear_mlas_packed_caches()",
     ] {
         let at = drop_body
@@ -13491,7 +13756,7 @@ fn qmoe_residency_plan_default_policy_matches_whole_bank_resident_for_pageable_c
     let (graph, weights, _path) = qmoe_expert_region_fixture();
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ep = WeightDeliveryEp::new(true, deliveries);
-    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+    let executor = Executor::build(graph, weights, Arc::new(ep), None).unwrap();
 
     let plan = executor.residency_plan();
     let candidates = executor.expert_region_candidates();
@@ -13535,7 +13800,7 @@ fn qmoe_residency_plan_surfaces_non_pageable_reason_without_changing_handles() {
 
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ep = WeightDeliveryEp::new(true, deliveries);
-    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+    let executor = Executor::build(graph, weights, Arc::new(ep), None).unwrap();
 
     let plan = executor.residency_plan();
     match plan.decision(packed_value) {
@@ -13585,7 +13850,7 @@ fn qmoe_residency_plan_seam_is_substitutable_with_an_alternate_policy() {
     let (graph, weights, _path) = qmoe_expert_region_fixture();
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ep = WeightDeliveryEp::new(true, deliveries);
-    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+    let executor = Executor::build(graph, weights, Arc::new(ep), None).unwrap();
 
     let candidates = executor.expert_region_candidates();
     let plan =

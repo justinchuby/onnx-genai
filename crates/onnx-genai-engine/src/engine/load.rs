@@ -1120,67 +1120,10 @@ impl Engine {
             force_managed_weight_streaming: force_managed_weight_streaming_enabled(),
         });
         log_memory_strategy_plan(&memory_strategy_plan, "single_model_native");
-        // #971: tell the CPU EP whether the governor admitted the resident f32
-        // decode cache. When declined (expanded footprint would not fit the
-        // budget), the kernel dequantises on the fly per call instead of holding
-        // the ~8x cache resident — slower per token but avoids paging.
-        onnx_runtime_ep_cpu::set_resident_dequant_f32_cache_enabled(
-            memory_strategy_plan.f32_weight_cache_admitted,
-        );
-        // #1027: the int4 accuracy_level=0 MLAS SQNBit route holds a packed
-        // buffer (CompFp32 packs to ~1x the int4 bytes) plus its retained scale
-        // copy, and the shape-keyed kernel cache materializes one per prefill
-        // and decode activation shape -- ~2.5x the int4 bytes beside the mapped
-        // weight for the session (#1051 corrected the earlier per-copy under-
-        // count). Its bytes are folded into `resident_f32_cache_bytes`, so the
-        // admission verdict governs it: when declined, the kernel keeps the
-        // borrowed zero-copy int4 path (byte-identical, only slower on x86)
-        // instead of doubling the weight footprint.
-        onnx_runtime_ep_cpu::set_mlas_sqnbit_packing_enabled(
-            memory_strategy_plan.f32_weight_cache_admitted,
-        );
-        // #1056: the weight-transpose cache (one resident `K x N` f32/f16 copy
-        // per transposed constant weight) is the third buffer folded into
-        // `resident_f32_cache_bytes`, so the same verdict governs it. When
-        // declined, the `MatMul`/`Gemm` kernels transpose per call and retain
-        // nothing instead of holding the session-lifetime copies resident over
-        // budget. That is byte-identical everywhere except the x86 f16/bf16
-        // decode GEMV, where admission picks the kernel too: a declined
-        // session reads the [K, N] weight in place with a different (slower,
-        // and further from an f64 reference) accumulation order, so its decode
-        // output differs in the low bits. See
-        // `set_weight_transpose_cache_enabled`.
-        onnx_runtime_ep_cpu::set_weight_transpose_cache_enabled(
-            memory_strategy_plan.f32_weight_cache_admitted,
-        );
-        // #1056: the per-kernel `MatMulPrepack::dense` widened-f32 cache (one
-        // resident `4 * K * N` f32 copy per constant operand that is not already
-        // contiguous f32 -- f16/bf16/f64 or strided) is the fourth buffer folded
-        // into `resident_f32_cache_bytes`, so the same verdict governs it. When
-        // declined, the `MatMul`/`FusedMatMulBias` kernels widen the operand per
-        // call and retain nothing (byte-identical output, only slower) instead of
-        // holding the session-lifetime copies resident over budget.
-        onnx_runtime_ep_cpu::set_matmul_dense_cache_enabled(
-            memory_strategy_plan.f32_weight_cache_admitted,
-        );
-        // #1133: the QLinearMatMul process-wide accumulator scratch budget and
-        // the constant-`B` MLAS pre-pack are the fifth and sixth buffers folded
-        // into `resident_f32_cache_bytes`, governed by the same verdict. When
-        // declined, the kernel reallocates the `i32` accumulator per call and
-        // takes the unpacked GEMM (densifying `B` per call) -- byte-identical
-        // output, only slower -- instead of retaining either buffer over budget.
-        onnx_runtime_ep_cpu::set_qlinear_accumulator_budget_admitted(
-            memory_strategy_plan.f32_weight_cache_admitted,
-        );
-        // Einsum's reusable Float32 output workspace is the seventh governed
-        // CPU buffer folded into `resident_f32_cache_bytes`. Capture this
-        // engine's verdict in an immutable handle that the CPU provider clones
-        // into its factory and compiled kernels. The process-wide byte counter
-        // remains shared, but loading another engine cannot change this one.
-        let einsum_scratch_retention = onnx_runtime_ep_cpu::EinsumScratchRetention::new(
-            memory_strategy_plan.f32_weight_cache_admitted,
-        );
-        onnx_runtime_ep_cpu::set_qlinear_packed_b_enabled(
+        // Capture the plan once for every CPU cache family it predicts, including
+        // providers used by plugin/CUDA fallback. Loading a second model cannot
+        // mutate this verdict; shared process byte ceilings remain shared.
+        let cache_retention = onnx_runtime_ep_cpu::CpuCacheRetention::new(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
         #[cfg(feature = "native-cuda")]
@@ -1257,7 +1200,7 @@ impl Engine {
                 &model_directory.model_path,
                 native_device.clone(),
                 crate::native_decode::NativeDecodeLoadOptions {
-                    cpu_resources: governor.cpu_memory_resources(einsum_scratch_retention),
+                    cpu_resources: governor.cpu_memory_resources(cache_retention.clone()),
                     #[cfg(feature = "native-cuda")]
                     cuda_offload_policy,
                     #[cfg(feature = "native-cuda")]
@@ -1543,7 +1486,15 @@ impl Engine {
             &model_directory,
             &environment,
             session_options,
-            native_device,
+            match native_device.cuda_index() {
+                Some(index) => crate::speculative::DraftProjectionDevice::Cuda {
+                    index,
+                    retain_caches: cache_retention.is_admitted(),
+                },
+                None => crate::speculative::DraftProjectionDevice::Cpu {
+                    retain_caches: cache_retention.is_admitted(),
+                },
+            },
             config.num_speculative_tokens,
             matches!(&config.speculative_mode, SpeculativeMode::Mtp(_))
                 || (matches!(&config.speculative_mode, SpeculativeMode::None)
@@ -2931,7 +2882,7 @@ fn load_native_mtp_proposer(
     model_directory: &ModelDirectory,
     environment: &Environment,
     session_options: &SessionOptions,
-    native_device: crate::native_decode::NativeDecodeDevice,
+    draft_projection: crate::speculative::DraftProjectionDevice,
     requested_drafts: usize,
     enabled: bool,
 ) -> anyhow::Result<(Option<MtpModel>, SpeculativeMode)> {
@@ -2976,29 +2927,25 @@ fn load_native_mtp_proposer(
     // the native path's default (CPU) options. Allow CPU fallback so the handful
     // of mixed-precision norm nodes ORT cannot assign to CUDA still get a home
     // (the bulk of the head — attention and matmuls — stays on CUDA).
-    let head_session_options = match native_device.cuda_index() {
-        Some(index) => {
+    let head_session_options = match draft_projection {
+        crate::speculative::DraftProjectionDevice::Cuda { index, .. } => {
             let mut selection = onnx_genai_ort::ep_selection("cuda");
             selection
                 .options
                 .insert("device_id".to_string(), index.to_string());
             SessionOptions::with_execution_provider(selection).with_cpu_fallback(true)
         }
-        None => session_options.clone(),
+        crate::speculative::DraftProjectionDevice::Cpu { .. } => session_options.clone(),
     };
     // The int4 shared LM-head is projected on the same device as the native
     // target: CUDA when the target is on CUDA, otherwise the CPU int4 kernel.
     // This projection runs during proposal, outside the captured decode step.
-    let draft_projection = Some(match native_device.cuda_index() {
-        Some(index) => crate::speculative::DraftProjectionDevice::Cuda { index },
-        None => crate::speculative::DraftProjectionDevice::Cpu,
-    });
     let mtp = build_mtp_model_from_resolved(
         resolved,
         environment,
         &head_session_options,
         model_directory,
-        draft_projection,
+        Some(draft_projection),
     )?;
     let mode = SpeculativeMode::Mtp(mtp.config.clone());
     Ok((Some(mtp), mode))

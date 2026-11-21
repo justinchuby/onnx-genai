@@ -715,12 +715,12 @@ impl EngineResourceGovernor {
     #[cfg(feature = "native-backend")]
     pub(crate) fn cpu_memory_resources(
         &self,
-        einsum_scratch_retention: onnx_runtime_ep_cpu::EinsumScratchRetention,
+        cache_retention: onnx_runtime_ep_cpu::CpuCacheRetention,
     ) -> onnx_runtime_ep_cpu::CpuMemoryResources {
         onnx_runtime_ep_cpu::CpuMemoryResources {
             host_cache: self.weight_offload_host_cache.clone(),
             derived_weights: self.derived_weight_memory.clone(),
-            einsum_scratch_retention,
+            cache_retention,
             ..Default::default()
         }
     }

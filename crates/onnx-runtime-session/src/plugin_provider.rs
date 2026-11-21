@@ -39,7 +39,7 @@ pub struct PluginExecutionProvider {
     registration_name: Option<String>,
     provider_name: String,
     device_label: String,
-    cpu: onnx_runtime_ep_cpu::CpuExecutionProvider,
+    cpu: Arc<dyn ExecutionProvider>,
     compiled: Arc<Mutex<Option<PluginExecutionPlan>>>,
 }
 
@@ -51,13 +51,15 @@ impl PluginExecutionProvider {
         registration_name: Option<String>,
         provider_name: impl Into<String>,
         device_label: impl Into<String>,
+        cpu: Arc<dyn ExecutionProvider>,
     ) -> onnx_runtime_ep_api::Result<Self> {
-        let mut cpu = onnx_runtime_ep_cpu::CpuExecutionProvider::new();
-        cpu.initialize(&EpConfig::default()).map_err(|err| {
-            EpError::KernelFailed(format!(
-                "initialize CPU fallback for plugin EP failed: {err}; fix by enabling the native CPU EP"
-            ))
-        })?;
+        if cpu.device_type() != DeviceType::Cpu {
+            return Err(EpError::KernelFailed(format!(
+                "plugin CPU fallback '{}' is bound to {:?}; pass an initialized CPU provider with this session's resources",
+                cpu.name(),
+                cpu.device_id()
+            )));
+        }
         Ok(Self {
             library,
             registration_name,
@@ -70,6 +72,14 @@ impl PluginExecutionProvider {
 }
 
 impl ExecutionProvider for PluginExecutionProvider {
+    fn prepare_static_constants(
+        &self,
+        node: &Node,
+        constants: &[Option<onnx_runtime_ep_api::KernelConstantInput<'_>>],
+    ) -> onnx_runtime_ep_api::Result<Option<Arc<dyn std::any::Any + Send + Sync>>> {
+        self.cpu.prepare_static_constants(node, constants)
+    }
+
     fn name(&self) -> &str {
         &self.provider_name
     }

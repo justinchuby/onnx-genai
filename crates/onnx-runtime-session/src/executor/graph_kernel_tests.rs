@@ -348,12 +348,17 @@ fn whole_graph_claim_executes_if_pattern_with_captures_and_changing_output_shape
         [NodeId(1), NodeId(0), NodeId(2)]
     );
     let ep = Arc::new(PatternGraphEp::new(false));
-    let mut custom =
-        Executor::build(graph.clone(), Arc::new(WeightStore::new()), ep.clone()).unwrap();
+    let mut custom = Executor::build(
+        graph.clone(),
+        Arc::new(WeightStore::new()),
+        ep.clone(),
+        None,
+    )
+    .unwrap();
     let mut cpu = CpuExecutionProvider::new();
     cpu.initialize(&EpConfig::default()).unwrap();
     let mut reference =
-        Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(cpu)).unwrap();
+        Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(cpu), None).unwrap();
     for (condition, values) in [
         (true, vec![1., 2.]),
         (false, vec![3., 4.]),
@@ -386,7 +391,7 @@ fn whole_graph_claim_executes_if_pattern_with_captures_and_changing_output_shape
 #[test]
 fn whole_graph_dynamic_output_payload_is_validated_before_publication() {
     let ep = Arc::new(PatternGraphEp::new(true));
-    let mut executor = Executor::build(if_graph(), Arc::new(WeightStore::new()), ep).unwrap();
+    let mut executor = Executor::build(if_graph(), Arc::new(WeightStore::new()), ep, None).unwrap();
     let x = Tensor::from_f32(&[2], &[1., 2.]).unwrap();
     let cond = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
     let error = executor
@@ -609,12 +614,17 @@ fn whole_graph_claim_executes_loop_and_scan_without_host_control_flow() {
         for iterations in [0, 1, 3] {
             let graph = accumulating_graph(is_loop, iterations);
             let ep = Arc::new(PatternGraphEp::new(false));
-            let mut custom =
-                Executor::build(graph.clone(), Arc::new(WeightStore::new()), ep.clone()).unwrap();
+            let mut custom = Executor::build(
+                graph.clone(),
+                Arc::new(WeightStore::new()),
+                ep.clone(),
+                None,
+            )
+            .unwrap();
             let mut cpu = CpuExecutionProvider::new();
             cpu.initialize(&EpConfig::default()).unwrap();
             let mut reference =
-                Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(cpu)).unwrap();
+                Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(cpu), None).unwrap();
             for delta in [[0.5, 2.], [-1., 3.]] {
                 let initial = Tensor::from_f32(&[2], &[1., -2.]).unwrap();
                 let delta_tensor = Tensor::from_f32(&[2], &delta).unwrap();
@@ -663,7 +673,7 @@ fn whole_graph_invalid_claims_and_compile_errors_fail_without_fallback() {
     for ids in [vec![NodeId(0), NodeId(0)], vec![NodeId(u32::MAX)]] {
         let mut ep = PatternGraphEp::new(false);
         ep.claim_override = Some(ids);
-        let error = Executor::build(if_graph(), Arc::new(WeightStore::new()), Arc::new(ep))
+        let error = Executor::build(if_graph(), Arc::new(WeightStore::new()), Arc::new(ep), None)
             .err()
             .expect("invalid claim must fail")
             .to_string();
@@ -676,7 +686,7 @@ fn whole_graph_invalid_claims_and_compile_errors_fail_without_fallback() {
     ep.compile_failure = true;
     let ep = Arc::new(ep);
     let mut executor =
-        Executor::build(if_graph(), Arc::new(WeightStore::new()), ep.clone()).unwrap();
+        Executor::build(if_graph(), Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
     let x = Tensor::from_f32(&[2], &[1., 2.]).unwrap();
     let condition = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
     let error = executor
@@ -706,7 +716,7 @@ fn whole_graph_dynamic_outputs_reject_incompatible_external_storage_before_writi
             .unwrap()
             .0;
         let ep = Arc::new(PatternGraphEp::new(false));
-        let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), ep).unwrap();
+        let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), ep, None).unwrap();
         let mut backing = [42f32; 4];
         let mut external = ExternalBindings::default();
         external.outputs.insert(
@@ -755,12 +765,17 @@ fn whole_graph_unknown_rank_inputs_follow_runtime_rank_changes() {
         graph.mark_value_shape_unknown(value);
     }
     let ep = Arc::new(PatternGraphEp::new(false));
-    let mut custom =
-        Executor::build(graph.clone(), Arc::new(WeightStore::new()), ep.clone()).unwrap();
+    let mut custom = Executor::build(
+        graph.clone(),
+        Arc::new(WeightStore::new()),
+        ep.clone(),
+        None,
+    )
+    .unwrap();
     let mut cpu = CpuExecutionProvider::new();
     cpu.initialize(&EpConfig::default()).unwrap();
     let mut reference =
-        Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(cpu)).unwrap();
+        Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(cpu), None).unwrap();
     for (shape, condition) in [(vec![2], true), (vec![1, 2], false), (vec![2, 1], true)] {
         let x = Tensor::from_f32(&shape, &[1., 2.]).unwrap();
         let condition = Tensor::from_raw(DataType::Bool, vec![], &[u8::from(condition)]).unwrap();

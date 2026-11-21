@@ -44,7 +44,6 @@ fn main() {
     let cap_mib = env_usize("QLINEAR_PROC_CAP_MIB", 128);
     let iters = env_usize("QLINEAR_ITERS", 24);
 
-    onnx_runtime_ep_cpu::set_qlinear_accumulator_budget_admitted(true);
     onnx_runtime_ep_cpu::set_qlinear_accumulator_process_cap_bytes((cap_mib as u64) << 20);
 
     // A per-thread accumulator of 12 MiB: under the 32 MiB per-thread cap (so a

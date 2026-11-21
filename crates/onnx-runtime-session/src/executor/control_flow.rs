@@ -25,6 +25,7 @@ impl ChildExecutor {
         inherited_opsets: HashMap<String, u64>,
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
+        fallback_ep: Option<Arc<dyn ExecutionProvider>>,
     ) -> Result<Self> {
         let name = name.into();
         let formal_names = body
@@ -53,6 +54,7 @@ impl ChildExecutor {
             inherited_opsets,
             weights,
             ep,
+            fallback_ep,
             formal_names,
             capture_names,
             input_names,
@@ -145,7 +147,12 @@ impl ChildExecutor {
 
         Ok(CompiledChildPlan {
             exec: {
-                let mut exec = Executor::build(graph, self.weights.clone(), self.ep.clone())?;
+                let mut exec = Executor::build(
+                    graph,
+                    self.weights.clone(),
+                    self.ep.clone(),
+                    self.fallback_ep.clone(),
+                )?;
                 exec.set_trace_context(self.trace.clone());
                 exec.set_release_dead_values(self.release_dead_values);
                 exec
@@ -645,6 +652,7 @@ impl Executor {
                 self.graph.opset_imports.clone(),
                 self.weights.clone(),
                 self.ep.clone(),
+                self.fallback_ep.clone(),
             )?;
             child.set_trace_context(self.trace.clone());
             child.set_release_dead_values(self.release_dead_values_enabled);

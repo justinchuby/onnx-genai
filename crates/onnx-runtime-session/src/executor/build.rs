@@ -1,3 +1,4 @@
+use super::platform::{resolve_cpu_fallback, validate_cpu_fallback};
 use super::*;
 
 pub(crate) fn prepare_execution(graph: &mut Graph) -> Result<()> {
@@ -898,15 +899,19 @@ impl Executor {
         graph: Graph,
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
+        fallback_ep: Option<Arc<dyn ExecutionProvider>>,
     ) -> Result<Self> {
-        Self::build_with_cuda_requirement(
+        Self::build_with_mode(
             graph,
             weights,
             ep,
             onnx_genai_runtime_config::runtime_config().require_cuda,
+            hetero_placement_env_enabled(),
+            fallback_ep,
         )
     }
 
+    #[cfg(test)]
     pub(super) fn build_with_cuda_requirement(
         graph: Graph,
         weights: Arc<WeightStore>,
@@ -919,6 +924,7 @@ impl Executor {
             ep,
             require_cuda,
             hetero_placement_env_enabled(),
+            None,
         )
     }
 
@@ -928,19 +934,23 @@ impl Executor {
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
     ) -> Result<Self> {
-        Self::build_with_mode(graph, weights, ep, false, true)
+        Self::build_with_mode(graph, weights, ep, false, true, None)
     }
 
-    fn build_with_mode(
+    pub(super) fn build_with_mode(
         mut graph: Graph,
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
         hetero_enabled: bool,
+        fallback_ep: Option<Arc<dyn ExecutionProvider>>,
     ) -> Result<Self> {
+        if let Some(fallback) = &fallback_ep {
+            validate_cpu_fallback(fallback.as_ref())?;
+        }
         prepare_execution(&mut graph)?;
         if hetero_enabled && !require_cuda && ep.device_type() != DeviceType::Cpu {
-            let cpu = auto_detect_cpu_ep()?;
+            let cpu = resolve_cpu_fallback(fallback_ep.as_ref())?;
             let providers = vec![
                 crate::hetero::ProviderPlacement {
                     ep: onnx_runtime_ep_api::EpId(0),
@@ -967,8 +977,14 @@ impl Executor {
                 // The outer Executor is only an API coordinator. Build its
                 // legacy fields from an empty graph so no whole-model CPU
                 // kernels, weights, or activation buffers are materialized.
-                let mut coordinator =
-                    Self::build_with_mode(Graph::new(), weights, cpu, false, false)?;
+                let mut coordinator = Self::build_with_mode(
+                    Graph::new(),
+                    weights,
+                    cpu,
+                    false,
+                    false,
+                    fallback_ep.clone(),
+                )?;
                 coordinator.graph = planned_graph;
                 coordinator.heterogeneous = Some(Box::new(heterogeneous));
                 coordinator.execution_provider_fallback_report = None;
@@ -988,6 +1004,7 @@ impl Executor {
             instance_id,
             &mut artifact_transaction,
             require_cuda,
+            fallback_ep,
         );
         match build {
             Ok(mut exec) => {
@@ -1012,6 +1029,7 @@ impl Executor {
         instance_id: ExecutorInstanceId,
         artifact_transaction: &mut ExecutorArtifactBuildTransaction,
         require_cuda: bool,
+        fallback_ep: Option<Arc<dyn ExecutionProvider>>,
     ) -> Result<Self> {
         let execution_provider_fallback_report = Self::place_graph(
             &mut graph,
@@ -1020,6 +1038,7 @@ impl Executor {
             instance_id,
             artifact_transaction,
             require_cuda,
+            fallback_ep.as_ref(),
         )?;
         // Topological order up front: also validates the selected graph is a DAG.
         let order = graph.topological_order()?;
@@ -1098,6 +1117,7 @@ impl Executor {
             graph,
             weights,
             ep,
+            fallback_ep,
             heterogeneous: None,
             graph_slot: DeviceGraphSlot::Primary,
             graph_owner: DeviceGraphOwner::new(),
@@ -1168,6 +1188,7 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
+            static_constant_states: Vec::new(),
             provider_artifact_readiness: ProviderArtifactReadiness::default(),
             persistent_workspace: None,
             step_workspace: None,
@@ -1175,6 +1196,49 @@ impl Executor {
             inherited_workspace: None,
             workspace_preparation_required: false,
         };
+
+        // Constant preparation depends only on immutable operand metadata.
+        // Providers decide eligibility; unresolved activation shapes do not
+        // postpone load-time preparation to the first request.
+        for node_plan in &exec.plan {
+            let node = exec.graph.node(node_plan.node_id);
+            let constants = node_plan
+                .inputs
+                .iter()
+                .map(|input| {
+                    let value = (*input)?;
+                    // Producer-backed initializer storage is writable, not an
+                    // immutable model constant, even when it has default bytes.
+                    if !exec.graph.is_constant_initializer(value)
+                        || exec.graph.value(value).producer.is_some()
+                    {
+                        return None;
+                    }
+                    let weight = exec.graph.initializers.get(&value)?;
+                    let buffer = exec.buffers.get(&value)?;
+                    if !buffer.device().is_host_accessible() {
+                        return None;
+                    }
+                    let bytes = if buffer.is_empty() {
+                        &[]
+                    } else {
+                        // SAFETY: this is an initialized, host-accessible immutable
+                        // initializer buffer owned by this executor for the call.
+                        unsafe {
+                            std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len())
+                        }
+                    };
+                    Some(KernelConstantInput {
+                        dtype: weight.dtype(),
+                        shape: exec.buffer_shapes.get(&value)?,
+                        bytes,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if let Some(state) = exec.ep.prepare_static_constants(node, &constants)? {
+                exec.static_constant_states.push(state);
+            }
+        }
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
         //    "compiled plan" of kernels), so the first `run` sees only cache
@@ -1194,118 +1258,6 @@ impl Executor {
                         .with("plan_len", exec.plan.len() as u64)
                         .with("cache_entries", exec.cache.stats().entries as u64),
                 );
-            }
-        }
-
-        // Pre-compute weight transposes for the GEMV decode path on Apple
-        // Silicon. Model load is 15× faster than ORT (105 ms vs 1596 ms), so
-        // spending ~1 s here still wins the model-load metric while eliminating
-        // a ~1 s spike on the first decode step.
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            use onnx_runtime_ir::DataType;
-            let mut _span = trace_span("session.precompute_weight_transposes", "session");
-            let mut transposed_count = 0_u64;
-            for node_plan in &exec.plan {
-                let node = exec.graph.node(node_plan.node_id);
-                if node.op_type != "MatMul" && node.op_type != "FusedMatMulBias" {
-                    continue;
-                }
-                let Some(b_vid) = node_plan.inputs.get(1).copied().flatten() else {
-                    continue;
-                };
-                if !exec.graph.initializers.contains_key(&b_vid) {
-                    continue;
-                }
-                if node_plan.input_dtypes.get(1) != Some(&DataType::Float16) {
-                    continue;
-                }
-                let Some(shape) = exec.value_shapes.get(&b_vid).and_then(Option::as_ref) else {
-                    continue;
-                };
-                if shape.len() != 2 {
-                    continue;
-                }
-                let (k, n) = match (shape[0].as_static(), shape[1].as_static()) {
-                    (Some(k), Some(n)) => (k, n),
-                    _ => continue,
-                };
-                let Some(buf) = exec.buffers.get(&b_vid) else {
-                    continue;
-                };
-                // Verify the buffer is dense (no padding/gaps). ONNX format
-                // guarantees initializer tensors are contiguous, but assert so
-                // a future change cannot silently produce wrong transposes.
-                debug_assert_eq!(
-                    buf.len(),
-                    k * n * 2,
-                    "precompute_f16_weight_transpose: buffer size {} != expected {} for shape [{k}, {n}]",
-                    buf.len(),
-                    k * n * 2,
-                );
-                let ptr = buf.as_ptr() as *const u16;
-                // SAFETY: `ptr` comes from a materialized DeviceBuffer backed by
-                // the model's mmap. The buffer holds k*n contiguous f16 values
-                // (verified by the initializer dtype + shape checks above) and
-                // outlives this call (model lifetime).
-                unsafe {
-                    onnx_runtime_ep_cpu::kernels::matmul::precompute_f16_weight_transpose(
-                        ptr, k, n,
-                    );
-                }
-                transposed_count += 1;
-            }
-            // Also pre-compute f32 transposes for weights eligible for the
-            // thin-M GEMM path (large K*N). Same rationale: move the transpose
-            // cost into model load to avoid a TTFT spike on first inference.
-            for node_plan in &exec.plan {
-                let node = exec.graph.node(node_plan.node_id);
-                if node.op_type != "MatMul" && node.op_type != "FusedMatMulBias" {
-                    continue;
-                }
-                let Some(b_vid) = node_plan.inputs.get(1).copied().flatten() else {
-                    continue;
-                };
-                if !exec.graph.initializers.contains_key(&b_vid) {
-                    continue;
-                }
-                if node_plan.input_dtypes.get(1) != Some(&DataType::Float32) {
-                    continue;
-                }
-                let Some(shape) = exec.value_shapes.get(&b_vid).and_then(Option::as_ref) else {
-                    continue;
-                };
-                if shape.len() != 2 {
-                    continue;
-                }
-                let (k, n) = match (shape[0].as_static(), shape[1].as_static()) {
-                    (Some(k), Some(n)) => (k, n),
-                    _ => continue,
-                };
-                let Some(buf) = exec.buffers.get(&b_vid) else {
-                    continue;
-                };
-                debug_assert_eq!(
-                    buf.len(),
-                    k * n * 4,
-                    "precompute_f32_weight_transpose: buffer size {} != expected {} for shape [{k}, {n}]",
-                    buf.len(),
-                    k * n * 4,
-                );
-                let ptr = buf.as_ptr() as *const f32;
-                // SAFETY: `ptr` comes from a materialized DeviceBuffer backed by
-                // the model's mmap. The buffer holds k*n contiguous f32 values
-                // (verified by the initializer dtype + shape checks above) and
-                // outlives this call (model lifetime).
-                unsafe {
-                    onnx_runtime_ep_cpu::kernels::matmul::precompute_f32_weight_transpose(
-                        ptr, k, n,
-                    );
-                }
-                transposed_count += 1;
-            }
-            if let Some(span) = _span.as_mut() {
-                span.set_args(Args::new().with("transposed_weights", transposed_count));
             }
         }
 
@@ -1347,7 +1299,12 @@ impl Executor {
         let opset_imports = graph.opset_imports.clone();
         registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
 
-        let sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
+        let sibling = Self::build(
+            graph,
+            Arc::clone(&self.weights),
+            Arc::clone(&self.ep),
+            self.fallback_ep.clone(),
+        )?;
         Ok(Some(sibling))
     }
 
@@ -1377,7 +1334,12 @@ impl Executor {
         let registry = InferenceRegistry::default_registry();
         let opset_imports = graph.opset_imports.clone();
         registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
-        let mut sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
+        let mut sibling = Self::build(
+            graph,
+            Arc::clone(&self.weights),
+            Arc::clone(&self.ep),
+            self.fallback_ep.clone(),
+        )?;
         sibling.graph_slot = DeviceGraphSlot::Verify;
         // Pin the sibling's StepScoped workspace. The sibling ONLY ever runs the
         // fixed M=k+1 verify shape, so its workspace is reserved once at that peak
@@ -1431,6 +1393,7 @@ impl Executor {
         instance_id: ExecutorInstanceId,
         artifact_transaction: &mut ExecutorArtifactBuildTransaction,
         require_cuda: bool,
+        fallback_ep: Option<&Arc<dyn ExecutionProvider>>,
     ) -> Result<Option<ExecutionProviderFallbackReport>> {
         let mut placement_span = trace_span("session.node_placement", "session");
         let requested_provider = placement_span.as_ref().map(|_| ep.name().to_string());
@@ -1472,6 +1435,7 @@ impl Executor {
             // post-pass graph means an EP optimizer introduced a decline after
             // planning, so fail closed rather than silently collapsing to CPU.
             // Default OFF remains the byte-identical fallback below.
+            let cpu = resolve_cpu_fallback(fallback_ep)?;
             let hetero_providers = [
                 crate::hetero::ProviderPlacement {
                     ep: onnx_runtime_ep_api::EpId(0),
@@ -1479,7 +1443,7 @@ impl Executor {
                 },
                 crate::hetero::ProviderPlacement {
                     ep: onnx_runtime_ep_api::EpId(1),
-                    provider: auto_detect_cpu_ep()?,
+                    provider: Arc::clone(&cpu),
                 },
             ];
             crate::hetero::guard_heterogeneous_fallback(
@@ -1487,7 +1451,6 @@ impl Executor {
                 &hetero_providers,
                 hetero_placement_env_enabled(),
             )?;
-            let cpu = auto_detect_cpu_ep()?;
             let cpu_artifact_config = Self::resolve_artifact_config(cpu.as_ref(), instance_id)?;
             artifact_transaction.rebind(Arc::clone(&cpu), cpu_artifact_config)?;
             *graph = graph_before_ep_passes;

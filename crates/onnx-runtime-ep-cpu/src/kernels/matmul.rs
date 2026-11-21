@@ -27,7 +27,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{
@@ -142,31 +141,6 @@ pub fn weight_transpose_cache_sizes() -> (usize, usize) {
 /// so this scales with model size and belongs in the memory plan (#1056).
 pub fn weight_transpose_cache_bytes() -> usize {
     weight_transpose::cache_bytes()
-}
-
-/// Admit (`true`) or decline (`false`) the process-global weight-transpose
-/// caches for the rest of the session (#1056).
-///
-/// When declined, the `MatMul`/`Gemm` kernels compute each constant-weight
-/// transpose per call and retain nothing, so the resident, session-lifetime,
-/// weight-scaled `K x N` copies never accrue. The engine calls this once at
-/// load from the memory-strategy plan's verdict, beside the identical gates for
-/// the resident dequant f32 cache (#987) and the MLAS SQNBit packed buffer
-/// (#1051), so one admission decision governs all three buffers.
-///
-/// Declining is **not** numerically neutral on the x86 f16/bf16 decode GEMV.
-/// Everywhere else it is a pure performance tradeoff — the transpose is
-/// byte-identical whether cached or recomputed, so generated tokens are
-/// unchanged. At `m == 1` with a 16-bit weight, though, admission decides
-/// *which kernel* runs: admitted takes `gemv_half_nk` over the cached [N, K]
-/// copy, declined reads the [K, N] weight in place through `gemv_half_kn`.
-/// Those accumulate differently (four pairwise accumulators versus one serial
-/// per column), so a declined session's decode output differs in the low bits
-/// — and is 2.7-9.3x further from an f64 reference, not closer. Both are
-/// within the kernel's error envelope; neither is "the exact one". See
-/// `a_declined_transpose_cache_falls_back_to_reading_in_place`.
-pub fn set_weight_transpose_cache_enabled(enabled: bool) {
-    weight_transpose::set_cache_enabled(enabled);
 }
 
 /// Predicted bytes the process-global weight-transpose caches will hold for
@@ -307,124 +281,20 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
     0
 }
 
-/// Evict all entries from the global weight-transpose caches.
+/// Explicit diagnostic reset of the shared transpose store.
 ///
-/// **Must** be called when an Executor drops. The caches are keyed by
-/// (address, K, N), and an address only names a tensor while that tensor is
-/// *live*: once freed, a same-shaped weight landing on the recycled address
-/// matches the key and is served the previous weight's rows (#1726). Clearing
-/// on Executor drop bounds cache growth across model lifetimes and closes that
-/// window for the prewarmed entries, which have no other owner; entries a
-/// [`MatMulPrepack`] installed are evicted when it drops.
-///
-/// Note this runs *before* `Executor::drop` frees the weight buffers, which is
-/// what makes the teardown ordering safe rather than merely lucky.
+/// Normal executor teardown drops its kernel and preparation owners before
+/// freeing weight buffers; it must not clear another session's warmed entries.
 pub fn clear_weight_transpose_caches() {
     weight_transpose::clear_all();
 }
 
-// ---------------------------------------------------------------------------
-// #1056: governance for the per-kernel `MatMulPrepack::dense` widened-f32 cache.
-// ---------------------------------------------------------------------------
-//
-// `MatMulPrepack::dense` keeps a session-lifetime `4 * K * N` f32 copy of a
-// **constant** operand whenever that operand is not already a contiguous f32
-// view -- i.e. whenever `to_dense_f32_widen` has to allocate (f16/bf16/f64, or a
-// strided f32). A contiguous f32 constant is borrowed zero-copy and nothing is
-// retained, which is why this buffer is dormant on the int4 / f32-contiguous
-// models we exercise most and was never reported to the plan. It is nonetheless
-// a resident, weight-scaled buffer and so must be declinable (#1056), exactly
-// like the resident dequant f32 cache (#987), the MLAS SQNBit packed buffer
-// (#1051), and the weight-transpose cache (#1079).
-//
-// The admission verdict is a process-global that production writes once, at
-// load, from the memory-strategy plan. Tests must never write it (that is the
-// #983 / #1033 / #1079 "passes alone, fails in company" trap); they use the
-// thread-local [`DenseCacheEnabledScope`] instead, which leaves the global
-// untouched and restores on drop even on panic.
-
-/// Admission verdict for the per-kernel `MatMulPrepack::dense` widened-f32
-/// caches. Defaults to enabled so the out-of-box path is unchanged.
-static MATMUL_DENSE_CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
-
-thread_local! {
-    /// Test-only, per-thread override of the dense-cache admission verdict.
-    /// `None` defers to the process-global; `Some(v)` forces `v` on **this
-    /// thread only**, so one test's decline cannot leak into another test
-    /// running concurrently on a different worker thread. Set exclusively
-    /// through [`DenseCacheEnabledScope`]. Production never touches this.
-    static MATMUL_DENSE_CACHE_ENABLED_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Admit (`true`) or decline (`false`) the per-kernel `MatMulPrepack::dense`
-/// widened-f32 caches for the rest of the session (#1056).
-///
-/// When declined, `MatMulPrepack::dense` widens the constant operand transiently
-/// on each call and frees it, so the resident, session-lifetime `4 * K * N`
-/// copies never accrue. The engine calls this once at load from the
-/// memory-strategy plan's verdict, beside the identical gates for the resident
-/// dequant f32 cache (#987), the MLAS SQNBit packed buffer (#1051), and the
-/// weight-transpose cache (#1079), so one admission decision governs all four
-/// buffers. Declining is a pure performance tradeoff: the widened f32 is
-/// byte-identical whether cached or recomputed, so generated tokens are
-/// unchanged.
-///
-/// This is the **production** entry point. Because it writes a process-global
-/// every worker thread reads, tests must not call it; they use
-/// [`DenseCacheEnabledScope`].
-pub fn set_matmul_dense_cache_enabled(enabled: bool) {
-    MATMUL_DENSE_CACHE_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-/// Whether the `MatMulPrepack::dense` caches are currently admitted, honouring a
-/// test-only thread-local override ([`DenseCacheEnabledScope`]) over the global.
-pub(crate) fn matmul_dense_cache_enabled() -> bool {
-    if let Some(forced) = MATMUL_DENSE_CACHE_ENABLED_OVERRIDE.with(std::cell::Cell::get) {
-        return forced;
-    }
-    MATMUL_DENSE_CACHE_ENABLED.load(Ordering::Relaxed)
-}
-
-/// The verdict a freshly-built [`MatMulPrepack`] slot carries, derived from the
-/// current admission gate. The predicted byte figure is per-*graph* (see
-/// [`matmul_dense_cache_predicted_bytes`]) rather than per-slot, because a
-/// prepack does not know `K`/`N` until an operand arrives; the slot therefore
-/// carries only the admit/decline decision, and [`GovernedWeightCache::live_bytes`]
-/// reports what it actually holds so a prediction can be checked against reality.
-fn dense_cache_verdict() -> CacheVerdict {
-    if matmul_dense_cache_enabled() {
+// Retention is captured by each prepack; shared stores contain no admission switch.
+fn dense_cache_verdict(admitted: bool) -> CacheVerdict {
+    if admitted {
         CacheVerdict::admit(0)
     } else {
         CacheVerdict::decline(0)
-    }
-}
-
-/// RAII, thread-local scoping of the dense-cache admission verdict for tests
-/// (#1056). Constructing one forces [`matmul_dense_cache_enabled`] to `enabled`
-/// on the current thread until dropped, restoring the previous value even on
-/// panic. Because the override is thread-local, a test scoping a decline here
-/// does not race the other `MatMulPrepack` tests running concurrently.
-///
-/// The verdict is read at `MatMulPrepack` construction, so a test must build its
-/// kernel *inside* the scope for the decline to take effect.
-#[cfg(test)]
-pub(crate) struct DenseCacheEnabledScope {
-    prev: Option<bool>,
-}
-
-#[cfg(test)]
-impl DenseCacheEnabledScope {
-    pub(crate) fn new(enabled: bool) -> Self {
-        let prev = MATMUL_DENSE_CACHE_ENABLED_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
-        Self { prev }
-    }
-}
-
-#[cfg(test)]
-impl Drop for DenseCacheEnabledScope {
-    fn drop(&mut self) {
-        MATMUL_DENSE_CACHE_ENABLED_OVERRIDE.with(|cell| cell.set(self.prev));
     }
 }
 
@@ -591,57 +461,6 @@ fn dense_operand_cache_bytes(node: &Node, graph: &Graph, index: usize) -> u64 {
     }
 }
 
-/// Pre-compute and cache the f16 transpose of a weight matrix.
-///
-/// Called during model load to move the ~1 s first-decode-step transpose cost
-/// into the model-load budget (we have ~1.5 s of headroom vs ORT). The global
-/// cache ensures subsequent kernel-cache shape misses (prefill M=40 → decode
-/// M=1) find the transpose immediately.
-///
-/// # Safety
-/// `data_ptr` must point to a valid, aligned, contiguous array of `k * n`
-/// `u16` values that remains live for the duration of this call.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub unsafe fn precompute_f16_weight_transpose(data_ptr: *const u16, k: usize, n: usize) {
-    let Some(numel) = k.checked_mul(n) else {
-        return;
-    };
-    if numel == 0 {
-        return;
-    }
-    // SAFETY: delegated to this function's contract — `data_ptr` addresses
-    // `k * n` live, aligned `u16` values for the duration of the call.
-    let src = unsafe { std::slice::from_raw_parts(data_ptr, numel) };
-    let _ = weight_transpose::cached_transpose_f16(src, k, n);
-}
-
-/// Pre-compute and cache the f32 transpose of a weight matrix.
-///
-/// Called during model load for weights eligible for the thin-M GEMM path
-/// (K*N > THIN_M_LARGE_B_THRESHOLD). Moves the transpose cost into model load
-/// so that TTFT is not penalized on the first inference after Engine creation.
-///
-/// # Safety
-/// `data_ptr` must point to a valid, aligned, contiguous array of `k * n`
-/// `f32` values that remains live for the duration of this call.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub unsafe fn precompute_f32_weight_transpose(data_ptr: *const f32, k: usize, n: usize) {
-    use accelerate_gemm::THIN_M_LARGE_B_THRESHOLD;
-    if (k as u64) * (n as u64) <= THIN_M_LARGE_B_THRESHOLD as u64 {
-        return;
-    }
-    let Some(numel) = k.checked_mul(n) else {
-        return;
-    };
-    if numel == 0 {
-        return;
-    }
-    // SAFETY: delegated to this function's contract — `data_ptr` addresses
-    // `k * n` live, aligned `f32` values for the duration of the call.
-    let src = unsafe { std::slice::from_raw_parts(data_ptr, numel) };
-    let _ = weight_transpose::cached_transpose_f32(src, k, n);
-}
-
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
 /// Contiguous f32 constants already have the ideal representation, so they stay
@@ -655,6 +474,7 @@ pub unsafe fn precompute_f32_weight_transpose(data_ptr: *const f32, k: usize, n:
 /// [`WeightTransposeKey`] it was filled for, so it is validated against the
 /// operand actually being multiplied on every call (#845).
 pub(crate) struct MatMulPrepack {
+    retain_caches: bool,
     constant_inputs: [bool; 2],
     /// Session-lifetime widened-f32 copy of a constant operand, governed by the
     /// memory plan (#1056): filled only under an admitting verdict, and reports
@@ -709,7 +529,7 @@ pub(crate) struct MatMulPrepack {
 /// Ownership is the installing call, not merely reaching the entry: a prepack
 /// that shared one someone else put there records `false` and evicts nothing.
 /// That distinction is load-bearing. The model-load prewarms
-/// ([`precompute_f16_weight_transpose`]) install under the same key a consuming
+/// (during constant preparation) install under the same key a consuming
 /// kernel later computes, so an unconditional eviction here would let the first
 /// transient consumer to drop pull the prewarmed transpose out from under a
 /// live one -- silently undoing the TTFT work the prewarm exists to do, and
@@ -735,14 +555,80 @@ impl Drop for MatMulPrepack {
 }
 
 impl Default for MatMulPrepack {
-    /// Build a prepack whose `dense` slots carry the current admission verdict
-    /// (#1056). Manual rather than derived because [`GovernedWeightCache`] has no
-    /// `Default`: an unaccounted cache must be impossible to construct by
-    /// accident, so every slot is stamped with the plan's admit/decline decision
-    /// at birth (read here from the process-global gate the engine set at load).
     fn default() -> Self {
-        let verdict = dense_cache_verdict();
+        Self::new(true)
+    }
+}
+
+impl MatMulPrepack {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) fn has_prepared_transpose(&self) -> bool {
+        self.transposed_b.get().is_some() || self.transposed_b_f16.get().is_some()
+    }
+
+    /// Preserve load-time transpose warming inside the owning kernel’s policy.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) fn prepare_constants(
+        &mut self,
+        constants: &[Option<onnx_runtime_ep_api::KernelConstantInput<'_>>],
+    ) {
+        if self.retain_caches
+            && self.constant_inputs[1]
+            && let Some(Some(weight)) = constants.get(1)
+            && weight.shape.len() == 2
+        {
+            let (k, n) = (weight.shape[0], weight.shape[1]);
+            if k == 0 || n == 0 {
+                return;
+            }
+            let element_size = match weight.dtype {
+                DataType::Float16 => 2,
+                DataType::Float32
+                    if (k as u64).saturating_mul(n as u64)
+                        > accelerate_gemm::THIN_M_LARGE_B_THRESHOLD as u64 =>
+                {
+                    4
+                }
+                _ => return,
+            };
+            if k.checked_mul(n)
+                .and_then(|numel| numel.checked_mul(element_size))
+                != Some(weight.bytes.len())
+                || !(weight.bytes.as_ptr() as usize).is_multiple_of(element_size)
+            {
+                return;
+            }
+            let Ok(n_stride) = i64::try_from(n) else {
+                return;
+            };
+            let strides = [n_stride, 1];
+            let view = TensorView::new(
+                onnx_runtime_ep_api::DevicePtr(weight.bytes.as_ptr().cast()),
+                weight.dtype,
+                weight.shape,
+                &strides,
+                onnx_runtime_ir::DeviceId::cpu(),
+            );
+            if weight.dtype == DataType::Float16 {
+                let _ = self.transposed_b_f16(&view, k, n);
+            } else {
+                // SAFETY: the dtype, byte count and f32 alignment were checked
+                // above; the descriptor borrows live immutable initializer bytes.
+                let values = unsafe {
+                    std::slice::from_raw_parts(
+                        weight.bytes.as_ptr().cast::<f32>(),
+                        weight.bytes.len() / 4,
+                    )
+                };
+                let _ = self.transposed_b(values, k, n);
+            }
+        }
+    }
+
+    pub(crate) fn new(retain_caches: bool) -> Self {
+        let verdict = dense_cache_verdict(retain_caches);
         Self {
+            retain_caches,
             constant_inputs: [false; 2],
             dense: [
                 GovernedWeightCache::new(verdict),
@@ -843,7 +729,7 @@ impl MatMulPrepack {
         // that per-instance memo would survive the session and, multiplied by
         // the shape-keyed kernel-cache instantiations, is exactly the resident
         // footprint the decline is meant to shed.
-        if !weight_transpose::cache_enabled() {
+        if !self.retain_caches {
             return None;
         }
         let key = WeightTransposeKey::new(b.as_ptr(), k, n);
@@ -924,7 +810,7 @@ impl MatMulPrepack {
             return None;
         }
         // #1056: declined cache -> recompute per call, retain nothing.
-        if !weight_transpose::cache_enabled() {
+        if !self.retain_caches {
             return None;
         }
         // The caller derives `k` from A and `n` from B, so operands that
@@ -1105,7 +991,19 @@ pub struct MatMulKernel {
 }
 
 /// Factory for [`MatMulKernel`] (no attributes).
-pub struct MatMulFactory;
+pub struct MatMulFactory {
+    retain_caches: bool,
+}
+impl MatMulFactory {
+    pub fn new(retain_caches: bool) -> Self {
+        Self { retain_caches }
+    }
+}
+impl Default for MatMulFactory {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
 
 impl KernelFactory for MatMulFactory {
     fn create(&self, _node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -1115,7 +1013,7 @@ impl KernelFactory for MatMulFactory {
         };
         Ok(Box::new(MatMulKernel {
             flops,
-            ..MatMulKernel::default()
+            prepack: MatMulPrepack::new(self.retain_caches),
         }))
     }
 }
@@ -2414,6 +2312,12 @@ impl Kernel for MatMulKernel {
 }
 
 impl MatMulKernel {
+    pub(crate) fn with_cache_retention(retain_caches: bool) -> Self {
+        Self {
+            prepack: MatMulPrepack::new(retain_caches),
+            flops: None,
+        }
+    }
     fn execute_with_backend(
         &self,
         inputs: &[TensorView],
@@ -3994,10 +3898,7 @@ mod tests {
     /// which is exactly #1051's defect.
     #[test]
     fn predicted_dense_bytes_equal_actual_after_matmul_execution() {
-        // Thread-local admit so the process-global the concurrent tests read is
-        // never touched (#1056 isolation). The verdict is read at construction,
-        // so each kernel is built inside the scope.
-        let _admit = DenseCacheEnabledScope::new(true);
+        // Standalone kernels capture the admitted retention verdict at construction.
 
         let (k, n) = (48usize, 33usize);
         let graph = dense_matmul_graph(k, n, DataType::Float16, true);
@@ -4087,12 +3988,11 @@ mod tests {
         let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.019).sin()).collect();
 
         let run = |enabled: bool| -> (Vec<f32>, u64) {
-            // Thread-local scope; the kernel reads the verdict at construction.
-            let _scope = DenseCacheEnabledScope::new(enabled);
+            // Each kernel captures its own verdict at construction.
             let a = Owned::f32(&[m, k], &a_data);
             let b = Owned::f16(&[k, n], &b_data);
             let mut out = Owned::zeros_f32(&[m, n]);
-            let mut kernel = MatMulKernel::default();
+            let mut kernel = MatMulKernel::with_cache_retention(enabled);
             kernel.set_constant_inputs(&[false, true]);
             kernel
                 .execute(&[a.view(), b.view()], &mut [out.view_mut()])
@@ -4113,6 +4013,105 @@ mod tests {
             admitted_out, declined_out,
             "output must be byte-identical whether the cache is admitted or declined"
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn constant_preparation_warms_transpose_only_for_own_admitted_provider() {
+        use onnx_runtime_ep_api::{ExecutionProvider, KernelConstantInput};
+        use onnx_runtime_ir::NodeId;
+        let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
+        for admitted in [false, true] {
+            let provider = crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
+                cache_retention: crate::CpuCacheRetention::new(admitted),
+                ..Default::default()
+            });
+            let b = Owned::f16(&[5, 7], &[0.25; 35]);
+            let state = provider
+                .prepare_static_constants(
+                    &node,
+                    &[
+                        None,
+                        Some(KernelConstantInput {
+                            dtype: b.dtype,
+                            shape: &b.shape,
+                            bytes: &b.bytes,
+                        }),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(state.is_some(), admitted);
+            if let Some(state) = state {
+                let prepack = state.downcast_ref::<MatMulPrepack>().unwrap();
+                assert!(prepack.transposed_b_f16.get().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn provider_cache_retention_survives_opposite_load_orders_and_interleaved_runs() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::NodeId;
+        let (m, k, n) = (4usize, 40usize, 24usize);
+        let a = Owned::f32(
+            &[m, k],
+            &(0..m * k)
+                .map(|i| (i as f32 * 0.011).cos())
+                .collect::<Vec<_>>(),
+        );
+        let b = Owned::f16(
+            &[k, n],
+            &(0..k * n)
+                .map(|i| (i as f32 * 0.019).sin())
+                .collect::<Vec<_>>(),
+        );
+        let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
+        for first_admitted in [true, false] {
+            let make = |admitted| {
+                crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
+                    cache_retention: crate::CpuCacheRetention::new(admitted),
+                    ..Default::default()
+                })
+            };
+            let first = make(first_admitted);
+            let second = make(!first_admitted);
+            let compile = |provider: &crate::CpuExecutionProvider| {
+                let mut kernel = provider
+                    .get_kernel(&node, &[vec![m, k], vec![k, n]], 17)
+                    .unwrap();
+                kernel.set_constant_inputs(&[false, true]);
+                kernel
+            };
+            let first_kernel = compile(&first);
+            let second_kernel = compile(&second);
+            let mut reference = None;
+            for (kernel, admitted) in [
+                (&first_kernel, first_admitted),
+                (&second_kernel, !first_admitted),
+                (&first_kernel, first_admitted),
+                (&second_kernel, !first_admitted),
+            ] {
+                let mut out = Owned::zeros_f32(&[m, n]);
+                kernel
+                    .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                    .unwrap();
+                let concrete = kernel
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<MatMulKernel>()
+                    .unwrap();
+                assert_eq!(
+                    concrete.prepack.dense_live_bytes(),
+                    if admitted { (k * n * 4) as u64 } else { 0 }
+                );
+                let values = out.to_f32();
+                if let Some(expected) = &reference {
+                    assert_eq!(&values, expected);
+                } else {
+                    reference = Some(values);
+                }
+            }
+        }
     }
 
     #[test]
@@ -6236,10 +6235,10 @@ mod tests {
     /// *used* it (#1726 follow-up).
     ///
     /// The eviction that closes #1726 belongs to the call that installed the
-    /// entry, not to everyone who reaches it. `precompute_f32_weight_transpose`
-    /// installs at model load under exactly the key a consuming kernel later
-    /// computes, and discards its `Arc` on purpose so the global cache is what
-    /// retains the work. If a transient consumer evicted on drop, the first
+    /// entry, not to everyone who reaches it. This test manually installs
+    /// shared prewarm state under the key a consuming kernel later computes.
+    /// Kernel-owned constant preparation instead keeps its own memo and evicts
+    /// its installation when the owner drops. If a transient consumer evicted on drop, the first
     /// kernel-cache shape eviction would throw away the prewarm -- the TTFT
     /// spike it exists to prevent -- and would undercount
     /// `weight_transpose_cache_bytes` while a sibling `Arc` still holds the
@@ -6818,6 +6817,7 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
     #[test]
     fn fp16_m1_decode_reaches_neon_gemv_not_half_gemm() {
+        #[cfg(any(target_os = "macos", target_os = "ios", test))]
         use std::sync::atomic::Ordering;
 
         let (k, n) = (64, 32);
@@ -6858,6 +6858,7 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
     #[test]
     fn fp16_m_ge2_prefill_reaches_bnns_not_half_gemm() {
+        #[cfg(any(target_os = "macos", target_os = "ios", test))]
         use std::sync::atomic::Ordering;
 
         if !accelerate_gemm::bnns_matmul_available() {
@@ -7066,6 +7067,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn f16_constant_non_contiguous_b_enters_rescue_block() {
+        #[cfg(any(target_os = "macos", target_os = "ios", test))]
         use std::sync::atomic::Ordering;
 
         let (m, k, n) = (4, 32, 16);
@@ -7135,6 +7137,7 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
     #[test]
     fn fp16_m1_column_major_b_reaches_colmaj_gemv() {
+        #[cfg(any(target_os = "macos", target_os = "ios", test))]
         use std::sync::atomic::Ordering;
 
         let (k, n) = (64, 32);
@@ -7199,6 +7202,7 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
     #[test]
     fn fp16_m1_non_constant_colmaj_b_does_not_reach_gemv() {
+        #[cfg(any(target_os = "macos", target_os = "ios", test))]
         use std::sync::atomic::Ordering;
 
         let (k, n) = (64, 32);
@@ -7240,6 +7244,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn f16_m_ge2_non_constant_non_contiguous_b_does_not_enter_rescue() {
+        #[cfg(any(target_os = "macos", target_os = "ios", test))]
         use std::sync::atomic::Ordering;
 
         let (m, k, n) = (4, 32, 16);
@@ -7281,6 +7286,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn f16_constant_non_contiguous_non_colmaj_b_enters_rescue() {
+        #[cfg(any(target_os = "macos", target_os = "ios", test))]
         use std::sync::atomic::Ordering;
 
         let (m, k, n) = (4, 16, 8);
@@ -7356,6 +7362,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn f32_m_ge2_does_not_enter_half_or_rescue_paths() {
+        #[cfg(any(target_os = "macos", target_os = "ios", test))]
         use std::sync::atomic::Ordering;
 
         let (m, k, n) = (4, 32, 16);
@@ -7395,6 +7402,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn bf16_non_contiguous_does_not_enter_f16_rescue() {
+        #[cfg(any(target_os = "macos", target_os = "ios", test))]
         use std::sync::atomic::Ordering;
 
         let (m, k, n) = (4, 32, 16);
@@ -7434,6 +7442,7 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
     #[test]
     fn f32_thin_m_prefill_reaches_neon_col_parallel() {
+        #[cfg(any(target_os = "macos", target_os = "ios", test))]
         use std::sync::atomic::Ordering;
 
         // Use M=7, K=64, N=65536 to trigger the thin-M path (K*N = 4.2M > 4M threshold).
@@ -8510,7 +8519,7 @@ mod weight_cache_accounting {
     fn predicted_transpose_bytes_equal_actual_for_every_caching_op() {
         // Reads only the pure `node_weight_transpose_cache_bytes` predictor, so
         // unlike `gemm.rs`'s reconciliation it touches no process-global cache
-        // and needs no `TRANSPOSE_TEST_LOCK` / `CacheEnabledScope` (#1056).
+        // and needs no global admission overrides (#1056).
         // Distinctive geometry so a stray same-shaped entry cannot alias it,
         // and an odd `k` so a tail-handling bug cannot hide.
         let (k, n) = (83usize, 41usize);
