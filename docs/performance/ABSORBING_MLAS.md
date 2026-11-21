@@ -137,13 +137,17 @@ domain exactly. It ports directly into a native kernel and should.
 ## Constraints that apply to every absorption
 
 - **Any resident buffer must be governed** under #1056: declared to the memory plan
-  before allocation, in the bytes actually allocated, and declinable. Use
-  `GovernedWeightCache<T>`; a new bare `OnceLock` buffer is flagged by
-  `.github/workflows/weight-cache-guard.yml`.
-- **Anything cached per kernel instance is retained at least twice.** The
-  executor's `KernelCache` is shape-keyed, so prefill (`m > 1`) and decode
-  (`m == 1`) are separate instances with separate caches. Prefer a process-global
-  cache keyed on weight identity, cleared at `Executor` drop.
+  before allocation, in the bytes actually allocated, and declinable. Use the
+  configured `CpuMemoryResources` source and owned grants: each retained payload
+  keeps its grant through its last owner, and the idle retention ceiling reserves
+  no physical memory. A new bare `OnceLock` buffer is flagged by
+  `.github/workflows/weight-cache-guard.yml`. Existing legacy packed stores are
+  remaining conversion work, not examples to copy.
+- **Account for every cache owner.** The executor's `KernelCache` is shape-keyed,
+  so prefill (`m > 1`) and decode (`m == 1`) can be separate kernel instances.
+  Share immutable derived payloads through an explicit resource domain keyed by
+  weight identity and format. One executor dropping must not clear unrelated
+  sessions' caches; an active payload must stay charged after cache eviction.
 - **Byte-identity is the default requirement.** An f32 GEMM change alters
   accumulation order and may not preserve it; if it cannot, quantify the deviation
   against a reference and say so. A numerical change shipped as a performance

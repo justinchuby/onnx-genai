@@ -140,7 +140,7 @@ for an inner primitive.
 | `MatMulF32` | MLAS | baseline |
 | `GemmF32` | Native-over-MLAS | partial — epilogue ours, inner SGEMM is `MatMulF32` |
 | `MatMulNBits` | Native-over-MLAS | partial — int4 acc0 decode absorbed (#1104); prefill still MLAS |
-| `QLinearMatMul` | MLAS | baseline |
+| `QLinearMatMul` | MLAS research route; native AVX2 / NEON | partial — native byte GEMM; packed/requantized MLAS reference remains |
 | `Activations` | Native-over-MLAS | partial — chunking, threading, special-value repair ours |
 | `Softmax` | MLAS | baseline |
 | `Normalization` | Native | no MLAS primitive |
@@ -223,10 +223,24 @@ Ordered by *decode-path impact × distance from parity*, which is also
    #1104 absorbed int4 acc0 decode (1.36× / 1.56×); prefill is the remainder,
    and `MoE` follows it.
 
-`QLinearMatMul`, `Convolution` and `Pooling` are **not** priorities. They are
-MLAS baselines with wide ISA-specific dispatch and no decode-path presence; the
-graduation rule below applies if someone wants to try, but nothing is waiting on
-them.
+The native `QLinearMatMul` byte GEMM now has AVX2 and row-reusing ARM64
+NEON implementations. NEON borrows the original weight bytes and retains no
+packed copy. Register tiles share each B load across up to four rows; tile
+height preserves at least one task per worker, with the compiler-vectorized
+portable loop for single-row or narrow work. This is progress toward absorption,
+not graduation of the MLAS packed/requantized route. See the scoped
+[M1 Max measurements](../benchmarks/2026-11-21-qgemm-neon.md). `Convolution` and `Pooling`
+still need their own capability and performance comparisons.
+
+The `bench_qgemm_ab` kernel diagnostic runs native, portable and a repeated
+native A/A control in the same explicit Rayon pool, with rotating order. It
+checks exact output equality before timing and reports elapsed and process CPU
+time (CPU time is explicitly unavailable on non-Unix platforms). It measures
+only `sum_k (a - za) * b`: row sums, B zero-point correction, requantization,
+load-time packing and session overhead are outside its scope. Earlier versions
+of this diagnostic ran portable outside the selected pool and compared its
+partial accumulation against a complete native GEMM. Those measurements must
+not establish a speedup or absorption verdict without remeasurement.
 
 ## The graduation rule
 
