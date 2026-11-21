@@ -176,3 +176,7 @@ branch protection is not bypassed.
   `NXRT_REQUIRE_ORT_TESTS=1` (one pre-existing ignored test). Workflow integrity,
   required-tier coverage and whitespace checks passed. Windows verification
   remains delegated to the actual CI runner, not inferred from this Mac.
+
+The repo-wide fixture guard caught opset 21 in the new Identity smoke fixture.
+Updated it to the required opset 24, retaining IR 11. Validate the actual CPU
+inference and the complete fixture guard together before the final CI rerun.

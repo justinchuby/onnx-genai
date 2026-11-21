@@ -1,5 +1,5 @@
 ir_version: 11
-opset_import { domain: "" version: 21 }
+opset_import { domain: "" version: 24 }
 graph {
   name: "runtime_upgrade_identity"
   input { name: "x" type { tensor_type { elem_type: 1 shape { dim { dim_value: 3 } } } } }
