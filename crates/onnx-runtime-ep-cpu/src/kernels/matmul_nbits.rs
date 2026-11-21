@@ -14881,7 +14881,10 @@ mod tests {
         let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
         let a = &Owned::f32(&[1, k], &activations);
         let b = &Owned::u8(&[n, blocks, block_size / 2], &packed);
-        let scales = &Owned::f32(&[n, blocks], &scales);
+        // Half scales require a prepared f32 copy. Contiguous f32 wire inputs
+        // deliberately borrow instead and need not populate a cache; their
+        // pointer/ownership guards live in the compact_nbits_wire_* tests.
+        let scales = &Owned::f16(&[n, blocks], &scales);
 
         let mut reference = accuracy4_kernel(k, n, block_size);
         reference.set_constant_inputs(&[false, true, true]);
