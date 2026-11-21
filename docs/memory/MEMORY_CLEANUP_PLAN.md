@@ -331,11 +331,9 @@ eligibility, exact output and cache-stat guards remain in place. This fixes the
 cache's standing entitlement transition, not all model working-memory grants.
 
 The remaining convergence work includes derived block caches' model-wide
-accounting and transient decoded/scratch memory. The existing prefetch
-full-residency predicate also needs auditing against cached foreign-layer
-entries and concurrent callers before treating isolated cache-stat parity as a
-universal guarantee. CPU/GPU hybrid execution and asynchronous device lifetimes
-still require real-device evidence.
+accounting and transient decoded/scratch memory. The shared-layer prefetch
+capacity audit is addressed below. CPU/GPU hybrid execution and asynchronous
+device lifetimes still require real-device evidence.
 
 
 ### Per-tier authority identity
@@ -353,3 +351,29 @@ both the original identity/lease mismatch and foreign Host adoption behind a
 shared Device authority, then check clones and mapped allowances. This fixes
 identity routing, not the separate physical-capacity relationship between CPU
 hot-tier and Host books.
+
+
+### Shared-cache prefetch capacity proof
+
+The layer-only bound `experts * expanded_bytes <= budget` was insufficient:
+foreign-layer payloads can occupy the rest of the shared partition. A reproduced
+case admits the next expert in serial execution by evicting the current expert,
+while prefetch's live `Arc` prevents that victim and changes the retained set.
+
+A routed operation now registers its complete expert bank using the canonical
+source/layout key and expert cardinality. Active operations and retained entries
+hold that bank's metadata; the partition keeps weak registrations and prunes dead
+ones on cold registration. Positive-budget prefetch requires the sum of every
+live bank's complete expanded set to fit. A shared registry read guard freezes
+that upper bound through compute and worker completion: new banks wait, while
+operations on known banks remain concurrent. Workers borrow the existing proof
+and never reacquire either reader lock behind a pending writer. Zero-budget
+streaming needs no registry lock, and retains its single-ahead pipeline.
+
+This is deliberately a conservative eviction proof, not a new memory budget or
+a scheduler. Existing source identity, admission frequencies, pinning, exact
+output and counter tests remain. Tests cover the foreign-bank counterexample,
+exact shared-capacity boundary, retained metadata, expiry/pruning, concurrent
+known-bank operations, cold-registration exclusion and worker progress. The
+standing partition still does not account for transient decoded or scratch
+allocations; model-wide grant convergence remains open.
