@@ -829,25 +829,17 @@ pub(super) fn linear_packed_grouped(
             bias.map(<[f32]>::len)
         )));
     }
-    let elements = rows
-        .checked_mul(out_features)
-        .ok_or_else(|| error("streamed projection output size overflow"))?;
-    if elements == 0 {
-        return Ok(Vec::new());
-    }
-    // The number of shards is bounded by the pool size. No nested Rayon work
-    // occurs inside a shard, so suspended tasks cannot retain extra weight rows.
-    let columns_per_shard = out_features.div_ceil(rayon::current_num_threads().max(1));
-    let mut column_major = vec![0.0f32; elements];
     let decoder = format.decoder();
-    column_major
-        .par_chunks_mut(columns_per_shard * rows)
-        .enumerate()
-        .try_for_each(|(shard, columns)| -> Result<()> {
-            let mut weight_row = vec![0.0f32; in_features];
+    super::decoded_projection::linear_decoded_grouped(
+        "block-quantized projection",
+        input,
+        rows,
+        in_features,
+        out_features,
+        bias,
+        || {
             let mut block = [0.0f32; IQ_SUPER_QK];
-            for (column, output) in columns.chunks_exact_mut(rows).enumerate() {
-                let feature = shard * columns_per_shard + column;
+            move |feature, weight_row: &mut [f32]| {
                 let packed_row = &packed[feature * packed_stride..(feature + 1) * packed_stride];
                 for (index, bytes) in packed_row.chunks_exact(format.block_bytes()).enumerate() {
                     decoder(bytes, &mut block[..format.qk()]);
@@ -855,22 +847,10 @@ pub(super) fn linear_packed_grouped(
                     let count = format.qk().min(in_features - start);
                     weight_row[start..start + count].copy_from_slice(&block[..count]);
                 }
-                super::matmul::gemm_bt_serial(input, &weight_row, output, rows, in_features, 1)?;
-                if let Some(bias) = bias {
-                    for value in output {
-                        *value += bias[feature];
-                    }
-                }
+                Ok(())
             }
-            Ok(())
-        })?;
-    let mut output = vec![0.0; elements];
-    for (row, target) in output.chunks_exact_mut(out_features).enumerate() {
-        for (column, value) in target.iter_mut().enumerate() {
-            *value = column_major[column * rows + row];
-        }
-    }
-    Ok(output)
+        },
+    )
 }
 
 fn decode_mxfp4_block(block: &[u8], output: &mut [f32]) {

@@ -383,10 +383,13 @@ Implemented integration points:
   `pkg.nxrt::BlockQuantizedMoE`.
 
 The implemented kernels route and group the token batch before expert execution.
-`QMoE` dequantizes only active experts, one expert at a time, so the route-first path
-keeps the peak dequantized residency to one expert. Remaining CPU work is performance
-optimization, including packing/prepacking improvements and reducing temporary expert
-materialization while preserving the bounded-residency behavior.
+`QMoE` expands only routed experts. Retained payloads use their standing host
+cache partition; uncached complete projection sets acquire a shared Host grant
+before allocation, or use row-decoded f32 projections on capacity refusal. The
+serial transient window is one expert. Single-ahead prefetch requires a scoped
+two-expert grant; warm cache hits skip this request. Row scratch, activations and
+outputs are separate from these payload grants. Removing idle standing
+reservations and adding compressed-domain compute remain open.
 
 ### 6.3 CUDA EP
 
@@ -560,7 +563,12 @@ CPU differential coverage:
 - `grouped_int4_qmoe_matches_per_token_dense_fallback_for_eight_experts_top2`
   compares int4 `QMoE`, grouped float `MoE`, and the per-token dequantized oracle.
 - `route_first_bounds_dequantized_residency_when_all_experts_are_selected`
-  proves the mmap/offload path's peak dequantized window remains one expert.
+  bounds the mmap/offload transient window to one expert in serial or two with
+  single-ahead prefetch.
+- `transient_expert_grants_cover_complete_sets_and_stream_all_gates` covers full-set
+  grants, active-owner lifetime and dense/row numerical parity.
+- `transient_mmap_grants_preserve_prefetch_outputs_and_cache_policy` verifies exact
+  serial/prefetch output, cache counters, two-slot grant peaks and warm issuer bypass.
 
 The ignored release-mode characterization
 `grouped_moe_measures_benefit_over_dense_fallback_decode_and_prefill` is the

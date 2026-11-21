@@ -1017,7 +1017,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     rec.register(
         OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory::new(
-            derived_weights,
+            derived_weights.clone(),
             dense_weight_cache_bytes,
         )),
     );
@@ -1214,7 +1214,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("QMoE", "com.microsoft", 1),
-        Box::new(qmoe::QMoEFactory::new(host_cache)),
+        Box::new(qmoe::QMoEFactory::new(host_cache, derived_weights)),
     );
     // Standard-domain LLM/transformer primitives (ai.onnx). Registered at their
     // ONNX since_version; the registry resolves the highest since_version <=
@@ -2958,4 +2958,5 @@ mod tests {
     }
 }
 
+mod decoded_projection;
 pub(crate) mod dense_weight_cache;

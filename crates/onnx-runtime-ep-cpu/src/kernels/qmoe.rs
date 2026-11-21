@@ -17,7 +17,6 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 
@@ -31,8 +30,12 @@ use onnx_runtime_loader::{
 };
 
 use super::matmul_nbits::dequantize_nbits_row;
-use super::moe::{MoeAttributes, routing_weights, run_expert_grouped};
+use super::moe::{
+    ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
+};
 use super::{check_arity, contiguous_u8_slice, to_dense_bytes, to_dense_f32, write_dense_f32};
+use crate::DerivedWeightMemory;
+use crate::resources::{DenseWeightGrant, WeightAdmission};
 use crate::weight_offload::{
     WeightOffloadMode, checked_host_budget, effective_host_budget_u64, metrics,
     weight_offload_prefetch_default,
@@ -41,11 +44,18 @@ use crate::weight_offload::{
 /// Factory for the ORT contrib `QMoE` operator.
 pub struct QMoEFactory {
     host_cache: WeightOffloadHostCache,
+    transient_memory: DerivedWeightMemory,
 }
 
 impl QMoEFactory {
-    pub(crate) fn new(host_cache: WeightOffloadHostCache) -> Self {
-        Self { host_cache }
+    pub(crate) fn new(
+        host_cache: WeightOffloadHostCache,
+        transient_memory: DerivedWeightMemory,
+    ) -> Self {
+        Self {
+            host_cache,
+            transient_memory,
+        }
     }
 }
 
@@ -62,6 +72,7 @@ pub struct QMoEKernel {
     weight_offload: WeightOffloadMode,
     host_cache: WeightOffloadHostCache,
     prefetch_experts: bool,
+    transient_memory: DerivedWeightMemory,
 }
 
 /// Why this kernel cannot run a given `QMoE` node, if it cannot.
@@ -129,6 +140,7 @@ impl KernelFactory for QMoEFactory {
             weight_offload: WeightOffloadMode::from_env(),
             host_cache: self.host_cache.clone(),
             prefetch_experts: weight_offload_prefetch_default(),
+            transient_memory: self.transient_memory.clone(),
         }))
     }
 }
@@ -435,7 +447,7 @@ impl Kernel for QMoEKernel {
             // by registering and admitting a previously unseen bank midway.
             let compute = |expert: usize,
                            expert_tasks: &[(usize, usize, f32)],
-                           weights: &DequantizedExpert,
+                           weights: &ExpertExecution,
                            contributions: &mut [f32]|
              -> Result<()> {
                 write_grouped_contributions(
@@ -444,6 +456,9 @@ impl Kernel for QMoEKernel {
                     expert_tasks,
                     expert,
                     weights,
+                    &fc1,
+                    &fc2,
+                    fc3.as_ref(),
                     fc1_bias.as_deref(),
                     fc2_bias.as_deref(),
                     fc3_bias.as_deref(),
@@ -454,10 +469,44 @@ impl Kernel for QMoEKernel {
                 )
             };
 
-            if self.prefetch_experts
+            let prefetch_memory = if self.prefetch_experts
                 && ordered.len() > 1
                 && cache_operation.prefetch_eligibility().allows_pipeline()
             {
+                if !self.transient_memory.is_governed()
+                    || cache_operation
+                        .all_selected_resident(ordered.iter().map(|(expert, _)| *expert))
+                {
+                    Some(TransientExpertMemory::OnDemand(&self.transient_memory))
+                } else if let Some(bytes) = expanded_bytes.checked_mul(2) {
+                    // Preflight both pipeline slots once. Without this, the
+                    // extra live payload can change a later expert from dense
+                    // to streamed solely because prefetch was enabled.
+                    match self.transient_memory.try_grant(bytes)? {
+                        WeightAdmission::Granted(grant) => {
+                            Some(TransientExpertMemory::Prefetched(Arc::new(grant)))
+                        }
+                        WeightAdmission::Declined(reason) => {
+                            onnx_runtime_ep_api::record_kernel_variant_stage!(
+                                "prefetch",
+                                "qmoe.serial",
+                                "two transient expert slots require {bytes} Host bytes: {reason}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    onnx_runtime_ep_api::record_kernel_variant_stage!(
+                        "prefetch",
+                        "qmoe.serial",
+                        "two transient expert slots exceed addressable bytes; execute one expert at a time"
+                    );
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(prefetch_memory) = prefetch_memory {
                 // Single-ahead prefetch pipeline: a dedicated worker leases
                 // (and, on a miss, dequantizes) expert `n+1` while the main
                 // thread computes expert `n`, overlapping the host-side
@@ -472,14 +521,20 @@ impl Kernel for QMoEKernel {
                 let fc2_ref = &fc2;
                 let fc3_ref = fc3.as_ref();
                 let ordered_ref = &ordered;
+                let prefetch_memory = &prefetch_memory;
                 std::thread::scope(|scope| -> Result<()> {
                     let (req_tx, req_rx) = mpsc::channel::<usize>();
-                    let (res_tx, res_rx) = mpsc::channel::<Result<Arc<DequantizedExpert>>>();
+                    let (res_tx, res_rx) = mpsc::channel::<Result<ExpertExecution>>();
                     scope.spawn(move || {
                         while let Ok(index) = req_rx.recv() {
                             let expert = ordered_ref[index].0;
                             let leased = lease_route_first_expert(
-                                host_cache, expert, fc1_ref, fc2_ref, fc3_ref,
+                                host_cache,
+                                expert,
+                                fc1_ref,
+                                fc2_ref,
+                                fc3_ref,
+                                prefetch_memory,
                             );
                             if res_tx.send(leased).is_err() {
                                 break;
@@ -511,19 +566,30 @@ impl Kernel for QMoEKernel {
                         &fc1,
                         &fc2,
                         fc3.as_ref(),
+                        &TransientExpertMemory::OnDemand(&self.transient_memory),
                     )?;
                     compute(*expert, expert_tasks, &weights, &mut contributions)?;
                 }
             }
         } else {
             for (expert, expert_tasks) in tasks {
-                let weights = DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref(), false)?;
+                let weights = load_transient_expert(
+                    expert,
+                    &fc1,
+                    &fc2,
+                    fc3.as_ref(),
+                    &self.transient_memory,
+                    false,
+                )?;
                 write_grouped_contributions(
                     &mut contributions,
                     &x,
                     &expert_tasks,
                     expert,
                     &weights,
+                    &fc1,
+                    &fc2,
+                    fc3.as_ref(),
                     fc1_bias.as_deref(),
                     fc2_bias.as_deref(),
                     fc3_bias.as_deref(),
@@ -565,6 +631,8 @@ struct DequantizedExpert {
     fc2: Vec<f32>,
     fc3: Option<Vec<f32>>,
     _residency: Option<DequantizedExpertResidency>,
+    // Payloads above are destroyed before returning transient Host capacity.
+    _grant: Option<Arc<DenseWeightGrant>>,
 }
 
 impl DequantizedExpert {
@@ -574,6 +642,7 @@ impl DequantizedExpert {
         fc2: &QuantizedExperts<'_>,
         fc3: Option<&QuantizedExperts<'_>>,
         track_residency: bool,
+        grant: Option<Arc<DenseWeightGrant>>,
     ) -> Result<Self> {
         Ok(Self {
             fc1: fc1.dequantize_expert(expert)?,
@@ -582,6 +651,7 @@ impl DequantizedExpert {
                 .map(|weights| weights.dequantize_expert(expert))
                 .transpose()?,
             _residency: track_residency.then(DequantizedExpertResidency::new),
+            _grant: grant,
         })
     }
 
@@ -670,16 +740,66 @@ impl ExpertCacheKey {
     }
 }
 
-struct ExpertLease {
-    weights: Arc<DequantizedExpert>,
-    read_from_mmap: bool,
+/// A cache lookup never builds transient weights while holding its payload lock.
+enum ExpertLease {
+    Hit(Arc<DequantizedExpert>),
+    Filled(Arc<DequantizedExpert>),
+    Transient,
 }
 
-impl Deref for ExpertLease {
-    type Target = DequantizedExpert;
+/// The resolved execution choice travels through the prefetch worker too.
+enum ExpertExecution {
+    Dense(Arc<DequantizedExpert>),
+    RowStreamed(onnx_runtime_memory_api::MemoryError),
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.weights
+/// The shared allowance is confined to the fixed one-ahead driver: at most
+/// current and next transient payloads coexist, and the allowance outlives both.
+/// Retained payloads remain funded by the standing cache partition.
+enum TransientExpertMemory<'a> {
+    OnDemand(&'a DerivedWeightMemory),
+    Prefetched(Arc<DenseWeightGrant>),
+}
+impl TransientExpertMemory<'_> {
+    fn load(
+        &self,
+        expert: usize,
+        fc1: &QuantizedExperts<'_>,
+        fc2: &QuantizedExperts<'_>,
+        fc3: Option<&QuantizedExperts<'_>>,
+    ) -> Result<ExpertExecution> {
+        match self {
+            Self::OnDemand(memory) => load_transient_expert(expert, fc1, fc2, fc3, memory, true),
+            Self::Prefetched(grant) => Ok(ExpertExecution::Dense(Arc::new(
+                DequantizedExpert::load(expert, fc1, fc2, fc3, true, Some(Arc::clone(grant)))?,
+            ))),
+        }
+    }
+}
+
+fn load_transient_expert(
+    expert: usize,
+    fc1: &QuantizedExperts<'_>,
+    fc2: &QuantizedExperts<'_>,
+    fc3: Option<&QuantizedExperts<'_>>,
+    memory: &DerivedWeightMemory,
+    track_residency: bool,
+) -> Result<ExpertExecution> {
+    match memory.try_grant(DequantizedExpert::expanded_bytes(fc1, fc2, fc3)?)? {
+        WeightAdmission::Granted(grant) => {
+            Ok(ExpertExecution::Dense(Arc::new(DequantizedExpert::load(
+                expert,
+                fc1,
+                fc2,
+                fc3,
+                track_residency,
+                match grant {
+                    DenseWeightGrant::Local => None,
+                    grant => Some(Arc::new(grant)),
+                },
+            )?)))
+        }
+        WeightAdmission::Declined(reason) => Ok(ExpertExecution::RowStreamed(reason)),
     }
 }
 
@@ -759,19 +879,13 @@ impl HostExpertCache {
             let weights = Arc::clone(&entry.weights);
             metrics().record_host_cache_hit();
             self.record_residency(budget_bytes)?;
-            return Ok(ExpertLease {
-                weights,
-                read_from_mmap: false,
-            });
+            return Ok(ExpertLease::Hit(weights));
         }
 
         metrics().record_host_cache_miss();
         if budget_bytes == 0 || expanded_bytes == 0 || expanded_bytes > budget_bytes {
             self.record_residency(budget_bytes)?;
-            return Ok(ExpertLease {
-                weights: Arc::new(load()?),
-                read_from_mmap: true,
-            });
+            return Ok(ExpertLease::Transient);
         }
 
         self.prune_history(now);
@@ -784,10 +898,7 @@ impl HostExpertCache {
         let candidate_frequency = history.frequency;
         if candidate_frequency < ADMISSION_FREQUENCY {
             self.record_residency(budget_bytes)?;
-            return Ok(ExpertLease {
-                weights: Arc::new(load()?),
-                read_from_mmap: true,
-            });
+            return Ok(ExpertLease::Transient);
         }
 
         let required = self
@@ -824,10 +935,7 @@ impl HostExpertCache {
             }
             if reclaim != 0 {
                 self.record_residency(budget_bytes)?;
-                return Ok(ExpertLease {
-                    weights: Arc::new(load()?),
-                    read_from_mmap: true,
-                });
+                return Ok(ExpertLease::Transient);
             }
         }
 
@@ -879,10 +987,7 @@ impl HostExpertCache {
                 pin_until: 0,
             },
         );
-        Ok(ExpertLease {
-            weights,
-            read_from_mmap: true,
-        })
+        Ok(ExpertLease::Filled(weights))
     }
 
     #[cfg(test)]
@@ -1044,6 +1149,7 @@ struct WeightOffloadHostCacheInner {
     // Cold-path adopters serialize without holding data locks during governor
     // callbacks. Cache operations and observers never acquire this gate.
     adoption: Mutex<()>,
+    operations: RwLock<()>,
 }
 
 /// A governor-owned warm-host expert-cache partition.
@@ -1076,10 +1182,11 @@ enum HostBankSnapshot<'a> {
 }
 
 /// Freeze one budget for a complete routed operation, including its prefetch
-/// worker. Workers borrow this view and do not reacquire the budget lock, so a
-/// queued adopting writer cannot deadlock a worker needed by the reader.
+/// worker. A separate lifecycle gate lets grant callbacks inspect the short-lived
+/// budget lock even while adoption waits for this operation to finish. Workers
+/// borrow the existing gate rather than reacquiring a reader behind a writer.
 struct HostCacheOperation<'a> {
-    _budget_guard: RwLockReadGuard<'a, HostCacheBudget>,
+    _operation_guard: RwLockReadGuard<'a, ()>,
     banks: HostBankSnapshot<'a>,
     bank: Arc<ExpertBank>,
     cache: &'a Mutex<HostExpertCache>,
@@ -1111,6 +1218,18 @@ impl HostCacheOperation<'_> {
                 budget_bytes: self.budget_bytes,
             }
         }
+    }
+
+    fn all_selected_resident(&self, experts: impl Iterator<Item = usize>) -> bool {
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut key = self.bank.key.representative.clone();
+        experts.into_iter().all(|expert| {
+            key.expert = expert;
+            cache.entries.contains_key(&key)
+        })
     }
 
     #[cfg(test)]
@@ -1153,6 +1272,7 @@ impl WeightOffloadHostCache {
                 budget: RwLock::new(HostCacheBudget::Local(budget_bytes)),
                 banks: RwLock::new(BTreeMap::new()),
                 adoption: Mutex::new(()),
+                operations: RwLock::new(()),
             }),
         })
     }
@@ -1186,6 +1306,7 @@ impl WeightOffloadHostCache {
                 }),
                 banks: RwLock::new(BTreeMap::new()),
                 adoption: Mutex::new(()),
+                operations: RwLock::new(()),
             }),
         })
     }
@@ -1260,6 +1381,11 @@ impl WeightOffloadHostCache {
         // workers finish. New operations can use the local budget while the
         // provisional reservation above is prepared; the cold gate serializes
         // adopters, so no competing adoption can publish a zero-sized grant.
+        let _operations = self
+            .inner
+            .operations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut budget = self
             .inner
             .budget
@@ -1290,15 +1416,21 @@ impl WeightOffloadHostCache {
             representative,
             experts,
         };
+        let operation = self
+            .inner
+            .operations
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let budget = self
             .inner
             .budget
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let budget_bytes = budget.effective_bytes()?;
+        drop(budget);
         if budget_bytes == 0 {
             return Ok(HostCacheOperation {
-                _budget_guard: budget,
+                _operation_guard: operation,
                 banks: HostBankSnapshot::Streaming,
                 bank: Arc::new(ExpertBank {
                     key,
@@ -1308,7 +1440,7 @@ impl WeightOffloadHostCache {
                 budget_bytes,
             });
         }
-        // Lock order is budget -> bank registry -> payload cache. Registration
+        // Lock order is operation -> brief budget snapshot -> bank registry -> payload. Registration
         // is cold; readers for known banks share the lock and compute concurrently.
         let mut banks = self
             .inner
@@ -1357,7 +1489,7 @@ impl WeightOffloadHostCache {
             )));
         }
         Ok(HostCacheOperation {
-            _budget_guard: budget,
+            _operation_guard: operation,
             banks: HostBankSnapshot::Registered(banks),
             bank,
             cache: &self.inner.cache,
@@ -1382,6 +1514,11 @@ impl WeightOffloadHostCache {
             .inner
             .adoption
             .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _operations = self
+            .inner
+            .operations
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut budget = self
             .inner
@@ -1443,11 +1580,17 @@ fn lease_route_first_expert(
     fc1: &QuantizedExperts<'_>,
     fc2: &QuantizedExperts<'_>,
     fc3: Option<&QuantizedExperts<'_>>,
-) -> Result<Arc<DequantizedExpert>> {
+    memory: &TransientExpertMemory<'_>,
+) -> Result<ExpertExecution> {
     let lease = host_cache.lease(expert, || {
-        DequantizedExpert::load(expert, fc1, fc2, fc3, true)
+        DequantizedExpert::load(expert, fc1, fc2, fc3, true, None)
     })?;
-    if lease.read_from_mmap {
+    let (execution, read_from_mmap) = match lease {
+        ExpertLease::Hit(weights) => (ExpertExecution::Dense(weights), false),
+        ExpertLease::Filled(weights) => (ExpertExecution::Dense(weights), true),
+        ExpertLease::Transient => (memory.load(expert, fc1, fc2, fc3)?, true),
+    };
+    if read_from_mmap {
         let mut bytes_read = fc1
             .expert_source_bytes(expert)?
             .checked_add(fc2.expert_source_bytes(expert)?)
@@ -1459,7 +1602,7 @@ fn lease_route_first_expert(
         }
         metrics().record_bytes_read(bytes_read).map_err(error)?;
     }
-    Ok(lease.weights)
+    Ok(execution)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1468,7 +1611,10 @@ fn write_grouped_contributions(
     input: &[f32],
     tasks: &[(usize, usize, f32)],
     expert: usize,
-    weights: &DequantizedExpert,
+    weights: &ExpertExecution,
+    fc1: &QuantizedExperts<'_>,
+    fc2: &QuantizedExperts<'_>,
+    fc3: Option<&QuantizedExperts<'_>>,
     fc1_bias: Option<&[f32]>,
     fc2_bias: Option<&[f32]>,
     fc3_bias: Option<&[f32]>,
@@ -1484,20 +1630,48 @@ fn write_grouped_contributions(
     for &(row, _, _) in tasks {
         grouped_input.extend_from_slice(&input[checked_range(row, hidden, "input row")?]);
     }
-    let expert_out = run_expert_grouped(
-        &grouped_input,
-        tasks.len(),
-        &weights.fc1,
-        fc1_bias.map(|bias| &bias[fc1_bias_range]),
-        &weights.fc2,
-        fc2_bias.map(|bias| &bias[fc2_bias_range]),
-        weights.fc3.as_deref(),
-        fc3_bias.map(|bias| &bias[fc3_bias_range]),
-        fc1_size,
-        hidden,
-        inter,
-        attributes,
-    )?;
+    let expert_out = match weights {
+        ExpertExecution::Dense(weights) => run_expert_grouped(
+            &grouped_input,
+            tasks.len(),
+            &weights.fc1,
+            fc1_bias.map(|bias| &bias[fc1_bias_range]),
+            &weights.fc2,
+            fc2_bias.map(|bias| &bias[fc2_bias_range]),
+            weights.fc3.as_deref(),
+            fc3_bias.map(|bias| &bias[fc3_bias_range]),
+            fc1_size,
+            hidden,
+            inter,
+            attributes,
+        )?,
+        ExpertExecution::RowStreamed(reason) => {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "qmoe.streamed_rows",
+                "Host transient expert grant declined: {reason}"
+            );
+            let fc1 = QuantizedExpertProjection {
+                source: fc1,
+                expert,
+            };
+            let fc2 = QuantizedExpertProjection {
+                source: fc2,
+                expert,
+            };
+            let fc3 = fc3.map(|source| QuantizedExpertProjection { source, expert });
+            run_expert_projections(
+                &grouped_input,
+                tasks.len(),
+                &fc1,
+                fc1_bias.map(|bias| &bias[fc1_bias_range]),
+                &fc2,
+                fc2_bias.map(|bias| &bias[fc2_bias_range]),
+                fc3.as_ref(),
+                fc3_bias.map(|bias| &bias[fc3_bias_range]),
+                attributes,
+            )?
+        }
+    };
     for (grouped_row, &(_, slot, route_weight)) in tasks.iter().enumerate() {
         let contribution =
             &mut contributions[checked_range(slot, hidden, "routed contribution row")?];
@@ -1737,36 +1911,50 @@ impl<'a> QuantizedExperts<'a> {
                 self.experts
             )));
         }
+        let requested = self.dequantized_bytes()? as u64;
         let mut output = Vec::new();
         output
             .try_reserve_exact(self.dequantized_elements)
             .map_err(|failure| {
-                error(format!("failed to allocate dequantized expert: {failure}"))
+                EpError::Memory(onnx_runtime_memory_api::MemoryError::AllocationFailed { tier: "host", requested, reason: format!("QMoE expert {expert} could not allocate its admitted f32 projection: {failure}; free Host memory or lower concurrent expert demand") })
             })?;
         output.resize(self.dequantized_elements, 0.0f32);
         for row in 0..self.out_features {
-            let expert_row = expert
-                .checked_mul(self.out_features)
-                .and_then(|offset| offset.checked_add(row))
-                .ok_or_else(|| error("expert-row offset overflow"))?;
-            let packed_range =
-                checked_range(expert_row, self.packed_in, "packed-weight expert row")?;
-            let scale_range = checked_range(expert_row, self.blocks, "scale expert row")?;
-            let zero_point_range =
-                checked_range(expert_row, self.zero_point_bytes, "zero-point expert row")?;
             let output_range = checked_range(row, self.in_features, "dequantized output row")?;
-            dequantize_nbits_row(
-                &self.packed[packed_range],
-                &self.scales[scale_range],
-                self.zero_points
-                    .as_ref()
-                    .map(|points| &points[zero_point_range]),
-                &mut output[output_range],
-                self.bits,
-                self.block_size,
-            );
+            self.decode_expert_row(expert, row, &mut output[output_range])?;
         }
         Ok(output)
+    }
+
+    fn decode_expert_row(&self, expert: usize, row: usize, output: &mut [f32]) -> Result<()> {
+        if expert >= self.experts || row >= self.out_features || output.len() != self.in_features {
+            return Err(error(format!(
+                "expert {expert}, output row {row}, decoded length {} do not match [{},{},{}]; use an in-range expert/row and a complete input-feature buffer",
+                output.len(),
+                self.experts,
+                self.out_features,
+                self.in_features
+            )));
+        }
+        let expert_row = expert
+            .checked_mul(self.out_features)
+            .and_then(|offset| offset.checked_add(row))
+            .ok_or_else(|| error("expert-row offset overflow"))?;
+        let packed_range = checked_range(expert_row, self.packed_in, "packed-weight expert row")?;
+        let scale_range = checked_range(expert_row, self.blocks, "scale expert row")?;
+        let zero_point_range =
+            checked_range(expert_row, self.zero_point_bytes, "zero-point expert row")?;
+        dequantize_nbits_row(
+            &self.packed[packed_range],
+            &self.scales[scale_range],
+            self.zero_points
+                .as_ref()
+                .map(|points| &points[zero_point_range]),
+            output,
+            self.bits,
+            self.block_size,
+        );
+        Ok(())
     }
 
     fn dequantized_bytes(&self) -> Result<usize> {
@@ -1774,6 +1962,30 @@ impl<'a> QuantizedExperts<'a> {
             self.dequantized_elements,
             std::mem::size_of::<f32>(),
             "per-expert expanded byte count",
+        )
+    }
+}
+
+struct QuantizedExpertProjection<'a, 'b> {
+    source: &'a QuantizedExperts<'b>,
+    expert: usize,
+}
+impl ExpertProjection for QuantizedExpertProjection<'_, '_> {
+    fn out_features(&self) -> usize {
+        self.source.out_features
+    }
+    fn in_features(&self) -> usize {
+        self.source.in_features
+    }
+    fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
+        super::decoded_projection::linear_decoded_grouped(
+            "QMoE NBits expert",
+            input,
+            rows,
+            self.in_features(),
+            self.out_features(),
+            bias,
+            || |row, output: &mut [f32]| self.source.decode_expert_row(self.expert, row, output),
         )
     }
 }
@@ -2305,7 +2517,16 @@ mod tests {
         routers: &[&[f32]],
         k: usize,
     ) -> MmapRun {
-        run_mmap_qmoe_sequence_prefetch(enabled, interleaved, input, routers, k, true)
+        run_mmap_qmoe_sequence_prefetch(
+            enabled,
+            interleaved,
+            input,
+            routers,
+            k,
+            true,
+            crate::CpuMemoryResources::default(),
+            1.0,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2316,6 +2537,8 @@ mod tests {
         routers: &[&[f32]],
         k: usize,
         prefetch_experts: bool,
+        resources: crate::CpuMemoryResources,
+        scale_multiplier: f32,
     ) -> MmapRun {
         const EXPERTS: usize = 4;
         const ROWS: usize = 4;
@@ -2326,8 +2549,11 @@ mod tests {
         const PACKED: usize = HIDDEN / 2;
         const BLOCKS: usize = 1;
 
-        let fc1 = quantize(EXPERTS, INTER, HIDDEN, BITS, BLOCK, false);
-        let fc2 = quantize(EXPERTS, HIDDEN, INTER, BITS, BLOCK, false);
+        let mut fc1 = quantize(EXPERTS, INTER, HIDDEN, BITS, BLOCK, false);
+        let mut fc2 = quantize(EXPERTS, HIDDEN, INTER, BITS, BLOCK, false);
+        for scale in fc1.scales.iter_mut().chain(&mut fc2.scales) {
+            *scale *= scale_multiplier;
+        }
         let fc1_packed = if interleaved {
             interleave_u8(&fc1.packed, EXPERTS, INTER, PACKED)
         } else {
@@ -2467,12 +2693,13 @@ mod tests {
         let mut attributes = MoeAttributes::from_node(graph.node(node)).expect("attributes");
         attributes.k = k;
         let kernel = QMoEKernel {
+            transient_memory: resources.derived_weights,
             layer_id: graph.node(node).id.0,
             attributes,
             bits: BITS,
             block_size: BLOCK,
             weight_offload: WeightOffloadMode { enabled },
-            host_cache: default_weight_offload_host_cache().clone(),
+            host_cache: resources.host_cache,
             prefetch_experts,
         };
         let x = Owned::f32(&[ROWS, HIDDEN], input);
@@ -2657,6 +2884,7 @@ mod tests {
         );
         let attributes = MoeAttributes::from_node(graph.node(node)).expect("attributes");
         let kernel = QMoEKernel {
+            transient_memory: DerivedWeightMemory::default(),
             layer_id: graph.node(node).id.0,
             attributes,
             bits,
@@ -3241,33 +3469,348 @@ mod tests {
             .zero_points
             .as_ref()
             .map(|points| Owned::u8(&[experts, hidden, inter_blocks.div_ceil(pack_size)], points));
+        let q_inputs = [
+            x.view(),
+            router_tensor.view(),
+            fc1_packed.view(),
+            fc1_scales.view(),
+            TensorView::absent(DataType::Float32),
+            fc2_packed.view(),
+            fc2_scales.view(),
+            TensorView::absent(DataType::Float32),
+            TensorView::absent(DataType::Uint8),
+            TensorView::absent(DataType::Float32),
+            TensorView::absent(DataType::Float32),
+            fc1_zero_points
+                .as_ref()
+                .map_or_else(|| TensorView::absent(DataType::Uint8), Owned::view),
+            fc2_zero_points
+                .as_ref()
+                .map_or_else(|| TensorView::absent(DataType::Uint8), Owned::view),
+        ];
         let mut q_output = Owned::zeros_f32(&[rows, hidden]);
         kernel(&q_graph, q_node)
             .unwrap()
-            .execute(
-                &[
-                    x.view(),
-                    router_tensor.view(),
-                    fc1_packed.view(),
-                    fc1_scales.view(),
-                    TensorView::absent(DataType::Float32),
-                    fc2_packed.view(),
-                    fc2_scales.view(),
-                    TensorView::absent(DataType::Float32),
-                    TensorView::absent(DataType::Uint8),
-                    TensorView::absent(DataType::Float32),
-                    TensorView::absent(DataType::Float32),
-                    fc1_zero_points
-                        .as_ref()
-                        .map_or_else(|| TensorView::absent(DataType::Uint8), Owned::view),
-                    fc2_zero_points
-                        .as_ref()
-                        .map_or_else(|| TensorView::absent(DataType::Uint8), Owned::view),
-                ],
-                &mut [q_output.view_mut()],
-            )
+            .execute(&q_inputs, &mut [q_output.view_mut()])
             .unwrap();
         assert_close(&q_output.to_f32(), &float_output.to_f32());
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let expanded_bytes = (inter * hidden + hidden * inter) * std::mem::size_of::<f32>();
+        for capacity in [0, expanded_bytes - 1, expanded_bytes] {
+            let governor = LedgerGovernor::new(LeaseLedger::new(0, capacity as u64, 0));
+            let provider = CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
+                derived_weights: DerivedWeightMemory::governed(&governor, HolderId::new(13))
+                    .unwrap(),
+                ..Default::default()
+            });
+            let governed = provider.get_kernel(q_graph.node(q_node), &[], 1).unwrap();
+            governed
+                .execute(&q_inputs, &mut [q_output.view_mut()])
+                .unwrap();
+            assert_close(&q_output.to_f32(), &float_output.to_f32());
+            assert_eq!(
+                governor.used(Tier::Host),
+                0,
+                "transient payloads must return their grants after execution"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_expert_grants_cover_complete_sets_and_stream_all_gates() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        const H: usize = 48;
+        const I: usize = 48;
+        const E: usize = 2;
+        for bits in [2, 4, 8] {
+            for affine in [false, true] {
+                for (activation, fusion, separate) in [
+                    ("identity", 0, false),
+                    ("relu", 0, false),
+                    ("gelu", 0, false),
+                    ("silu", 0, false),
+                    ("silu", 0, true),
+                    ("swiglu", 0, true),
+                    ("swiglu", 1, false),
+                    ("swiglu", 2, false),
+                ] {
+                    let mut attrs = attributes(bits, 16, 2, true);
+                    attrs
+                        .iter_mut()
+                        .find(|(key, _)| *key == "activation_type")
+                        .unwrap()
+                        .1 = Attribute::String(activation.as_bytes().to_vec());
+                    attrs.push(("swiglu_fusion", Attribute::Int(fusion)));
+                    let (graph, node) = model_node("QMoE", &[], &[2, H], &attrs);
+                    let attrs = quantized_moe_attributes(graph.node(node)).unwrap().0;
+                    let fc1_size = attrs.checked_fc1_size(I, "test QMoE").unwrap();
+                    let dims = [(fc1_size, H), (H, I), (I, H)];
+                    let mut q: [_; 3] = std::array::from_fn(|i| {
+                        quantize(E, dims[i].0, dims[i].1, bits, 16, affine)
+                    });
+                    for bank in &mut q {
+                        for scale in &mut bank.scales {
+                            *scale *= 0.73145;
+                        }
+                    }
+                    let p: [_; 3] = std::array::from_fn(|i| {
+                        Owned::u8(&[E, dims[i].0, dims[i].1 / (8 / bits)], &q[i].packed)
+                    });
+                    let sc: [_; 3] = std::array::from_fn(|i| {
+                        Owned::f32(&[E, dims[i].0, dims[i].1 / 16], &q[i].scales)
+                    });
+                    let zp: [_; 3] = std::array::from_fn(|i| {
+                        let shape = [E, dims[i].0, (dims[i].1 / 16).div_ceil(8 / bits)];
+                        let fallback = vec![0; shape.iter().product()];
+                        Owned::u8(&shape, q[i].zero_points.as_deref().unwrap_or(&fallback))
+                    });
+                    let pv: [_; 3] = std::array::from_fn(|i| p[i].view());
+                    let sv: [_; 3] = std::array::from_fn(|i| sc[i].view());
+                    let zv: [_; 3] = std::array::from_fn(|i| zp[i].view());
+                    let sources: [_; 3] = std::array::from_fn(|i| {
+                        QuantizedExperts::new(
+                            "test projection",
+                            &pv[i],
+                            &sv[i],
+                            affine.then_some(&zv[i]),
+                            E,
+                            dims[i].0,
+                            dims[i].1,
+                            bits,
+                            16,
+                            false,
+                        )
+                        .unwrap()
+                    });
+                    let (fc1, fc2) = (&sources[0], &sources[1]);
+                    let fc3 = separate.then_some(&sources[2]);
+                    let bytes = DequantizedExpert::expanded_bytes(fc1, fc2, fc3).unwrap();
+                    let input = pseudo_random_values(2 * H, 0xdeadbeef);
+                    let tasks = [(1, 0, 0.25), (0, 1, 0.75), (1, 2, -0.5)];
+                    let biases: [Vec<f32>; 3] = std::array::from_fn(|i| {
+                        (0..E * dims[i].0).map(|j| (j % 3) as f32 * 0.125).collect()
+                    });
+                    let run = |execution: &ExpertExecution| {
+                        let mut out = vec![0.; tasks.len() * H];
+                        write_grouped_contributions(
+                            &mut out,
+                            &input,
+                            &tasks,
+                            1,
+                            execution,
+                            fc1,
+                            fc2,
+                            fc3,
+                            Some(&biases[0]),
+                            Some(&biases[1]),
+                            separate.then_some(biases[2].as_slice()),
+                            fc1_size,
+                            H,
+                            I,
+                            &attrs,
+                        )
+                        .unwrap();
+                        out
+                    };
+                    let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+                    let memory =
+                        DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+                    let dense = load_transient_expert(1, fc1, fc2, fc3, &memory, false).unwrap();
+                    assert_eq!(governor.used(Tier::Host), bytes as u64);
+                    let expected = run(&dense);
+                    assert!(
+                        matches!(
+                            load_transient_expert(1, fc1, fc2, fc3, &memory, false).unwrap(),
+                            ExpertExecution::RowStreamed(_)
+                        ),
+                        "an active full-set owner must keep the quota occupied"
+                    );
+                    for limit in [0, bytes - 1] {
+                        let denied = LedgerGovernor::new(LeaseLedger::new(0, limit as u64, 0));
+                        let source =
+                            DerivedWeightMemory::governed(&denied, HolderId::new(13)).unwrap();
+                        let streamed =
+                            load_transient_expert(1, fc1, fc2, fc3, &source, false).unwrap();
+                        assert!(matches!(streamed, ExpertExecution::RowStreamed(_)));
+                        let actual = run(&streamed);
+                        assert_close(&actual, &expected);
+                        assert_eq!(denied.used(Tier::Host), 0);
+                    }
+                    let ExpertExecution::Dense(payload) = &dense else {
+                        panic!("exact quota must admit a dense set")
+                    };
+                    let active = payload.clone();
+                    drop(dense);
+                    assert_eq!(governor.used(Tier::Host), bytes as u64);
+                    drop(active);
+                    assert_eq!(governor.used(Tier::Host), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transient_mmap_grants_preserve_prefetch_outputs_and_cache_policy() {
+        use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseAccounting, LeaseLedger, MemoryAuthorityId, MemoryGovernor, MemoryLease,
+        };
+        #[derive(Debug)]
+        struct ObservedBooks {
+            ledger: Arc<LeaseLedger>,
+            peak: AtomicU64,
+            grants: Mutex<Vec<u64>>,
+        }
+        impl LeaseAccounting for ObservedBooks {
+            fn authority_id(&self) -> Option<MemoryAuthorityId> {
+                self.ledger.authority_id()
+            }
+            fn release(&self, tier: Tier, bytes: u64) {
+                self.ledger.release(tier, bytes);
+            }
+            fn try_claim(
+                &self,
+                tier: Tier,
+                bytes: u64,
+                role: MemoryRole,
+            ) -> std::result::Result<(), MemoryError> {
+                self.ledger.try_claim(tier, bytes, role)?;
+                self.peak
+                    .fetch_max(self.ledger.used(tier), Ordering::Relaxed);
+                self.grants.lock().unwrap().push(bytes);
+                Ok(())
+            }
+        }
+        struct ObservedGovernor(Arc<ObservedBooks>);
+        impl MemoryGovernor for ObservedGovernor {
+            fn authority_id(&self, _tier: Tier) -> MemoryAuthorityId {
+                self.0.authority_id().unwrap()
+            }
+            fn reserve(
+                &self,
+                tier: Tier,
+                bytes: u64,
+                role: MemoryRole,
+                holder: HolderId,
+            ) -> std::result::Result<MemoryLease, MemoryError> {
+                self.0.try_claim(tier, bytes, role)?;
+                Ok(MemoryLease::new(tier, bytes, role, holder, self.0.clone()))
+            }
+            fn available(&self, tier: Tier) -> u64 {
+                self.0.ledger.available(tier)
+            }
+            fn used(&self, tier: Tier) -> u64 {
+                self.0.ledger.used(tier)
+            }
+        }
+        let _guard = hold_metrics_test_lock();
+        let input = pseudo_random_values(4 * 16, 0xcafe);
+        let router = pseudo_random_values(4 * 4, 0xfeed);
+        const BYTES: u64 = 2 * 16 * 16 * 4;
+        reset_offload_test_state(0);
+        let baseline = run_mmap_qmoe_sequence_prefetch(
+            false,
+            false,
+            &input,
+            &[&router],
+            3,
+            false,
+            crate::CpuMemoryResources::default(),
+            0.73145,
+        );
+        for cache_bytes in [0, 4 * BYTES] {
+            for transient_bytes in [0, BYTES - 1, BYTES, 2 * BYTES] {
+                let mut previous = None;
+                let mut previous_output = None;
+                for prefetch in [false, true] {
+                    metrics().reset();
+                    let books = Arc::new(ObservedBooks {
+                        ledger: LeaseLedger::new(0, cache_bytes + transient_bytes, 0),
+                        peak: AtomicU64::new(0),
+                        grants: Mutex::new(Vec::new()),
+                    });
+                    let governor = ObservedGovernor(books.clone());
+                    let cache = WeightOffloadHostCache::new_leased(
+                        cache_bytes,
+                        &governor,
+                        HolderId::new(10),
+                    )
+                    .unwrap();
+                    let memory =
+                        DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+                    let result = run_mmap_qmoe_sequence_prefetch(
+                        true,
+                        false,
+                        &input,
+                        &[&router, &router, &router],
+                        3,
+                        prefetch,
+                        crate::CpuMemoryResources {
+                            host_cache: cache.clone(),
+                            derived_weights: memory,
+                            ..Default::default()
+                        },
+                        0.73145,
+                    );
+                    assert_close(&result.output, &baseline.output);
+                    assert_eq!(
+                        governor.used(Tier::Host),
+                        cache_bytes,
+                        "every transient grant must be returned after workers and compute finish"
+                    );
+                    if let Some(previous) = &previous_output {
+                        assert_eq!(
+                            &result.output, previous,
+                            "prefetch must preserve exact output under the same Host capacity"
+                        );
+                    }
+                    previous_output = Some(result.output.clone());
+                    let transient_peak = if prefetch && transient_bytes >= 2 * BYTES {
+                        2 * BYTES
+                    } else if transient_bytes >= BYTES {
+                        BYTES
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        books.peak.load(Ordering::Relaxed),
+                        cache_bytes + transient_peak,
+                        "unexpected working-set grant peak for prefetch={prefetch}"
+                    );
+                    if prefetch && cache_bytes != 0 && transient_bytes >= 2 * BYTES {
+                        assert_eq!(
+                            books
+                                .grants
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|&&bytes| bytes == 2 * BYTES)
+                                .count(),
+                            2,
+                            "the third, fully cached step must not claim a transient allowance"
+                        );
+                    }
+                    let stats = crate::weight_offload_stats();
+                    let policy = (
+                        stats.host_cache_hits,
+                        stats.host_cache_misses,
+                        stats.host_cache_evictions,
+                        stats.owned_host_cache_bytes,
+                    );
+                    if let Some(previous) = previous {
+                        assert_eq!(
+                            policy, previous,
+                            "prefetch must preserve cache admission and eviction counters"
+                        );
+                    }
+                    previous = Some(policy);
+                    drop(cache);
+                    assert_eq!(governor.used(Tier::Host), 0);
+                }
+            }
+        }
     }
 
     #[test]
@@ -3383,7 +3926,16 @@ mod tests {
         // flight the peak is deterministically the working set. This pins the
         // lower edge of the bound and proves the accounting itself is correct.
         reset_offload_test_state(0);
-        let serial = run_mmap_qmoe_sequence_prefetch(true, false, &input, &[&router], 1, false);
+        let serial = run_mmap_qmoe_sequence_prefetch(
+            true,
+            false,
+            &input,
+            &[&router],
+            1,
+            false,
+            crate::CpuMemoryResources::default(),
+            1.0,
+        );
         let serial_stats = crate::weight_offload_stats();
         assert_close(&serial.output, &baseline.output);
         assert_eq!(serial_stats.unique_experts_per_batch, 4);
@@ -3575,6 +4127,7 @@ mod tests {
             fc2: Vec::new(),
             fc3: None,
             _residency: None,
+            _grant: None,
         };
 
         for cache in [&engine_a, &engine_b] {
@@ -3600,6 +4153,7 @@ mod tests {
             fc2: vec![],
             fc3: None,
             _residency: None,
+            _grant: None,
         }
     }
 
@@ -3675,7 +4229,10 @@ mod tests {
             0,
             "failed adoption must refund its reservation"
         );
-        assert_eq!(held.fc1, vec![0.]);
+        let ExpertLease::Hit(weights) = &held else {
+            panic!("fixture expert must be cached")
+        };
+        assert_eq!(weights.fc1, vec![0.]);
         drop(held);
         assert_eq!(
             cache
@@ -3709,6 +4266,136 @@ mod tests {
         }
         drop(cache);
         assert_eq!(owner.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn transient_grant_callbacks_can_inspect_cache_while_adoption_waits() {
+        use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseAccounting, LeaseLedger, LedgerGovernor, MemoryAuthorityId,
+            MemoryGovernor, MemoryLease,
+        };
+        use std::sync::{atomic::AtomicUsize, mpsc};
+        use std::time::{Duration, Instant};
+        struct Observer {
+            cache: WeightOffloadHostCache,
+            id: MemoryAuthorityId,
+            calls: AtomicUsize,
+            used: AtomicU64,
+        }
+        impl std::fmt::Debug for Observer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("Observer").finish_non_exhaustive()
+            }
+        }
+        impl LeaseAccounting for Observer {
+            fn authority_id(&self) -> Option<MemoryAuthorityId> {
+                Some(self.id)
+            }
+            fn release(&self, _tier: Tier, bytes: u64) {
+                self.used.fetch_sub(bytes, Ordering::Relaxed);
+            }
+            fn try_claim(
+                &self,
+                _tier: Tier,
+                bytes: u64,
+                _role: MemoryRole,
+            ) -> std::result::Result<(), MemoryError> {
+                assert!(
+                    self.cache.inner.cache.try_lock().is_ok(),
+                    "grant callbacks must run outside the payload lock"
+                );
+                assert_eq!(
+                    self.cache.budget(),
+                    (8, false),
+                    "a waiting adopter must not block budget inspection by an active operation's grant callback"
+                );
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.used.fetch_add(bytes, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        struct ObservedGovernor(Arc<Observer>);
+        impl MemoryGovernor for ObservedGovernor {
+            fn authority_id(&self, _tier: Tier) -> MemoryAuthorityId {
+                self.0.id
+            }
+            fn reserve(
+                &self,
+                tier: Tier,
+                bytes: u64,
+                role: MemoryRole,
+                holder: HolderId,
+            ) -> std::result::Result<MemoryLease, MemoryError> {
+                if bytes != 0 {
+                    self.0.try_claim(tier, bytes, role)?;
+                }
+                Ok(MemoryLease::new(tier, bytes, role, holder, self.0.clone()))
+            }
+            fn available(&self, _tier: Tier) -> u64 {
+                u64::MAX
+            }
+            fn used(&self, _tier: Tier) -> u64 {
+                self.0.used.load(Ordering::Relaxed)
+            }
+        }
+        let _guard = hold_metrics_test_lock();
+        let cache = WeightOffloadHostCache::new(8).unwrap();
+        let books = Arc::new(Observer {
+            cache: cache.clone(),
+            id: LedgerGovernor::new(LeaseLedger::new(0, 8, 0)).authority_id(Tier::Host),
+            calls: AtomicUsize::new(0),
+            used: AtomicU64::new(0),
+        });
+        let source =
+            DerivedWeightMemory::governed(&ObservedGovernor(books.clone()), HolderId::new(13))
+                .unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (grant_tx, grant_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let reader_cache = cache.clone();
+        let reader = std::thread::spawn(move || {
+            let operation = reader_cache.begin_operation(cache_key(0), 2, 4).unwrap();
+            ready_tx.send(()).unwrap();
+            grant_rx.recv().unwrap();
+            let WeightAdmission::Granted(grant) = source.try_grant(4).unwrap() else {
+                panic!("observed fixture must grant")
+            };
+            drop(grant);
+            done_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            drop(operation);
+        });
+        let timeout = Duration::from_secs(5);
+        ready_rx.recv_timeout(timeout).unwrap();
+        assert!(
+            cache.inner.budget.try_write().is_ok(),
+            "active operations must freeze lifecycle without retaining a budget reader"
+        );
+        let adopting = Arc::new(LedgerGovernor::new(LeaseLedger::new(0, 4, 0)));
+        let writer_governor = adopting.clone();
+        let writer_cache = cache.clone();
+        let writer = std::thread::spawn(move || {
+            writer_cache.adopt_governed_budget(writer_governor.as_ref(), HolderId::new(10))
+        });
+        let deadline = Instant::now() + timeout;
+        while adopting.used(Tier::Host) != 4 {
+            assert!(
+                Instant::now() < deadline,
+                "adopter never prepared its provisional grant"
+            );
+            std::thread::yield_now();
+        }
+        grant_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(timeout)
+            .expect("grant callback must finish while the adopter waits");
+        assert_eq!(books.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(books.used.load(Ordering::Relaxed), 0);
+        finish_tx.send(()).unwrap();
+        reader.join().unwrap();
+        assert_eq!(writer.join().unwrap().unwrap(), 4);
     }
 
     #[test]
@@ -3848,6 +4535,7 @@ mod tests {
                 }),
                 banks: RwLock::new(BTreeMap::new()),
                 adoption: Mutex::new(()),
+                operations: RwLock::new(()),
             }),
         };
         for _ in 0..2 {
@@ -3991,6 +4679,7 @@ mod tests {
             fc2: Vec::new(),
             fc3: None,
             _residency: None,
+            _grant: None,
         };
 
         for expert in 0..2 {
@@ -4033,6 +4722,7 @@ mod tests {
             fc2: Vec::new(),
             fc3: None,
             _residency: None,
+            _grant: None,
         };
 
         drop(cache.lease(cache_key(0), 4, 0, || Ok(weights())).unwrap());
@@ -4239,6 +4929,7 @@ mod tests {
                     fc2: Vec::new(),
                     fc3: None,
                     _residency: None,
+                    _grant: None,
                 })
             };
             let mut foreign = cache_key(0);
@@ -4283,6 +4974,7 @@ mod tests {
             fc2: Vec::new(),
             fc3: None,
             _residency: None,
+            _grant: None,
         };
         let mut cache = HostExpertCache::default();
 
