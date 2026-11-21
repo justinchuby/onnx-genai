@@ -63,11 +63,6 @@ pub use weight_offload::placement::{
     Placement, PlacementError, PlacementPlan, QuantTileFormat, RegionPlacement, SnappedTileSize,
     TileSizeError, plan_placement, snap_transfer_tile_bytes,
 };
-pub use weight_offload::weight_handle::{
-    ExecutionProviderCapabilities, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary,
-    NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight, Phase3aHostOnlyBinder, ResidentWeight,
-    ResidentWeightMaterializer, WeightHandle, WeightHandleError,
-};
 pub use weight_offload::{
     LinuxProcessMemoryStats, WEIGHT_OFFLOAD_ENV, WEIGHT_OFFLOAD_HOST_BYTES_ENV,
     WeightOffloadLayerStats, WeightOffloadStats, weight_offload_stats,

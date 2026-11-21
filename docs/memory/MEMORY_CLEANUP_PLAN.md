@@ -191,3 +191,41 @@ second provider. Preserve the chain index/name/source assertions without relying
 on accelerator availability. Complete ORT/server tests now pass: 612 passed,
 zero failed, two existing ignored tests across 17 suites; strict ORT all-target
 Clippy also passes. No runtime algorithm changed in this follow-up.
+
+
+## Follow-up: shared weight contracts and external design comparison
+
+The CPU EP's `weight_offload::weight_handle` module was only a compatibility
+re-export of `onnx-runtime-ep-api`, with a second re-export at the CPU crate root.
+Both surfaces are removed. Shared weight negotiation, leases, binding and provider
+capabilities are owned by `onnx-runtime-ep-api`; consumers import them there.
+The existing executor and CUDA consumers already use that authority. No allocator,
+budget, placement, kernel or release behavior changes in this removal.
+
+Upstream comparison, inspected at fixed revisions:
+
+- [Linger `fb6812d`](https://github.com/simplexai-labs/linger/tree/fb6812dcfdf079c76c3cf9a2a500e0697bab3c45)
+  is the application layer; its README identifies PolyStrata as the inference
+  engine. Application descriptions and reported performance are not runtime
+  validation for nxrt.
+- [PolyStrata cache `3e16421`](https://github.com/simplexai-labs/PolyStrata/blob/3e1642161198c50ff1abed4046f4e4f476099dbb/src/core/expert_cache.cpp)
+  has an optional CUDA VMM path (`cuMemAddressReserve`, `cuMemCreate`,
+  `cuMemMap`, `cuMemSetAccess`) and a `cudaMalloc` fallback. Its design therefore
+  does not justify removing our VMM. Mapping policy and allocation mechanism
+  remain separate decisions.
+- [PolyStrata CPU expert interface](https://github.com/simplexai-labs/PolyStrata/blob/3e1642161198c50ff1abed4046f4e4f476099dbb/src/poly/cpu_experts.hpp)
+  uses ggml CPU quantized dot products, groups tokens sharing an expert, and
+  exposes overlap/readiness callbacks. These are distinct capabilities; a host
+  implementation does not establish GPU overlap correctness.
+
+| Capability | Current nxrt position | Next integration boundary |
+|---|---|---|
+| Reuse an expert across a token batch | CPU `BlockQuantizedMoE` already groups routed tokens and resolves each projection once per expert group | Preserve grouping and numerical tests; do not add a parallel batching authority |
+| Compute cold experts from compressed weights | CPU native-block kernels currently decode routed projections to f32 and execute dense math | Evaluate a bounded compressed-weight compute path against the dense oracle on CPU; qualify formats from projection metadata and measure memory/time before dispatch changes |
+| Use CPU and GPU experts within one layer | Static engine placement is advisory; native sessions still own one EP | Requires an executable partition and synchronization contract, plus real-device numerical and failure tests |
+| Overlap expert loading and compute | CPU QMoE has a guarded route-first prefetch path; CUDA has separate stream/fence and residency authorities | Reuse their ownership and budget guards; do not copy callbacks into a second unaccounted scheduler |
+| Choose a memory tier | Governor owns capacity; placement chooses residency within its grant | Keep byte budgets and explainable eligibility canonical; use measured cost-model rates rather than model or GPU identity guesses |
+
+This comparison adds no upstream code dependency and makes no throughput claim.
+The real-CUDA validation requirements above still apply to changes in mapping,
+GPU/CPU execution splits, capture lifetime and asynchronous release ordering.
