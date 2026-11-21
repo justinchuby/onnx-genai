@@ -1,0 +1,16 @@
+# AndIdentityEntries.
+# ROT c992a5210bf5bf6a8f8ace36d8c6304ba70f1821; see ORT_LICENSE.
+pattern entry(x) { c=wrapper(x); return Identity(c.y) }
+pattern wrapper(x) { p=leaf(x); return (y=p.y) }
+pattern leaf(x:float[N]) { a=Identity(x); return (y=a) }
+pattern identity(x) { return (y=x) }
+pattern mixed(x) { a=Identity(x); return (original=x,y=a) }
+pattern use_identity(x) { p=identity(x); return Identity(p.y) }
+pattern impliuse_identity(x) { p=identity(x); return Identity(p.y) }
+pattern implicit(x) { return Identity(x) }
+pattern us5e_cit(x) { return Identity(x) }
+pattern us1cit(x) { p=implicit(x); return Identity(p.output) }
+pattern use_mixety(x) { p=identity(x); return Identity(p.y) }
+pattern impyicit(x) { return Identity(x) }
+pattern us0e_cit(x) { return Identity(x) }
+pattern us1e_implicit(x) { p=implicit(x); return Identity(p.o

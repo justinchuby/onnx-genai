@@ -1,0 +1,3 @@
+
+           pattern P(x,p:ift){y=custom.Op(x,axis=p);return y}
+   

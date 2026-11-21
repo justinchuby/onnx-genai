@@ -1518,6 +1518,70 @@ fn assert_close(got: &[f32], want: &[f32]) {
 
 // --- tests ------------------------------------------------------------------
 
+#[test]
+fn legacy_initializer_inputs_execute_as_constants_not_runtime_feeds() {
+    for version in [3, 4] {
+        let mut graph = Graph::new();
+        graph.ir_version = Some(version);
+        let weight = f32_init(&mut graph, "weight", &[2], &[3.0, 4.0]);
+        graph.add_input(weight);
+        let out = op(
+            &mut graph,
+            "Identity",
+            &[weight],
+            DataType::Float32,
+            &[2],
+            &[],
+        );
+        graph.add_output(out);
+        let result = InferenceSession::from_graph(graph);
+        if version < 4 {
+            let mut session = result.unwrap();
+            let outputs = session.run(&[]).unwrap();
+            assert_eq!(outputs[0].to_vec_f32(), vec![3.0, 4.0]);
+        } else {
+            let error = result
+                .err()
+                .expect("overridable defaults remain unsupported")
+                .to_string();
+            assert!(error.contains("overridable defaults"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn optional_output_holes_execute_without_compacting_kernel_slots() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = input(&mut graph, "x", DataType::Float32, &[2, 2]);
+    let scale = f32_init(&mut graph, "scale", &[2], &[1.0, 1.0]);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([2, 2]));
+    let inv_std = graph.create_named_value("inv_std", DataType::Float32, static_shape([2, 1]));
+    let node = graph.insert_node(Node::new_with_output_slots(
+        NodeId(0),
+        "LayerNormalization",
+        vec![Some(x), Some(scale)],
+        vec![Some(y), None, Some(inv_std)],
+    ));
+    graph
+        .node_mut(node)
+        .attributes
+        .insert("axis".into(), Attribute::Int(-1));
+    graph.add_output(y);
+    graph.add_output(inv_std);
+    let source = graph.clone();
+    let mut session = InferenceSession::from_graph(graph).unwrap();
+    let x = Tensor::from_f32(&[2, 2], &[1.0, 3.0, 4.0, 6.0]).unwrap();
+    let outputs = session.run(&[("x", &x)]).unwrap();
+    let inv = 1.0f32 / (1.0f32 + 1e-5).sqrt();
+    assert_close(&outputs[0].to_vec_f32(), &[-inv, inv, -inv, inv]);
+    assert_close(&outputs[1].to_vec_f32(), &[inv, inv]);
+    assert_eq!(
+        source.node(node).outputs,
+        vec![Some(y), None, Some(inv_std)]
+    );
+}
+
 /// MatMul → Add → LayerNormalization → Relu, a realistic multi-node chain.
 #[test]
 fn matmul_add_layernorm_relu_chain_matches_reference() {
@@ -2193,7 +2257,6 @@ fn runtime_dispatch_specialization_model() -> Vec<u8> {
         DataType::Float32,
         vec![Dim::Symbolic(rows), Dim::Symbolic(columns)],
     );
-    graph.mark_value_shape_unknown(reshaped);
     graph.insert_node(Node::new(
         NodeId(0),
         "Reshape",
@@ -2206,7 +2269,6 @@ fn runtime_dispatch_specialization_model() -> Vec<u8> {
         DataType::Float32,
         vec![Dim::Symbolic(rows), Dim::Symbolic(columns)],
     );
-    graph.mark_value_shape_unknown(y);
     graph.insert_node(Node::new(
         NodeId(1),
         "Add",

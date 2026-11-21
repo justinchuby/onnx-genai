@@ -37,11 +37,8 @@ pub struct OutboundGraphReader {
     /// Membership here therefore also requires
     /// `ValueInfo_IsConstantInitializer`.
     constant_initializer_names: HashSet<String>,
-    /// Out-of-band set of ValueIds that represent absent optional output slots.
-    /// This replaces the previous in-band string sentinel (`__absent_output_*`)
-    /// which was forgeable from model content. ValueIds are graph-internal
-    /// identifiers not derivable from untrusted model data.
-    absent_outputs: HashSet<ValueId>,
+    /// ORT-declared types for absent slots, which have no SSA value in the IR.
+    absent_output_dtypes: HashMap<(NodeId, usize), DataType>,
 }
 
 // OutboundGraphReader intentionally does NOT implement Send or Sync.
@@ -172,7 +169,7 @@ impl OutboundGraphReader {
         let constant_initializer_names =
             unsafe { Self::read_constant_initializer_names(api, graph_ptr).unwrap_or_default() };
 
-        let mut absent_outputs: HashSet<ValueId> = HashSet::new();
+        let mut absent_output_dtypes = HashMap::new();
 
         // Second pass: create nodes with proper edges and attributes.
         for (i, ort_node) in ort_nodes.iter().enumerate() {
@@ -196,39 +193,20 @@ impl OutboundGraphReader {
                 })
                 .collect();
 
-            // Preserve positional output slots: ONNX addresses outputs by
-            // position, so omitted optional outputs (empty name) must remain
-            // as placeholder ValueIds rather than being compacted away, which
-            // would shift downstream positions. Absent slots now carry the
-            // ORT-declared dtype (not Undefined) so downstream scratch buffers
-            // can be sized correctly for f16/bf16 ops.
-            let outputs: Vec<ValueId> = node_output_names[i]
+            let outputs: Vec<Option<ValueId>> = node_output_names[i]
                 .iter()
-                .enumerate()
-                .map(|(slot, (n, slot_dtype))| {
+                .map(|(n, _)| {
                     if n.is_empty() {
-                        // Absent output slot — create a placeholder value so the
-                        // position is preserved. The ValueId is recorded in
-                        // `absent_outputs` (out-of-band) rather than using a
-                        // magic name prefix that could be forged from model content.
-                        // Carry the actual ORT-declared dtype so scratch buffers
-                        // match the kernel's element size.
-                        let vid = ir_graph.create_named_value(
-                            format!("_absent_{i}_{slot}"),
-                            *slot_dtype,
-                            vec![],
-                        );
-                        absent_outputs.insert(vid);
-                        vid
+                        None
                     } else {
-                        *value_map.get(n).unwrap_or_else(|| {
+                        Some(*value_map.get(n).unwrap_or_else(|| {
                             panic!("BUG: output name {n:?} not found in value_map")
-                        })
+                        }))
                     }
                 })
                 .collect();
 
-            let mut node = Node::new(NodeId(0), &op_type, inputs, outputs);
+            let mut node = Node::new_with_output_slots(NodeId(0), &op_type, inputs, outputs);
             node.name = name;
             node.domain = domain.clone();
             if since_version > 0 {
@@ -254,6 +232,11 @@ impl OutboundGraphReader {
             }
 
             let nid = ir_graph.insert_node(node);
+            for (slot, (name, dtype)) in node_output_names[i].iter().enumerate() {
+                if name.is_empty() {
+                    absent_output_dtypes.insert((nid, slot), *dtype);
+                }
+            }
             ort_index_to_node_id.push(nid);
         }
 
@@ -279,7 +262,7 @@ impl OutboundGraphReader {
             ort_node_ptrs: ort_nodes,
             initializer_int64,
             constant_initializer_names,
-            absent_outputs,
+            absent_output_dtypes,
         })
     }
 
@@ -288,11 +271,9 @@ impl OutboundGraphReader {
         &self.graph
     }
 
-    /// Out-of-band set of ValueIds representing absent optional output slots.
-    /// These are not derivable from model content — they are assigned by the
-    /// reader at graph construction time.
-    pub fn absent_outputs(&self) -> &HashSet<ValueId> {
-        &self.absent_outputs
+    /// An absent slot can still have an authoritative ORT element type.
+    pub fn absent_output_dtype(&self, node: NodeId, slot: usize) -> Option<DataType> {
+        self.absent_output_dtypes.get(&(node, slot)).copied()
     }
 
     /// Names of the graph's **constant** initializers, i.e. the values ORT

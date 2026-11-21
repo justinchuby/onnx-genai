@@ -1113,7 +1113,7 @@ mod state;
 use state::*;
 pub(crate) use state::{ChildExecutor, ChildExecutorStats, Executor};
 mod kernel_cache;
-use build::*;
+pub(crate) use build::*;
 use capture::*;
 pub use capture::{
     CaptureDecline, CaptureDeclineReport, CapturePathKind, ControlFlowStats,

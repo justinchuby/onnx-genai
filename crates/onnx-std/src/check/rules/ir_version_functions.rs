@@ -444,6 +444,17 @@ fn check_dtype_ir_feature(
 /// rules plus signature, default-attribute, and unique-ID rules.
 pub struct FunctionProtoValidityRule;
 
+impl FunctionProtoValidityRule {
+    /// Validate raw function declarations before constructing a checked shared
+    /// IR. This also reports malformed declarations rejected by the loader.
+    pub fn check_proto(&self, proto: &ModelProto, ctx: &ValidationContext) -> Vec<Violation> {
+        if proto.ir_version < 8 {
+            return Vec::new();
+        }
+        check_model_functions(proto, ctx, self.id())
+    }
+}
+
 impl ValidationRule for FunctionProtoValidityRule {
     fn id(&self) -> &str {
         "proto.function_valid"
@@ -457,10 +468,7 @@ impl ValidationRule for FunctionProtoValidityRule {
         let Some(proto) = model.retained_proto() else {
             return Vec::new();
         };
-        if proto.ir_version < 8 {
-            return Vec::new();
-        }
-        check_model_functions(proto, ctx, self.id())
+        self.check_proto(proto, ctx)
     }
 }
 

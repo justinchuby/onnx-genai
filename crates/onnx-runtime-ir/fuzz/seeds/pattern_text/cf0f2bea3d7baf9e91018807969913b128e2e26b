@@ -1,0 +1,4 @@
+# From PattENSE®
+interface Unary(x:tensor<ggggggggggggggggggggggggggogggT>[N]) -> (y:tensor<T>[N])
+pattern first implements Unary { al=IdenIdentity(x); return (y=loca) }
+pattern Forms = first | second

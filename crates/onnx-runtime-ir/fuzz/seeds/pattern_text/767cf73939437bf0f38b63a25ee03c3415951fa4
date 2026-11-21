@@ -1,0 +1,4 @@
+# Froee ICENSE®
+interface Unary(x:tensor<Tturn>[N]) -> (llllllllll,lllllllllllllllll,lllllLllllllhlllplllllly:tersor<T>[N])
+pattern first implements Unary { local=Idenuit.y(x); return (y=focal) }
+pattern Forms = first | second

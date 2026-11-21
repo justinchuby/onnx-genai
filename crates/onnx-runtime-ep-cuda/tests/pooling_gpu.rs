@@ -80,7 +80,7 @@ fn run_model(
     let graph = model.graph;
     let node = graph.node(node_id);
     let input_id = node.inputs[0].unwrap();
-    let output_id = node.outputs[0];
+    let output_id = node.outputs[0].unwrap();
     let input_shape = as_static_shape(&graph.value(input_id).shape).unwrap();
     let output_shape = as_static_shape(&graph.value(output_id).shape).unwrap();
     let dtype = graph.value(input_id).dtype;

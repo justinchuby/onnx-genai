@@ -494,7 +494,7 @@ fn output_names(g: &Graph, id: NodeId) -> Vec<String> {
     g.node(id)
         .outputs
         .iter()
-        .map(|v| g.value(*v).name.clone().unwrap_or_default())
+        .map(|slot| slot.map_or_else(String::new, |v| g.value(v).name.clone().unwrap_or_default()))
         .collect()
 }
 

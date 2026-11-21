@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use crate::arena::ArenaKey;
 use crate::device::DeviceId;
 use crate::graph::Graph;
+use crate::onnx::attribute_proto::AttributeType;
 use crate::shape::Shape;
 use crate::tensor::{SparseTensorData, TensorData, TypeProto};
 use crate::value::ValueId;
@@ -20,7 +21,7 @@ use crate::value::ValueId;
 pub const RUNTIME_DOMAIN: &str = "pkg.nxrt";
 
 /// Unique identifier for a [`Node`] within a [`Graph`](crate::Graph).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct NodeId(pub u32);
 
 impl ArenaKey for NodeId {
@@ -35,8 +36,8 @@ impl ArenaKey for NodeId {
 /// An operation in the graph.
 ///
 /// Inputs are `Option<ValueId>` because ONNX ops may have optional (skipped)
-/// inputs represented by empty names; a `None` slot preserves positional
-/// arity. Outputs are always present (SSA values).
+/// inputs and outputs represented by empty names; a `None` slot preserves
+/// positional arity without fabricating an SSA value.
 #[derive(Clone, Debug)]
 pub struct Node {
     pub id: NodeId,
@@ -45,6 +46,9 @@ pub struct Node {
     pub op_type: String,
     /// Operator domain (`""` == the default ONNX domain).
     pub domain: String,
+    /// Model-local function overload identifier (`""` for ordinary operators
+    /// and the default overload).
+    pub overload: String,
     /// Opset version of the operator called.
     ///
     /// If `None`, the version is unspecified and follows the owning graph's
@@ -55,7 +59,7 @@ pub struct Node {
     /// the graph's older exported opset, avoiding a false graph-wide upgrade.
     pub version: Option<i64>,
     pub inputs: Vec<Option<ValueId>>,
-    pub outputs: Vec<ValueId>,
+    pub outputs: Vec<Option<ValueId>>,
     pub attributes: HashMap<String, Attribute>,
     pub doc_string: Option<String>,
     /// Device placement, filled in by the placement pass.
@@ -72,11 +76,22 @@ impl Node {
         inputs: Vec<Option<ValueId>>,
         outputs: Vec<ValueId>,
     ) -> Self {
+        Self::new_with_output_slots(id, op_type, inputs, outputs.into_iter().map(Some).collect())
+    }
+
+    /// A new node with explicit positional output slots.
+    pub fn new_with_output_slots(
+        id: NodeId,
+        op_type: impl Into<String>,
+        inputs: Vec<Option<ValueId>>,
+        outputs: Vec<Option<ValueId>>,
+    ) -> Self {
         Self {
             id,
             name: String::new(),
             op_type: op_type.into(),
             domain: String::new(),
+            overload: String::new(),
             version: None,
             inputs,
             outputs,
@@ -90,6 +105,11 @@ impl Node {
     /// Iterate over the present (non-skipped) input value ids.
     pub fn input_values(&self) -> impl Iterator<Item = ValueId> + '_ {
         self.inputs.iter().filter_map(|slot| *slot)
+    }
+
+    /// Iterate over the present (non-skipped) output value ids.
+    pub fn output_values(&self) -> impl Iterator<Item = ValueId> + '_ {
+        self.outputs.iter().filter_map(|slot| *slot)
     }
 
     /// Look up an attribute by name.
@@ -137,6 +157,13 @@ pub(crate) const MAX_PLAUSIBLE_OPSET: i64 = 1_000;
 /// An ONNX operator attribute. Covers all attribute value kinds.
 #[derive(Clone, Debug)]
 pub enum Attribute {
+    /// A function-body attribute whose value is bound from a formal function
+    /// attribute at a call site. The referenced formal name and declared ONNX
+    /// kind are retained until explicit function lowering.
+    Ref {
+        name: String,
+        kind: AttributeType,
+    },
     Int(i64),
     Float(f32),
     /// An ONNX `STRING` attribute. Stored as **raw bytes**, not `String`, so
@@ -163,6 +190,27 @@ pub enum Attribute {
 }
 
 impl Attribute {
+    /// The declared ONNX attribute kind, including unresolved formal references.
+    pub fn kind(&self) -> AttributeType {
+        match self {
+            Self::Ref { kind, .. } => *kind,
+            Self::Int(_) => AttributeType::Int,
+            Self::Float(_) => AttributeType::Float,
+            Self::String(_) => AttributeType::String,
+            Self::Ints(_) => AttributeType::Ints,
+            Self::Floats(_) => AttributeType::Floats,
+            Self::Strings(_) => AttributeType::Strings,
+            Self::Tensor(_) => AttributeType::Tensor,
+            Self::Tensors(_) => AttributeType::Tensors,
+            Self::SparseTensor(_) => AttributeType::SparseTensor,
+            Self::SparseTensors(_) => AttributeType::SparseTensors,
+            Self::Graph(_) => AttributeType::Graph,
+            Self::Graphs(_) => AttributeType::Graphs,
+            Self::TypeProto(_) => AttributeType::TypeProto,
+            Self::TypeProtos(_) => AttributeType::TypeProtos,
+        }
+    }
+
     /// The `i64` value, if this is an [`Attribute::Int`].
     pub fn as_int(&self) -> Option<i64> {
         match self {

@@ -509,7 +509,7 @@ fn verify_fixture(name: &str, model: &onnx_std::Model) {
     let output_names: Vec<_> = node
         .outputs
         .iter()
-        .map(|&output| model.graph.value(output).name.as_deref())
+        .map(|output| output.and_then(|output| model.graph.value(output).name.as_deref()))
         .collect();
     let graph_outputs: Vec<_> = model
         .graph

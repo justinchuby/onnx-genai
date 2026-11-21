@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use crate::TypeProto;
 use crate::arena::ArenaKey;
 use crate::device::DeviceId;
 use crate::dtype::DataType;
@@ -11,7 +12,7 @@ use crate::node::NodeId;
 use crate::shape::Shape;
 
 /// Unique identifier for a [`Value`] within a [`Graph`](crate::Graph).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ValueId(pub u32);
 
 impl ArenaKey for ValueId {
@@ -91,8 +92,15 @@ pub struct Value {
     /// Optional name (graph inputs/outputs and initializers are named; interior
     /// SSA values may be anonymous).
     pub name: Option<String>,
+    /// Full declared ONNX type, before tensor inference. This retains recursive
+    /// containers, opaque types, denotations and absent rank/dimension fields.
+    /// `dtype`/`shape` below are tensor inference facts, not substitutes for this
+    /// descriptor. Non-tensor and untyped values use `DataType::Undefined`.
+    pub declared_type: Option<TypeProto>,
     pub dtype: DataType,
     pub shape: Shape,
+    pub(crate) tensor_type_known: bool,
+    pub(crate) tensor_shape_known: bool,
     pub layout: TensorLayout,
     /// Device placement, filled in by the placement pass.
     pub device: Option<DeviceId>,
@@ -113,8 +121,11 @@ impl Value {
         Self {
             id,
             name: None,
+            declared_type: None,
             dtype,
             shape,
+            tensor_type_known: dtype != DataType::Undefined,
+            tensor_shape_known: true,
             layout: TensorLayout::contiguous(),
             device: None,
             producer: None,
@@ -129,8 +140,38 @@ impl Value {
         self.producer.is_none()
     }
 
-    /// The static rank (number of dimensions).
-    pub fn rank(&self) -> usize {
-        self.shape.len()
+    /// Publish resolved tensor metadata together with its known-state flags.
+    /// An empty shape here is a known scalar. This does not replace the source
+    /// `declared_type`, and container declarations remain non-tensor values.
+    pub fn set_tensor_facts(&mut self, dtype: DataType, shape: Shape) {
+        self.dtype = dtype;
+        self.shape = shape;
+        self.tensor_type_known = dtype != DataType::Undefined;
+        self.tensor_shape_known = true;
+    }
+
+    /// Known tensor element type; never projects a container into a tensor.
+    pub fn tensor_dtype(&self) -> Option<DataType> {
+        (self.tensor_type_known && self.dtype != DataType::Undefined && self.permits_tensor_facts())
+            .then_some(self.dtype)
+    }
+
+    /// Known-rank tensor shape. `None` differs from the scalar shape `Some([])`.
+    pub fn tensor_shape(&self) -> Option<&Shape> {
+        (self.tensor_shape_known && self.permits_tensor_facts()).then_some(&self.shape)
+    }
+
+    /// The tensor rank, or `None` for unknown-rank and non-tensor values.
+    pub fn rank(&self) -> Option<usize> {
+        self.tensor_shape().map(Vec::len)
+    }
+
+    fn permits_tensor_facts(&self) -> bool {
+        self.declared_type.as_ref().is_none_or(|tp| {
+            matches!(
+                tp.value,
+                None | Some(crate::onnx::type_proto::Value::TensorType(_))
+            )
+        })
     }
 }

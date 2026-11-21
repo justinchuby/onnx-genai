@@ -229,14 +229,22 @@ impl VersionConverter {
                 match attribute {
                     Attribute::Graph(subgraph) => {
                         self.convert_graph(subgraph, source_opset, target_opset, report)?;
-                        vec![(attribute_name.clone(), (**subgraph).clone())]
+                        vec![(
+                            onnx_runtime_ir::GraphAttribute::single(attribute_name.clone()),
+                            (**subgraph).clone(),
+                        )]
                     }
                     Attribute::Graphs(subgraphs) => {
                         let mut converted = Vec::with_capacity(subgraphs.len());
                         for (index, subgraph) in subgraphs.iter_mut().enumerate() {
                             self.convert_graph(subgraph, source_opset, target_opset, report)?;
-                            converted
-                                .push((format!("{attribute_name}[{index}]"), subgraph.clone()));
+                            converted.push((
+                                onnx_runtime_ir::GraphAttribute::element(
+                                    attribute_name.clone(),
+                                    index,
+                                ),
+                                subgraph.clone(),
+                            ));
                         }
                         converted
                     }
@@ -445,7 +453,7 @@ impl OpAdapter for Softmax12To13Adapter {
                 reason: format!("{} requires one present input", self.op_type),
             });
         };
-        let Some(&output) = node.outputs.first() else {
+        let Some(output) = node.outputs.first().copied().flatten() else {
             return Ok(AdaptResult::Incompatible {
                 reason: format!("{} requires one output", self.op_type),
             });
@@ -458,7 +466,11 @@ impl OpAdapter for Softmax12To13Adapter {
                 ),
             });
         }
-        let rank = graph.value(input).rank();
+        let Some(rank) = graph.value(input).rank() else {
+            return Ok(AdaptResult::Incompatible {
+                reason: format!("{} requires a tensor input with known rank", self.op_type),
+            });
+        };
         let Ok(rank_i64) = i64::try_from(rank) else {
             return Ok(AdaptResult::Incompatible {
                 reason: format!(
@@ -525,7 +537,7 @@ impl OpAdapter for Softmax12To13Adapter {
         let mut softmax = node.clone();
         softmax.id = NodeId(0);
         softmax.inputs = vec![Some(flattened)];
-        softmax.outputs = vec![intermediate];
+        softmax.outputs = vec![Some(intermediate)];
         softmax.attributes.insert("axis".into(), Attribute::Int(-1));
 
         let mut reshape = Node::new(
@@ -676,7 +688,7 @@ mod tests {
         let if_node_id = graph.insert_node(if_node);
         graph
             .subgraphs
-            .insert((if_node_id, "then_branch".to_string()), branch);
+            .insert((if_node_id, "then_branch".into()), branch);
 
         Model::new(graph)
     }
@@ -745,7 +757,7 @@ since_version: 5
             branch.nodes.values().next().unwrap().attributes["allowzero"].as_int(),
             Some(0)
         );
-        let indexed = &model.graph.subgraphs[&(if_node.id, "then_branch".to_string())];
+        let indexed = &model.graph.subgraphs[&(if_node.id, "then_branch".into())];
         assert_eq!(
             indexed.nodes.values().next().unwrap().attributes["allowzero"].as_int(),
             Some(0)
@@ -899,8 +911,8 @@ since_version: 5
             Some(shape.id)
         );
         assert_eq!(model.graph.value(output).producer, Some(reshape.id));
-        let flattened_output = flatten.outputs[0];
-        let converted_output = converted.outputs[0];
+        let flattened_output = flatten.outputs[0].expect("Flatten output must be present");
+        let converted_output = converted.outputs[0].expect("converted output must be present");
 
         crate::infer_shapes(&mut model).unwrap();
         assert_eq!(

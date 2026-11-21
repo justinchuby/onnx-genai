@@ -316,7 +316,7 @@ fn partition_boundary(
     }
     for nid in &ordered {
         let node = graph.node(*nid);
-        for &vid in &node.outputs {
+        for vid in node.output_values() {
             let escapes = graph_outputs.contains(&vid)
                 || graph
                     .consumers(vid)

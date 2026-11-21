@@ -128,6 +128,7 @@ impl OptimizationPass for ConstantFolding {
                     (node.outputs[0], folded)
                 };
                 let Some(tensor) = folded else { continue };
+                let Some(out) = out else { continue };
 
                 // Only fold outputs that are still needed (have a consumer or
                 // are graph outputs); dead outputs are DCE's job and folding
@@ -246,6 +247,9 @@ fn unresolved_inputs(graph: &Graph, node: &onnx_runtime_ir::Node) -> Option<Vec<
 /// The inline constant tensor backing `value`, if any (external weights, which
 /// are large, are never folded).
 fn inline_const(graph: &Graph, value: ValueId) -> Option<&TensorData> {
+    if !graph.is_constant_initializer(value) {
+        return None;
+    }
     match graph.initializers.get(&value)? {
         WeightRef::Inline(t) => Some(t),
         WeightRef::External { .. } => None,
@@ -616,7 +620,7 @@ mod tests {
                 if !matches!(node.domain.as_str(), "" | "ai.onnx") || node.outputs.len() != 1 {
                     continue;
                 }
-                let out = node.outputs[0];
+                let Some(out) = node.outputs[0] else { continue };
                 let folded = match node.op_type.as_str() {
                     "Constant" => eval_constant(&node),
                     "Shape" => fold_shape(graph, &node),
@@ -833,6 +837,29 @@ mod tests {
         let t = inline_const(&g, out).expect("out is now an initializer");
         assert_eq!(read_i64(t).unwrap(), vec![11, 22, 33]);
         assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn initializer_input_default_is_not_folded_as_an_immutable_operand() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 24);
+        let a = const_init(&mut graph, "a", vec![1], &[1]);
+        let b = const_init(&mut graph, "b", vec![1], &[2]);
+        graph.add_input(a);
+        let out = graph.create_named_value("out", DataType::Int64, static_shape([1]));
+        let root = graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(b)],
+            vec![out],
+        ));
+        graph.add_output(out);
+        ConstantFolding
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(graph.try_node(root).is_some());
+        assert!(!graph.initializers.contains_key(&out));
+        assert!(graph.inputs.contains(&a));
     }
 
     #[test]

@@ -105,7 +105,7 @@ fn build_hybrid() -> (Graph, ValueId, ValueId) {
     scan.attributes
         .insert("scan_output_axes".to_string(), Attribute::Ints(vec![0]));
     let scan = g.insert_node(scan);
-    g.subgraphs.insert((scan, "body".to_string()), build_body());
+    g.subgraphs.insert((scan, "body".into()), build_body());
 
     g.add_output(present_state);
     g.add_output(scan_out);

@@ -1,0 +1,1 @@
+(head,xs:values[0:0],tail)=>return Ctom(head,...xs,tail)

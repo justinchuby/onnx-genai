@@ -194,7 +194,9 @@ impl OptimizationPass for CudaSiluFusion {
             if !matches!(graph.value(x).dtype, DataType::Float16 | DataType::BFloat16) {
                 continue;
             }
-            let sigmoid_output = sigmoid.outputs[0];
+            let Some(sigmoid_output) = sigmoid.outputs[0] else {
+                continue;
+            };
             if graph.outputs.contains(&sigmoid_output) {
                 continue;
             }
@@ -306,7 +308,9 @@ impl OptimizationPass for CudaRsqrtFusion {
             ) {
                 continue;
             }
-            let sqrt_output = sqrt.outputs[0];
+            let Some(sqrt_output) = sqrt.outputs[0] else {
+                continue;
+            };
             if graph.outputs.contains(&sqrt_output) {
                 continue;
             }
@@ -427,7 +431,7 @@ impl CudaL2NormalizeFusion {
         // No axes given: derive from the static shapes (the one dim reduced to 1).
         let x = rss.inputs.first().copied().flatten()?;
         let in_shape = &graph.value(x).shape;
-        let out_shape = &graph.value(rss.outputs[0]).shape;
+        let out_shape = &graph.value(rss.outputs[0]?).shape;
         if in_shape.len() != out_shape.len() {
             return None;
         }
@@ -1059,7 +1063,12 @@ impl CudaDropNormalizationCasts {
         // 4. Delete the input `Cast` nodes that are now orphaned.
         for cast_id in plan.dead_input_casts {
             if let Some(cast) = graph.try_node(cast_id) {
-                let cast_output = *cast.outputs.first().expect("Cast has one output");
+                let cast_output = cast
+                    .outputs
+                    .first()
+                    .copied()
+                    .flatten()
+                    .expect("Cast has one present output");
                 if graph.consumers(cast_output).is_empty()
                     && !graph.value(cast_output).is_graph_output
                 {
@@ -1152,7 +1161,7 @@ impl CudaDropNormalizationCasts {
         // where `narrow` matches the activation dtype.
         let mut retyped_outputs = Vec::new();
         let mut output_cast_bypass = Vec::new();
-        for &output in &node.outputs {
+        for output in node.output_values() {
             if graph.value(output).is_graph_output {
                 return None;
             }
@@ -1168,7 +1177,7 @@ impl CudaDropNormalizationCasts {
                 if cast_target(cast)? != narrow_dtype {
                     return None;
                 }
-                let cast_output = *cast.outputs.first()?;
+                let cast_output = cast.outputs.first().copied().flatten()?;
                 output_cast_bypass.push((cast_output, output, *consumer));
             }
             retyped_outputs.push(output);
@@ -1176,7 +1185,7 @@ impl CudaDropNormalizationCasts {
 
         // The primary (normalized) output must actually be one we retyped; the
         // kernel requires the output dtype to match the narrow input dtype.
-        let primary = *node.outputs.first()?;
+        let primary = node.outputs.first().copied().flatten()?;
         if !retyped_outputs.contains(&primary) {
             return None;
         }
@@ -1328,7 +1337,7 @@ impl CudaSkipRmsNormFusion {
         if norm.inputs.get(2).copied().flatten().is_some() {
             return None; // no bias slot support in the byte-exact fused path
         }
-        let normalized_out = *norm.outputs.first()?;
+        let normalized_out = norm.outputs.first().copied().flatten()?;
         if graph.value(normalized_out).is_graph_output {
             return None;
         }
@@ -1355,7 +1364,7 @@ impl CudaSkipRmsNormFusion {
         }
         let a = add.inputs[0]?;
         let b = add.inputs[1]?;
-        let residual_sum = *add.outputs.first()?;
+        let residual_sum = add.outputs.first().copied().flatten()?;
         if residual_sum != norm_input || graph.value(residual_sum).is_graph_output {
             return None;
         }
@@ -1500,7 +1509,7 @@ impl CudaFoldConstantTranspose {
     ) -> Option<TransposeFoldPlan> {
         let node = graph.try_node(node_id)?;
         let input = node.inputs[0]?;
-        let output = node.outputs[0];
+        let output = node.outputs[0]?;
 
         // The input must be an immutable, producer-less constant initializer.
         if graph.try_value(input)?.producer.is_some() {
@@ -1709,7 +1718,7 @@ impl CudaFoldConstantCast {
     fn plan_fold(&self, graph: &Graph, ctx: &PassContext, node_id: NodeId) -> Option<CastFoldPlan> {
         let node = graph.try_node(node_id)?;
         let input = node.inputs[0]?;
-        let output = node.outputs[0];
+        let output = node.outputs[0]?;
 
         // The input must be an immutable, producer-less constant initializer.
         if graph.try_value(input)?.producer.is_some() {
@@ -1866,7 +1875,9 @@ impl OptimizationPass for CudaDropIdentityCast {
             let Some(input) = node.inputs[0] else {
                 continue;
             };
-            let output = node.outputs[0];
+            let Some(output) = node.outputs[0] else {
+                continue;
+            };
             if input == output {
                 continue;
             }
@@ -1988,7 +1999,7 @@ impl CudaMatMulNBitsBiasFusion {
         let add = graph.try_node(add_id)?;
         let lhs = add.inputs[0]?;
         let rhs = add.inputs[1]?;
-        let add_out = add.outputs[0];
+        let add_out = add.outputs[0]?;
 
         // Exactly one Add operand must be a foldable MatMulNBits output; the
         // other is the bias.
@@ -2486,13 +2497,14 @@ impl CudaSkipRmsNormMatMulFusion {
 
         // Outputs: [normalized, mean, inv_std, residual_sum]. mean/inv_std must
         // be unused (the fused path does not compute stats).
-        let normalized_out = *skip.outputs.first()?;
+        let normalized_out = skip.outputs.first().copied().flatten()?;
         for stat in skip.outputs.iter().skip(1).take(2) {
-            if !graph.consumers(*stat).is_empty() || graph.value(*stat).is_graph_output {
+            let Some(stat) = *stat else { continue };
+            if !graph.consumers(stat).is_empty() || graph.value(stat).is_graph_output {
                 return None;
             }
         }
-        let sum_out = skip.outputs.get(3).copied();
+        let sum_out = skip.outputs.get(3).copied().flatten();
         if graph.value(normalized_out).is_graph_output {
             return None;
         }
@@ -2829,7 +2841,9 @@ impl OptimizationPass for CudaSwiGluFusion {
             let Some(gate) = silu.inputs[0] else {
                 continue;
             };
-            let silu_output = silu.outputs[0];
+            let Some(silu_output) = silu.outputs[0] else {
+                continue;
+            };
             if graph.outputs.contains(&silu_output) {
                 continue;
             }
@@ -3118,7 +3132,7 @@ impl CudaGateUpSwiGluFusion {
         // unfused two-GEMV + `swish` + `mul` path (#1528).
         let activation_dtype = graph.value(activation).dtype;
         if !matches!(activation_dtype, DataType::Float16 | DataType::BFloat16)
-            || graph.value(matmul.outputs[0]).dtype != activation_dtype
+            || graph.value(matmul.outputs[0]?).dtype != activation_dtype
             || graph.value(scales).dtype != activation_dtype
         {
             return None;
@@ -3404,7 +3418,7 @@ impl CudaQkvProjectionFusion {
 
         // The projection output must feed exactly one consumer and not escape as
         // a graph output, so reusing it as a `Split` output is safe.
-        let out = node.outputs[0];
+        let out = node.outputs[0]?;
         if graph.consumers(out).len() != 1 || graph.value(out).is_graph_output {
             return None;
         }
@@ -3659,8 +3673,8 @@ struct SelectOutput {
 
 struct SelectPlan {
     if_node: NodeId,
-    then_key: (NodeId, String),
-    else_key: (NodeId, String),
+    then_key: (NodeId, onnx_runtime_ir::GraphAttribute),
+    else_key: (NodeId, onnx_runtime_ir::GraphAttribute),
     cond: ValueId,
     name: String,
     outputs: Vec<SelectOutput>,
@@ -3746,8 +3760,8 @@ impl CudaOnDeviceConstantSelect {
     fn plan_select(&self, graph: &Graph, ctx: &PassContext, if_node: NodeId) -> Option<SelectPlan> {
         let node = graph.try_node(if_node)?;
         let cond = node.inputs.first().copied().flatten()?;
-        let then_key = (if_node, "then_branch".to_string());
-        let else_key = (if_node, "else_branch".to_string());
+        let then_key = (if_node, "then_branch".into());
+        let else_key = (if_node, "else_branch".into());
         let then_branch = graph.subgraphs.get(&then_key)?;
         let else_branch = graph.subgraphs.get(&else_key)?;
 
@@ -3795,7 +3809,7 @@ impl CudaOnDeviceConstantSelect {
             let plan = if then_dims == else_dims {
                 // Equal-shaped select: byte-exact for either predicate value.
                 SelectOutput {
-                    value: node.outputs[i],
+                    value: node.outputs[i]?,
                     dtype,
                     out_dims: then_dims,
                     x_bytes: then_bytes.to_vec(),
@@ -3823,7 +3837,7 @@ impl CudaOnDeviceConstantSelect {
                 let pad_rows = then_lead.checked_sub(else_lead)?;
                 y_bytes.resize(else_bytes.len() + pad_rows.checked_mul(row_bytes)?, 0);
                 SelectOutput {
-                    value: node.outputs[i],
+                    value: node.outputs[i]?,
                     dtype,
                     out_dims: then_dims,
                     x_bytes: then_bytes.to_vec(),
@@ -4097,8 +4111,8 @@ mod tests {
                 "skip inputs = [a, b, gamma] (gamma={gamma_dtype:?})"
             );
             // Output[0] = normalized (reused), output[3] = residual sum (reused).
-            assert_eq!(skip.outputs[0], normalized);
-            assert_eq!(skip.outputs[3], sum);
+            assert_eq!(skip.outputs[0], Some(normalized));
+            assert_eq!(skip.outputs[3], Some(sum));
             assert_eq!(skip.outputs.len(), 4);
 
             // The residual sum is now produced by the skip node and still feeds
@@ -4516,7 +4530,7 @@ mod tests {
             "LpNormalization stays default domain"
         );
         assert_eq!(lp.inputs, vec![Some(x)], "reads the pre-norm activation x");
-        assert_eq!(lp.outputs, vec![output], "keeps the Div output value");
+        assert_eq!(lp.outputs, vec![Some(output)], "keeps the Div output value");
         assert_eq!(
             lp.attr("p").and_then(Attribute::as_int),
             Some(2),
@@ -5220,7 +5234,7 @@ mod tests {
         assert!(fused.inputs[5].is_some(), "bias must be wired at index 5");
         // The fused node's single output is still the (sole) graph output and
         // inherits the folded Add output's name so output binding is stable.
-        let out = fused.outputs[0];
+        let out = fused.outputs[0].unwrap();
         assert_eq!(graph.outputs, vec![out]);
         assert_eq!(graph.value(out).name.as_deref(), Some("out"));
         assert!(graph.validate().is_ok());
@@ -5492,7 +5506,7 @@ mod tests {
         );
         // The fused node keeps the Mul's output value, so downstream binding is
         // stable.
-        let out = fused.outputs[0];
+        let out = fused.outputs[0].unwrap();
         assert_eq!(graph.outputs, vec![out]);
         assert_eq!(graph.value(out).name.as_deref(), Some("output"));
         assert!(graph.validate().is_ok());
@@ -6592,7 +6606,7 @@ mod tests {
             "activation inputs rewired to fp16 sources; gamma untouched"
         );
         // Its consumed float outputs are retyped to fp16, matching the inputs.
-        for &out in &skip.outputs {
+        for out in skip.output_values() {
             assert_eq!(graph.value(out).dtype, DataType::Float16);
         }
         // The fp32 gamma weight is preserved (kernel upcasts it internally).
@@ -6920,7 +6934,10 @@ mod tests {
             "activation input rewired to bf16 source; scale untouched"
         );
         // Its consumed float output is retyped to bf16, matching the input.
-        assert_eq!(graph.value(rms.outputs[0]).dtype, DataType::BFloat16);
+        assert_eq!(
+            graph.value(rms.outputs[0].unwrap()).dtype,
+            DataType::BFloat16
+        );
         // The fp32 scale weight is preserved (kernel upcasts activation, applies
         // fp32 scale).
         assert_eq!(graph.value(scale).dtype, DataType::Float32);
@@ -6945,7 +6962,8 @@ mod tests {
             .values()
             .find(|n| n.op_type == "SimplifiedLayerNormalization")
             .expect("converted norm retained after inference")
-            .outputs[0];
+            .outputs[0]
+            .unwrap();
         assert_eq!(
             graph.value(rms_out).dtype,
             DataType::BFloat16,
@@ -7210,8 +7228,8 @@ mod tests {
                 _ => panic!("y must be inline"),
             };
             let (then_sentinel, else_sentinel) = match node.outputs[0] {
-                output if output == cos => (THEN_COS_SENTINEL, ELSE_COS_SENTINEL),
-                output if output == sin => (THEN_SIN_SENTINEL, ELSE_SIN_SENTINEL),
+                Some(output) if output == cos => (THEN_COS_SENTINEL, ELSE_COS_SENTINEL),
+                Some(output) if output == sin => (THEN_SIN_SENTINEL, ELSE_SIN_SENTINEL),
                 output => panic!("unexpected Where output {output:?}"),
             };
             assert_eq!(
@@ -7277,7 +7295,7 @@ mod tests {
                 .iter()
                 .find_map(|(id, n)| (n.op_type == "If").then_some(id))
                 .unwrap(),
-            "then_branch".to_string(),
+            "then_branch".into(),
         );
         let branch = graph.subgraphs.get_mut(&key).unwrap();
         let victim = branch
@@ -7509,7 +7527,7 @@ mod tests {
         );
         assert_eq!(split.attr("axis").and_then(Attribute::as_int), Some(1));
         // Split re-attaches the original consumer edges.
-        assert_eq!(split.outputs, vec![q_out, k_out, v_out]);
+        assert_eq!(split.outputs, vec![Some(q_out), Some(k_out), Some(v_out)]);
 
         // Fused weight bytes are the byte concatenation of Q||K||V weights.
         let fused_weight = fused.inputs[1].unwrap();

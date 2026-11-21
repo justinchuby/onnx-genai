@@ -1,0 +1,5 @@
+
+        pattern A(x)->(y:float[N]){y=Identity(x);return y}
+        pattern B(x)->(y:float[M]){y=Identity(x);return y}
+        pattern P(x){p=A(x)|B(x);return Ident}
+    

@@ -1,0 +1,5 @@
+
+        pattern P(x,p:int|None){y=P(x,p);return y}
+   pattern Branch(x:float[N]){y=Identity(x);return y}
+        pattern Conditional(c){y=If(c,then_branch=Branch,else_branch=Bracnh);return y}
+         

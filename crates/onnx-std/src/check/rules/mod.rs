@@ -1136,11 +1136,14 @@ mod tests {
             ..Default::default()
         }];
         invalid.opset_import.clear();
-        let model = retained_model(ModelProto {
+        let proto = ModelProto {
+            ir_version: 13,
             functions: vec![invalid.clone(), invalid],
             ..Default::default()
-        });
-        let violations = FunctionProtoValidityRule.check(&model, &ValidationContext::default());
+        };
+        assert!(Model::from_proto(proto.clone()).is_err());
+        let violations =
+            FunctionProtoValidityRule.check_proto(&proto, &ValidationContext::default());
         for expected in [
             "is not unique",
             "both attribute and attribute_proto",
@@ -1179,11 +1182,14 @@ mod tests {
                 version: 1,
             });
         }
-        let model = retained_model(ModelProto {
+        let proto = ModelProto {
+            ir_version: 13,
             functions: vec![first, second],
             ..Default::default()
-        });
-        let violations = FunctionProtoValidityRule.check(&model, &ValidationContext::default());
+        };
+        assert!(Model::from_proto(proto.clone()).is_err());
+        let violations =
+            FunctionProtoValidityRule.check_proto(&proto, &ValidationContext::default());
         assert!(
             violations
                 .iter()

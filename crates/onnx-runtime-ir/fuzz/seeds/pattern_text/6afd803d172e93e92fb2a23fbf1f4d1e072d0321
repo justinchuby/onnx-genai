@@ -1,0 +1,1 @@
+(x:tensor<T>[T])=>return Idet(x)

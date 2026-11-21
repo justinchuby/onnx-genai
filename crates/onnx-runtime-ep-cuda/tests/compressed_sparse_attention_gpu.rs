@@ -577,7 +577,9 @@ fn ratio4_node_five_outputs(inputs: &[HostTensor]) -> (Graph, NodeId) {
         .outputs
         .pop()
         .expect("ratio4_node builds 6 outputs");
-    if let Some(index) = graph.outputs.iter().position(|&value| value == dropped) {
+    if let Some(dropped) = dropped
+        && let Some(index) = graph.outputs.iter().position(|&value| value == dropped)
+    {
         graph.remove_output(index);
     }
     (graph, node)
@@ -1416,7 +1418,7 @@ fn ratio4_node_topk(inputs: &[HostTensor], index_topk: usize) -> (Graph, NodeId)
         DataType::Int32,
         static_shape([1, RATIO4_INDEX_HEADS, sequence, topk]),
     );
-    graph.node_mut(node).outputs[5] = selected;
+    graph.node_mut(node).outputs[5] = Some(selected);
     let _ = records;
     (graph, node)
 }

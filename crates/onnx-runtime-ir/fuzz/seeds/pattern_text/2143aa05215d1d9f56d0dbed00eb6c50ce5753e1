@@ -1,0 +1,4 @@
+
+        pattern Branch(x:float[N]){y=Identity(x);return y}
+        pattern Conditional(c){y=If(c,yhen=Branch,elsranch=Branch);return y}
+    

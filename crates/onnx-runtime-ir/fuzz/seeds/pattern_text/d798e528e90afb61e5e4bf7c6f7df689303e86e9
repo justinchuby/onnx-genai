@@ -1,0 +1,3 @@
+
+        pattern A(x)->(flo){ return (y=local) }
+pattern Forms = f

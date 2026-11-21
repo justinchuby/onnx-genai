@@ -1,0 +1,1 @@
+(head,xs:value,tail)=>return utom(head,...xs,tl)

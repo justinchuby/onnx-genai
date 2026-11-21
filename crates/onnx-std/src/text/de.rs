@@ -203,6 +203,7 @@ struct TypedValue {
     name: String,
     dtype: DataType,
     dims: Vec<String>,
+    rank_known: bool,
 }
 
 fn parse_signature(line: Line<'_>) -> Result<(String, Vec<TypedValue>, Vec<TypedValue>)> {
@@ -244,6 +245,18 @@ fn parse_typed_values(text: &str, line: usize) -> Result<Vec<TypedValue>> {
 }
 
 fn parse_typed_value(text: &str, line: usize) -> Result<TypedValue> {
+    if !text.contains('[') {
+        let (dtype, name) = text
+            .split_once(char::is_whitespace)
+            .filter(|(_, name)| !name.trim().is_empty())
+            .ok_or_else(|| parse_error(line, "typed value requires an element type and name"))?;
+        return Ok(TypedValue {
+            name: name.trim().into(),
+            dtype: parse_dtype(dtype, line)?,
+            dims: Vec::new(),
+            rank_known: false,
+        });
+    }
     let open = text
         .find('[')
         .ok_or_else(|| parse_error(line, "typed value is missing '['"))?;
@@ -267,6 +280,7 @@ fn parse_typed_value(text: &str, line: usize) -> Result<TypedValue> {
         name: name.to_string(),
         dtype,
         dims,
+        rank_known: true,
     })
 }
 
@@ -282,7 +296,11 @@ fn create_typed_value(graph: &mut Graph, value: &TypedValue, line: usize) -> Res
             Err(_) => return Err(parse_error(line, "empty dimension")),
         }
     }
-    Ok(graph.create_named_value(&value.name, value.dtype, shape))
+    let id = graph.create_named_value(&value.name, value.dtype, shape);
+    if !value.rank_known {
+        graph.mark_value_shape_unknown(id);
+    }
+    Ok(id)
 }
 
 fn parse_node(
@@ -367,6 +385,34 @@ fn parse_invocation(
 }
 
 fn parse_attribute(text: &str, line: usize, mark_opaque_placeholders: bool) -> Result<Attribute> {
+    if let Some(reference) = text.strip_prefix('@') {
+        let (name, kind) = reference.rsplit_once(':').ok_or_else(|| {
+            parse_error(
+                line,
+                "function attribute reference requires @\"name\":ONNX_KIND",
+            )
+        })?;
+        let name: String = serde_json::from_str(name).map_err(|error| {
+            parse_error(
+                line,
+                format!("invalid function attribute reference name: {error}"),
+            )
+        })?;
+        let kind = onnx_runtime_ir::onnx::attribute_proto::AttributeType::from_str_name(kind)
+            .filter(|kind| {
+                *kind != onnx_runtime_ir::onnx::attribute_proto::AttributeType::Undefined
+            })
+            .ok_or_else(|| {
+                parse_error(line, "function attribute reference has unknown ONNX_KIND")
+            })?;
+        if name.is_empty() {
+            return Err(parse_error(
+                line,
+                "function attribute reference name must not be empty",
+            ));
+        }
+        return Ok(Attribute::Ref { name, kind });
+    }
     match text {
         "[]:ints" => return Ok(Attribute::Ints(Vec::new())),
         "[]:floats" => return Ok(Attribute::Floats(Vec::new())),
@@ -455,12 +501,7 @@ fn parse_attribute(text: &str, line: usize, mark_opaque_placeholders: bool) -> R
     {
         let count = parse_placeholder_count(count, line, "type-list")?;
         return Ok(Attribute::TypeProtos(
-            (0..count)
-                .map(|_| TypeProto::Tensor {
-                    dtype: DataType::Float32,
-                    shape: Vec::new(),
-                })
-                .collect(),
+            (0..count).map(|_| TypeProto::default()).collect(),
         ));
     }
     if let Some(count) = text
@@ -491,10 +532,7 @@ fn parse_attribute(text: &str, line: usize, mark_opaque_placeholders: bool) -> R
         return Ok(Attribute::SparseTensor(empty_sparse_tensor()));
     }
     if text == "<type>" {
-        return Ok(Attribute::TypeProto(TypeProto::Tensor {
-            dtype: DataType::Float32,
-            shape: Vec::new(),
-        }));
+        return Ok(Attribute::TypeProto(TypeProto::default()));
     }
     if looks_float(text) {
         return parse_float(text, line).map(Attribute::Float);
@@ -548,6 +586,12 @@ fn parse_initializer(
         .find('=')
         .ok_or_else(|| parse_error(line, "initializer reference is missing '='"))?;
     let typed = parse_typed_value(text[..eq].trim(), line)?;
+    if !typed.rank_known {
+        return Err(parse_error(
+            line,
+            "initializer reference requires a known static rank",
+        ));
+    }
     let kind = text[eq + 1..].trim();
     let dims = typed
         .dims
@@ -617,9 +661,9 @@ fn attach_subgraph(
     index: Option<usize>,
     subgraph: Graph,
 ) {
-    let key = match index {
-        Some(index) => format!("{name}[{index}]"),
-        None => name.clone(),
+    let key = onnx_runtime_ir::GraphAttribute {
+        name: name.clone(),
+        index,
     };
     graph.subgraphs.insert((node_id, key), subgraph.clone());
     let attrs = &mut graph.node_mut(node_id).attributes;
@@ -646,17 +690,28 @@ fn parse_subgraph_marker(text: &str) -> Option<(String, Option<usize>)> {
         && let Ok(index) = lhs[open + 1..lhs.len() - 1].parse()
     {
         if index <= 65_535 {
-            return Some((lhs[..open].to_string(), Some(index)));
+            let name = &lhs[..open];
+            let name = if name.starts_with('"') {
+                serde_json::from_str(name).ok()?
+            } else {
+                name.to_string()
+            };
+            return Some((name, Some(index)));
         }
         return None;
+    }
+    if lhs.starts_with('"') {
+        return serde_json::from_str(lhs).ok().map(|name| (name, None));
     }
     (!lhs.is_empty()).then(|| (lhs.to_string(), None))
 }
 
 fn value_id(graph: &mut Graph, values: &mut HashMap<String, ValueId>, name: &str) -> ValueId {
-    *values
-        .entry(name.to_string())
-        .or_insert_with(|| graph.create_named_value(name, DataType::Float32, Vec::new()))
+    *values.entry(name.to_string()).or_insert_with(|| {
+        let id = graph.create_named_value(name, DataType::Undefined, Vec::new());
+        graph.mark_value_shape_unknown(id);
+        id
+    })
 }
 
 fn split_names(text: &str) -> Vec<&str> {

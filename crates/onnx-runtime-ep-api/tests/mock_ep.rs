@@ -342,7 +342,10 @@ fn graph_view_capability_splits_regions_at_unsupported_nodes() {
     let graph = frozen.view().graph();
     let nodes: Vec<_> = graph.topological_order().unwrap();
     assert_eq!(claims[0].node_ids, vec![nodes[0]]);
-    assert_eq!(claims[0].output_values, graph.node(nodes[0]).outputs);
+    assert_eq!(
+        claims[0].output_values,
+        graph.node(nodes[0]).output_values().collect::<Vec<_>>()
+    );
     assert_eq!(claims[1].node_ids, vec![nodes[2]]);
     assert_eq!(
         claims[1].input_values,
@@ -454,5 +457,5 @@ fn producer_of(graph: &Graph, value: onnx_runtime_ir::ValueId) -> Option<NodeId>
         .topological_order()
         .unwrap()
         .into_iter()
-        .find(|&node| graph.node(node).outputs.contains(&value))
+        .find(|&node| graph.node(node).outputs.contains(&Some(value)))
 }

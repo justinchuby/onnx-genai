@@ -1,0 +1,1 @@
+(x,v:tensor[...]|None[...]|Non)=>return Clip(x,v,v)

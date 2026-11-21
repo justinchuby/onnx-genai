@@ -173,6 +173,10 @@ fn all_payload_tensors() -> Vec<TensorProto> {
 }
 
 fn full_spec_proto() -> ModelProto {
+    let mut unknown_extent = tensor_type(tensor_proto::DataType::Float8e5m2fnuz, &[0]);
+    if let Some(type_proto::Value::TensorType(tensor)) = &mut unknown_extent.value {
+        tensor.shape.as_mut().unwrap().dim[0].value = None;
+    }
     let nested_types = vec![
         tensor_type(tensor_proto::DataType::Float, &[2, 3]),
         TypeProto {
@@ -190,10 +194,7 @@ fn full_spec_proto() -> ModelProto {
                     elem_type: Some(Box::new(TypeProto {
                         value: Some(type_proto::Value::OptionalType(Box::new(
                             type_proto::Optional {
-                                elem_type: Some(Box::new(tensor_type(
-                                    tensor_proto::DataType::Float8e5m2fnuz,
-                                    &[-1],
-                                ))),
+                                elem_type: Some(Box::new(unknown_extent)),
                             },
                         ))),
                         denotation: "OPTIONAL".into(),
@@ -819,7 +820,7 @@ fn readable_body_edits_are_authoritative_over_extensions() {
     let edited = text
         .replacen("full_graph (", "edited_graph (", 1)
         .replacen("bool[] cond", "int64[2] condition", 1)
-        .replacen("float[] sequence_input", "uint8[7] sequence_input", 1)
+        .replacen("undefined sequence_input", "uint8[7] sequence_input", 1)
         .replacen("(cond)", "(condition)", 1)
         .replacen(
             "external_tensor = <tensor float[[1]]>",

@@ -1429,10 +1429,10 @@ fn route_residency_boundary_skips_nested_control_flow_runs() {
     let if_node = graph.insert_node(Node::new(NodeId(0), "If", vec![Some(cond)], vec![y]));
     graph
         .subgraphs
-        .insert((if_node, "then_branch".to_string()), deferred_branch());
+        .insert((if_node, "then_branch".into()), deferred_branch());
     graph
         .subgraphs
-        .insert((if_node, "else_branch".to_string()), deferred_branch());
+        .insert((if_node, "else_branch".into()), deferred_branch());
     graph.add_output(top_out);
     graph.add_output(y);
 
@@ -1846,14 +1846,12 @@ fn inplace_capture_if_graph() -> Graph {
     graph.insert_node(Node::new(NodeId(1), "Tanh", vec![Some(h)], vec![t]));
     let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
     graph.insert_node(Node::new(NodeId(2), "If", vec![Some(cond)], vec![y]));
-    graph.subgraphs.insert(
-        (NodeId(2), "then_branch".to_string()),
-        identity_capture_body(),
-    );
-    graph.subgraphs.insert(
-        (NodeId(2), "else_branch".to_string()),
-        identity_capture_body(),
-    );
+    graph
+        .subgraphs
+        .insert((NodeId(2), "then_branch".into()), identity_capture_body());
+    graph
+        .subgraphs
+        .insert((NodeId(2), "else_branch".into()), identity_capture_body());
     graph.add_output(y);
     graph
 }
@@ -4578,7 +4576,7 @@ fn shape_kv_growth_concat_as_rank4_axis2(graph: &mut Graph, concat_id: NodeId) {
     let axis = 2;
     let past = node.inputs[0].expect("KV-growth Concat must have a past operand");
     let current = node.inputs[1].expect("KV-growth Concat must have a current operand");
-    let present = node.outputs[0];
+    let present = node.outputs[0].expect("Concat output must be present");
     graph.value_mut(past).shape = static_shape([1, 2, 4, 8]);
     graph.value_mut(current).shape = static_shape([1, 2, 1, 8]);
     graph.value_mut(present).shape = static_shape([1, 2, 4, 8]);
@@ -4714,7 +4712,7 @@ fn rewrite_kv_capacity_appends_is_a_no_op_when_past_is_not_rank4() {
     let (mut graph, key_concat_id, value_concat_id, _position_ids) =
         decomposed_kv_growth_cone_with_position_ids();
     let past = graph.node(key_concat_id).inputs[0].unwrap();
-    let present = graph.node(key_concat_id).outputs[0];
+    let present = graph.node(key_concat_id).outputs[0].expect("Concat output must be present");
     graph.value_mut(past).shape = static_shape([2, 4, 8]);
     graph.value_mut(present).shape = static_shape([2, 4, 8]);
     let ep = KvCapacityAppendTestEp::new(true);
@@ -11700,7 +11698,7 @@ fn scan_inline_test_graph(steps: usize) -> Graph {
     scan.attributes
         .insert("num_scan_inputs".to_string(), Attribute::Int(2));
     let scan_id = graph.insert_node(scan);
-    graph.subgraphs.insert((scan_id, "body".to_string()), body);
+    graph.subgraphs.insert((scan_id, "body".into()), body);
     graph.add_output(final_state);
     graph.add_output(scan_output);
     graph
@@ -11851,7 +11849,7 @@ fn recurrent_state_graph() -> Graph {
     scan.attributes
         .insert("num_scan_inputs".to_string(), Attribute::Int(1));
     let scan_id = g.insert_node(scan);
-    g.subgraphs.insert((scan_id, "body".to_string()), body);
+    g.subgraphs.insert((scan_id, "body".into()), body);
     g.add_output(present_state);
     g.add_output(scan_out);
     g
@@ -13595,4 +13593,24 @@ fn qmoe_residency_plan_seam_is_substitutable_with_an_alternate_policy() {
         "whole_bank_resident"
     );
     assert_eq!(executor.weight_handles.len(), 2);
+}
+
+#[test]
+fn execution_trims_absent_trailing_outputs_without_changing_the_source() {
+    let mut graph = Graph::new();
+    let input = graph.create_named_value("x", DataType::Float32, vec![2.into()]);
+    let output = graph.create_named_value("y", DataType::Float32, vec![2.into()]);
+    graph.add_input(input);
+    graph.add_output(output);
+    graph.insert_node(Node::new_with_output_slots(
+        NodeId(0),
+        "Dropout",
+        vec![Some(input)],
+        vec![Some(output), None],
+    ));
+
+    let source = graph.clone();
+    prepare_execution(&mut graph).unwrap();
+    assert_eq!(graph.node(NodeId(0)).outputs, vec![Some(output)]);
+    assert_eq!(source.node(NodeId(0)).outputs, vec![Some(output), None]);
 }

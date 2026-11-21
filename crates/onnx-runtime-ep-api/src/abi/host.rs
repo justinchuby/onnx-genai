@@ -240,7 +240,7 @@ impl HostSupportInfo {
                             input_values.push(value_id);
                         }
                     }
-                    for &value_id in &node.outputs {
+                    for value_id in node.output_values() {
                         let value = graph.value(value_id);
                         let leaves = value.is_graph_output
                             || value
@@ -347,9 +347,8 @@ impl HostGraph {
                 outputs: node
                     .outputs
                     .iter()
-                    .map(|v| {
-                        values
-                            .get(v)
+                    .map(|slot| {
+                        slot.and_then(|v| values.get(&v))
                             .map(|value| value_ptr(value))
                             .unwrap_or(ptr::null())
                     })
@@ -373,7 +372,7 @@ impl HostGraph {
                 owned_values: Vec::new(),
             });
             let node_ptr = (&*host_node as *const HostNode).cast::<ort::OrtNode>();
-            for &output in &node.outputs {
+            for output in node.output_values() {
                 if let Some(value) = values.get_mut(&output) {
                     value.producer = Some(node_ptr);
                 }

@@ -1030,7 +1030,7 @@ fn loop_body_records_formal_io_and_inline_initializer_when_attr_type_is_omitted(
         .expect("Loop node");
     let body = loaded
         .subgraphs
-        .get(&(loop_id, "body".to_string()))
+        .get(&(loop_id, "body".into()))
         .expect("Loop body");
 
     let input_names: Vec<_> = body

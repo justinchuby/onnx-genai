@@ -1,0 +1,4 @@
+
+       pattern P(x,p:int){y=custom.O(x,axis=p);return y}
+            pattern Q(x,p:int|None){y=P(x,zzzp);return y}
+        

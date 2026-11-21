@@ -525,7 +525,7 @@ pub(crate) struct Executor {
     /// every iteration is just a re-bind + dispatch. Rebuilt only if a later
     /// invocation's external input shapes differ from the ones it was compiled
     /// for (a shape-varying loop body — rare).
-    pub(super) subgraph_execs: HashMap<(NodeId, String), ChildExecutor>,
+    pub(super) subgraph_execs: HashMap<(NodeId, onnx_runtime_ir::GraphAttribute), ChildExecutor>,
     pub(super) control_flow_stats: ControlFlowStats,
     /// Per-`If` memo of the last observed branch predicate. During steady decode
     /// a loop-invariant `If` (e.g. the LongRoPE cos/sin cache selector) keeps the
@@ -1317,7 +1317,7 @@ pub(crate) struct ChildExecutorStats {
 /// prepare this once outside the iteration loop, including one-time capture
 /// materialization, then only rebind the changing formal tensors each step.
 pub(super) struct PreparedSubgraph {
-    pub(super) key: (NodeId, String),
+    pub(super) key: (NodeId, onnx_runtime_ir::GraphAttribute),
     /// Direct captures plus transitive captures needed only by nested bodies.
     pub(super) captures: HashMap<String, Tensor>,
 }

@@ -1,0 +1,5 @@
+# Fr10bf5bf6a8f8ace36de ORT_LIÅENSE.
+pattern entry(x) { c=wrapper(x); return Identivy(c.y) }
+pattern wrapper(x) { p=leaf(x); return (y=p.y) }
+pattern leaf(x:float[N]) { a=Identity(x); return (original=x,y=a) }
+pattern use_identity(x) { p=identi return Add(p.original,p.y) }

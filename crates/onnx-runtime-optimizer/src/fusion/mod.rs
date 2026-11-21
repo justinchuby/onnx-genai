@@ -338,7 +338,7 @@ impl FusionPattern {
         if !Self::op_matches(mean_rm, "ReduceMean") || mean_rm.outputs.len() != 1 {
             return None;
         }
-        let mean = mean_rm.outputs[0];
+        let mean = mean_rm.outputs[0]?;
 
         // Every `Sub` that consumes `mean` (i.e. computes `x - mean`). One in the
         // canonical diamond, two in the split-diff variant.
@@ -357,24 +357,24 @@ impl FusionPattern {
             if sp.outputs.len() != 1 {
                 continue;
             }
-            let diff_pow = sp.outputs[0];
+            let diff_pow = sp.outputs[0]?;
             // Variance branch: Pow → ReduceMean → Add(eps) → Sqrt.
             let Some(pow) = Self::find_consumer(graph, diff_pow, "Pow") else {
                 continue;
             };
-            let sq = graph.node(pow).outputs[0];
+            let sq = graph.node(pow).outputs[0]?;
             let Some(var_rm) = Self::find_consumer(graph, sq, "ReduceMean") else {
                 continue;
             };
-            let var = graph.node(var_rm).outputs[0];
+            let var = graph.node(var_rm).outputs[0]?;
             let Some(add_eps) = Self::find_consumer(graph, var, "Add") else {
                 continue;
             };
-            let vare = graph.node(add_eps).outputs[0];
+            let vare = graph.node(add_eps).outputs[0]?;
             let Some(sqrt) = Self::find_consumer(graph, vare, "Sqrt") else {
                 continue;
             };
-            let std = graph.node(sqrt).outputs[0];
+            let std = graph.node(sqrt).outputs[0]?;
             // Numerator branch: Div(diff, std) → Mul(scale) → Add(bias).
             let Some(div) = Self::find_consumer(graph, std, "Div") else {
                 continue;
@@ -385,14 +385,19 @@ impl FusionPattern {
             let Some(num) = dn.input_values().find(|&v| v != std) else {
                 continue;
             };
-            let Some(&sub_div) = subs.iter().find(|&&s| graph.node(s).outputs[0] == num) else {
+            let Some(&sub_div) = subs
+                .iter()
+                .find(|&&s| graph.node(s).outputs[0] == Some(num))
+            else {
                 continue;
             };
-            let norm = dn.outputs[0];
+            let Some(norm) = dn.outputs[0] else { continue };
             let Some(mul) = Self::find_consumer(graph, norm, "Mul") else {
                 continue;
             };
-            let scaled = graph.node(mul).outputs[0];
+            let Some(scaled) = graph.node(mul).outputs[0] else {
+                continue;
+            };
             let Some(final_add) = Self::find_consumer(graph, scaled, "Add") else {
                 continue;
             };
@@ -414,7 +419,7 @@ impl FusionPattern {
             // that escapes the matched set (external consumer or graph output).
             let escapes = nodes.iter().any(|&nid| {
                 nid != final_add
-                    && graph.node(nid).outputs.iter().any(|&out| {
+                    && graph.node(nid).output_values().any(|out| {
                         graph.outputs.contains(&out)
                             || graph
                                 .consumers(out)
@@ -432,7 +437,7 @@ impl FusionPattern {
             if fa.outputs.len() != 1 {
                 continue;
             }
-            let output = fa.outputs[0];
+            let output = fa.outputs[0]?;
             let survives = graph.outputs.contains(&output)
                 || graph
                     .consumers(output)
@@ -445,7 +450,7 @@ impl FusionPattern {
             // External inputs in first-seen order (X, Scale, B, plus constants).
             let produced: HashSet<ValueId> = nodes
                 .iter()
-                .flat_map(|&n| graph.node(n).outputs.iter().copied())
+                .flat_map(|&n| graph.node(n).output_values())
                 .collect();
             let mut external = Vec::new();
             let mut seen = HashSet::new();
@@ -529,7 +534,7 @@ impl FusionPattern {
             return None;
         }
         let sm_in = sm.inputs[0]?;
-        let sm_out = sm.outputs[0];
+        let sm_out = sm.outputs[0]?;
         let rank = graph.value(sm_in).shape.len();
         if rank == 0 {
             return None;
@@ -555,7 +560,7 @@ impl FusionPattern {
             return None;
         }
         let v = out_mm_node.inputs[1]?;
-        let output = out_mm_node.outputs[0];
+        let output = out_mm_node.outputs[0]?;
 
         // Backward: the Softmax input is produced either directly by the score
         // scaling, or by a mask `Add` sitting between the scaling and Softmax.
@@ -590,7 +595,7 @@ impl FusionPattern {
         // scalar f32 constant, `scores` a MatMul output.
         let scale_node_id = graph.value(scale_out).producer?;
         let scale_node = graph.node(scale_node_id);
-        if scale_node.outputs.len() != 1 || scale_node.outputs[0] != scale_out {
+        if scale_node.outputs.len() != 1 || scale_node.outputs[0] != Some(scale_out) {
             return None;
         }
         let (scores_out, scale) = Self::parse_scale(graph, scale_node_id)?;
@@ -602,7 +607,7 @@ impl FusionPattern {
         if !Self::op_matches(score_mm, "MatMul")
             || score_mm.inputs.len() != 2
             || score_mm.outputs.len() != 1
-            || score_mm.outputs[0] != scores_out
+            || score_mm.outputs[0] != Some(scores_out)
         {
             return None;
         }
@@ -633,7 +638,7 @@ impl FusionPattern {
         // graph output) — fusion must not delete a value observed elsewhere.
         let escapes = nodes.iter().any(|&nid| {
             nid != out_mm
-                && graph.node(nid).outputs.iter().any(|&o| {
+                && graph.node(nid).output_values().any(|o| {
                     graph.outputs.contains(&o)
                         || graph
                             .consumers(o)
@@ -733,7 +738,7 @@ impl FusionPattern {
             if Self::op_matches(t, "Transpose")
                 && t.inputs.len() == 1
                 && t.outputs.len() == 1
-                && t.outputs[0] == k_side
+                && t.outputs[0] == Some(k_side)
                 && graph.consumers(k_side) == [score_mm_id]
                 && let Some(perm) = t.attr("perm").and_then(Attribute::as_ints)
                 && is_last2_swap_perm(perm)
@@ -799,12 +804,12 @@ impl FusionPattern {
             return None;
         }
         let erf_in = erf.inputs[0]?;
-        let erf_out = erf.outputs[0];
+        let erf_out = erf.outputs[0]?;
 
         // Backward: `erf_in = X / √2`, via `Div(X, √2)` or `Mul(X, 1/√2)`.
         let inner_id = graph.value(erf_in).producer?;
         let inner = graph.node(inner_id);
-        if inner.outputs.first() != Some(&erf_in) {
+        if inner.outputs.first() != Some(&Some(erf_in)) {
             return None;
         }
         let x = Self::parse_scaled(graph, inner, &[("Div", SQRT_2), ("Mul", FRAC_1_SQRT_2)])?;
@@ -819,7 +824,7 @@ impl FusionPattern {
         if !approx(read_scalar_const_f32(graph, one)?, 1.0) {
             return None;
         }
-        let add1_out = add1.outputs[0];
+        let add1_out = add1.outputs[0]?;
 
         // Forward: `add1_out` consumed by `Mul(0.5·X, add1_out)`.
         let outer_id = Self::find_consumer(graph, add1_out, "Mul")?;
@@ -828,14 +833,14 @@ impl FusionPattern {
             return None;
         }
         let half = outer.input_values().find(|&v| v != add1_out)?;
-        let output = outer.outputs[0];
+        let output = outer.outputs[0]?;
 
         // The half-scale operand must be `0.5·X` (`Mul(X, 0.5)` or `Div(X, 2.0)`)
         // over the SAME `X` that feeds the `Erf` branch — this closes the
         // diamond and confirms a real GELU, not a coincidental op sequence.
         let half_id = graph.value(half).producer?;
         let half_node = graph.node(half_id);
-        if half_node.outputs.first() != Some(&half) {
+        if half_node.outputs.first() != Some(&Some(half)) {
             return None;
         }
         let x2 = Self::parse_scaled(graph, half_node, &[("Mul", 0.5), ("Div", 2.0)])?;
@@ -855,7 +860,7 @@ impl FusionPattern {
         // consumer, no graph output).
         let escapes = nodes.iter().any(|&nid| {
             nid != outer_id
-                && graph.node(nid).outputs.iter().any(|&o| {
+                && graph.node(nid).output_values().any(|o| {
                     graph.outputs.contains(&o)
                         || graph
                             .consumers(o)
@@ -953,7 +958,7 @@ impl FusionPattern {
         // Safety rule: no non-final matched node may have an output that escapes
         // the matched set (external consumer or graph output).
         for &nid in &chain[..chain.len() - 1] {
-            for &out in &graph.node(nid).outputs {
+            for out in graph.node(nid).output_values() {
                 if graph.outputs.contains(&out) {
                     return None;
                 }
@@ -973,7 +978,7 @@ impl FusionPattern {
         if last_node.outputs.len() != 1 {
             return None;
         }
-        let output = last_node.outputs[0];
+        let output = last_node.outputs[0]?;
 
         // The output must survive removal of the matched nodes: it is either a
         // graph output or has a consumer outside the matched set.
@@ -989,7 +994,7 @@ impl FusionPattern {
         // Collect external inputs in first-seen order.
         let produced: HashSet<ValueId> = chain
             .iter()
-            .flat_map(|&n| graph.node(n).outputs.iter().copied())
+            .flat_map(|&n| graph.node(n).output_values())
             .collect();
         let mut external = Vec::new();
         let mut seen = HashSet::new();
@@ -1066,7 +1071,9 @@ impl FusionPattern {
         let (Some(&matmul), Some(&add)) = (m.nodes.first(), m.nodes.get(1)) else {
             return false;
         };
-        let mm_out = graph.node(matmul).outputs[0];
+        let Some(mm_out) = graph.node(matmul).outputs[0] else {
+            return false;
+        };
         let Some(bias) = graph.node(add).input_values().find(|&v| v != mm_out) else {
             return false;
         };
@@ -1197,12 +1204,12 @@ impl FusionPattern {
             sub_pow
         };
 
-        let mean = rm1.outputs[0];
-        let diff_pow = sub_pow.outputs[0];
-        let diff_div = sub_div.outputs[0];
-        let var = rm2.outputs[0];
-        let norm = div.outputs[0];
-        let scaled = mul.outputs[0];
+        let mean = rm1.outputs[0]?;
+        let diff_pow = sub_pow.outputs[0]?;
+        let diff_div = sub_div.outputs[0]?;
+        let var = rm2.outputs[0]?;
+        let norm = div.outputs[0]?;
+        let scaled = mul.outputs[0]?;
 
         // Positive structural guard: confirm the interior data-flow really is the
         // LayerNorm decomposition, not just a coincidental op-type sequence. Each
@@ -1288,6 +1295,9 @@ fn reduce_single_axis(graph: &Graph, rm: &Node) -> Option<i64> {
 /// Read a scalar (or leading) f32 element from an inline float initializer, if
 /// `value` is backed by one. Used to fold a constant `epsilon` into an attribute.
 fn read_scalar_f32(graph: &Graph, value: ValueId) -> Option<f32> {
+    if !graph.is_constant_initializer(value) {
+        return None;
+    }
     match graph.initializers.get(&value)? {
         WeightRef::Inline(t) if t.dtype == DataType::Float32 && t.data.len() >= 4 => {
             Some(f32::from_le_bytes(t.data[0..4].try_into().ok()?))
@@ -1305,6 +1315,9 @@ fn read_scalar_f32(graph: &Graph, value: ValueId) -> Option<f32> {
 /// non-standard-domain `Constant`) yields `None` so the caller declines rather
 /// than mis-reading the axes.
 fn read_i64_vector(graph: &Graph, value: ValueId) -> Option<Vec<i64>> {
+    if graph.inputs.contains(&value) {
+        return None;
+    }
     if let Some(WeightRef::Inline(tensor)) = graph.initializers.get(&value) {
         return i64_axes_from_tensor(tensor);
     }
@@ -1379,6 +1392,9 @@ struct GeluParts {
 /// scalar, so a multi-element initializer (whose first element we'd otherwise
 /// silently read) is declined.
 fn read_scalar_const_f32(graph: &Graph, value: ValueId) -> Option<f32> {
+    if !graph.is_constant_initializer(value) {
+        return None;
+    }
     match graph.initializers.get(&value)? {
         WeightRef::Inline(t) if t.dtype == DataType::Float32 => {
             let numel: usize = t.dims.iter().product();

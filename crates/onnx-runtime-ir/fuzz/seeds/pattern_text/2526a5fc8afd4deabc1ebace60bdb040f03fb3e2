@@ -1,0 +1,2 @@
+# header
+(x)=>{y=ai.onnx::Idy(x);ry=ai.i.onnx::Identity(x);ryP=ai.onnx::Identity(x);retP=ai.onnx::Identity(x);return custom.Op(y,text='a#b',value=-0.0)} #e'a#)} I# done

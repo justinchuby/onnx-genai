@@ -36,12 +36,8 @@
 //! The IR `Graph` does not model these, so they cannot be reproduced and are
 //! emitted empty / default:
 //!
-//! * `TrainingInfoProto`, `FunctionProto`, sparse initializers, quantization
-//!   annotations (not represented in the IR). Model-local functions ARE
-//!   supported on the load path — [`crate::function_inline`] expands every
-//!   function call into its primitive body before the IR is built — but the IR
-//!   `Graph` does not retain the original `FunctionProto` declarations, so they
-//!   are not re-emitted here;
+//! * `TrainingInfoProto` and quantization annotations (not represented in the
+//!   IR). Model-local functions are retained and re-emitted;
 //! * nested `GraphProto.name` values — the IR does not retain graph names for
 //!   control-flow bodies, so nested graphs are emitted with an empty name.
 
@@ -56,7 +52,7 @@ use onnx_runtime_ir::{
 
 use crate::LoaderError;
 use crate::proto::onnx::{
-    self, AttributeProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto,
+    self, AttributeProto, FunctionProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto,
     StringStringEntryProto, TensorProto, TensorShapeProto, ValueInfoProto,
     attribute_proto::AttributeType, tensor_shape_proto, type_proto,
 };
@@ -74,7 +70,7 @@ pub const DEFAULT_OPSET_VERSION: i64 = 24;
 
 /// Model-level metadata that the IR [`Graph`] does not itself carry.
 ///
-/// The load path drops these (it only keeps `opset_imports` on the `Graph`), so
+/// Except for `ir_version`, the load path does not retain these on `Graph`, so
 /// a caller that wants a faithful `ModelProto` supplies them here. All fields
 /// default to empty/zero except [`ir_version`](ModelMetadata::ir_version).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,15 +128,18 @@ impl<'a> Model<'a> {
     /// A model over `graph` with default metadata and no external weight store.
     ///
     /// **Note on defaulted metadata:** the load path does not preserve
-    /// model-level metadata (it keeps only `opset_imports` on the `Graph`), so a
-    /// model built this way stamps [`DEFAULT_IR_VERSION`] and empty producer /
+    /// other model-level metadata, so a model built this way retains the graph's
+    /// IR version (or [`DEFAULT_IR_VERSION`]) and stamps empty producer /
     /// version / `metadata_props` fields. A rewrite path that must reproduce the
     /// original model faithfully should capture the source metadata and pass it
     /// via [`Model::with_metadata`] rather than relying on these defaults.
     pub fn new(graph: &'a Graph) -> Self {
         Self {
             graph,
-            metadata: ModelMetadata::default(),
+            metadata: ModelMetadata {
+                ir_version: graph.ir_version.unwrap_or(DEFAULT_IR_VERSION),
+                ..ModelMetadata::default()
+            },
             weights: None,
         }
     }
@@ -250,6 +249,12 @@ pub fn encode_model_proto(model: &Model) -> Result<ModelProto, LoaderError> {
             value: value.clone(),
         })
         .collect();
+    let mut function_entries: Vec<_> = model.graph.model_functions.iter().collect();
+    function_entries.sort_by_key(|(key, _)| *key);
+    let functions = function_entries
+        .into_iter()
+        .map(|(_, function)| encode_function_proto(function, model.weights))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ModelProto {
         ir_version: meta.ir_version,
@@ -261,8 +266,20 @@ pub fn encode_model_proto(model: &Model) -> Result<ModelProto, LoaderError> {
         doc_string: meta.doc_string.clone().unwrap_or_default(),
         graph: Some(graph),
         metadata_props,
+        functions,
         ..Default::default()
     })
+}
+
+fn encode_function_proto(
+    function: &onnx_runtime_ir::ModelFunction,
+    weights: Option<&WeightStore>,
+) -> Result<FunctionProto, LoaderError> {
+    reject_unrepresentable_node_versions(&function.body)?;
+    let mut declaration = function.declaration.clone();
+    let encoded = encode_graph_proto(&function.body, weights, false, "")?;
+    declaration.node = encoded.node;
+    Ok(declaration)
 }
 
 /// Encode a [`Graph`] into a `GraphProto`. `is_top_level` reserved for future
@@ -302,6 +319,7 @@ fn encode_graph_proto(
     excluded.extend(graph.inputs.iter().copied());
     excluded.extend(graph.outputs.iter().copied());
     excluded.extend(init_ids.iter().copied());
+    excluded.extend(graph.sparse_initializers.keys().copied());
     let mut value_info = Vec::new();
     for (vid, value) in graph.values.iter() {
         if excluded.contains(&vid) {
@@ -322,6 +340,20 @@ fn encode_graph_proto(
         node,
         name: name.to_string(),
         initializer,
+        sparse_initializer: {
+            let mut initializers: Vec<_> = graph.sparse_initializers.iter().collect();
+            initializers.sort_by_key(|(id, _)| id.0);
+            initializers
+                .into_iter()
+                .map(|(id, sparse)| {
+                    let mut sparse = sparse.clone();
+                    if let Some(values) = &mut sparse.values {
+                        values.name = value_name(graph, *id).unwrap_or_default().to_string();
+                    }
+                    sparse
+                })
+                .collect()
+        },
         input,
         output,
         value_info,
@@ -346,7 +378,10 @@ fn encode_node(
     let output: Vec<String> = node
         .outputs
         .iter()
-        .map(|&vid| value_name(graph, vid).unwrap_or_default().to_string())
+        .map(|slot| match slot {
+            Some(vid) => value_name(graph, *vid).unwrap_or_default().to_string(),
+            None => String::new(),
+        })
         .collect();
 
     // Sort attributes by name so the encoding is deterministic (the IR stores
@@ -370,6 +405,7 @@ fn encode_node(
         name: node.name.clone(),
         op_type: node.op_type.clone(),
         domain: node.domain.clone(),
+        overload: node.overload.clone(),
         attribute,
         doc_string: node.doc_string.clone().unwrap_or_default(),
         ..Default::default()
@@ -390,6 +426,10 @@ fn encode_attribute(
         ..Default::default()
     };
     match attr {
+        Attribute::Ref { name, kind } => {
+            ap.ref_attr_name = name.clone();
+            ap.r#type = *kind as i32;
+        }
         Attribute::Int(v) => {
             ap.i = *v;
             ap.r#type = AttributeType::Int as i32;
@@ -425,7 +465,7 @@ fn encode_attribute(
         Attribute::Graph(inline) => {
             let subgraph = graph
                 .subgraphs
-                .get(&(node.id, name.to_string()))
+                .get(&(node.id, name.into()))
                 .unwrap_or(inline);
             ap.g = Some(encode_graph_proto(subgraph, weights, false, "")?);
             ap.r#type = AttributeType::Graph as i32;
@@ -435,7 +475,10 @@ fn encode_attribute(
                 .iter()
                 .enumerate()
                 .map(|(index, fallback)| {
-                    let key = (node.id, format!("{name}[{index}]"));
+                    let key = (
+                        node.id,
+                        onnx_runtime_ir::GraphAttribute::element(name, index),
+                    );
                     let subgraph = graph.subgraphs.get(&key).unwrap_or(fallback);
                     encode_graph_proto(subgraph, weights, false, "")
                 })
@@ -475,7 +518,7 @@ fn encode_tensor(t: &TensorData) -> TensorProto {
         ..Default::default()
     };
     if t.dtype == DataType::String {
-        tp.string_data = t.strings.iter().map(|s| s.clone().into_bytes()).collect();
+        tp.string_data = t.strings.clone();
     } else {
         tp.raw_data = t.data.clone();
     }
@@ -535,7 +578,17 @@ fn encode_value_info(graph: &Graph, vid: ValueId) -> ValueInfoProto {
     let value = graph.value(vid);
     ValueInfoProto {
         name: value.name.clone().unwrap_or_default(),
-        r#type: Some(encode_tensor_type(graph, value.dtype, &value.shape)),
+        r#type: value.declared_type.clone().or_else(|| {
+            graph.value_type_is_known(vid).then(|| {
+                let mut tp = encode_tensor_type(graph, value.dtype, &value.shape);
+                if !graph.value_shape_is_known(vid)
+                    && let Some(type_proto::Value::TensorType(tensor)) = &mut tp.value
+                {
+                    tensor.shape = None;
+                }
+                tp
+            })
+        }),
         ..Default::default()
     }
 }
@@ -577,37 +630,8 @@ fn encode_shape(graph: &Graph, shape: &Shape) -> TensorShapeProto {
 }
 
 /// Encode an IR [`TypeProto`] (the inverse of `graph_builder::convert_type_proto`).
-fn encode_type_proto(graph: &Graph, tp: &TypeProto) -> onnx::TypeProto {
-    let value = match tp {
-        TypeProto::Tensor { dtype, shape } => type_proto::Value::TensorType(type_proto::Tensor {
-            elem_type: dtype.to_onnx(),
-            shape: Some(encode_shape(graph, shape)),
-        }),
-        TypeProto::SparseTensor { dtype, shape } => {
-            type_proto::Value::SparseTensorType(type_proto::SparseTensor {
-                elem_type: dtype.to_onnx(),
-                shape: Some(encode_shape(graph, shape)),
-            })
-        }
-        TypeProto::Sequence(inner) => {
-            type_proto::Value::SequenceType(Box::new(type_proto::Sequence {
-                elem_type: Some(Box::new(encode_type_proto(graph, inner))),
-            }))
-        }
-        TypeProto::Optional(inner) => {
-            type_proto::Value::OptionalType(Box::new(type_proto::Optional {
-                elem_type: Some(Box::new(encode_type_proto(graph, inner))),
-            }))
-        }
-        TypeProto::Map { key, value } => type_proto::Value::MapType(Box::new(type_proto::Map {
-            key_type: key.to_onnx(),
-            value_type: Some(Box::new(encode_type_proto(graph, value))),
-        })),
-    };
-    onnx::TypeProto {
-        value: Some(value),
-        ..Default::default()
-    }
+fn encode_type_proto(_graph: &Graph, tp: &TypeProto) -> onnx::TypeProto {
+    tp.clone()
 }
 
 /// The name of a graph value, if it has one.

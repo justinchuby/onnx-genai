@@ -466,7 +466,7 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
             if !membership[node.as_usize()] {
                 continue;
             }
-            for &output in self.view.node_outputs(node) {
+            for &output in self.view.node_outputs(node).iter().flatten() {
                 for consumer in self.view.consumers(output) {
                     let neighbor = consumer.node;
                     if !membership[neighbor.as_usize()]
@@ -537,7 +537,7 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
         }
         for node in self.view.nodes() {
             let from = partitions.find(node.as_usize());
-            for &output in self.view.node_outputs(node) {
+            for &output in self.view.node_outputs(node).iter().flatten() {
                 for consumer in self.view.consumers(output) {
                     let to = partitions.find(consumer.node.as_usize());
                     if from != to && edges.insert((from, to)) {
@@ -587,7 +587,7 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
                     inputs.push(input);
                 }
             }
-            for &output in self.view.node_outputs(node) {
+            for &output in self.view.node_outputs(node).iter().flatten() {
                 let crosses_partition = self
                     .view
                     .consumers(output)

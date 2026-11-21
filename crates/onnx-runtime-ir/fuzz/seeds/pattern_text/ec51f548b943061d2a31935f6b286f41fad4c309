@@ -1,0 +1,1 @@
+(x,p:None)=>{a=ose(x,perm=p);return Tranose(a)}

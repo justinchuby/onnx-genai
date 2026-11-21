@@ -1,0 +1,5 @@
+# FrotionoNamXedAndAnonCENSE®
+interface Unary(x) -> (y:tensor<T0q000000000000000000000000000001>[N])
+pattern first implements Unary { local=Identity(x); return (y=local) }
+pattern second implements Unary { local=Identity(x); return (y=local) }
+pattern Forms = first | second

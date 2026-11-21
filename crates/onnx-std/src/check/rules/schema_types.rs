@@ -221,7 +221,7 @@ fn schema_value_bindings<'a>(
         bindings.extend(
             values
                 .iter()
-                .copied()
+                .filter_map(|slot| *slot)
                 .map(|value_id| (spec.type_str.as_str(), value_id)),
         );
     }
@@ -1199,6 +1199,7 @@ fn attribute_matches(value: &Attribute, expected: AttributeType) -> bool {
 
 fn attribute_name(value: &Attribute) -> &'static str {
     match value {
+        Attribute::Ref { .. } => "unbound function attribute reference",
         Attribute::Int(_) => "int",
         Attribute::Float(_) => "float",
         Attribute::String(_) => "string",

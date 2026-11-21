@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 keywords = ["onnx", "ir", "graph", "inference", "runtime"]
 categories = ["science", "data-structures"]
+# The nightly-only cargo-fuzz harness is its own workspace; never package it.
+exclude = ["fuzz/"]
 
 [dependencies]
 thiserror = { workspace = true }

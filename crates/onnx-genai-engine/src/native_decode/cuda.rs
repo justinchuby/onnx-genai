@@ -433,7 +433,7 @@ impl CsaRecordLayout {
         let node = graph.node(producer);
         if node.domain != onnx_runtime_ir::RUNTIME_DOMAIN
             || node.op_type != "CompressedSparseAttention"
-            || node.outputs.get(5).copied() != Some(value_id)
+            || node.outputs.get(5).copied().flatten() != Some(value_id)
         {
             return None;
         }

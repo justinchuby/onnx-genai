@@ -1,0 +1,6 @@
+#ternCompositionoNamedAndAnonymousAlternativesAreOccurrenceLocal.
+# ORT c
+interface Unary(x:tensor<T>[Nqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq,qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq]) -> (y:tensor<T1m>[N])
+pattern first implements Unary { local=Identity(x); return (y=local) }
+pattern second implements Unary { local=Identity(x); return (y=local) }
+pattern Forms = first | second

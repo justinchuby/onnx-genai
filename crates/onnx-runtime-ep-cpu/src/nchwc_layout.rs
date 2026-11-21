@@ -155,7 +155,13 @@ impl OptimizationPass for NchwcLayoutPropagation {
                         .copied()
                         .flatten()
                         .and_then(|v| value_shape4_all_static(graph, v));
-                    let os = resolve4(graph, &shapes, n.outputs[0]).map(|s| [s.c, s.h, s.w]);
+                    let os = n
+                        .outputs
+                        .first()
+                        .copied()
+                        .flatten()
+                        .and_then(|output| resolve4(graph, &shapes, output))
+                        .map(|s| [s.c, s.h, s.w]);
                     eprintln!(
                         "[nchwc-layout] first Conv x(chw)={xs:?} w={ws:?} out(chw)={os:?} domain={:?}",
                         n.domain
@@ -178,7 +184,7 @@ impl OptimizationPass for NchwcLayoutPropagation {
                 continue;
             };
             let node = graph.node(nid).clone();
-            let out = node.outputs[0];
+            let out = node.outputs[0].expect("classified member has a present output");
             let out_nchw = resolve4(graph, &shapes, out).expect("member output must be static 4-D");
             let out_blocked = graph.create_named_value(
                 format!("__nxrt_nchwc_{}", nid.0),
@@ -213,7 +219,7 @@ impl OptimizationPass for NchwcLayoutPropagation {
                         let bin = blocked_input(graph, &mut blocked, &shapes, iv, block);
                         new.inputs[idx] = Some(bin);
                     }
-                    new.outputs = vec![out_blocked];
+                    new.outputs = vec![Some(out_blocked)];
                     new
                 }
             };
@@ -466,7 +472,7 @@ fn unary_shapes_ok(graph: &Graph, node: &Node, shapes: &HashMap<ValueId, Shape4>
     };
     let (Some(i), Some(o)) = (
         resolve4(graph, shapes, input),
-        resolve4(graph, shapes, node.outputs[0]),
+        node.outputs[0].and_then(|output| resolve4(graph, shapes, output)),
     ) else {
         return false;
     };
@@ -474,7 +480,7 @@ fn unary_shapes_ok(graph: &Graph, node: &Node, shapes: &HashMap<ValueId, Shape4>
 }
 
 fn add_ok(graph: &Graph, node: &Node, shapes: &HashMap<ValueId, Shape4>) -> bool {
-    if node.inputs.len() != 2 || node.outputs.len() != 1 {
+    if node.inputs.len() != 2 || node.outputs.len() != 1 || node.outputs[0].is_none() {
         return false;
     }
     let (Some(a), Some(b)) = (
@@ -499,7 +505,7 @@ fn pool_ok(graph: &Graph, node: &Node, shapes: &HashMap<ValueId, Shape4>) -> boo
     };
     let (Some(i), Some(o)) = (
         resolve4(graph, shapes, input),
-        resolve4(graph, shapes, node.outputs[0]),
+        node.outputs[0].and_then(|output| resolve4(graph, shapes, output)),
     ) else {
         return false;
     };
@@ -555,7 +561,7 @@ fn conv_plan(
     let x = node.inputs.first().copied().flatten()?;
     let w = node.inputs.get(1).copied().flatten()?;
     let x_shape = resolve4(graph, shapes, x)?;
-    let out_shape = resolve4(graph, shapes, node.outputs[0])?;
+    let out_shape = resolve4(graph, shapes, node.outputs[0]?)?;
     let w_shape = value_shape4_all_static(graph, w)?;
 
     let group = node
@@ -782,8 +788,10 @@ fn propagate_shapes(graph: &Graph) -> HashMap<ValueId, Shape4> {
         if node.outputs.len() != 1 {
             continue;
         }
-        if let Some(out) = compute_output_shape(graph, &shapes, node) {
-            shapes.insert(node.outputs[0], out);
+        if let Some(output) = node.outputs[0]
+            && let Some(out) = compute_output_shape(graph, &shapes, node)
+        {
+            shapes.insert(output, out);
         }
     }
     shapes
@@ -1017,7 +1025,7 @@ mod tests {
             .nodes
             .values()
             .filter(|n| n.op_type == NCHWC_CONV_OP)
-            .map(|n| n.outputs[0])
+            .flat_map(|n| n.output_values())
             .collect();
         for slot in &add.inputs {
             let v = slot.expect("Add operand present");

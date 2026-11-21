@@ -1,0 +1,1 @@
+pattern P(x){y=Identity(x);return y} pattern Q(x:tensor[...]|None){y=(6);return y}

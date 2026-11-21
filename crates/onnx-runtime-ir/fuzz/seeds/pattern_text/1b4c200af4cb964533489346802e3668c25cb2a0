@@ -1,0 +1,3 @@
+# From Paÿÿÿÿÿ
+interface Unary(x:tensor<T>[x]) -> (y:tensor<T>[N])
+pattern fis =cond

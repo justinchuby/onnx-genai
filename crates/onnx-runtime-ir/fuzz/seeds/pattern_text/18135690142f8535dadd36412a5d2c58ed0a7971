@@ -1,0 +1,4 @@
+# From Uni { a=IdentitQQQ); return (y=a) }
+pattern identity(
+) { return*(y=x) }
+pattern mixeixed(x) { p=mixed(x); return Add() }

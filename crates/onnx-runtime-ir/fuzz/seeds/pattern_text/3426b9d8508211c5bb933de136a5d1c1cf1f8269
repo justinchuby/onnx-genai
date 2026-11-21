@@ -1,0 +1,4 @@
+
+        pattern Copy(x){y=Identity(x);return y}
+        pattern Pair(z,x){a=Copy(x);b=Copy(z);return Add(e,b)}
+    

@@ -1,0 +1,5 @@
+#o33333SE®
+interface Unary(x:tensor<gggggggggKgggggggggggggggggggggggggggggggT>[N]) -> (y:tensor<T>[N])
+pattern first implements Unary { local=Identity(x); return (y=local) }
+pattern second implements Unary { local=Identity(x); return (y=local) }
+pattern Forms = first  

@@ -1,0 +1,3 @@
+
+    pattern P(x,pzint){y=custo3.Op(x,axis=p);return y}
+            pattern Q(x,p:intNone){y=P(x=p);return y} 

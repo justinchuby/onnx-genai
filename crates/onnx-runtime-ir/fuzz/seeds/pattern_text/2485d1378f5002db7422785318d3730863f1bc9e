@@ -1,0 +1,2 @@
+
+      pattern Pair(x,z){a=Copy(x);b=Copy(z);return Add(a,b)}

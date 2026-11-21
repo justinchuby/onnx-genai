@@ -1,0 +1,1 @@
+pattern A(x){y=Identity(x);return y} pattern B(x){y=Neg(x);return y} pattern Er=A|B

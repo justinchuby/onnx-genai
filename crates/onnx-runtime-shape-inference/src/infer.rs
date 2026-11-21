@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use onnx_runtime_ir::{
-    Attribute, DataType, Dim, Graph, Node, SymbolConstraints, SymbolId, ValueId, WeightRef,
+    Attribute, DataType, Dim, Graph, GraphAttribute, Node, SymbolConstraints, SymbolId, ValueId,
+    WeightRef,
 };
 
 use crate::context::{
@@ -156,7 +157,7 @@ impl InferenceRegistry {
                 &mut interner,
             )?;
             if remaining_subgraph_nodes > 0 {
-                pending_scope_values.extend(node.outputs.iter().copied());
+                pending_scope_values.extend(node.output_values());
             }
         }
 
@@ -222,7 +223,7 @@ impl InferenceRegistry {
         pending_scope_values: &mut Vec<ValueId>,
         remaining_subgraph_nodes: &mut usize,
         interner: &mut SymbolInterner,
-    ) -> Result<HashMap<String, ScopedInference>, ShapeInferError> {
+    ) -> Result<HashMap<GraphAttribute, ScopedInference>, ShapeInferError> {
         let mut child_keys: Vec<_> = graph
             .subgraphs
             .keys()
@@ -319,16 +320,17 @@ impl InferenceRegistry {
         let inputs = gather_inputs(node, types, shape_data, containers);
         let outputs = self.infer_node(node, opset_imports, inputs, policy, interner)?;
         for (slot, io) in node.outputs.iter().zip(outputs) {
+            let Some(slot) = *slot else { continue };
             if let Some(type_info) = io.type_info {
-                types.insert(*slot, type_info);
+                types.insert(slot, type_info);
             }
             if let Some(data) = io.shape_data
                 && data.within_bounds()
             {
-                shape_data.insert(*slot, data);
+                shape_data.insert(slot, data);
             }
             if let Some(value_type) = io.value_type {
-                containers.insert(*slot, value_type);
+                containers.insert(slot, value_type);
             }
         }
         Ok(())
@@ -363,7 +365,7 @@ fn effective_version(node: &Node, opset_imports: &HashMap<String, u64>) -> u64 {
 fn infer_control_flow(
     graph: &mut Graph,
     node: &Node,
-    subgraph_results: &HashMap<String, ScopedInference>,
+    subgraph_results: &HashMap<GraphAttribute, ScopedInference>,
     types: &mut HashMap<ValueId, TypeInfo>,
     shape_data: &mut HashMap<ValueId, ShapeData>,
     containers: &mut HashMap<ValueId, ValueType>,
@@ -391,7 +393,7 @@ fn infer_control_flow(
         apply_cf_outputs(graph, node, outputs, types, shape_data, containers);
     }
     if remaining_subgraph_nodes > 0 {
-        pending_scope_values.extend(node.outputs.iter().copied());
+        pending_scope_values.extend(node.output_values());
     }
 
     Ok(true)
@@ -408,25 +410,26 @@ fn apply_cf_outputs(
     containers: &mut HashMap<ValueId, ValueType>,
 ) {
     for (slot, output) in node.outputs.iter().zip(outputs) {
+        let Some(slot) = *slot else { continue };
         match output {
             CfOutput::Container(value_type) => {
                 // A container CF output lives in the parallel container map, not
                 // in `types` (the IR `Value` has no container representation) —
                 // consistent with how a top-level `Sequence` producer is handled.
-                types.remove(slot);
-                shape_data.remove(slot);
-                containers.insert(*slot, value_type);
+                types.remove(&slot);
+                shape_data.remove(&slot);
+                containers.insert(slot, value_type);
             }
             CfOutput::Typed(type_info) => {
-                types.insert(*slot, type_info);
+                types.insert(slot, type_info);
             }
             CfOutput::UnknownRank(element_type) => {
-                types.remove(slot);
-                shape_data.remove(slot);
-                let value = graph.value_mut(*slot);
+                types.remove(&slot);
+                shape_data.remove(&slot);
+                let value = graph.value_mut(slot);
                 value.dtype = element_type;
-                graph.mark_value_type_known(*slot);
-                graph.mark_value_shape_unknown(*slot);
+                graph.mark_value_type_known(slot);
+                graph.mark_value_shape_unknown(slot);
             }
             CfOutput::Unresolved => {}
         }
@@ -463,9 +466,7 @@ fn write_back_types(
             .iter()
             .map(|dimension| interner.lower(dimension))
             .collect();
-        let value = graph.value_mut(vid);
-        value.shape = dims;
-        value.dtype = type_info.dtype;
+        graph.value_mut(vid).set_tensor_facts(type_info.dtype, dims);
         resolved.push(vid);
     }
     resolved
@@ -488,24 +489,24 @@ enum CfOutput {
 fn infer_if_outputs(
     graph: &Graph,
     node: &Node,
-    subgraph_results: &HashMap<String, ScopedInference>,
+    subgraph_results: &HashMap<GraphAttribute, ScopedInference>,
     interner: &mut SymbolInterner,
 ) -> Result<Option<Vec<CfOutput>>, ShapeInferError> {
     if !is_standard_if(node) {
         return Ok(None);
     }
-    let then_key = (node.id, "then_branch".to_string());
-    let else_key = (node.id, "else_branch".to_string());
+    let then_key = (node.id, "then_branch".into());
+    let else_key = (node.id, "else_branch".into());
     let Some(then_branch) = graph.subgraphs.get(&then_key) else {
         return Ok(None);
     };
     let Some(else_branch) = graph.subgraphs.get(&else_key) else {
         return Ok(None);
     };
-    let Some(then_result) = subgraph_results.get("then_branch") else {
+    let Some(then_result) = subgraph_results.get(&"then_branch".into()) else {
         return Ok(None);
     };
-    let Some(else_result) = subgraph_results.get("else_branch") else {
+    let Some(else_result) = subgraph_results.get(&"else_branch".into()) else {
         return Ok(None);
     };
     let then_resolved: HashSet<_> = then_result.report.resolved.iter().copied().collect();
@@ -631,14 +632,14 @@ fn branch_output_is_resolved(branch: &Graph, output: ValueId, resolved: &HashSet
 /// no formal inputs) and for bodies whose operand types are not yet known.
 fn seed_control_flow_body(
     node: &Node,
-    attr_name: &str,
+    attr: &GraphAttribute,
     body: &mut Graph,
     types: &HashMap<ValueId, TypeInfo>,
     containers: &HashMap<ValueId, ValueType>,
     version: u64,
     interner: &mut SymbolInterner,
 ) {
-    if !node.is_default_domain() || attr_name != "body" {
+    if !node.is_default_domain() || attr.index.is_some() || attr.name != "body" {
         return;
     }
     match node.op_type.as_str() {
@@ -689,13 +690,13 @@ fn seed_sequence_map_body(
 /// keeps the tensor path byte-identical.
 fn body_container_seeds(
     node: &Node,
-    attr_name: &str,
+    attr: &GraphAttribute,
     body: &Graph,
     containers: &HashMap<ValueId, ValueType>,
     version: u64,
 ) -> HashMap<ValueId, ValueType> {
     let mut seeds = HashMap::new();
-    if !node.is_default_domain() || attr_name != "body" {
+    if !node.is_default_domain() || attr.index.is_some() || attr.name != "body" {
         return seeds;
     }
     match node.op_type.as_str() {
@@ -869,11 +870,7 @@ fn set_body_input(body: &mut Graph, vid: ValueId, dtype: DataType, shape: Vec<Di
     if body.try_value(vid).is_none() {
         return;
     }
-    let value = body.value_mut(vid);
-    value.dtype = dtype;
-    value.shape = shape;
-    body.mark_value_type_known(vid);
-    body.mark_value_shape_known(vid);
+    body.value_mut(vid).set_tensor_facts(dtype, shape);
 }
 
 /// Seed a `Loop` body: formal inputs are `(iter_num, cond_in, v_1..v_N)`, bound
@@ -1038,14 +1035,14 @@ fn read_body_output(
 fn infer_loop_outputs(
     graph: &Graph,
     node: &Node,
-    subgraph_results: &HashMap<String, ScopedInference>,
+    subgraph_results: &HashMap<GraphAttribute, ScopedInference>,
     interner: &mut SymbolInterner,
 ) -> Result<Option<Vec<CfOutput>>, ShapeInferError> {
-    let key = (node.id, "body".to_string());
+    let key = (node.id, "body".into());
     let Some(body) = graph.subgraphs.get(&key) else {
         return Ok(None);
     };
-    let Some(result) = subgraph_results.get("body") else {
+    let Some(result) = subgraph_results.get(&"body".into()) else {
         return Ok(None);
     };
     let resolved: HashSet<_> = result.report.resolved.iter().copied().collect();
@@ -1123,15 +1120,15 @@ fn cf_typed(dtype: DataType, shape: TypedShape) -> CfOutput {
 fn infer_scan_outputs(
     graph: &Graph,
     node: &Node,
-    subgraph_results: &HashMap<String, ScopedInference>,
+    subgraph_results: &HashMap<GraphAttribute, ScopedInference>,
     types: &HashMap<ValueId, TypeInfo>,
     interner: &mut SymbolInterner,
 ) -> Result<Option<Vec<CfOutput>>, ShapeInferError> {
-    let key = (node.id, "body".to_string());
+    let key = (node.id, "body".into());
     let Some(body) = graph.subgraphs.get(&key) else {
         return Ok(None);
     };
-    let Some(result) = subgraph_results.get("body") else {
+    let Some(result) = subgraph_results.get(&"body".into()) else {
         return Ok(None);
     };
     let Some(num_scan) = scan_num_scan_inputs(node, body.inputs.len()) else {
@@ -1209,14 +1206,14 @@ fn scan_sequence_length(
 fn infer_sequence_map_outputs(
     graph: &Graph,
     node: &Node,
-    subgraph_results: &HashMap<String, ScopedInference>,
+    subgraph_results: &HashMap<GraphAttribute, ScopedInference>,
     interner: &mut SymbolInterner,
 ) -> Result<Option<Vec<CfOutput>>, ShapeInferError> {
-    let key = (node.id, "body".to_string());
+    let key = (node.id, "body".into());
     let Some(body) = graph.subgraphs.get(&key) else {
         return Ok(None);
     };
-    let Some(result) = subgraph_results.get("body") else {
+    let Some(result) = subgraph_results.get(&"body".into()) else {
         return Ok(None);
     };
     let resolved: HashSet<_> = result.report.resolved.iter().copied().collect();
@@ -1270,6 +1267,9 @@ fn seed_sources(
     }
     // Initializers carry concrete data; capture their shape-data too.
     for (&vid, weight) in &graph.initializers {
+        if graph.inputs.contains(&vid) {
+            continue;
+        }
         if let WeightRef::Inline(t) = weight
             && let Some(sd) = ShapeData::from_tensor(t.dtype, &t.dims, &t.data)
         {
