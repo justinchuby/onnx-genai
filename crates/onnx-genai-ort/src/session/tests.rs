@@ -516,30 +516,24 @@ fn implicit_node_cpu_fallback_is_disabled_unless_explicitly_allowed() {
 
 #[test]
 fn append_chain_error_reports_the_mid_chain_provider_that_failed() {
-    let mut options = SessionOptions::with_execution_provider(ep_selection("coreml"));
-    options.execution_providers[0] = ResolvedEp {
-        selection: ep_selection("webgpu"),
-        caps: EpCapabilities::new("webgpu", HardwareKind::Gpu, None, None, &[]),
-        strategy: ep_compat::AppendStrategy::HostDefault,
-        graph_capture_env: false,
-        transitional_webgpu: false,
-    };
+    // Exercise chain attribution independently of which accelerator EPs the
+    // runtime ships. An available CoreML EP would dereference a null handle.
+    let env = Environment::new("mid-chain-provider-error-test").expect("environment");
+    let mut options = SessionOptions::cpu();
+    let raw = RawSessionOptions::new(&env, &options).expect("valid CPU session options");
+    let missing = "missing-ep-for-append-chain-test";
     options
         .execution_providers
-        .push(resolve_execution_provider(&ep_selection("coreml")));
+        .push(resolve_execution_provider(&ep_selection(missing)));
 
-    let error = append_execution_providers(
-        &Environment::new("mid-chain-provider-error-test").expect("environment"),
-        std::ptr::null_mut(),
-        &options,
-    )
-    .expect_err("the second provider append must fail on this host");
+    let error = append_execution_providers(&env, raw.ptr.as_ptr(), &options)
+        .expect_err("the unsupported second provider must fail on every host");
 
     assert_eq!(error.provider_index, 1);
-    assert_eq!(error.provider_name, "coreml");
+    assert_eq!(error.provider_name, missing);
     assert!(
-        error.source.to_string().contains("CoreMLExecutionProvider"),
-        "failure must be attributed to CoreML, not the working WebGPU prefix: {error:?}"
+        error.source.to_string().contains(missing),
+        "failure must be attributed to the second provider, not the working CPU prefix: {error:?}"
     );
 }
 

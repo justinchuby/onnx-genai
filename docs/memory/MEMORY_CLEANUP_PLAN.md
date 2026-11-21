@@ -180,3 +180,14 @@ branch protection is not bypassed.
 The repo-wide fixture guard caught opset 21 in the new Identity smoke fixture.
 Updated it to the required opset 24, retaining IR 11. Validate the actual CPU
 inference and the complete fixture guard together before the final CI rerun.
+
+
+Expanded local ORT-backed execution exposed a pre-existing host assumption in
+`append_chain_error_reports_the_mid_chain_provider_that_failed`: it passed a null
+session-options handle while assuming CoreML was unavailable. The official macOS
+wheel advertises CoreML, so the test entered the real C API and crashed. Replace
+that setup with owned valid CPU session options and a deliberately unsupported
+second provider. Preserve the chain index/name/source assertions without relying
+on accelerator availability. Complete ORT/server tests now pass: 612 passed,
+zero failed, two existing ignored tests across 17 suites; strict ORT all-target
+Clippy also passes. No runtime algorithm changed in this follow-up.
