@@ -114,6 +114,43 @@ impl ExecutionProvider for PluginExecutionProvider {
             .supports_op(op, opset, shapes, input_dtypes, layouts)
     }
 
+    fn claim_graph(&self, graph: &Graph) -> onnx_runtime_ep_api::Result<Vec<NodeId>> {
+        use onnx_runtime_ep_api::Kernel;
+        let guard = self.compiled.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "plugin compiled-plan lock was poisoned; recreate the session".into(),
+            )
+        })?;
+        let Some(plan) = guard.as_ref() else {
+            return Ok(Vec::new());
+        };
+        graph
+            .nodes
+            .iter()
+            .filter(|(_, node)| is_plugin_fused(node))
+            .filter_map(|(id, node)| {
+                match fusion_id(node).and_then(|index| {
+                    plan.kernel(index).ok_or_else(|| {
+                        EpError::KernelFailed(format!("missing compiled plugin fusion {index}"))
+                    })
+                }) {
+                    Ok(kernel) if kernel.has_kernel_sized_outputs() => Some(Ok(id)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
+    }
+
+    fn get_graph_kernel(
+        &self,
+        request: onnx_runtime_ep_api::GraphKernelRequest<'_>,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn onnx_runtime_ep_api::Kernel>> {
+        self.get_kernel(request.node, shapes, opset)
+    }
+
     fn get_kernel(
         &self,
         op: &Node,

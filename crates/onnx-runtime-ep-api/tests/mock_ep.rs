@@ -312,7 +312,9 @@ fn graph_chain(ops: &[(&str, &str)]) -> FrozenGraph {
 
 fn native_claims(frozen: &FrozenGraph, ep: &MockEp) -> Vec<onnx_runtime_ep_api::SubgraphClaim> {
     let view = frozen.view();
-    onnx_runtime_ep_api::abi::OrtGraphView::new(&view).query_capabilities(ep)
+    onnx_runtime_ep_api::abi::OrtGraphView::new(&view)
+        .query_capabilities(ep)
+        .unwrap()
 }
 
 #[test]

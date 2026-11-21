@@ -499,7 +499,9 @@ pub(crate) struct Executor {
     /// Empty outside an in-progress capture pass.
     pub(super) capture_deferred_frees: Vec<DeviceBuffer>,
     /// Loader-produced (possibly symbolic) shape of every value.
-    pub(super) value_shapes: HashMap<ValueId, Shape>,
+    pub(super) value_shapes: HashMap<ValueId, Option<Shape>>,
+    /// Shape substitution cannot prove runtime ranks for these graphs.
+    pub(super) has_unknown_rank: bool,
     /// Element type of every value.
     pub(super) value_dtypes: HashMap<ValueId, DataType>,
     /// Topologically ordered execution plan (structure only; shapes per run).
@@ -865,7 +867,7 @@ pub(super) struct DecodeBindingSig {
     pub(super) vid: ValueId,
     pub(super) is_input: bool,
     pub(super) dtype: DataType,
-    pub(super) decl_shape: Shape,
+    pub(super) decl_shape: Option<Shape>,
 }
 
 impl DecodePlanMemo {

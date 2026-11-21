@@ -117,6 +117,20 @@ impl Executor {
         let decode_memo_eligible = self.decode_memo_eligible(mode, nested);
         let mut resolved =
             self.prepare_resolved_shapes(&bindings, external, mode, nested, decode_memo_eligible);
+        // Unknown rank is runtime metadata, never an empty scalar declaration.
+        if self.has_unknown_rank {
+            for (name, tensor) in inputs {
+                let value = self.input_index[*name];
+                if self.value_shapes[&value].is_none() {
+                    resolved.insert(value, tensor.shape.clone());
+                }
+            }
+            for (&value, binding) in &external.inputs {
+                if self.value_shapes[&value].is_none() {
+                    resolved.insert(value, binding.shape.clone());
+                }
+            }
+        }
         // Static build and every symbolic/dynamic readiness epoch converge on
         // this fail-closed transition: compile every currently-resolved leaf,
         // publish its executor-scoped producers, then require an honest
@@ -430,6 +444,10 @@ impl Executor {
     }
 
     fn decode_memo_eligible(&self, mode: RunMode, nested: bool) -> bool {
+        if self.has_unknown_rank {
+            return false;
+        }
+
         self.decode_memo_enabled
             && mode == RunMode::Eager
             && !nested

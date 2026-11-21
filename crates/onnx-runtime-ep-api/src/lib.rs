@@ -63,8 +63,9 @@ pub use provider::{
     ExecutorArtifactPending, ExecutorArtifactPolicy, ExecutorArtifactProviderId,
     ExecutorArtifactReadinessEpoch, ExecutorArtifactReport, ExecutorArtifactRequirementState,
     ExecutorArtifactState, ExecutorArtifactUseGuard, ExecutorInstanceId, ExecutorKernelScope,
-    ExecutorRouteResidencyConfig, Fence, HostToDeviceCopier, RawDeviceAllocationSiteStats,
-    SealedDeviceAllocation, StructuralCaptureDecline, WorkspaceAllocation,
+    ExecutorRouteResidencyConfig, Fence, GraphKernelClaims, GraphKernelRequest, GraphKernelScope,
+    HostToDeviceCopier, RawDeviceAllocationSiteStats, SealedDeviceAllocation,
+    StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{

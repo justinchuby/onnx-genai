@@ -2578,6 +2578,7 @@ dependencies = [
  "onnx-runtime-memory-api",
  "onnx-runtime-memory-governor",
  "onnx-runtime-ort-testkit",
+ "onnx-runtime-session",
  "onnx-std",
 ]
 

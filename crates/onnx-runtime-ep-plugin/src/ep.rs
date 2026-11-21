@@ -396,8 +396,18 @@ fn ep_get_capability_inner(
     // the gate off under `session.disable_cpu_ep_fallback=1` are all deleted,
     // so the deferral cannot be reintroduced by overriding a default — there is
     // nothing left to override.
+    let mut graph_kernel_nodes = std::collections::HashSet::new();
     let claims = exported.ep.with(|ep| {
-        ort_view.query_capabilities_filtered(ep, |node| {
+        ort_view.query_capabilities_filtered(ep, |node, graph_kernel| {
+            if graph_kernel {
+                if ep.executor_kernel_scope(view.node(node))
+                    == onnx_runtime_ep_api::ExecutorKernelScope::Required
+                {
+                    return false;
+                }
+                graph_kernel_nodes.insert(view.node(node).id);
+                return true;
+            }
             if is_gpu_ep && !node_inputs_all_routable(&view, node) {
                 return false;
             }
@@ -430,6 +440,13 @@ fn ep_get_capability_inner(
             true
         })
     });
+
+    let claims = match claims {
+        Ok(claims) => claims,
+        Err(error) => {
+            return fail_status(&format!("GetCapability: whole-graph claim failed: {error}"));
+        }
+    };
 
     if claims.is_empty() {
         return ok_status();
@@ -467,6 +484,9 @@ fn ep_get_capability_inner(
         .into_iter()
         .filter(|claim| {
             claim.node_ids.iter().all(|&nid| {
+                if graph_kernel_nodes.contains(&nid) {
+                    return true;
+                }
                 let node = ir_graph.nodes.get(nid);
                 if node.is_none() {
                     return false;
@@ -806,18 +826,44 @@ fn ep_compile_inner(
         };
         let view = onnx_runtime_ir::GraphView::new(ir_graph, &cache);
 
+        let graph_claims = match exported
+            .ep
+            .with(|ep| onnx_runtime_ep_api::GraphKernelClaims::query(ep, ir_graph))
+        {
+            Ok(claims) => claims,
+            Err(error) => {
+                cleanup_partial_infos(out_infos, i);
+                return fail_status(&format!(
+                    "Compile: graph claim validation failed for subgraph {i}: {error}"
+                ));
+            }
+        };
+        let captures = ir_graph.captured_inputs_by_node();
         // Collect kernels for all nodes in the subgraph.
         let mut entries: Vec<crate::compute::CompiledKernelEntry> = Vec::new();
         for node_idx in view.nodes() {
             let node = view.node(node_idx);
+            let graph_kernel = graph_claims.contains(node.id);
+            let kernel_inputs = if graph_kernel {
+                node.inputs_with_captures(captures.get(&node.id).into_iter().flatten().copied())
+            } else {
+                node.inputs.clone()
+            };
+
             // Preserve rank: map each dim to Option<usize> so symbolic dims
             // become None rather than being dropped (which would destroy rank).
-            let shapes_opt: Vec<Vec<Option<usize>>> = view
-                .node_inputs(node_idx)
+            let shapes_opt: Vec<Vec<Option<usize>>> = kernel_inputs
                 .iter()
                 .map(|input| {
                     input
-                        .map(|v| view.value(v).shape.iter().map(|d| d.as_static()).collect())
+                        .map(|v| {
+                            ir_graph
+                                .value(v)
+                                .shape
+                                .iter()
+                                .map(|d| d.as_static())
+                                .collect()
+                        })
                         .unwrap_or_default()
                 })
                 .collect();
@@ -842,7 +888,18 @@ fn ep_compile_inner(
 
             let opset = ir_graph.effective_opset(node).unwrap_or(0);
 
-            match exported.ep.with(|ep| ep.get_kernel(node, &shapes, opset)) {
+            let compiled = exported.ep.with(|ep| {
+                if graph_kernel {
+                    if ep.executor_kernel_scope(node) == onnx_runtime_ep_api::ExecutorKernelScope::Required {
+                        return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!("graph node #{} requires a native executor namespace; it cannot compile in an unscoped ORT callback", node.id.0)));
+                    }
+                    ep.get_graph_kernel(onnx_runtime_ep_api::GraphKernelRequest {
+                        scope: onnx_runtime_ep_api::GraphKernelScope::Unscoped,
+                        graph: ir_graph, node, inputs: &kernel_inputs,
+                    }, &shapes, opset)
+                } else { ep.get_kernel(node, &shapes, opset) }
+            });
+            match compiled {
                 Ok(mut kernel) => {
                     // Tell the kernel which of its inputs are session-lifetime
                     // constants. Without this every kernel sees all inputs as
@@ -851,14 +908,17 @@ fn ep_compile_inner(
                     // the MLAS SQNBit path, which is gated on the same flag)
                     // and `QLinearMatMul` re-packs B, turning a load-time cost
                     // into a per-token cost.
-                    let constant_inputs =
-                        constant_input_flags(&view, node_idx, reader.constant_initializer_names());
+                    let constant_inputs = constant_input_flags(
+                        ir_graph,
+                        &kernel_inputs,
+                        reader.constant_initializer_names(),
+                    );
                     CONSTANT_WEIGHT_INPUTS.fetch_add(
                         constant_inputs.iter().filter(|c| **c).count(),
                         Ordering::Relaxed,
                     );
                     kernel.set_constant_inputs(&constant_inputs);
-                    let num_inputs = view.node_inputs(node_idx).len();
+                    let num_inputs = kernel_inputs.len();
                     let num_outputs = view.node_outputs(node_idx).len();
 
                     // Read per-output declared dtype from the ORT graph's
@@ -917,8 +977,33 @@ fn ep_compile_inner(
 
                     // Determine shape inference strategy using full node
                     // attributes (wired to Deckard's 22 rules).
-                    let shape_inference =
-                        crate::compute::ShapeInference::for_node(node, &shapes_opt, num_outputs);
+                    let shape_inference = if graph_kernel {
+                        if kernel.has_kernel_sized_outputs() {
+                            crate::compute::ShapeInference::KernelSizedOutputs
+                        } else {
+                            let static_shapes = node
+                                .outputs
+                                .iter()
+                                .map(|slot| {
+                                    slot.map_or(Some(Vec::new()), |value| {
+                                        ir_graph.value(value).tensor_shape().and_then(|shape| {
+                                            onnx_runtime_ir::as_static_shape(shape)
+                                        })
+                                    })
+                                })
+                                .collect::<Option<Vec<_>>>();
+                            let Some(static_shapes) = static_shapes else {
+                                cleanup_partial_infos(out_infos, i);
+                                return fail_status(&format!(
+                                    "Compile: graph node #{} ('{}') has unresolved output shapes; its kernel must implement kernel-sized outputs",
+                                    node.id.0, node.op_type
+                                ));
+                            };
+                            crate::compute::ShapeInference::StaticOutputs(static_shapes)
+                        }
+                    } else {
+                        crate::compute::ShapeInference::for_node(node, &shapes_opt, num_outputs)
+                    };
                     if matches!(
                         &shape_inference,
                         crate::compute::ShapeInference::KernelSizedOutputs
@@ -946,11 +1031,10 @@ fn ep_compile_inner(
                     // `Mul(x, x)`-shaped node does the same.
                     let mut ort_input_idx = 0usize;
                     let mut value_to_ort_index: std::collections::HashMap<
-                        onnx_runtime_ir::ValueIndex,
+                        onnx_runtime_ir::ValueId,
                         usize,
                     > = std::collections::HashMap::new();
-                    let input_slots: Vec<Option<usize>> = view
-                        .node_inputs(node_idx)
+                    let input_slots: Vec<Option<usize>> = kernel_inputs
                         .iter()
                         .map(|input| {
                             input.map(|value| {
@@ -1058,15 +1142,16 @@ fn ep_compile_inner(
 /// Absent optional inputs and unnamed values are never constant: there is
 /// nothing to cache and nothing to key a cache on.
 fn constant_input_flags(
-    view: &onnx_runtime_ir::GraphView<'_>,
-    node: NodeIndex,
+    graph: &onnx_runtime_ir::Graph,
+    inputs: &[Option<onnx_runtime_ir::ValueId>],
     constant_initializer_names: &std::collections::HashSet<String>,
 ) -> Vec<bool> {
-    view.node_inputs(node)
+    inputs
         .iter()
         .map(|input| {
             input.is_some_and(|value| {
-                view.value(value)
+                graph
+                    .value(value)
                     .name
                     .as_deref()
                     .is_some_and(|name| constant_initializer_names.contains(name))
@@ -1118,6 +1203,12 @@ fn claim_has_unroutable_internal_output(
     }
     let claimed: std::collections::HashSet<_> = node_ids.iter().copied().collect();
 
+    let mut capture_users: std::collections::HashMap<_, Vec<_>> = std::collections::HashMap::new();
+    for (owner, values) in graph.captured_inputs_by_node() {
+        for value in values {
+            capture_users.entry(value).or_default().push(owner);
+        }
+    }
     for &nid in node_ids {
         let Some(node) = graph.nodes.get(nid) else {
             return true;
@@ -1128,7 +1219,12 @@ fn claim_has_unroutable_internal_output(
             };
             let mut consumed_inside = false;
             let mut consumed_outside = value.is_graph_output;
-            for consumer in value.consumers.nodes() {
+            for consumer in value
+                .consumers
+                .nodes()
+                .into_iter()
+                .chain(capture_users.get(&produced).into_iter().flatten().copied())
+            {
                 if claimed.contains(&consumer) {
                     consumed_inside |= consumer != nid;
                 } else {
@@ -1212,14 +1308,17 @@ fn build_subgraph_routing(
     let mut input_sources: Vec<Vec<NodeInputSource>> = Vec::with_capacity(nodes.len());
     let mut output_sinks: Vec<Vec<NodeOutputSink>> = Vec::with_capacity(nodes.len());
 
+    let captures = graph.captured_inputs_by_node();
     for &node_idx in &nodes {
         // Build input sources.
-        let node_inputs = view.node_inputs(node_idx);
+        let node = view.node(node_idx);
+        let node_inputs =
+            node.inputs_with_captures(captures.get(&node.id).into_iter().flatten().copied());
         let mut sources = Vec::with_capacity(node_inputs.len());
         for input_slot in node_inputs {
             match input_slot {
                 Some(val_idx) => {
-                    let vid = view.value_id(*val_idx);
+                    let vid = val_idx;
                     if let Some(&ort_idx) = input_index.get(&vid) {
                         sources.push(NodeInputSource::Ort(ort_idx));
                     } else if let Some(&buf_idx) = value_to_buffer.get(&vid) {
@@ -2396,7 +2495,11 @@ mod tests {
             ["w".to_owned(), "scales".to_owned()].into_iter().collect();
 
         assert_eq!(
-            super::constant_input_flags(&view, node, &constant_initializers),
+            super::constant_input_flags(
+                view.graph(),
+                &view.node(node).inputs,
+                &constant_initializers
+            ),
             vec![false, true, true, false],
             "weights are constant, the activation is not, and an absent optional \
              input is not"
@@ -2426,7 +2529,11 @@ mod tests {
         let view = GraphView::new(&g, &cache);
         let node = view.nodes().next().expect("one node");
         assert_eq!(
-            super::constant_input_flags(&view, node, &std::collections::HashSet::new()),
+            super::constant_input_flags(
+                view.graph(),
+                &view.node(node).inputs,
+                &std::collections::HashSet::new()
+            ),
             vec![false, false],
             "a producerless value is only constant when ORT says it is an initializer"
         );

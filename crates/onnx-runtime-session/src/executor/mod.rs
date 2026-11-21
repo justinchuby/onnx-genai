@@ -765,6 +765,8 @@ fn record_dense_prefetch_gap(nodes_between: u64) {
 #[derive(Debug)]
 pub(crate) struct NodePlan {
     pub node_id: NodeId,
+    /// Accepted whole-graph claim; compile and dispatch through the provider.
+    pub graph_kernel: bool,
     /// Positional input value ids in ONNX signature order. An omitted optional
     /// input (ONNX empty-string input name → `None` slot) is preserved as
     /// `None` so a later present input is never misread as the omitted one
@@ -921,36 +923,6 @@ fn missing_capture_error(attr_key: &str, name: &str) -> SessionError {
          values that are graph inputs, initializers, or produced by an upstream node in an \
          enclosing graph; '{name}' matches none of these"
     ))
-}
-
-/// Names a graph or any nested body needs from its enclosing lexical scope.
-/// A nested requirement stops propagating when this graph defines that name,
-/// because the nested body will bind the local value at execution time.
-fn required_outer_names(graph: &Graph) -> HashSet<String> {
-    let formal_set: HashSet<ValueId> = graph.inputs.iter().copied().collect();
-    let local_names: HashSet<&str> = graph
-        .values
-        .iter()
-        .filter_map(|(_, value)| value.name.as_deref())
-        .collect();
-    let mut required = HashSet::new();
-    for (vid, value) in graph.values.iter() {
-        if value.producer.is_none()
-            && !formal_set.contains(&vid)
-            && !graph.initializers.contains_key(&vid)
-            && let Some(name) = &value.name
-        {
-            required.insert(name.clone());
-        }
-    }
-    for nested in graph.subgraphs.values() {
-        for name in required_outer_names(nested) {
-            if !local_names.contains(name.as_str()) {
-                required.insert(name);
-            }
-        }
-    }
-    required
 }
 
 impl Drop for Executor {
@@ -1145,3 +1117,6 @@ pub use prefetch::{PrefetchStep, drive_double_buffer, plan_double_buffer};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod graph_kernel_tests;

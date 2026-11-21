@@ -1085,7 +1085,7 @@ mod tests {
         let frozen = FrozenGraph::build(graph).unwrap();
         let view = frozen.view();
         let ep = CpuExecutionProvider::new();
-        let claims = OrtGraphView::new(&view).query_capabilities(&ep);
+        let claims = OrtGraphView::new(&view).query_capabilities(&ep).unwrap();
         assert_eq!(claims.len(), 2);
         assert_eq!(claims[0].node_ids, vec![add]);
         assert_eq!(claims[1].node_ids, vec![relu]);

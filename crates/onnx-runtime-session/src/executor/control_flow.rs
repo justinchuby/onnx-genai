@@ -39,18 +39,7 @@ impl ChildExecutor {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let formal_set: HashSet<ValueId> = body.inputs.iter().copied().collect();
-        let mut capture_names = body
-            .values
-            .iter()
-            .filter_map(|(vid, value)| {
-                (value.producer.is_none()
-                    && !formal_set.contains(&vid)
-                    && !body.initializers.contains_key(&vid))
-                .then(|| value.name.clone())
-                .flatten()
-            })
-            .collect::<Vec<_>>();
+        let mut capture_names = body.required_outer_names().into_iter().collect::<Vec<_>>();
         capture_names.sort();
         let input_names = formal_names
             .iter()
@@ -106,7 +95,7 @@ impl ChildExecutor {
         // imports from their enclosing graph.
         graph.opset_imports = self.inherited_opsets.clone();
 
-        let body_names = graph
+        let mut body_names = graph
             .values
             .iter()
             .filter_map(|(vid, value)| value.name.clone().map(|name| (name, vid)))
@@ -114,13 +103,22 @@ impl ChildExecutor {
 
         // Direct captures become required graph inputs. Local inline
         // initializers stay in `graph.initializers`, preserving their scope.
-        for name in &self.capture_names {
-            let vid = *body_names.get(name).ok_or_else(|| {
-                SessionError::Internal(format!(
-                    "subgraph '{}' lost captured value '{name}'",
-                    self.name
-                ))
-            })?;
+        for (index, name) in self.capture_names.iter().enumerate() {
+            let vid = if let Some(&vid) = body_names.get(name) {
+                vid
+            } else {
+                // A descendant may capture an ancestor name without any direct
+                // read in this scope. Materialize its lexical binding here so
+                // the whole graph offered to the provider is closed over it.
+                let tensor = externals[self.formal_names.len() + index];
+                let vid = graph.create_named_value(
+                    name,
+                    tensor.dtype,
+                    tensor.shape.iter().map(|&dim| Dim::Static(dim)).collect(),
+                );
+                body_names.insert(name.clone(), vid);
+                vid
+            };
             if !graph.inputs.contains(&vid) {
                 graph.add_input(vid);
             }
@@ -134,8 +132,10 @@ impl ChildExecutor {
                 ))
             })?;
             let value = graph.value_mut(vid);
-            value.dtype = tensor.dtype;
-            value.shape = tensor.shape.iter().map(|&dim| Dim::Static(dim)).collect();
+            value.set_tensor_facts(
+                tensor.dtype,
+                tensor.shape.iter().map(|&dim| Dim::Static(dim)).collect(),
+            );
         }
 
         // Seeded formal/capture shapes let inference resolve the body once.
@@ -589,7 +589,7 @@ impl Executor {
             ))
         })?;
 
-        let mut scope_names = required_outer_names(body).into_iter().collect::<Vec<_>>();
+        let mut scope_names = body.required_outer_names().into_iter().collect::<Vec<_>>();
         scope_names.sort();
         let mut captures = HashMap::with_capacity(scope_names.len());
         for name in scope_names {
@@ -785,7 +785,7 @@ impl Executor {
             .graph
             .subgraphs
             .get(&(node.id, attr_key.into()))
-            .map(|body| required_outer_names(body).is_empty())
+            .map(|body| body.required_outer_names().is_empty())
             .unwrap_or(false);
         let prepared = {
             let _s = phase_span!("execif.prepare_subgraph");

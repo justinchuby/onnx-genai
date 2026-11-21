@@ -483,6 +483,104 @@ pub struct KernelSizedOutput {
     pub bytes: Vec<u8>,
 }
 
+/// Validate every returned payload before allocating or publishing any outputs.
+/// Both the native executor and ORT plugin bridge use this contract.
+pub fn validate_kernel_sized_outputs(
+    outputs: &[Option<KernelSizedOutput>],
+    requested_outputs: &[bool],
+    declared_dtypes: &[DataType],
+    context: &str,
+) -> std::result::Result<(), String> {
+    if declared_dtypes.len() != requested_outputs.len() {
+        return Err(format!(
+            "{context}: output dtype metadata has {} slots, expected {}",
+            declared_dtypes.len(),
+            requested_outputs.len()
+        ));
+    }
+    if outputs.len() != requested_outputs.len() {
+        return Err(format!(
+            "{context}: kernel-sized output count mismatch: kernel returned {}, node has {} slots",
+            outputs.len(),
+            requested_outputs.len()
+        ));
+    }
+
+    for (slot, ((output, &requested), &declared_dtype)) in outputs
+        .iter()
+        .zip(requested_outputs)
+        .zip(declared_dtypes)
+        .enumerate()
+    {
+        match (requested, output) {
+            (false, None) => continue,
+            (false, Some(_)) => {
+                return Err(format!(
+                    "{context}: absent output slot {slot} unexpectedly returned bytes"
+                ));
+            }
+            (true, None) => {
+                return Err(format!(
+                    "{context}: present output slot {slot} returned no bytes"
+                ));
+            }
+            (true, Some(output)) => {
+                if declared_dtype == DataType::Undefined {
+                    return Err(format!(
+                        "{context}: present output slot {slot} has no declared dtype"
+                    ));
+                }
+                if output.dtype != declared_dtype {
+                    return Err(format!(
+                        "{context}: kernel-sized output slot {slot} returned dtype {:?}, but the \
+                         graph declares {:?}",
+                        output.dtype, declared_dtype
+                    ));
+                }
+                let element_size = output.dtype.byte_size();
+                if element_size == 0 {
+                    return Err(format!(
+                        "{context}: kernel-sized output slot {slot} has unsupported zero-sized \
+                         dtype {:?}",
+                        output.dtype
+                    ));
+                }
+                let numel = output.shape.iter().try_fold(1usize, |product, &extent| {
+                    if extent > i64::MAX as usize {
+                        return Err(format!(
+                            "{context}: kernel-sized output slot {slot} extent {extent} exceeds \
+                             ORT's i64 shape range"
+                        ));
+                    }
+                    product.checked_mul(extent).ok_or_else(|| {
+                        format!(
+                            "{context}: kernel-sized output slot {slot} shape {:?} overflows usize",
+                            output.shape
+                        )
+                    })
+                })?;
+                let expected_bytes = numel.checked_mul(element_size).ok_or_else(|| {
+                    format!(
+                        "{context}: kernel-sized output slot {slot} byte length overflows usize \
+                         for shape {:?} and dtype {:?}",
+                        output.shape, output.dtype
+                    )
+                })?;
+                if output.bytes.len() != expected_bytes {
+                    return Err(format!(
+                        "{context}: kernel-sized output slot {slot} returned {} bytes, expected \
+                         {expected_bytes} for shape {:?} and dtype {:?}",
+                        output.bytes.len(),
+                        output.shape,
+                        output.dtype
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Where an opted-in kernel produces data-dependent output payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelSizedOutputPolicy {

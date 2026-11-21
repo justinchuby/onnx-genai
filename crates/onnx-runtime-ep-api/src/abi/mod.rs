@@ -5,6 +5,10 @@
 //! raw FFI boundary here so the rest of the native runtime can keep using safe
 //! Rust graph data.
 
+/// Maximum nested-graph depth transported through the ORT callback bridge.
+/// Both import and export reject deeper structures before recursive traversal.
+pub const MAX_GRAPH_NESTING: usize = 128;
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
@@ -373,6 +377,22 @@ impl PluginExecutionPlan {
                 index,
                 calls: AtomicU64::new(0),
                 device_label: Arc::clone(&device_label),
+                dynamic_output_dtypes: claims[index]
+                    .node_ids
+                    .iter()
+                    .any(|node| graph.subgraphs.keys().any(|(owner, _)| owner == node))
+                    .then(|| {
+                        claims[index]
+                            .output_values
+                            .iter()
+                            .map(|&value| {
+                                graph
+                                    .value(value)
+                                    .tensor_dtype()
+                                    .unwrap_or(onnx_runtime_ir::DataType::Undefined)
+                            })
+                            .collect()
+                    }),
             }));
         }
         Ok((claims, Self { inner, kernels }))
@@ -408,8 +428,8 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
     /// excluded node, and re-enters it. Unsupported nodes and merges that would
     /// break convexity split the region into several claims, preserving ORT's
     /// `GetCapability` schedulability contract rather than flattening by EP.
-    pub fn query_capabilities(&self, ep: &dyn ExecutionProvider) -> Vec<SubgraphClaim> {
-        self.query_capabilities_filtered(ep, |_| true)
+    pub fn query_capabilities(&self, ep: &dyn ExecutionProvider) -> Result<Vec<SubgraphClaim>> {
+        self.query_capabilities_filtered(ep, |_, _| true)
     }
 
     /// Like [`Self::query_capabilities`], but additionally requires every claimed
@@ -425,16 +445,18 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
     pub fn query_capabilities_filtered<F>(
         &self,
         ep: &dyn ExecutionProvider,
-        node_admissible: F,
-    ) -> Vec<SubgraphClaim>
+        mut node_admissible: F,
+    ) -> Result<Vec<SubgraphClaim>>
     where
-        F: Fn(NodeIndex) -> bool,
+        F: FnMut(NodeIndex, bool) -> bool,
     {
+        let graph_claims = crate::GraphKernelClaims::query(ep, self.view.graph())?;
         let supported: Vec<_> = self
             .view
             .nodes()
             .filter(|&node| {
-                if !node_admissible(node) {
+                let graph_kernel = graph_claims.contains(self.view.node(node).id);
+                if !node_admissible(node, graph_kernel) {
                     return false;
                 }
                 let opset = self
@@ -442,11 +464,11 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
                     .graph()
                     .effective_opset(self.view.node(node))
                     .unwrap_or(0);
-                ep.supports_node(self.view, node, opset).is_supported()
+                graph_kernel || ep.supports_node(self.view, node, opset).is_supported()
             })
             .collect();
         if supported.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let node_count = self.view.nodes().len();
@@ -467,8 +489,7 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
                 continue;
             }
             for &output in self.view.node_outputs(node).iter().flatten() {
-                for consumer in self.view.consumers(output) {
-                    let neighbor = consumer.node;
+                for neighbor in self.view.dependent_nodes(output) {
                     if !membership[neighbor.as_usize()]
                         || partitions.find(node.as_usize()) == partitions.find(neighbor.as_usize())
                     {
@@ -496,14 +517,14 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
             }
             component.push(node);
         }
-        order
+        Ok(order
             .into_iter()
             .map(|root| {
                 let mut component = components.remove(&root).expect("root has a component");
                 component.sort_unstable();
                 self.claim_for_component(&component)
             })
-            .collect()
+            .collect())
     }
 
     /// Whether fusing the partitions containing `left` and `right` keeps every
@@ -538,8 +559,8 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
         for node in self.view.nodes() {
             let from = partitions.find(node.as_usize());
             for &output in self.view.node_outputs(node).iter().flatten() {
-                for consumer in self.view.consumers(output) {
-                    let to = partitions.find(consumer.node.as_usize());
+                for consumer in self.view.dependent_nodes(output) {
+                    let to = partitions.find(consumer.as_usize());
                     if from != to && edges.insert((from, to)) {
                         successors.entry(from).or_default().push(to);
                         *in_degree.entry(to).or_insert(0) += 1;
@@ -577,7 +598,7 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
         let mut inputs = Vec::<ValueIndex>::new();
         let mut outputs = Vec::<ValueIndex>::new();
         for &node in nodes {
-            for &input in self.view.node_inputs(node).iter().flatten() {
+            for input in self.view.node_dependencies(node) {
                 if self
                     .view
                     .producer(input)
@@ -590,9 +611,8 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
             for &output in self.view.node_outputs(node).iter().flatten() {
                 let crosses_partition = self
                     .view
-                    .consumers(output)
-                    .iter()
-                    .any(|use_| !membership[use_.node.as_usize()]);
+                    .dependent_nodes(output)
+                    .any(|user| !membership[user.as_usize()]);
                 if (crosses_partition || self.view.value(output).is_graph_output)
                     && !outputs.contains(&output)
                 {

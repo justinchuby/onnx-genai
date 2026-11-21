@@ -200,7 +200,7 @@ fn evaluate(spec: &DsaSpec) -> Capability {
     // with the direct `supports_node` claim (single-node graph), and the
     // combined predicate is what ORT keeps at session load.
     let ort_view = OrtGraphView::new(&view);
-    let trait_claims = ort_view.query_capabilities(&ep);
+    let trait_claims = ort_view.query_capabilities(&ep).unwrap();
     assert_eq!(
         trait_claims.is_empty(),
         !trait_supported,

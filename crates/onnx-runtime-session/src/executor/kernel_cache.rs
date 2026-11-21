@@ -1074,6 +1074,7 @@ impl KernelCache {
         artifact_readiness: &mut ProviderArtifactReadiness,
         ep: &dyn ExecutionProvider,
         graph_tokens: [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT],
+        graph_request: Option<onnx_runtime_ep_api::GraphKernelRequest<'_>>,
     ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
         let key = KernelKey {
             node: node_id.0,
@@ -1102,8 +1103,9 @@ impl KernelCache {
                 .map(|s| s.iter().map(|&d| Dim::Static(d)).collect())
                 .collect();
             let layouts = vec![TensorLayout::contiguous(); input_shapes.len()];
-            if let KernelMatch::Unsupported { reason } =
-                ep.supports_op(node, opset, &shape_dims, input_dtypes, &layouts)
+            if graph_request.is_none()
+                && let KernelMatch::Unsupported { reason } =
+                    ep.supports_op(node, opset, &shape_dims, input_dtypes, &layouts)
             {
                 return Err(SessionError::unsupported_op(
                     node,
@@ -1113,14 +1115,18 @@ impl KernelCache {
                     reason,
                 ));
             }
-            let mut kernel = match ep.get_kernel_for_executor(
-                artifact_config.provider(),
-                artifact_config.executor(),
-                artifact_config.generation(),
-                node,
-                input_shapes,
-                opset,
-            ) {
+            let compiled = match graph_request {
+                Some(request) => ep.get_graph_kernel(request, input_shapes, opset),
+                None => ep.get_kernel_for_executor(
+                    artifact_config.provider(),
+                    artifact_config.executor(),
+                    artifact_config.generation(),
+                    node,
+                    input_shapes,
+                    opset,
+                ),
+            };
+            let mut kernel = match compiled {
                 Ok(kernel) => kernel,
                 Err(EpError::NoEpForOp {
                     domain,

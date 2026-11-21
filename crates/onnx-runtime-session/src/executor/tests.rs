@@ -778,6 +778,7 @@ fn readiness_exhaustion_rejects_before_kernel_publication_and_stays_exhausted() 
             &mut readiness,
             &ep,
             [None; DeviceGraphSlot::COUNT],
+            None,
         ) {
             Ok(_) => panic!("readiness exhaustion must fail closed"),
             Err(error) => error,
@@ -2199,7 +2200,12 @@ fn build_identity_capture_fixture() -> (Executor, Vec<KernelKey>, HashMap<ValueI
     let resolved = executor
         .value_shapes
         .iter()
-        .filter_map(|(&value, shape)| as_static_shape(shape).map(|shape| (value, shape)))
+        .filter_map(|(&value, shape)| {
+            shape
+                .as_ref()
+                .and_then(|shape| as_static_shape(shape))
+                .map(|shape| (value, shape))
+        })
         .collect::<HashMap<_, _>>();
     let keys = executor
         .plan
@@ -2506,7 +2512,12 @@ fn ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines() {
     let mut resolved = executor
         .value_shapes
         .iter()
-        .filter_map(|(&value, shape)| as_static_shape(shape).map(|shape| (value, shape)))
+        .filter_map(|(&value, shape)| {
+            shape
+                .as_ref()
+                .and_then(|shape| as_static_shape(shape))
+                .map(|shape| (value, shape))
+        })
         .collect::<HashMap<_, _>>();
     let keys = executor
         .plan
@@ -8395,7 +8406,8 @@ fn coverage_collector_surfaces_ep_decline_reason() {
     )
     .unwrap();
     let mut issues = Vec::new();
-    collect_cuda_coverage_issues(&graph, &graph, &ep, artifact_config, "graph", &mut issues);
+    collect_cuda_coverage_issues(&graph, &graph, &ep, artifact_config, "graph", &mut issues)
+        .unwrap();
 
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].op_type, "NotRegistered");
@@ -8463,6 +8475,7 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
     .unwrap();
     let report = || {
         cuda_fallback_report(&graph, &ep, artifact_config)
+            .unwrap()
             .expect("CUDA declines must produce a fallback report")
             .to_string()
     };
@@ -12759,7 +12772,7 @@ fn prepare_workspace_binds_unresolved_context_axis_to_kv_capacity() {
         ],
     );
     exec.value_shapes
-        .insert(v, exec.graph.value(v).shape.clone());
+        .insert(v, exec.graph.value(v).tensor_shape().cloned());
     // Only the KV axis is bound (to physical capacity 2048); `v_seq` is unbound.
     let mut symbols = HashMap::new();
     symbols.insert(kv_seq, 2048usize);
@@ -12793,7 +12806,7 @@ fn prepare_workspace_context_axis_never_under_reserves_below_declared_max() {
         vec![Dim::Static(1), Dim::Symbolic(v_seq), Dim::Static(16)],
     );
     exec.value_shapes
-        .insert(v, exec.graph.value(v).shape.clone());
+        .insert(v, exec.graph.value(v).tensor_shape().cloned());
     let mut symbols = HashMap::new();
     symbols.insert(kv_seq, 2048usize);
     let node = Node::new(NodeId(1), "Attention", vec![Some(v)], vec![]);
@@ -12823,7 +12836,7 @@ fn prepare_workspace_binds_unresolved_axis_to_configured_max() {
         vec![Dim::Static(2), Dim::Symbolic(seq), Dim::Static(64)],
     );
     exec.value_shapes
-        .insert(v, exec.graph.value(v).shape.clone());
+        .insert(v, exec.graph.value(v).tensor_shape().cloned());
     let symbols = HashMap::new();
     let node = Node::new(NodeId(9), "Attention", vec![Some(v)], vec![]);
     let resolved = exec
@@ -12851,7 +12864,7 @@ fn prepare_workspace_fails_on_unresolved_unbounded_axis() {
         vec![Dim::Static(4), Dim::Symbolic(mystery)],
     );
     exec.value_shapes
-        .insert(v, exec.graph.value(v).shape.clone());
+        .insert(v, exec.graph.value(v).tensor_shape().cloned());
     let symbols = HashMap::new();
     let node = Node::new(NodeId(7), "Attention", vec![Some(v)], vec![]);
     let err = exec
@@ -12880,7 +12893,7 @@ fn prepare_workspace_exact_resolution_is_unchanged() {
         vec![Dim::Static(1), Dim::Symbolic(seq), Dim::Static(8)],
     );
     exec.value_shapes
-        .insert(v, exec.graph.value(v).shape.clone());
+        .insert(v, exec.graph.value(v).tensor_shape().cloned());
     let mut symbols = HashMap::new();
     symbols.insert(seq, 12usize);
     let node = Node::new(NodeId(3), "Attention", vec![Some(v)], vec![]);
@@ -12963,7 +12976,7 @@ fn prepare_workspace_resolves_reshape_flatten_chain_exactly() {
     )
     .unwrap();
     exec.value_shapes
-        .insert(cast, exec.graph.value(cast).shape.clone());
+        .insert(cast, exec.graph.value(cast).tensor_shape().cloned());
     let mut symbols = HashMap::new();
     symbols.insert(batch, 1);
     symbols.insert(seq, 5);
@@ -13423,7 +13436,7 @@ fn prepare_workspace_resolves_deepseek_additive_mask_query_axis_exactly() {
         mask,
     ] {
         exec.value_shapes
-            .insert(value, exec.graph.value(value).shape.clone());
+            .insert(value, exec.graph.value(value).tensor_shape().cloned());
     }
     let mut symbols = HashMap::new();
     symbols.insert(batch, 1);

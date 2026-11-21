@@ -55,12 +55,75 @@ impl OutboundGraphReader {
     /// `graph_ptr` must be a valid `OrtGraph*` from ORT, and the host ORT API
     /// must have been initialized via [`crate::status::set_host_api`].
     pub unsafe fn from_ort_graph(graph_ptr: *const ort::OrtGraph) -> Result<Self, String> {
+        unsafe { Self::from_ort_graph_at_depth(graph_ptr, 0) }
+    }
+
+    unsafe fn from_ort_graph_at_depth(
+        graph_ptr: *const ort::OrtGraph,
+        depth: usize,
+    ) -> Result<Self, String> {
+        if graph_ptr.is_null() {
+            return Err("cannot read ORT graph: graph pointer is null; pass a live graph".into());
+        }
+        if depth > onnx_runtime_ep_api::abi::MAX_GRAPH_NESTING {
+            return Err(format!(
+                "ORT graph nesting depth {depth} exceeds supported import limit {}; reduce nested graph depth",
+                onnx_runtime_ep_api::abi::MAX_GRAPH_NESTING
+            ));
+        }
         let api = crate::status::host_api();
         if api.is_null() {
             return Err("host ORT API not initialized".into());
         }
 
         let mut ir_graph = Graph::new();
+        let mut ir_version = 0;
+        Self::check(unsafe {
+            ((*api)
+                .Graph_GetOnnxIRVersion
+                .ok_or("Graph_GetOnnxIRVersion is null")?)(graph_ptr, &mut ir_version)
+        })?;
+        if ir_version > 0 {
+            ir_graph.ir_version = Some(ir_version);
+        }
+        let mut num_opsets = 0;
+        Self::check(unsafe {
+            ((*api)
+                .Graph_GetNumOperatorSets
+                .ok_or("Graph_GetNumOperatorSets is null")?)(graph_ptr, &mut num_opsets)
+        })?;
+        let mut domains = vec![ptr::null(); num_opsets];
+        let mut versions = vec![0; num_opsets];
+        Self::check(unsafe {
+            ((*api)
+                .Graph_GetOperatorSets
+                .ok_or("Graph_GetOperatorSets is null")?)(
+                graph_ptr,
+                domains.as_mut_ptr(),
+                versions.as_mut_ptr(),
+                num_opsets,
+            )
+        })?;
+        for (domain, version) in domains.into_iter().zip(versions) {
+            if domain.is_null() || version <= 0 {
+                return Err(format!(
+                    "graph returned a null opset domain or invalid version {version}; provide valid model operator-set metadata"
+                ));
+            }
+            let domain = unsafe { CStr::from_ptr(domain) }
+                .to_str()
+                .map_err(|error| format!("opset domain is not UTF-8: {error}"))?
+                .to_owned();
+            if ir_graph
+                .opset_imports
+                .insert(domain.clone(), version as u64)
+                .is_some()
+            {
+                return Err(format!(
+                    "graph repeats opset domain '{domain}'; provide one import per domain"
+                ));
+            }
+        }
         let mut ort_index_to_node_id = Vec::new();
 
         // Get nodes.
@@ -97,8 +160,8 @@ impl OutboundGraphReader {
             if info.is_null() {
                 continue;
             }
-            let (name, dtype, shape) = unsafe { Self::read_value_info(api, *info)? };
-            let vid = ir_graph.create_named_value(&name, dtype, shape);
+            let (name, dtype, shape) = unsafe { Self::read_value_info(api, *info, &mut ir_graph)? };
+            let vid = Self::create_value(&mut ir_graph, &name, dtype, shape);
             ir_graph.add_input(vid);
             value_map.insert(name, vid);
         }
@@ -129,9 +192,10 @@ impl OutboundGraphReader {
                     out_names.push((String::new(), DataType::Undefined));
                     continue;
                 }
-                let (name, dtype, shape) = unsafe { Self::read_value_info(api, *info)? };
+                let (name, dtype, shape) =
+                    unsafe { Self::read_value_info(api, *info, &mut ir_graph)? };
                 if !name.is_empty() && !value_map.contains_key(&name) {
-                    let vid = ir_graph.create_named_value(&name, dtype, shape);
+                    let vid = Self::create_value(&mut ir_graph, &name, dtype, shape);
                     value_map.insert(name.clone(), vid);
                 }
                 out_names.push((name, dtype));
@@ -153,12 +217,41 @@ impl OutboundGraphReader {
                     in_names.push(String::new());
                     continue;
                 }
-                let (name, dtype, shape) = unsafe { Self::read_value_info(api, *info)? };
+                let (name, dtype, shape) =
+                    unsafe { Self::read_value_info(api, *info, &mut ir_graph)? };
                 if !name.is_empty() && !value_map.contains_key(&name) {
-                    let vid = ir_graph.create_named_value(&name, dtype, shape);
+                    let vid = Self::create_value(&mut ir_graph, &name, dtype, shape);
                     value_map.insert(name.clone(), vid);
                 }
                 in_names.push(name);
+            }
+            let get_implicit_count = unsafe { (*api).Node_GetNumImplicitInputs }
+                .ok_or("OrtApi.Node_GetNumImplicitInputs is null; lexical dependencies are required for whole-graph claims")?;
+            let mut implicit_count = 0;
+            Self::check(unsafe { get_implicit_count(*ort_node, &mut implicit_count) })?;
+            if implicit_count > 0 {
+                let get_implicit = unsafe { (*api).Node_GetImplicitInputs }.ok_or(
+                    "OrtApi.Node_GetImplicitInputs is null; cannot import lexical captures",
+                )?;
+                let mut implicit = vec![ptr::null(); implicit_count];
+                Self::check(unsafe {
+                    get_implicit(*ort_node, implicit.as_mut_ptr(), implicit_count)
+                })?;
+                for info in implicit {
+                    if info.is_null() {
+                        return Err(
+                            "ORT implicit input pointer is null; return live capture descriptors"
+                                .into(),
+                        );
+                    }
+                    let (name, dtype, shape) =
+                        unsafe { Self::read_value_info(api, info, &mut ir_graph)? };
+                    if !name.is_empty() {
+                        value_map.entry(name.clone()).or_insert_with(|| {
+                            Self::create_value(&mut ir_graph, &name, dtype, shape)
+                        });
+                    }
+                }
             }
             node_input_names.push(in_names);
         }
@@ -214,9 +307,8 @@ impl OutboundGraphReader {
             }
 
             // Read node attributes from ORT and populate IR node.
-            if let Ok(attrs) = unsafe { Self::read_node_attributes(api, *ort_node) } {
-                node.attributes = attrs;
-            }
+            node.attributes = unsafe { Self::read_node_attributes(api, *ort_node) }
+                .map_err(|reason| format!("node #{i} ('{op_type}') attributes: {reason}"))?;
 
             // For opset-13+ Unsqueeze/Squeeze: if axes attribute is missing but
             // input[1] is a constant initializer, inject it as an attribute so
@@ -232,6 +324,57 @@ impl OutboundGraphReader {
             }
 
             let nid = ir_graph.insert_node(node);
+            // Keep GRAPH attributes and their executable bodies in the same
+            // owning scope. The provider receives this complete recursive graph.
+            let get_count = unsafe { (*api).Node_GetNumSubgraphs }.ok_or(
+                "OrtApi.Node_GetNumSubgraphs is null; a complete graph is required for EP claim",
+            )?;
+            let mut body_count = 0;
+            Self::check(unsafe { get_count(*ort_node, &mut body_count) })?;
+            if body_count > 0 {
+                let get_bodies = unsafe { (*api).Node_GetSubgraphs }.ok_or(
+                    "OrtApi.Node_GetSubgraphs is null; control-flow bodies cannot be imported",
+                )?;
+                let mut bodies = vec![ptr::null(); body_count];
+                let mut names = vec![ptr::null(); body_count];
+                Self::check(unsafe {
+                    get_bodies(
+                        *ort_node,
+                        bodies.as_mut_ptr(),
+                        body_count,
+                        names.as_mut_ptr(),
+                    )
+                })?;
+                let mut seen = HashSet::new();
+                for (body, name) in bodies.into_iter().zip(names) {
+                    if name.is_null() {
+                        return Err(format!(
+                            "node #{i} ('{op_type}') returned a subgraph without an attribute name; supply named graph attributes"
+                        ));
+                    }
+                    let name = unsafe { CStr::from_ptr(name) }
+                        .to_str()
+                        .map_err(|err| {
+                            format!("node #{i} graph attribute name is not UTF-8: {err}")
+                        })?
+                        .to_owned();
+                    if !seen.insert(name.clone()) {
+                        return Err(format!(
+                            "node #{i} graph attribute '{name}' is repeated; the ORT graph-name API cannot distinguish GRAPH-list elements losslessly; use native graph compilation"
+                        ));
+                    }
+                    let body = unsafe { Self::from_ort_graph_at_depth(body, depth + 1) }
+                        .map_err(|reason| {
+                            format!("node #{i} ('{op_type}') subgraph '{name}': {reason}")
+                        })?
+                        .graph;
+                    ir_graph
+                        .node_mut(nid)
+                        .attributes
+                        .insert(name.clone(), Attribute::Graph(Box::new(body.clone())));
+                    ir_graph.subgraphs.insert((nid, name.into()), body);
+                }
+            }
             for (slot, (name, dtype)) in node_output_names[i].iter().enumerate() {
                 if name.is_empty() {
                     absent_output_dtypes.insert((nid, slot), *dtype);
@@ -245,16 +388,63 @@ impl OutboundGraphReader {
             if info.is_null() {
                 continue;
             }
-            let (name, _dtype, _shape) = unsafe { Self::read_value_info(api, *info)? };
-            if let Some(&vid) = value_map.get(&name) {
-                ir_graph.add_output(vid);
-            }
+            let (name, dtype, shape) = unsafe { Self::read_value_info(api, *info, &mut ir_graph)? };
+            let vid = *value_map
+                .entry(name.clone())
+                .or_insert_with(|| Self::create_value(&mut ir_graph, &name, dtype, shape));
+            ir_graph.add_output(vid);
         }
 
-        // Set default opset.
-        ir_graph
-            .opset_imports
-            .insert(String::new(), ort::ORT_API_VERSION as u64);
+        // ORT queries nested scopes independently as well as their owners.
+        // Close only the callback root over ancestor captures; recursively
+        // imported bodies retain their true ONNX formal arity and lexical links.
+        if depth == 0 {
+            let get_parent = unsafe { (*api).Graph_GetParentNode }
+                .ok_or("OrtApi.Graph_GetParentNode is null; cannot resolve callback graph scope")?;
+            let mut parent = ptr::null();
+            Self::check(unsafe { get_parent(graph_ptr, &mut parent) })?;
+            if !parent.is_null() {
+                let mut required = ir_graph.required_outer_names();
+                let mut count = 0;
+                Self::check(unsafe {
+                    ((*api)
+                        .Node_GetNumImplicitInputs
+                        .ok_or("Node_GetNumImplicitInputs is null")?)(
+                        parent, &mut count
+                    )
+                })?;
+                let mut infos = vec![ptr::null(); count];
+                Self::check(unsafe {
+                    ((*api)
+                        .Node_GetImplicitInputs
+                        .ok_or("Node_GetImplicitInputs is null")?)(
+                        parent,
+                        infos.as_mut_ptr(),
+                        count,
+                    )
+                })?;
+                for info in infos {
+                    if info.is_null() {
+                        return Err("enclosing node returned null implicit-input metadata; provide every lexical capture".into());
+                    }
+                    let (name, dtype, shape) =
+                        unsafe { Self::read_value_info(api, info, &mut ir_graph) }?;
+                    if required.remove(&name) {
+                        let capture = *value_map.entry(name.clone()).or_insert_with(|| {
+                            Self::create_value(&mut ir_graph, &name, dtype, shape)
+                        });
+                        ir_graph.add_input(capture);
+                    }
+                }
+                if !required.is_empty() {
+                    let mut names = required.into_iter().collect::<Vec<_>>();
+                    names.sort();
+                    return Err(format!(
+                        "callback subgraph has unresolved ancestor captures {names:?}; expose them through the enclosing node's implicit inputs"
+                    ));
+                }
+            }
+        }
 
         Ok(Self {
             graph: ir_graph,
@@ -264,6 +454,20 @@ impl OutboundGraphReader {
             constant_initializer_names,
             absent_output_dtypes,
         })
+    }
+
+    fn create_value(
+        graph: &mut Graph,
+        name: &str,
+        dtype: DataType,
+        shape: Option<Shape>,
+    ) -> ValueId {
+        let known = shape.is_some();
+        let value = graph.create_named_value(name, dtype, shape.unwrap_or_default());
+        if !known {
+            graph.mark_value_shape_unknown(value);
+        }
+        value
     }
 
     /// Get the IR graph for capability discovery.
@@ -485,7 +689,8 @@ impl OutboundGraphReader {
     unsafe fn read_value_info(
         api: *const ort::OrtApi,
         info: *const ort::OrtValueInfo,
-    ) -> Result<(String, DataType, Shape), String> {
+        graph: &mut Graph,
+    ) -> Result<(String, DataType, Option<Shape>), String> {
         // Get name.
         let get_name =
             unsafe { (*api).GetValueInfoName }.ok_or("OrtApi.GetValueInfoName is null")?;
@@ -508,7 +713,7 @@ impl OutboundGraphReader {
         Self::check(status)?;
 
         if type_info.is_null() {
-            return Ok((name, DataType::Undefined, Vec::new()));
+            return Ok((name, DataType::Undefined, None));
         }
 
         // Cast to tensor info.
@@ -519,7 +724,7 @@ impl OutboundGraphReader {
         Self::check(status)?;
 
         if tensor_info.is_null() {
-            return Ok((name, DataType::Undefined, Vec::new()));
+            return Ok((name, DataType::Undefined, None));
         }
 
         // Get element type.
@@ -530,6 +735,11 @@ impl OutboundGraphReader {
         Self::check(status)?;
         let dtype = DataType::from_onnx(elem_type as i32).unwrap_or(DataType::Undefined);
 
+        let has_shape = unsafe { (*api).TensorTypeAndShape_HasShape }
+            .ok_or("OrtApi.TensorTypeAndShape_HasShape is null; unknown rank must be distinguishable from a scalar")?;
+        if !unsafe { has_shape(tensor_info) } {
+            return Ok((name, dtype, None));
+        }
         // Get dimensions.
         let get_dims_count =
             unsafe { (*api).GetDimensionsCount }.ok_or("OrtApi.GetDimensionsCount is null")?;
@@ -543,19 +753,41 @@ impl OutboundGraphReader {
             let status = unsafe { get_dims(tensor_info, dims.as_mut_ptr(), dims_count) };
             Self::check(status)?;
 
-            Shape::from(
-                dims.iter()
-                    .map(|&d| {
-                        if d < 0 {
-                            onnx_runtime_ir::Dim::Symbolic(onnx_runtime_ir::SymbolId(0))
+            let mut names = vec![ptr::null(); dims_count];
+            if dims.iter().any(|&dim| dim < 0) {
+                let get_symbols = unsafe { (*api).GetSymbolicDimensions }.ok_or(
+                    "OrtApi.GetSymbolicDimensions is null; symbolic identities cannot be imported",
+                )?;
+                Self::check(unsafe { get_symbols(tensor_info, names.as_mut_ptr(), dims_count) })?;
+            }
+            let mut shape = Vec::with_capacity(dims_count);
+            for (dim, symbolic_name) in dims.into_iter().zip(names) {
+                if dim >= 0 {
+                    shape.push(onnx_runtime_ir::Dim::Static(dim as usize));
+                } else {
+                    let symbol = if symbolic_name.is_null() {
+                        graph.create_symbol(None)
+                    } else {
+                        let name =
+                            unsafe { CStr::from_ptr(symbolic_name) }
+                                .to_str()
+                                .map_err(|error| {
+                                    format!(
+                                        "value '{name}' symbolic dimension is not UTF-8: {error}"
+                                    )
+                                })?;
+                        if name.is_empty() {
+                            graph.create_symbol(None)
                         } else {
-                            onnx_runtime_ir::Dim::Static(d as usize)
+                            graph.intern_symbol(name)
                         }
-                    })
-                    .collect::<Vec<_>>(),
-            )
+                    };
+                    shape.push(onnx_runtime_ir::Dim::Symbolic(symbol));
+                }
+            }
+            Some(shape)
         } else {
-            Vec::new()
+            Some(Vec::new())
         };
 
         Ok((name, dtype, shape))
@@ -593,7 +825,7 @@ impl OutboundGraphReader {
 
         for &attr_ptr in &attr_ptrs {
             if attr_ptr.is_null() {
-                continue;
+                return Err("Node_GetAttributes returned a null attribute; expose complete attribute metadata".into());
             }
 
             // Get name.
@@ -601,18 +833,20 @@ impl OutboundGraphReader {
             let status = unsafe { get_name(attr_ptr, &mut name_ptr) };
             Self::check(status)?;
             if name_ptr.is_null() {
-                continue;
+                return Err("OpAttr_GetName returned null; supply a named attribute".into());
             }
             let name = unsafe { CStr::from_ptr(name_ptr) }
-                .to_string_lossy()
-                .into_owned();
+                .to_str()
+                .map_err(|error| format!("attribute name is not UTF-8: {error}"))?
+                .to_owned();
 
             // Get type.
             let mut attr_type: ort::OrtOpAttrType = 0;
             let status = unsafe { get_type(attr_ptr, &mut attr_type) };
             Self::check(status)?;
 
-            let attr_value = unsafe { Self::read_attr_value(read_attr, attr_ptr, attr_type) };
+            let attr_value = unsafe { Self::read_attr_value(api, read_attr, attr_ptr, attr_type) }
+                .map_err(|reason| format!("attribute '{name}': {reason}"))?;
 
             if let Some(value) = attr_value {
                 result.insert(name, value);
@@ -622,8 +856,10 @@ impl OutboundGraphReader {
         Ok(result)
     }
 
-    /// Read a single attribute value from its OrtOpAttr pointer.
+    /// Read attribute payloads exactly; GRAPH attributes are imported separately
+    /// through Node_GetSubgraphs, preserving their owning scope.
     unsafe fn read_attr_value(
+        api: *const ort::OrtApi,
         read_attr: unsafe extern "C" fn(
             *const ort::OrtOpAttr,
             ort::OrtOpAttrType,
@@ -633,128 +869,215 @@ impl OutboundGraphReader {
         ) -> *mut ort::OrtStatus,
         attr_ptr: *const ort::OrtOpAttr,
         attr_type: ort::OrtOpAttrType,
-    ) -> Option<Attribute> {
-        match attr_type {
-            ort::ORT_OP_ATTR_INT => {
-                let mut val: i64 = 0;
-                let mut out_size = 0usize;
-                let status = unsafe {
-                    read_attr(
-                        attr_ptr,
-                        ort::ORT_OP_ATTR_INT,
-                        (&raw mut val).cast(),
-                        std::mem::size_of::<i64>(),
-                        &mut out_size,
-                    )
-                };
-                if status.is_null() {
-                    Some(Attribute::Int(val))
-                } else {
-                    Self::check(status).ok();
-                    None
-                }
-            }
-            ort::ORT_OP_ATTR_INTS => {
-                // First call with zero len to get required size.
-                let mut required = 0usize;
-                let status = unsafe {
-                    read_attr(
-                        attr_ptr,
-                        ort::ORT_OP_ATTR_INTS,
-                        ptr::null_mut(),
-                        0,
-                        &mut required,
-                    )
-                };
-                // Status is non-null (buffer too small) but `required` has the count.
-                if !status.is_null() {
-                    Self::check(status).ok();
-                }
-                if required == 0 {
-                    return Some(Attribute::Ints(Vec::new()));
-                }
-                let count = required / std::mem::size_of::<i64>();
-                let mut buf: Vec<i64> = vec![0; count];
-                let mut out_size = 0usize;
-                let status = unsafe {
-                    read_attr(
-                        attr_ptr,
-                        ort::ORT_OP_ATTR_INTS,
-                        buf.as_mut_ptr().cast(),
-                        required,
-                        &mut out_size,
-                    )
-                };
-                if status.is_null() {
-                    Some(Attribute::Ints(buf))
-                } else {
-                    Self::check(status).ok();
-                    None
-                }
-            }
-            ort::ORT_OP_ATTR_FLOAT => {
-                let mut val: f32 = 0.0;
-                let mut out_size = 0usize;
-                let status = unsafe {
-                    read_attr(
-                        attr_ptr,
-                        ort::ORT_OP_ATTR_FLOAT,
-                        (&raw mut val).cast(),
-                        std::mem::size_of::<f32>(),
-                        &mut out_size,
-                    )
-                };
-                if status.is_null() {
-                    Some(Attribute::Float(val))
-                } else {
-                    Self::check(status).ok();
-                    None
-                }
-            }
-            ort::ORT_OP_ATTR_STRING => {
-                // First call to get required size.
-                let mut required = 0usize;
-                let status = unsafe {
-                    read_attr(
-                        attr_ptr,
-                        ort::ORT_OP_ATTR_STRING,
-                        ptr::null_mut(),
-                        0,
-                        &mut required,
-                    )
-                };
-                if !status.is_null() {
-                    Self::check(status).ok();
-                }
-                if required == 0 {
-                    return Some(Attribute::String(Vec::new()));
-                }
-                let mut buf: Vec<u8> = vec![0; required];
-                let mut out_size = 0usize;
-                let status = unsafe {
-                    read_attr(
-                        attr_ptr,
-                        ort::ORT_OP_ATTR_STRING,
-                        buf.as_mut_ptr().cast(),
-                        required,
-                        &mut out_size,
-                    )
-                };
-                if status.is_null() {
-                    // Trim trailing null if present.
-                    if buf.last() == Some(&0) {
-                        buf.pop();
-                    }
-                    Some(Attribute::String(buf))
-                } else {
-                    Self::check(status).ok();
-                    None
-                }
-            }
-            // FLOATS, STRINGS, GRAPH, TENSOR — not needed for shape inference;
-            // skip gracefully.
-            _ => None,
+    ) -> Result<Option<Attribute>, String> {
+        if attr_type == ort::ORT_OP_ATTR_GRAPH {
+            return Ok(None);
         }
+        if attr_type == ort::ORT_OP_ATTR_TENSOR {
+            return unsafe { Self::read_tensor_attribute(api, attr_ptr) }
+                .map(|value| Some(Attribute::Tensor(value)));
+        }
+        let mut required = 0;
+        let status = unsafe { read_attr(attr_ptr, attr_type, ptr::null_mut(), 0, &mut required) };
+        if required == 0 {
+            Self::check(status)?;
+        } else {
+            // The size query convention returns buffer-too-small with the size.
+            let _ = Self::check(status);
+        }
+        // u64 storage provides alignment for every supported scalar/list type.
+        let mut storage = vec![0u64; required.div_ceil(8)];
+        let mut written = 0;
+        Self::check(unsafe {
+            read_attr(
+                attr_ptr,
+                attr_type,
+                storage.as_mut_ptr().cast(),
+                required,
+                &mut written,
+            )
+        })?;
+        if written != required {
+            return Err(format!(
+                "attribute size changed while reading: expected {required} bytes, got {written}"
+            ));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), required) };
+        let malformed =
+            || format!("attribute type {attr_type} has invalid payload length {required}");
+        let value = match attr_type {
+            ort::ORT_OP_ATTR_INT if required == 8 => Attribute::Int(i64::from_ne_bytes(
+                bytes.try_into().map_err(|_| malformed())?,
+            )),
+            ort::ORT_OP_ATTR_FLOAT if required == 4 => Attribute::Float(f32::from_ne_bytes(
+                bytes.try_into().map_err(|_| malformed())?,
+            )),
+            ort::ORT_OP_ATTR_INTS if required.is_multiple_of(8) => Attribute::Ints(
+                bytes
+                    .chunks_exact(8)
+                    .map(|b| i64::from_ne_bytes(b.try_into().expect("exact chunk")))
+                    .collect(),
+            ),
+            ort::ORT_OP_ATTR_FLOATS if required.is_multiple_of(4) => Attribute::Floats(
+                bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_ne_bytes(b.try_into().expect("exact chunk")))
+                    .collect(),
+            ),
+            ort::ORT_OP_ATTR_STRING => Attribute::String(bytes.to_vec()),
+            ort::ORT_OP_ATTR_STRINGS => {
+                if !bytes.is_empty() && bytes.last() != Some(&0) {
+                    return Err(malformed());
+                }
+                Attribute::Strings(if bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    bytes[..bytes.len() - 1]
+                        .split(|&b| b == 0)
+                        .map(<[u8]>::to_vec)
+                        .collect()
+                })
+            }
+            _ => {
+                return Err(format!(
+                    "cannot faithfully import attribute type {attr_type} with {required} bytes; use a supported ORT attribute representation"
+                ));
+            }
+        };
+        Ok(Some(value))
+    }
+
+    unsafe fn read_tensor_attribute(
+        api: *const ort::OrtApi,
+        attr: *const ort::OrtOpAttr,
+    ) -> Result<onnx_runtime_ir::TensorData, String> {
+        let release_value = unsafe { (*api).ReleaseValue }.ok_or("OrtApi.ReleaseValue is null")?;
+        let release_shape = unsafe { (*api).ReleaseTensorTypeAndShapeInfo }
+            .ok_or("OrtApi.ReleaseTensorTypeAndShapeInfo is null")?;
+        struct ValueGuard(*mut ort::OrtValue, unsafe extern "C" fn(*mut ort::OrtValue));
+        impl Drop for ValueGuard {
+            fn drop(&mut self) {
+                unsafe { (self.1)(self.0) }
+            }
+        }
+        struct ShapeGuard(
+            *mut ort::OrtTensorTypeAndShapeInfo,
+            unsafe extern "C" fn(*mut ort::OrtTensorTypeAndShapeInfo),
+        );
+        impl Drop for ShapeGuard {
+            fn drop(&mut self) {
+                unsafe { (self.1)(self.0) }
+            }
+        }
+        let get = unsafe { (*api).OpAttr_GetTensorAttributeAsOrtValue }
+            .ok_or("OrtApi.OpAttr_GetTensorAttributeAsOrtValue is null")?;
+        let mut value = ptr::null_mut();
+        Self::check(unsafe { get(attr, &mut value) })?;
+        if value.is_null() {
+            return Err("tensor attribute returned a null OrtValue".into());
+        }
+        let value = ValueGuard(value, release_value);
+        let get_shape = unsafe { (*api).GetTensorTypeAndShape }
+            .ok_or("OrtApi.GetTensorTypeAndShape is null")?;
+        let mut shape = ptr::null_mut();
+        Self::check(unsafe { get_shape(value.0, &mut shape) })?;
+        if shape.is_null() {
+            return Err("tensor attribute returned null shape information".into());
+        }
+        let shape = ShapeGuard(shape, release_shape);
+        let mut dtype = 0;
+        Self::check(unsafe {
+            ((*api)
+                .GetTensorElementType
+                .ok_or("GetTensorElementType is null")?)(shape.0, &mut dtype)
+        })?;
+        let dtype = DataType::from_onnx(dtype as i32)
+            .ok_or_else(|| format!("unsupported tensor attribute dtype {dtype}"))?;
+        let mut rank = 0;
+        Self::check(unsafe {
+            ((*api)
+                .GetDimensionsCount
+                .ok_or("GetDimensionsCount is null")?)(shape.0, &mut rank)
+        })?;
+        let mut dims = vec![0i64; rank];
+        Self::check(unsafe {
+            ((*api).GetDimensions.ok_or("GetDimensions is null")?)(shape.0, dims.as_mut_ptr(), rank)
+        })?;
+        let dims = dims
+            .into_iter()
+            .map(|d| {
+                usize::try_from(d).map_err(|_| format!("tensor attribute has invalid extent {d}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut tensor = onnx_runtime_ir::TensorData::from_raw(dtype, dims, Vec::new());
+        if dtype == DataType::String {
+            let count = tensor
+                .checked_numel()
+                .ok_or("string tensor attribute element count overflows")?;
+            let mut size = 0;
+            Self::check(unsafe {
+                ((*api)
+                    .GetStringTensorDataLength
+                    .ok_or("GetStringTensorDataLength is null")?)(value.0, &mut size)
+            })?;
+            let mut data = vec![0u8; size];
+            let mut offsets = vec![0usize; count];
+            Self::check(unsafe {
+                ((*api)
+                    .GetStringTensorContent
+                    .ok_or("GetStringTensorContent is null")?)(
+                    value.0,
+                    data.as_mut_ptr().cast(),
+                    size,
+                    offsets.as_mut_ptr(),
+                    count,
+                )
+            })?;
+            offsets.push(size);
+            for pair in offsets.windows(2) {
+                tensor.strings.push(
+                    data.get(pair[0]..pair[1])
+                        .ok_or("string tensor attribute contains invalid offsets")?
+                        .to_vec(),
+                );
+            }
+        } else {
+            let mut info = ptr::null();
+            Self::check(unsafe {
+                ((*api)
+                    .GetTensorMemoryInfo
+                    .ok_or("GetTensorMemoryInfo is null")?)(value.0, &mut info)
+            })?;
+            if info.is_null() {
+                return Err("tensor attribute has null memory information".into());
+            }
+            let mut device = 0;
+            unsafe {
+                ((*api)
+                    .MemoryInfoGetDeviceType
+                    .ok_or("MemoryInfoGetDeviceType is null")?)(info, &mut device)
+            };
+            if device != ort::OrtMemoryInfoDeviceType_CPU {
+                return Err(format!(
+                    "tensor attribute is on device type {device}; host-readable attribute storage is required"
+                ));
+            }
+            let size = tensor
+                .checked_expected_bytes()
+                .ok_or("tensor attribute byte size is unsupported or overflows")?;
+            let mut data = ptr::null();
+            Self::check(unsafe {
+                ((*api).GetTensorData.ok_or("GetTensorData is null")?)(value.0, &mut data)
+            })?;
+            if size != 0 {
+                if data.is_null() {
+                    return Err("nonempty tensor attribute has a null data pointer".into());
+                }
+                tensor.data =
+                    unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size) }.to_vec();
+            }
+        }
+        Ok(tensor)
     }
 
     // ─── Initializer reading ────────────────────────────────────────────
