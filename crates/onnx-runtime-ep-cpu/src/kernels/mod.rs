@@ -1,5 +1,5 @@
 //! CPU kernels for the Phase-1 BERT-on-CPU correctness milestone (`docs/architecture/ORT2.md`
-//! §4.4). One [`Kernel`] per ONNX op, keyed purely by op type — there are **no**
+//! §4.4). One [`onnx_runtime_ep_api::Kernel`] per ONNX op, keyed purely by op type — there are **no**
 //! model-specific shapes or names anywhere in this crate; BERT is only the
 //! validation target.
 //!
@@ -10,8 +10,8 @@
 //! MatMul GEMM went through the Phase-1.5 perf pass (`docs/architecture/ORT2.md` §25.2): its
 //! default backend is a blocked, register-tiled, rayon-parallelized pure-Rust
 //! kernel. Every kernel sits behind the
-//! [`Kernel`] trait, so backends swap in **without touching the EP contract or
-//! the session**. The seam is [`Kernel`] itself; see [`matmul`] for the hot spot
+//! [`onnx_runtime_ep_api::Kernel`] trait, so backends swap in **without touching the EP contract or
+//! the session**. The seam is [`onnx_runtime_ep_api::Kernel`] itself; see [`matmul`] for the hot spot
 //! and [`crate::backend`] for backend selection.
 //!
 //! ## Strided inputs
@@ -20,6 +20,8 @@
 //! [`to_dense_f32`]/[`to_dense_i64`], which materialize a view (applying its
 //! strides and byte offset) into a dense row-major buffer. This keeps the
 //! per-kernel `unsafe` surface to the two element accessors in this module.
+
+use std::borrow::Cow;
 
 use onnx_runtime_ep_api::{EpError, OpKey, OpRegistry, Result, TensorMut, TensorView};
 use onnx_runtime_ir::DataType;
@@ -1007,7 +1009,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
-        Box::new(matmul_nbits::MatMulNBitsFactory::new(retain_caches)),
+        Box::new(matmul_nbits::MatMulNBitsFactory::new(resources.clone())),
     );
     rec.register(
         OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
@@ -1690,6 +1692,15 @@ pub fn to_dense_f32(view: &TensorView) -> Result<Vec<f32>> {
         }
     }
     Ok(out)
+}
+
+/// Borrow contiguous packed input; strided storage needs only a packed copy.
+pub(super) fn quantized_input_bytes<'a>(view: &'a TensorView<'_>) -> Result<Cow<'a, [u8]>> {
+    if view.is_contiguous() {
+        Ok(Cow::Borrowed(contiguous_u8_slice(view)?))
+    } else {
+        Ok(Cow::Owned(to_dense_bytes(view)?))
+    }
 }
 
 /// Borrow a contiguous host `Uint8` tensor without materializing it.

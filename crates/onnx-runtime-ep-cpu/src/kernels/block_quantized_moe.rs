@@ -10,7 +10,7 @@
 //!
 //! Every consumer — the schema/claim validator, this CPU oracle, and the CUDA
 //! claim gate — derives its byte offsets, strides and decode parameters from one
-//! property-typed [`ProjectionLayout`] contract (qtype, elements/block,
+//! property-typed `ProjectionLayout` contract (qtype, elements/block,
 //! bytes/block, logical K/N, per-row and per-expert bank strides, expert count).
 //! The GLM-5.2 IQ/K-quant/Q8 layouts are decoded by the CPU parity oracle.
 //!
@@ -33,7 +33,8 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node, Shape};
 
 use super::block_quantized_matmul::{
-    BlockFormat, DenseWeightIdentity, DenseWeightLayout, decode_dense_weight_into,
+    BlockFormat, DenseWeightCacheKey, DenseWeightIdentity, DenseWeightLayout,
+    decode_dense_weight_into,
 };
 use super::moe::{
     ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
@@ -177,7 +178,7 @@ pub struct BlockQuantizedMoEKernel {
     formats: ProjectionFormats,
     constant_inputs: [bool; 9],
     weight_identities: [DenseWeightIdentity; 3],
-    weight_cache: DenseWeightCache,
+    weight_cache: DenseWeightCache<DenseWeightCacheKey>,
 }
 
 #[derive(Debug)]
@@ -1640,7 +1641,7 @@ mod tests {
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
             // The default ceiling, pinned rather than inherited: `new()` reads
-            // `ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES` through a process-wide
+            // `ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES` through a process-wide
             // `OnceLock`, so an ambient `=0` turns every resolve into
             // `MissNotStored` and this cell would be reporting the environment
             // instead of the kernel. It fails loudly there rather than

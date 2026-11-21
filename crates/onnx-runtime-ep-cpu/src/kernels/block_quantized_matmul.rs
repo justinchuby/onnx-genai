@@ -199,7 +199,7 @@ pub struct BlockQuantizedMatMulKernel {
     format: BlockFormat,
     packed_b_constant: bool,
     weight_identity: DenseWeightIdentity,
-    weight_cache: DenseWeightCache,
+    weight_cache: DenseWeightCache<DenseWeightCacheKey>,
 }
 
 pub struct BlockQuantizedMatMulFactory {
@@ -609,8 +609,8 @@ pub(super) struct DenseWeightCacheKey {
     source: DenseWeightSource,
 }
 
-impl DenseWeightCacheKey {
-    pub(super) fn dense_bytes(&self) -> Result<usize> {
+impl super::dense_weight_cache::DenseWeightKey for DenseWeightCacheKey {
+    fn dense_bytes(&self) -> Result<usize> {
         self.in_features
             .checked_mul(self.out_features)
             .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
@@ -850,6 +850,8 @@ pub(super) fn linear_packed_grouped(
                 Ok(())
             }
         },
+        |input, row, output, rows, k| super::matmul::gemm_bt_serial(input, row, output, rows, k, 1),
+        super::decoded_projection::rayon_decoded_columns,
     )
 }
 

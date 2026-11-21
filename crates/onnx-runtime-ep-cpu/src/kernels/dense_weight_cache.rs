@@ -1,17 +1,21 @@
 //! Dense derived weights: cache membership is a policy, ownership holds the grant.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_memory_api::MemoryError;
 
-use super::block_quantized_matmul::DenseWeightCacheKey;
 use crate::DerivedWeightMemory;
 use crate::resources::{DenseWeightGrant, WeightAdmission};
 
+pub(super) trait DenseWeightKey: Clone + Eq + Hash {
+    fn dense_bytes(&self) -> Result<usize>;
+}
+
 pub(crate) const DEFAULT_DENSE_WEIGHT_CACHE_BYTES: usize = 256 * 1024 * 1024;
-const DENSE_WEIGHT_CACHE_BYTES_ENV: &str = "ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES";
+const DENSE_WEIGHT_CACHE_BYTES_ENV: &str = "ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES";
 
 pub(crate) fn configured_dense_weight_cache_bytes() -> usize {
     static BYTES: OnceLock<usize> = OnceLock::new();
@@ -45,21 +49,34 @@ pub(super) enum DenseWeightCacheStatus {
     MissNotStored,
 }
 
-pub(super) struct DenseWeightSpec<'a> {
-    key: Option<&'a DenseWeightCacheKey>,
+pub(super) struct DenseWeightSpec<'a, K> {
+    key: Option<&'a K>,
     bytes: usize,
+    build_peak_bytes: usize,
 }
 
-impl<'a> DenseWeightSpec<'a> {
-    pub(super) fn cached(key: &'a DenseWeightCacheKey) -> Result<Self> {
+impl<'a, K: DenseWeightKey> DenseWeightSpec<'a, K> {
+    pub(super) fn cached(key: &'a K) -> Result<Self> {
+        let bytes = key.dense_bytes()?;
         Ok(Self {
             key: Some(key),
-            bytes: key.dense_bytes()?,
+            bytes,
+            build_peak_bytes: bytes,
         })
     }
 
     pub(super) fn transient(bytes: usize) -> Self {
-        Self { key: None, bytes }
+        Self {
+            key: None,
+            bytes,
+            build_peak_bytes: bytes,
+        }
+    }
+    /// Upper bound on simultaneously live f32 weight buffers during building.
+    /// Only payload bytes remain charged after the operation completes.
+    pub(super) fn with_build_peak(mut self, bytes: usize) -> Self {
+        self.build_peak_bytes = bytes;
+        self
     }
 }
 
@@ -73,20 +90,19 @@ pub(super) enum DenseWeightLoad {
     Declined(MemoryError),
 }
 
-pub(super) struct DenseWeightCache {
+pub(super) struct DenseWeightCache<K> {
     max_bytes: usize,
     memory: DerivedWeightMemory,
-    inner: Mutex<CacheState>,
+    inner: Mutex<CacheState<K>>,
     // Cold fills serialize separately: accountant callbacks and decoding never
     // run under the payload lock. Warm hits do not acquire this gate.
     fill: Mutex<()>,
 }
 
-#[derive(Default)]
-struct CacheState {
+struct CacheState<K> {
     used_bytes: usize,
     tick: u64,
-    entries: HashMap<DenseWeightCacheKey, CacheEntry>,
+    entries: HashMap<K, CacheEntry>,
     #[cfg(test)]
     hits: usize,
     #[cfg(test)]
@@ -99,7 +115,21 @@ struct CacheEntry {
     last_used: u64,
 }
 
-impl Default for DenseWeightCache {
+impl<K> Default for CacheState<K> {
+    fn default() -> Self {
+        Self {
+            used_bytes: 0,
+            tick: 0,
+            entries: HashMap::new(),
+            #[cfg(test)]
+            hits: 0,
+            #[cfg(test)]
+            builds: 0,
+        }
+    }
+}
+
+impl<K: DenseWeightKey> Default for DenseWeightCache<K> {
     fn default() -> Self {
         Self::new(
             DerivedWeightMemory::default(),
@@ -108,7 +138,7 @@ impl Default for DenseWeightCache {
     }
 }
 
-impl DenseWeightCache {
+impl<K: DenseWeightKey> DenseWeightCache<K> {
     pub(super) fn new(memory: DerivedWeightMemory, max_bytes: usize) -> Self {
         Self {
             max_bytes,
@@ -132,7 +162,7 @@ impl DenseWeightCache {
         self.max_bytes
     }
 
-    fn lookup(&self, specs: &[DenseWeightSpec<'_>]) -> Vec<Option<Arc<DenseWeight>>> {
+    fn lookup(&self, specs: &[DenseWeightSpec<'_, K>]) -> Vec<Option<Arc<DenseWeight>>> {
         let mut inner = self
             .inner
             .lock()
@@ -176,10 +206,36 @@ impl DenseWeightCache {
     /// weights (key=None). A refusal does not invoke any builder.
     pub(super) fn load_group(
         &self,
-        specs: &[DenseWeightSpec<'_>],
+        specs: &[DenseWeightSpec<'_, K>],
         mut build: impl FnMut(usize, &mut [f32]) -> Result<()>,
     ) -> Result<DenseWeightLoad> {
+        self.load_group_owned(specs, |index| {
+            let elements = specs[index].bytes / std::mem::size_of::<f32>();
+            let mut payload = super::decoded_projection::zeroed_f32(
+                "dense projection",
+                "admitted weight payload",
+                elements,
+            )?;
+            build(index, &mut payload)?;
+            Ok(payload)
+        })
+    }
+
+    /// Preflight construction peaks before any builder runs. Builders return
+    /// exactly sized final payloads; unused scratch allowance returns at the
+    /// end of this operation while each live payload keeps only its own grant.
+    pub(super) fn load_group_owned(
+        &self,
+        specs: &[DenseWeightSpec<'_, K>],
+        mut build: impl FnMut(usize) -> Result<Vec<f32>>,
+    ) -> Result<DenseWeightLoad> {
         for (index, spec) in specs.iter().enumerate() {
+            if spec.build_peak_bytes < spec.bytes {
+                return Err(EpError::KernelFailed(format!(
+                    "dense projection {index} build peak {} is below its {}-byte payload; account for every simultaneously live f32 weight buffer",
+                    spec.build_peak_bytes, spec.bytes
+                )));
+            }
             if spec.bytes > isize::MAX as usize
                 || !spec.bytes.is_multiple_of(std::mem::size_of::<f32>())
             {
@@ -220,7 +276,7 @@ impl DenseWeightCache {
         }
         let required = specs.iter().zip(&values).try_fold(0usize, |total, (spec, value)| {
             if value.is_some() { Ok(total) } else {
-                total.checked_add(spec.bytes).ok_or_else(|| EpError::KernelFailed("dense weight projection-group byte count overflow; use addressable projection dimensions".into()))
+                total.checked_add(spec.build_peak_bytes).ok_or_else(|| EpError::KernelFailed("dense weight projection-group byte count overflow; use addressable projection dimensions".into()))
             }
         })?;
         let max_bytes = self.byte_limit();
@@ -283,21 +339,17 @@ impl DenseWeightCache {
                 continue;
             }
             let child = grant.split_off(spec.bytes)?;
-            let elements = spec.bytes / std::mem::size_of::<f32>();
-            let mut payload = Vec::new();
-            payload.try_reserve_exact(elements).map_err(|source| EpError::Memory(MemoryError::AllocationFailed {
-                tier: "host", requested: spec.bytes as u64,
-                reason: format!("dense projection {index} could not allocate its admitted f32 buffer: {source}; lower concurrent weight demand or free Host memory"),
-            }))?;
-            if payload.capacity().checked_mul(std::mem::size_of::<f32>()) != Some(spec.bytes) {
+            let payload = build(index)?;
+            if payload.len().checked_mul(std::mem::size_of::<f32>()) != Some(spec.bytes)
+                || payload.capacity().checked_mul(std::mem::size_of::<f32>()) != Some(spec.bytes)
+            {
                 return Err(EpError::KernelFailed(format!(
-                    "dense projection {index} allocator returned capacity {} for {} bytes; use an allocator honoring exact f32 capacity",
+                    "dense projection {index} builder returned length {} and capacity {} for {} admitted bytes; return an exactly sized f32 payload",
+                    payload.len(),
                     payload.capacity(),
                     spec.bytes
                 )));
             }
-            payload.resize(elements, 0.0);
-            build(index, &mut payload)?;
             values[index] = Some(Arc::new(DenseWeight {
                 values: payload,
                 _grant: child,
@@ -369,6 +421,16 @@ impl DenseWeightCache {
     }
 
     #[cfg(test)]
+    pub(super) fn test_get(&self, key: &K) -> Option<Arc<DenseWeight>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .get(key)
+            .map(|entry| Arc::clone(&entry.value))
+    }
+
+    #[cfg(test)]
     pub(super) fn stats(&self) -> (usize, usize) {
         let inner = self
             .inner
@@ -389,19 +451,12 @@ impl DenseWeightCache {
     #[cfg(test)]
     pub(super) fn test_get_or_insert_with(
         &self,
-        key: &DenseWeightCacheKey,
+        key: &K,
         build: impl FnOnce() -> Result<Vec<f32>>,
     ) -> Result<(Arc<DenseWeight>, DenseWeightCacheStatus)> {
         let mut build = Some(build);
-        match self.load_group(&[DenseWeightSpec::cached(key)?], |_, output| {
-            let values = build.take().expect("single fixture builder")()?;
-            if values.len() != output.len() {
-                return Err(EpError::KernelFailed(
-                    "dense cache fixture output length mismatch".into(),
-                ));
-            }
-            output.copy_from_slice(&values);
-            Ok(())
+        match self.load_group_owned(&[DenseWeightSpec::cached(key)?], |_| {
+            build.take().expect("single fixture builder")()
         })? {
             DenseWeightLoad::Ready(mut loaded) => {
                 Ok((loaded.weights.remove(0), loaded.statuses.remove(0)))
@@ -411,11 +466,11 @@ impl DenseWeightCache {
     }
 }
 
-fn oldest_unused(
-    inner: &CacheState,
-    specs: &[DenseWeightSpec<'_>],
+fn oldest_unused<K: DenseWeightKey>(
+    inner: &CacheState<K>,
+    specs: &[DenseWeightSpec<'_, K>],
     inactive_only: bool,
-) -> Option<DenseWeightCacheKey> {
+) -> Option<K> {
     inner
         .entries
         .iter()
@@ -427,7 +482,7 @@ fn oldest_unused(
         .map(|(key, _)| key.clone())
 }
 
-fn remove_entry(inner: &mut CacheState, key: &DenseWeightCacheKey) -> CacheEntry {
+fn remove_entry<K: DenseWeightKey>(inner: &mut CacheState<K>, key: &K) -> CacheEntry {
     let entry = inner
         .entries
         .remove(key)
@@ -443,7 +498,7 @@ fn remove_entry(inner: &mut CacheState, key: &DenseWeightCacheKey) -> CacheEntry
 mod tests {
     use super::*;
     use crate::kernels::block_quantized_matmul::{
-        BlockFormat, DenseWeightIdentity, packed_tensor_bytes,
+        BlockFormat, DenseWeightCacheKey, DenseWeightIdentity, packed_tensor_bytes,
     };
     use crate::kernels::testutil::Owned;
     use onnx_runtime_memory_api::{MemoryRole, Tier};
@@ -463,10 +518,11 @@ mod tests {
             .unwrap()
             .key
     }
-    fn cached(key: &DenseWeightCacheKey) -> DenseWeightSpec<'_> {
+    fn cached(key: &DenseWeightCacheKey) -> DenseWeightSpec<'_, DenseWeightCacheKey> {
         DenseWeightSpec {
             key: Some(key),
             bytes: 16,
+            build_peak_bytes: 16,
         }
     }
     fn memory(limit: u64) -> (LedgerGovernor, DerivedWeightMemory) {
@@ -482,13 +538,107 @@ mod tests {
     }
 
     #[test]
+    fn owned_builder_peak_refunds_scratch_and_keeps_only_the_live_payload_charge() {
+        let packed = Owned::u8(&[4], &[1; 4]);
+        let key = key(&packed);
+        let (governor, source) = memory(32);
+        let cache = DenseWeightCache::<DenseWeightCacheKey>::new(source, 16);
+        let spec = cached(&key).with_build_peak(32);
+        let mut loaded = ready(
+            cache
+                .load_group_owned(&[spec], |_| {
+                    assert_eq!(governor.used(Tier::Host), 32);
+                    let source = vec![2.0f32; 4];
+                    let placed = source.clone();
+                    assert_eq!(governor.used(Tier::Host), 32);
+                    Ok(placed)
+                })
+                .unwrap(),
+        );
+        assert_eq!(governor.used(Tier::Host), 16);
+        let live = loaded.weights.remove(0);
+        drop(loaded);
+        let other = governor
+            .reserve(Tier::Host, 16, MemoryRole::KvCache, HolderId::new(7))
+            .unwrap();
+        let hit = ready(
+            cache
+                .load_group_owned(&[cached(&key).with_build_peak(32)], |_| {
+                    panic!("warm payload must not rebuild or request a second peak allowance")
+                })
+                .unwrap(),
+        );
+        assert!(Arc::ptr_eq(&live, &hit.weights[0]));
+        assert_eq!(governor.used(Tier::Host), 32);
+        drop(hit);
+        drop(other);
+        drop(cache);
+        assert_eq!(governor.used(Tier::Host), 16);
+        drop(live);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn owned_builder_refusal_and_invalid_payloads_leave_no_reservation_or_cache_entry() {
+        let packed = Owned::u8(&[4], &[1; 4]);
+        let key = key(&packed);
+        let (governor, source) = memory(16);
+        let cache = DenseWeightCache::<DenseWeightCacheKey>::new(source, 16);
+        assert!(matches!(
+            cache
+                .load_group_owned(&[cached(&key).with_build_peak(32)], |_| {
+                    panic!("placement peak must be admitted before invoking the builder")
+                })
+                .unwrap(),
+            DenseWeightLoad::Declined(_)
+        ));
+        assert_eq!(governor.used(Tier::Host), 0);
+        for mode in 0..3 {
+            let failure = cache
+                .load_group_owned(&[cached(&key)], |_| {
+                    if mode == 0 {
+                        return Ok(vec![1.0; 3]);
+                    }
+                    if mode == 1 {
+                        let mut v = Vec::with_capacity(8);
+                        v.resize(4, 1.0);
+                        return Ok(v);
+                    }
+                    Err(EpError::KernelFailed("fixture decode failure".into()))
+                })
+                .err()
+                .expect("invalid builder result must fail");
+            assert!(failure.to_string().contains(if mode == 2 {
+                "fixture decode failure"
+            } else {
+                "exactly sized f32 payload"
+            }));
+            assert_eq!(governor.used(Tier::Host), 0);
+            assert_eq!(cache.stats(), (0, 0));
+        }
+        let failure = cache
+            .load_group_owned(&[cached(&key).with_build_peak(15)], |_| {
+                panic!("an underspecified construction peak must not run")
+            })
+            .err()
+            .unwrap();
+        assert!(failure.to_string().contains("below its 16-byte payload"));
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
     fn invalid_buffer_sizes_are_rejected_before_any_builder_or_grant() {
-        let cache = DenseWeightCache::default();
+        let cache = DenseWeightCache::<DenseWeightCacheKey>::default();
         for bytes in [3, isize::MAX as usize + 1] {
             let failure = cache
-                .load_group(&[DenseWeightSpec { key: None, bytes }], |_, _| {
-                    panic!("invalid buffer must not be allocated")
-                })
+                .load_group(
+                    &[DenseWeightSpec {
+                        key: None,
+                        bytes,
+                        build_peak_bytes: bytes,
+                    }],
+                    |_, _| panic!("invalid buffer must not be allocated"),
+                )
                 .err()
                 .expect("invalid f32 buffer size");
             assert!(failure.to_string().contains("addressable f32 buffer"));
@@ -502,8 +652,8 @@ mod tests {
         let k1 = key(&p1);
         let k2 = key(&p2);
         let (governor, source) = memory(16);
-        let first = DenseWeightCache::new(source.clone(), 16);
-        let second = DenseWeightCache::new(source, 1024);
+        let first = DenseWeightCache::<DenseWeightCacheKey>::new(source.clone(), 16);
+        let second = DenseWeightCache::<DenseWeightCacheKey>::new(source, 1024);
         let live = ready(
             first
                 .load_group(&[cached(&k1)], |_, output| {
@@ -570,15 +720,17 @@ mod tests {
     #[test]
     fn complete_projection_group_is_preflighted_before_any_builder() {
         let (governor, source) = memory(31);
-        let cache = DenseWeightCache::new(source, 1024);
+        let cache = DenseWeightCache::<DenseWeightCacheKey>::new(source, 1024);
         let specs = [
             DenseWeightSpec {
                 key: None,
                 bytes: 16,
+                build_peak_bytes: 16,
             },
             DenseWeightSpec {
                 key: None,
                 bytes: 16,
+                build_peak_bytes: 16,
             },
         ];
         let mut builds = 0;
@@ -596,7 +748,7 @@ mod tests {
         assert_eq!(governor.used(Tier::Host), 0);
         assert_eq!(cache.stats(), (0, 0));
         let (governor, source) = memory(32);
-        let cache = DenseWeightCache::new(source, 1024);
+        let cache = DenseWeightCache::<DenseWeightCacheKey>::new(source, 1024);
         let mut loaded = ready(
             cache
                 .load_group(&specs, |_, output| {
@@ -627,7 +779,7 @@ mod tests {
         let (governor, source) = memory(32);
         let cache = DenseWeightCache {
             max_bytes: 32,
-            ..DenseWeightCache::new(source, 1024)
+            ..DenseWeightCache::<DenseWeightCacheKey>::new(source, 1024)
         };
         let first = ready(
             cache
@@ -681,7 +833,7 @@ mod tests {
         let k1 = key(&p1);
         let k2 = key(&p2);
         let (governor, source) = memory(32);
-        let cache = DenseWeightCache::new(source, 1024);
+        let cache = DenseWeightCache::<DenseWeightCacheKey>::new(source, 1024);
         let failure = cache
             .load_group(&[cached(&k1), cached(&k2)], |index, output| {
                 if index == 0 {
@@ -707,7 +859,7 @@ mod tests {
         let k1 = key(&p1);
         let k2 = key(&p2);
         let (governor, source) = memory(32);
-        let cache = Arc::new(DenseWeightCache::new(source, 1024));
+        let cache = Arc::new(DenseWeightCache::<DenseWeightCacheKey>::new(source, 1024));
         let builds = AtomicUsize::new(0);
         let barrier = Barrier::new(4);
         std::thread::scope(|scope| {
@@ -734,7 +886,7 @@ mod tests {
     #[derive(Debug)]
     struct ObservingBooks {
         governor: LedgerGovernor,
-        cache: Mutex<Weak<DenseWeightCache>>,
+        cache: Mutex<Weak<DenseWeightCache<DenseWeightCacheKey>>>,
         blocked: AtomicBool,
         observations: AtomicUsize,
     }
@@ -799,7 +951,7 @@ mod tests {
         let source =
             DerivedWeightMemory::governed(&ObservingGovernor(books.clone()), HolderId::new(13))
                 .unwrap();
-        let cache = Arc::new(DenseWeightCache::new(source, 1024));
+        let cache = Arc::new(DenseWeightCache::<DenseWeightCacheKey>::new(source, 1024));
         *books.cache.lock().unwrap() = Arc::downgrade(&cache);
         let p1 = Owned::u8(&[4], &[1; 4]);
         let p2 = Owned::u8(&[4], &[2; 4]);

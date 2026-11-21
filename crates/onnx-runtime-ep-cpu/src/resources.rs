@@ -12,7 +12,7 @@ use crate::kernels::qmoe::WeightOffloadHostCache;
 /// Retention ceilings, separate from the Host grants that fund actual payloads.
 #[derive(Clone, Copy, Debug)]
 pub struct CpuWeightCacheLimits {
-    /// Per-kernel block-format dense expansion retention ceiling.
+    /// Per-kernel f32 dense expansion retention ceiling (block formats and NBits).
     pub dense_bytes: usize,
     /// Shared QMoE expert retention ceiling.
     pub expert_bytes: u64,
@@ -27,7 +27,7 @@ impl Default for CpuWeightCacheLimits {
     }
 }
 
-/// Immutable CPU weight resources. Full block-format expansions and retained
+/// Immutable CPU weight resources. Full f32 block-format/NBits expansions and retained
 /// or transient QMoE experts use one Host grant source. Private fields
 /// prevent a shared expert cache from being paired with a different authority.
 /// Cache ceilings and the legacy planned-family verdict only admit retention;
@@ -110,7 +110,7 @@ impl CpuMemoryResources {
     pub(crate) fn expert_cache(&self) -> &WeightOffloadHostCache {
         &self.host_cache
     }
-    /// Whether block/QMoE full payloads obtain actual Host grants.
+    /// Whether block/NBits/QMoE full payloads obtain actual Host grants.
     pub fn is_governed(&self) -> bool {
         self.host_cache.memory().is_governed()
     }

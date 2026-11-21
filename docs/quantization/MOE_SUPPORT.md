@@ -543,7 +543,7 @@ block-MoE groups share the CPU GEMM backend, including single-row groups.
 `QMoE` and `BlockQuantizedMoE` process active experts one at a time.
 
 `BlockQuantizedMoE` admits a complete expert's FC1/FC2/optional-FC3 f32 set only
-when it fits `ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES` (default 256 MiB). Constant
+when it fits `ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES` (default 256 MiB). Constant
 projections use the existing kernel-local dense LRU. If the complete set does
 not fit, the kernel decodes one weight row per worker shard and reuses it for
 all tokens in the group. Budget zero selects this streamed path without
