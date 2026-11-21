@@ -72,14 +72,13 @@ pub mod weight_offload;
 
 pub use backend::CpuBackend;
 pub use dispatch_ledger::{Backend as DispatchBackend, KernelFamily, effective_backend};
-pub use kernels::qmoe::WeightOffloadHostCache;
 pub use kernels::{CpuOpDescriptor, build_cpu_registry_with_descriptors, supported_dtypes_for_op};
 pub use optimizer::{
     ConvBatchNormActivationFusion, MatMulNBitsBiasFusion, ProjectionFusion, SiblingProjectionMerge,
     cpu_optimization_passes,
 };
 pub use provider::CpuExecutionProvider;
-pub use resources::{CpuMemoryResources, DerivedWeightMemory};
+pub use resources::{CpuMemoryResources, CpuWeightCacheLimits, DerivedWeightMemory};
 pub use weight_offload::placement::{
     GpuLayersOverrideReport, HostFallbackReason, IqFormat, LayerPlacement, LayerWeightRegions,
     Placement, PlacementError, PlacementPlan, QuantTileFormat, RegionPlacement, SnappedTileSize,

@@ -383,13 +383,16 @@ Implemented integration points:
   `pkg.nxrt::BlockQuantizedMoE`.
 
 The implemented kernels route and group the token batch before expert execution.
-`QMoE` expands only routed experts. Retained payloads use their standing host
-cache partition; uncached complete projection sets acquire a shared Host grant
-before allocation, or use row-decoded f32 projections on capacity refusal. The
-serial transient window is one expert. Single-ahead prefetch requires a scoped
-two-expert grant; warm cache hits skip this request. Row scratch, activations and
-outputs are separate from these payload grants. Removing idle standing
-reservations and adding compressed-domain compute remain open.
+`QMoE` expands only routed experts. Both retained and temporary complete
+projection sets use the same Host source as block expansions, with exact grants
+owned by their payloads. The cache's retention ceiling consumes no idle capacity.
+Capacity refusal uses row-decoded f32 projections. Serial execution needs at most
+one temporary dense expert; streaming-only prefetch preflights a two-slot window.
+For a positive cache ceiling, prefetch pins selected hits and splits a preflight
+for the complete missing selected set into independent expert grants; refusal
+stays serial. Fully cached operations do not query the issuer. Row scratch,
+activations and outputs remain separate from these payload grants. Compressed-
+domain compute and physical CPU Device/Host quota reconciliation remain open.
 
 ### 6.3 CUDA EP
 

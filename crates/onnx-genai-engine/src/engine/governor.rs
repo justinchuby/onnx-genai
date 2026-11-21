@@ -194,9 +194,7 @@ pub struct EngineResourceGovernor {
     /// Kept for its Drop: unloading the model returns these bytes to the tier.
     plan: Arc<std::sync::Mutex<ModelMemoryPlan>>,
     #[cfg(feature = "native-backend")]
-    weight_offload_host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
-    #[cfg(feature = "native-backend")]
-    derived_weight_memory: onnx_runtime_ep_cpu::DerivedWeightMemory,
+    cpu_resources: onnx_runtime_ep_cpu::CpuMemoryResources,
 }
 
 impl EngineResourceGovernor {
@@ -500,10 +498,8 @@ impl EngineResourceGovernor {
                 })?;
         }
         #[cfg(feature = "native-backend")]
-        // A host-cache lease is a standing claim on RAM. Take it only when the
-        // offload path can actually admit experts; otherwise a disabled cache
-        // would consume the host tier before recurrent state or host KV get a
-        // chance to fit.
+        // This is a retention ceiling only. Concrete CPU weight payloads claim
+        // Host bytes from the same source as block expansions and host KV.
         let weight_offload_host_budget =
             if std::env::var_os(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV)
                 .is_some_and(|value| value == "1")
@@ -512,15 +508,6 @@ impl EngineResourceGovernor {
             } else {
                 0
             };
-        #[cfg(feature = "native-backend")]
-        let weight_offload_host_cache = onnx_runtime_ep_cpu::WeightOffloadHostCache::new_leased(
-            weight_offload_host_budget,
-            &memory,
-            Holder::WeightOffloadHostCache.id(),
-        )
-        .map_err(|source| {
-            ResourceError::memory_grant("lease the native weight-offload host-cache budget", source)
-        })?;
         #[cfg(feature = "native-backend")]
         let derived_weight_memory = onnx_runtime_ep_cpu::DerivedWeightMemory::governed(
             &memory,
@@ -532,6 +519,17 @@ impl EngineResourceGovernor {
                 source,
             )
         })?;
+        #[cfg(feature = "native-backend")]
+        let cpu_resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+            derived_weight_memory,
+            onnx_runtime_ep_cpu::CpuWeightCacheLimits {
+                expert_bytes: weight_offload_host_budget,
+                ..Default::default()
+            },
+        )
+        .map_err(|source| {
+            ResourceError::memory_grant("construct native CPU weight retention resources", source)
+        })?;
         Ok(Self {
             inner,
             allow_runtime_override,
@@ -539,9 +537,7 @@ impl EngineResourceGovernor {
             process_memory_manager,
             plan: Arc::new(std::sync::Mutex::new(plan)),
             #[cfg(feature = "native-backend")]
-            weight_offload_host_cache,
-            #[cfg(feature = "native-backend")]
-            derived_weight_memory,
+            cpu_resources,
         })
     }
 
@@ -717,12 +713,9 @@ impl EngineResourceGovernor {
         &self,
         cache_retention: onnx_runtime_ep_cpu::CpuCacheRetention,
     ) -> onnx_runtime_ep_cpu::CpuMemoryResources {
-        onnx_runtime_ep_cpu::CpuMemoryResources {
-            host_cache: self.weight_offload_host_cache.clone(),
-            derived_weights: self.derived_weight_memory.clone(),
-            cache_retention,
-            ..Default::default()
-        }
+        self.cpu_resources
+            .clone()
+            .with_cache_retention(cache_retention)
     }
 }
 

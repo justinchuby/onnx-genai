@@ -765,10 +765,8 @@ fn build_quantized_draft_lm_head(
     };
     let cpu: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = Arc::new(
         onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(
-            onnx_runtime_ep_cpu::CpuMemoryResources {
-                cache_retention: onnx_runtime_ep_cpu::CpuCacheRetention::new(retain_caches),
-                ..Default::default()
-            },
+            onnx_runtime_ep_cpu::CpuMemoryResources::default()
+                .with_cache_retention(onnx_runtime_ep_cpu::CpuCacheRetention::new(retain_caches)),
         )
         .context("initialize draft projection CPU and fallback cache policy")?,
     );

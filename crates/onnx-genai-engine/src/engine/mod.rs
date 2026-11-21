@@ -1423,9 +1423,8 @@ mod tests {
 
         for governor in [&first, &second] {
             let resources = governor.cpu_memory_resources(Default::default());
-            assert_eq!(resources.host_cache.configured_budget_bytes(), 0);
-            assert_eq!(resources.host_cache.budget(), (0, true));
-            assert!(resources.derived_weights.is_governed());
+            assert_eq!(resources.weight_cache_limits().expert_bytes, 0);
+            assert!(resources.is_governed());
             assert_eq!(governor.memory().used(Tier::Host), 0);
         }
     }

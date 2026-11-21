@@ -73,6 +73,7 @@ pub struct WeightOffloadStats {
     pub host_cache_evictions: u64,
     pub owned_host_cache_bytes: u64,
     pub peak_owned_host_cache_bytes: u64,
+    /// Sum of effective cache-retention ceilings; this is not a physical Host reservation.
     pub host_cache_budget_bytes: u64,
     pub routed_tokens: u64,
     pub tokens_per_expert: BTreeMap<usize, u64>,

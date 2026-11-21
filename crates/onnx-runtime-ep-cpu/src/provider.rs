@@ -110,7 +110,7 @@ impl CpuExecutionProvider {
         Self {
             device: DeviceId::cpu(),
             initialized: false,
-            retain_caches: resources.cache_retention.is_admitted(),
+            retain_caches: resources.cache_retention().is_admitted(),
             registry: build_cpu_registry_with_resources(resources),
             memory: default_cpu_memory(),
         }

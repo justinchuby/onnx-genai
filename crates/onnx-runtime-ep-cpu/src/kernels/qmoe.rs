@@ -44,18 +44,11 @@ use crate::weight_offload::{
 /// Factory for the ORT contrib `QMoE` operator.
 pub struct QMoEFactory {
     host_cache: WeightOffloadHostCache,
-    transient_memory: DerivedWeightMemory,
 }
 
 impl QMoEFactory {
-    pub(crate) fn new(
-        host_cache: WeightOffloadHostCache,
-        transient_memory: DerivedWeightMemory,
-    ) -> Self {
-        Self {
-            host_cache,
-            transient_memory,
-        }
+    pub(crate) fn new(host_cache: WeightOffloadHostCache) -> Self {
+        Self { host_cache }
     }
 }
 
@@ -72,7 +65,6 @@ pub struct QMoEKernel {
     weight_offload: WeightOffloadMode,
     host_cache: WeightOffloadHostCache,
     prefetch_experts: bool,
-    transient_memory: DerivedWeightMemory,
 }
 
 /// Why this kernel cannot run a given `QMoE` node, if it cannot.
@@ -140,7 +132,6 @@ impl KernelFactory for QMoEFactory {
             weight_offload: WeightOffloadMode::from_env(),
             host_cache: self.host_cache.clone(),
             prefetch_experts: weight_offload_prefetch_default(),
-            transient_memory: self.transient_memory.clone(),
         }))
     }
 }
@@ -473,36 +464,7 @@ impl Kernel for QMoEKernel {
                 && ordered.len() > 1
                 && cache_operation.prefetch_eligibility().allows_pipeline()
             {
-                if !self.transient_memory.is_governed()
-                    || cache_operation
-                        .all_selected_resident(ordered.iter().map(|(expert, _)| *expert))
-                {
-                    Some(TransientExpertMemory::OnDemand(&self.transient_memory))
-                } else if let Some(bytes) = expanded_bytes.checked_mul(2) {
-                    // Preflight both pipeline slots once. Without this, the
-                    // extra live payload can change a later expert from dense
-                    // to streamed solely because prefetch was enabled.
-                    match self.transient_memory.try_grant(bytes)? {
-                        WeightAdmission::Granted(grant) => {
-                            Some(TransientExpertMemory::Prefetched(Arc::new(grant)))
-                        }
-                        WeightAdmission::Declined(reason) => {
-                            onnx_runtime_ep_api::record_kernel_variant_stage!(
-                                "prefetch",
-                                "qmoe.serial",
-                                "two transient expert slots require {bytes} Host bytes: {reason}"
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    onnx_runtime_ep_api::record_kernel_variant_stage!(
-                        "prefetch",
-                        "qmoe.serial",
-                        "two transient expert slots exceed addressable bytes; execute one expert at a time"
-                    );
-                    None
-                }
+                cache_operation.prefetch_memory(ordered.iter().map(|(expert, _)| *expert))?
             } else {
                 None
             };
@@ -566,7 +528,7 @@ impl Kernel for QMoEKernel {
                         &fc1,
                         &fc2,
                         fc3.as_ref(),
-                        &TransientExpertMemory::OnDemand(&self.transient_memory),
+                        &ExpertMemoryScope::OnDemand(self.host_cache.memory()),
                     )?;
                     compute(*expert, expert_tasks, &weights, &mut contributions)?;
                 }
@@ -578,7 +540,7 @@ impl Kernel for QMoEKernel {
                     &fc1,
                     &fc2,
                     fc3.as_ref(),
-                    &self.transient_memory,
+                    self.host_cache.memory(),
                     false,
                 )?;
                 write_grouped_contributions(
@@ -631,7 +593,7 @@ struct DequantizedExpert {
     fc2: Vec<f32>,
     fc3: Option<Vec<f32>>,
     _residency: Option<DequantizedExpertResidency>,
-    // Payloads above are destroyed before returning transient Host capacity.
+    // Payloads above are destroyed before returning their owned Host capacity.
     _grant: Option<Arc<DenseWeightGrant>>,
 }
 
@@ -740,11 +702,12 @@ impl ExpertCacheKey {
     }
 }
 
-/// A cache lookup never builds transient weights while holding its payload lock.
+/// Policy lookup and payload publication are separate from dense allocation.
 enum ExpertLease {
     Hit(Arc<DequantizedExpert>),
     Filled(Arc<DequantizedExpert>),
     Transient,
+    Refused(onnx_runtime_memory_api::MemoryError),
 }
 
 /// The resolved execution choice travels through the prefetch worker too.
@@ -753,14 +716,55 @@ enum ExpertExecution {
     RowStreamed(onnx_runtime_memory_api::MemoryError),
 }
 
-/// The shared allowance is confined to the fixed one-ahead driver: at most
-/// current and next transient payloads coexist, and the allowance outlives both.
-/// Retained payloads remain funded by the standing cache partition.
-enum TransientExpertMemory<'a> {
+/// A streaming-only two-slot allowance is never attached to retained state.
+/// Cacheable prefetch instead splits one exact payload grant for each initially
+/// missing selected expert; active hits are pinned through the operation.
+enum ExpertMemoryScope<'a> {
     OnDemand(&'a DerivedWeightMemory),
-    Prefetched(Arc<DenseWeightGrant>),
+    StreamingWindow(Arc<DenseWeightGrant>),
+    Selected {
+        grants: Mutex<BTreeMap<usize, DenseWeightGrant>>,
+        _pins: Vec<Arc<DequantizedExpert>>,
+    },
 }
-impl TransientExpertMemory<'_> {
+
+enum ExpertGrantAdmission {
+    Granted(Option<Arc<DenseWeightGrant>>),
+    Declined(onnx_runtime_memory_api::MemoryError),
+}
+
+fn owned_expert_grant(grant: DenseWeightGrant) -> Option<Arc<DenseWeightGrant>> {
+    match grant {
+        DenseWeightGrant::Local => None,
+        grant => Some(Arc::new(grant)),
+    }
+}
+
+impl ExpertMemoryScope<'_> {
+    fn grant(&self, expert: usize, bytes: usize, retained: bool) -> Result<ExpertGrantAdmission> {
+        match self {
+            Self::OnDemand(memory) => match memory.try_grant(bytes)? {
+                WeightAdmission::Granted(grant) => {
+                    Ok(ExpertGrantAdmission::Granted(owned_expert_grant(grant)))
+                }
+                WeightAdmission::Declined(reason) => Ok(ExpertGrantAdmission::Declined(reason)),
+            },
+            Self::StreamingWindow(grant) => {
+                if retained {
+                    return Err(error(
+                        "a retained QMoE expert cannot borrow a streaming-only two-slot grant; prepare individual selected-expert grants before admitting retained payloads",
+                    ));
+                }
+                Ok(ExpertGrantAdmission::Granted(Some(Arc::clone(grant))))
+            }
+            Self::Selected { grants, .. } => {
+                let grant = grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&expert)
+                    .ok_or_else(|| error(format!("QMoE expert {expert} has no unused preflight payload grant; selected experts must be unique and initially resident entries must stay pinned")))?;
+                Ok(ExpertGrantAdmission::Granted(owned_expert_grant(grant)))
+            }
+        }
+    }
+
     fn load(
         &self,
         expert: usize,
@@ -768,11 +772,15 @@ impl TransientExpertMemory<'_> {
         fc2: &QuantizedExperts<'_>,
         fc3: Option<&QuantizedExperts<'_>>,
     ) -> Result<ExpertExecution> {
-        match self {
-            Self::OnDemand(memory) => load_transient_expert(expert, fc1, fc2, fc3, memory, true),
-            Self::Prefetched(grant) => Ok(ExpertExecution::Dense(Arc::new(
-                DequantizedExpert::load(expert, fc1, fc2, fc3, true, Some(Arc::clone(grant)))?,
+        match self.grant(
+            expert,
+            DequantizedExpert::expanded_bytes(fc1, fc2, fc3)?,
+            false,
+        )? {
+            ExpertGrantAdmission::Granted(grant) => Ok(ExpertExecution::Dense(Arc::new(
+                DequantizedExpert::load(expert, fc1, fc2, fc3, true, grant)?,
             ))),
+            ExpertGrantAdmission::Declined(reason) => Ok(ExpertExecution::RowStreamed(reason)),
         }
     }
 }
@@ -852,7 +860,175 @@ const HISTORY_DECAY_WINDOW: u64 = 64;
 const HISTORY_EXPIRY_WINDOW: u64 = HISTORY_DECAY_WINDOW * 256;
 const MAX_ADMISSION_HISTORY_ENTRIES: usize = 4096;
 
+struct HostCacheFill {
+    key: ExpertCacheKey,
+    bank: Arc<ExpertBank>,
+    expanded_bytes: usize,
+    frequency: u64,
+    last_used: u64,
+}
+
+enum HostCachePlan {
+    Ready(ExpertLease),
+    Fill(HostCacheFill),
+}
+
 impl HostExpertCache {
+    fn hit(
+        &mut self,
+        key: &ExpertCacheKey,
+        budget_bytes: usize,
+    ) -> Result<Option<Arc<DequantizedExpert>>> {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return Ok(None);
+        };
+        self.clock = self
+            .clock
+            .checked_add(1)
+            .ok_or_else(|| error("host-cache access clock overflow"))?;
+        let now = self.clock;
+        entry.frequency = entry.frequency.saturating_add(1);
+        entry.last_used = now;
+        if entry.frequency >= PIN_FREQUENCY {
+            entry.pin_until = now.saturating_add(PIN_WINDOW);
+        }
+        let weights = Arc::clone(&entry.weights);
+        metrics().record_host_cache_hit();
+        self.record_residency(budget_bytes)?;
+        Ok(Some(weights))
+    }
+
+    /// Select policy under the payload lock; allocation and retired-payload
+    /// destruction happen only after the caller has released that lock.
+    fn plan_lease(
+        &mut self,
+        key: ExpertCacheKey,
+        expanded_bytes: usize,
+        budget_bytes: usize,
+        bank: Arc<ExpertBank>,
+    ) -> (Result<HostCachePlan>, Vec<HostCacheEntry>) {
+        let mut retired = Vec::new();
+        let result = (|| -> Result<HostCachePlan> {
+            if let Some(weights) = self.hit(&key, budget_bytes)? {
+                return Ok(HostCachePlan::Ready(ExpertLease::Hit(weights)));
+            }
+            self.clock = self
+                .clock
+                .checked_add(1)
+                .ok_or_else(|| error("host-cache access clock overflow"))?;
+            let now = self.clock;
+            metrics().record_host_cache_miss();
+            if budget_bytes == 0 || expanded_bytes == 0 || expanded_bytes > budget_bytes {
+                self.record_residency(budget_bytes)?;
+                return Ok(HostCachePlan::Ready(ExpertLease::Transient));
+            }
+            self.prune_history(now);
+            let history = self.history.entry(key.clone()).or_default();
+            if now.saturating_sub(history.last_used) > HISTORY_DECAY_WINDOW {
+                history.frequency /= 2;
+            }
+            history.frequency = history.frequency.saturating_add(1);
+            history.last_used = now;
+            let candidate_frequency = history.frequency;
+            if candidate_frequency < ADMISSION_FREQUENCY {
+                self.record_residency(budget_bytes)?;
+                return Ok(HostCachePlan::Ready(ExpertLease::Transient));
+            }
+            let required = self
+                .owned_bytes
+                .checked_add(expanded_bytes)
+                .ok_or_else(|| error("owned host-cache byte count overflow"))?;
+            let mut victims = Vec::new();
+            if required > budget_bytes {
+                let mut candidates = self
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| {
+                        Arc::strong_count(&entry.weights) == 1
+                            && entry.pin_until < now
+                            && candidate_frequency > entry.frequency
+                    })
+                    .map(|(key, entry)| {
+                        (
+                            entry.frequency,
+                            entry.last_used,
+                            key.clone(),
+                            entry.expanded_bytes,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort_by_key(|(frequency, last_used, _, _)| (*frequency, *last_used));
+                let mut reclaim = required - budget_bytes;
+                for (_, _, victim, bytes) in candidates {
+                    victims.push(victim);
+                    reclaim = reclaim.saturating_sub(bytes);
+                    if reclaim == 0 {
+                        break;
+                    }
+                }
+                if reclaim != 0 {
+                    self.record_residency(budget_bytes)?;
+                    return Ok(HostCachePlan::Ready(ExpertLease::Transient));
+                }
+            }
+            for victim in &victims {
+                if let Some(entry) = self.entries.remove(victim) {
+                    let bytes = entry.expanded_bytes;
+                    retired.push(entry);
+                    self.owned_bytes = self.owned_bytes.checked_sub(bytes).ok_or_else(|| error(format!(
+                        "host expert cache layer {} expert {} accounting underflow: cannot retire {bytes} bytes from {} owned bytes; recreate the CPU provider and report inconsistent cache accounting",
+                        victim.layer_id, victim.expert, self.owned_bytes,
+                    )))?;
+                }
+            }
+            metrics()
+                .record_host_cache_evictions(victims.len())
+                .map_err(error)?;
+            self.record_residency(budget_bytes)?;
+            Ok(HostCachePlan::Fill(HostCacheFill {
+                key,
+                bank,
+                expanded_bytes,
+                frequency: candidate_frequency,
+                last_used: now,
+            }))
+        })();
+        (result, retired)
+    }
+
+    fn publish(
+        &mut self,
+        fill: HostCacheFill,
+        weights: Arc<DequantizedExpert>,
+        budget_bytes: usize,
+    ) -> Result<ExpertLease> {
+        let total = self
+            .owned_bytes
+            .checked_add(fill.expanded_bytes)
+            .ok_or_else(|| error("owned host-cache byte count overflow"))?;
+        if total > budget_bytes || self.entries.contains_key(&fill.key) {
+            return Err(error(
+                "host-cache fill publication lost its exclusive cold-fill policy slot; preserve the fill gate through allocation and publication",
+            ));
+        }
+        self.history.remove(&fill.key);
+        self.entries.insert(
+            fill.key,
+            HostCacheEntry {
+                _bank: fill.bank,
+                weights: Arc::clone(&weights),
+                expanded_bytes: fill.expanded_bytes,
+                frequency: fill.frequency,
+                last_used: fill.last_used,
+                pin_until: 0,
+            },
+        );
+        self.owned_bytes = total;
+        self.record_residency(budget_bytes)?;
+        Ok(ExpertLease::Filled(weights))
+    }
+
+    #[cfg(test)]
     fn lease_registered<F>(
         &mut self,
         key: ExpertCacheKey,
@@ -864,130 +1040,14 @@ impl HostExpertCache {
     where
         F: FnOnce() -> Result<DequantizedExpert>,
     {
-        self.clock = self
-            .clock
-            .checked_add(1)
-            .ok_or_else(|| error("host-cache access clock overflow"))?;
-        let now = self.clock;
-        self.trim_to_budget(budget_bytes)?;
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.frequency = entry.frequency.saturating_add(1);
-            entry.last_used = now;
-            if entry.frequency >= PIN_FREQUENCY {
-                entry.pin_until = now.saturating_add(PIN_WINDOW);
-            }
-            let weights = Arc::clone(&entry.weights);
-            metrics().record_host_cache_hit();
-            self.record_residency(budget_bytes)?;
-            return Ok(ExpertLease::Hit(weights));
+        let trimmed = self.trim_to_budget(budget_bytes)?;
+        drop(trimmed);
+        let (plan, retired) = self.plan_lease(key, expanded_bytes, budget_bytes, bank);
+        drop(retired);
+        match plan? {
+            HostCachePlan::Ready(lease) => Ok(lease),
+            HostCachePlan::Fill(fill) => self.publish(fill, Arc::new(load()?), budget_bytes),
         }
-
-        metrics().record_host_cache_miss();
-        if budget_bytes == 0 || expanded_bytes == 0 || expanded_bytes > budget_bytes {
-            self.record_residency(budget_bytes)?;
-            return Ok(ExpertLease::Transient);
-        }
-
-        self.prune_history(now);
-        let history = self.history.entry(key.clone()).or_default();
-        if now.saturating_sub(history.last_used) > HISTORY_DECAY_WINDOW {
-            history.frequency /= 2;
-        }
-        history.frequency = history.frequency.saturating_add(1);
-        history.last_used = now;
-        let candidate_frequency = history.frequency;
-        if candidate_frequency < ADMISSION_FREQUENCY {
-            self.record_residency(budget_bytes)?;
-            return Ok(ExpertLease::Transient);
-        }
-
-        let required = self
-            .owned_bytes
-            .checked_add(expanded_bytes)
-            .ok_or_else(|| error("owned host-cache byte count overflow"))?;
-        let mut victims = Vec::new();
-        if required > budget_bytes {
-            let mut candidates = self
-                .entries
-                .iter()
-                .filter(|(_, entry)| {
-                    Arc::strong_count(&entry.weights) == 1
-                        && entry.pin_until < now
-                        && candidate_frequency > entry.frequency
-                })
-                .map(|(key, entry)| {
-                    (
-                        entry.frequency,
-                        entry.last_used,
-                        key.clone(),
-                        entry.expanded_bytes,
-                    )
-                })
-                .collect::<Vec<_>>();
-            candidates.sort_by_key(|(frequency, last_used, _, _)| (*frequency, *last_used));
-            let mut reclaim = required - budget_bytes;
-            for (_, _, victim, bytes) in candidates {
-                victims.push(victim);
-                reclaim = reclaim.saturating_sub(bytes);
-                if reclaim == 0 {
-                    break;
-                }
-            }
-            if reclaim != 0 {
-                self.record_residency(budget_bytes)?;
-                return Ok(ExpertLease::Transient);
-            }
-        }
-
-        let mut evicted_bytes = 0usize;
-        for victim in &victims {
-            let entry = self
-                .entries
-                .remove(victim)
-                .expect("selected host-cache victim exists");
-            evicted_bytes = evicted_bytes
-                .checked_add(entry.expanded_bytes)
-                .ok_or_else(|| error("evicted host-cache byte count overflow"))?;
-        }
-        self.owned_bytes = self
-            .owned_bytes
-            .checked_sub(evicted_bytes)
-            .ok_or_else(|| error("owned host-cache byte accounting underflow"))?;
-        self.owned_bytes = self
-            .owned_bytes
-            .checked_add(expanded_bytes)
-            .ok_or_else(|| error("owned host-cache byte count overflow"))?;
-        debug_assert!(self.owned_bytes <= budget_bytes);
-        metrics()
-            .record_host_cache_evictions(victims.len())
-            .map_err(error)?;
-        self.record_residency(budget_bytes)?;
-
-        let loaded = match load() {
-            Ok(loaded) => loaded,
-            Err(failure) => {
-                self.owned_bytes = self
-                    .owned_bytes
-                    .checked_sub(expanded_bytes)
-                    .ok_or_else(|| error("host-cache reservation rollback underflow"))?;
-                self.record_residency(budget_bytes)?;
-                return Err(failure);
-            }
-        };
-        let weights = Arc::new(loaded);
-        self.history.remove(&key);
-        self.entries.insert(
-            key,
-            HostCacheEntry {
-                _bank: bank,
-                weights: Arc::clone(&weights),
-                expanded_bytes,
-                frequency: candidate_frequency,
-                last_used: now,
-                pin_until: 0,
-            },
-        );
-        Ok(ExpertLease::Filled(weights))
     }
 
     #[cfg(test)]
@@ -1029,10 +1089,11 @@ impl HostExpertCache {
         }
     }
 
-    fn trim_to_budget(&mut self, budget_bytes: usize) -> Result<()> {
+    #[cfg(test)]
+    fn trim_to_budget(&mut self, budget_bytes: usize) -> Result<Vec<HostCacheEntry>> {
         if self.owned_bytes <= budget_bytes {
             self.record_residency(budget_bytes)?;
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut candidates = self
             .entries
@@ -1064,17 +1125,16 @@ impl HostExpertCache {
                 "cannot lower owned host-cache budget to {budget_bytes} bytes while {projected} bytes are leased"
             )));
         }
-        for victim in &victims {
-            self.entries
-                .remove(victim)
-                .expect("selected host-cache trim victim exists");
-        }
+        let retired = victims
+            .iter()
+            .filter_map(|victim| self.entries.remove(victim))
+            .collect();
         self.owned_bytes = projected;
         metrics()
             .record_host_cache_evictions(victims.len())
             .map_err(error)?;
         self.record_residency(budget_bytes)?;
-        Ok(())
+        Ok(retired)
     }
 
     fn record_residency(&mut self, budget_bytes: usize) -> Result<()> {
@@ -1097,15 +1157,6 @@ impl HostExpertCache {
         self.reported_owned_bytes = 0;
         self.reported_budget_bytes = 0;
     }
-
-    #[cfg(test)]
-    fn clear(&mut self) {
-        self.release_residency();
-        self.entries.clear();
-        self.history.clear();
-        self.owned_bytes = 0;
-        self.clock = 0;
-    }
 }
 
 impl Drop for HostExpertCache {
@@ -1114,47 +1165,20 @@ impl Drop for HostExpertCache {
     }
 }
 
-/// A governed ceiling is the lease's actual size, never a second byte counter.
-enum HostCacheBudget {
-    Local(u64),
-    Governed {
-        authority: onnx_runtime_memory_governor::MemoryAuthorityId,
-        lease: onnx_runtime_memory_governor::MemoryLease,
-    },
-}
-
-impl HostCacheBudget {
-    fn bytes(&self) -> u64 {
-        match self {
-            Self::Local(bytes) => *bytes,
-            Self::Governed { lease, .. } => lease.bytes(),
-        }
-    }
-
-    fn effective_bytes(&self) -> Result<usize> {
-        let bytes = match self {
-            Self::Local(bytes) => effective_host_budget_u64(*bytes)?,
-            Self::Governed { lease, .. } => lease.bytes(),
-        };
-        checked_host_budget(bytes).map_err(error)
-    }
-}
-
 struct WeightOffloadHostCacheInner {
-    // Declaration order is intentional: release cached payloads before the
-    // governor lease, so capacity cannot be handed back while values remain.
     cache: Mutex<HostExpertCache>,
-    budget: RwLock<HostCacheBudget>,
+    retention_bytes: u64,
+    memory: DerivedWeightMemory,
+    effective_retention: OnceLock<usize>,
     banks: RwLock<ExpertBanks>,
-    // Cold-path adopters serialize without holding data locks during governor
-    // callbacks. Cache operations and observers never acquire this gate.
-    adoption: Mutex<()>,
-    operations: RwLock<()>,
+    // Serialize cold publication, never holding the payload lock across a
+    // governor callback, allocation, dequantization, or retired-payload drop.
+    fill: Mutex<()>,
 }
 
-/// A governor-owned warm-host expert-cache partition.
+/// Shared expert retention policy and payloads funded by their own Host grants.
 #[derive(Clone)]
-pub struct WeightOffloadHostCache {
+pub(crate) struct WeightOffloadHostCache {
     inner: Arc<WeightOffloadHostCacheInner>,
 }
 
@@ -1181,15 +1205,13 @@ enum HostBankSnapshot<'a> {
     Registered(RwLockReadGuard<'a, ExpertBanks>),
 }
 
-/// Freeze one budget for a complete routed operation, including its prefetch
-/// worker. A separate lifecycle gate lets grant callbacks inspect the short-lived
-/// budget lock even while adoption waits for this operation to finish. Workers
-/// borrow the existing gate rather than reacquiring a reader behind a writer.
+/// Borrow the immutable retention decision and freeze bank membership through
+/// the routed operation. Workers borrow this proof rather than taking another
+/// reader behind a pending cold registrar.
 struct HostCacheOperation<'a> {
-    _operation_guard: RwLockReadGuard<'a, ()>,
     banks: HostBankSnapshot<'a>,
     bank: Arc<ExpertBank>,
-    cache: &'a Mutex<HostExpertCache>,
+    cache: &'a WeightOffloadHostCacheInner,
     budget_bytes: usize,
 }
 
@@ -1220,16 +1242,74 @@ impl HostCacheOperation<'_> {
         }
     }
 
-    fn all_selected_resident(&self, experts: impl Iterator<Item = usize>) -> bool {
-        let cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut key = self.bank.key.representative.clone();
-        experts.into_iter().all(|expert| {
-            key.expert = expert;
-            cache.entries.contains_key(&key)
-        })
+    fn prefetch_memory(
+        &self,
+        experts: impl Iterator<Item = usize>,
+    ) -> Result<Option<ExpertMemoryScope<'_>>> {
+        if !self.cache.memory.is_governed() {
+            return Ok(Some(ExpertMemoryScope::OnDemand(&self.cache.memory)));
+        }
+        if self.budget_bytes == 0 {
+            let Some(bytes) = self.bank.expanded_bytes.checked_mul(2) else {
+                return Ok(None);
+            };
+            return match self.cache.memory.try_grant(bytes)? {
+                WeightAdmission::Granted(grant) => {
+                    Ok(Some(ExpertMemoryScope::StreamingWindow(Arc::new(grant))))
+                }
+                WeightAdmission::Declined(reason) => {
+                    onnx_runtime_ep_api::record_kernel_variant_stage!(
+                        "prefetch",
+                        "qmoe.serial",
+                        "two streaming expert slots require {bytes} Host bytes: {reason}"
+                    );
+                    Ok(None)
+                }
+            };
+        }
+        let (pins, missing) = {
+            let cache = self
+                .cache
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pins = Vec::new();
+            let mut missing = Vec::new();
+            let mut key = self.bank.key.representative.clone();
+            for expert in experts {
+                key.expert = expert;
+                if let Some(entry) = cache.entries.get(&key) {
+                    pins.push(Arc::clone(&entry.weights));
+                } else {
+                    missing.push(expert);
+                }
+            }
+            (pins, missing)
+        };
+        let mut grants = BTreeMap::new();
+        if !missing.is_empty() {
+            let Some(bytes) = self.bank.expanded_bytes.checked_mul(missing.len()) else {
+                return Ok(None);
+            };
+            let mut group = match self.cache.memory.try_grant(bytes)? {
+                WeightAdmission::Granted(grant) => grant,
+                WeightAdmission::Declined(reason) => {
+                    onnx_runtime_ep_api::record_kernel_variant_stage!(
+                        "prefetch",
+                        "qmoe.serial",
+                        "complete missing selected experts require {bytes} Host bytes: {reason}"
+                    );
+                    return Ok(None);
+                }
+            };
+            for expert in missing {
+                grants.insert(expert, group.split_off(self.bank.expanded_bytes)?);
+            }
+        }
+        Ok(Some(ExpertMemoryScope::Selected {
+            grants: Mutex::new(grants),
+            _pins: pins,
+        }))
     }
 
     #[cfg(test)]
@@ -1240,169 +1320,93 @@ impl HostCacheOperation<'_> {
         }
     }
 
-    fn lease<F>(&self, expert: usize, load: F) -> Result<ExpertLease>
+    fn lease<F>(
+        &self,
+        expert: usize,
+        memory: &ExpertMemoryScope<'_>,
+        load: F,
+    ) -> Result<ExpertLease>
     where
-        F: FnOnce() -> Result<DequantizedExpert>,
+        F: FnOnce(Option<Arc<DenseWeightGrant>>) -> Result<DequantizedExpert>,
     {
+        if self.budget_bytes == 0 {
+            metrics().record_host_cache_miss();
+            return Ok(ExpertLease::Transient);
+        }
         let mut key = self.bank.key.representative.clone();
         key.expert = expert;
-        self.cache
+        if let Some(weights) = self
+            .cache
+            .cache
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .lease_registered(
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .hit(&key, self.budget_bytes)?
+        {
+            return Ok(ExpertLease::Hit(weights));
+        }
+        let _fill = self
+            .cache
+            .fill
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (plan, retired) = self
+            .cache
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .plan_lease(
                 key,
                 self.bank.expanded_bytes,
                 self.budget_bytes,
-                load,
                 Arc::clone(&self.bank),
-            )
+            );
+        drop(retired);
+        match plan? {
+            HostCachePlan::Ready(lease) => Ok(lease),
+            HostCachePlan::Fill(fill) => match memory.grant(expert, fill.expanded_bytes, true)? {
+                ExpertGrantAdmission::Granted(grant) => {
+                    let loaded = Arc::new(load(grant)?);
+                    let result = self
+                        .cache
+                        .cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .publish(fill, Arc::clone(&loaded), self.budget_bytes);
+                    // Keep this owner outside the guard, including publication errors.
+                    drop(loaded);
+                    result
+                }
+                ExpertGrantAdmission::Declined(reason) => Ok(ExpertLease::Refused(reason)),
+            },
+        }
     }
 }
 
 impl WeightOffloadHostCache {
-    /// Create an independent cache partition with its own byte ceiling.
-    ///
-    /// Prefer [`Self::new_leased`] where a governor exists: a local ceiling is
-    /// invisible to the ledger that grants host KV pages.
-    pub fn new(budget_bytes: u64) -> std::result::Result<Self, &'static str> {
-        checked_host_budget(budget_bytes)?;
+    pub(crate) fn new(
+        retention_bytes: u64,
+        memory: DerivedWeightMemory,
+    ) -> std::result::Result<Self, &'static str> {
+        checked_host_budget(retention_bytes)?;
         Ok(Self {
             inner: Arc::new(WeightOffloadHostCacheInner {
                 cache: Mutex::new(HostExpertCache::default()),
-                budget: RwLock::new(HostCacheBudget::Local(budget_bytes)),
+                retention_bytes,
+                memory,
+                effective_retention: OnceLock::new(),
                 banks: RwLock::new(BTreeMap::new()),
-                adoption: Mutex::new(()),
-                operations: RwLock::new(()),
+                fill: Mutex::new(()),
             }),
         })
     }
 
-    /// Create a host expert cache whose standing budget belongs to `governor`.
-    /// The request is capped to available host bytes; the lease's actual size
-    /// drives every admission, sharing the same books as host KV.
-    pub fn new_leased(
-        budget_bytes: u64,
-        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
-        holder: onnx_runtime_memory_governor::HolderId,
-    ) -> std::result::Result<Self, onnx_runtime_memory_api::MemoryError> {
-        let requested = effective_host_budget_u64(budget_bytes)?;
-        checked_host_budget(requested)
-            .map_err(|reason| invalid_host_budget_request(requested, reason))?;
-        let grant = requested.min(governor.available(onnx_runtime_memory_api::Tier::Host));
-        let lease = governor.reserve(
-            onnx_runtime_memory_api::Tier::Host,
-            grant,
-            onnx_runtime_memory_api::MemoryRole::Weights,
-            holder,
-        )?;
-        checked_host_budget(lease.bytes())
-            .map_err(|reason| invalid_host_budget_request(lease.bytes(), reason))?;
-        Ok(Self {
-            inner: Arc::new(WeightOffloadHostCacheInner {
-                cache: Mutex::new(HostExpertCache::default()),
-                budget: RwLock::new(HostCacheBudget::Governed {
-                    authority: governor.authority_id(onnx_runtime_memory_api::Tier::Host),
-                    lease,
-                }),
-                banks: RwLock::new(BTreeMap::new()),
-                adoption: Mutex::new(()),
-                operations: RwLock::new(()),
-            }),
-        })
+    /// Configured retention ceiling, never an idle reservation on Host capacity.
+    pub(crate) fn retention_budget_bytes(&self) -> u64 {
+        self.inner.retention_bytes
     }
 
-    /// Return this partition's configured byte ceiling.
-    pub fn configured_budget_bytes(&self) -> u64 {
-        self.budget().0
-    }
-
-    /// Inspect a coherent `(bytes, governed)` snapshot. Governed bytes are read
-    /// directly from the live lease, not a separately updated atomic counter.
-    pub fn budget(&self) -> (u64, bool) {
-        let budget = self
-            .inner
-            .budget
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (
-            budget.bytes(),
-            matches!(*budget, HostCacheBudget::Governed { .. }),
-        )
-    }
-
-    /// Replace a local budget with a host-tier governor lease. Existing routed
-    /// operations finish under their original budget before this transition.
-    /// Inactive cached weights are trimmed before publishing a smaller grant;
-    /// live expert leases that prevent trimming reject adoption transactionally.
-    /// Repeated adoption is valid only for the same authority and holder.
-    pub fn adopt_governed_budget(
-        &self,
-        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
-        holder: onnx_runtime_memory_governor::HolderId,
-    ) -> Result<u64> {
-        let requested_authority = governor.authority_id(onnx_runtime_memory_api::Tier::Host);
-        let _adoption = self
-            .inner
-            .adoption
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let requested = {
-            let budget = self
-                .inner
-                .budget
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let HostCacheBudget::Governed { authority, lease } = &*budget {
-                if *authority != requested_authority || lease.holder() != holder {
-                    return Err(error(format!(
-                        "host cache belongs to authority {authority:?}, holder {:?}; cannot adopt authority {requested_authority:?}, holder {holder:?}; construct a separate cache for a different governor or holder",
-                        lease.holder()
-                    )));
-                }
-                return Ok(lease.bytes());
-            }
-            effective_host_budget_u64(budget.bytes())?
-        };
-        checked_host_budget(requested)
-            .map_err(|reason| invalid_host_budget_request(requested, reason))?;
-        // The coordinator may query/reclaim caches while granting capacity.
-        // Keep both the budget and payload locks released across this call.
-        let grant = requested.min(governor.available(onnx_runtime_memory_api::Tier::Host));
-        let lease = governor.reserve(
-            onnx_runtime_memory_api::Tier::Host,
-            grant,
-            onnx_runtime_memory_api::MemoryRole::Weights,
-            holder,
-        )?;
-        let granted = lease.bytes();
-        let checked = checked_host_budget(granted)
-            .map_err(|reason| invalid_host_budget_request(granted, reason))?;
-        // Freeze publication until existing routed operations and prefetch
-        // workers finish. New operations can use the local budget while the
-        // provisional reservation above is prepared; the cold gate serializes
-        // adopters, so no competing adoption can publish a zero-sized grant.
-        let _operations = self
-            .inner
-            .operations
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut budget = self
-            .inner
-            .budget
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.inner.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-            .trim_to_budget(checked)
-            .map_err(|cause| error(format!(
-                "cannot adopt host-cache grant of {granted} bytes: {cause}; finish outstanding expert leases or provide more host capacity before retrying"
-            )))?;
-        // Every failure above leaves the local budget intact and drops the new
-        // lease. Publish only after cached residency fits the actual grant.
-        *budget = HostCacheBudget::Governed {
-            authority: requested_authority,
-            lease,
-        };
-        Ok(granted)
+    pub(crate) fn memory(&self) -> &DerivedWeightMemory {
+        &self.inner.memory
     }
 
     fn begin_operation(
@@ -1416,31 +1420,33 @@ impl WeightOffloadHostCache {
             representative,
             experts,
         };
-        let operation = self
-            .inner
-            .operations
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let budget = self
-            .inner
-            .budget
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let budget_bytes = budget.effective_bytes()?;
-        drop(budget);
+        let budget_bytes = if let Some(&bytes) = self.inner.effective_retention.get() {
+            bytes
+        } else {
+            let requested = effective_host_budget_u64(self.inner.retention_bytes)?;
+            let candidate = checked_host_budget(requested).map_err(|reason| {
+                EpError::Memory(onnx_runtime_memory_api::MemoryError::InvalidRequest {
+                    tier: onnx_runtime_memory_api::Tier::Host.name(),
+                    requested,
+                    reason,
+                })
+            })?;
+            // Resolve once on success. Invalid configuration leaves no policy
+            // or payload state behind, so correcting it can be retried.
+            *self.inner.effective_retention.get_or_init(|| candidate)
+        };
         if budget_bytes == 0 {
             return Ok(HostCacheOperation {
-                _operation_guard: operation,
                 banks: HostBankSnapshot::Streaming,
                 bank: Arc::new(ExpertBank {
                     key,
                     expanded_bytes,
                 }),
-                cache: &self.inner.cache,
+                cache: &self.inner,
                 budget_bytes,
             });
         }
-        // Lock order is operation -> brief budget snapshot -> bank registry -> payload. Registration
+        // The immutable policy needs no adoption/lifecycle locks. Registration
         // is cold; readers for known banks share the lock and compute concurrently.
         let mut banks = self
             .inner
@@ -1489,10 +1495,9 @@ impl WeightOffloadHostCache {
             )));
         }
         Ok(HostCacheOperation {
-            _operation_guard: operation,
             banks: HostBankSnapshot::Registered(banks),
             bank,
-            cache: &self.inner.cache,
+            cache: &self.inner,
             budget_bytes,
         })
     }
@@ -1504,74 +1509,33 @@ impl WeightOffloadHostCache {
     {
         let expert = key.expert;
         self.begin_operation(key, usize::MAX, expanded_bytes)?
-            .lease(expert, load)
-    }
-
-    #[cfg(test)]
-    fn reconfigure(&self, budget_bytes: u64) -> Result<()> {
-        let checked = checked_host_budget(budget_bytes).map_err(error)?;
-        let _adoption = self
-            .inner
-            .adoption
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _operations = self
-            .inner
-            .operations
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut budget = self
-            .inner
-            .budget
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if matches!(*budget, HostCacheBudget::Governed { .. }) {
-            return Err(error(
-                "a governed cache cannot be reconfigured as a local test cache; construct a new cache under the desired governor",
-            ));
-        }
-        self.inner
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .trim_to_budget(checked)?;
-        *budget = HostCacheBudget::Local(budget_bytes);
-        Ok(())
+            .lease(
+                expert,
+                &ExpertMemoryScope::OnDemand(self.memory()),
+                |grant| {
+                    let mut weights = load()?;
+                    weights._grant = grant;
+                    Ok(weights)
+                },
+            )
     }
 
     #[cfg(test)]
     fn clear(&self) {
-        let _budget = self
-            .inner
-            .budget
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.inner
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        let retired = {
+            let mut cache = self
+                .inner
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.release_residency();
+            cache.history.clear();
+            cache.owned_bytes = 0;
+            cache.clock = 0;
+            std::mem::take(&mut cache.entries)
+        };
+        drop(retired);
     }
-}
-
-fn invalid_host_budget_request(
-    requested: u64,
-    reason: &'static str,
-) -> onnx_runtime_memory_api::MemoryError {
-    onnx_runtime_memory_api::MemoryError::InvalidRequest {
-        tier: onnx_runtime_memory_api::Tier::Host.name(),
-        requested,
-        reason,
-    }
-}
-
-pub(crate) fn default_weight_offload_host_cache() -> &'static WeightOffloadHostCache {
-    static CACHE: OnceLock<WeightOffloadHostCache> = OnceLock::new();
-    // Deliberately inert unless the environment supplies a budget. The engine
-    // path injects a governed cache; this singleton is only for embedders that
-    // build a bare CPU EP, where silently inventing a host-RAM entitlement would
-    // recreate the second-ledger bug this type is designed to avoid.
-    CACHE.get_or_init(|| WeightOffloadHostCache::new(0).expect("zero host-cache budget is valid"))
 }
 
 fn lease_route_first_expert(
@@ -1580,15 +1544,16 @@ fn lease_route_first_expert(
     fc1: &QuantizedExperts<'_>,
     fc2: &QuantizedExperts<'_>,
     fc3: Option<&QuantizedExperts<'_>>,
-    memory: &TransientExpertMemory<'_>,
+    memory: &ExpertMemoryScope<'_>,
 ) -> Result<ExpertExecution> {
-    let lease = host_cache.lease(expert, || {
-        DequantizedExpert::load(expert, fc1, fc2, fc3, true, None)
+    let lease = host_cache.lease(expert, memory, |grant| {
+        DequantizedExpert::load(expert, fc1, fc2, fc3, true, grant)
     })?;
     let (execution, read_from_mmap) = match lease {
         ExpertLease::Hit(weights) => (ExpertExecution::Dense(weights), false),
         ExpertLease::Filled(weights) => (ExpertExecution::Dense(weights), true),
         ExpertLease::Transient => (memory.load(expert, fc1, fc2, fc3)?, true),
+        ExpertLease::Refused(reason) => (ExpertExecution::RowStreamed(reason), true),
     };
     if read_from_mmap {
         let mut bytes_read = fc1
@@ -2356,7 +2321,11 @@ mod tests {
 
     fn kernel(graph: &Graph, node: NodeId) -> Result<Box<dyn Kernel>> {
         let model = Model::new(graph);
-        CpuExecutionProvider::new().get_kernel(model.graph.node(node), &[], 1)
+        CpuExecutionProvider::with_resources(test_resources()).get_kernel(
+            model.graph.node(node),
+            &[],
+            1,
+        )
     }
 
     fn attributes(
@@ -2524,7 +2493,7 @@ mod tests {
             routers,
             k,
             true,
-            crate::CpuMemoryResources::default(),
+            test_resources(),
             1.0,
         )
     }
@@ -2693,13 +2662,12 @@ mod tests {
         let mut attributes = MoeAttributes::from_node(graph.node(node)).expect("attributes");
         attributes.k = k;
         let kernel = QMoEKernel {
-            transient_memory: resources.derived_weights,
             layer_id: graph.node(node).id.0,
             attributes,
             bits: BITS,
             block_size: BLOCK,
             weight_offload: WeightOffloadMode { enabled },
-            host_cache: resources.host_cache,
+            host_cache: resources.expert_cache().clone(),
             prefetch_experts,
         };
         let x = Owned::f32(&[ROWS, HIDDEN], input);
@@ -2883,18 +2851,17 @@ mod tests {
             &attributes(bits, block, k, false),
         );
         let attributes = MoeAttributes::from_node(graph.node(node)).expect("attributes");
+        reset_offload_test_state(host_cache_budget);
         let kernel = QMoEKernel {
-            transient_memory: DerivedWeightMemory::default(),
             layer_id: graph.node(node).id.0,
             attributes,
             bits,
             block_size: block,
             weight_offload: WeightOffloadMode { enabled: true },
-            host_cache: default_weight_offload_host_cache().clone(),
+            host_cache: test_resources().expert_cache().clone(),
             prefetch_experts,
         };
 
-        reset_offload_test_state(host_cache_budget);
         let input = pseudo_random_values(rows * hidden, 0xa5a5_1234);
         let x = Owned::f32(&[rows, hidden], &input);
         let mut final_output = None;
@@ -3318,12 +3285,29 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    thread_local! {
+        static TEST_RESOURCES: std::cell::RefCell<crate::CpuMemoryResources> =
+            std::cell::RefCell::new(crate::CpuMemoryResources::default());
+    }
+
+    fn test_resources() -> crate::CpuMemoryResources {
+        TEST_RESOURCES.with(|resources| resources.borrow().clone())
+    }
+
     fn reset_offload_test_state(host_cache_budget: u64) {
-        default_weight_offload_host_cache().clear();
+        TEST_RESOURCES.with(|resources| {
+            let mut resources = resources.borrow_mut();
+            resources.expert_cache().clear();
+            *resources = crate::CpuMemoryResources::new(
+                DerivedWeightMemory::default(),
+                crate::CpuWeightCacheLimits {
+                    expert_bytes: host_cache_budget,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        });
         metrics().reset();
-        default_weight_offload_host_cache()
-            .reconfigure(host_cache_budget)
-            .expect("test host-cache budget");
     }
 
     fn cache_key(expert: usize) -> ExpertCacheKey {
@@ -3499,11 +3483,13 @@ mod tests {
         let expanded_bytes = (inter * hidden + hidden * inter) * std::mem::size_of::<f32>();
         for capacity in [0, expanded_bytes - 1, expanded_bytes] {
             let governor = LedgerGovernor::new(LeaseLedger::new(0, capacity as u64, 0));
-            let provider = CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-                derived_weights: DerivedWeightMemory::governed(&governor, HolderId::new(13))
-                    .unwrap(),
-                ..Default::default()
-            });
+            let provider = CpuExecutionProvider::with_resources(
+                crate::CpuMemoryResources::new(
+                    DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+                    crate::CpuWeightCacheLimits::default(),
+                )
+                .unwrap(),
+            );
             let governed = provider.get_kernel(q_graph.node(q_node), &[], 1).unwrap();
             governed
                 .execute(&q_inputs, &mut [q_output.view_mut()])
@@ -3717,7 +3703,7 @@ mod tests {
             &[&router],
             3,
             false,
-            crate::CpuMemoryResources::default(),
+            test_resources(),
             0.73145,
         );
         for cache_bytes in [0, 4 * BYTES] {
@@ -3732,14 +3718,15 @@ mod tests {
                         grants: Mutex::new(Vec::new()),
                     });
                     let governor = ObservedGovernor(books.clone());
-                    let cache = WeightOffloadHostCache::new_leased(
-                        cache_bytes,
-                        &governor,
-                        HolderId::new(10),
+                    let resources = crate::CpuMemoryResources::new(
+                        DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+                        crate::CpuWeightCacheLimits {
+                            expert_bytes: cache_bytes,
+                            ..Default::default()
+                        },
                     )
                     .unwrap();
-                    let memory =
-                        DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+                    let cache = resources.expert_cache().clone();
                     let result = run_mmap_qmoe_sequence_prefetch(
                         true,
                         false,
@@ -3747,11 +3734,7 @@ mod tests {
                         &[&router, &router, &router],
                         3,
                         prefetch,
-                        crate::CpuMemoryResources {
-                            host_cache: cache.clone(),
-                            derived_weights: memory,
-                            ..Default::default()
-                        },
+                        resources,
                         0.73145,
                     );
                     assert_close(&result.output, &baseline.output);
@@ -3767,7 +3750,9 @@ mod tests {
                         );
                     }
                     previous_output = Some(result.output.clone());
-                    let transient_peak = if prefetch && transient_bytes >= 2 * BYTES {
+                    let transient_peak = if cache_bytes != 0 {
+                        0
+                    } else if prefetch && transient_bytes >= 2 * BYTES {
                         2 * BYTES
                     } else if transient_bytes >= BYTES {
                         BYTES
@@ -3779,17 +3764,17 @@ mod tests {
                         cache_bytes + transient_peak,
                         "unexpected working-set grant peak for prefetch={prefetch}"
                     );
-                    if prefetch && cache_bytes != 0 && transient_bytes >= 2 * BYTES {
+                    if prefetch && cache_bytes != 0 {
                         assert_eq!(
                             books
                                 .grants
                                 .lock()
                                 .unwrap()
                                 .iter()
-                                .filter(|&&bytes| bytes == 2 * BYTES)
+                                .filter(|&&bytes| bytes == cache_bytes)
                                 .count(),
                             2,
-                            "the third, fully cached step must not claim a transient allowance"
+                            "the first two cold steps split complete selected-expert grants; the third warm step must bypass the issuer"
                         );
                     }
                     let stats = crate::weight_offload_stats();
@@ -3933,7 +3918,7 @@ mod tests {
             &[&router],
             1,
             false,
-            crate::CpuMemoryResources::default(),
+            test_resources(),
             1.0,
         );
         let serial_stats = crate::weight_offload_stats();
@@ -4120,8 +4105,8 @@ mod tests {
     fn two_engine_cache_partitions_respect_independent_budgets() {
         let _guard = hold_metrics_test_lock();
         metrics().reset();
-        let engine_a = WeightOffloadHostCache::new(4).unwrap();
-        let engine_b = WeightOffloadHostCache::new(8).unwrap();
+        let engine_a = WeightOffloadHostCache::new(4, DerivedWeightMemory::default()).unwrap();
+        let engine_b = WeightOffloadHostCache::new(8, DerivedWeightMemory::default()).unwrap();
         let weights = |value| DequantizedExpert {
             fc1: vec![value],
             fc2: Vec::new(),
@@ -4137,8 +4122,8 @@ mod tests {
             drop(cache.lease(cache_key(1), 4, || Ok(weights(2.0))).unwrap());
         }
 
-        assert_eq!(engine_a.configured_budget_bytes(), 4);
-        assert_eq!(engine_b.configured_budget_bytes(), 8);
+        assert_eq!(engine_a.retention_budget_bytes(), 4);
+        assert_eq!(engine_b.retention_budget_bytes(), 8);
         let cache_a = engine_a.inner.cache.lock().unwrap();
         let cache_b = engine_b.inner.cache.lock().unwrap();
         assert!(cache_a.owned_bytes <= 4);
@@ -4147,7 +4132,22 @@ mod tests {
         assert_eq!(cache_b.entries.len(), 2);
     }
 
-    fn adoption_expert(value: f32) -> DequantizedExpert {
+    fn lease_fixture_expert(
+        operation: &HostCacheOperation<'_>,
+        expert: usize,
+    ) -> Result<ExpertLease> {
+        operation.lease(
+            expert,
+            &ExpertMemoryScope::OnDemand(&operation.cache.memory),
+            |grant| {
+                let mut payload = expert_payload(1.0);
+                payload._grant = grant;
+                Ok(payload)
+            },
+        )
+    }
+
+    fn expert_payload(value: f32) -> DequantizedExpert {
         DequantizedExpert {
             fc1: vec![value],
             fc2: vec![],
@@ -4157,168 +4157,71 @@ mod tests {
         }
     }
 
-    fn populated_adoption_cache() -> WeightOffloadHostCache {
-        let cache = WeightOffloadHostCache::new(8).unwrap();
-        for expert in 0..2 {
-            for _ in 0..2 {
-                drop(
-                    cache
-                        .lease(cache_key(expert), 4, || Ok(adoption_expert(expert as f32)))
-                        .unwrap(),
-                );
-            }
-        }
-        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 8);
-        cache
-    }
-
     #[test]
-    fn host_cache_adoption_trims_to_the_actual_grant_before_publishing_it() {
-        use onnx_runtime_memory_api::Tier;
-        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
-        let _guard = hold_metrics_test_lock();
-        let cache = populated_adoption_cache();
-        let governor = LedgerGovernor::new(LeaseLedger::new(0, 4, 0));
-        assert_eq!(
-            cache
-                .adopt_governed_budget(&governor, HolderId::new(10))
-                .unwrap(),
-            4
-        );
-        assert_eq!(cache.budget(), (4, true));
-        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 4);
-        assert_eq!(governor.used(Tier::Host), 4);
-        assert_eq!(
-            cache
-                .adopt_governed_budget(&governor, HolderId::new(10))
-                .unwrap(),
-            4
-        );
-        assert_eq!(
-            governor.used(Tier::Host),
-            4,
-            "same-owner adoption must be idempotent"
-        );
-        drop(cache);
-        assert_eq!(governor.used(Tier::Host), 0);
-    }
-
-    #[test]
-    fn host_cache_adoption_failure_preserves_the_local_cache_and_refunds_the_grant() {
-        use onnx_runtime_memory_api::Tier;
-        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
-        let _guard = hold_metrics_test_lock();
-        let cache = populated_adoption_cache();
-        let held = cache
-            .lease(cache_key(0), 4, || {
-                panic!("held expert must already be cached")
-            })
-            .unwrap();
-        let governor = LedgerGovernor::new(LeaseLedger::new(0, 2, 0));
-        let error = cache
-            .adopt_governed_budget(&governor, HolderId::new(10))
-            .unwrap_err();
-        let text = error.to_string();
-        assert!(text.contains("grant of 2 bytes"), "{text}");
-        assert!(text.contains("while 4 bytes are leased"), "{text}");
-        assert!(text.contains("finish outstanding expert leases"), "{text}");
-        assert_eq!(cache.budget(), (8, false));
-        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 8);
-        assert_eq!(
-            governor.used(Tier::Host),
-            0,
-            "failed adoption must refund its reservation"
-        );
-        let ExpertLease::Hit(weights) = &held else {
-            panic!("fixture expert must be cached")
-        };
-        assert_eq!(weights.fc1, vec![0.]);
-        drop(held);
-        assert_eq!(
-            cache
-                .adopt_governed_budget(&governor, HolderId::new(10))
-                .unwrap(),
-            2
-        );
-        assert_eq!(cache.budget(), (2, true));
-        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 0);
-        assert_eq!(governor.used(Tier::Host), 2);
-    }
-
-    #[test]
-    fn host_cache_adoption_rejects_a_different_authority_or_holder() {
-        use onnx_runtime_memory_api::Tier;
-        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
-        let _guard = hold_metrics_test_lock();
-        let owner = LedgerGovernor::new(LeaseLedger::new(0, 16, 0));
-        let foreign = LedgerGovernor::new(LeaseLedger::new(0, 16, 0));
-        let cache = WeightOffloadHostCache::new_leased(8, &owner, HolderId::new(10)).unwrap();
-        for (governor, holder) in [(&foreign, HolderId::new(10)), (&owner, HolderId::new(11))] {
-            let error = cache
-                .adopt_governed_budget(governor, holder)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("host cache belongs to authority"), "{error}");
-            assert!(error.contains("construct a separate cache"), "{error}");
-            assert_eq!(cache.budget(), (8, true));
-            assert_eq!(owner.used(Tier::Host), 8);
-            assert_eq!(foreign.used(Tier::Host), 0);
-        }
-        drop(cache);
-        assert_eq!(owner.used(Tier::Host), 0);
-    }
-
-    #[test]
-    fn transient_grant_callbacks_can_inspect_cache_while_adoption_waits() {
+    fn retained_grant_callbacks_observe_unlocked_payloads_and_hard_failures_are_transactional() {
         use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
         use onnx_runtime_memory_governor::{
-            HolderId, LeaseAccounting, LeaseLedger, LedgerGovernor, MemoryAuthorityId,
-            MemoryGovernor, MemoryLease,
+            HolderId, LeaseAccounting, LeaseLedger, MemoryAuthorityId, MemoryGovernor, MemoryLease,
         };
-        use std::sync::{atomic::AtomicUsize, mpsc};
-        use std::time::{Duration, Instant};
-        struct Observer {
-            cache: WeightOffloadHostCache,
-            id: MemoryAuthorityId,
-            calls: AtomicUsize,
-            used: AtomicU64,
+        use std::sync::atomic::AtomicBool;
+        #[derive(Debug)]
+        struct Books {
+            ledger: Arc<LeaseLedger>,
+            cache: Mutex<Weak<WeightOffloadHostCacheInner>>,
+            payload: Mutex<Weak<DequantizedExpert>>,
+            callbacks_unlocked: AtomicBool,
+            released_while_live: AtomicBool,
+            reject: AtomicBool,
+            grants: AtomicU64,
+            refunds: AtomicU64,
         }
-        impl std::fmt::Debug for Observer {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.debug_struct("Observer").finish_non_exhaustive()
+        impl Books {
+            fn observe(&self) {
+                if let Some(cache) = self.cache.lock().unwrap().upgrade() {
+                    self.callbacks_unlocked
+                        .fetch_and(cache.cache.try_lock().is_ok(), Ordering::Relaxed);
+                }
             }
         }
-        impl LeaseAccounting for Observer {
+        impl LeaseAccounting for Books {
             fn authority_id(&self) -> Option<MemoryAuthorityId> {
-                Some(self.id)
-            }
-            fn release(&self, _tier: Tier, bytes: u64) {
-                self.used.fetch_sub(bytes, Ordering::Relaxed);
+                self.ledger.authority_id()
             }
             fn try_claim(
                 &self,
-                _tier: Tier,
+                tier: Tier,
                 bytes: u64,
-                _role: MemoryRole,
+                role: MemoryRole,
             ) -> std::result::Result<(), MemoryError> {
-                assert!(
-                    self.cache.inner.cache.try_lock().is_ok(),
-                    "grant callbacks must run outside the payload lock"
-                );
-                assert_eq!(
-                    self.cache.budget(),
-                    (8, false),
-                    "a waiting adopter must not block budget inspection by an active operation's grant callback"
-                );
-                self.calls.fetch_add(1, Ordering::Relaxed);
-                self.used.fetch_add(bytes, Ordering::Relaxed);
-                Ok(())
+                if bytes != 0 {
+                    self.observe();
+                    if self.reject.load(Ordering::Relaxed) {
+                        return Err(MemoryError::InvalidRequest {
+                            tier: tier.name(),
+                            requested: bytes,
+                            reason: "fixture rejects this allocator request; restore the source before retrying",
+                        });
+                    }
+                    self.grants.fetch_add(1, Ordering::Relaxed);
+                }
+                self.ledger.try_claim(tier, bytes, role)
+            }
+            fn release(&self, tier: Tier, bytes: u64) {
+                if bytes != 0 {
+                    self.observe();
+                    self.released_while_live.fetch_or(
+                        self.payload.lock().unwrap().strong_count() != 0,
+                        Ordering::Relaxed,
+                    );
+                    self.refunds.fetch_add(1, Ordering::Relaxed);
+                }
+                self.ledger.release(tier, bytes);
             }
         }
-        struct ObservedGovernor(Arc<Observer>);
-        impl MemoryGovernor for ObservedGovernor {
+        struct Governor(Arc<Books>);
+        impl MemoryGovernor for Governor {
             fn authority_id(&self, _tier: Tier) -> MemoryAuthorityId {
-                self.0.id
+                self.0.authority_id().unwrap()
             }
             fn reserve(
                 &self,
@@ -4327,353 +4230,316 @@ mod tests {
                 role: MemoryRole,
                 holder: HolderId,
             ) -> std::result::Result<MemoryLease, MemoryError> {
-                if bytes != 0 {
-                    self.0.try_claim(tier, bytes, role)?;
-                }
+                self.0.try_claim(tier, bytes, role)?;
                 Ok(MemoryLease::new(tier, bytes, role, holder, self.0.clone()))
             }
-            fn available(&self, _tier: Tier) -> u64 {
-                u64::MAX
+            fn available(&self, tier: Tier) -> u64 {
+                self.0.ledger.available(tier)
             }
-            fn used(&self, _tier: Tier) -> u64 {
-                self.0.used.load(Ordering::Relaxed)
-            }
-        }
-        let _guard = hold_metrics_test_lock();
-        let cache = WeightOffloadHostCache::new(8).unwrap();
-        let books = Arc::new(Observer {
-            cache: cache.clone(),
-            id: LedgerGovernor::new(LeaseLedger::new(0, 8, 0)).authority_id(Tier::Host),
-            calls: AtomicUsize::new(0),
-            used: AtomicU64::new(0),
-        });
-        let source =
-            DerivedWeightMemory::governed(&ObservedGovernor(books.clone()), HolderId::new(13))
-                .unwrap();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (grant_tx, grant_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let (finish_tx, finish_rx) = mpsc::channel();
-        let reader_cache = cache.clone();
-        let reader = std::thread::spawn(move || {
-            let operation = reader_cache.begin_operation(cache_key(0), 2, 4).unwrap();
-            ready_tx.send(()).unwrap();
-            grant_rx.recv().unwrap();
-            let WeightAdmission::Granted(grant) = source.try_grant(4).unwrap() else {
-                panic!("observed fixture must grant")
-            };
-            drop(grant);
-            done_tx.send(()).unwrap();
-            finish_rx.recv().unwrap();
-            drop(operation);
-        });
-        let timeout = Duration::from_secs(5);
-        ready_rx.recv_timeout(timeout).unwrap();
-        assert!(
-            cache.inner.budget.try_write().is_ok(),
-            "active operations must freeze lifecycle without retaining a budget reader"
-        );
-        let adopting = Arc::new(LedgerGovernor::new(LeaseLedger::new(0, 4, 0)));
-        let writer_governor = adopting.clone();
-        let writer_cache = cache.clone();
-        let writer = std::thread::spawn(move || {
-            writer_cache.adopt_governed_budget(writer_governor.as_ref(), HolderId::new(10))
-        });
-        let deadline = Instant::now() + timeout;
-        while adopting.used(Tier::Host) != 4 {
-            assert!(
-                Instant::now() < deadline,
-                "adopter never prepared its provisional grant"
-            );
-            std::thread::yield_now();
-        }
-        grant_tx.send(()).unwrap();
-        done_rx
-            .recv_timeout(timeout)
-            .expect("grant callback must finish while the adopter waits");
-        assert_eq!(books.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(books.used.load(Ordering::Relaxed), 0);
-        finish_tx.send(()).unwrap();
-        reader.join().unwrap();
-        assert_eq!(writer.join().unwrap().unwrap(), 4);
-    }
-
-    #[test]
-    fn host_cache_adoption_waits_for_the_complete_operation_and_its_worker() {
-        use onnx_runtime_memory_api::Tier;
-        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
-        use std::sync::mpsc;
-        use std::time::Duration;
-        let _guard = hold_metrics_test_lock();
-        let cache = WeightOffloadHostCache::new(8).unwrap();
-        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(0, 4, 0)));
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (compute_tx, compute_rx) = mpsc::channel();
-        let (computed_tx, computed_rx) = mpsc::channel();
-        let (finish_tx, finish_rx) = mpsc::channel();
-        let reader_cache = cache.clone();
-        // Use owned test threads so a regression can time out without an
-        // unwinding scoped join preventing this test process from finishing.
-        let reader = std::thread::spawn(move || {
-            let operation = reader_cache.begin_operation(cache_key(0), 2, 4).unwrap();
-            ready_tx.send(operation.budget_bytes).unwrap();
-            compute_rx.recv().unwrap();
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        for expert in 0..2 {
-                            for _ in 0..2 {
-                                drop(
-                                    operation
-                                        .lease(expert, || Ok(adoption_expert(expert as f32)))
-                                        .unwrap(),
-                                );
-                            }
-                        }
-                    })
-                    .join()
-                    .unwrap();
-            });
-            computed_tx.send(()).unwrap();
-            finish_rx.recv().unwrap();
-        });
-        let timeout = Duration::from_secs(5);
-        assert_eq!(ready_rx.recv_timeout(timeout).unwrap(), 8);
-        let (started_tx, started_rx) = mpsc::channel();
-        let (adopted_tx, adopted_rx) = mpsc::channel();
-        let writer_cache = cache.clone();
-        let writer_governor = governor.clone();
-        let writer = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            adopted_tx
-                .send(
-                    writer_cache.adopt_governed_budget(writer_governor.as_ref(), HolderId::new(10)),
-                )
-                .unwrap();
-        });
-        started_rx.recv_timeout(timeout).unwrap();
-        compute_tx.send(()).unwrap();
-        computed_rx
-            .recv_timeout(timeout)
-            .expect("prefetch worker must complete while an adopting writer is pending");
-        assert!(matches!(
-            adopted_rx.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-        // A provisional reservation may exist, but publication must still
-        // wait for the complete operation to finish under its old budget.
-        finish_tx.send(()).unwrap();
-        assert_eq!(adopted_rx.recv_timeout(timeout).unwrap().unwrap(), 4);
-        reader.join().unwrap();
-        writer.join().unwrap();
-        assert_eq!(cache.budget(), (4, true));
-        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 4);
-        assert_eq!(governor.used(Tier::Host), 4);
-        drop(cache);
-        assert_eq!(governor.used(Tier::Host), 0);
-    }
-
-    #[test]
-    fn host_cache_adoption_owner_drops_payloads_before_releasing_its_grant() {
-        use onnx_runtime_memory_api::{DeviceKey, MemoryError, MemoryRole, Tier};
-        use onnx_runtime_memory_governor::{
-            HolderId, LeaseAccounting, MemoryAuthorityId, MemoryLease,
-        };
-        use std::sync::{Weak, atomic::AtomicBool};
-        #[derive(Debug)]
-        struct ObservedBooks {
-            authority: MemoryAuthorityId,
-            payload: Mutex<Weak<DequantizedExpert>>,
-            used: AtomicU64,
-            released: AtomicU64,
-            released_while_live: AtomicBool,
-        }
-        impl LeaseAccounting for ObservedBooks {
-            fn authority_id(&self) -> Option<MemoryAuthorityId> {
-                Some(self.authority)
-            }
-            fn try_claim(
-                &self,
-                _tier: Tier,
-                bytes: u64,
-                _role: MemoryRole,
-            ) -> std::result::Result<(), MemoryError> {
-                self.used.fetch_add(bytes, Ordering::Relaxed);
-                Ok(())
-            }
-            fn release(&self, _tier: Tier, bytes: u64) {
-                self.released_while_live.store(
-                    self.payload.lock().unwrap().strong_count() != 0,
-                    Ordering::Relaxed,
-                );
-                self.released.fetch_add(bytes, Ordering::Relaxed);
-                self.used.fetch_sub(bytes, Ordering::Relaxed);
+            fn used(&self, tier: Tier) -> u64 {
+                self.0.ledger.used(tier)
             }
         }
         let _guard = hold_metrics_test_lock();
-        let books = Arc::new(ObservedBooks {
-            authority: MemoryAuthorityId::new(DeviceKey::HOST),
+        let books = Arc::new(Books {
+            ledger: LeaseLedger::new(0, 4, 0),
+            cache: Mutex::new(Weak::new()),
             payload: Mutex::new(Weak::new()),
-            used: AtomicU64::new(0),
-            released: AtomicU64::new(0),
+            callbacks_unlocked: AtomicBool::new(true),
             released_while_live: AtomicBool::new(false),
+            reject: AtomicBool::new(false),
+            grants: AtomicU64::new(0),
+            refunds: AtomicU64::new(0),
         });
-        books.try_claim(Tier::Host, 8, MemoryRole::Weights).unwrap();
-        let lease = MemoryLease::new(
-            Tier::Host,
-            8,
-            MemoryRole::Weights,
-            HolderId::new(10),
-            books.clone(),
-        );
-        let cache = WeightOffloadHostCache {
-            inner: Arc::new(WeightOffloadHostCacheInner {
-                cache: Mutex::new(HostExpertCache::default()),
-                budget: RwLock::new(HostCacheBudget::Governed {
-                    authority: books.authority,
-                    lease,
-                }),
-                banks: RwLock::new(BTreeMap::new()),
-                adoption: Mutex::new(()),
-                operations: RwLock::new(()),
-            }),
-        };
+        let governor = Governor(books.clone());
+        let cache = WeightOffloadHostCache::new(
+            4,
+            DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+        )
+        .unwrap();
+        *books.cache.lock().unwrap() = Arc::downgrade(&cache.inner);
         for _ in 0..2 {
             drop(
                 cache
-                    .lease(cache_key(0), 4, || Ok(adoption_expert(1.)))
+                    .lease(cache_key(0), 4, || Ok(expert_payload(1.)))
                     .unwrap(),
             );
         }
         *books.payload.lock().unwrap() =
             Arc::downgrade(&cache.inner.cache.lock().unwrap().entries[&cache_key(0)].weights);
-        assert_eq!(books.payload.lock().unwrap().strong_count(), 1);
-        drop(cache);
-        assert_eq!(books.released.load(Ordering::Relaxed), 8);
-        assert_eq!(books.used.load(Ordering::Relaxed), 0);
+        // The third cold reference is frequent enough to evict the first entry.
+        for _ in 0..3 {
+            drop(
+                cache
+                    .lease(cache_key(1), 4, || Ok(expert_payload(2.)))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(governor.used(Tier::Host), 4);
         assert!(
-            !books.released_while_live.load(Ordering::Relaxed),
-            "returning the grant before payload destruction exposes phantom free capacity"
+            cache
+                .inner
+                .cache
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&cache_key(1))
         );
+        *books.payload.lock().unwrap() =
+            Arc::downgrade(&cache.inner.cache.lock().unwrap().entries[&cache_key(1)].weights);
+        cache.clear();
+        assert_eq!(governor.used(Tier::Host), 0);
+        assert_eq!(books.grants.load(Ordering::Relaxed), 2);
+        assert_eq!(books.refunds.load(Ordering::Relaxed), 2);
+        assert!(
+            books.callbacks_unlocked.load(Ordering::Relaxed),
+            "reserve/refund callbacks must never run under the payload lock"
+        );
+        assert!(!books.released_while_live.load(Ordering::Relaxed));
+        books.reject.store(true, Ordering::Relaxed);
+        drop(
+            cache
+                .lease(cache_key(2), 4, || Ok(expert_payload(3.)))
+                .unwrap(),
+        );
+        let failure = cache
+            .lease(cache_key(2), 4, || Ok(expert_payload(3.)))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            failure,
+            EpError::Memory(MemoryError::InvalidRequest { .. })
+        ));
+        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 0);
+        assert_eq!(governor.used(Tier::Host), 0);
+        books.reject.store(false, Ordering::Relaxed);
+        assert!(matches!(
+            cache
+                .lease(cache_key(2), 4, || Ok(expert_payload(3.)))
+                .unwrap(),
+            ExpertLease::Filled(_)
+        ));
+        cache.clear();
+        assert_eq!(governor.used(Tier::Host), 0);
+        for _ in 0..2 {
+            drop(
+                cache
+                    .lease(cache_key(3), 4, || Ok(expert_payload(4.)))
+                    .unwrap(),
+            );
+        }
+        // Fault injection pins the retirement error path: even an inconsistent
+        // local counter must return payloads outside the lock, never refund
+        // through an observer while still holding that lock.
+        cache.inner.cache.lock().unwrap().owned_bytes = 1;
+        for _ in 0..2 {
+            drop(
+                cache
+                    .lease(cache_key(4), 4, || Ok(expert_payload(5.)))
+                    .unwrap(),
+            );
+        }
+        let failure = cache
+            .lease(cache_key(4), 4, || Ok(expert_payload(5.)))
+            .err()
+            .unwrap();
+        assert!(failure.to_string().contains("accounting underflow"));
+        assert_eq!(governor.used(Tier::Host), 0);
+        assert!(books.callbacks_unlocked.load(Ordering::Relaxed));
+        cache.clear();
     }
 
     #[test]
-    fn host_cache_adoption_governor_can_observe_the_cache_during_reservation() {
-        use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
-        use onnx_runtime_memory_governor::{
-            HolderId, LeaseLedger, LedgerGovernor, MemoryAuthorityId, MemoryGovernor, MemoryLease,
-        };
-        use std::sync::mpsc;
-        use std::time::Duration;
-        struct ObservingGovernor {
-            inner: LedgerGovernor,
-            cache: WeightOffloadHostCache,
-            observed: Mutex<Vec<(&'static str, (u64, bool))>>,
-        }
-        impl MemoryGovernor for ObservingGovernor {
-            fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
-                self.inner.authority_id(tier)
-            }
-            fn reserve(
-                &self,
-                tier: Tier,
-                bytes: u64,
-                role: MemoryRole,
-                holder: HolderId,
-            ) -> std::result::Result<MemoryLease, MemoryError> {
-                self.observed
-                    .lock()
-                    .unwrap()
-                    .push(("reserve", self.cache.budget()));
-                self.inner.reserve(tier, bytes, role, holder)
-            }
-            fn available(&self, tier: Tier) -> u64 {
-                self.observed
-                    .lock()
-                    .unwrap()
-                    .push(("available", self.cache.budget()));
-                self.inner.available(tier)
-            }
-            fn used(&self, tier: Tier) -> u64 {
-                self.inner.used(tier)
-            }
-        }
+    fn concurrent_cold_references_publish_one_payload_and_one_grant() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        use std::sync::{Barrier, atomic::AtomicUsize};
         let _guard = hold_metrics_test_lock();
-        let cache = WeightOffloadHostCache::new(8).unwrap();
-        let ledger = LeaseLedger::new(0, 8, 0);
-        let worker_ledger = ledger.clone();
-        let worker_cache = cache.clone();
-        let (tx, rx) = mpsc::channel();
-        // A regression must fail by timeout, rather than hang this test binary
-        // if a coordinator callback is invoked under the cache's write lock.
-        let worker = std::thread::spawn(move || {
-            let governor = ObservingGovernor {
-                inner: LedgerGovernor::new(worker_ledger),
-                cache: worker_cache.clone(),
-                observed: Mutex::new(Vec::new()),
-            };
-            let first = worker_cache.adopt_governed_budget(&governor, HolderId::new(10));
-            let second = worker_cache.adopt_governed_budget(&governor, HolderId::new(10));
-            tx.send((first, second, governor.observed.lock().unwrap().clone()))
-                .unwrap();
-        });
-        let (first, second, observed) = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("governor observers must not deadlock on host-cache state");
-        assert_eq!(first.unwrap(), 8);
-        assert_eq!(second.unwrap(), 8);
-        worker.join().unwrap();
-        assert_eq!(
-            observed,
-            vec![("available", (8, false)), ("reserve", (8, false))]
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 4, 0));
+        let cache = WeightOffloadHostCache::new(
+            64,
+            DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+        )
+        .unwrap();
+        drop(
+            cache
+                .lease(cache_key(0), 4, || Ok(expert_payload(1.)))
+                .unwrap(),
         );
-        assert_eq!(cache.budget(), (8, true));
-        assert_eq!(ledger.used(Tier::Host), 8);
-        drop(cache);
-        assert_eq!(ledger.used(Tier::Host), 0);
+        let loads = AtomicUsize::new(0);
+        let start = Barrier::new(9);
+        std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        let held = cache
+                            .lease(cache_key(0), 4, || {
+                                loads.fetch_add(1, Ordering::Relaxed);
+                                Ok(expert_payload(1.))
+                            })
+                            .unwrap();
+                        assert!(matches!(held, ExpertLease::Hit(_) | ExpertLease::Filled(_)));
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert_eq!(governor.used(Tier::Host), 4);
+        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 4);
+        cache.clear();
+        assert_eq!(governor.used(Tier::Host), 0);
     }
 
     #[test]
-    fn governed_host_cache_uses_only_the_host_bytes_the_ledger_can_grant() {
+    fn governed_retention_reserves_only_live_payloads_and_active_arcs_keep_grants() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let _guard = hold_metrics_test_lock();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 8, 0));
+        let cache = WeightOffloadHostCache::new(
+            64,
+            DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache.retention_budget_bytes(), 64);
+        assert_eq!(governor.used(Tier::Host), 0);
+        drop(
+            cache
+                .lease(cache_key(0), 4, || Ok(expert_payload(1.)))
+                .unwrap(),
+        );
+        assert_eq!(
+            governor.used(Tier::Host),
+            0,
+            "history alone allocates no retained payload"
+        );
+        let held = cache
+            .lease(cache_key(0), 4, || Ok(expert_payload(1.)))
+            .unwrap();
+        assert_eq!(governor.used(Tier::Host), 4);
+        drop(cache);
+        assert_eq!(
+            governor.used(Tier::Host),
+            4,
+            "an active expert outlives its cache partition"
+        );
+        drop(held);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn governed_retention_competes_with_real_host_kv_without_idle_entitlement() {
         use onnx_runtime_memory_api::{MemoryRole, Tier};
         use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
-
-        let governor = LedgerGovernor::new(LeaseLedger::new(0, 1_000, 0));
-        let _kv = governor
-            .reserve(Tier::Host, 800, MemoryRole::KvCache, HolderId::new(1))
-            .expect("pre-lease most host RAM to KV");
-
-        let requested = 700;
-        let cache = WeightOffloadHostCache::new_leased(requested, &governor, HolderId::new(10))
-            .expect("host cache can degrade to remaining host RAM");
-
-        let (granted, governed) = cache.budget();
-        assert!(governed, "the cache budget must be backed by a host lease");
-        assert!(
-            granted < requested,
-            "pre-leasing host RAM should force a smaller grant than the cache asked for"
+        let _guard = hold_metrics_test_lock();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 12, 0));
+        let kv = governor
+            .reserve(Tier::Host, 8, MemoryRole::KvCache, HolderId::new(1))
+            .unwrap();
+        let cache = WeightOffloadHostCache::new(
+            64,
+            DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(governor.used(Tier::Host), 8);
+        for _ in 0..2 {
+            drop(
+                cache
+                    .lease(cache_key(0), 4, || Ok(expert_payload(1.)))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(governor.used(Tier::Host), 12);
+        drop(
+            cache
+                .lease(cache_key(1), 4, || Ok(expert_payload(2.)))
+                .unwrap(),
         );
-        assert_eq!(granted, 200);
+        assert!(matches!(
+            cache
+                .lease(cache_key(1), 4, || Ok(expert_payload(2.)))
+                .unwrap(),
+            ExpertLease::Refused(_)
+        ));
+        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 4);
+        drop(kv);
+        assert!(matches!(
+            cache
+                .lease(cache_key(1), 4, || Ok(expert_payload(2.)))
+                .unwrap(),
+            ExpertLease::Filled(_)
+        ));
+        assert_eq!(governor.used(Tier::Host), 8);
+        cache.clear();
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn selected_prefetch_grants_refund_each_retained_payload_independently() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let _guard = hold_metrics_test_lock();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 12, 0));
+        let cache = WeightOffloadHostCache::new(
+            12,
+            DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+        )
+        .unwrap();
+        let operation = cache.begin_operation(cache_key(0), 3, 4).unwrap();
+        for expert in 0..3 {
+            drop(
+                operation
+                    .lease(
+                        expert,
+                        &ExpertMemoryScope::OnDemand(cache.memory()),
+                        |grant| {
+                            let mut payload = expert_payload(expert as f32);
+                            payload._grant = grant;
+                            Ok(payload)
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        let scope = operation.prefetch_memory(0..3).unwrap().unwrap();
+        assert_eq!(governor.used(Tier::Host), 12);
+        let mut active = None;
+        for expert in 0..3 {
+            let held = operation
+                .lease(expert, &scope, |grant| {
+                    let mut payload = expert_payload(expert as f32);
+                    payload._grant = grant;
+                    Ok(payload)
+                })
+                .unwrap();
+            assert!(matches!(held, ExpertLease::Filled(_)));
+            if expert == 0 {
+                active = Some(held);
+            }
+        }
+        drop(scope);
+        assert_eq!(governor.used(Tier::Host), 12);
+        cache.clear();
         assert_eq!(
             governor.used(Tier::Host),
-            1_000,
-            "the host tier must see both KV and the cache lease"
+            4,
+            "two evicted payloads must not keep a shared full-group allowance alive"
         );
-
-        drop(cache);
-        assert_eq!(
-            governor.used(Tier::Host),
-            800,
-            "dropping the cache must return its host lease"
-        );
+        drop(active);
+        assert_eq!(governor.used(Tier::Host), 0);
     }
 
     #[test]
     fn process_metrics_aggregate_live_cache_residency_and_release_on_drop() {
         let _guard = hold_metrics_test_lock();
         metrics().reset();
-        let engine_a = WeightOffloadHostCache::new(4).unwrap();
-        let engine_b = WeightOffloadHostCache::new(8).unwrap();
+        let engine_a = WeightOffloadHostCache::new(4, DerivedWeightMemory::default()).unwrap();
+        let engine_b = WeightOffloadHostCache::new(8, DerivedWeightMemory::default()).unwrap();
         let weights = |value| DequantizedExpert {
             fc1: vec![value],
             fc2: Vec::new(),
@@ -4757,11 +4623,11 @@ mod tests {
     fn shared_bank_rejects_inconsistent_expanded_size_with_source_context() {
         let _guard = hold_metrics_test_lock();
         metrics().reset();
-        let cache = WeightOffloadHostCache::new(8).unwrap();
+        let cache = WeightOffloadHostCache::new(8, DerivedWeightMemory::default()).unwrap();
         {
             let operation = cache.begin_operation(cache_key(0), 1, 4).unwrap();
             for _ in 0..2 {
-                drop(operation.lease(0, || Ok(adoption_expert(1.0))).unwrap());
+                drop(lease_fixture_expert(&operation, 0).unwrap());
             }
         }
         let failure = cache
@@ -4777,7 +4643,7 @@ mod tests {
     #[test]
     fn zero_budget_prefetch_needs_no_bank_registry_lock() {
         let _guard = hold_metrics_test_lock();
-        let cache = WeightOffloadHostCache::new(0).unwrap();
+        let cache = WeightOffloadHostCache::new(0, DerivedWeightMemory::default()).unwrap();
         let first = cache.begin_operation(cache_key(0), 2, 4).unwrap();
         assert!(first.prefetch_eligibility().allows_pipeline());
         let registry = cache
@@ -4798,13 +4664,14 @@ mod tests {
         let _guard = hold_metrics_test_lock();
         metrics().reset();
         for (budget, expected) in [(0, true), (8, false), (12, true)] {
-            let cache = WeightOffloadHostCache::new(budget).unwrap();
+            let cache =
+                WeightOffloadHostCache::new(budget, DerivedWeightMemory::default()).unwrap();
             let mut foreign = cache_key(0);
             foreign.layer_id = 99;
             {
                 let operation = cache.begin_operation(foreign, 1, 4).unwrap();
                 for _ in 0..2 {
-                    drop(operation.lease(0, || Ok(adoption_expert(1.0))).unwrap());
+                    drop(lease_fixture_expert(&operation, 0).unwrap());
                 }
             }
             let operation = cache.begin_operation(cache_key(0), 2, 4).unwrap();
@@ -4835,7 +4702,7 @@ mod tests {
         use std::time::Duration;
         let _guard = hold_metrics_test_lock();
         metrics().reset();
-        let cache = WeightOffloadHostCache::new(8).unwrap();
+        let cache = WeightOffloadHostCache::new(8, DerivedWeightMemory::default()).unwrap();
         let operation = cache.begin_operation(cache_key(0), 2, 4).unwrap();
         assert!(operation.prefetch_eligibility().allows_pipeline());
         assert!(cache.inner.banks.try_write().is_err());
@@ -4870,7 +4737,7 @@ mod tests {
                 let borrowed = &operation;
                 workers.spawn(move || {
                     for _ in 0..2 {
-                        drop(borrowed.lease(0, || Ok(adoption_expert(1.0))).unwrap());
+                        drop(lease_fixture_expert(borrowed, 0).unwrap());
                     }
                     worker_tx.send(()).unwrap();
                 });
@@ -4894,11 +4761,11 @@ mod tests {
     fn shared_bank_registry_prunes_dead_sources_and_retains_live_entries() {
         let _guard = hold_metrics_test_lock();
         metrics().reset();
-        let cache = WeightOffloadHostCache::new(8).unwrap();
+        let cache = WeightOffloadHostCache::new(8, DerivedWeightMemory::default()).unwrap();
         {
             let retained = cache.begin_operation(cache_key(0), 1, 4).unwrap();
             for _ in 0..2 {
-                drop(retained.lease(0, || Ok(adoption_expert(1.0))).unwrap());
+                drop(lease_fixture_expert(&retained, 0).unwrap());
             }
         }
         for layer_id in 100..132 {

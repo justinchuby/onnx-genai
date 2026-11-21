@@ -1929,12 +1929,16 @@ mod tests {
         let (graph, node) = model_node(&shapes, &attrs("identity", 1, false, 0));
         let bytes = (2 * H * H * 4) as u64;
         let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes, 0));
-        let provider = CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-            derived_weights: crate::DerivedWeightMemory::governed(&governor, HolderId::new(13))
-                .unwrap(),
-            dense_weight_cache_bytes: bytes as usize,
-            ..Default::default()
-        });
+        let provider = CpuExecutionProvider::with_resources(
+            crate::CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+                crate::CpuWeightCacheLimits {
+                    dense_bytes: bytes as usize,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
         let mut first = provider.get_kernel(graph.node(node), &[], 1).unwrap();
         let mut second = provider.get_kernel(graph.node(node), &[], 1).unwrap();
         first.set_constant_inputs(&[false, false, true, false, true]);

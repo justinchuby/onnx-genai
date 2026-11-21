@@ -325,15 +325,33 @@ operands. This borrow decision does not depend on `ONNX_GENAI_WEIGHT_OFFLOAD` or
 mmap catalog eligibility; the latter still controls route-first paging, metrics
 and cache identity. Device-only operands fail before CPU reads, with instructions
 to move the named tensor to CPU. Borrowing removes duplicate source buffers;
-QMoE's uncached dense FC1/FC2/(optional FC3) set now obtains a complete Host
-grant before allocation; refusal selects row-decoded f32 projections shared with
-the block-quantized kernels. Retained experts remain paid by their standing host
-cache partition. Cold prefetch preflights a scoped allowance for its two live
-expert slots; refusal runs serially, and fully cached operations skip this grant.
-The allowance outlives both the worker and its payloads. Default standalone CPU
-resources remain ungoverned. This covers dense weight payloads, not row scratch,
-activation/output buffers or allocator metadata; compressed-domain compute and
-removing idle standing reservations remain follow-up work.
+QMoE's complete dense FC1/FC2/(optional FC3) set obtains a Host grant before
+allocation; refusal selects row-decoded f32 projections shared with the
+block-quantized kernels. Each retained expert keeps its own exact payload grant
+until its last owner drops, including owners that outlive cache eviction or the
+provider. The retention ceiling itself reserves no idle Host bytes.
+
+A sealed `CpuMemoryResources` constructor pairs the cache and all block/QMoE
+expansions with one grant source. `CpuWeightCacheLimits` controls retention;
+`with_cache_retention` carries the immutable legacy planned-family verdict.
+The optional host-cache environment override is resolved once on the cache's
+first operation, with typed configuration errors rather than a constructor panic.
+There is no runtime budget-adoption/reconfiguration API or process-global cache.
+
+Cold fills serialize publication while allocation, accounting callbacks and
+retired-payload destruction happen outside the payload lock. Warm hits bypass
+the grant issuer and cold-fill gate. Streaming-only prefetch retains its scoped
+two-expert allowance. Cacheable prefetch pins existing selected hits, preflights
+the complete initially missing selected set and splits exact per-expert grants.
+Unused shares are returned at operation completion; retained shares outlive the
+operation independently. If that preflight does not fit, execution stays serial,
+preserving the serial dense/row choice and cache admission statistics. This
+reservation is an active-operation admission bound, not a measured RSS peak.
+
+Default standalone CPU resources remain ungoverned. These grants cover full
+dense weight payloads, not row scratch, activation/output buffers or allocator
+metadata. Other packed caches, CPU Device/Host physical-capacity reconciliation,
+compressed-domain compute and GPU lifetime validation remain follow-up work.
 
 `MOE_SUPPORT.md` already requires expert-major contiguous external data so each expert
 slice can be computed from the initializer descriptor without materializing the tensor

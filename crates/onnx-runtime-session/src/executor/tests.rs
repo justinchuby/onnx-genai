@@ -8578,10 +8578,8 @@ fn symbolic_cpu_session_prepares_constants_at_load_with_own_retention_policy() {
             vec![y],
         ));
         let cpu = CpuExecutionProvider::initialized_with_resources(
-            onnx_runtime_ep_cpu::CpuMemoryResources {
-                cache_retention: onnx_runtime_ep_cpu::CpuCacheRetention::new(admitted),
-                ..Default::default()
-            },
+            onnx_runtime_ep_cpu::CpuMemoryResources::default()
+                .with_cache_retention(onnx_runtime_ep_cpu::CpuCacheRetention::new(admitted)),
         )
         .unwrap();
         let mut executor =
@@ -8676,10 +8674,10 @@ fn configured_cpu_fallback_is_used_and_non_cpu_fallback_is_rejected() {
         Arc::new(AtomicUsize::new(0)),
     ));
     let cpu: Arc<dyn ExecutionProvider> = Arc::new(
-        CpuExecutionProvider::initialized_with_resources(onnx_runtime_ep_cpu::CpuMemoryResources {
-            cache_retention: onnx_runtime_ep_cpu::CpuCacheRetention::new(false),
-            ..Default::default()
-        })
+        CpuExecutionProvider::initialized_with_resources(
+            onnx_runtime_ep_cpu::CpuMemoryResources::default()
+                .with_cache_retention(onnx_runtime_ep_cpu::CpuCacheRetention::new(false)),
+        )
         .unwrap(),
     );
     let mut exec = Executor::build_with_mode(
