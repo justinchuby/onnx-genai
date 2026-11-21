@@ -140,6 +140,16 @@ impl Value {
         self.producer.is_none()
     }
 
+    /// Publish resolved tensor metadata together with its known-state flags.
+    /// An empty shape here is a known scalar. This does not replace the source
+    /// `declared_type`, and container declarations remain non-tensor values.
+    pub fn set_tensor_facts(&mut self, dtype: DataType, shape: Shape) {
+        self.dtype = dtype;
+        self.shape = shape;
+        self.tensor_type_known = dtype != DataType::Undefined;
+        self.tensor_shape_known = true;
+    }
+
     /// Known tensor element type; never projects a container into a tensor.
     pub fn tensor_dtype(&self) -> Option<DataType> {
         (self.tensor_type_known && self.dtype != DataType::Undefined && self.permits_tensor_facts())

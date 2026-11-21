@@ -4,7 +4,9 @@ use onnx_runtime_einsum_conformance::{
     ConformanceDType, DeclaredDType, MalformedCase, malformed_cases, named_cases,
 };
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, static_shape};
-use onnx_runtime_loader::{LoaderError, load_model_bytes, proto::onnx, validate_model};
+use onnx_runtime_loader::{
+    LoaderError, load_model_bytes, load_model_ir_bytes, proto::onnx, validate_model,
+};
 
 fn tensor_type(elem_type: i32, shape: Option<&[i64]>) -> onnx::TypeProto {
     use onnx::tensor_shape_proto::{Dimension, dimension::Value};
@@ -185,24 +187,31 @@ fn loader_rejects_einsum_empty_required_output_name() {
 
 #[test]
 fn loader_accepts_single_named_einsum_output_with_unknown_metadata() {
-    let graph = load_model_bytes(&model(
+    let bytes = model(
         12,
         value_info("X", Some(1), Some(&[2])),
         value_info("Y", None, None),
         vec![einsum_node("X", "Y", "i->i")],
-    ))
-    .unwrap();
+    );
+    let source = load_model_ir_bytes(&bytes).unwrap();
+    let graph = load_model_bytes(&bytes).unwrap();
 
     let output = find(&graph, "Y");
-    assert!(!graph.value_type_is_known(output));
-    assert!(!graph.value_shape_is_known(output));
+    assert!(!source.value_type_is_known(find(&source, "Y")));
+    assert!(!source.value_shape_is_known(find(&source, "Y")));
+    assert!(graph.value_type_is_known(output));
+    assert!(graph.value_shape_is_known(output));
+    assert_eq!(
+        graph.value(output).declared_type,
+        source.value(find(&source, "Y")).declared_type
+    );
     assert_eq!(graph.value(output).dtype, DataType::Float32);
     assert_eq!(graph.value(output).shape, static_shape([2]));
 }
 
 #[test]
 fn omitted_interior_value_info_is_inferred_after_fail_fast_validation() {
-    let graph = load_model_bytes(&model(
+    let bytes = model(
         12,
         value_info("X", Some(1), Some(&[2])),
         value_info("Y", Some(1), Some(&[2])),
@@ -210,12 +219,19 @@ fn omitted_interior_value_info_is_inferred_after_fail_fast_validation() {
             einsum_node("X", "interior", "i->i"),
             einsum_node("interior", "Y", "i->i"),
         ],
-    ))
-    .unwrap();
+    );
+    let source = load_model_ir_bytes(&bytes).unwrap();
+    let graph = load_model_bytes(&bytes).unwrap();
 
     let interior = find(&graph, "interior");
-    assert!(!graph.value_type_is_known(interior));
-    assert!(!graph.value_shape_is_known(interior));
+    assert!(!source.value_type_is_known(find(&source, "interior")));
+    assert!(!source.value_shape_is_known(find(&source, "interior")));
+    assert!(graph.value_type_is_known(interior));
+    assert!(graph.value_shape_is_known(interior));
+    assert_eq!(
+        graph.value(interior).declared_type,
+        source.value(find(&source, "interior")).declared_type
+    );
     assert_eq!(graph.value(interior).dtype, DataType::Float32);
     assert_eq!(graph.value(interior).shape, static_shape([2]));
 }
@@ -223,7 +239,7 @@ fn omitted_interior_value_info_is_inferred_after_fail_fast_validation() {
 #[test]
 fn unannotated_f16_and_opset28_bf16_values_do_not_claim_placeholder_f32() {
     for (opset, raw_dtype, dtype) in [(12, 10, DataType::Float16), (28, 16, DataType::BFloat16)] {
-        let graph = load_model_bytes(&model(
+        let bytes = model(
             opset,
             value_info("X", Some(raw_dtype), Some(&[3])),
             value_info("Y", None, None),
@@ -231,13 +247,27 @@ fn unannotated_f16_and_opset28_bf16_values_do_not_claim_placeholder_f32() {
                 einsum_node("X", "interior", "i->i"),
                 einsum_node("interior", "Y", "i->i"),
             ],
-        ))
-        .unwrap_or_else(|error| panic!("opset {opset}, dtype {dtype:?}: {error}"));
+        );
+        let source = load_model_ir_bytes(&bytes).unwrap();
+        let graph = load_model_bytes(&bytes)
+            .unwrap_or_else(|error| panic!("opset {opset}, dtype {dtype:?}: {error}"));
 
         for name in ["interior", "Y"] {
             let value = find(&graph, name);
-            assert!(!graph.value_type_is_known(value), "{name}, opset {opset}");
-            assert!(!graph.value_shape_is_known(value), "{name}, opset {opset}");
+            assert!(
+                !source.value_type_is_known(find(&source, name)),
+                "{name}, opset {opset}"
+            );
+            assert!(
+                !source.value_shape_is_known(find(&source, name)),
+                "{name}, opset {opset}"
+            );
+            assert!(graph.value_type_is_known(value), "{name}, opset {opset}");
+            assert!(graph.value_shape_is_known(value), "{name}, opset {opset}");
+            assert_eq!(
+                graph.value(value).declared_type,
+                source.value(find(&source, name)).declared_type
+            );
             assert_eq!(graph.value(value).dtype, dtype, "{name}, opset {opset}");
             assert_eq!(
                 graph.value(value).shape,

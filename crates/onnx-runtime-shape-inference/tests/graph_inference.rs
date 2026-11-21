@@ -2429,3 +2429,45 @@ fn rank_mismatched_matmul_does_not_collapse_sequence_onto_batch() {
         graph.symbol_unifications
     );
 }
+
+#[test]
+fn inferred_tensor_facts_are_visible_without_fabricating_unknown_rank() {
+    for known_rank in [false, true] {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let x = graph.create_named_value("x", DataType::Float32, vec![2.into()]);
+        graph.add_input(x);
+        if !known_rank {
+            graph.mark_value_shape_unknown(x);
+        }
+        let y = graph.create_named_value("y", DataType::Undefined, vec![]);
+        graph.mark_value_type_unknown(y);
+        graph.mark_value_shape_unknown(y);
+        let root = graph.insert_node(node(0, "Identity", vec![Some(x)], vec![y]));
+        graph.add_output(y);
+        let imports = graph.opset_imports.clone();
+        InferenceRegistry::default_registry()
+            .infer_graph(&mut graph, &imports, MergePolicy::Permissive)
+            .unwrap();
+        if known_rank {
+            assert_eq!(graph.value(y).tensor_dtype(), Some(DataType::Float32));
+            assert_eq!(graph.value(y).tensor_shape(), Some(&vec![2.into()]));
+            let pattern = onnx_runtime_ir::pattern::Pattern::parse_ort(
+                "(x)=>{y:float[2]=Identity(x);return y}",
+            )
+            .unwrap();
+            assert!(
+                onnx_runtime_ir::pattern::MatchSession::new(&graph)
+                    .unwrap()
+                    .match_at(&pattern, root, Default::default())
+                    .unwrap()
+                    .is_some()
+            );
+        } else {
+            assert!(
+                graph.value(y).tensor_shape().is_none(),
+                "unknown rank must not become a scalar"
+            );
+        }
+    }
+}

@@ -466,9 +466,7 @@ fn write_back_types(
             .iter()
             .map(|dimension| interner.lower(dimension))
             .collect();
-        let value = graph.value_mut(vid);
-        value.shape = dims;
-        value.dtype = type_info.dtype;
+        graph.value_mut(vid).set_tensor_facts(type_info.dtype, dims);
         resolved.push(vid);
     }
     resolved
@@ -872,11 +870,7 @@ fn set_body_input(body: &mut Graph, vid: ValueId, dtype: DataType, shape: Vec<Di
     if body.try_value(vid).is_none() {
         return;
     }
-    let value = body.value_mut(vid);
-    value.dtype = dtype;
-    value.shape = shape;
-    body.mark_value_type_known(vid);
-    body.mark_value_shape_known(vid);
+    body.value_mut(vid).set_tensor_facts(dtype, shape);
 }
 
 /// Seed a `Loop` body: formal inputs are `(iter_num, cond_in, v_1..v_N)`, bound
