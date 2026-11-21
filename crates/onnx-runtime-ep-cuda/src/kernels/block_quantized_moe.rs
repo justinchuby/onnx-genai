@@ -44,7 +44,7 @@ use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
 };
 use onnx_runtime_ir::{DataType, Node, Shape};
-use onnx_runtime_memory_governor::{MemoryRole, ProviderContextIdentity};
+use onnx_runtime_memory_api::{MemoryRole, ProviderContextIdentity};
 
 use crate::error::driver_err;
 use crate::kernels::block_quantized_matmul::{BlockFormat, decoder_prelude};

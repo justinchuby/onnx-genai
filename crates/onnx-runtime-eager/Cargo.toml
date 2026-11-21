@@ -9,6 +9,7 @@ keywords = ["onnx", "eager", "dispatch", "inference", "runtime"]
 categories = ["science", "algorithms"]
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }

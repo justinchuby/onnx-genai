@@ -76,11 +76,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use cudarc::driver::sys as cu;
+use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 use onnx_runtime_memory_governor::{
-    HolderId, MappedPhysicalCapacityToken, MemoryAuthorityId, MemoryError, MemoryGovernor,
-    MemoryLease, MemoryRole, Tier,
+    HolderId, MappedPhysicalCapacityToken, MemoryAuthorityId, MemoryGovernor, MemoryLease,
 };
-use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking, VirtualMemoryError};
+use onnx_runtime_virtual_memory::{
+    PhysicalMemoryAccounting, ReservationBacking, VirtualMemoryError,
+};
 
 use crate::release::{
     BlockAccess, DriverFault, DriverOperation, HandleDisposition, MappedBlock, ReleaseDriver,
@@ -706,7 +708,7 @@ impl CudaVirtualBacking {
         let mut committed = Vec::new();
         for &offset in offsets {
             if let Err(error) =
-                <Self as VirtualBacking>::commit(self, reservation, offset, granularity)
+                <Self as ReservationBacking>::commit(self, reservation, offset, granularity)
             {
                 // Unwind with the structured release so a granule whose unmap
                 // fails stays recorded as mapped rather than silently vanishing
@@ -749,7 +751,7 @@ impl CudaVirtualBacking {
     ///
     /// Every driver call (`cuMemCreate`, `cuMemMap`, `cuMemSetAccess`) is
     /// wrapped in `capture_gate::synchronizing_section()` exactly as the
-    /// existing [`VirtualBacking::commit`] path is. The failure/rollback
+    /// existing [`ReservationBacking::commit`] path is. The failure/rollback
     /// contract matches `commit_offsets_with_owned_limit_and_capacity`:
     /// on any failure the granule just attempted is unwound (create/map/access)
     /// and any granules already mapped via earlier calls to this function for
@@ -878,7 +880,7 @@ impl CudaVirtualBacking {
         self.bind("reserving a shared prefix")?;
         let granularity = pool.granularity;
         let len = granule_count * granularity;
-        let mut reservation = <Self as VirtualBacking>::reserve(self, len)?;
+        let mut reservation = <Self as ReservationBacking>::reserve(self, len)?;
 
         // Acquire every handle first, so a shortfall fails before any mapping
         // exists to unwind.
@@ -1065,7 +1067,7 @@ impl CudaVirtualBacking {
     /// `cuMemRelease`.
     ///
     /// Callers must also synchronize all work using a mapping before calling
-    /// [`VirtualBacking::release`]. CUDA VMM unmap/remap is not ordered after
+    /// [`ReservationBacking::release`]. CUDA VMM unmap/remap is not ordered after
     /// in-flight kernels or copies merely because they used the old address.
     pub fn with_physical_pool(pool: Arc<PhysicalHandlePool>) -> Self {
         Self {
@@ -1170,7 +1172,7 @@ impl CudaVirtualBacking {
             .collect()
     }
 
-    /// Public wrapper around [`blocks_in_range`] for use by the
+    /// Public wrapper around `blocks_in_range` for use by the
     /// `granule_transition` module (and tests) without exposing the internal
     /// `CudaReservation::blocks` field directly.
     pub fn blocks_in_range_pub(
@@ -1185,7 +1187,7 @@ impl CudaVirtualBacking {
     /// Release every mapping in `[offset, offset + requested_len)`, reporting
     /// exactly what each block did.
     ///
-    /// This is the CUDA-specific report the generic [`VirtualBacking`] trait
+    /// This is the CUDA-specific report the generic [`ReservationBacking`] trait
     /// cannot carry: `Result<(), _>` can say "something went wrong" but not
     /// "these three granules are still mapped, this handle is unmapped and
     /// still owned, and these two are gone". The trait method is implemented
@@ -1216,7 +1218,7 @@ impl CudaVirtualBacking {
         }
         // `cuMemUnmap`/`cuMemRelease` synchronize the device, which invalidates
         // a CUDA graph capture running on *any* thread of this process. See
-        // `capture_gate`. Upstream (#1612) guarded the `VirtualBacking::release`
+        // `capture_gate`. Upstream (#1612) guarded the `ReservationBacking::release`
         // body; this stack moved those driver calls down here, where they are
         // reached by four callers rather than one, so the guard belongs at the
         // syscalls rather than at the trait method.
@@ -1622,9 +1624,7 @@ impl PhysicalHandlePool {
     ) -> Result<Arc<Self>, MemoryError> {
         let authority = governor.authority_id();
         let authority_gate = physical_pool_authority_gate(authority);
-        if authority.device()
-            != onnx_runtime_memory_governor::DeviceKey::device(device_ordinal as u32)
-        {
+        if authority.device() != onnx_runtime_memory_api::DeviceKey::device(device_ordinal as u32) {
             return Err(MemoryError::InvalidRequest {
                 tier: Tier::Device.name(),
                 requested: 0,
@@ -1729,9 +1729,7 @@ impl PhysicalHandlePool {
         // For Device locations the authority must match the device. For
         // HostNuma locations the authority is on the *device* context (the GPU
         // that will read through this pool) — same check applies.
-        if authority.device()
-            != onnx_runtime_memory_governor::DeviceKey::device(device_ordinal as u32)
-        {
+        if authority.device() != onnx_runtime_memory_api::DeviceKey::device(device_ordinal as u32) {
             return Err(MemoryError::InvalidRequest {
                 tier: Tier::Device.name(),
                 requested: 0,
@@ -1835,9 +1833,7 @@ impl PhysicalHandlePool {
             });
         }
         let authority = governor.authority_id();
-        if authority.device()
-            != onnx_runtime_memory_governor::DeviceKey::device(device_ordinal as u32)
-        {
+        if authority.device() != onnx_runtime_memory_api::DeviceKey::device(device_ordinal as u32) {
             return Err(MemoryError::InvalidRequest {
                 tier: Tier::Device.name(),
                 requested: 0,
@@ -1962,7 +1958,7 @@ impl PhysicalHandlePool {
 
     /// Return a handle to the pool WITHOUT calling `cuMemUnmap` on it.
     ///
-    /// Used to roll back a handle acquired via [`acquire_handle_raw`] when the
+    /// Used to roll back a handle acquired via `acquire_handle_raw` when the
     /// caller never mapped it. Equivalent to `rollback_checkout(checkout, false)`.
     pub fn return_handle_unmapped(&self, handle: cu::CUmemGenericAllocationHandle) {
         // We don't know if it was created or was a pool hit (we don't have the
@@ -2912,7 +2908,7 @@ impl Drop for CudaReservation {
 // the driver's own for this device and constant; `commit` maps and grants
 // access to the whole range it reports success for; and `CudaReservation`'s
 // `Drop` unmaps every block, releases every handle, and frees the reservation.
-unsafe impl VirtualBacking for CudaVirtualBacking {
+unsafe impl ReservationBacking for CudaVirtualBacking {
     type Reservation = CudaReservation;
 
     fn granularity(&self) -> usize {

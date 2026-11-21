@@ -20,7 +20,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use onnx_runtime_memory_governor::allocator::{DeviceAllocator, HostAllocator};
+use onnx_runtime_memory_api::{DeviceAllocator, HostAllocator};
 use onnx_runtime_memory_governor::large_alloc_cache::LargeAllocCache;
 
 /// Straddles glibc's 32 MiB `DEFAULT_MMAP_THRESHOLD_MAX` and the current

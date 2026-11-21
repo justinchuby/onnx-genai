@@ -146,7 +146,7 @@ fn managed_vmm_is_the_default_and_streams_over_budget() -> anyhow::Result<()> {
     decode_one(&mut engine_a)?;
     let committed_a = engine_a
         .governor()
-        .leased_bytes_on(onnx_runtime_memory_governor::Tier::Device);
+        .leased_bytes_on(onnx_runtime_memory_api::Tier::Device);
     let stats_a = onnx_runtime_ep_cuda::global_offload_stats();
     assert_eq!(
         stats_a.page_ins, 0,
@@ -184,7 +184,7 @@ fn managed_vmm_is_the_default_and_streams_over_budget() -> anyhow::Result<()> {
             // before decode so the ceiling reflects the admitted residency.
             let committed = engine
                 .governor()
-                .leased_bytes_on(onnx_runtime_memory_governor::Tier::Device);
+                .leased_bytes_on(onnx_runtime_memory_api::Tier::Device);
             assert!(
                 committed <= TINY_DEVICE_BUDGET_BYTES + 2 * 1024 * 1024,
                 "committed device bytes {committed} exceed the {TINY_DEVICE_BUDGET_BYTES}-byte \

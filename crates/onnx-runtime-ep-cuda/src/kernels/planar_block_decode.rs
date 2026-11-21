@@ -67,7 +67,7 @@ use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     PlanarLayout, validate_planar_values,
 };
 use onnx_runtime_ir::DataType;
-use onnx_runtime_memory_governor::ProviderContextIdentity;
+use onnx_runtime_memory_api::ProviderContextIdentity;
 
 use crate::error::driver_err;
 use crate::provider::{CudaExecutionProvider, CudaSealedAllocation};

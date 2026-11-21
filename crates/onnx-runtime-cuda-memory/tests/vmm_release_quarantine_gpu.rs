@@ -22,10 +22,11 @@ use std::sync::Arc;
 use cudarc::driver::CudaContext;
 use onnx_runtime_cuda_memory::release::{DriverFaultPlan, DriverOperation};
 use onnx_runtime_cuda_memory::vmm_allocator::{CudaVmmAllocator, DecommitOutcome};
-use onnx_runtime_memory_governor::{
-    AllocationReleaseState, DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor,
-    MemoryRole, QuarantineReason, VirtualBacking,
+use onnx_runtime_memory_api::{
+    AllocationReleaseState, DeviceAllocator, DeviceKey, MemoryRole, QuarantineReason,
+    VirtualBacking,
 };
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 
 #[cfg(feature = "gpu-tests")]
 use onnx_runtime_cuda_memory::test_support::TestStream;

@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use onnx_runtime_memory_governor::{
+use onnx_runtime_memory_api::{
     AllocationReleaseOutcome, AllocationReleaseState, DeferredEnqueueError,
     DeferredEnqueueRejection, DeferredReleaseQueue, PreparedAllocationRelease, QuarantineReason,
 };

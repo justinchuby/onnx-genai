@@ -112,13 +112,13 @@ For reference, a `--features mlas` research build of the same tree reads 0.56 / 
 `M = 128` (2 / 8 threads) and 0.82 / 0.76 at `M = 512`. The pure-native path is now within
 1.05-1.35x of it, where before it was 2.5-3.7x behind.
 
-### Block sizes ORT cannot build at all
+### Wider blocks and the pinned ORT version
 
-Worth recording because it shows a handover was never universally available even when the policy
-wanted one. This EP accepts any power-of-two `block_size >= 16`; ORT's CPU `MatMulNBits`
-`ORT_ENFORCE`s `block_size` in {16, 32, 64, 128, 256}, and that check throws at *kernel
-construction*. Giving a 512-wide block back would turn a working session into a load failure, not a
-slow one. `bits` needs no equivalent note -- both runtimes accept exactly {2, 4, 8}.
+This EP accepts power-of-two `block_size >= 16`. Older ORT builds rejected a
+512-wide `MatMulNBits` block during kernel construction, but the pinned ORT 1.32
+CPU runtime now constructs and executes this case. The integration test therefore
+requires numerical parity for the 512-wide case as well as EP assignment; the
+older rejection is no longer a reason to claim a capability advantage.
 
 ### 2-bit was never measured
 

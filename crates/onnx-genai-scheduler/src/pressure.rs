@@ -490,7 +490,7 @@ impl HostGovernor {
         Ok(Self {
             inner: Arc::new(HostGovernorInner {
                 memory_authority_id: onnx_runtime_memory_governor::MemoryAuthorityId::new(
-                    onnx_runtime_memory_governor::DeviceKey::HOST,
+                    onnx_runtime_memory_api::DeviceKey::HOST,
                 ),
                 ledger: Mutex::new(ledger),
                 mailbox: Mutex::new(CancelMailbox::new(config.mailbox_capacity)?),

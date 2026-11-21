@@ -32,8 +32,9 @@ use onnx_runtime_cuda_memory::capability::{CapabilityGateFailure, host_numa_capa
 use onnx_runtime_cuda_memory::virtual_memory::{
     CudaVirtualBacking, PhysicalHandlePool, PhysicalLocation,
 };
-use onnx_runtime_memory_governor::{DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole};
-use onnx_runtime_virtual_memory::VirtualBacking;
+use onnx_runtime_memory_api::{DeviceKey, MemoryRole};
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
+use onnx_runtime_virtual_memory::ReservationBacking;
 
 /// Serialize every test in this file against other CUDA tests on this GPU.
 static GPU_SERIAL: Mutex<()> = Mutex::new(());
@@ -238,9 +239,9 @@ fn commit_at_location_mixed_arena_write_and_read_back() {
     .expect("host_numa pool");
 
     let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&device_pool));
-    let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&backing, total_len).expect("reserve VA");
-    let base = <CudaVirtualBacking as VirtualBacking>::base(&reservation);
+    let mut reservation = <CudaVirtualBacking as ReservationBacking>::reserve(&backing, total_len)
+        .expect("reserve VA");
+    let base = <CudaVirtualBacking as ReservationBacking>::base(&reservation);
 
     let mut device_committed = 0u64;
     let mut host_committed = 0u64;
@@ -373,7 +374,8 @@ fn commit_at_location_double_commit_at_same_offset_fails_cleanly() {
 
     let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&device_pool));
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&backing, granularity).expect("reserve");
+        <CudaVirtualBacking as ReservationBacking>::reserve(&backing, granularity)
+            .expect("reserve");
 
     // First commit at offset 0 must succeed.
     backing
@@ -449,7 +451,7 @@ fn commit_at_location_accounting_oscillation_returns_to_baseline() {
 
     for cycle in 0..5 {
         let mut reservation =
-            <CudaVirtualBacking as VirtualBacking>::reserve(&backing, granularity)
+            <CudaVirtualBacking as ReservationBacking>::reserve(&backing, granularity)
                 .expect("reserve");
         backing
             .commit_at_location(
@@ -532,7 +534,8 @@ fn commit_at_location_rejects_device_location_against_host_numa_pool() {
 
     let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&host_pool));
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&backing, granularity).expect("reserve");
+        <CudaVirtualBacking as ReservationBacking>::reserve(&backing, granularity)
+            .expect("reserve");
 
     let stats = host_pool.stats();
     let before_counters = stats.snapshot();
@@ -601,7 +604,8 @@ fn commit_at_location_rejects_host_numa_location_against_device_pool() {
 
     let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&device_pool));
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&backing, granularity).expect("reserve");
+        <CudaVirtualBacking as ReservationBacking>::reserve(&backing, granularity)
+            .expect("reserve");
 
     let stats = device_pool.stats();
     let before_counters = stats.snapshot();
@@ -673,7 +677,8 @@ fn commit_at_location_rejects_mismatched_device_ordinal() {
 
     let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&device_pool));
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&backing, granularity).expect("reserve");
+        <CudaVirtualBacking as ReservationBacking>::reserve(&backing, granularity)
+            .expect("reserve");
 
     let stats = device_pool.stats();
     let before_counters = stats.snapshot();

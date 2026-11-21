@@ -13,7 +13,7 @@ use onnx_genai_engine::{
 };
 use onnx_genai_metadata::{CompressionRatio, StateGroupProperties, StateKind, StatePortRole};
 use onnx_runtime_ir::DataType;
-use onnx_runtime_memory_governor::Tier;
+use onnx_runtime_memory_api::Tier;
 #[cfg(feature = "native-cuda")]
 use onnx_runtime_session::{DevicePreference, InferenceSession};
 

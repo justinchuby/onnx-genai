@@ -4414,7 +4414,7 @@ impl DecodeCudaState {
         let mut grant = session
             .prepare_mapped_growth(
                 mapped_growth_bytes,
-                onnx_runtime_memory_governor::MemoryRole::KvCache,
+                onnx_runtime_memory_api::MemoryRole::KvCache,
             )
             .context("prepare transactional seq-major native CUDA KV commit")?;
         tracing::info!(
@@ -4489,7 +4489,7 @@ impl DecodeCudaState {
             let mut grant = session
                 .prepare_mapped_growth(
                     mapped_growth_bytes,
-                    onnx_runtime_memory_governor::MemoryRole::KvCache,
+                    onnx_runtime_memory_api::MemoryRole::KvCache,
                 )
                 .context("prepare transactional native CUDA KV growth")?;
             tracing::info!(

@@ -5,13 +5,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
+use onnx_runtime_memory_api::{
+    AllocationReleaseOutcome, BindingRegistry, DeviceAllocator, DeviceKey, HostAllocator,
+    MemoryError, MemoryRole, QuarantineReason, ReleaseAccounting, ResidualOwnership, Tier,
+};
 use onnx_runtime_memory_governor::{
-    AllocationChargeMode, AllocationPublication, AllocationReleaseOutcome, AllocationRequest,
-    AllocationStepError, AllocationTransactionError, BindingRegistry, DeviceAllocator, DeviceKey,
-    HolderId, HostAllocator, LeaseLedger, LedgerGovernor, MemoryError, MemoryGovernor, MemoryRole,
-    ProcessMemoryLimits, ProcessMemoryManager, QuarantineReason, RegisteredMemoryAuthority,
-    RegisteredMemoryContext, RegisteredMemoryHolder, RegisteredMemoryMechanism, ReleaseAccounting,
-    ResidualOwnership, Tier,
+    AllocationChargeMode, AllocationPublication, AllocationRequest, AllocationStepError,
+    AllocationTransactionError, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor,
+    ProcessMemoryLimits, ProcessMemoryManager, RegisteredMemoryAuthority, RegisteredMemoryContext,
+    RegisteredMemoryHolder, RegisteredMemoryMechanism,
 };
 
 #[test]
@@ -151,7 +153,7 @@ impl DeviceAllocator for TestAllocator {
             ReleaseBehavior::Quarantine => AllocationReleaseOutcome::quarantined(
                 ReleaseAccounting::new(bytes as u64, 0),
                 ResidualOwnership {
-                    state: onnx_runtime_memory_governor::AllocationReleaseState::Quarantined,
+                    state: onnx_runtime_memory_api::AllocationReleaseState::Quarantined,
                     reason: QuarantineReason::PartialRelease,
                     retained_bytes: bytes as u64,
                     address: ptr.as_ptr() as usize,
@@ -1752,7 +1754,7 @@ fn last_token_drop_cannot_reinsert_after_context_termination() {
     let outcome = request.quarantine_device_lost();
     assert_eq!(
         outcome.state(),
-        onnx_runtime_memory_governor::AllocationReleaseState::DeviceLost
+        onnx_runtime_memory_api::AllocationReleaseState::DeviceLost
     );
     fixture
         .manager

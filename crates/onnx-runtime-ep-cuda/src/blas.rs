@@ -56,7 +56,7 @@ use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
     EpError, Result, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
-use onnx_runtime_memory_governor::MemoryRole;
+use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::cublas_err;
 

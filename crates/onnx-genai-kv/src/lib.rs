@@ -259,7 +259,7 @@ pub enum KvError {
     /// than it was granted: a budget that is exceeded while reporting success
     /// is worse than no budget.
     #[error("cannot lease the KV page pool: {0}")]
-    PoolNotLeased(#[from] onnx_runtime_memory_governor::MemoryError),
+    PoolNotLeased(#[from] onnx_runtime_memory_api::MemoryError),
     /// The pool allocated a different amount than it leased.
     ///
     /// Only reachable if the size planner and the page allocator disagree,
@@ -278,7 +278,7 @@ pub enum KvError {
         actual: u64,
     },
     #[error("cannot reserve transient KV migration memory: {0}")]
-    MigrationPressure(onnx_runtime_memory_governor::MemoryError),
+    MigrationPressure(onnx_runtime_memory_api::MemoryError),
     #[error("KV migration lease invariant failed: {0}")]
     MigrationLeaseInvariant(&'static str),
     #[error("Sequence {0} not found")]

@@ -35,9 +35,8 @@ use onnx_runtime_memory_api::{
     RegisteredMechanism, RegisteredProviderContext, ReleaseAccounting, ResidualOwnership,
 };
 
-use crate::{
-    HolderId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, PressureResponder, Tier,
-};
+use crate::{HolderId, MemoryGovernor, MemoryLease, PressureResponder};
+use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 
 static NEXT_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
 

@@ -9,7 +9,7 @@ use onnx_runtime_ep_api::{
     ExecutorArtifactReport, ExecutorArtifactState, ExecutorRouteResidencyConfig, Fence, Kernel,
     NegotiatedWeight,
 };
-use onnx_runtime_memory_governor::MemoryRole;
+use onnx_runtime_memory_api::MemoryRole;
 
 use super::*;
 
@@ -5207,7 +5207,7 @@ impl Kernel for WeightDeliveryKernel {
             bytes,
             alignment: if rows >= 4 { 512 } else { 256 },
             lifetime: WorkspaceLifetime::SessionPersistent,
-            role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+            role: onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
         })
     }
 
@@ -5608,7 +5608,7 @@ impl ExecutionProvider for WeightDeliveryEp {
     fn reserve_workspace(
         &self,
         bytes: u64,
-        role: onnx_runtime_memory_governor::MemoryRole,
+        role: onnx_runtime_memory_api::MemoryRole,
     ) -> onnx_runtime_ep_api::Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
         assert_eq!(role, MemoryRole::Workspace { step_scoped: false });
         self.deliveries.lock().unwrap().push("reserve_workspace");
@@ -13070,7 +13070,7 @@ fn sequence_promotion_never_retains_a_borrowed_input_alias() {
 /// and the final assertion fails with `live=1`.
 #[test]
 fn dropping_an_executor_with_a_parked_input_buffer_leaks_nothing() {
-    use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, HostAllocator, MemoryError};
+    use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, HostAllocator, MemoryError};
     use std::ptr::NonNull;
 
     #[derive(Debug, Default)]

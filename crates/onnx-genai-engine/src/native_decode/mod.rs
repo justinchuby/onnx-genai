@@ -1438,16 +1438,16 @@ impl NativeDecodeSession {
 
     pub fn recurrent_state_reservation(
         &self,
-    ) -> anyhow::Result<(u64, onnx_runtime_memory_governor::Tier)> {
+    ) -> anyhow::Result<(u64, onnx_runtime_memory_api::Tier)> {
         let per_row = crate::native_decode::tensor::recurrent_state_bytes_per_sequence(
             &self.session,
             &self.present_to_past,
         )?;
         let bytes = per_row.saturating_mul(self.concurrent_state_rows() as u64);
         let tier = if self.session.device_id().is_host_accessible() {
-            onnx_runtime_memory_governor::Tier::Host
+            onnx_runtime_memory_api::Tier::Host
         } else {
-            onnx_runtime_memory_governor::Tier::Device
+            onnx_runtime_memory_api::Tier::Device
         };
         Ok((bytes, tier))
     }
@@ -1473,7 +1473,7 @@ impl NativeDecodeSession {
     pub fn kv_reservation(
         &self,
         max_context: usize,
-    ) -> anyhow::Result<(u64, onnx_runtime_memory_governor::Tier)> {
+    ) -> anyhow::Result<(u64, onnx_runtime_memory_api::Tier)> {
         let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(
             &self.session,
             &self.present_to_past,
@@ -1484,9 +1484,9 @@ impl NativeDecodeSession {
         // fact about the running system, not about the holder. A CPU EP session
         // holds them in host memory.
         let tier = if self.session.device_id().is_host_accessible() {
-            onnx_runtime_memory_governor::Tier::Host
+            onnx_runtime_memory_api::Tier::Host
         } else {
-            onnx_runtime_memory_governor::Tier::Device
+            onnx_runtime_memory_api::Tier::Device
         };
         Ok((bytes, tier))
     }
@@ -1505,7 +1505,7 @@ impl NativeDecodeSession {
     pub fn adopt_memory_governor(
         &self,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
-        tier: onnx_runtime_memory_governor::Tier,
+        tier: onnx_runtime_memory_api::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> anyhow::Result<u64> {
         Ok(self.session.adopt_memory_governor(governor, tier, holder)?)

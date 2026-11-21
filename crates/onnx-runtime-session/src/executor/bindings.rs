@@ -390,7 +390,7 @@ impl Executor {
     pub(crate) fn prepare_mapped_growth(
         &self,
         bytes: u64,
-        role: onnx_runtime_memory_governor::MemoryRole,
+        role: onnx_runtime_memory_api::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
         Ok(self.ep.prepare_mapped_growth(bytes, role)?)
     }
@@ -398,7 +398,7 @@ impl Executor {
     pub(crate) fn release_mapped_growth(
         &self,
         bytes: u64,
-        role: onnx_runtime_memory_governor::MemoryRole,
+        role: onnx_runtime_memory_api::MemoryRole,
     ) {
         self.ep.release_mapped_growth(bytes, role);
     }
@@ -648,7 +648,7 @@ impl Executor {
                 continue;
             }
             match requirement.role {
-                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped }
+                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped }
                     if step_scoped
                         == matches!(requirement.lifetime, WorkspaceLifetime::StepScoped) => {}
                 _ => {
@@ -791,7 +791,7 @@ impl Executor {
                 continue;
             }
             match requirement.role {
-                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped }
+                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped }
                     if step_scoped
                         == matches!(requirement.lifetime, WorkspaceLifetime::StepScoped) => {}
                 _ => {
@@ -1325,7 +1325,7 @@ impl Executor {
     /// Place any long-lived device memory the provider holds under `governor`.
     /// Whether the memory this executor's provider hands out commits
     /// physically as it is used. See
-    /// [`DeviceAllocator::commits_on_demand`](onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand).
+    /// [`DeviceAllocator::commits_on_demand`](onnx_runtime_memory_api::DeviceAllocator::commits_on_demand).
     pub(crate) fn commits_on_demand(&self) -> bool {
         self.ep.commits_on_demand()
     }
@@ -1333,7 +1333,7 @@ impl Executor {
     pub(crate) fn adopt_memory_governor(
         &self,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
-        tier: onnx_runtime_memory_governor::Tier,
+        tier: onnx_runtime_memory_api::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> onnx_runtime_ep_api::Result<u64> {
         self.ep.adopt_memory_governor(governor, tier, holder)
@@ -1713,7 +1713,7 @@ mod planned_workspace_node_tests {
             bytes: 32 * 1024 * 1024,
             alignment: 256,
             lifetime: WorkspaceLifetime::SessionPersistent,
-            role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+            role: onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
         };
         let mut peak = WorkspaceRequirement::NONE;
         for _ in 0..4 {

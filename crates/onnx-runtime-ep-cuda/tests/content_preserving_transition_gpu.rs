@@ -67,8 +67,9 @@ use onnx_runtime_ep_cuda::granule_transition::{
     TransitionOutcome, TransitionTimings, VerifiedSafePoint, transition_granule_range,
     transition_granule_range_timed, verify_safe_point,
 };
-use onnx_runtime_memory_governor::{DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole};
-use onnx_runtime_virtual_memory::VirtualBacking;
+use onnx_runtime_memory_api::{DeviceKey, MemoryRole};
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
+use onnx_runtime_virtual_memory::ReservationBacking;
 
 // ---------------------------------------------------------------------------
 // Phase-8 fault injection, routed so this target still builds without gpu-tests
@@ -315,7 +316,7 @@ fn host_device_host_content_bit_identity_and_stable_pointer() {
     // Reserve a stable VA using device pool.
     let stable_len = gran;
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&pools.device_backing, stable_len)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&pools.device_backing, stable_len)
             .expect("reserve stable VA");
     let stable_base = reservation.base_ptr();
 
@@ -429,7 +430,7 @@ fn partial_granule_range_transition() {
     let stable_len = n_granules * gran;
 
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&pools.device_backing, stable_len)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&pools.device_backing, stable_len)
             .expect("reserve stable VA");
     let stable_base = reservation.base_ptr();
 
@@ -515,7 +516,7 @@ fn oscillation_1000_cycles_content_correctness() {
     let gran = pools.granularity;
 
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&pools.device_backing, gran)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&pools.device_backing, gran)
             .expect("reserve stable VA");
     let stable_base = reservation.base_ptr();
 
@@ -689,7 +690,7 @@ fn drop_after_fully_committed_transition_does_not_panic() {
 
     // Create a reservation, transition it, then drop — must not panic.
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&pools.device_backing, gran)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&pools.device_backing, gran)
             .expect("reserve");
     let stable_base = reservation.base_ptr();
 
@@ -758,9 +759,11 @@ fn setup_fault_matrix<'a>(
 ) -> FaultMatrixSetup<'a> {
     let gran = pools.granularity;
     let rt = runtime.runtime();
-    let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&pools.device_backing, n_granules * gran)
-            .expect("reserve stable VA");
+    let mut reservation = <CudaVirtualBacking as ReservationBacking>::reserve(
+        &pools.device_backing,
+        n_granules * gran,
+    )
+    .expect("reserve stable VA");
     let stable_base = reservation.base_ptr();
     for i in 0..n_granules {
         pools
@@ -1217,7 +1220,7 @@ fn fault_injection_recheck_safe_point_rejected_gpu() {
     let gran = pools.granularity;
 
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&pools.device_backing, gran)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&pools.device_backing, gran)
             .expect("reserve");
     let stable_base = reservation.base_ptr();
 
@@ -1363,7 +1366,7 @@ fn a100_benchmark_transition_timing_decomposition() {
         println!("--- K={k} granules ({} MiB) ---", len >> 20);
 
         let mut reservation =
-            <CudaVirtualBacking as VirtualBacking>::reserve(&pools.device_backing, len)
+            <CudaVirtualBacking as ReservationBacking>::reserve(&pools.device_backing, len)
                 .expect("reserve stable VA");
         let stable_base = reservation.base_ptr();
 

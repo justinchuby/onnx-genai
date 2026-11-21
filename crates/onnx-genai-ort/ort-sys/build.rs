@@ -5,31 +5,23 @@
 //! ORT is found via (in priority order):
 //! 1. ORT_LIB_DIR env var — path to directory containing libonnxruntime.so/dylib/dll
 //! 2. ORT_ROOT env var — path to ORT installation root (lib/ and include/ subdirs)
-//! 3. pkg-config
-//! 4. Automatic download of Microsoft's NuGet SDK (matching headers and runtime)
+//! 3. Pinned native runtime from PyPI, with matching bundled official C headers
 
 use std::env;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-
-use sha2::{Digest, Sha256};
 
 mod build_support;
 
-// Keep this aligned with the ORT headers used by bindgen. ORT 1.29.x exposes
-// ORT_API_VERSION 29, so the downloaded runtime must also be 1.29.x.
-const ORT_VERSION: &str = "1.29.0";
-const ORT_API_VERSION: &str = "29";
-const ORT_SDK_BASE: &str = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime";
-// Verified against NuGet's x-ms-meta-sha512 metadata for the official package.
-const ORT_SDK_SHA256: &str = "4557021fec4da3924e2e12ff44b1cc50b176de0d2c5c7daa89ab11c208b3a454";
+// This pin matches the bundled Microsoft C headers and the pinned PyPI wheels.
+const ORT_VERSION: &str = "1.32.0";
+const ORT_API_VERSION: &str = "32";
 
 fn main() {
-    println!("cargo:rerun-if-changed=build_support.rs");
-    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=ONNX_GENAI_METAL_EP_LIB");
     println!("cargo:rerun-if-env-changed=ORT_ROOT");
     println!("cargo:rerun-if-env-changed=ORT_LIB_DIR");
-    println!("cargo:rerun-if-env-changed=ONNX_GENAI_METAL_EP_LIB");
+    println!("cargo:rerun-if-changed=third_party/onnxruntime/include");
+    println!("cargo:rustc-env=NXRT_ORT_VERSION={ORT_VERSION}");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // Find ORT installation
@@ -44,6 +36,13 @@ fn main() {
             "Cannot find onnxruntime_c_api.h at {}. \
              Set ORT_ROOT to your ONNX Runtime installation directory, \
              or ORT_LIB_DIR to the directory containing the shared library.",
+            header_path.display()
+        );
+    }
+
+    if !header_matches_api_version(&header_path) {
+        panic!(
+            "ONNX Runtime header {} does not declare API {ORT_API_VERSION}, required for ORT {ORT_VERSION}; point ORT_ROOT to the matching install, or unset ORT_ROOT/ORT_LIB_DIR to use the pinned PyPI runtime and bundled headers",
             header_path.display()
         );
     }
@@ -196,195 +195,109 @@ fn metal_plugin_ort_root() -> Option<PathBuf> {
 }
 
 fn download_prebuilt(target_dir: &Path) {
-    let target = build_support::sdk_target(
-        &target_os(),
-        &target_arch(),
-        &env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default(),
-    )
-    .unwrap_or_else(|err| panic!("{err}"));
-    let filename = format!("microsoft.ml.onnxruntime.{ORT_VERSION}.nupkg");
-    let url = format!("{ORT_SDK_BASE}/{ORT_VERSION}/{filename}");
-
-    eprintln!("Downloading ONNX Runtime {ORT_VERSION} from {url}");
-
-    // Use curl for download (available on all CI platforms). curl exits 0 on an
-    // HTTP 404 unless told otherwise, so capture the HTTP status via -w and
-    // check it explicitly. Without this a 404 "Not Found" body is saved as the
-    // "archive" and only surfaces later as an opaque tar/zip "unrecognized
-    // format" failure that names neither the URL nor the status (RULES.md #1).
-    //
-    // We wrap curl in a Rust-level retry loop instead of relying on curl's
-    // `--retry-all-errors`: that flag only exists in curl >=7.71.0, but the
-    // manylinux_2_28 (AlmaLinux 8) build container ships curl 7.61.1, which
-    // rejects it outright (exit 2). curl's plain `--retry` does NOT retry the
-    // transient failures we actually hit on CI (exit 52 empty-reply, exit 56
-    // connection-died) on ANY curl version, so this portable loop covers them.
-    // `--connect-timeout` / `--max-time` are ancient and safe on curl 7.61.
-    let download_path = target_dir.parent().unwrap().join(&filename);
-    let max_attempts = 4;
-    let mut http_code = String::new();
-    let mut output = None;
-    for attempt in 1..=max_attempts {
+    let artifact = build_support::artifact_for(&target_os(), &target_arch())
+        .unwrap_or_else(|message| panic!("{message}"));
+    let parent = target_dir.parent().expect("ORT cache has a parent");
+    std::fs::create_dir_all(parent)
+        .unwrap_or_else(|e| panic!("cannot create ORT cache {}: {e}", parent.display()));
+    let download_path = parent.join(artifact.filename);
+    eprintln!(
+        "Downloading ONNX Runtime {ORT_VERSION} native runtime from {}",
+        artifact.url
+    );
+    let mut last_failure = String::new();
+    for attempt in 1..=4 {
         let result = std::process::Command::new("curl")
-            .args([
-                "-sSL",
-                "--retry",
-                "5",
-                "--retry-delay",
-                "2",
-                // Bound each attempt so a hung connection can't consume the job.
-                "--connect-timeout",
-                "30",
-                "--max-time",
-                "300",
-                "-w",
-                "%{http_code}",
-                "-o",
-            ])
-            .arg(&download_path)
-            .arg(&url)
-            .output()
-            .expect("Failed to run curl. Install curl or set ORT_ROOT manually.");
-
-        http_code = String::from_utf8_lossy(&result.stdout).trim().to_string();
-        let ok = result.status.success() && http_code == "200";
-        if ok || attempt == max_attempts {
-            output = Some(result);
+            .args(["-sSL", "--connect-timeout", "30", "--max-time", "300", "-w", "%{http_code}", "-o"])
+            .arg(&download_path).arg(artifact.url).output()
+            .unwrap_or_else(|e| panic!("cannot run curl to download {}: {e}; install curl or set ORT_ROOT to a local ORT {ORT_VERSION} install", artifact.url));
+        let status = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+        if result.status.success() && status == "200" {
+            last_failure.clear();
             break;
         }
-
-        // Transient failure (e.g. curl exit 52 empty-reply / 56 connection-died,
-        // or a 5xx) that is NOT the final attempt: warn and back off, then retry.
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        let stderr_tail: String = stderr.trim().chars().take(500).collect();
-        let backoff = 3u64 * (1 << (attempt - 1)); // 3s, 6s, 12s
-        eprintln!(
-            "curl download of {url} failed (attempt {attempt}/{max_attempts}, \
-             curl exit {:?}, HTTP status {http_code}); retrying in {backoff}s. stderr: {stderr_tail}",
+        last_failure = format!(
+            "curl exit {:?}, HTTP {status}: {}",
             result.status.code(),
+            String::from_utf8_lossy(&result.stderr).trim()
         );
-        std::thread::sleep(std::time::Duration::from_secs(backoff));
+        if attempt < 4 {
+            let pause = 3u64 * (1 << (attempt - 1));
+            eprintln!(
+                "ORT PyPI download attempt {attempt}/4 failed: {last_failure}; retrying in {pause}s"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(pause));
+        }
     }
-    let output = output.expect("curl retry loop produced no output");
-
-    if !output.status.success() {
+    if !last_failure.is_empty() {
         panic!(
-            "curl failed to download ONNX Runtime from {url} \
-             (curl exit {:?}, HTTP status {http_code}). stderr: {}. \
-             Set ORT_ROOT to a local ONNX Runtime {ORT_VERSION} install to skip the download.",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim(),
+            "cannot download ONNX Runtime {} from {}: {last_failure}; the upstream service may be unavailable. Retry later or set ORT_ROOT to a local install",
+            artifact.filename, artifact.url
         );
     }
-
-    if http_code != "200" {
-        panic!(
-            "Failed to download ONNX Runtime SDK: {url} returned HTTP {http_code} \
-             (expected 200). {}. Check access to api.nuget.org or set ORT_ROOT \
-             to a local ONNX Runtime {ORT_VERSION} SDK with API {ORT_API_VERSION} headers.",
-            describe_download(&download_path),
-        );
-    }
-
-    let actual = sha256_file_hex(&download_path)
-        .unwrap_or_else(|err| panic!("Cannot hash SDK {}: {err}", download_path.display()));
-    if actual != ORT_SDK_SHA256 {
-        panic!(
-            "SHA-256 mismatch for ONNX Runtime SDK from {url}: expected \
-             {ORT_SDK_SHA256}, got {actual}. Refusing to extract native runtime. \
-             Delete {} and retry, or set ORT_ROOT to a trusted local SDK.",
-            download_path.display()
-        );
-    }
-
-    // Guard against a non-archive body (e.g. an HTML/text error page or a
-    // redirect returned with HTTP 200) reaching tar/zip as an "unrecognized
-    // format". This turns a cryptic extractor error into an actionable one that
-    // names the URL, byte size, and first bytes actually downloaded.
-    verify_archive_magic(&download_path, &url);
-    build_support::extract_sdk(
+    build_support::verify_checksum(&download_path, &artifact)
+        .unwrap_or_else(|message| panic!("{message}"));
+    let required = expected_versioned_runtime_path(Path::new(""));
+    build_support::extract_native_libraries(
         &download_path,
-        target_dir,
-        &target,
-        ORT_VERSION,
-        ORT_API_VERSION,
+        &target_dir.join("lib"),
+        required.to_str().expect("static library name"),
     )
-    .unwrap_or_else(|err| {
+    .unwrap_or_else(|message| panic!("{message}"));
+    let include = target_dir.join("include");
+    std::fs::create_dir_all(&include).unwrap_or_else(|e| {
         panic!(
-            "Cannot install ONNX Runtime SDK {} from {url} into {}: {err}. \
-             Delete the partial installation and retry, or set ORT_ROOT to a \
-             local ONNX Runtime {ORT_VERSION} SDK with API {ORT_API_VERSION} headers.",
-            download_path.display(),
+            "cannot create ORT include directory {}: {e}",
+            include.display()
+        )
+    });
+    let bundled =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
+            .join("third_party/onnxruntime/include");
+    for name in [
+        "onnxruntime_c_api.h",
+        "onnxruntime_ep_c_api.h",
+        "onnxruntime_error_code.h",
+    ] {
+        std::fs::copy(bundled.join(name), include.join(name)).unwrap_or_else(|e| {
+            panic!(
+                "cannot install bundled ORT header {name} into {}: {e}",
+                include.display()
+            )
+        });
+    }
+    std::fs::write(target_dir.join("VERSION_NUMBER"), ORT_VERSION).unwrap_or_else(|e| {
+        panic!(
+            "cannot record ORT {ORT_VERSION} cache version in {}: {e}",
             target_dir.display()
         )
     });
-
-    // Cleanup
-    let _ = std::fs::remove_file(&download_path);
-}
-
-/// Read up to `max` leading bytes of `path`, returning what was read (possibly
-/// fewer bytes, or empty if the file cannot be opened).
-fn read_first_bytes(path: &Path, max: usize) -> Vec<u8> {
-    let mut buf = vec![0_u8; max];
-    match std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)) {
-        Ok(n) => {
-            buf.truncate(n);
-            buf
-        }
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Human-readable description of a just-downloaded file: its size and a lossy
-/// preview of its first bytes. Used to make download/extract failures name what
-/// actually came back (a 404 body, an HTML error page, a truncated file).
-fn describe_download(path: &Path) -> String {
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let head = read_first_bytes(path, 64);
-    let preview = String::from_utf8_lossy(&head);
-    format!(
-        "Saved file is {size} bytes; first bytes: {:?}",
-        preview.trim()
-    )
-}
-
-/// Fail fast if the downloaded file does not start with the magic bytes of the
-/// expected archive format, before handing it to tar/zip. Catches error pages
-/// or redirects that were served with HTTP 200.
-fn verify_archive_magic(path: &Path, url: &str) {
-    let head = read_first_bytes(path, 8);
-    if !head.starts_with(b"PK") {
-        panic!(
-            "Downloaded file from {url} is not a valid zip archive. {}. The download most \
-             likely returned an error page or a redirect instead of the ONNX Runtime binary. \
-             Confirm access to the official api.nuget.org SDK package and \
-             re-run, or set ORT_ROOT to a local ONNX Runtime {ORT_VERSION} install.",
-            describe_download(path),
-        );
-    }
-}
-
-fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    let _ = std::fs::remove_file(download_path);
 }
 
 fn cached_prebuilt_matches_version(download_dir: &Path) -> bool {
     let header_path = download_dir.join("include").join("onnxruntime_c_api.h");
-    build_support::validate_header_api(&header_path, ORT_API_VERSION).is_ok()
-        && expected_versioned_runtime_path(&download_dir.join("lib")).exists()
-        && download_dir.join("LICENSE").is_file()
-        && download_dir.join("ThirdPartyNotices.txt").is_file()
+    header_matches_api_version(&header_path)
+        && download_dir
+            .join("include/onnxruntime_ep_c_api.h")
+            .is_file()
+        && download_dir
+            .join("include/onnxruntime_error_code.h")
+            .is_file()
+        && std::fs::read_to_string(download_dir.join("VERSION_NUMBER"))
+            .is_ok_and(|version| version.trim() == ORT_VERSION)
+        && expected_versioned_runtime_path(&download_dir.join("lib")).is_file()
+}
+
+fn header_matches_api_version(header_path: &Path) -> bool {
+    let Ok(header) = std::fs::read_to_string(header_path) else {
+        return false;
+    };
+
+    header.lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields.as_slice() == ["#define", "ORT_API_VERSION", ORT_API_VERSION]
+    })
 }
 
 fn ensure_major_version_runtime_link(lib_dir: &Path) {
@@ -403,25 +316,14 @@ fn ensure_major_version_runtime_link(lib_dir: &Path) {
     }
 
     #[cfg(unix)]
-    for name in [
-        major_name,
-        if target_os() == "macos" {
+    {
+        let unversioned = if target_os() == "macos" {
             "libonnxruntime.dylib"
         } else {
             "libonnxruntime.so"
-        },
-    ] {
-        let path = lib_dir.join(name);
-        if !path.exists() {
-            std::os::unix::fs::symlink(&versioned_name, &path).unwrap_or_else(|err| {
-                panic!(
-                    "Failed to create ONNX Runtime symlink {} -> {}: {err}. \
-                     Ensure the SDK lib directory is writable.",
-                    path.display(),
-                    versioned_name
-                )
-            });
-        }
+        };
+        build_support::ensure_runtime_links(lib_dir, &versioned_name, &[major_name, unversioned])
+            .unwrap_or_else(|message| panic!("{message}"));
     }
 
     configure_macos_install_names(lib_dir, &major_path, &versioned_path);
