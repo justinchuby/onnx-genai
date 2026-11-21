@@ -387,6 +387,12 @@ reference also constrains the selected call-site/default value's ONNX kind.
 Both protobuf and IR lowering reject a mismatch with function, call-node and
 formal-attribute context before copying it into the body.
 
+Resolved tensor metadata is published through `Value::set_tensor_facts`, which
+updates dtype, shape and known-state flags together. Inference writeback and
+immutable dense initializer attachment use this same operation; an unresolved rank remains
+unknown rather than becoming an empty scalar shape. Source `declared_type` is
+retained separately, including container descriptors.
+
 Dense and sparse initializer defaults retain their shared identity with graph
 inputs. `Graph::is_initializer` covers either storage form;
 `is_constant_initializer` excludes graph inputs unless the model's IR version

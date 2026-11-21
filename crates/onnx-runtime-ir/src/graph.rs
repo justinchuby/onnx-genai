@@ -283,13 +283,13 @@ impl Graph {
         self.values.len()
     }
 
-    /// Whether a value's element type came from explicit source type information.
+    /// Whether a tensor element type is known from source metadata or inference.
     pub fn value_type_is_known(&self, id: ValueId) -> bool {
         self.try_value(id)
             .is_some_and(|value| value.tensor_dtype().is_some())
     }
 
-    /// Whether a value's rank and dimensions came from explicit source shape information.
+    /// Whether tensor rank and dimensions are known from source metadata or inference.
     pub fn value_shape_is_known(&self, id: ValueId) -> bool {
         self.try_value(id)
             .is_some_and(|value| value.tensor_shape().is_some())
@@ -446,6 +446,16 @@ impl Graph {
     pub fn set_initializer(&mut self, value: ValueId, weight: WeightRef) {
         self.sparse_initializers.remove(&value);
         self.initializers.insert(value, weight);
+        // A default is not a proof of an overridable input's runtime shape.
+        if self.is_constant_initializer(value) {
+            let weight = &self.initializers[&value];
+            if let Some(metadata) = self.values.get_mut(value) {
+                metadata.set_tensor_facts(
+                    weight.dtype(),
+                    crate::static_shape(weight.dims().iter().copied()),
+                );
+            }
+        }
     }
 
     /// Whether a value has a dense or sparse initializer default.
@@ -1841,5 +1851,44 @@ mod effective_opset_tests {
     fn an_unimported_domain_resolves_to_nothing() {
         let graph = Graph::default();
         assert_eq!(graph.effective_opset(&node_with(None)), None);
+    }
+    #[test]
+    fn attaching_an_initializer_establishes_complete_tensor_facts() {
+        let mut graph = Graph::new();
+        let value = graph.create_value(DataType::Undefined, vec![]);
+        graph.mark_value_type_unknown(value);
+        graph.mark_value_shape_unknown(value);
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(crate::TensorData::from_raw(
+                DataType::Float32,
+                vec![2],
+                vec![0; 8],
+            )),
+        );
+        assert_eq!(graph.value(value).tensor_dtype(), Some(DataType::Float32));
+        assert_eq!(
+            graph.value(value).tensor_shape(),
+            Some(&crate::static_shape([2]))
+        );
+    }
+    #[test]
+    fn attaching_a_default_does_not_specialize_an_unknown_overridable_input() {
+        let mut graph = Graph::new();
+        graph.ir_version = Some(11);
+        let value = graph.create_value(DataType::Undefined, vec![]);
+        graph.mark_value_type_unknown(value);
+        graph.mark_value_shape_unknown(value);
+        graph.add_input(value);
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(crate::TensorData::from_raw(
+                DataType::Float32,
+                vec![2],
+                vec![0; 8],
+            )),
+        );
+        assert!(graph.value(value).tensor_dtype().is_none());
+        assert!(graph.value(value).tensor_shape().is_none());
     }
 }
