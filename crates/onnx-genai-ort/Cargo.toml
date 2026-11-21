@@ -57,6 +57,7 @@ cuda-13000 = [
 ]
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 half = { workspace = true, features = ["use-intrinsics"] }
 onnx-runtime-memory-governor = { workspace = true }
 onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.6", optional = true, default-features = false }

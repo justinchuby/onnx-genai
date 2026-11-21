@@ -97,7 +97,7 @@ jobs:
     name: New weight-derived caches must be governed
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -166,7 +166,7 @@ jobs:
     name: A per-thread buffer needs a per-process bound
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

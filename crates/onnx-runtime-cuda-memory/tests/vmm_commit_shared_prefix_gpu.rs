@@ -52,10 +52,8 @@ use cudarc::driver::sys as cu;
 use onnx_runtime_cuda_memory::vmm_allocator::{
     CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV, CudaVmmAllocator,
 };
-use onnx_runtime_memory_governor::{
-    DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
-    Tier, VirtualBacking,
-};
+use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, MemoryRole, Tier, VirtualBacking};
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
 
 const HOLDER: HolderId = HolderId::new(777);
 /// Distinct byte the prefix is filled with, to prove every sharer reads the

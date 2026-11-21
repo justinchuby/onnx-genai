@@ -179,6 +179,10 @@ fn build_factory(
             // `ValidateCompiledModelCompatibilityInfo`, which we do implement
             // and which is the correct answer for one candidate.
             SelectBestModelCandidate: None,
+            // Optional in ORT 1.32. Capacity is not exposed by the generic EP
+            // contract; leave this unsupported rather than report a process
+            // budget as device-global capacity.
+            GetDeviceMemoryCapacity: None,
         },
         name_cstr,
         vendor_cstr,

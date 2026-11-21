@@ -17,7 +17,7 @@ use onnx_runtime_ep_cuda::deferred_release::{
     CudaDeferredReleaseQueue, DeferredActionOutcome, DeferredReleaseAction, ReleaseFence,
     ReleaseFenceSource, RetainedOwnership,
 };
-use onnx_runtime_memory_governor::{
+use onnx_runtime_memory_api::{
     AllocationIdentity, AllocationReleaseState, BindingRegistry, BindingResource,
     DeferredEnqueueRejection, DeviceAllocator, DeviceKey, HostAllocator, MemoryBinding,
     MemoryError, QuarantineReason, QuarantinedAllocation, RegisteredMechanism,
@@ -827,7 +827,7 @@ impl BoundFixture {
         }
     }
 
-    fn snapshot(&self) -> onnx_runtime_memory_governor::MechanismSnapshot {
+    fn snapshot(&self) -> onnx_runtime_memory_api::MechanismSnapshot {
         self.registry.snapshot(self.mechanism).expect("snapshot")
     }
 

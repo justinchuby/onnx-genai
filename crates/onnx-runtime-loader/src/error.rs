@@ -188,6 +188,19 @@ pub enum LoaderError {
     MalformedFunctionAttribute { function: String, detail: String },
 
     #[error(
+        "illegal ONNX model: node {node} calling model-local function {function} binds \
+         attribute {attribute:?} as {actual}, but its body reference requires {expected:?}. \
+         Expected: supply a value or default with the declared reference kind"
+    )]
+    FunctionAttributeTypeMismatch {
+        function: String,
+        node: String,
+        attribute: String,
+        expected: onnx_runtime_ir::onnx::attribute_proto::AttributeType,
+        actual: String,
+    },
+
+    #[error(
         "illegal ONNX model: node {node} in model-local function {function} has attribute \
          {attribute:?} referring to undeclared formal attribute {reference:?}. Expected: add \
          {reference:?} to FunctionProto.attribute or attribute_proto, or fix ref_attr_name"

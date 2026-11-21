@@ -64,7 +64,7 @@ use onnx_runtime_ep_plugin::device::DeviceSupport;
 use onnx_runtime_ep_plugin::ep::KernelRegistryEntry;
 use onnx_runtime_ep_plugin::factory::create_ep_factories_for_shared_ep;
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
-use onnx_runtime_memory_governor::MemoryRole;
+use onnx_runtime_memory_api::MemoryRole;
 
 /// Alignment the mock `Add` kernel demands of its workspace. Deliberately much
 /// larger than the adapter's default 16-byte device alignment so a plumbing

@@ -48,6 +48,7 @@ einsum_concurrency_probe = []
 tracing = ["dep:onnx-runtime-tracer", "dep:tracing-crate"]
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }

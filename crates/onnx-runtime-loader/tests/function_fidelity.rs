@@ -295,3 +295,48 @@ fn ir_function_binding_rejects_missing_required_value() {
         "{error}"
     );
 }
+
+#[test]
+fn function_attribute_binding_rejects_call_site_and_default_kind_mismatches() {
+    for supplied in [false, true] {
+        let mut function = identity_function("");
+        function.node[0].attribute = vec![AttributeProto {
+            name: "alpha".into(),
+            ref_attr_name: "slope".into(),
+            r#type: AttributeType::Float as i32,
+            ..Default::default()
+        }];
+        let wrong = AttributeProto {
+            name: "slope".into(),
+            i: 7,
+            r#type: AttributeType::Int as i32,
+            ..Default::default()
+        };
+        if supplied {
+            function.attribute = vec!["slope".into()];
+        } else {
+            function.attribute_proto = vec![wrong.clone()];
+        }
+        let mut source = model(vec![function], "");
+        if supplied {
+            source.graph.as_mut().unwrap().node[0].attribute.push(wrong);
+        }
+        let proto_error = onnx_runtime_loader::function_inline::inline_functions(&source)
+            .unwrap_err()
+            .to_string();
+        let graph = load_model_ir_bytes(&source.encode_to_vec()).unwrap();
+        let call = graph.nodes.values().next().unwrap();
+        let function = &graph.model_functions[&ModelFunctionKey::new("local", "F", "")];
+        let mut body = function.body.clone();
+        let ir_error = onnx_runtime_loader::function_inline::bind_ir_function_attributes(
+            call, function, &mut body,
+        )
+        .unwrap_err()
+        .to_string();
+        for message in [proto_error, ir_error] {
+            for context in ["local::F", "slope", "Float", "Int"] {
+                assert!(message.contains(context), "missing {context:?}: {message}");
+            }
+        }
+    }
+}

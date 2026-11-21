@@ -35,7 +35,7 @@
 //! one backing able to serve many reservations, and keeps the state next to the
 //! thing it describes.
 //!
-//! The cost is that `VirtualBacking` is not `dyn`-safe. That is deliberate and
+//! The cost is that `ReservationBacking` is not `dyn`-safe. That is deliberate and
 //! it costs nothing: what callers hold is a
 //! [`VirtualBuffer`](crate::VirtualBuffer), and *that* can be boxed behind an
 //! object-safe trait if it ever needs to be. Nobody needs to hold a backing.
@@ -48,7 +48,7 @@
 use crate::VirtualMemoryError;
 use onnx_runtime_memory_governor::MemoryAuthorityId;
 
-/// Who charges physical memory committed by a [`VirtualBacking`].
+/// Who charges physical memory committed by a [`ReservationBacking`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysicalMemoryAccounting {
     /// [`VirtualBuffer`](crate::VirtualBuffer) leases mapped physical bytes.
@@ -64,8 +64,11 @@ pub enum PhysicalMemoryAccounting {
     },
 }
 
-/// The platform operations a [`VirtualBuffer`](crate::VirtualBuffer) is built
-/// from.
+/// Reservation-level platform operations used by [`VirtualBuffer`](crate::VirtualBuffer).
+///
+/// Distinct from `onnx_runtime_memory_api::VirtualBacking`, the object-safe
+/// capability discovered from a selected allocator. This trait owns reservation
+/// mechanics and an associated reservation type, rather than allocator bindings.
 ///
 /// # Safety
 ///
@@ -75,19 +78,19 @@ pub enum PhysicalMemoryAccounting {
 /// it did not honour, would turn those writes into memory corruption rather
 /// than an error. Specifically:
 ///
-/// * [`VirtualBacking::granularity`] is constant for the backing's life and a
+/// * [`ReservationBacking::granularity`] is constant for the backing's life and a
 ///   power of two.
-/// * [`VirtualBacking::reserve`] takes address space only. It must not commit
+/// * [`ReservationBacking::reserve`] takes address space only. It must not commit
 ///   memory: the whole design rests on reserving generously being free.
-/// * [`VirtualBacking::base`] returns the address the reservation actually
+/// * [`ReservationBacking::base`] returns the address the reservation actually
 ///   starts at, and that address does not change for the reservation's life.
-/// * After [`VirtualBacking::commit`] returns `Ok`, every byte of
+/// * After [`ReservationBacking::commit`] returns `Ok`, every byte of
 ///   `base + offset .. base + offset + len` is writable through that address.
 /// * Dropping a `Reservation` releases both its address space and any blocks
 ///   still committed in it.
 ///
 /// [`VirtualBuffer`]: crate::VirtualBuffer
-pub unsafe trait VirtualBacking: Send + Sync + std::fmt::Debug {
+pub unsafe trait ReservationBacking: Send + Sync + std::fmt::Debug {
     /// One reserved address range, and whatever the platform needs to remember
     /// about what is committed in it.
     type Reservation: Send + Sync + std::fmt::Debug;
@@ -112,7 +115,7 @@ pub unsafe trait VirtualBacking: Send + Sync + std::fmt::Debug {
 
     /// Back `offset..offset + len` of `reservation` with fresh memory.
     ///
-    /// `offset` and `len` are multiples of [`VirtualBacking::granularity`] and
+    /// `offset` and `len` are multiples of [`ReservationBacking::granularity`] and
     /// the range lies inside the reservation; the implementation is entitled to
     /// rely on both. Overlapping an already-committed block is a caller error
     /// the implementation should report rather than assume away.
@@ -144,7 +147,7 @@ pub struct HostBacking;
 // SAFETY: every address comes from `VirtualRange::reserve`; the granularity is
 // the platform's own and constant for the process; `VirtualRange` tracks its
 // own mapped blocks and releases everything on drop.
-unsafe impl VirtualBacking for HostBacking {
+unsafe impl ReservationBacking for HostBacking {
     type Reservation = crate::VirtualRange;
 
     fn granularity(&self) -> usize {

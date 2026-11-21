@@ -66,7 +66,7 @@ use onnx_runtime_ep_api::{
     WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
-use onnx_runtime_memory_governor::MemoryRole;
+use onnx_runtime_memory_api::MemoryRole;
 
 use crate::blas::{GemmDtype, GemmEx, WORKSPACE_BYTES, gemm_ex};
 use crate::error::{driver_err, not_implemented};

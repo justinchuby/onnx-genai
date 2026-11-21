@@ -89,7 +89,7 @@ use onnx_runtime_cuda_memory::virtual_memory::{
     CudaReservation, CudaVirtualBacking, PhysicalHandlePool, PhysicalLocation,
 };
 use onnx_runtime_ep_api::ResizeSafePoint;
-use onnx_runtime_virtual_memory::VirtualBacking;
+use onnx_runtime_virtual_memory::ReservationBacking;
 
 use crate::runtime::CudaRuntime;
 
@@ -359,7 +359,7 @@ fn transition_granule_range_inner(
     }
 
     // ── Phase 3: reserve staging VMM window ───────────────────────────────────
-    let staging_result = <CudaVirtualBacking as VirtualBacking>::reserve(backing, len);
+    let staging_result = <CudaVirtualBacking as ReservationBacking>::reserve(backing, len);
     let staging_reservation = match staging_result {
         Ok(r) => r,
         Err(e) => {

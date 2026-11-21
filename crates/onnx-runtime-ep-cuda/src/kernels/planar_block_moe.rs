@@ -70,7 +70,7 @@ use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     FP4_MICROSCALE_BLOCK as CPU_FP4_MICROSCALE_BLOCK, PlanarBankIdentity, PlanarBlockFormat,
     PlanarLayout, validate_planar_expert_bank_values,
 };
-use onnx_runtime_memory_governor::ProviderContextIdentity;
+use onnx_runtime_memory_api::ProviderContextIdentity;
 
 use crate::error::driver_err;
 use crate::kernels::block_quantized_matmul::decoder_prelude;

@@ -131,7 +131,7 @@ impl PagedKvCache {
         layer_configs: Vec<LayerTensorConfig>,
         num_gpu_pages: usize,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
-        tier: onnx_runtime_memory_governor::Tier,
+        tier: onnx_runtime_memory_api::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<Self, KvError> {
         Ok(Self {
@@ -1260,7 +1260,7 @@ mod tests {
         fn drop(&mut self) {
             if self.snapshot {
                 self.observed_snapshot_drop_used.store(
-                    self.ledger.used(onnx_runtime_memory_governor::Tier::Host),
+                    self.ledger.used(onnx_runtime_memory_api::Tier::Host),
                     Ordering::Relaxed,
                 );
             }
@@ -1310,7 +1310,7 @@ mod tests {
 
         fn copy_to(&self, target: &mut dyn KvPageStore) -> Result<u64, KvError> {
             self.observed_copy_used.store(
-                self.ledger.used(onnx_runtime_memory_governor::Tier::Host),
+                self.ledger.used(onnx_runtime_memory_api::Tier::Host),
                 Ordering::Relaxed,
             );
             if self.fail_copy.load(Ordering::Relaxed) {
@@ -2019,9 +2019,8 @@ mod tests {
 
     #[test]
     fn full_budget_refuses_cow_snapshot_before_allocation() {
-        use onnx_runtime_memory_governor::{
-            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
-        };
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
 
         let config = PageTensorConfig {
             page_size: 2,
@@ -2072,7 +2071,8 @@ mod tests {
 
     #[test]
     fn full_budget_with_free_page_refuses_cow_before_snapshot_clone() {
-        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 
         let config = PageTensorConfig {
             page_size: 2,
@@ -2131,7 +2131,8 @@ mod tests {
         Arc<AtomicU64>,
         Arc<AtomicU64>,
     ) {
-        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 
         let config = PageTensorConfig {
             page_size: 2,
@@ -2192,7 +2193,7 @@ mod tests {
 
     #[test]
     fn cow_lease_covers_both_snapshots_and_outlives_them_on_success() {
-        use onnx_runtime_memory_governor::Tier;
+        use onnx_runtime_memory_api::Tier;
 
         let (mut cache, forked, ledger, baseline, observed_copy, observed_drop) =
             governed_tracked_cow(false);
@@ -2210,7 +2211,7 @@ mod tests {
 
     #[test]
     fn cow_failure_keeps_lease_until_snapshots_drop_then_returns_to_baseline() {
-        use onnx_runtime_memory_governor::Tier;
+        use onnx_runtime_memory_api::Tier;
 
         let (mut cache, forked, ledger, baseline, observed_copy, observed_drop) =
             governed_tracked_cow(true);
@@ -2230,7 +2231,7 @@ mod tests {
 
     #[test]
     fn cow_pressure_refusal_happens_before_tracked_snapshot_clone() {
-        use onnx_runtime_memory_governor::Tier;
+        use onnx_runtime_memory_api::Tier;
 
         let (mut cache, forked, ledger, baseline, observed_copy, observed_drop) =
             governed_tracked_cow(false);
@@ -2251,7 +2252,8 @@ mod tests {
 
     #[test]
     fn cow_persistent_growth_is_absorbed_into_pool_lease() {
-        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 
         let config = PageTensorConfig {
             page_size: 2,
@@ -2295,7 +2297,8 @@ mod tests {
 
     #[test]
     fn repeated_cow_growth_accumulates_exact_persistent_pool_bytes() {
-        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 
         const GROWTHS: usize = 3;
         let config = PageTensorConfig {
@@ -2343,7 +2346,8 @@ mod tests {
 
     #[test]
     fn failed_cow_growth_releases_persistent_preflight_after_page_drop() {
-        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 
         let config = PageTensorConfig {
             page_size: 2,

@@ -9,12 +9,15 @@ use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_ep_cuda::deferred_release::{
     CudaDeferredReleaseQueue, ReleaseFence, ReleaseFenceSource, ReleaseObserver,
 };
+use onnx_runtime_memory_api::{
+    AllocationReleaseOutcome, BindingError, DeviceAllocator, DeviceKey, MemoryRole, Tier,
+};
 use onnx_runtime_memory_governor::{
-    AllocationChargeMode, AllocationPublication, AllocationReleaseOutcome, AllocationRequest,
-    AllocationSettlementToken, AllocationStepError, AllocationTransactionError, BindingError,
-    DeviceAllocator, DeviceKey, DeviceLossListener, HolderId, ManagedAllocation, MemoryGovernor,
-    MemoryRole, ProcessMemoryManager, RegisteredMemoryAuthority, RegisteredMemoryContext,
-    RegisteredMemoryHolder, RegisteredMemoryMechanism, ScopedMemoryBinding, Tier,
+    AllocationChargeMode, AllocationPublication, AllocationRequest, AllocationSettlementToken,
+    AllocationStepError, AllocationTransactionError, DeviceLossListener, HolderId,
+    ManagedAllocation, MemoryGovernor, ProcessMemoryManager, RegisteredMemoryAuthority,
+    RegisteredMemoryContext, RegisteredMemoryHolder, RegisteredMemoryMechanism,
+    ScopedMemoryBinding,
 };
 
 use crate::allocator::MemoryInfo;
@@ -854,7 +857,7 @@ fn manager_error(operation: &str, error: AllocationTransactionError) -> OrtError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_memory_governor::HostAllocator;
+    use onnx_runtime_memory_api::HostAllocator;
     use std::sync::Barrier;
 
     #[derive(Debug)]

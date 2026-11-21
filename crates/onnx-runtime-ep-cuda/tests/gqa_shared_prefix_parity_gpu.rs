@@ -60,10 +60,10 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cuda::{CudaExecutionProvider, GroupQueryAttentionKernel};
 use onnx_runtime_ir::{DataType, compute_contiguous_strides};
+use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, MemoryRole, SharedDevicePrefix, Tier};
 use onnx_runtime_memory_governor::{
-    DeviceAllocator, DeviceKey, HolderId, KvFragmentation, LeaseLedger, LedgerGovernor,
-    MemoryGovernor, MemoryRole, ModelKvGeometry, SharedDevicePrefix, SharedPrefixCommitTarget,
-    Tier, commit_shared_prefix_pair, evaluate_prefix_shareability,
+    HolderId, KvFragmentation, LeaseLedger, LedgerGovernor, MemoryGovernor, ModelKvGeometry,
+    SharedPrefixCommitTarget, commit_shared_prefix_pair, evaluate_prefix_shareability,
 };
 
 const BATCH: usize = 1;

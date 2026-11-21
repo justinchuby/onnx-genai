@@ -382,7 +382,10 @@ imports, formal/default/reference attributes and canonical `FunctionProto`
 declaration. That declaration is the serialization source; the derived body is
 an execution/analysis view, not a function-rewrite API. Calls retain overload and
 raw attribute binding metadata. Execution lowering binds explicit/default
-attributes; unresolved references are not fabricated values.
+attributes; unresolved references are not fabricated values. A typed attribute
+reference also constrains the selected call-site/default value's ONNX kind.
+Both protobuf and IR lowering reject a mismatch with function, call-node and
+formal-attribute context before copying it into the body.
 
 Dense and sparse initializer defaults retain their shared identity with graph
 inputs. `Graph::is_initializer` covers either storage form;

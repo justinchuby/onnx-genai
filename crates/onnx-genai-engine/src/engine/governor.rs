@@ -565,7 +565,7 @@ impl EngineResourceGovernor {
     /// Said plainly because a breakdown that quietly omitted the two largest
     /// holders would be read as the whole picture -- which is how
     /// `activations_bytes: 0` came to be published as fact.
-    pub fn leased_breakdown(&self) -> Vec<(&'static str, onnx_runtime_memory_governor::Tier, u64)> {
+    pub fn leased_breakdown(&self) -> Vec<(&'static str, onnx_runtime_memory_api::Tier, u64)> {
         self.plan().breakdown()
     }
 
@@ -575,7 +575,7 @@ impl EngineResourceGovernor {
     /// leases the plan does not itself hold: the KV pool's lives inside
     /// `PagedKvCache` and the weight-residency pool's inside the execution
     /// provider, because each is held by the thing that must outlive it.
-    pub fn leased_bytes_on(&self, tier: onnx_runtime_memory_governor::Tier) -> u64 {
+    pub fn leased_bytes_on(&self, tier: onnx_runtime_memory_api::Tier) -> u64 {
         onnx_runtime_memory_governor::MemoryGovernor::used(&self.memory, tier)
     }
 
@@ -583,7 +583,7 @@ impl EngineResourceGovernor {
     pub fn device_oversubscribed_bytes(&self) -> u64 {
         onnx_runtime_memory_governor::MemoryGovernor::oversubscribed_bytes(
             &self.memory,
-            onnx_runtime_memory_governor::Tier::Device,
+            onnx_runtime_memory_api::Tier::Device,
         )
     }
 
@@ -607,7 +607,7 @@ impl EngineResourceGovernor {
 
     /// Point-in-time configured, resolved, derived, and live per-tier state.
     pub fn snapshot(&self) -> GovernorSnapshot {
-        use onnx_runtime_memory_governor::Tier;
+        use onnx_runtime_memory_api::Tier;
 
         let mut snapshot = self.inner.snapshot();
         snapshot.vram = Self::tier_snapshot_from_ledger(
@@ -661,7 +661,7 @@ impl EngineResourceGovernor {
     /// request happened to be active, so admission saw an empty card (#706).
     fn tier_snapshot_from_ledger(
         memory: &EngineMemoryGovernor,
-        tier: onnx_runtime_memory_governor::Tier,
+        tier: onnx_runtime_memory_api::Tier,
         limit: u64,
     ) -> onnx_genai_scheduler::TierSnapshot {
         let used = onnx_runtime_memory_governor::MemoryGovernor::used(memory, tier);
@@ -688,7 +688,7 @@ impl EngineResourceGovernor {
         let kv_pool_bytes = self.plan().kv_pool_bytes_handle();
         let limit = self
             .memory
-            .available(onnx_runtime_memory_governor::Tier::Device)
+            .available(onnx_runtime_memory_api::Tier::Device)
             .saturating_add(kv_pool_bytes.load(std::sync::atomic::Ordering::Relaxed));
         onnx_genai_scheduler::ByteBudget::new(limit).with_ceiling(std::sync::Arc::new(
             LedgerAdmissionCeiling {
@@ -741,7 +741,7 @@ impl onnx_genai_scheduler::AdmissionCeiling for LedgerAdmissionCeiling {
     fn ceiling_bytes(&self) -> u64 {
         use onnx_runtime_memory_governor::MemoryGovernor as _;
         self.memory
-            .available(onnx_runtime_memory_governor::Tier::Device)
+            .available(onnx_runtime_memory_api::Tier::Device)
             .saturating_add(
                 self.kv_pool_bytes
                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -1278,7 +1278,8 @@ mod tests {
         // the usable-free cap, and a Device-tier reservation one byte past it
         // must be refused (G3) — the admission refusal that converts the #1295
         // oversubscription cliff into a plateau.
-        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
         const MIB: u64 = 1 << 20;
         let total = 8188 * MIB;
         let free = 7959 * MIB;

@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use onnx_runtime_ir::{DataType, TensorLayout};
-use onnx_runtime_memory_governor::MemoryRole;
+use onnx_runtime_memory_api::MemoryRole;
 
 use crate::ExecutionProvider;
 use crate::error::Result;

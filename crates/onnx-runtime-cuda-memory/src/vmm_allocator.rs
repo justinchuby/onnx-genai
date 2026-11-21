@@ -62,14 +62,15 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use onnx_runtime_memory_governor::{
+use onnx_runtime_memory_api::{
     AllocationCommitRange, AllocationReleaseOutcome, AllocationReleaseState, DeviceAllocator,
-    DeviceKey, HolderId, MappedPhysicalCapacityToken, MemoryAuthorityId, MemoryError,
-    MemoryGovernor, MemoryLease, MemoryRole, QuarantineReason, ResidualOwnership,
-    SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, Tier,
-    VirtualBacking as MemoryVirtualBacking,
+    DeviceKey, MemoryError, MemoryRole, QuarantineReason, ResidualOwnership, SharedDevicePrefix,
+    SharedMapping, SharedPrefixCommitInfo, Tier, VirtualBacking as MemoryVirtualBacking,
 };
-use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
+use onnx_runtime_memory_governor::{
+    HolderId, MappedPhysicalCapacityToken, MemoryAuthorityId, MemoryGovernor, MemoryLease,
+};
+use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, ReservationBacking};
 
 use crate::release::{MappedBlock, SpanReleaseReport, block_bytes};
 use crate::virtual_memory::{
@@ -570,7 +571,7 @@ impl Spans {
 /// One reserved address range and the bookkeeping over it.
 #[derive(Debug)]
 struct Arena {
-    reservation: <CudaVirtualBacking as VirtualBacking>::Reservation,
+    reservation: <CudaVirtualBacking as ReservationBacking>::Reservation,
     spans: Spans,
     /// The ledger claim covering every committed granule.
     ///
@@ -1222,7 +1223,7 @@ impl CudaVmmAllocator {
         let granularity = backing.granularity();
         // Unreachable from the CUDA provider: `CudaVirtualBacking::granularity`
         // resolves through `allocation_granularity`, which substitutes 2 MiB
-        // for a driver refusal or a reported zero. It is kept for `VirtualBacking`
+        // for a driver refusal or a reported zero. It is kept for `ReservationBacking`
         // implementations that do report zero. The init-time capability
         // detector for CUDA is the `reserve` call below.
         if granularity == 0 {
@@ -1311,11 +1312,11 @@ impl CudaVmmAllocator {
     /// The closure receives `(&mut CudaReservation, &CudaVirtualBacking)`.
     /// It **must not** attempt to re-lock this allocator (would deadlock).
     ///
-    /// [`CudaReservation`]: onnx_runtime_virtual_memory::VirtualBacking::Reservation
+    /// [`CudaReservation`]: onnx_runtime_virtual_memory::ReservationBacking::Reservation
     pub fn with_reservation_mut<R, F>(&self, f: F) -> R
     where
         F: FnOnce(
-            &mut <CudaVirtualBacking as onnx_runtime_virtual_memory::VirtualBacking>::Reservation,
+            &mut <CudaVirtualBacking as onnx_runtime_virtual_memory::ReservationBacking>::Reservation,
             &CudaVirtualBacking,
         ) -> R,
     {
@@ -1607,7 +1608,7 @@ impl CudaVmmAllocator {
         align: usize,
     ) -> Option<String> {
         let arena = self.lock();
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let base = <CudaVirtualBacking as ReservationBacking>::base(&arena.reservation);
         let offset = (ptr.as_ptr() as usize).checked_sub(base)?;
         let live = arena.spans.live.get(&offset)?;
         if live.len != bytes {
@@ -1642,7 +1643,7 @@ impl CudaVmmAllocator {
         release: SpanReleaseReport,
         reason: QuarantineReason,
     ) -> QuarantinedSpan {
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let base = <CudaVirtualBacking as ReservationBacking>::base(&arena.reservation);
         QuarantinedSpan {
             offset,
             len,
@@ -1783,7 +1784,7 @@ impl CudaVmmAllocator {
     /// later allocation from inheriting a stale mapping.
     pub fn deallocate_span_outcome(&self, ptr: NonNull<u8>) -> AllocationReleaseOutcome {
         let mut arena = self.lock();
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let base = <CudaVirtualBacking as ReservationBacking>::base(&arena.reservation);
         let address = ptr.as_ptr() as usize;
         let Some(offset) = address.checked_sub(base) else {
             return AllocationReleaseOutcome::failed(format!(
@@ -1809,7 +1810,7 @@ impl CudaVmmAllocator {
         };
         let (len, align) = (live.len, live.align);
         let release = self.drop_granule_references(&mut arena, &live.committed);
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let base = <CudaVirtualBacking as ReservationBacking>::base(&arena.reservation);
         let outcome = release.outcome(len as u64, base + offset, align);
         if release.is_complete() {
             arena.spans.give_back(offset, len);
@@ -1863,7 +1864,7 @@ impl CudaVmmAllocator {
             ));
         }
         let mut arena = self.lock();
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let base = <CudaVirtualBacking as ReservationBacking>::base(&arena.reservation);
         let address = ptr.as_ptr() as usize;
         let Some(offset) = address.checked_sub(base) else {
             return Err(invalid(
@@ -2256,7 +2257,7 @@ impl CudaVmmAllocator {
             ));
         }
 
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let base = <CudaVirtualBacking as ReservationBacking>::base(&arena.reservation);
         let address = ptr.as_ptr() as usize;
         let Some(offset) = address.checked_sub(base) else {
             return Err(invalid(
@@ -2424,7 +2425,7 @@ impl CudaVmmAllocator {
                 ),
             ));
         }
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let base = <CudaVirtualBacking as ReservationBacking>::base(&arena.reservation);
         let address = ptr.as_ptr() as usize;
         let Some(offset) = address.checked_sub(base) else {
             return Err(invalid(
@@ -2561,7 +2562,7 @@ impl CudaVmmAllocator {
         align: usize,
         committed_ranges: &[std::ops::Range<usize>],
         capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<NonNull<u8>>, MemoryError> {
+    ) -> Result<onnx_runtime_memory_api::MappedAllocation<NonNull<u8>>, MemoryError> {
         if capacity.role() != self.role {
             return Err(invalid(
                 bytes,
@@ -2591,7 +2592,7 @@ impl CudaVmmAllocator {
                 return Err(error);
             }
         };
-        Ok(onnx_runtime_memory_governor::MappedAllocation {
+        Ok(onnx_runtime_memory_api::MappedAllocation {
             allocation: ptr,
             additional_owned_bytes: commit.additional_owned_bytes,
             newly_mapped_bytes: commit.newly_mapped_bytes,
@@ -2755,7 +2756,7 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
             },
         );
         GLOBAL_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let base = <CudaVirtualBacking as ReservationBacking>::base(&arena.reservation);
         // SAFETY: `base` is non-null (cuMemAddressReserve refuses otherwise) and
         // `offset` is within the reservation, so the sum cannot be null.
         Ok(unsafe { NonNull::new_unchecked((base + offset) as *mut u8) })
@@ -2787,7 +2788,7 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
             return Ok(());
         }
         let mut arena = self.lock();
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let base = <CudaVirtualBacking as ReservationBacking>::base(&arena.reservation);
         let address = ptr.as_ptr() as usize;
         let Some(offset) = address.checked_sub(base) else {
             return Err(invalid(
@@ -2914,7 +2915,7 @@ impl MemoryVirtualBacking for CudaVmmAllocator {
         _align: usize,
     ) -> usize {
         let arena = self.lock();
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let base = <CudaVirtualBacking as ReservationBacking>::base(&arena.reservation);
         let address = ptr.as_ptr() as usize;
         let Some(offset) = address.checked_sub(base) else {
             return allocation_bytes;

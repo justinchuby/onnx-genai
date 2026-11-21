@@ -76,8 +76,9 @@ use onnx_runtime_cuda_memory::capability::{CapabilityGateFailure, host_numa_capa
 use onnx_runtime_cuda_memory::virtual_memory::{
     CudaVirtualBacking, PhysicalHandlePool, PhysicalLocation,
 };
-use onnx_runtime_memory_governor::{DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole};
-use onnx_runtime_virtual_memory::VirtualBacking;
+use onnx_runtime_memory_api::{DeviceKey, MemoryRole};
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
+use onnx_runtime_virtual_memory::ReservationBacking;
 
 // ---------------------------------------------------------------------------
 // Serialise every test in this file
@@ -459,9 +460,9 @@ fn run_remap_benchmark(
     // physical mapping yet). Pool choice doesn't matter for VA reservation.
     context.bind_to_thread().expect("bind context for reserve");
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&device_backing, total_bytes)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&device_backing, total_bytes)
             .expect("VA reservation must succeed");
-    let base_va = <CudaVirtualBacking as VirtualBacking>::base(&reservation);
+    let base_va = <CudaVirtualBacking as ReservationBacking>::base(&reservation);
 
     // --- Commit ALL experts initially as host-NUMA-backed ---
     let mut granule_location: Vec<GranuleLocation> =
@@ -676,9 +677,9 @@ fn run_correctness_cycles(
         .bind_to_thread()
         .expect("bind for correctness reserve");
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&device_backing, total_bytes)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&device_backing, total_bytes)
             .expect("correctness VA reserve");
-    let base_va = <CudaVirtualBacking as VirtualBacking>::base(&reservation);
+    let base_va = <CudaVirtualBacking as ReservationBacking>::base(&reservation);
 
     // Start all host-NUMA.
     for g in 0..total_granules {
@@ -824,7 +825,7 @@ fn run_correctness_cycles(
         );
 
         // VA must not have changed.
-        let current_base = <CudaVirtualBacking as VirtualBacking>::base(&reservation);
+        let current_base = <CudaVirtualBacking as ReservationBacking>::base(&reservation);
         assert_eq!(
             base_va, current_base,
             "VA changed at cycle {cycle}: {base_va:#x} → {current_base:#x}"
@@ -879,7 +880,7 @@ fn run_accounting_oscillation(
 
     context.bind_to_thread().expect("bind for oscillation");
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&device_backing, granularity)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&device_backing, granularity)
             .expect("oscillation reserve");
 
     // Start host-NUMA.
@@ -1030,7 +1031,7 @@ fn run_capture_gate_check(
     let host_backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&host_pool));
     context.bind_to_thread().expect("bind for gate check");
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&host_backing, granularity)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&host_backing, granularity)
             .expect("gate check reserve");
 
     host_backing
@@ -1082,7 +1083,7 @@ fn run_capture_gate_check(
         .bind_to_thread()
         .expect("bind for cross-thread reservation");
     let mut reservation2 =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&host_backing2, granularity)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&host_backing2, granularity)
             .expect("cross-thread reserve");
     host_backing2
         .commit_at_location(
@@ -1371,7 +1372,7 @@ fn teardown_no_panic_in_drop() {
     // Create reservation, commit, then drop without explicit release.
     // Drop must not panic (panics in Drop cause SIGABRT / stack overflow).
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&host_backing, cap.granularity)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&host_backing, cap.granularity)
             .expect("teardown reserve");
     host_backing
         .commit_at_location(
@@ -1433,7 +1434,7 @@ fn concurrent_stream_sync_contract_documented() {
     let stream_b = context.new_stream().expect("stream B");
 
     let mut reservation =
-        <CudaVirtualBacking as VirtualBacking>::reserve(&host_backing, cap.granularity)
+        <CudaVirtualBacking as ReservationBacking>::reserve(&host_backing, cap.granularity)
             .expect("stream test reserve");
     host_backing
         .commit_at_location(

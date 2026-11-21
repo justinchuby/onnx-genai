@@ -54,12 +54,23 @@
 //! `onnx-runtime-memory-governor`. A [`VirtualRange`] is a mapping mechanism; a
 //! lease is the permission to use one.
 
+//! ## Reservation and allocator capabilities
+//!
+//! [`ReservationBacking`] defines reservation mechanics, with an associated
+//! reservation type. The allocator-level capability is separately defined as
+//! `onnx_runtime_memory_api::VirtualBacking`. The old reservation-trait name is
+//! removed rather than kept as an alias:
+//!
+//! ```compile_fail
+//! use onnx_runtime_virtual_memory::VirtualBacking;
+//! ```
+
 #![allow(unsafe_code)]
 
 pub mod backing;
 pub mod buffer;
 
-pub use backing::{HostBacking, PhysicalMemoryAccounting, VirtualBacking};
+pub use backing::{HostBacking, PhysicalMemoryAccounting, ReservationBacking};
 pub use buffer::{VirtualBuffer, VirtualBufferError};
 
 use std::ptr::NonNull;

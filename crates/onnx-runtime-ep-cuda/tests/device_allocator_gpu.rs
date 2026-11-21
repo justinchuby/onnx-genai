@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cudarc::driver::CudaContext;
-use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, MemoryError, Tier};
+use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, MemoryError, Tier};
 
 /// An eager `cuMemAlloc` device allocator, written entirely outside the
 /// runtime.
@@ -360,7 +360,7 @@ fn an_injected_external_eager_allocator_replaces_the_built_in_arena() {
 fn an_allocator_for_the_wrong_device_is_refused() {
     let provider = require_provider("the device-mismatch check");
     let error = provider
-        .with_memory(Arc::new(onnx_runtime_memory_governor::HostAllocator))
+        .with_memory(Arc::new(onnx_runtime_memory_api::HostAllocator))
         .expect_err("host memory is not CUDA device memory");
     let message = error.to_string();
     assert!(

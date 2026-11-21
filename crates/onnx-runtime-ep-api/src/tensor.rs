@@ -27,7 +27,7 @@
 
 use onnx_runtime_ir::DataType;
 use onnx_runtime_ir::DeviceId;
-use onnx_runtime_memory_governor::{AllocationIdentity, ProviderContextIdentity};
+use onnx_runtime_memory_api::{AllocationIdentity, ProviderContextIdentity};
 use std::marker::PhantomData;
 
 use crate::error::{EpError, Result};

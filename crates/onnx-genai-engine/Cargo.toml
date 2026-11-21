@@ -136,6 +136,7 @@ cuda-13000 = [
 ]
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 onnx-genai-metadata = { workspace = true }
 onnx-genai-preprocess = { workspace = true }
 onnx-genai-genai-config = { workspace = true }

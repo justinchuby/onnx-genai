@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, HostAllocator, MemoryError};
+use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, HostAllocator, MemoryError};
 
 /// Counts what passes through it, so a test can tell "used" from "ignored".
 #[derive(Debug, Default)]
@@ -216,9 +216,8 @@ fn a_refusal_from_the_supplied_allocator_keeps_its_reason() {
 /// default reconciled against nothing.
 #[test]
 fn a_third_party_provider_can_put_its_standing_pool_on_the_governor() {
-    use onnx_runtime_memory_governor::{
-        HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
-    };
+    use onnx_runtime_memory_api::{MemoryRole, Tier};
+    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
 
     #[derive(Debug)]
     struct PoolingProvider {
@@ -272,9 +271,8 @@ fn a_third_party_provider_can_put_its_standing_pool_on_the_governor() {
 /// A provider with no standing pool reports zero rather than failing.
 #[test]
 fn a_provider_without_a_standing_pool_adopts_nothing() {
-    use onnx_runtime_memory_governor::{
-        HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
-    };
+    use onnx_runtime_memory_api::Tier;
+    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
 
     let ep = CpuExecutionProvider::new();
     let governor = LedgerGovernor::new(LeaseLedger::new(0, 1000, 0));

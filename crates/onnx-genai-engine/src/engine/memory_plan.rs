@@ -32,7 +32,8 @@
 //! the caller's responsibility", and the callers were three `HolderId::new(N)`
 //! constants with hand-picked numbers in two different files.
 
-use onnx_runtime_memory_governor::{HolderId, MemoryError, MemoryGovernor, MemoryRole, Tier};
+use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
 
 /// Declares the holder registry from one list, so the enum, [`Holder::ALL`] and
 /// [`Holder::id`] cannot disagree.

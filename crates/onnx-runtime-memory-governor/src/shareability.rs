@@ -37,7 +37,7 @@
 //! It is the shareability **decision**, not the mapping. It says whether — and
 //! at what cost — a prefix can be shared for a given layout, geometry, prefix
 //! length, and granule. The actual multi-map is
-//! [`SharedMapping::commit_shared_prefix`](crate::SharedMapping::commit_shared_prefix);
+//! [`SharedMapping::commit_shared_prefix`](onnx_runtime_memory_api::SharedMapping::commit_shared_prefix);
 //! a caller uses [`PrefixShareability::shareable`] to decide whether to attempt
 //! it, and [`PrefixShareability::refusal_reason`] to refuse **with a reason**
 //! rather than silently falling back to N private copies — the same "error,
@@ -47,7 +47,7 @@
 /// are computed from.
 ///
 /// This is the layout-independent shape: how the per-token KV bytes decompose
-/// into layers, heads, and per-head width. A [`KvLayout`] turns it into a
+/// into layers, heads, and per-head width. A `KvLayout` turns it into a
 /// [`KvFragmentation`] (how those bytes are scattered into contiguous
 /// fragments).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

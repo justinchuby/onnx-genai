@@ -63,7 +63,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.filter.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Classify docs-only vs. code changes
@@ -233,7 +233,7 @@ jobs:
       NXRT_REQUIRE_SIMD_X86_TESTS: "1"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install the pinned Rust toolchain
@@ -251,7 +251,7 @@ jobs:
           target="$(rustc -Vv | sed -n 's/^host: //p')"
           echo "triple=$target" >> "$GITHUB_OUTPUT"
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -260,13 +260,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-cargo-registry-
       - name: Cache fast cargo target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: target
           key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-fast-rust-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-fast-rust-${{ steps.rust-toolchain.outputs.version }}-
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install Python test dependencies
@@ -388,7 +388,7 @@ jobs:
       CARGO_TERM_COLOR: always
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
@@ -414,7 +414,7 @@ jobs:
           target="$(rustc -Vv | sed -n 's/^host: //p')"
           echo "triple=$target" >> "$GITHUB_OUTPUT"
       - name: Cache cargo artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin
@@ -775,7 +775,7 @@ jobs:
       # so what is added here is codegen, linking and the run itself.
       #
       # NXRT_REQUIRE_ORT_TESTS mirrors the `CLI ORT` job env. No test in these
-      # six crates reads it today; it is set so that the first one that does
+      # ORT-backed crates reads it today; it is set so that the first one that does
       # cannot silently skip here after passing there.
       #
       # Serialized for the reason the `CLI ORT` step was: several integration
@@ -832,7 +832,7 @@ jobs:
       NXRT_REQUIRE_PLACEMENT_TESTS: ${{ matrix.require_placement }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install the pinned Rust toolchain
@@ -850,7 +850,7 @@ jobs:
           target="$(rustc -Vv | sed -n 's/^host: //p')"
           echo "triple=$target" >> "$GITHUB_OUTPUT"
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -859,7 +859,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-cargo-registry-
       - name: Cache coverage cargo target and tools
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin
@@ -867,7 +867,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-coverage-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-coverage-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install Python test dependencies
@@ -909,7 +909,7 @@ jobs:
           cargo llvm-cov --locked --codecov --output-path codecov-offline.json $packages
       - name: Upload offline coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: codecov-offline.json
           flags: offline
@@ -926,7 +926,7 @@ jobs:
           cargo llvm-cov --locked --codecov --output-path codecov-mlas.json $packages
       - name: Upload MLAS coverage to Codecov
         if: always() && runner.os == 'Linux'
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: codecov-mlas.json
           flags: mlas
@@ -947,13 +947,14 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
-      CMAKE_GENERATOR: "Visual Studio 17 2022"
+      # Let the native build scripts discover Ninja/installed Visual Studio;
+      # windows-11-arm no longer guarantees Visual Studio 2022.
       # ARM64 Windows has the affinity backend, so the placement falsifiers are
       # answerable here and their silence would be a defect, not a platform fact.
       NXRT_REQUIRE_PLACEMENT_TESTS: "1"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install the pinned Rust toolchain
@@ -971,7 +972,7 @@ jobs:
           target="aarch64-pc-windows-msvc"
           echo "triple=$target" >> "$GITHUB_OUTPUT"
       - name: Cache cargo artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -980,7 +981,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-platform-test-rust-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-platform-test-rust-${{ steps.rust-toolchain.outputs.version }}-
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install Python test dependencies
@@ -1028,7 +1029,7 @@ jobs:
       RUSTFLAGS: "-D warnings"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install the pinned Rust toolchain
@@ -1046,7 +1047,7 @@ jobs:
           target="$(rustc -Vv | sed -n 's/^host: //p')"
           echo "triple=$target" >> "$GITHUB_OUTPUT"
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -1055,17 +1056,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-cargo-registry-
       - name: Cache conformance cargo target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: target
           key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-ep-conformance-rust-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-ep-conformance-rust-${{ steps.rust-toolchain.outputs.version }}-
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Check out onnx-tests conformance suite
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: cbourjau/onnx-tests
           path: external/onnx-tests
@@ -1112,7 +1113,7 @@ jobs:
       NXRT_REQUIRE_ORT_TESTS: "1"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
@@ -1138,7 +1139,7 @@ jobs:
           target="$(rustc -Vv | sed -n 's/^host: //p')"
           echo "triple=$target" >> "$GITHUB_OUTPUT"
       - name: Cache cargo artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin
@@ -1259,7 +1260,7 @@ jobs:
           -p onnx-runtime-ep-cpu-plugin --features mlas
       - name: Upload CLI ORT coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: codecov-cli-ort.json
           flags: ${{ matrix.coverage_flag }}
@@ -1309,7 +1310,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "1"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
@@ -1335,7 +1336,7 @@ jobs:
           target="$(rustc -Vv | sed -n 's/^host: //p')"
           echo "triple=$target" >> "$GITHUB_OUTPUT"
       - name: Cache cargo artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin
@@ -1500,7 +1501,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "1"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
@@ -1526,7 +1527,7 @@ jobs:
           target="$(rustc -Vv | sed -n 's/^host: //p')"
           echo "triple=$target" >> "$GITHUB_OUTPUT"
       - name: Cache cargo artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin

@@ -43,7 +43,8 @@ use onnx_runtime_ep_cuda::{
     PlanarActivationDtype, PlanarLinearDims, admit_planar_linear, launch_planar_linear,
     planar_matmul_capable_formats, warm_planar_linear,
 };
-use onnx_runtime_memory_governor::{DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole};
+use onnx_runtime_memory_api::{DeviceKey, MemoryRole};
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------

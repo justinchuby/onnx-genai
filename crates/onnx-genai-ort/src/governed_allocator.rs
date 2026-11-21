@@ -36,9 +36,8 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use onnx_runtime_memory_governor::{
-    DeviceAllocator, HolderId, HostAllocator, MemoryGovernor, MemoryLease, MemoryRole, Tier,
-};
+use onnx_runtime_memory_api::{DeviceAllocator, HostAllocator, MemoryRole, Tier};
+use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryLease};
 
 use crate::allocator::MemoryInfo;
 
@@ -214,7 +213,7 @@ impl GovernedAllocator {
     /// knowing which backend it got.
     ///
     /// [`new`]: Self::new
-    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
+    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_api::DeviceAllocator::commits_on_demand
     pub fn on_device(
         memory_info: MemoryInfo,
         memory: Arc<dyn DeviceAllocator>,
@@ -325,7 +324,7 @@ impl GovernedAllocator {
     /// This is the seam a caller replaces. Governance is unchanged — the same
     /// leases, roles and counters — only the source of the bytes moves.
     ///
-    /// The allocator's [`DeviceKey`](onnx_runtime_memory_governor::DeviceKey)
+    /// The allocator's [`DeviceKey`](onnx_runtime_memory_api::DeviceKey)
     /// must agree with the tier this allocator was built for. ONNX Runtime
     /// decides from the memory info whether a pointer is a host address, so an
     /// allocator returning device memory under host memory info turns a kernel
@@ -796,9 +795,9 @@ mod tests {
                 &self,
                 _bytes: usize,
                 _align: usize,
-            ) -> std::result::Result<std::ptr::NonNull<u8>, onnx_runtime_memory_governor::MemoryError>
+            ) -> std::result::Result<std::ptr::NonNull<u8>, onnx_runtime_memory_api::MemoryError>
             {
-                Err(onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                Err(onnx_runtime_memory_api::MemoryError::InvalidRequest {
                     tier: "device",
                     requested: 0,
                     reason: "test double",
@@ -808,8 +807,8 @@ mod tests {
             unsafe fn deallocate(&self, _ptr: std::ptr::NonNull<u8>, _bytes: usize, _align: usize) {
             }
 
-            fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
-                onnx_runtime_memory_governor::DeviceKey::device(0)
+            fn device(&self) -> onnx_runtime_memory_api::DeviceKey {
+                onnx_runtime_memory_api::DeviceKey::device(0)
             }
 
             fn commits_on_demand(&self) -> bool {
@@ -1313,7 +1312,7 @@ mod tests {
             bytes: u64,
             role: MemoryRole,
             holder: HolderId,
-        ) -> Result<MemoryLease, onnx_runtime_memory_governor::MemoryError> {
+        ) -> Result<MemoryLease, onnx_runtime_memory_api::MemoryError> {
             let lease = self.inner.reserve(tier, bytes, role, holder)?;
             self.seen.lock().expect("roles").push(role);
             Ok(lease)
@@ -1450,7 +1449,7 @@ mod tests {
             &self,
             bytes: usize,
             align: usize,
-        ) -> Result<std::ptr::NonNull<u8>, onnx_runtime_memory_governor::MemoryError> {
+        ) -> Result<std::ptr::NonNull<u8>, onnx_runtime_memory_api::MemoryError> {
             let ptr = self.inner.allocate(bytes, align)?;
             self.allocations.fetch_add(1, Ordering::Relaxed);
             self.live_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -1464,8 +1463,8 @@ mod tests {
             self.live_bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
         }
 
-        fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
-            onnx_runtime_memory_governor::DeviceKey::HOST
+        fn device(&self) -> onnx_runtime_memory_api::DeviceKey {
+            onnx_runtime_memory_api::DeviceKey::HOST
         }
     }
 
@@ -1478,7 +1477,7 @@ mod tests {
             &self,
             _bytes: usize,
             _align: usize,
-        ) -> Result<std::ptr::NonNull<u8>, onnx_runtime_memory_governor::MemoryError> {
+        ) -> Result<std::ptr::NonNull<u8>, onnx_runtime_memory_api::MemoryError> {
             unreachable!("the tier check must refuse this allocator before it is used")
         }
 
@@ -1486,8 +1485,8 @@ mod tests {
             unreachable!("the tier check must refuse this allocator before it is used")
         }
 
-        fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
-            onnx_runtime_memory_governor::DeviceKey::device(0)
+        fn device(&self) -> onnx_runtime_memory_api::DeviceKey {
+            onnx_runtime_memory_api::DeviceKey::device(0)
         }
     }
 }

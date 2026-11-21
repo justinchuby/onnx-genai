@@ -129,7 +129,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: shellcheck
         run: shellcheck scripts/hostlock.sh scripts/hostlock_test.sh scripts/hostcensus.sh scripts/hostcensus_test.sh
