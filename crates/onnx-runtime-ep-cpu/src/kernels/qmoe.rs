@@ -32,10 +32,7 @@ use onnx_runtime_loader::{
 
 use super::matmul_nbits::dequantize_nbits_row;
 use super::moe::{MoeAttributes, routing_weights, run_expert_grouped};
-use super::{
-    check_arity, contiguous_f32_slice, contiguous_u8_slice, to_dense_bytes, to_dense_f32,
-    write_dense_f32,
-};
+use super::{check_arity, contiguous_u8_slice, to_dense_bytes, to_dense_f32, write_dense_f32};
 use crate::weight_offload::{
     WeightOffloadMode, checked_host_budget, effective_host_budget_u64, metrics,
     weight_offload_prefetch_default,
@@ -1543,6 +1540,17 @@ impl<'a> QuantizedExperts<'a> {
         block_size: usize,
         prefer_mmap: bool,
     ) -> Result<Self> {
+        for (operand, view) in [
+            ("experts_weights", Some(packed)),
+            ("scales", Some(scales)),
+            ("zero_points", zero_points),
+        ] {
+            if view.is_some_and(|view| !view.device.is_host_accessible()) {
+                return Err(error(format!(
+                    "{name}_{operand} must be host-accessible for CPU QMoE; move this tensor to the CPU before execution"
+                )));
+            }
+        }
         let pack_size = 8 / bits;
         if !in_features.is_multiple_of(pack_size) {
             return Err(error(format!(
@@ -1663,29 +1671,16 @@ impl<'a> QuantizedExperts<'a> {
             && zero_point_catalog
                 .as_ref()
                 .is_none_or(WeightRegionCatalog::is_pageable)
-            && packed.device.is_host_accessible()
-            && scales.device.is_host_accessible()
-            && zero_points.is_none_or(|points| points.device.is_host_accessible())
             && mapped_region(packed).is_some()
             && mapped_region(scales).is_some()
             && zero_points.is_none_or(|points| mapped_region(points).is_some());
 
-        let (packed_data, scale_data, zero_point_data) = if pageable {
-            (
-                Cow::Borrowed(contiguous_u8_slice(packed)?),
-                Cow::Borrowed(contiguous_f32_slice(scales)?),
-                zero_points
-                    .map(contiguous_u8_slice)
-                    .transpose()?
-                    .map(Cow::Borrowed),
-            )
-        } else {
-            (
-                Cow::Owned(to_dense_bytes(packed)?),
-                Cow::Owned(to_dense_f32(scales)?),
-                zero_points.map(to_dense_bytes).transpose()?.map(Cow::Owned),
-            )
-        };
+        // Borrowability is a layout/device property, independent of whether
+        // the complete bank qualifies for mmap paging. Materialize each strided
+        // operand separately instead of copying every tensor in the bank.
+        let packed_data = quantized_input_bytes(packed)?;
+        let scale_data = crate::dtype::to_dense_f32_widen("QMoE scales", scales)?;
+        let zero_point_data = zero_points.map(quantized_input_bytes).transpose()?;
         let mut catalogs = vec![packed_catalog, scale_catalog];
         catalogs.extend(zero_point_catalog);
         let mut mapped_regions = Vec::new();
@@ -1780,6 +1775,15 @@ impl<'a> QuantizedExperts<'a> {
             std::mem::size_of::<f32>(),
             "per-expert expanded byte count",
         )
+    }
+}
+
+/// Borrow contiguous packed input; strided storage needs only a packed copy.
+fn quantized_input_bytes<'a>(view: &'a TensorView<'_>) -> Result<Cow<'a, [u8]>> {
+    if view.is_contiguous() {
+        Ok(Cow::Borrowed(contiguous_u8_slice(view)?))
+    } else {
+        Ok(Cow::Owned(to_dense_bytes(view)?))
     }
 }
 
@@ -1951,6 +1955,152 @@ mod tests {
             scales,
             zero_points,
             dequantized,
+        }
+    }
+
+    #[test]
+    fn quantized_inputs_borrow_each_contiguous_operand_independently_of_paging() {
+        const EXPERTS: usize = 2;
+        const OUTPUTS: usize = 3;
+        const INPUTS: usize = 96;
+        const BLOCK: usize = 16;
+        for bits in [2, 4, 8] {
+            for affine in [false, true] {
+                let quantized = quantize(EXPERTS, OUTPUTS, INPUTS, bits, BLOCK, affine);
+                for prefer_mmap in [false, true] {
+                    for strided in 0usize..8 {
+                        // Prefixes exercise byte_offset; independent stride masks
+                        // ensure one strided operand does not force other copies.
+                        let steps: [usize; 3] = std::array::from_fn(|i| 1 + ((strided >> i) & 1));
+                        let padded_u8 = |values: &[u8], step: usize| {
+                            let mut data = vec![0; 1 + values.len() * step];
+                            for (i, value) in values.iter().enumerate() {
+                                data[1 + i * step] = *value;
+                            }
+                            Owned::u8(&[data.len()], &data)
+                        };
+                        let packed = padded_u8(&quantized.packed, steps[0]);
+                        let mut scale_data = vec![0.0; 1 + quantized.scales.len() * steps[1]];
+                        for (i, value) in quantized.scales.iter().enumerate() {
+                            scale_data[1 + i * steps[1]] = *value;
+                        }
+                        let scales = Owned::f32(&[scale_data.len()], &scale_data);
+                        let points = quantized
+                            .zero_points
+                            .as_deref()
+                            .map(|data| padded_u8(data, steps[2]));
+                        let blocks = INPUTS / BLOCK;
+                        let packed_in = INPUTS / (8 / bits);
+                        let point_width = blocks.div_ceil(8 / bits);
+                        let shapes = [
+                            [EXPERTS, OUTPUTS, packed_in],
+                            [EXPERTS, OUTPUTS, blocks],
+                            [EXPERTS, OUTPUTS, point_width],
+                        ];
+                        let strides: [[i64; 3]; 3] = std::array::from_fn(|i| {
+                            [
+                                (OUTPUTS * shapes[i][2] * steps[i]) as i64,
+                                (shapes[i][2] * steps[i]) as i64,
+                                steps[i] as i64,
+                            ]
+                        });
+                        let mut packed_view = packed.view();
+                        packed_view.shape = &shapes[0];
+                        packed_view.strides = &strides[0];
+                        packed_view.byte_offset = 1;
+                        let mut scale_view = scales.view();
+                        scale_view.shape = &shapes[1];
+                        scale_view.strides = &strides[1];
+                        scale_view.byte_offset = 4;
+                        let point_view = points.as_ref().map(|points| {
+                            let mut view = points.view();
+                            view.shape = &shapes[2];
+                            view.strides = &strides[2];
+                            view.byte_offset = 1;
+                            view
+                        });
+                        let source = QuantizedExperts::new(
+                            "fc1",
+                            &packed_view,
+                            &scale_view,
+                            point_view.as_ref(),
+                            EXPERTS,
+                            OUTPUTS,
+                            INPUTS,
+                            bits,
+                            BLOCK,
+                            prefer_mmap,
+                        )
+                        .unwrap();
+                        assert!(
+                            !source.is_pageable(),
+                            "opaque storage never becomes mmap-pageable"
+                        );
+                        assert_eq!(matches!(&source.packed, Cow::Borrowed(_)), steps[0] == 1);
+                        assert_eq!(matches!(&source.scales, Cow::Borrowed(_)), steps[1] == 1);
+                        if steps[0] == 1 {
+                            assert_eq!(source.packed.as_ptr(), packed_view.data_ptr::<u8>());
+                        }
+                        if steps[1] == 1 {
+                            assert_eq!(source.scales.as_ptr(), scale_view.data_ptr::<f32>());
+                        }
+                        assert_eq!(&*source.packed, &quantized.packed);
+                        assert_eq!(&*source.scales, &quantized.scales);
+                        match (&source.zero_points, &point_view) {
+                            (Some(data), Some(view)) => {
+                                assert_eq!(matches!(data, Cow::Borrowed(_)), steps[2] == 1);
+                                if steps[2] == 1 {
+                                    assert_eq!(data.as_ptr(), view.data_ptr::<u8>());
+                                }
+                                assert_eq!(
+                                    data.as_ref(),
+                                    quantized.zero_points.as_deref().unwrap()
+                                );
+                            }
+                            (None, None) => {}
+                            _ => panic!("optional zero-point storage changed"),
+                        }
+                        for expert in 0..EXPERTS {
+                            let range = expert * OUTPUTS * INPUTS..(expert + 1) * OUTPUTS * INPUTS;
+                            assert_eq!(
+                                source.dequantize_expert(expert).unwrap(),
+                                quantized.dequantized[range]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_inputs_refuse_nonhost_operands_before_reading_storage() {
+        let packed = Owned::u8(&[1, 1, 8], &[0; 8]);
+        let scales = Owned::f32(&[1, 1, 1], &[1.0]);
+        let points = Owned::u8(&[1, 1, 1], &[0]);
+        for (slot, name) in ["experts_weights", "scales", "zero_points"]
+            .iter()
+            .enumerate()
+        {
+            let mut views = [packed.view(), scales.view(), points.view()];
+            views[slot].device = DeviceId::cuda(0);
+            let failure = QuantizedExperts::new(
+                "fc1",
+                &views[0],
+                &views[1],
+                Some(&views[2]),
+                1,
+                1,
+                16,
+                4,
+                16,
+                false,
+            )
+            .err()
+            .expect("CPU cannot read a device-only operand");
+            let message = failure.to_string();
+            assert!(message.contains(&format!("fc1_{name}")), "{message}");
+            assert!(message.contains("move this tensor to the CPU"), "{message}");
         }
     }
 
