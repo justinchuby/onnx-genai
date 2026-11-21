@@ -1176,6 +1176,52 @@ struct WeightOffloadHostCacheInner {
     fill: Mutex<()>,
 }
 
+impl crate::resources::IdleWeightCache for WeightOffloadHostCacheInner {
+    fn reclaim_idle(&self, want: usize) -> Result<usize> {
+        let mut retired = Vec::new();
+        let result = {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (|| {
+                let mut released = 0usize;
+                // Frequency pins guide ordinary retention, not physical pressure.
+                // Active Arc readers always remain protected.
+                while released < want {
+                    let candidate = cache
+                        .entries
+                        .iter()
+                        .filter(|(_, entry)| Arc::strong_count(&entry.weights) == 1)
+                        .min_by_key(|(_, entry)| (entry.frequency, entry.last_used))
+                        .map(|(key, _)| key.clone());
+                    let Some(key) = candidate else {
+                        break;
+                    };
+                    let entry = cache
+                        .entries
+                        .remove(&key)
+                        .expect("selected idle expert exists");
+                    let bytes = entry.expanded_bytes;
+                    retired.push(entry);
+                    cache.owned_bytes = cache.owned_bytes.checked_sub(bytes)
+                        .ok_or_else(|| error("idle expert reclamation exceeded owned cache bytes; recreate the CPU provider and report inconsistent cache accounting"))?;
+                    released += bytes;
+                }
+                metrics()
+                    .record_host_cache_evictions(retired.len())
+                    .map_err(error)?;
+                let budget = usize::try_from(cache.reported_budget_bytes)
+                    .expect("reported cache budget originated from an addressable usize");
+                cache.record_residency(budget)?;
+                Ok(released)
+            })()
+        };
+        drop(retired);
+        result
+    }
+}
+
 /// Shared expert retention policy and payloads funded by their own Host grants.
 #[derive(Clone)]
 pub(crate) struct WeightOffloadHostCache {
@@ -1388,16 +1434,16 @@ impl WeightOffloadHostCache {
         memory: DerivedWeightMemory,
     ) -> std::result::Result<Self, &'static str> {
         checked_host_budget(retention_bytes)?;
-        Ok(Self {
-            inner: Arc::new(WeightOffloadHostCacheInner {
-                cache: Mutex::new(HostExpertCache::default()),
-                retention_bytes,
-                memory,
-                effective_retention: OnceLock::new(),
-                banks: RwLock::new(BTreeMap::new()),
-                fill: Mutex::new(()),
-            }),
-        })
+        let inner = Arc::new(WeightOffloadHostCacheInner {
+            cache: Mutex::new(HostExpertCache::default()),
+            retention_bytes,
+            memory,
+            effective_retention: OnceLock::new(),
+            banks: RwLock::new(BTreeMap::new()),
+            fill: Mutex::new(()),
+        });
+        inner.memory.register_idle_cache(&inner);
+        Ok(Self { inner })
     }
 
     /// Configured retention ceiling, never an idle reservation on Host capacity.
@@ -4428,6 +4474,85 @@ mod tests {
     }
 
     #[test]
+    fn shared_pressure_expert_and_dense_caches_reclaim_each_others_idle_payloads() {
+        use super::super::dense_weight_cache::{
+            DenseWeightCache, DenseWeightKey, DenseWeightLoad, DenseWeightSpec,
+        };
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        struct Key;
+        impl DenseWeightKey for Key {
+            fn dense_bytes(&self) -> Result<usize> {
+                Ok(4)
+            }
+        }
+        let _guard = hold_metrics_test_lock();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 4, 0));
+        let source = DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let experts = WeightOffloadHostCache::new(64, source.clone()).unwrap();
+        let dense = DenseWeightCache::<Key>::new(source, 4);
+        for _ in 0..4 {
+            drop(
+                experts
+                    .lease(cache_key(0), 4, || Ok(expert_payload(2.0)))
+                    .unwrap(),
+            );
+        }
+        // Frequency pinning cannot keep an inactive payload physically resident
+        // when the shared Host books refuse another weight allocation.
+        assert_eq!(experts.inner.cache.lock().unwrap().owned_bytes, 4);
+        let loaded = dense
+            .load_group(&[DenseWeightSpec::cached(&Key).unwrap()], |_, row| {
+                row.fill(3.0);
+                Ok(())
+            })
+            .unwrap();
+        let DenseWeightLoad::Ready(loaded) = loaded else {
+            panic!("idle expert must fund dense payload");
+        };
+        assert_eq!(experts.inner.cache.lock().unwrap().owned_bytes, 0);
+        assert_eq!(governor.used(Tier::Host), 4);
+        assert!(matches!(
+            experts
+                .lease(cache_key(0), 4, || Ok(expert_payload(2.0)))
+                .unwrap(),
+            ExpertLease::Transient
+        ));
+        assert!(matches!(
+            experts
+                .lease(cache_key(0), 4, || Ok(expert_payload(2.0)))
+                .unwrap(),
+            ExpertLease::Refused(_)
+        ));
+        assert_eq!(loaded.weights[0].as_slice(), &[3.0]);
+        drop(loaded);
+        let held = experts
+            .lease(cache_key(0), 4, || Ok(expert_payload(2.0)))
+            .unwrap();
+        assert!(matches!(held, ExpertLease::Filled(_)));
+        assert_eq!(dense.stats(), (0, 0));
+        assert_eq!(experts.inner.cache.lock().unwrap().owned_bytes, 4);
+        let before = crate::weight_offload_stats();
+        assert!(matches!(
+            dense
+                .load_group(&[DenseWeightSpec::transient(4)], |_, _| panic!(
+                    "active expert cannot be reclaimed"
+                ))
+                .unwrap(),
+            DenseWeightLoad::Declined(_)
+        ));
+        assert_eq!(
+            crate::weight_offload_stats().host_cache_evictions,
+            before.host_cache_evictions
+        );
+        experts.clear();
+        assert_eq!(governor.used(Tier::Host), 4);
+        drop(held);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
     fn governed_retention_competes_with_real_host_kv_without_idle_entitlement() {
         use onnx_runtime_memory_api::{MemoryRole, Tier};
         use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
@@ -4450,6 +4575,7 @@ mod tests {
             );
         }
         assert_eq!(governor.used(Tier::Host), 12);
+        let active = cache.lease(cache_key(0), 4, || unreachable!()).unwrap();
         drop(
             cache
                 .lease(cache_key(1), 4, || Ok(expert_payload(2.)))
@@ -4462,14 +4588,16 @@ mod tests {
             ExpertLease::Refused(_)
         ));
         assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 4);
-        drop(kv);
+        drop(active);
         assert!(matches!(
             cache
                 .lease(cache_key(1), 4, || Ok(expert_payload(2.)))
                 .unwrap(),
             ExpertLease::Filled(_)
         ));
-        assert_eq!(governor.used(Tier::Host), 8);
+        assert_eq!(governor.used(Tier::Host), 12);
+        drop(kv);
+        assert_eq!(governor.used(Tier::Host), 4);
         cache.clear();
         assert_eq!(governor.used(Tier::Host), 0);
     }

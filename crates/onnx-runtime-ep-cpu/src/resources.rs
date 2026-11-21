@@ -1,6 +1,6 @@
 //! Immutable memory resources supplied before the CPU registry is constructed.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
@@ -124,9 +124,43 @@ impl CpuMemoryResources {
 /// A governed source retains a zero-byte anchor, rather than a standing cache
 /// allowance. Each owned expansion claims its payload bytes against the same
 /// Host books as other holders, and keeps them until its last owner drops.
+/// Clones share weak idle-cache registrations. A capacity refusal can reclaim
+/// inactive dense/expert entries from that domain before retrying the grant;
+/// allocator/configuration errors and warm cache hits do not trigger eviction.
 #[derive(Clone, Default)]
 pub struct DerivedWeightMemory {
-    anchor: Option<Arc<MemoryLease>>,
+    domain: Option<Arc<DerivedWeightDomain>>,
+}
+
+struct DerivedWeightDomain {
+    anchor: MemoryLease,
+    idle_caches: Mutex<IdleCacheRegistry>,
+}
+
+/// A cache may remove only entries whose last owner is the cache itself.
+/// Implementations drop payloads after releasing their data lock, so returning
+/// their Host grants can safely call an external accountant.
+pub(crate) trait IdleWeightCache: Send + Sync {
+    fn reclaim_idle(&self, want: usize) -> Result<usize>;
+}
+
+#[derive(Default)]
+struct IdleCacheRegistry {
+    caches: Vec<Weak<dyn IdleWeightCache>>,
+    next: usize,
+}
+
+impl IdleCacheRegistry {
+    fn snapshot(&mut self) -> Vec<Arc<dyn IdleWeightCache>> {
+        self.caches.retain(|cache| cache.strong_count() != 0);
+        let mut caches: Vec<_> = self.caches.iter().filter_map(Weak::upgrade).collect();
+        if !caches.is_empty() {
+            let first = self.next % caches.len();
+            caches.rotate_left(first);
+            self.next = (first + 1) % caches.len();
+        }
+        caches
+    }
 }
 
 impl DerivedWeightMemory {
@@ -157,29 +191,88 @@ impl DerivedWeightMemory {
             });
         }
         Ok(Self {
-            anchor: Some(Arc::new(anchor)),
+            domain: Some(Arc::new(DerivedWeightDomain {
+                anchor,
+                idle_caches: Mutex::new(IdleCacheRegistry::default()),
+            })),
         })
     }
 
     pub fn is_governed(&self) -> bool {
-        self.anchor.is_some()
+        self.domain.is_some()
+    }
+
+    pub(crate) fn register_idle_cache<T: IdleWeightCache + 'static>(&self, cache: &Arc<T>) {
+        let Some(domain) = &self.domain else {
+            return;
+        };
+        let cache: Arc<dyn IdleWeightCache> = cache.clone();
+        let mut registry = domain
+            .idle_caches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.caches.retain(|cache| cache.strong_count() != 0);
+        registry.caches.push(Arc::downgrade(&cache));
     }
 
     pub(crate) fn try_grant(&self, bytes: usize) -> Result<WeightAdmission> {
-        let Some(anchor) = &self.anchor else {
+        let Some(domain) = &self.domain else {
             return Ok(WeightAdmission::Granted(DenseWeightGrant::Local));
         };
-        let bytes = u64::try_from(bytes).map_err(|_| EpError::KernelFailed(
+        let requested = u64::try_from(bytes).map_err(|_| EpError::KernelFailed(
             "derived dense weight byte count exceeds u64; use dimensions addressable by the Host memory governor".into()
         ))?;
-        match anchor.reserve_sibling(bytes) {
+        let reserve = || match domain.anchor.reserve_sibling(requested) {
             Ok(lease) => Ok(WeightAdmission::Granted(DenseWeightGrant::Governed(lease))),
             Err(
                 failure @ (MemoryError::TierExhausted { .. }
                 | MemoryError::CapacityUnavailable { .. }),
             ) => Ok(WeightAdmission::Declined(failure)),
             Err(failure) => Err(EpError::Memory(failure)),
+        };
+        let mut reason = match reserve()? {
+            granted @ WeightAdmission::Granted(_) => return Ok(granted),
+            WeightAdmission::Declined(reason) => reason,
+        };
+        // Reclaim cannot make a payload larger than the entire tier fit.
+        // Apply the same classification to the initial refusal and retries,
+        // including a limit lowered concurrently with cache reclamation.
+        let shortfall = |reason: &MemoryError| match reason {
+            _ if requested == 0 => None,
+            MemoryError::TierExhausted { limit, .. } if requested > *limit => None,
+            MemoryError::TierExhausted { available, .. }
+            | MemoryError::CapacityUnavailable { available, .. } => Some(
+                bytes
+                    .saturating_sub((*available).min(requested) as usize)
+                    .max(1),
+            ),
+            _ => unreachable!("only capacity refusals enter idle-weight reclamation"),
+        };
+        let Some(mut want) = shortfall(&reason) else {
+            return Ok(WeightAdmission::Declined(reason));
+        };
+        // Snapshot once, then release the registration lock before any cache,
+        // payload destructor or governor callback is entered. One bounded pass
+        // cannot spin indefinitely against concurrent cache fills.
+        let caches = domain
+            .idle_caches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot();
+        for cache in caches {
+            if cache.reclaim_idle(want)? == 0 {
+                continue;
+            }
+            match reserve()? {
+                granted @ WeightAdmission::Granted(_) => return Ok(granted),
+                WeightAdmission::Declined(failure) => reason = failure,
+            }
+            let Some(remaining) = shortfall(&reason) else {
+                break;
+            };
+            want = remaining;
         }
+        Ok(WeightAdmission::Declined(reason))
     }
 }
 
@@ -293,6 +386,109 @@ mod tests {
         }
     }
 
+    struct IdleFixture {
+        source: DerivedWeightMemory,
+        grant: Mutex<Option<DenseWeightGrant>>,
+        wants: Mutex<Vec<usize>>,
+    }
+    impl IdleWeightCache for IdleFixture {
+        fn reclaim_idle(&self, want: usize) -> Result<usize> {
+            // A callback may register another cache or claim already available
+            // bytes: the shared registry must not be locked across callbacks.
+            assert!(
+                self.source
+                    .domain
+                    .as_ref()
+                    .unwrap()
+                    .idle_caches
+                    .try_lock()
+                    .is_ok()
+            );
+            assert!(matches!(
+                self.source.try_grant(0)?,
+                WeightAdmission::Granted(_)
+            ));
+            self.wants.lock().unwrap().push(want);
+            let retired = self.grant.lock().unwrap().take();
+            let bytes = match &retired {
+                Some(DenseWeightGrant::Governed(lease)) => lease.bytes() as usize,
+                _ => 0,
+            };
+            drop(retired);
+            Ok(bytes)
+        }
+    }
+
+    #[test]
+    fn shared_pressure_requests_only_the_shortfall_and_does_not_retain_registered_caches() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 32, 0));
+        let source = DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let idle = || {
+            let WeightAdmission::Granted(grant) = source.try_grant(8).unwrap() else {
+                panic!("fixture cache capacity");
+            };
+            let cache = Arc::new(IdleFixture {
+                source: source.clone(),
+                grant: Mutex::new(Some(grant)),
+                wants: Mutex::new(Vec::new()),
+            });
+            source.register_idle_cache(&cache);
+            cache
+        };
+        let first = idle();
+        let second = idle();
+        assert!(matches!(
+            source.try_grant(33).unwrap(),
+            WeightAdmission::Declined(_)
+        ));
+        assert!(first.wants.lock().unwrap().is_empty());
+        assert!(second.wants.lock().unwrap().is_empty());
+        let kv = governor
+            .reserve(Tier::Host, 12, MemoryRole::KvCache, HolderId::new(1))
+            .unwrap();
+        let WeightAdmission::Granted(held) = source.try_grant(8).unwrap() else {
+            panic!("one idle entry must fund this request");
+        };
+        assert_eq!(*first.wants.lock().unwrap(), vec![4]);
+        assert!(second.wants.lock().unwrap().is_empty());
+        assert_eq!(governor.used(Tier::Host), 28);
+        let first_weak = Arc::downgrade(&first);
+        let second_weak = Arc::downgrade(&second);
+        drop(first);
+        drop(second);
+        assert!(first_weak.upgrade().is_none());
+        assert!(second_weak.upgrade().is_none());
+        assert_eq!(governor.used(Tier::Host), 20);
+        // The next refused request prunes dead registrations and terminates.
+        assert!(matches!(
+            source.try_grant(16).unwrap(),
+            WeightAdmission::Declined(_)
+        ));
+        assert!(
+            source
+                .domain
+                .as_ref()
+                .unwrap()
+                .idle_caches
+                .lock()
+                .unwrap()
+                .caches
+                .is_empty()
+        );
+        drop(held);
+        drop(kv);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[derive(Default)]
+    struct EmptyIdleCache(AtomicUsize);
+    impl IdleWeightCache for EmptyIdleCache {
+        fn reclaim_idle(&self, _want: usize) -> Result<usize> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(0)
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum FailureKind {
         Configuration,
@@ -362,6 +558,8 @@ mod tests {
             let source =
                 DerivedWeightMemory::governed(&FaultingGovernor(books.clone()), HolderId::new(13))
                     .unwrap();
+            let idle = Arc::new(EmptyIdleCache::default());
+            source.register_idle_cache(&idle);
             match (kind, source.try_grant(16)) {
                 (
                     FailureKind::Allocator,
@@ -381,6 +579,11 @@ mod tests {
                 _ => panic!("memory failure was misclassified"),
             }
             assert_eq!(books.attempts.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                idle.0.load(Ordering::Relaxed),
+                usize::from(matches!(kind, FailureKind::Capacity)),
+                "hard errors must not evict cache payloads; an empty cache is visited at most once on refusal"
+            );
         }
     }
 }

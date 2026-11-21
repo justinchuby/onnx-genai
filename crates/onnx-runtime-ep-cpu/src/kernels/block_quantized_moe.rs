@@ -1963,6 +1963,26 @@ mod tests {
             bytes,
             "both projection buffers retain their exact slices"
         );
+        let concrete = first
+            .as_any()
+            .downcast_ref::<BlockQuantizedMoEKernel>()
+            .unwrap();
+        let layout = ProjectionLayout::new(BlockFormat::Mxfp4, H, H, E);
+        let mut active = Vec::new();
+        for (index, slot) in [(0, 2), (1, 4)] {
+            let resolved = concrete.weight_identities[index]
+                .resolve(
+                    &views[slot],
+                    BlockFormat::Mxfp4,
+                    H,
+                    H,
+                    (index + 1) as u8,
+                    Some(0),
+                    || packed_expert_bytes(&views[slot], &layout, 0),
+                )
+                .unwrap();
+            active.push(concrete.weight_cache.test_get(&resolved.key).unwrap());
+        }
         second.execute(&views, &mut [actual.view_mut()]).unwrap();
         assert_eq!(actual.bytes, expected.bytes);
         assert_eq!(
@@ -1970,7 +1990,23 @@ mod tests {
             bytes,
             "second expert kernel must stream rather than claim another full grant"
         );
+        assert_eq!(
+            second
+                .as_any()
+                .downcast_ref::<BlockQuantizedMoEKernel>()
+                .unwrap()
+                .weight_cache
+                .stats(),
+            (0, 0),
+            "the refused complete group must build neither projection"
+        );
         drop(first);
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes,
+            "active projection Arcs retain their grants after kernel drop"
+        );
+        drop(active);
         assert_eq!(governor.used(Tier::Host), 0);
         second.execute(&views, &mut [actual.view_mut()]).unwrap();
         assert_eq!(actual.bytes, expected.bytes);

@@ -2465,6 +2465,18 @@ mod tests {
             .execute(&[input.view(), weights.view()], &mut [expected.view_mut()])
             .unwrap();
         assert_eq!(governor.used(Tier::Host), bytes + 16);
+        let concrete = first
+            .as_any()
+            .downcast_ref::<BlockQuantizedMatMulKernel>()
+            .unwrap();
+        let view = weights.view();
+        let resolved = concrete
+            .weight_identity
+            .resolve(&view, BlockFormat::Mxfp4, k, n, 0, None, || {
+                packed_tensor_bytes(&view)
+            })
+            .unwrap();
+        let active = concrete.weight_cache.test_get(&resolved.key).unwrap();
         second
             .execute(&[input.view(), weights.view()], &mut [actual.view_mut()])
             .unwrap();
@@ -2474,7 +2486,23 @@ mod tests {
             bytes + 16,
             "second kernel cannot take a separate full Host budget"
         );
+        assert_eq!(
+            second
+                .as_any()
+                .downcast_ref::<BlockQuantizedMatMulKernel>()
+                .unwrap()
+                .weight_cache
+                .stats(),
+            (0, 0),
+            "an active reader prevents cross-cache eviction and forces row execution"
+        );
         drop(first);
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes + 16,
+            "active weights outlive their kernel and cannot fund another projection"
+        );
+        drop(active);
         assert_eq!(governor.used(Tier::Host), 16);
         second
             .execute(&[input.view(), weights.view()], &mut [actual.view_mut()])
