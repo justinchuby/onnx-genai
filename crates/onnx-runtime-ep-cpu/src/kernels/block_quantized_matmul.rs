@@ -3,9 +3,10 @@
 //! The packed weight tensor keeps llama.cpp's serialized block layout. MXFP4
 //! decoding follows OCP MX E2M1/E8M0 and llama.cpp's `block_mxfp4`; IQ
 //! decoding follows llama.cpp's native super-block layouts and audited grids.
-//! This CPU kernel is a memory-format baseline: it dequantizes `packed_B` to a
-//! dense f32 matrix, caches that f32 expansion only for constant weights, and
-//! runs dense GEMM. It does not perform quantized-domain matmul compute.
+//! This CPU kernel uses f32 compute. A complete dense weight must fit the
+//! existing dense-cache budget to use dense GEMM and constant-weight caching;
+//! larger weights use bounded row decoding shared with BlockQuantizedMoE.
+//! Neither path performs integer-domain matmul compute.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -279,6 +280,41 @@ impl Kernel for BlockQuantizedMatMulKernel {
         };
 
         let activations = to_dense_f32_widen(OP, &inputs[0])?;
+        let m = numel(&a_shape[..a_shape.len() - 1]);
+        let dense_bytes = self
+            .k
+            .checked_mul(self.n)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| error(format!(
+                "dense weight byte count overflow for K={}, N={}; supply dimensions whose f32 projection fits the address space", self.k, self.n
+            )))?;
+        let cache_budget = if m == 0 {
+            0
+        } else {
+            self.weight_cache.byte_limit()
+        };
+        let use_dense = dense_bytes <= cache_budget;
+        onnx_runtime_ep_api::record_kernel_variant!(
+            if use_dense {
+                "block_matmul.dense_resident_set"
+            } else {
+                "block_matmul.streamed_rows"
+            },
+            "dense projection requires {dense_bytes} bytes; dense cache budget is {cache_budget} bytes"
+        );
+        if !use_dense {
+            let packed = packed_tensor_bytes(&inputs[1])?;
+            let result = linear_packed_grouped(
+                self.format,
+                &packed,
+                &activations,
+                m,
+                self.k,
+                self.n,
+                bias.as_deref(),
+            )?;
+            return write_dense_f32_narrow(OP, &mut outputs[0], &result);
+        }
         let owned_weight;
         let cached_weight;
         let weight_kn = if self.packed_b_constant {
@@ -314,7 +350,6 @@ impl Kernel for BlockQuantizedMatMulKernel {
             &owned_weight
         };
 
-        let m = numel(&a_shape[..a_shape.len() - 1]);
         let result_elements = m
             .checked_mul(self.n)
             .ok_or_else(|| error("Y element count overflow"))?;
@@ -1482,6 +1517,56 @@ fn error(message: impl Into<String>) -> EpError {
 }
 
 #[cfg(test)]
+/// Build a decodable packed projection tensor `[experts, out_features,
+/// ceil(in_features/qk), block_bytes]` for an arbitrary native format. Each
+/// block is filled with a deterministic byte pattern plus the format's own
+/// scale header so every decoder accepts it. This is the fixture that lets a
+/// single projection carry its own qtype/block width independently of the
+/// other projections (the whole point of the mixed-projection ABI).
+pub(super) fn packed_for_format(
+    format: BlockFormat,
+    experts: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Vec<u8> {
+    let block_bytes = format.block_bytes();
+    let blocks_per_row = in_features.div_ceil(format.qk());
+    let mut packed = vec![0u8; experts * out_features * blocks_per_row * block_bytes];
+    for (block_index, block) in packed.chunks_exact_mut(block_bytes).enumerate() {
+        for (index, byte) in block.iter_mut().enumerate() {
+            *byte = block_index.wrapping_mul(29).wrapping_add(index * 17) as u8;
+        }
+        match format {
+            BlockFormat::Mxfp4 => block[0] = 127,
+            BlockFormat::Iq1M => {
+                // The f16 scale is distributed over four high nibbles.
+                let bits = half::f16::from_f32(0.125).to_bits();
+                for group in 0..4 {
+                    let scale = ((bits >> (4 * group)) & 0xf) << 12;
+                    block[48 + 2 * group..50 + 2 * group].copy_from_slice(&scale.to_le_bytes());
+                }
+            }
+            BlockFormat::Q2K => {
+                block[80..82].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes());
+                block[82..84].copy_from_slice(&half::f16::from_f32(0.0625).to_le_bytes());
+            }
+            BlockFormat::Q3K => {
+                block[108..110].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes())
+            }
+            BlockFormat::Q5K => {
+                block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes());
+                block[2..4].copy_from_slice(&half::f16::from_f32(0.0625).to_le_bytes());
+            }
+            BlockFormat::Q6K => {
+                block[208..210].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes())
+            }
+            _ => block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes()),
+        }
+    }
+    packed
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
@@ -1537,6 +1622,15 @@ mod tests {
         let node = graph.insert_node(node);
         graph.add_output(output);
         (graph, node)
+    }
+
+    fn compute_values(tensor: &Owned, dtype: DataType) -> Vec<f32> {
+        match dtype {
+            DataType::Float32 => tensor.to_f32(),
+            DataType::Float16 => tensor.to_f16_as_f32(),
+            DataType::BFloat16 => tensor.to_bf16_as_f32(),
+            _ => panic!("test requires a supported compute storage dtype, got {dtype:?}"),
+        }
     }
 
     fn kernel(graph: &Graph, node: NodeId) -> Box<dyn Kernel> {
@@ -2245,6 +2339,193 @@ mod tests {
     }
 
     #[test]
+    fn bounded_projection_matches_dense_and_f64_for_all_formats_and_tail_shapes() {
+        for format in [
+            BlockFormat::Mxfp4,
+            BlockFormat::Iq4Nl,
+            BlockFormat::Iq4Xs,
+            BlockFormat::Iq3S,
+            BlockFormat::Iq3Xxs,
+            BlockFormat::Iq2S,
+            BlockFormat::Iq2Xs,
+            BlockFormat::Iq2Xxs,
+            BlockFormat::Iq1S,
+            BlockFormat::Iq1M,
+            BlockFormat::Q2K,
+            BlockFormat::Q3K,
+            BlockFormat::Q5K,
+            BlockFormat::Q6K,
+            BlockFormat::Q8_0,
+        ] {
+            let (rows, k, n) = (6, 2 * format.qk() - 3, 5);
+            let packed = packed_for_format(format, 1, n, k);
+            let dense_kn = dequantize_weight_kn(format, k, n, &packed).unwrap();
+            assert!(dense_kn.iter().all(|value| value.is_finite()));
+            assert!(
+                dense_kn.iter().any(|&value| value != 0.0),
+                "{format:?} fixture must exercise nonzero weights"
+            );
+            let values = (0..rows * k)
+                .map(|i| (i as f32 % 31. - 15.) / 2048.)
+                .collect::<Vec<_>>();
+            let biases = (0..n).map(|i| i as f32 / 4.).collect::<Vec<_>>();
+            let a = Owned::f32(&[2, 3, k], &values);
+            let b = Owned::u8(&[n, 2, format.block_bytes()], &packed);
+            let bias = Owned::f32(&[n], &biases);
+            let bytes = k * n * std::mem::size_of::<f32>();
+            let make = |budget| BlockQuantizedMatMulKernel {
+                k,
+                n,
+                format,
+                packed_b_constant: true,
+                weight_identity: DenseWeightIdentity::default(),
+                weight_cache: DenseWeightCache::with_limit(budget),
+            };
+            let dense = make(bytes);
+            for budget in [bytes - 1, 0] {
+                let streamed = make(budget);
+                for _ in 0..2 {
+                    let mut expected = Owned::zeros_f32(&[2, 3, n]);
+                    let mut actual = Owned::zeros_f32(&[2, 3, n]);
+                    let inputs = [a.view(), b.view(), bias.view()];
+                    dense.execute(&inputs, &mut [expected.view_mut()]).unwrap();
+                    streamed.execute(&inputs, &mut [actual.view_mut()]).unwrap();
+                    for (index, (got, dense_value)) in actual
+                        .to_f32()
+                        .into_iter()
+                        .zip(expected.to_f32())
+                        .enumerate()
+                    {
+                        let row = index / n;
+                        let column = index % n;
+                        let oracle = (0..k)
+                            .map(|inner| {
+                                f64::from(values[row * k + inner])
+                                    * f64::from(dense_kn[inner * n + column])
+                            })
+                            .sum::<f64>()
+                            + f64::from(biases[column]);
+                        assert!(
+                            (f64::from(got) - oracle).abs() <= 1e-5 + 1e-4 * oracle.abs(),
+                            "{format:?} index {index}: {got} vs f64 {oracle}"
+                        );
+                        assert!(
+                            (got - dense_value).abs() <= 1e-5 + 1e-4 * dense_value.abs(),
+                            "{format:?} index {index}: {got} vs dense {dense_value}"
+                        );
+                    }
+                }
+                assert_eq!(streamed.weight_cache.stats(), (0, 0));
+                assert_eq!(streamed.weight_cache.activity(), (0, 0));
+                assert_eq!(streamed.weight_identity.stats(), (0, 0, 0));
+            }
+            assert_eq!(dense.weight_cache.stats(), (1, bytes));
+            assert_eq!(dense.weight_cache.activity().1, 1);
+        }
+    }
+
+    #[test]
+    fn bounded_projection_refreshes_strided_weights_for_all_activation_storage_types() {
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let floats = |shape: &[usize], values: &[f32]| match dtype {
+                DataType::Float32 => Owned::f32(shape, values),
+                DataType::Float16 => Owned::f16(shape, values),
+                DataType::BFloat16 => Owned::bf16(shape, values),
+                _ => unreachable!(),
+            };
+            let kernel = BlockQuantizedMatMulKernel {
+                k: 32,
+                n: 2,
+                format: BlockFormat::Mxfp4,
+                packed_b_constant: true,
+                weight_identity: DenseWeightIdentity::default(),
+                weight_cache: DenseWeightCache::with_limit(0),
+            };
+            let a = floats(&[2, 32], &[1.; 64]);
+            let bias = floats(&[2], &[0.5, -0.5]);
+            let mut packed = vec![0x22; 34];
+            packed[0] = 127;
+            packed[17] = 127;
+            let mut b = Owned::u8(&[2, 1, 17], &packed);
+            for changed in [false, true] {
+                if changed {
+                    // SAFETY: b owns this Uint8 allocation and all input views
+                    // from the previous call have been dropped.
+                    unsafe {
+                        *b.view_mut().data_ptr_mut::<u8>().add(1) = 0x24;
+                    }
+                }
+                let mut y = Owned::zeros(dtype, &[2, 2]);
+                kernel
+                    .execute(&[a.view(), b.view(), bias.view()], &mut [y.view_mut()])
+                    .unwrap();
+                assert_eq!(
+                    compute_values(&y, dtype),
+                    if changed {
+                        vec![33.5, 31.5, 33.5, 31.5]
+                    } else {
+                        vec![32.5, 31.5, 32.5, 31.5]
+                    }
+                );
+            }
+            packed[1] = 0x24;
+            let padded = packed
+                .into_iter()
+                .flat_map(|byte| [byte, 0xa5])
+                .collect::<Vec<_>>();
+            let shape = [2, 1, 17];
+            let strides = [34, 34, 2];
+            let b = TensorView::new(
+                onnx_runtime_ep_api::DevicePtr(padded.as_ptr().cast()),
+                DataType::Uint8,
+                &shape,
+                &strides,
+                onnx_runtime_ir::DeviceId::cpu(),
+            );
+            let mut y = Owned::zeros(dtype, &[2, 2]);
+            kernel
+                .execute(&[a.view(), b, bias.view()], &mut [y.view_mut()])
+                .unwrap();
+            assert_eq!(compute_values(&y, dtype), vec![33.5, 31.5, 33.5, 31.5]);
+            assert_eq!(kernel.weight_identity.stats(), (0, 0, 0));
+            assert_eq!(kernel.weight_cache.activity(), (0, 0));
+        }
+    }
+
+    #[test]
+    fn bounded_projection_empty_rows_skip_expansion_and_preserve_bias_validation() {
+        let kernel = BlockQuantizedMatMulKernel {
+            k: 32,
+            n: 2,
+            format: BlockFormat::Mxfp4,
+            packed_b_constant: true,
+            weight_identity: DenseWeightIdentity::default(),
+            weight_cache: DenseWeightCache::with_limit(1024),
+        };
+        let a = Owned::f32(&[0, 32], &[]);
+        let b = Owned::u8(
+            &[2, 1, 17],
+            &packed_for_format(BlockFormat::Mxfp4, 1, 2, 32),
+        );
+        let mut y = Owned::zeros_f32(&[0, 2]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert!(y.to_f32().is_empty());
+        let wrong_bias = Owned::f32(&[3], &[0.; 3]);
+        let error = kernel
+            .execute(
+                &[a.view(), b.view(), wrong_bias.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bias must have shape [2]"), "{error}");
+        assert_eq!(kernel.weight_identity.stats(), (0, 0, 0));
+        assert_eq!(kernel.weight_cache.activity(), (0, 0));
+    }
+
+    #[test]
     fn cached_dense_matches_uncached_for_supported_formats_and_activation_dtypes() {
         let n = 2usize;
         for format in [
@@ -2320,10 +2601,9 @@ mod tests {
                     BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed) > hits_before,
                     "{format:?}/{dtype:?} should hit cached-dense on the second call"
                 );
-                for (index, (actual, expected)) in actual
-                    .to_f32()
+                for (index, (actual, expected)) in compute_values(&actual, dtype)
                     .into_iter()
-                    .zip(expected.to_f32())
+                    .zip(compute_values(&expected, dtype))
                     .enumerate()
                 {
                     assert!(

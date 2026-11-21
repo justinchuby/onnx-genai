@@ -120,3 +120,16 @@ archive when sharing Cargo targets between worktrees: the MLAS build script
 captured its source root at compile time. It now resolves `CARGO_MANIFEST_DIR`
 when Cargo runs the script; after cleaning only MLAS artifacts, the real native
 serial/parallel counter test passes. No test assertion was weakened.
+
+
+## Shared projection use
+
+The bounded row helper also serves standalone `BlockQuantizedMatMul` when its
+complete dense matrix exceeds the same cache budget, including budget zero.
+Fitting matrices keep their dense GEMM/cache path. This reuses the decoder and
+serial inner GEMM; it adds no independent batching or memory authority. The
+measurements above remain MoE measurements and do not establish standalone
+MatMul performance. Separate operator tests compare all 15 formats and partial
+blocks to dense and f64 math, and cover f32/f16/bf16 storage, fresh/strided packed
+inputs, bias and empty leading dimensions. Neither operator's local cache limit
+is a global working-memory grant.

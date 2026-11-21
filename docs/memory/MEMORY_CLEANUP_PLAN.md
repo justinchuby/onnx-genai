@@ -283,3 +283,20 @@ unchanged cache implementation with the lazy path and an explicit-floor control.
 This avoids needless construction/small-request work; it does not remove the
 probe from eligible large workloads or turn a retention cap into a peak-memory
 guarantee. The separate global grant and active-allocation work remains open.
+
+
+### Bounded standalone block projections
+
+`BlockQuantizedMatMul` now applies the same dense-set eligibility rule as the
+expert path: use full f32 expansion/GEMM only when the complete matrix fits its
+existing cache budget. Otherwise reuse `linear_packed_grouped`, including all
+format decoders and the inner serial/MLAS scheduling contract. No new allocator,
+cache, format table or scheduler is introduced. Empty batches avoid dense
+expansion while keeping argument validation. Fitting constant matrices retain
+their existing cached fast path. The per-kernel cap and decoded scratch bound
+remain distinct from a model-wide governor grant.
+
+The block projection and MoE tests share one packed-format fixture. IQ1_M now
+uses a finite nonzero scale so it exercises arithmetic rather than zero weights.
+Half-storage output comparisons decode the actual dtype rather than interpreting
+pairs of half values as f32 words. Existing cache/format guards remain intact.
