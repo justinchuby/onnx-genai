@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     impl MemoryGovernor for CountingGovernor {
-        fn authority_id(&self) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+        fn authority_id(&self, _tier: Tier) -> onnx_runtime_memory_governor::MemoryAuthorityId {
             self.authority
         }
 

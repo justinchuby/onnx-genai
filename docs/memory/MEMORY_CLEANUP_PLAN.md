@@ -300,3 +300,56 @@ The block projection and MoE tests share one packed-format fixture. IQ1_M now
 uses a finite nonzero scale so it exercises arithmetic rather than zero weights.
 Half-storage output comparisons decode the actual dtype rather than interpreting
 pairs of half values as f32 words. Existing cache/format guards remain intact.
+
+
+### Coherent QMoE host-cache budget ownership
+
+The warm expert cache previously stored its byte ceiling in an atomic separate
+from its governor lease. A budget read could therefore mix an old ceiling with
+a newly adopted lease. Adoption also returned success for an already governed
+cache without checking the incoming authority/holder, and published smaller
+grants before trimming existing resident experts.
+
+The state is now `Local(bytes)` or `Governed { authority, lease }` behind one
+`RwLock`. Governed bytes come directly from `MemoryLease::bytes()`. A routed
+operation retains one read guard through its prefetch/compute scope; workers
+borrow that operation and use its resolved budget without acquiring the budget
+lock again. This preserves concurrent readers and avoids a queued writer
+blocking a worker needed by an existing reader. Cold adopters serialize through
+a separate gate. Identity is checked and a provisional grant is prepared without
+holding either data lock, allowing coordinator callbacks to inspect cache state.
+The write guard then waits for current operations, trims inactive entries and
+publishes the new state only after residency fits. A live-lease refusal drops
+the provisional grant and preserves the original local state. Cached payloads
+are destroyed before the standing governor lease is returned.
+
+`adopt_governed_budget` returns the common EP result so memory failures retain
+their typed source while ownership/refusal errors describe the authority,
+holder and remedy. The old lossy budget-parsing wrapper is removed; there is no
+compatibility signature. Existing admission, frequency/pinning, prefetch
+eligibility, exact output and cache-stat guards remain in place. This fixes the
+cache's standing entitlement transition, not all model working-memory grants.
+
+The remaining convergence work includes derived block caches' model-wide
+accounting and transient decoded/scratch memory. The existing prefetch
+full-residency predicate also needs auditing against cached foreign-layer
+entries and concurrent callers before treating isolated cache-stat parity as a
+universal guarantee. CPU/GPU hybrid execution and asynchronous device lifetimes
+still require real-device evidence.
+
+
+### Per-tier authority identity
+
+`MemoryGovernor::authority_id(tier)` resolves the same books as a lease or
+mapped allowance for that tier. The engine composes shared Device books with
+worker-group-local Host/Disk books; a single Device identity incorrectly made
+separate Host partitions look interchangeable when engines shared a device.
+QMoE adoption now compares Host identity, virtual buffers compare their requested
+tier, and process registration uses the declared device key's tier. CUDA pools
+validate their context against Device identity, while sharing/admission/reclaim
+use the physical location's tier: Device for VRAM and Host for Host-NUMA. All governor implementations and callers
+use the explicit tier; no old-signature shim is retained. Regressions reproduce
+both the original identity/lease mismatch and foreign Host adoption behind a
+shared Device authority, then check clones and mapped allowances. This fixes
+identity routing, not the separate physical-capacity relationship between CPU
+hot-tier and Host books.

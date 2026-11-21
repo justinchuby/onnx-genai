@@ -1302,8 +1302,11 @@ mod tests {
     }
 
     impl onnx_runtime_memory_governor::MemoryGovernor for RecordingGovernor {
-        fn authority_id(&self) -> onnx_runtime_memory_governor::MemoryAuthorityId {
-            self.inner.authority_id()
+        fn authority_id(
+            &self,
+            tier: onnx_runtime_memory_api::Tier,
+        ) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+            self.inner.authority_id(tier)
         }
 
         fn reserve(

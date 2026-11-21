@@ -133,7 +133,7 @@ impl<B: ReservationBacking> VirtualBuffer<B> {
     ) -> Result<Self, VirtualBufferError> {
         let physical_memory_accounting = backing.physical_memory_accounting();
         if let PhysicalMemoryAccounting::Backing { authority } = physical_memory_accounting {
-            let governor_authority = governor.authority_id();
+            let governor_authority = governor.authority_id(tier);
             if authority != governor_authority {
                 return Err(VirtualBufferError::AuthorityMismatch {
                     backing: authority,
@@ -404,7 +404,7 @@ mod tests {
         ));
         let commits = Arc::new(AtomicUsize::new(0));
         let backing = AuthorityBacking {
-            authority: governor.authority_id(),
+            authority: governor.authority_id(Tier::Device),
             reserves: Arc::new(AtomicUsize::new(0)),
             commits: Arc::clone(&commits),
         };
@@ -445,7 +445,7 @@ mod tests {
         let reserves = Arc::new(AtomicUsize::new(0));
         let commits = Arc::new(AtomicUsize::new(0));
         let backing = AuthorityBacking {
-            authority: backing_governor.authority_id(),
+            authority: backing_governor.authority_id(Tier::Device),
             reserves: Arc::clone(&reserves),
             commits: Arc::clone(&commits),
         };
@@ -463,8 +463,8 @@ mod tests {
         assert!(matches!(
             error,
             VirtualBufferError::AuthorityMismatch { backing, governor }
-                if backing == backing_governor.authority_id()
-                    && governor == buffer_governor.authority_id()
+                if backing == backing_governor.authority_id(Tier::Device)
+                    && governor == buffer_governor.authority_id(Tier::Device)
         ));
         assert_eq!(reserves.load(Ordering::Relaxed), 0);
         assert_eq!(commits.load(Ordering::Relaxed), 0);

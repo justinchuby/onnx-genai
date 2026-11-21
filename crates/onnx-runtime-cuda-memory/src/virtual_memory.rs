@@ -111,6 +111,37 @@ pub enum PhysicalLocation {
     HostNuma { node: i32 },
 }
 
+impl PhysicalLocation {
+    fn accounting_tier(self) -> Tier {
+        match self {
+            Self::Device { .. } => Tier::Device,
+            Self::HostNuma { .. } => Tier::Host,
+        }
+    }
+}
+
+// The CUDA context and the physical allocation's accounting are separate axes:
+// HostNuma pools use the Device authority to validate the context, and the Host
+// authority for pool sharing, admission and reclaim gates.
+fn physical_pool_authority(
+    governor: &dyn MemoryGovernor,
+    device_ordinal: i32,
+    location: PhysicalLocation,
+) -> Result<MemoryAuthorityId, MemoryError> {
+    let device_authority = governor.authority_id(Tier::Device);
+    if device_ordinal < 0
+        || device_authority.device()
+            != onnx_runtime_memory_api::DeviceKey::device(device_ordinal as u32)
+    {
+        return Err(MemoryError::InvalidRequest {
+            tier: Tier::Device.name(),
+            requested: 0,
+            reason: "physical-handle pool CUDA device does not match the governor's Device-tier authority; use the governor for this CUDA context",
+        });
+    }
+    Ok(governor.authority_id(location.accounting_tier()))
+}
+
 /// Device address space, backed by CUDA physical allocations.
 ///
 /// Holds the runtime so the CUDA context is bound before every driver call —
@@ -1622,15 +1653,14 @@ impl PhysicalHandlePool {
         holder: HolderId,
         role: MemoryRole,
     ) -> Result<Arc<Self>, MemoryError> {
-        let authority = governor.authority_id();
+        let authority = physical_pool_authority(
+            governor,
+            device_ordinal,
+            PhysicalLocation::Device {
+                ordinal: device_ordinal,
+            },
+        )?;
         let authority_gate = physical_pool_authority_gate(authority);
-        if authority.device() != onnx_runtime_memory_api::DeviceKey::device(device_ordinal as u32) {
-            return Err(MemoryError::InvalidRequest {
-                tier: Tier::Device.name(),
-                requested: 0,
-                reason: "the physical-handle pool governor authority names a different device",
-            });
-        }
         let granularity = allocation_granularity(device_ordinal);
         let allocation = allocation_compatibility(device_ordinal);
         let context_id = physical_pool_context_identity(&context).map_err(|reason| {
@@ -1723,19 +1753,8 @@ impl PhysicalHandlePool {
         holder: HolderId,
         role: MemoryRole,
     ) -> Result<Arc<Self>, MemoryError> {
-        let authority = governor.authority_id();
+        let authority = physical_pool_authority(governor, device_ordinal, location)?;
         let authority_gate = physical_pool_authority_gate(authority);
-
-        // For Device locations the authority must match the device. For
-        // HostNuma locations the authority is on the *device* context (the GPU
-        // that will read through this pool) — same check applies.
-        if authority.device() != onnx_runtime_memory_api::DeviceKey::device(device_ordinal as u32) {
-            return Err(MemoryError::InvalidRequest {
-                tier: Tier::Device.name(),
-                requested: 0,
-                reason: "the physical-handle pool governor authority names a different device",
-            });
-        }
 
         let granularity = allocation_granularity_for_location(location);
         let allocation = allocation_compatibility_for_location(location);
@@ -1757,10 +1776,7 @@ impl PhysicalHandlePool {
         // Charge the correct tier: host-NUMA bytes come from host RAM, not
         // VRAM; charging them to Tier::Device would silently block real device
         // allocations and misreport both limits.
-        let tier = match location {
-            PhysicalLocation::Device { .. } => Tier::Device,
-            PhysicalLocation::HostNuma { .. } => Tier::Host,
-        };
+        let tier = location.accounting_tier();
 
         let lease = governor.reserve(tier, 0, role, holder)?;
         let registry = PHYSICAL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1832,14 +1848,7 @@ impl PhysicalHandlePool {
                 reason: "the isolated physical-pool location does not match its CUDA device",
             });
         }
-        let authority = governor.authority_id();
-        if authority.device() != onnx_runtime_memory_api::DeviceKey::device(device_ordinal as u32) {
-            return Err(MemoryError::InvalidRequest {
-                tier: Tier::Device.name(),
-                requested: 0,
-                reason: "the physical-handle pool governor authority names a different device",
-            });
-        }
+        let authority = physical_pool_authority(governor, device_ordinal, location)?;
         let granularity = allocation_granularity_for_location(location);
         let context_identity = physical_pool_context_identity(&context).map_err(|reason| {
             MemoryError::AllocationFailed {
@@ -1848,10 +1857,7 @@ impl PhysicalHandlePool {
                 reason,
             }
         })?;
-        let tier = match location {
-            PhysicalLocation::Device { .. } => Tier::Device,
-            PhysicalLocation::HostNuma { .. } => Tier::Host,
-        };
+        let tier = location.accounting_tier();
         let lease = governor.reserve(tier, 0, role, holder)?;
         Ok(Arc::new(Self {
             context,
@@ -3103,4 +3109,64 @@ fn rollback_pooled_maps(
     }
     residual.sort_unstable_by_key(|block| block.offset);
     residual
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
+
+    struct TieredGovernor {
+        device: LedgerGovernor,
+        host: LedgerGovernor,
+    }
+
+    impl TieredGovernor {
+        fn books(&self, tier: Tier) -> &LedgerGovernor {
+            match tier {
+                Tier::Device => &self.device,
+                Tier::Host | Tier::Disk => &self.host,
+            }
+        }
+    }
+
+    impl MemoryGovernor for TieredGovernor {
+        fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
+            self.books(tier).authority_id(tier)
+        }
+        fn reserve(
+            &self,
+            tier: Tier,
+            bytes: u64,
+            role: MemoryRole,
+            holder: HolderId,
+        ) -> Result<MemoryLease, MemoryError> {
+            self.books(tier).reserve(tier, bytes, role, holder)
+        }
+        fn available(&self, tier: Tier) -> u64 {
+            self.books(tier).available(tier)
+        }
+        fn used(&self, tier: Tier) -> u64 {
+            self.books(tier).used(tier)
+        }
+    }
+
+    #[test]
+    fn pool_identity_uses_physical_tier_while_context_checks_device_books() {
+        let governor = TieredGovernor {
+            device: LedgerGovernor::new(LeaseLedger::new(64, 0, 0)),
+            host: LedgerGovernor::new(LeaseLedger::new(0, 64, 0)),
+        };
+        let device = PhysicalLocation::Device { ordinal: 0 };
+        let host = PhysicalLocation::HostNuma { node: 0 };
+        let device_id = physical_pool_authority(&governor, 0, device).unwrap();
+        let host_id = physical_pool_authority(&governor, 0, host).unwrap();
+        assert_eq!(device_id, governor.authority_id(Tier::Device));
+        assert_eq!(host_id, governor.authority_id(Tier::Host));
+        assert_ne!(device_id, host_id);
+        for location in [device, host] {
+            assert!(physical_pool_authority(&governor, 1, location).is_err());
+            assert!(physical_pool_authority(&governor, -1, location).is_err());
+        }
+    }
 }

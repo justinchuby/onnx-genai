@@ -1000,7 +1000,7 @@ impl CudaVmmAllocator {
     pub fn adopt_governor(&self, governor: &dyn MemoryGovernor, holder: HolderId) -> VmmAdoption {
         if let Some(pool) = self.backing.physical_pool() {
             let owned = pool.stats().snapshot().total_owned_bytes;
-            return if pool.authority() == governor.authority_id() {
+            return if pool.authority() == governor.authority_id(Tier::Device) {
                 VmmAdoption {
                     recorded_bytes: 0,
                     unaccounted_bytes: 0,
@@ -1178,7 +1178,7 @@ impl CudaVmmAllocator {
             reservation_queue,
         } = construction;
         let backing = if let Some(pool) = physical_pool {
-            if pool.authority() != governor.authority_id() {
+            if pool.authority() != governor.authority_id(Tier::Device) {
                 return Err(MemoryError::InvalidRequest {
                     tier: Tier::Device.name(),
                     requested: 0,
