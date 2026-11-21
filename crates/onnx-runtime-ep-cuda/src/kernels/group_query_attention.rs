@@ -18,7 +18,7 @@ use onnx_runtime_ep_api::{
     TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
-use onnx_runtime_memory_governor::MemoryRole;
+use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::driver_err;
 use crate::kernels::kv_stride::{KvCachePath, KvCacheStrides};

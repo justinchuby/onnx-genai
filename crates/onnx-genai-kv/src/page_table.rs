@@ -1462,7 +1462,7 @@ impl PageTable {
         dtype: KvDType,
         layer_configs: Vec<LayerTensorConfig>,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
-        tier: onnx_runtime_memory_governor::Tier,
+        tier: onnx_runtime_memory_api::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<Self, KvError> {
         let quant_config = KvQuantConfig::homogeneous(dtype, layer_configs.len());
@@ -1475,7 +1475,7 @@ impl PageTable {
         let lease = governor.reserve(
             tier,
             planned,
-            onnx_runtime_memory_governor::MemoryRole::KvCache,
+            onnx_runtime_memory_api::MemoryRole::KvCache,
             holder,
         )?;
         let mut table = Self::new_with_layer_storage(
@@ -2441,9 +2441,8 @@ mod pool_accounting_tests {
 #[cfg(test)]
 mod pool_lease_tests {
     use super::*;
-    use onnx_runtime_memory_governor::{
-        HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
-    };
+    use onnx_runtime_memory_api::Tier;
+    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     const HOLDER: HolderId = HolderId::new(7);

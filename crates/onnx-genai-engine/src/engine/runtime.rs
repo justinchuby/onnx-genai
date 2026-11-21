@@ -3761,7 +3761,7 @@ impl Engine {
                         let reserve_snapshot = || {
                             onnx_runtime_memory_governor::MemoryGovernor::reserve(
                                 governor_memory,
-                                onnx_runtime_memory_governor::Tier::Host,
+                                onnx_runtime_memory_api::Tier::Host,
                                 snapshot.bytes(),
                                 Holder::RecurrentPrefixSnapshot.role(),
                                 Holder::RecurrentPrefixSnapshot.id(),

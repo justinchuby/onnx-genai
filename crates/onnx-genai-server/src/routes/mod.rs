@@ -884,11 +884,11 @@ mod overload_tests {
 
     #[tokio::test]
     async fn unreclaimable_mapped_capacity_is_a_pre_header_overload() {
-        let error: anyhow::Error = onnx_runtime_memory_governor::MemoryError::CapacityUnavailable {
+        let error: anyhow::Error = onnx_runtime_memory_api::MemoryError::CapacityUnavailable {
             tier: "device",
             requested: 4096,
             available: 0,
-            role: onnx_runtime_memory_governor::MemoryRole::KvCache,
+            role: onnx_runtime_memory_api::MemoryRole::KvCache,
             detail: "mapped holder could not reach its tentative reclaim target".into(),
             source: None,
         }

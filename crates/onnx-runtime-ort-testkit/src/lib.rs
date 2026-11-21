@@ -205,7 +205,7 @@ fn workspace_root() -> PathBuf {
 /// The ORT version this workspace pins, read from `ort-sys`' build script.
 ///
 /// `ort-sys` declares `const ORT_VERSION: &str = "x.y.z"` and downloads exactly
-/// that tarball, so the build script is the single source of truth. The
+/// that native wheel, so the build script is the single source of truth. The
 /// generated bindings expose the ABI version but not this release string, so
 /// the testkit reads the declaration from the build script.
 ///
@@ -235,7 +235,7 @@ fn parse_pinned_version(build_rs: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-/// Version recorded by the ORT release tarball itself, as extracted by
+/// Version recorded in the native-runtime cache by
 /// `ort-sys`' build script.
 ///
 /// `<candidate>/out/ort-prebuilt/lib` is the library directory, so the marker

@@ -60,7 +60,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # `onnxruntime` is an optional peer used by nxrt_ep_cuda.register().
-onnxruntime = ["onnxruntime>=1.22"]
+onnxruntime = ["onnxruntime>=1.32,<2"]
 
 [project.urls]
 repository = "https://github.com/justinchuby/onnx-genai"

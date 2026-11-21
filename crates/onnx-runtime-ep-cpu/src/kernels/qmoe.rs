@@ -1043,7 +1043,7 @@ impl WeightOffloadHostCache {
     /// the same tier, the process has two truthful but unreconciled budgets:
     /// KV can be granted most of RAM and the expert cache can still believe it
     /// owns all of it. Taking the cache budget as a
-    /// [`onnx_runtime_memory_governor::MemoryRole::Weights`] lease makes the
+    /// [`onnx_runtime_memory_api::MemoryRole::Weights`] lease makes the
     /// claim visible to the same ledger as KV.
     ///
     /// Unlike device residency, the host cache can safely degrade to a smaller
@@ -1055,15 +1055,15 @@ impl WeightOffloadHostCache {
         budget_bytes: u64,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
         holder: onnx_runtime_memory_governor::HolderId,
-    ) -> std::result::Result<Self, onnx_runtime_memory_governor::MemoryError> {
+    ) -> std::result::Result<Self, onnx_runtime_memory_api::MemoryError> {
         let requested = effective_host_budget_u64(budget_bytes)?;
         checked_host_budget(requested)
             .map_err(|reason| invalid_host_budget_request(requested, reason))?;
-        let grant = requested.min(governor.available(onnx_runtime_memory_governor::Tier::Host));
+        let grant = requested.min(governor.available(onnx_runtime_memory_api::Tier::Host));
         let lease = governor.reserve(
-            onnx_runtime_memory_governor::Tier::Host,
+            onnx_runtime_memory_api::Tier::Host,
             grant,
-            onnx_runtime_memory_governor::MemoryRole::Weights,
+            onnx_runtime_memory_api::MemoryRole::Weights,
             holder,
         )?;
         Ok(Self {
@@ -1106,7 +1106,7 @@ impl WeightOffloadHostCache {
         &self,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
         holder: onnx_runtime_memory_governor::HolderId,
-    ) -> std::result::Result<u64, onnx_runtime_memory_governor::MemoryError> {
+    ) -> std::result::Result<u64, onnx_runtime_memory_api::MemoryError> {
         {
             let lease = self
                 .inner
@@ -1120,11 +1120,11 @@ impl WeightOffloadHostCache {
         let requested = effective_host_budget_u64(self.inner.budget_bytes.load(Ordering::Relaxed))?;
         checked_host_budget(requested)
             .map_err(|reason| invalid_host_budget_request(requested, reason))?;
-        let grant = requested.min(governor.available(onnx_runtime_memory_governor::Tier::Host));
+        let grant = requested.min(governor.available(onnx_runtime_memory_api::Tier::Host));
         let lease = governor.reserve(
-            onnx_runtime_memory_governor::Tier::Host,
+            onnx_runtime_memory_api::Tier::Host,
             grant,
-            onnx_runtime_memory_governor::MemoryRole::Weights,
+            onnx_runtime_memory_api::MemoryRole::Weights,
             holder,
         )?;
         let granted = lease.bytes();
@@ -1188,9 +1188,9 @@ impl WeightOffloadHostCache {
 fn invalid_host_budget_request(
     requested: u64,
     reason: &'static str,
-) -> onnx_runtime_memory_governor::MemoryError {
-    onnx_runtime_memory_governor::MemoryError::InvalidRequest {
-        tier: onnx_runtime_memory_governor::Tier::Host.name(),
+) -> onnx_runtime_memory_api::MemoryError {
+    onnx_runtime_memory_api::MemoryError::InvalidRequest {
+        tier: onnx_runtime_memory_api::Tier::Host.name(),
         requested,
         reason,
     }
@@ -3217,9 +3217,8 @@ mod tests {
 
     #[test]
     fn governed_host_cache_uses_only_the_host_bytes_the_ledger_can_grant() {
-        use onnx_runtime_memory_governor::{
-            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
-        };
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
 
         let governor = LedgerGovernor::new(LeaseLedger::new(0, 1_000, 0));
         let _kv = governor

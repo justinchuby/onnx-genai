@@ -20,7 +20,7 @@ use onnx_runtime_eager::Tensor;
 use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::DataType;
-use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, MemoryError};
+use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, MemoryError};
 
 /// Hands back memory filled with a non-zero pattern.
 ///

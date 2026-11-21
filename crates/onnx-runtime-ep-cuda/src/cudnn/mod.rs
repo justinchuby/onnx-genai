@@ -19,7 +19,7 @@ use onnx_runtime_ep_api::{
     EpError, Result, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::DataType;
-use onnx_runtime_memory_governor::MemoryRole;
+use onnx_runtime_memory_api::MemoryRole;
 
 use crate::dynamic_library::{CudaLibrary, is_available};
 use crate::error::{cudnn_err, cudnn_unavailable, driver_err};

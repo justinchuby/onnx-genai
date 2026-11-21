@@ -842,11 +842,11 @@ mod tests {
     /// A mock GPU execution provider for testing device surfaces without hardware.
     struct MockGpuEp;
 
-    fn mock_gpu_binding() -> &'static onnx_runtime_memory_governor::MemoryBinding {
-        static BINDING: std::sync::OnceLock<onnx_runtime_memory_governor::MemoryBinding> =
+    fn mock_gpu_binding() -> &'static onnx_runtime_memory_api::MemoryBinding {
+        static BINDING: std::sync::OnceLock<onnx_runtime_memory_api::MemoryBinding> =
             std::sync::OnceLock::new();
         BINDING.get_or_init(|| {
-            use onnx_runtime_memory_governor::{
+            use onnx_runtime_memory_api::{
                 BindingRegistry, BindingResource, DeviceAllocator as MemoryAllocator, DeviceKey,
                 HostAllocator,
             };

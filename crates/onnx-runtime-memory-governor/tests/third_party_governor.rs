@@ -10,9 +10,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use onnx_runtime_memory_api::{DeviceKey, MemoryError, MemoryRole, Tier};
 use onnx_runtime_memory_governor::{
-    DeviceKey, HolderId, LeaseAccounting, MemoryAuthorityId, MemoryError, MemoryGovernor,
-    MemoryLease, MemoryRole, Tier,
+    HolderId, LeaseAccounting, MemoryAuthorityId, MemoryGovernor, MemoryLease,
 };
 
 /// A memory manager written entirely against the public API, sharing no code

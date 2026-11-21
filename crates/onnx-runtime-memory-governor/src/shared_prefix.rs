@@ -2,7 +2,9 @@
 
 use std::ptr::NonNull;
 
-use crate::{DeviceAllocator, MemoryError, SharedDevicePrefix, SharedPrefixCommitInfo};
+use onnx_runtime_memory_api::{
+    DeviceAllocator, MemoryError, SharedDevicePrefix, SharedPrefixCommitInfo,
+};
 
 /// One side of an all-or-private K/V shared-prefix admission transaction.
 #[derive(Clone, Copy, Debug)]
@@ -100,7 +102,7 @@ mod tests {
     use std::any::Any;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use crate::{
+    use onnx_runtime_memory_api::{
         AllocationCommitRange, DeviceKey, HostAllocator, SharedMapping, Tier, VirtualBacking,
     };
 

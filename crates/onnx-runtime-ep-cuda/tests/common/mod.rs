@@ -36,7 +36,7 @@ use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
-use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, MemoryError, Tier};
+use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, MemoryError, Tier};
 
 /// Runtime-exact workspace bytes for one dispatch.
 pub fn runtime_workspace_requirement(

@@ -2488,7 +2488,7 @@ fn elastic_kv_floor_device_bytes(
     let (bytes, tier) = native_session
         .kv_reservation(floor_context)
         .context("sizing the elastic native CUDA KV floor")?;
-    Ok(if tier == onnx_runtime_memory_governor::Tier::Device {
+    Ok(if tier == onnx_runtime_memory_api::Tier::Device {
         bytes
     } else {
         0
@@ -2514,10 +2514,10 @@ fn reconcile_cuda_offload_budget_after_native_load(
         Some(max_context) => native_session
             .kv_reservation(max_context)
             .context("sizing native CUDA KV before deriving the weight-offload budget")?,
-        None => (0, onnx_runtime_memory_governor::Tier::Device),
+        None => (0, onnx_runtime_memory_api::Tier::Device),
     };
     let native_kv_full_context_device_bytes =
-        if native_kv_tier == onnx_runtime_memory_governor::Tier::Device {
+        if native_kv_tier == onnx_runtime_memory_api::Tier::Device {
             native_kv_bytes
         } else {
             0
@@ -2564,7 +2564,7 @@ fn reconcile_cuda_offload_budget_after_native_load(
     let (recurrent_state_bytes, recurrent_tier) = native_session
         .recurrent_state_reservation()
         .context("sizing native CUDA recurrent state before deriving the weight-offload budget")?;
-    let recurrent_device_bytes = if recurrent_tier == onnx_runtime_memory_governor::Tier::Device {
+    let recurrent_device_bytes = if recurrent_tier == onnx_runtime_memory_api::Tier::Device {
         recurrent_state_bytes
     } else {
         0

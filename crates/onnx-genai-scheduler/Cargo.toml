@@ -9,6 +9,7 @@ keywords = ["llm", "inference", "scheduler", "batching"]
 categories = ["concurrency", "science"]
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 onnx-runtime-protocol-trace = { workspace = true }

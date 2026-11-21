@@ -1,10 +1,13 @@
+#[cfg(not(target_os = "macos"))]
 use std::path::{Path, PathBuf};
 
+use onnx_genai_ort::available_execution_providers;
+#[cfg(not(target_os = "macos"))]
 use onnx_genai_ort::{
-    Environment, Session, SessionOptions, available_execution_providers, ep_selection,
-    resolve_execution_provider,
+    Environment, Session, SessionOptions, ep_selection, resolve_execution_provider,
 };
 
+#[cfg(not(target_os = "macos"))]
 fn tiny_llm() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm/model.onnx.textproto")
 }

@@ -33,8 +33,8 @@ jobs:
             archs: AMD64
           # macOS is Apple Silicon (arm64) ONLY, deliberately — not an oversight.
           # The macOS x86_64 (Intel) matrix entry was removed 2026-07-29: we no
-          # longer ship an Intel-Mac wheel. ONNX Runtime is pinned to 1.27.0 (for
-          # ORT_API_VERSION 27) and upstream publishes no osx-x86_64 prebuilt at
+          # longer ship an Intel-Mac wheel. ONNX Runtime is pinned to 1.32.0 (for
+          # ORT_API_VERSION 32) and PyPI publishes no macOS x86_64 wheel at
           # that version, so an Intel row could only ever fail the build. Do NOT
           # re-add an x86_64 / macos-13 / macos-15-intel row without first sourcing
           # an Intel-macOS ONNX Runtime; a job that can never pass just trains

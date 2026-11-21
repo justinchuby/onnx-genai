@@ -54,9 +54,9 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ir::Node;
+use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 use onnx_runtime_memory_governor::{
-    HolderId, LeaseLedger, LedgerGovernor, MemoryError, MemoryGovernor, MemoryLease, MemoryRole,
-    Tier,
+    HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryLease,
 };
 
 /// Process-unique identity for one CSA state-group holder of device memory, so
@@ -1104,7 +1104,7 @@ mod tests {
         let governor = Arc::new(CountingGovernor {
             books: Arc::clone(&books),
             authority: onnx_runtime_memory_governor::MemoryAuthorityId::new(
-                onnx_runtime_memory_governor::DeviceKey::device(0),
+                onnx_runtime_memory_api::DeviceKey::device(0),
             ),
         });
         let ledger = Arc::new(CsaStateGroupLedger::new(

@@ -246,7 +246,7 @@ fn vram_limit_auto_enables_offload_or_fails_at_load() -> anyhow::Result<()> {
 
     let used = engine
         .governor()
-        .leased_bytes_on(onnx_runtime_memory_governor::Tier::Device);
+        .leased_bytes_on(onnx_runtime_memory_api::Tier::Device);
     let limit = engine
         .resource_snapshot()
         .resolved_limits

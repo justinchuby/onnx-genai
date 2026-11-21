@@ -40,7 +40,7 @@
 
 use std::fmt::Debug;
 
-use onnx_runtime_memory_governor::{
+use onnx_runtime_memory_api::{
     AllocationReleaseOutcome, AllocationReleaseState, QuarantineReason, ReleaseAccounting,
     ResidualOwnership,
 };

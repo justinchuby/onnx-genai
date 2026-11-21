@@ -34,10 +34,10 @@
 //! are served from memory that is already mapped and never reach the governor.
 //!
 //! [`virtual_memory::CudaVirtualBacking`] is the CUDA implementation of the
-//! platform-independent [`VirtualBacking`] contract, so the same growable
+//! platform-independent [`ReservationBacking`] contract, so the same growable
 //! buffer works over host or device memory.
 //!
-//! [`VirtualBacking`]: onnx_runtime_virtual_memory::VirtualBacking
+//! [`ReservationBacking`]: onnx_runtime_virtual_memory::ReservationBacking
 //!
 //! # What is deliberately *not* here
 //!
@@ -53,21 +53,15 @@
 //! `CudaExecutionProvider::with_memory`, exactly as the CPU EP and ONNX
 //! Runtime's governed allocator already allow.
 //!
-//! [`DeviceAllocator`]: onnx_runtime_memory_governor::DeviceAllocator
+//! [`DeviceAllocator`]: onnx_runtime_memory_api::DeviceAllocator
 //!
 //! # Building without CUDA
 //!
-//! Everything here is behind the `cuda` feature, matching the execution
-//! provider. `cargo build` needs no CUDA toolkit either way: cudarc is used
-//! with `dynamic-loading`, so the driver is opened at runtime.
-
-//! # Building without CUDA, continued
-//!
-//! The modules are not feature-gated. cudarc is used with `dynamic-loading`,
-//! so they compile anywhere and only fail at runtime on a machine with no
-//! driver -- which is what lets `cargo check --workspace` cover this code on
-//! a machine with no GPU. The `cuda` feature exists to match the execution
-//! provider's, not to hide the source.
+//! The modules compile without a CUDA toolkit or device: cudarc uses
+//! `dynamic-loading`, opening the driver at runtime. The `cuda` feature matches
+//! the execution provider; it does not hide these modules. Source checks can
+//! therefore cover them on a host without a GPU, while real-device behavior
+//! still requires a CUDA runner.
 
 pub mod capability;
 pub mod capture_gate;

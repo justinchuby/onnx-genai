@@ -344,7 +344,7 @@ fn check_same_device(
     device_ordinal: i32,
 ) -> Result<(), String> {
     let allocator_device = allocator.device_key();
-    let expected = onnx_runtime_memory_governor::DeviceKey::device(device_ordinal as u32);
+    let expected = onnx_runtime_memory_api::DeviceKey::device(device_ordinal as u32);
     if allocator_device != expected {
         return Err(format!(
             "allocator device_key {allocator_device:?} does not match requested device_ordinal {device_ordinal} (expected {expected:?})"

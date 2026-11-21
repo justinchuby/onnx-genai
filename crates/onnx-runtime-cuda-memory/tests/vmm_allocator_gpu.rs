@@ -20,10 +20,10 @@
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys as cu;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
-use onnx_runtime_memory_governor::{
-    AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor,
-    MemoryGovernor, MemoryRole, Tier, VirtualBacking,
+use onnx_runtime_memory_api::{
+    AllocationCommitRange, DeviceAllocator, DeviceKey, MemoryRole, Tier, VirtualBacking,
 };
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
 
 const HOLDER: HolderId = HolderId::new(21);
 
