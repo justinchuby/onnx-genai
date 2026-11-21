@@ -567,11 +567,11 @@ impl MatMulPrepack {
     }
 
     /// Preserve load-time transpose warming inside the owning kernel’s policy.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) fn prepare_constants(
         &mut self,
         constants: &[Option<onnx_runtime_ep_api::KernelConstantInput<'_>>],
     ) {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self.retain_caches
             && self.constant_inputs[1]
             && let Some(Some(weight)) = constants.get(1)
@@ -623,8 +623,6 @@ impl MatMulPrepack {
                 let _ = self.transposed_b(values, k, n);
             }
         }
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let _ = constants;
     }
 
     pub(crate) fn new(retain_caches: bool) -> Self {
