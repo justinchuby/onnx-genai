@@ -4022,10 +4022,10 @@ mod tests {
         use onnx_runtime_ir::NodeId;
         let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
         for admitted in [false, true] {
-            let provider = crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-                cache_retention: crate::CpuCacheRetention::new(admitted),
-                ..Default::default()
-            });
+            let provider = crate::CpuExecutionProvider::with_resources(
+                crate::CpuMemoryResources::default()
+                    .with_cache_retention(crate::CpuCacheRetention::new(admitted)),
+            );
             let b = Owned::f16(&[5, 7], &[0.25; 35]);
             let state = provider
                 .prepare_static_constants(
@@ -4068,10 +4068,10 @@ mod tests {
         let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
         for first_admitted in [true, false] {
             let make = |admitted| {
-                crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-                    cache_retention: crate::CpuCacheRetention::new(admitted),
-                    ..Default::default()
-                })
+                crate::CpuExecutionProvider::with_resources(
+                    crate::CpuMemoryResources::default()
+                        .with_cache_retention(crate::CpuCacheRetention::new(admitted)),
+                )
             };
             let first = make(first_admitted);
             let second = make(!first_admitted);

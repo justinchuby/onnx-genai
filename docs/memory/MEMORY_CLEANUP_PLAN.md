@@ -302,38 +302,34 @@ Half-storage output comparisons decode the actual dtype rather than interpreting
 pairs of half values as f32 words. Existing cache/format guards remain intact.
 
 
-### Coherent QMoE host-cache budget ownership
+### Owned QMoE host-cache payloads
 
-The warm expert cache previously stored its byte ceiling in an atomic separate
-from its governor lease. A budget read could therefore mix an old ceiling with
-a newly adopted lease. Adoption also returned success for an already governed
-cache without checking the incoming authority/holder, and published smaller
-grants before trimming existing resident experts.
+Cache retention is an immutable policy ceiling, not a standing governor lease.
+Each retained or temporary complete expert owns an exact grant from the same
+Host source as block expansions. The grant survives cache eviction/provider
+teardown while an active `Arc` still owns the expert, and returns only after
+payload destruction. An empty cache consumes no Host capacity and can coexist
+with host KV that was allocated before any expert is expanded.
 
-The state is now `Local(bytes)` or `Governed { authority, lease }` behind one
-`RwLock`. Governed bytes come directly from `MemoryLease::bytes()`. A routed
-operation retains one read guard through its prefetch/compute scope; workers
-borrow that operation and use its resolved budget without acquiring the budget
-lock again. This preserves concurrent readers and avoids a queued writer
-blocking a worker needed by an existing reader. Cold adopters serialize through
-a separate gate. Identity is checked and a provisional grant is prepared without
-holding either data lock, allowing coordinator callbacks to inspect cache state.
-The write guard then waits for current operations, trims inactive entries and
-publishes the new state only after residency fits. A live-lease refusal drops
-the provisional grant and preserves the original local state. Cached payloads
-are destroyed before the standing governor lease is returned.
+`CpuMemoryResources::new(source, limits)` seals the cache and block/QMoE grant
+source together. Its private fields prevent foreign-source cache pairing.
+`CpuWeightCacheLimits` holds dense/expert retention ceilings, and the consuming
+`with_cache_retention` builder captures the legacy planned-family verdict.
+Standalone defaults are ungoverned; engine components clone their engine-owned
+resource handle. The unused late-adoption API and the separate cache holder have
+been removed without aliases. The optional environment ceiling is resolved once
+at the cache's first operation; invalid configuration remains a typed error.
 
-`adopt_governed_budget` returns the common EP result so memory failures retain
-their typed source while ownership/refusal errors describe the authority,
-holder and remedy. The old lossy budget-parsing wrapper is removed; there is no
-compatibility signature. Existing admission, frequency/pinning, prefetch
-eligibility, exact output and cache-stat guards remain in place. This fixes the
-cache's standing entitlement transition, not all model working-memory grants.
+Cold publication has a single fill gate. Policy selection and publication hold
+the short payload mutex; governor callbacks, dequantization and retired payload
+drops do not. Ready hits skip the cold gate and issuer. This removes the old
+adoption mutex, budget `RwLock` and operation-lifecycle `RwLock` while preserving
+single-flight fills and the bank registry's independent prefetch proof.
 
-The remaining convergence work includes derived block caches' model-wide
-accounting and transient decoded/scratch memory. The shared-layer prefetch
-capacity audit is addressed below. CPU/GPU hybrid execution and asynchronous
-device lifetimes still require real-device evidence.
+Tests cover idle-zero ownership, KV competition and grant refusal, exact partial
+refunds, active owners after cache drop, concurrent same-key fills, hard-failure
+rollback and observers on reserve/refund. The existing frequency/pinning,
+foreign-bank, routing, numerical and prefetch-statistics guards remain.
 
 
 ### Per-tier authority identity
@@ -342,13 +338,13 @@ device lifetimes still require real-device evidence.
 mapped allowance for that tier. The engine composes shared Device books with
 worker-group-local Host/Disk books; a single Device identity incorrectly made
 separate Host partitions look interchangeable when engines shared a device.
-QMoE adoption now compares Host identity, virtual buffers compare their requested
+CPU weight-source anchors validate Host identity, virtual buffers compare their requested
 tier, and process registration uses the declared device key's tier. CUDA pools
 validate their context against Device identity, while sharing/admission/reclaim
 use the physical location's tier: Device for VRAM and Host for Host-NUMA. All governor implementations and callers
 use the explicit tier; no old-signature shim is retained. Regressions reproduce
-both the original identity/lease mismatch and foreign Host adoption behind a
-shared Device authority, then check clones and mapped allowances. This fixes
+the original identity/lease mismatch and independent Host books behind a shared
+Device authority, then check clones and mapped allowances. This fixes
 identity routing, not the separate physical-capacity relationship between CPU
 hot-tier and Host books.
 
@@ -374,9 +370,8 @@ This is deliberately a conservative eviction proof, not a new memory budget or
 a scheduler. Existing source identity, admission frequencies, pinning, exact
 output and counter tests remain. Tests cover the foreign-bank counterexample,
 exact shared-capacity boundary, retained metadata, expiry/pruning, concurrent
-known-bank operations, cold-registration exclusion and worker progress. The
-standing partition still does not account for transient decoded or scratch
-allocations; model-wide grant convergence remains open.
+known-bank operations, cold-registration exclusion and worker progress. Full expert payload grants now share the Host source; row scratch and other
+allocation classes still need model-wide grant convergence.
 
 
 ### Owned grants for block-quantized CPU derived weights
@@ -407,54 +402,41 @@ complete-group refusal, partial replacement at exact quota, active owners after
 LRU eviction, failure rollback, concurrent fills and numerical equivalence
 across formats, dtypes, mutable/constant weights and packed storage layouts.
 
-This is a scoped convergence step. QMoE's standing partition and transient
-expansions, other derived caches, scratch/activation buffers, the physical
+This is a scoped convergence step. Other derived caches, scratch/activation buffers, the physical
 relationship between CPU Device and Host books, process-wide capacity and GPU
 asynchronous lifetimes remain open. Default standalone CPU resources remain
 ungoverned. CPU tests and CUDA compilation do not prove CUDA execution behavior.
 
 
-### QMoE transient expert working sets
+### QMoE expert working sets and prefetch
 
-QMoE factories now receive the existing `derived_weights` Host source alongside
-their retained-expert cache. A cache lookup returns Hit, Filled or Transient;
-unadmitted lookups do not execute a dense builder under the payload lock.
-Transient resolution occurs after leaving that lock and preflights the complete
-FC1/FC2/(optional FC3) set. Its shared owner holds the grant until all projections
-and the last payload owner have dropped. Cache-admitted sets remain funded by
-the existing standing partition and are not charged twice.
+Complete FC1/FC2/(optional FC3) sets acquire their Host grant before allocation.
+Cache fills and transients share the sealed resource source. The same owned grant
+remains with a retained payload, so there is no standing cache entitlement or
+double charge. Capacity refusal chooses NBits row decoding through the shared
+per-shard projection driver; allocation/configuration errors retain typed causes.
 
-Capacity refusal chooses NBits row decoding. The common row-projection driver
-keeps one decoded row per worker shard and reuses it across the grouped tokens;
-block-format and NBits decoders retain their own canonical format math and
-per-shard scratch. Routing, activation/gates, biases and contribution order use
-the existing shared MoE implementation. Allocation/configuration errors retain
-their typed causes instead of being treated as capacity refusals.
+Streaming-only prefetch obtains a scoped grant for the driver's two simultaneous
+temporary experts. Positive-cache prefetch pins initially selected hits, obtains
+one admission grant for the complete missing selected set and splits exact
+payload shares. A retained share survives on its own; consumed transient shares
+and unused shares return independently. The scoped admission bound may exceed
+the currently allocated dense payloads and is not an RSS measurement. Failure to
+preflight keeps the existing serial path, rather than changing representation
+only because an extra overlapping payload is live. Fully cached operations keep
+the prefetch path without querying the issuer.
 
-Cold prefetch obtains a scoped grant for the fixed driver's two simultaneous
-transient expert sets; if unavailable, it runs the same serial path. Fully cached
-operations retain their prefetch path without querying the issuer. This grant
-lasts through worker completion and payload destruction. It is an execution
-working set, not another cache entitlement or a parallel quota ledger.
-
-Budget adoption now waits on an operation-lifetime gate while the budget lock
-is used only for brief coherent inspection/publication. A transient issuer can
-inspect cache state while an adopter waits without recursively taking a budget
-reader behind its writer. Workers borrow the existing lifecycle/registry proof.
-Tests preserve the old adoption/refund, bank registry, frequency/pinning and
-prefetch guards, and add complete-set quotas, active-owner refunds, realistic
-rounding/gated projections, shared Host pressure, scoped two-slot grant peaks,
-warm issuer bypass, and callback progress during adoption.
-
-The idle standing QMoE partition still needs conversion to per-payload ownership.
-Other derived caches, scratch/activation accounting, CPU Device/Host physical
-capacity relationships, process-global capacity and asynchronous GPU validation
-remain open. These host checks do not establish CUDA runtime behavior.
+Real mmap fixtures verify exact serial/prefetch outputs and cache statistics,
+Host-book peaks at quota boundaries, complete-set refusal, all activation/gates,
+partial selected-set refunds and warm issuer bypass. Other derived caches,
+scratch/activation accounting, CPU Device/Host physical-capacity relationships,
+process-global capacity and asynchronous GPU validation remain open. Host tests
+and CUDA compilation do not establish CUDA runtime behavior.
 
 
 ### Provider-scoped CPU cache retention
 
-`CpuMemoryResources::cache_retention` carries an immutable `CpuCacheRetention`
+`CpuMemoryResources::with_cache_retention` carries an immutable `CpuCacheRetention`
 verdict captured before registry construction. MatMul, Gemm, FusedMatMulBias,
 MatMulNBits, QLinearMatMul and Einsum use it for the cache families already
 included in the memory plan. The six process-global admission setters have
@@ -473,8 +455,7 @@ still auto-detect a default CPU provider.
 This is admission policy, not a new physical quota or grant. Existing shared
 transpose/MLAS stores and process scratch ceilings remain shared. Block-derived
 and transient QMoE payloads retain their separate owned Host grants. Remaining
-work includes idle retained QMoE reservations, actual grants for other legacy
-packed caches, and the CPU Device/Host physical-capacity relationship. No GPU
+work includes actual grants for other legacy packed caches, and the CPU Device/Host physical-capacity relationship. No GPU
 execution or throughput claim follows from these changes.
 
 Load-time constant preparation is a provider hook over immutable host operands,

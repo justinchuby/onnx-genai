@@ -990,12 +990,10 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
 pub(crate) fn build_cpu_registry_with_resources(
     resources: crate::CpuMemoryResources,
 ) -> OpRegistry {
-    let crate::CpuMemoryResources {
-        host_cache,
-        derived_weights,
-        dense_weight_cache_bytes,
-        cache_retention,
-    } = resources;
+    let host_cache = resources.expert_cache().clone();
+    let derived_weights = resources.weight_memory().clone();
+    let dense_weight_cache_bytes = resources.weight_cache_limits().dense_bytes;
+    let cache_retention = resources.cache_retention().clone();
     let retain_caches = cache_retention.is_admitted();
     let mut rec = OpRegistry::new();
     register_cnn_ops(&mut rec);
@@ -1220,7 +1218,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("QMoE", "com.microsoft", 1),
-        Box::new(qmoe::QMoEFactory::new(host_cache, derived_weights)),
+        Box::new(qmoe::QMoEFactory::new(host_cache)),
     );
     // Standard-domain LLM/transformer primitives (ai.onnx). Registered at their
     // ONNX since_version; the registry resolves the highest since_version <=

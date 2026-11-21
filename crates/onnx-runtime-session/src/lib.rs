@@ -2531,7 +2531,7 @@ mod device_binding_tests {
         scan.attributes
             .insert("num_scan_inputs".to_string(), Attribute::Int(1));
         let scan_id = graph.insert_node(scan);
-        graph.subgraphs.insert((scan_id, "body".to_string()), body);
+        graph.subgraphs.insert((scan_id, "body".into()), body);
         graph.add_output(present_state);
         graph.add_output(scan_out);
 

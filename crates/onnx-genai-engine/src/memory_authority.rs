@@ -430,20 +430,36 @@ mod tests {
 
     #[cfg(feature = "native-backend")]
     #[test]
-    fn per_tier_host_cache_rejects_foreign_host_books_behind_a_shared_device() {
+    fn shared_device_keeps_cpu_host_grants_on_separate_books() {
         let device = DeviceMemoryAuthority::new(DeviceCompatibilityDomain::Host, 100);
         let first = EngineMemoryGovernor::new(device.clone(), 100, 80);
         let second = EngineMemoryGovernor::new(device, 100, 80);
-        let holder = HolderId::new(10);
-        let cache =
-            onnx_runtime_ep_cpu::WeightOffloadHostCache::new_leased(8, &first, holder).unwrap();
-        assert!(cache.adopt_governed_budget(&first.clone(), holder).is_ok());
-        assert!(
-            cache.adopt_governed_budget(&second, holder).is_err(),
-            "sharing Device books must not make independent Host books interchangeable"
+        let holder = HolderId::new(13);
+        let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+            onnx_runtime_ep_cpu::DerivedWeightMemory::governed(&first, holder).unwrap(),
+            onnx_runtime_ep_cpu::CpuWeightCacheLimits {
+                expert_bytes: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(resources.is_governed());
+        assert_eq!(
+            first.used(Tier::Host),
+            0,
+            "an idle retention ceiling reserves no RAM"
         );
+        assert_ne!(
+            first.authority_id(Tier::Host),
+            second.authority_id(Tier::Host)
+        );
+        let active = first
+            .reserve(Tier::Host, 8, MemoryRole::Weights, holder)
+            .unwrap();
         assert_eq!(first.used(Tier::Host), 8);
         assert_eq!(second.used(Tier::Host), 0);
+        drop(active);
+        assert_eq!(first.used(Tier::Host), 0);
     }
 
     #[test]

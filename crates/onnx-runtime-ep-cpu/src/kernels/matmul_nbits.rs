@@ -11402,10 +11402,10 @@ mod tests {
         }
         for admitted_first in [true, false] {
             let make = |admitted| {
-                crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-                    cache_retention: crate::CpuCacheRetention::new(admitted),
-                    ..Default::default()
-                })
+                crate::CpuExecutionProvider::with_resources(
+                    crate::CpuMemoryResources::default()
+                        .with_cache_retention(crate::CpuCacheRetention::new(admitted)),
+                )
             };
             let first = make(admitted_first);
             let second = make(!admitted_first);

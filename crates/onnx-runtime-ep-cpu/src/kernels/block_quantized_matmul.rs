@@ -2440,12 +2440,16 @@ mod tests {
         let kv = governor
             .reserve(Tier::Host, 16, MemoryRole::KvCache, HolderId::new(1))
             .unwrap();
-        let provider = CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-            derived_weights: crate::DerivedWeightMemory::governed(&governor, HolderId::new(13))
-                .unwrap(),
-            dense_weight_cache_bytes: bytes as usize,
-            ..Default::default()
-        });
+        let provider = CpuExecutionProvider::with_resources(
+            crate::CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+                crate::CpuWeightCacheLimits {
+                    dense_bytes: bytes as usize,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
         let (graph, node) = model_node("mxfp4", &[1, k], &[n, 1, 17], &[1, n], k, n, false);
         let input = Owned::f32(&[1, k], &vec![0.0625; k]);
         let weights = Owned::u8(&[n, 1, 17], &packed_for_format(BlockFormat::Mxfp4, 1, n, k));

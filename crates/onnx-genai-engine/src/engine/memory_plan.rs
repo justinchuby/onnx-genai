@@ -88,11 +88,9 @@ macro_rules! holder_registry {
 
             /// The identifier the governor accounts against.
             ///
-            /// The first values are pinned to what the previous constants used,
-            /// so a trace recorded before this module is still readable against
-            /// one after. Ids are written next to their variant above; nothing
-            /// requires them to be consecutive, but `all_covers_every_holder_id`
-            /// pins that they are, which is what keeps the space readable.
+            /// The registry is consecutive and independent of build features.
+            /// Interpret traces with the registry from their recording build:
+            /// pre-release role removal may renumber subsequent entries.
             pub(crate) const fn id(self) -> HolderId {
                 HolderId::new(match self {
                     $(Holder::$variant => $id,)+
@@ -131,8 +129,6 @@ holder_registry! {
     NativeKvCache = 8,
     /// Semantic-prefix snapshots of recurrent/native loop-carried state.
     RecurrentPrefixSnapshot = 9,
-    /// The CPU EP's warm host cache for dequantized MoE experts.
-    WeightOffloadHostCache = 10,
     /// The standing device pool held by a pipeline component session (a vision
     /// encoder, say) that is loaded lazily alongside the decoder.
     ///
@@ -143,7 +139,7 @@ holder_registry! {
     /// co-resident tenants each admitting against the whole card is how a
     /// 3264-patch vision prefill drove a 30B decoder into `CUDA_ERROR_OUT_OF_MEMORY`
     /// with the card genuinely full.
-    PipelineComponentPool = 11,
+    PipelineComponentPool = 10,
     /// The standing device pool held by a speculative proposer's own session.
     ///
     /// Distinct from [`Holder::DraftKvPool`], which is the draft model's host
@@ -151,9 +147,9 @@ holder_registry! {
     /// execution provider builds for itself -- the same blind spot
     /// [`Holder::PipelineComponentPool`] exists for, on the other co-resident
     /// session the engine loads next to the decoder.
-    DraftModelPool = 12,
+    DraftModelPool = 11,
     /// Live f32 weight copies owned by native CPU kernels.
-    CpuDerivedWeights = 13,
+    CpuDerivedWeights = 12,
 }
 
 impl Holder {
@@ -162,9 +158,7 @@ impl Holder {
     pub(crate) const fn role(self) -> MemoryRole {
         match self {
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => MemoryRole::KvCache,
-            Holder::WeightResidency
-            | Holder::WeightOffloadHostCache
-            | Holder::CpuDerivedWeights => MemoryRole::Weights,
+            Holder::WeightResidency | Holder::CpuDerivedWeights => MemoryRole::Weights,
             // Rolling state that is destroyed as it is updated: it cannot be
             // rewound, recomputed or shared, so it is not a `Weights`-style
             // demotion candidate and not step-scoped `Workspace` either. It
@@ -188,7 +182,6 @@ impl Holder {
             Holder::PipelineKvPool => "pipeline KV page pool",
             Holder::DraftKvPool => "draft model KV page pool",
             Holder::WeightResidency => "device weight residency cache",
-            Holder::WeightOffloadHostCache => "host weight-offload expert cache",
             Holder::CpuDerivedWeights => "CPU derived weight buffers",
             Holder::RecurrentState => "recurrent state",
             Holder::RecurrentPrefixSnapshot => "recurrent prefix snapshots",
@@ -212,7 +205,7 @@ impl Holder {
             // Charging it to `Device` would let it exhaust host RAM while the
             // device ledger still reported headroom.
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
-            Holder::WeightOffloadHostCache | Holder::CpuDerivedWeights => Tier::Host,
+            Holder::CpuDerivedWeights => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
             | Holder::RecurrentPrefixSnapshot

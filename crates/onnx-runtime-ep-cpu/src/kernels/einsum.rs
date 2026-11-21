@@ -3647,10 +3647,9 @@ mod tests {
         let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
         node.attributes
             .insert("equation".into(), Attribute::String(b"ij->i".to_vec()));
-        let provider = crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-            cache_retention: retention,
-            ..Default::default()
-        });
+        let provider = crate::CpuExecutionProvider::with_resources(
+            crate::CpuMemoryResources::default().with_cache_retention(retention),
+        );
         let kernel = provider
             .get_kernel(&node, &[vec![2, 4]], 12)
             .expect("session compiles Einsum");
@@ -4297,14 +4296,12 @@ mod tests {
 
             let first_retention = test_retention(admitted_first);
             let second_retention = test_retention(!admitted_first);
-            let first = crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-                cache_retention: first_retention.clone(),
-                ..Default::default()
-            });
-            let second = crate::CpuExecutionProvider::with_resources(crate::CpuMemoryResources {
-                cache_retention: second_retention.clone(),
-                ..Default::default()
-            });
+            let first = crate::CpuExecutionProvider::with_resources(
+                crate::CpuMemoryResources::default().with_cache_retention(first_retention.clone()),
+            );
+            let second = crate::CpuExecutionProvider::with_resources(
+                crate::CpuMemoryResources::default().with_cache_retention(second_retention.clone()),
+            );
             let (admitted_provider, admitted_retention, declined_provider, declined_retention) =
                 if admitted_first {
                     (&first, &first_retention, &second, &second_retention)

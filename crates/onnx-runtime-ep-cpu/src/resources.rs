@@ -6,49 +6,116 @@ use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryLease};
 
-use crate::{CpuCacheRetention, WeightOffloadHostCache};
+use crate::CpuCacheRetention;
+use crate::kernels::qmoe::WeightOffloadHostCache;
 
-/// Session memory resources supplied before the CPU registry is constructed.
-/// Block-quantized factories and transient QMoE expansions share `derived_weights`;
-/// retained QMoE experts use `host_cache`
-/// and planned legacy caches use the immutable `cache_retention` verdict.
-/// That verdict admits retention without supplying physical grants. Other allocations are not
-/// covered by the derived-weight grant source. The default is the standalone,
-/// ungoverned policy; engines supply their Host authority explicitly.
+/// Retention ceilings, separate from the Host grants that fund actual payloads.
+#[derive(Clone, Copy, Debug)]
+pub struct CpuWeightCacheLimits {
+    /// Per-kernel block-format dense expansion retention ceiling.
+    pub dense_bytes: usize,
+    /// Shared QMoE expert retention ceiling.
+    pub expert_bytes: u64,
+}
+
+impl Default for CpuWeightCacheLimits {
+    fn default() -> Self {
+        Self {
+            dense_bytes: crate::kernels::dense_weight_cache::configured_dense_weight_cache_bytes(),
+            expert_bytes: 0,
+        }
+    }
+}
+
+/// Immutable CPU weight resources. Full block-format expansions and retained
+/// or transient QMoE experts use one Host grant source. Private fields
+/// prevent a shared expert cache from being paired with a different authority.
+/// Cache ceilings and the legacy planned-family verdict only admit retention;
+/// they reserve no idle physical capacity.
 ///
 /// ```
-/// use onnx_runtime_ep_cpu::{CpuExecutionProvider, CpuMemoryResources, DerivedWeightMemory};
+/// use onnx_runtime_ep_cpu::{CpuExecutionProvider, CpuMemoryResources, CpuWeightCacheLimits, DerivedWeightMemory};
 /// use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let governor = LedgerGovernor::new(LeaseLedger::new(0, 1024 * 1024, 0));
-/// let resources = CpuMemoryResources {
-///     derived_weights: DerivedWeightMemory::governed(&governor, HolderId::new(13))?,
-///     dense_weight_cache_bytes: 64 * 1024,
-///     ..Default::default()
-/// };
+/// let resources = CpuMemoryResources::new(
+///     DerivedWeightMemory::governed(&governor, HolderId::new(13))?,
+///     CpuWeightCacheLimits { dense_bytes: 64 * 1024, expert_bytes: 512 * 1024 },
+/// )?;
 /// let provider = CpuExecutionProvider::with_resources(resources);
 /// # let _ = provider;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// A caller cannot replace only the source of an already constructed cache:
+/// ```compile_fail
+/// use onnx_runtime_ep_cpu::CpuMemoryResources;
+/// let mut resources = CpuMemoryResources::default();
+/// resources.host_cache = CpuMemoryResources::default().host_cache;
+/// ```
 #[derive(Clone)]
 pub struct CpuMemoryResources {
-    pub host_cache: WeightOffloadHostCache,
-    pub derived_weights: DerivedWeightMemory,
-    /// Per-kernel retention/eligibility policy, separate from shared physical grants.
-    pub dense_weight_cache_bytes: usize,
-    pub cache_retention: CpuCacheRetention,
+    host_cache: WeightOffloadHostCache,
+    dense_bytes: usize,
+    cache_retention: CpuCacheRetention,
 }
 
 impl Default for CpuMemoryResources {
     fn default() -> Self {
-        Self {
-            host_cache: crate::kernels::qmoe::default_weight_offload_host_cache().clone(),
-            derived_weights: DerivedWeightMemory::default(),
-            dense_weight_cache_bytes:
-                crate::kernels::dense_weight_cache::configured_dense_weight_cache_bytes(),
+        Self::new(
+            DerivedWeightMemory::default(),
+            CpuWeightCacheLimits::default(),
+        )
+        .expect("the default zero expert-cache retention ceiling is addressable")
+    }
+}
+
+impl CpuMemoryResources {
+    pub fn new(
+        memory: DerivedWeightMemory,
+        limits: CpuWeightCacheLimits,
+    ) -> std::result::Result<Self, MemoryError> {
+        let host_cache =
+            WeightOffloadHostCache::new(limits.expert_bytes, memory).map_err(|reason| {
+                MemoryError::InvalidRequest {
+                    tier: Tier::Host.name(),
+                    requested: limits.expert_bytes,
+                    reason,
+                }
+            })?;
+        Ok(Self {
+            host_cache,
+            dense_bytes: limits.dense_bytes,
             cache_retention: CpuCacheRetention::default(),
+        })
+    }
+
+    /// Capture the legacy planned-family retention verdict before registry construction.
+    pub fn with_cache_retention(mut self, retention: CpuCacheRetention) -> Self {
+        self.cache_retention = retention;
+        self
+    }
+
+    pub fn cache_retention(&self) -> &CpuCacheRetention {
+        &self.cache_retention
+    }
+    /// Configured limits; an optional expert environment override resolves at first use.
+    pub fn weight_cache_limits(&self) -> CpuWeightCacheLimits {
+        CpuWeightCacheLimits {
+            dense_bytes: self.dense_bytes,
+            expert_bytes: self.host_cache.retention_budget_bytes(),
         }
+    }
+    pub(crate) fn expert_cache(&self) -> &WeightOffloadHostCache {
+        &self.host_cache
+    }
+    /// Whether block/QMoE full payloads obtain actual Host grants.
+    pub fn is_governed(&self) -> bool {
+        self.host_cache.memory().is_governed()
+    }
+    pub(crate) fn weight_memory(&self) -> &DerivedWeightMemory {
+        self.host_cache.memory()
     }
 }
 
