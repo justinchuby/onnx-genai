@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 use onnx_runtime_ep_api::{
     EpError, ExternalMmapRegion, Kernel, KernelFactory, Result, TensorBacking, TensorMut,
@@ -38,7 +38,7 @@ use super::{
 };
 use crate::weight_offload::{
     WeightOffloadMode, checked_host_budget, effective_host_budget_u64, metrics,
-    weight_offload_host_budget, weight_offload_prefetch_default,
+    weight_offload_prefetch_default,
 };
 
 /// Factory for the ORT contrib `QMoE` operator.
@@ -419,6 +419,7 @@ impl Kernel for QMoEKernel {
 
             let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
             let ordered: Vec<RoutedExpert> = tasks.into_iter().collect();
+            let cache_operation = self.host_cache.begin_operation()?;
 
             // Eviction-neutrality guard for the prefetch pipeline.
             //
@@ -451,16 +452,11 @@ impl Kernel for QMoEKernel {
             // (partial-cache) budget the pipeline transparently falls back to the
             // serial route-first loop, which is byte- and stat-identical to the
             // pre-prefetch baseline.
-            let prefetch_is_eviction_neutral = self
-                .host_cache
-                .effective_budget_bytes()
-                .map(|budget| {
-                    budget == 0
-                        || (experts as u128)
-                            .checked_mul(expanded_bytes as u128)
-                            .is_some_and(|resident| resident <= budget as u128)
-                })
-                .unwrap_or(false);
+            let budget = cache_operation.budget_bytes;
+            let prefetch_is_eviction_neutral = budget == 0
+                || (experts as u128)
+                    .checked_mul(expanded_bytes as u128)
+                    .is_some_and(|resident| resident <= budget as u128);
             let compute = |expert: usize,
                            expert_tasks: &[(usize, usize, f32)],
                            weights: &DequantizedExpert,
@@ -495,7 +491,7 @@ impl Kernel for QMoEKernel {
                 let layer_id = self.layer_id;
                 let bits = self.bits;
                 let block_size = self.block_size;
-                let host_cache = &self.host_cache;
+                let host_cache = &cache_operation;
                 let fc1_ref = &fc1;
                 let fc2_ref = &fc2;
                 let fc3_ref = fc3.as_ref();
@@ -542,7 +538,7 @@ impl Kernel for QMoEKernel {
             } else {
                 for (expert, expert_tasks) in &ordered {
                     let weights = lease_route_first_expert(
-                        &self.host_cache,
+                        &cache_operation,
                         self.layer_id,
                         self.bits,
                         self.block_size,
@@ -1006,10 +1002,40 @@ impl Drop for HostExpertCache {
     }
 }
 
+/// A governed ceiling is the lease's actual size, never a second byte counter.
+enum HostCacheBudget {
+    Local(u64),
+    Governed {
+        authority: onnx_runtime_memory_governor::MemoryAuthorityId,
+        lease: onnx_runtime_memory_governor::MemoryLease,
+    },
+}
+
+impl HostCacheBudget {
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Local(bytes) => *bytes,
+            Self::Governed { lease, .. } => lease.bytes(),
+        }
+    }
+
+    fn effective_bytes(&self) -> Result<usize> {
+        let bytes = match self {
+            Self::Local(bytes) => effective_host_budget_u64(*bytes)?,
+            Self::Governed { lease, .. } => lease.bytes(),
+        };
+        checked_host_budget(bytes).map_err(error)
+    }
+}
+
 struct WeightOffloadHostCacheInner {
-    budget_bytes: AtomicU64,
+    // Declaration order is intentional: release cached payloads before the
+    // governor lease, so capacity cannot be handed back while values remain.
     cache: Mutex<HostExpertCache>,
-    lease: Mutex<Option<onnx_runtime_memory_governor::MemoryLease>>,
+    budget: RwLock<HostCacheBudget>,
+    // Cold-path adopters serialize without holding data locks during governor
+    // callbacks. Cache operations and observers never acquire this gate.
+    adoption: Mutex<()>,
 }
 
 /// A governor-owned warm-host expert-cache partition.
@@ -1018,39 +1044,46 @@ pub struct WeightOffloadHostCache {
     inner: Arc<WeightOffloadHostCacheInner>,
 }
 
+/// Freeze one budget for a complete routed operation, including its prefetch
+/// worker. Workers borrow this view and do not reacquire the budget lock, so a
+/// queued adopting writer cannot deadlock a worker needed by the reader.
+struct HostCacheOperation<'a> {
+    _budget_guard: RwLockReadGuard<'a, HostCacheBudget>,
+    cache: &'a Mutex<HostExpertCache>,
+    budget_bytes: usize,
+}
+
+impl HostCacheOperation<'_> {
+    fn lease<F>(&self, key: ExpertCacheKey, expanded_bytes: usize, load: F) -> Result<ExpertLease>
+    where
+        F: FnOnce() -> Result<DequantizedExpert>,
+    {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lease(key, expanded_bytes, self.budget_bytes, load)
+    }
+}
+
 impl WeightOffloadHostCache {
     /// Create an independent cache partition with its own byte ceiling.
     ///
-    /// Prefer [`Self::new_leased`] where a governor exists. A host-cache budget
-    /// chosen here is invisible to the ledger that grants host KV pages, so the
-    /// two pools can each be within their private ceilings while together
-    /// oversubscribing RAM.
+    /// Prefer [`Self::new_leased`] where a governor exists: a local ceiling is
+    /// invisible to the ledger that grants host KV pages.
     pub fn new(budget_bytes: u64) -> std::result::Result<Self, &'static str> {
         checked_host_budget(budget_bytes)?;
         Ok(Self {
             inner: Arc::new(WeightOffloadHostCacheInner {
-                budget_bytes: AtomicU64::new(budget_bytes),
                 cache: Mutex::new(HostExpertCache::default()),
-                lease: Mutex::new(None),
+                budget: RwLock::new(HostCacheBudget::Local(budget_bytes)),
+                adoption: Mutex::new(()),
             }),
         })
     }
 
-    /// Create a host expert cache whose budget is leased from `governor`.
-    ///
-    /// The cache holds dequantized experts for as long as the model/provider is
-    /// alive. If it sizes itself from the host limit while the KV pool leases
-    /// the same tier, the process has two truthful but unreconciled budgets:
-    /// KV can be granted most of RAM and the expert cache can still believe it
-    /// owns all of it. Taking the cache budget as a
-    /// [`onnx_runtime_memory_api::MemoryRole::Weights`] lease makes the
-    /// claim visible to the same ledger as KV.
-    ///
-    /// Unlike device residency, the host cache can safely degrade to a smaller
-    /// warm partition: a miss just rereads and dequantizes the expert. For that
-    /// reason the requested budget is capped to the currently available host
-    /// bytes and the cache uses the bytes actually granted, not the caller's
-    /// original ceiling.
+    /// Create a host expert cache whose standing budget belongs to `governor`.
+    /// The request is capped to available host bytes; the lease's actual size
+    /// drives every admission, sharing the same books as host KV.
     pub fn new_leased(
         budget_bytes: u64,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
@@ -1066,60 +1099,76 @@ impl WeightOffloadHostCache {
             onnx_runtime_memory_api::MemoryRole::Weights,
             holder,
         )?;
+        checked_host_budget(lease.bytes())
+            .map_err(|reason| invalid_host_budget_request(lease.bytes(), reason))?;
         Ok(Self {
             inner: Arc::new(WeightOffloadHostCacheInner {
-                budget_bytes: AtomicU64::new(lease.bytes()),
                 cache: Mutex::new(HostExpertCache::default()),
-                lease: Mutex::new(Some(lease)),
+                budget: RwLock::new(HostCacheBudget::Governed {
+                    authority: governor.authority_id(),
+                    lease,
+                }),
+                adoption: Mutex::new(()),
             }),
         })
     }
 
-    /// Return this partition's governor-configured byte ceiling.
+    /// Return this partition's configured byte ceiling.
     pub fn configured_budget_bytes(&self) -> u64 {
         self.budget().0
     }
 
-    /// Bytes this cache is entitled to, and whether that came from a governor.
-    ///
-    /// `false` means the budget is local to this cache. That mode remains for
-    /// standalone embedders, but an engine should use a governed cache so host
-    /// KV and warm experts cannot be satisfied against separate ledgers.
+    /// Inspect a coherent `(bytes, governed)` snapshot. Governed bytes are read
+    /// directly from the live lease, not a separately updated atomic counter.
     pub fn budget(&self) -> (u64, bool) {
-        let budget = self.inner.budget_bytes.load(Ordering::Relaxed);
-        let governed = self
+        let budget = self
             .inner
-            .lease
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some();
-        (budget, governed)
+            .budget
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            budget.bytes(),
+            matches!(*budget, HostCacheBudget::Governed { .. }),
+        )
     }
 
-    /// Replace a local budget with one charged to the host tier.
-    ///
-    /// This seam exists for providers constructed before an engine governor is
-    /// available. No expert has to be resident yet for the accounting to be
-    /// useful: the lease is the standing warm-cache entitlement, and admissions
-    /// then stay within the bytes the ledger actually granted.
+    /// Replace a local budget with a host-tier governor lease. Existing routed
+    /// operations finish under their original budget before this transition.
+    /// Inactive cached weights are trimmed before publishing a smaller grant;
+    /// live expert leases that prevent trimming reject adoption transactionally.
+    /// Repeated adoption is valid only for the same authority and holder.
     pub fn adopt_governed_budget(
         &self,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
         holder: onnx_runtime_memory_governor::HolderId,
-    ) -> std::result::Result<u64, onnx_runtime_memory_api::MemoryError> {
-        {
-            let lease = self
+    ) -> Result<u64> {
+        let requested_authority = governor.authority_id();
+        let _adoption = self
+            .inner
+            .adoption
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let requested = {
+            let budget = self
                 .inner
-                .lease
-                .lock()
+                .budget
+                .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if lease.is_some() {
-                return Ok(self.inner.budget_bytes.load(Ordering::Relaxed));
+            if let HostCacheBudget::Governed { authority, lease } = &*budget {
+                if *authority != requested_authority || lease.holder() != holder {
+                    return Err(error(format!(
+                        "host cache belongs to authority {authority:?}, holder {:?}; cannot adopt authority {requested_authority:?}, holder {holder:?}; construct a separate cache for a different governor or holder",
+                        lease.holder()
+                    )));
+                }
+                return Ok(lease.bytes());
             }
-        }
-        let requested = effective_host_budget_u64(self.inner.budget_bytes.load(Ordering::Relaxed))?;
+            effective_host_budget_u64(budget.bytes())?
+        };
         checked_host_budget(requested)
             .map_err(|reason| invalid_host_budget_request(requested, reason))?;
+        // The coordinator may query/reclaim caches while granting capacity.
+        // Keep both the budget and payload locks released across this call.
         let grant = requested.min(governor.available(onnx_runtime_memory_api::Tier::Host));
         let lease = governor.reserve(
             onnx_runtime_memory_api::Tier::Host,
@@ -1128,55 +1177,87 @@ impl WeightOffloadHostCache {
             holder,
         )?;
         let granted = lease.bytes();
-        let mut slot = self
+        let checked = checked_host_budget(granted)
+            .map_err(|reason| invalid_host_budget_request(granted, reason))?;
+        // Freeze publication until existing routed operations and prefetch
+        // workers finish. New operations can use the local budget while the
+        // provisional reservation above is prepared; the cold gate serializes
+        // adopters, so no competing adoption can publish a zero-sized grant.
+        let mut budget = self
             .inner
-            .lease
-            .lock()
+            .budget
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if slot.is_none() {
-            self.inner.budget_bytes.store(granted, Ordering::Relaxed);
-            *slot = Some(lease);
-        }
-        Ok(self.inner.budget_bytes.load(Ordering::Relaxed))
+        self.inner.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .trim_to_budget(checked)
+            .map_err(|cause| error(format!(
+                "cannot adopt host-cache grant of {granted} bytes: {cause}; finish outstanding expert leases or provide more host capacity before retrying"
+            )))?;
+        // Every failure above leaves the local budget intact and drops the new
+        // lease. Publish only after cached residency fits the actual grant.
+        *budget = HostCacheBudget::Governed {
+            authority: requested_authority,
+            lease,
+        };
+        Ok(granted)
     }
 
-    fn effective_budget_bytes(&self) -> Result<usize> {
-        let (budget, governed) = self.budget();
-        if governed {
-            checked_host_budget(budget).map_err(error)
-        } else {
-            weight_offload_host_budget(budget).map_err(error)
-        }
+    fn begin_operation(&self) -> Result<HostCacheOperation<'_>> {
+        let budget = self
+            .inner
+            .budget
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let budget_bytes = budget.effective_bytes()?;
+        Ok(HostCacheOperation {
+            _budget_guard: budget,
+            cache: &self.inner.cache,
+            budget_bytes,
+        })
     }
 
+    #[cfg(test)]
     fn lease<F>(&self, key: ExpertCacheKey, expanded_bytes: usize, load: F) -> Result<ExpertLease>
     where
         F: FnOnce() -> Result<DequantizedExpert>,
     {
-        let budget_bytes = self.effective_budget_bytes()?;
-        self.inner
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .lease(key, expanded_bytes, budget_bytes, load)
+        self.begin_operation()?.lease(key, expanded_bytes, load)
     }
 
     #[cfg(test)]
     fn reconfigure(&self, budget_bytes: u64) -> Result<()> {
         let checked = checked_host_budget(budget_bytes).map_err(error)?;
+        let _adoption = self
+            .inner
+            .adoption
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut budget = self
+            .inner
+            .budget
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*budget, HostCacheBudget::Governed { .. }) {
+            return Err(error(
+                "a governed cache cannot be reconfigured as a local test cache; construct a new cache under the desired governor",
+            ));
+        }
         self.inner
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .trim_to_budget(checked)?;
-        self.inner
-            .budget_bytes
-            .store(budget_bytes, Ordering::Relaxed);
+        *budget = HostCacheBudget::Local(budget_bytes);
         Ok(())
     }
 
     #[cfg(test)]
     fn clear(&self) {
+        let _budget = self
+            .inner
+            .budget
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.inner
             .cache
             .lock()
@@ -1207,7 +1288,7 @@ pub(crate) fn default_weight_offload_host_cache() -> &'static WeightOffloadHostC
 
 #[allow(clippy::too_many_arguments)]
 fn lease_route_first_expert(
-    host_cache: &WeightOffloadHostCache,
+    host_cache: &HostCacheOperation<'_>,
     layer_id: u32,
     bits: usize,
     block_size: usize,
@@ -3213,6 +3294,358 @@ mod tests {
         assert!(cache_b.owned_bytes <= 8);
         assert_eq!(cache_a.entries.len(), 1);
         assert_eq!(cache_b.entries.len(), 2);
+    }
+
+    fn adoption_expert(value: f32) -> DequantizedExpert {
+        DequantizedExpert {
+            fc1: vec![value],
+            fc2: vec![],
+            fc3: None,
+            _residency: None,
+        }
+    }
+
+    fn populated_adoption_cache() -> WeightOffloadHostCache {
+        let cache = WeightOffloadHostCache::new(8).unwrap();
+        for expert in 0..2 {
+            for _ in 0..2 {
+                drop(
+                    cache
+                        .lease(cache_key(expert), 4, || Ok(adoption_expert(expert as f32)))
+                        .unwrap(),
+                );
+            }
+        }
+        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 8);
+        cache
+    }
+
+    #[test]
+    fn host_cache_adoption_trims_to_the_actual_grant_before_publishing_it() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let _guard = hold_metrics_test_lock();
+        let cache = populated_adoption_cache();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 4, 0));
+        assert_eq!(
+            cache
+                .adopt_governed_budget(&governor, HolderId::new(10))
+                .unwrap(),
+            4
+        );
+        assert_eq!(cache.budget(), (4, true));
+        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 4);
+        assert_eq!(governor.used(Tier::Host), 4);
+        assert_eq!(
+            cache
+                .adopt_governed_budget(&governor, HolderId::new(10))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            governor.used(Tier::Host),
+            4,
+            "same-owner adoption must be idempotent"
+        );
+        drop(cache);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn host_cache_adoption_failure_preserves_the_local_cache_and_refunds_the_grant() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let _guard = hold_metrics_test_lock();
+        let cache = populated_adoption_cache();
+        let held = cache
+            .lease(cache_key(0), 4, || {
+                panic!("held expert must already be cached")
+            })
+            .unwrap();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 2, 0));
+        let error = cache
+            .adopt_governed_budget(&governor, HolderId::new(10))
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("grant of 2 bytes"), "{text}");
+        assert!(text.contains("while 4 bytes are leased"), "{text}");
+        assert!(text.contains("finish outstanding expert leases"), "{text}");
+        assert_eq!(cache.budget(), (8, false));
+        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 8);
+        assert_eq!(
+            governor.used(Tier::Host),
+            0,
+            "failed adoption must refund its reservation"
+        );
+        assert_eq!(held.fc1, vec![0.]);
+        drop(held);
+        assert_eq!(
+            cache
+                .adopt_governed_budget(&governor, HolderId::new(10))
+                .unwrap(),
+            2
+        );
+        assert_eq!(cache.budget(), (2, true));
+        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 0);
+        assert_eq!(governor.used(Tier::Host), 2);
+    }
+
+    #[test]
+    fn host_cache_adoption_rejects_a_different_authority_or_holder() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let _guard = hold_metrics_test_lock();
+        let owner = LedgerGovernor::new(LeaseLedger::new(0, 16, 0));
+        let foreign = LedgerGovernor::new(LeaseLedger::new(0, 16, 0));
+        let cache = WeightOffloadHostCache::new_leased(8, &owner, HolderId::new(10)).unwrap();
+        for (governor, holder) in [(&foreign, HolderId::new(10)), (&owner, HolderId::new(11))] {
+            let error = cache
+                .adopt_governed_budget(governor, holder)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("host cache belongs to authority"), "{error}");
+            assert!(error.contains("construct a separate cache"), "{error}");
+            assert_eq!(cache.budget(), (8, true));
+            assert_eq!(owner.used(Tier::Host), 8);
+            assert_eq!(foreign.used(Tier::Host), 0);
+        }
+        drop(cache);
+        assert_eq!(owner.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn host_cache_adoption_waits_for_the_complete_operation_and_its_worker() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let _guard = hold_metrics_test_lock();
+        let cache = WeightOffloadHostCache::new(8).unwrap();
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(0, 4, 0)));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (compute_tx, compute_rx) = mpsc::channel();
+        let (computed_tx, computed_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let reader_cache = cache.clone();
+        // Use owned test threads so a regression can time out without an
+        // unwinding scoped join preventing this test process from finishing.
+        let reader = std::thread::spawn(move || {
+            let operation = reader_cache.begin_operation().unwrap();
+            ready_tx.send(operation.budget_bytes).unwrap();
+            compute_rx.recv().unwrap();
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        for expert in 0..2 {
+                            for _ in 0..2 {
+                                drop(
+                                    operation
+                                        .lease(cache_key(expert), 4, || {
+                                            Ok(adoption_expert(expert as f32))
+                                        })
+                                        .unwrap(),
+                                );
+                            }
+                        }
+                    })
+                    .join()
+                    .unwrap();
+            });
+            computed_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        });
+        let timeout = Duration::from_secs(5);
+        assert_eq!(ready_rx.recv_timeout(timeout).unwrap(), 8);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (adopted_tx, adopted_rx) = mpsc::channel();
+        let writer_cache = cache.clone();
+        let writer_governor = governor.clone();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            adopted_tx
+                .send(
+                    writer_cache.adopt_governed_budget(writer_governor.as_ref(), HolderId::new(10)),
+                )
+                .unwrap();
+        });
+        started_rx.recv_timeout(timeout).unwrap();
+        compute_tx.send(()).unwrap();
+        computed_rx
+            .recv_timeout(timeout)
+            .expect("prefetch worker must complete while an adopting writer is pending");
+        assert!(matches!(
+            adopted_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        // A provisional reservation may exist, but publication must still
+        // wait for the complete operation to finish under its old budget.
+        finish_tx.send(()).unwrap();
+        assert_eq!(adopted_rx.recv_timeout(timeout).unwrap().unwrap(), 4);
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert_eq!(cache.budget(), (4, true));
+        assert_eq!(cache.inner.cache.lock().unwrap().owned_bytes, 4);
+        assert_eq!(governor.used(Tier::Host), 4);
+        drop(cache);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn host_cache_adoption_owner_drops_payloads_before_releasing_its_grant() {
+        use onnx_runtime_memory_api::{DeviceKey, MemoryError, MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseAccounting, MemoryAuthorityId, MemoryLease,
+        };
+        use std::sync::{Weak, atomic::AtomicBool};
+        #[derive(Debug)]
+        struct ObservedBooks {
+            authority: MemoryAuthorityId,
+            payload: Mutex<Weak<DequantizedExpert>>,
+            used: AtomicU64,
+            released: AtomicU64,
+            released_while_live: AtomicBool,
+        }
+        impl LeaseAccounting for ObservedBooks {
+            fn authority_id(&self) -> Option<MemoryAuthorityId> {
+                Some(self.authority)
+            }
+            fn try_claim(
+                &self,
+                _tier: Tier,
+                bytes: u64,
+                _role: MemoryRole,
+            ) -> std::result::Result<(), MemoryError> {
+                self.used.fetch_add(bytes, Ordering::Relaxed);
+                Ok(())
+            }
+            fn release(&self, _tier: Tier, bytes: u64) {
+                self.released_while_live.store(
+                    self.payload.lock().unwrap().strong_count() != 0,
+                    Ordering::Relaxed,
+                );
+                self.released.fetch_add(bytes, Ordering::Relaxed);
+                self.used.fetch_sub(bytes, Ordering::Relaxed);
+            }
+        }
+        let _guard = hold_metrics_test_lock();
+        let books = Arc::new(ObservedBooks {
+            authority: MemoryAuthorityId::new(DeviceKey::HOST),
+            payload: Mutex::new(Weak::new()),
+            used: AtomicU64::new(0),
+            released: AtomicU64::new(0),
+            released_while_live: AtomicBool::new(false),
+        });
+        books.try_claim(Tier::Host, 8, MemoryRole::Weights).unwrap();
+        let lease = MemoryLease::new(
+            Tier::Host,
+            8,
+            MemoryRole::Weights,
+            HolderId::new(10),
+            books.clone(),
+        );
+        let cache = WeightOffloadHostCache {
+            inner: Arc::new(WeightOffloadHostCacheInner {
+                cache: Mutex::new(HostExpertCache::default()),
+                budget: RwLock::new(HostCacheBudget::Governed {
+                    authority: books.authority,
+                    lease,
+                }),
+                adoption: Mutex::new(()),
+            }),
+        };
+        for _ in 0..2 {
+            drop(
+                cache
+                    .lease(cache_key(0), 4, || Ok(adoption_expert(1.)))
+                    .unwrap(),
+            );
+        }
+        *books.payload.lock().unwrap() =
+            Arc::downgrade(&cache.inner.cache.lock().unwrap().entries[&cache_key(0)].weights);
+        assert_eq!(books.payload.lock().unwrap().strong_count(), 1);
+        drop(cache);
+        assert_eq!(books.released.load(Ordering::Relaxed), 8);
+        assert_eq!(books.used.load(Ordering::Relaxed), 0);
+        assert!(
+            !books.released_while_live.load(Ordering::Relaxed),
+            "returning the grant before payload destruction exposes phantom free capacity"
+        );
+    }
+
+    #[test]
+    fn host_cache_adoption_governor_can_observe_the_cache_during_reservation() {
+        use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseLedger, LedgerGovernor, MemoryAuthorityId, MemoryGovernor, MemoryLease,
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+        struct ObservingGovernor {
+            inner: LedgerGovernor,
+            cache: WeightOffloadHostCache,
+            observed: Mutex<Vec<(&'static str, (u64, bool))>>,
+        }
+        impl MemoryGovernor for ObservingGovernor {
+            fn authority_id(&self) -> MemoryAuthorityId {
+                self.inner.authority_id()
+            }
+            fn reserve(
+                &self,
+                tier: Tier,
+                bytes: u64,
+                role: MemoryRole,
+                holder: HolderId,
+            ) -> std::result::Result<MemoryLease, MemoryError> {
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(("reserve", self.cache.budget()));
+                self.inner.reserve(tier, bytes, role, holder)
+            }
+            fn available(&self, tier: Tier) -> u64 {
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(("available", self.cache.budget()));
+                self.inner.available(tier)
+            }
+            fn used(&self, tier: Tier) -> u64 {
+                self.inner.used(tier)
+            }
+        }
+        let _guard = hold_metrics_test_lock();
+        let cache = WeightOffloadHostCache::new(8).unwrap();
+        let ledger = LeaseLedger::new(0, 8, 0);
+        let worker_ledger = ledger.clone();
+        let worker_cache = cache.clone();
+        let (tx, rx) = mpsc::channel();
+        // A regression must fail by timeout, rather than hang this test binary
+        // if a coordinator callback is invoked under the cache's write lock.
+        let worker = std::thread::spawn(move || {
+            let governor = ObservingGovernor {
+                inner: LedgerGovernor::new(worker_ledger),
+                cache: worker_cache.clone(),
+                observed: Mutex::new(Vec::new()),
+            };
+            let first = worker_cache.adopt_governed_budget(&governor, HolderId::new(10));
+            let second = worker_cache.adopt_governed_budget(&governor, HolderId::new(10));
+            tx.send((first, second, governor.observed.lock().unwrap().clone()))
+                .unwrap();
+        });
+        let (first, second, observed) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("governor observers must not deadlock on host-cache state");
+        assert_eq!(first.unwrap(), 8);
+        assert_eq!(second.unwrap(), 8);
+        worker.join().unwrap();
+        assert_eq!(
+            observed,
+            vec![("available", (8, false)), ("reserve", (8, false))]
+        );
+        assert_eq!(cache.budget(), (8, true));
+        assert_eq!(ledger.used(Tier::Host), 8);
+        drop(cache);
+        assert_eq!(ledger.used(Tier::Host), 0);
     }
 
     #[test]

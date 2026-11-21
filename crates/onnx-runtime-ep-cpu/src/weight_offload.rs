@@ -383,13 +383,6 @@ pub fn weight_offload_stats() -> WeightOffloadStats {
     metrics().snapshot()
 }
 
-pub(crate) fn weight_offload_host_budget(governor_bytes: u64) -> Result<usize, &'static str> {
-    checked_host_budget(
-        effective_host_budget_u64(governor_bytes)
-            .map_err(|_| "host-cache byte budget is not valid for the memory governor")?,
-    )
-}
-
 pub(crate) fn effective_host_budget_u64(
     governor_bytes: u64,
 ) -> Result<u64, onnx_runtime_memory_api::MemoryError> {
