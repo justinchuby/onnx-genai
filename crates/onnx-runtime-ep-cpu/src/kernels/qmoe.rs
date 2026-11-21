@@ -1105,7 +1105,7 @@ impl WeightOffloadHostCache {
             inner: Arc::new(WeightOffloadHostCacheInner {
                 cache: Mutex::new(HostExpertCache::default()),
                 budget: RwLock::new(HostCacheBudget::Governed {
-                    authority: governor.authority_id(),
+                    authority: governor.authority_id(onnx_runtime_memory_api::Tier::Host),
                     lease,
                 }),
                 adoption: Mutex::new(()),
@@ -1142,7 +1142,7 @@ impl WeightOffloadHostCache {
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64> {
-        let requested_authority = governor.authority_id();
+        let requested_authority = governor.authority_id(onnx_runtime_memory_api::Tier::Host);
         let _adoption = self
             .inner
             .adoption
@@ -3586,8 +3586,8 @@ mod tests {
             observed: Mutex<Vec<(&'static str, (u64, bool))>>,
         }
         impl MemoryGovernor for ObservingGovernor {
-            fn authority_id(&self) -> MemoryAuthorityId {
-                self.inner.authority_id()
+            fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
+                self.inner.authority_id(tier)
             }
             fn reserve(
                 &self,

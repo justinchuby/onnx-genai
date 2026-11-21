@@ -670,7 +670,7 @@ impl ProcessMemoryManager {
     ) -> Result<RegisteredMemoryAuthority, AllocationTransactionError> {
         let label = label.into();
         // Third-party callbacks run before the non-reentrant registration gate.
-        let memory_authority = governor.authority_id();
+        let memory_authority = governor.authority_id(device.tier);
         let _registration = self
             .inner
             .registration_gate

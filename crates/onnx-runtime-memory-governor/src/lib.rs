@@ -1824,13 +1824,17 @@ pub trait PressureResponder: Send + Sync {
 
 /// The authority that grants leases.
 pub trait MemoryGovernor {
-    /// Stable identity of the physical-memory books this governor charges.
+    /// Stable identity of the physical-memory books charged for `tier`.
+    ///
+    /// Composite governors must resolve the same per-tier ledger used by
+    /// `reserve`, `record_committed`, and mapped allowances. Sharing device
+    /// books does not imply that host or disk books are also shared.
     ///
     /// Backings that retain physical allocations after unmapping use this to
     /// reject a buffer wired to different books. Implementations must return
     /// the same value for their lifetime. Two governors may return the same ID
     /// only when they deliberately share one physical-memory ledger.
-    fn authority_id(&self) -> MemoryAuthorityId;
+    fn authority_id(&self, tier: Tier) -> MemoryAuthorityId;
 
     /// Reserve `bytes` on `tier` for `role`, or fail without disturbing any
     /// existing lease.
@@ -1995,7 +1999,7 @@ impl LedgerGovernor {
 }
 
 impl MemoryGovernor for LedgerGovernor {
-    fn authority_id(&self) -> MemoryAuthorityId {
+    fn authority_id(&self, _tier: Tier) -> MemoryAuthorityId {
         self.ledger.authority_id
     }
 
@@ -2026,7 +2030,7 @@ impl MemoryGovernor for LedgerGovernor {
         self.ledger
             .try_reserve_mapped_allowance(tier, bytes, role)?;
         let allowance = MappedAllowance::new(
-            self.authority_id(),
+            self.authority_id(tier),
             tier,
             bytes,
             role,
@@ -2846,9 +2850,18 @@ mod tests {
         let second_wrapper = LedgerGovernor::new(ledger);
         let independent = LedgerGovernor::new(LeaseLedger::new(10, 0, 0));
 
-        assert_eq!(governor.authority_id(), second_wrapper.authority_id());
-        assert_ne!(governor.authority_id(), independent.authority_id());
-        assert_eq!(governor.authority_id().device(), DeviceKey::device(0));
+        assert_eq!(
+            governor.authority_id(Tier::Device),
+            second_wrapper.authority_id(Tier::Device)
+        );
+        assert_ne!(
+            governor.authority_id(Tier::Device),
+            independent.authority_id(Tier::Device)
+        );
+        assert_eq!(
+            governor.authority_id(Tier::Device).device(),
+            DeviceKey::device(0)
+        );
     }
 
     #[test]

@@ -56,7 +56,7 @@ impl DeviceMemoryAuthority {
     }
 
     pub fn authority_id(&self) -> MemoryAuthorityId {
-        self.governor.authority_id()
+        self.governor.authority_id(Tier::Device)
     }
 
     pub fn limit_bytes(&self) -> u64 {
@@ -149,8 +149,8 @@ impl DeviceMemoryAuthority {
 }
 
 impl MemoryGovernor for DeviceMemoryAuthority {
-    fn authority_id(&self) -> MemoryAuthorityId {
-        self.governor.authority_id()
+    fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
+        self.governor.authority_id(tier)
     }
 
     fn reserve(
@@ -327,8 +327,8 @@ impl EngineMemoryAccounting {
 }
 
 impl MemoryGovernor for EngineMemoryGovernor {
-    fn authority_id(&self) -> MemoryAuthorityId {
-        self.device.authority_id()
+    fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
+        self.governor(tier).authority_id(tier)
     }
 
     fn reserve(
@@ -398,6 +398,53 @@ impl MemoryGovernor for EngineMemoryGovernor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_tier_governor_identity_matches_the_lease_accounting_books() {
+        let first = EngineMemoryGovernor::new(
+            DeviceMemoryAuthority::new(DeviceCompatibilityDomain::Host, 100),
+            100,
+            80,
+        );
+        let cloned = first.clone();
+        for tier in Tier::ALL {
+            assert_eq!(first.authority_id(tier), cloned.authority_id(tier));
+            let allowance = first
+                .reserve_mapped_allowance(tier, 0, MemoryRole::Weights, HolderId::new(1))
+                .unwrap();
+            assert_eq!(
+                first.authority_id(tier),
+                allowance.authority(),
+                "mapped tier={tier:?}"
+            );
+            let lease = first
+                .reserve(tier, 0, MemoryRole::Weights, HolderId::new(1))
+                .unwrap();
+            assert_eq!(
+                Some(first.authority_id(tier)),
+                lease.authority_id(),
+                "tier={tier:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn per_tier_host_cache_rejects_foreign_host_books_behind_a_shared_device() {
+        let device = DeviceMemoryAuthority::new(DeviceCompatibilityDomain::Host, 100);
+        let first = EngineMemoryGovernor::new(device.clone(), 100, 80);
+        let second = EngineMemoryGovernor::new(device, 100, 80);
+        let holder = HolderId::new(10);
+        let cache =
+            onnx_runtime_ep_cpu::WeightOffloadHostCache::new_leased(8, &first, holder).unwrap();
+        assert!(cache.adopt_governed_budget(&first.clone(), holder).is_ok());
+        assert!(
+            cache.adopt_governed_budget(&second, holder).is_err(),
+            "sharing Device books must not make independent Host books interchangeable"
+        );
+        assert_eq!(first.used(Tier::Host), 8);
+        assert_eq!(second.used(Tier::Host), 0);
+    }
 
     #[test]
     fn shared_authority_combines_headroom_and_releases_per_lease() {

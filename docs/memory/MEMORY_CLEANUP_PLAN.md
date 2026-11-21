@@ -336,3 +336,20 @@ full-residency predicate also needs auditing against cached foreign-layer
 entries and concurrent callers before treating isolated cache-stat parity as a
 universal guarantee. CPU/GPU hybrid execution and asynchronous device lifetimes
 still require real-device evidence.
+
+
+### Per-tier authority identity
+
+`MemoryGovernor::authority_id(tier)` resolves the same books as a lease or
+mapped allowance for that tier. The engine composes shared Device books with
+worker-group-local Host/Disk books; a single Device identity incorrectly made
+separate Host partitions look interchangeable when engines shared a device.
+QMoE adoption now compares Host identity, virtual buffers compare their requested
+tier, and process registration uses the declared device key's tier. CUDA pools
+validate their context against Device identity, while sharing/admission/reclaim
+use the physical location's tier: Device for VRAM and Host for Host-NUMA. All governor implementations and callers
+use the explicit tier; no old-signature shim is retained. Regressions reproduce
+both the original identity/lease mismatch and foreign Host adoption behind a
+shared Device authority, then check clones and mapped allowances. This fixes
+identity routing, not the separate physical-capacity relationship between CPU
+hot-tier and Host books.

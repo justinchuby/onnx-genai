@@ -228,7 +228,7 @@ fn vmm_committed_authority_matches(
     allocator: &crate::vmm_allocator::CudaVmmAllocator,
     governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
 ) -> bool {
-    allocator.committed_byte_authority() == Some(governor.authority_id())
+    allocator.committed_byte_authority() == Some(governor.authority_id(Tier::Device))
 }
 
 /// Snapshot of the process-global weight-offload counters.
@@ -3772,7 +3772,7 @@ impl CudaWeightResidency {
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64, onnx_runtime_memory_api::MemoryError> {
         if let Some(physical) = self.physical.get() {
-            if physical.governor.authority_id() != governor.authority_id() {
+            if physical.governor.authority_id(Tier::Device) != governor.authority_id(tier) {
                 return Err(onnx_runtime_memory_api::MemoryError::InvalidRequest {
                     tier: tier.name(),
                     requested: 0,
@@ -4869,7 +4869,7 @@ impl CudaWeightResidency {
                 "VMM weight residency and its governor must share one committed-byte \
                      authority (allocator: {:?}, governor: {:?})",
                 allocator.committed_byte_authority(),
-                governor.authority_id()
+                governor.authority_id(Tier::Device)
             )));
         }
         let _ = self.physical.set(PhysicalAdmission {
@@ -4896,7 +4896,7 @@ impl CudaWeightResidency {
                 "VMM weight residency and its governor must share one committed-byte \
                      authority (allocator: {:?}, governor: {:?})",
                 allocator.committed_byte_authority(),
-                governor.authority_id()
+                governor.authority_id(Tier::Device)
             )));
         }
         self.physical

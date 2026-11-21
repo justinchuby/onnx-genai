@@ -86,7 +86,7 @@ struct MyOwnGovernor {
 }
 
 impl MemoryGovernor for MyOwnGovernor {
-    fn authority_id(&self) -> MemoryAuthorityId {
+    fn authority_id(&self, _tier: Tier) -> MemoryAuthorityId {
         self.authority_id
     }
 

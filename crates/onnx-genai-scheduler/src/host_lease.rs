@@ -227,7 +227,7 @@ impl HostLeaseGovernor {
 }
 
 impl MemoryGovernor for HostLeaseGovernor {
-    fn authority_id(&self) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+    fn authority_id(&self, _tier: Tier) -> onnx_runtime_memory_governor::MemoryAuthorityId {
         self.authority_id
     }
 
@@ -297,7 +297,10 @@ mod tests {
         let first = HostLeaseGovernor::new(Arc::clone(&host), DEVICE, 1);
         let second = HostLeaseGovernor::new(host, LocalDeviceId::new(1), 2);
 
-        assert_eq!(first.authority_id(), second.authority_id());
+        assert_eq!(
+            first.authority_id(Tier::Host),
+            second.authority_id(Tier::Host)
+        );
     }
 
     /// The point of the adapter: a lease is charged to the *machine's* ledger,

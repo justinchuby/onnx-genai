@@ -52,7 +52,7 @@ impl ManagedCudaAllocatorConfig {
             ))
         })?;
         let expected = DeviceKey::device(device);
-        let actual = governor.authority_id().device();
+        let actual = governor.authority_id(Tier::Device).device();
         if actual != expected {
             return Err(OrtError::InvalidArgument(format!(
                 "managed CUDA allocator authority is registered for {actual:?}, not {expected:?}"
@@ -70,7 +70,7 @@ impl ManagedCudaAllocatorConfig {
     }
 
     pub(crate) fn authority_id(&self) -> onnx_runtime_memory_governor::MemoryAuthorityId {
-        self.governor.authority_id()
+        self.governor.authority_id(Tier::Device)
     }
 
     pub(crate) fn manager(&self) -> &ProcessMemoryManager {
@@ -87,7 +87,7 @@ impl fmt::Debug for ManagedCudaAllocatorConfig {
         formatter
             .debug_struct("ManagedCudaAllocatorConfig")
             .field("device_id", &self.device_id)
-            .field("authority_id", &self.governor.authority_id())
+            .field("authority_id", &self.governor.authority_id(Tier::Device))
             .finish_non_exhaustive()
     }
 }

@@ -405,7 +405,7 @@ fn lowering_an_authority_can_trim_unmapped_pool_handles() {
         .expect("return");
 
     assert_eq!(
-        trim_physical_handle_pools(governor.authority_id(), granule as u64)
+        trim_physical_handle_pools(governor.authority_id(Tier::Device), granule as u64)
             .expect("trim one granule"),
         granule as u64
     );
@@ -596,7 +596,7 @@ fn authority_write_gate_freezes_pool_checkout_and_return() {
         .expect("first commit");
     backing.release(&mut first, 0, granule).expect("seed pool");
 
-    let gate = physical_pool_authority_gate(governor.authority_id());
+    let gate = physical_pool_authority_gate(governor.authority_id(Tier::Device));
     let writer = gate
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -657,7 +657,7 @@ fn authority_write_gate_freezes_pool_checkout_and_return() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let before_trim = stats.snapshot();
     assert_eq!(
-        trim_physical_handle_pools(governor.authority_id(), granule as u64)
+        trim_physical_handle_pools(governor.authority_id(Tier::Device), granule as u64)
             .expect("transaction trim"),
         granule as u64
     );

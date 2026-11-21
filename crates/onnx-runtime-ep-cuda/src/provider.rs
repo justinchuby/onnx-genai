@@ -5593,12 +5593,12 @@ impl ExecutionProvider for CudaExecutionProvider {
     ) -> Result<u64> {
         if let Some(arena) = self.memory.vmm() {
             if let Some(authority) = arena.physical_pool_authority()
-                && authority != governor.authority_id()
+                && authority != governor.authority_id(tier)
             {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep: physical-handle pool uses {authority}, but adoption supplied {}; \
                      both must use the same memory authority",
-                    governor.authority_id()
+                    governor.authority_id(tier)
                 )));
             }
             // The arena has been serving allocations against its own ledger
