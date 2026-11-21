@@ -281,18 +281,10 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
     0
 }
 
-/// Evict all entries from the global weight-transpose caches.
+/// Explicit diagnostic reset of the shared transpose store.
 ///
-/// **Must** be called when an Executor drops. The caches are keyed by
-/// (address, K, N), and an address only names a tensor while that tensor is
-/// *live*: once freed, a same-shaped weight landing on the recycled address
-/// matches the key and is served the previous weight's rows (#1726). Clearing
-/// on Executor drop bounds cache growth across model lifetimes and closes that
-/// window for the prewarmed entries, which have no other owner; entries a
-/// [`MatMulPrepack`] installed are evicted when it drops.
-///
-/// Note this runs *before* `Executor::drop` frees the weight buffers, which is
-/// what makes the teardown ordering safe rather than merely lucky.
+/// Normal executor teardown drops its kernel and preparation owners before
+/// freeing weight buffers; it must not clear another session's warmed entries.
 pub fn clear_weight_transpose_caches() {
     weight_transpose::clear_all();
 }
@@ -569,6 +561,11 @@ impl Default for MatMulPrepack {
 }
 
 impl MatMulPrepack {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) fn has_prepared_transpose(&self) -> bool {
+        self.transposed_b.get().is_some() || self.transposed_b_f16.get().is_some()
+    }
+
     /// Preserve load-time transpose warming inside the owning kernel’s policy.
     pub(crate) fn prepare_constants(
         &mut self,
@@ -2299,15 +2296,6 @@ mod gemm_bt_avx2 {
 }
 
 impl Kernel for MatMulKernel {
-    fn prepare_constant_inputs(
-        &mut self,
-        constants: &[Option<onnx_runtime_ep_api::KernelConstantInput<'_>>],
-        _provider: &dyn onnx_runtime_ep_api::ExecutionProvider,
-    ) -> Result<()> {
-        self.prepack.prepare_constants(constants);
-        Ok(())
-    }
-
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         self.prepack.set_constant_inputs(constant_inputs);
     }
@@ -4041,12 +4029,9 @@ mod tests {
                 ..Default::default()
             });
             let b = Owned::f16(&[5, 7], &[0.25; 35]);
-            let mut kernel = provider
-                .get_kernel(&node, &[vec![1, 5], vec![5, 7]], 17)
-                .unwrap();
-            kernel.set_constant_inputs(&[false, true]);
-            kernel
-                .prepare_constant_inputs(
+            let state = provider
+                .prepare_static_constants(
+                    &node,
                     &[
                         None,
                         Some(KernelConstantInput {
@@ -4055,15 +4040,13 @@ mod tests {
                             bytes: &b.bytes,
                         }),
                     ],
-                    &provider,
                 )
                 .unwrap();
-            let concrete = kernel
-                .as_ref()
-                .as_any()
-                .downcast_ref::<MatMulKernel>()
-                .unwrap();
-            assert_eq!(concrete.prepack.transposed_b_f16.get().is_some(), admitted);
+            assert_eq!(state.is_some(), admitted);
+            if let Some(state) = state {
+                let prepack = state.downcast_ref::<MatMulPrepack>().unwrap();
+                assert!(prepack.transposed_b_f16.get().is_some());
+            }
         }
     }
 

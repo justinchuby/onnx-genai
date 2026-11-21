@@ -72,6 +72,14 @@ impl PluginExecutionProvider {
 }
 
 impl ExecutionProvider for PluginExecutionProvider {
+    fn prepare_static_constants(
+        &self,
+        node: &Node,
+        constants: &[Option<onnx_runtime_ep_api::KernelConstantInput<'_>>],
+    ) -> onnx_runtime_ep_api::Result<Option<Arc<dyn std::any::Any + Send + Sync>>> {
+        self.cpu.prepare_static_constants(node, constants)
+    }
+
     fn name(&self) -> &str {
         &self.provider_name
     }

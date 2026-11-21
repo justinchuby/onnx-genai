@@ -943,10 +943,6 @@ impl Drop for Executor {
                  dispatch_elided={dispatch_elided}"
             );
         }
-        // Evict the global weight-transpose cache to prevent address-reuse
-        // staleness: if a subsequently loaded model's mmap recycles a virtual
-        // address, the cache must not serve the old model's transposed weights.
-        onnx_runtime_ep_cpu::kernels::matmul::clear_weight_transpose_caches();
         // Same lifetime boundary for the shared MLAS SQNBit packed weights
         // (#1056): they are keyed on the weight's address, so a later model whose
         // mmap recycles an address for a same-shaped weight must not inherit this
@@ -1032,6 +1028,11 @@ impl Drop for Executor {
                 );
             }
         }
+        // Each kernel/preparation owns its installed transpose entries. Drop
+        // only this executor's owners before freeing their source buffers;
+        // clearing the shared store would discard another session's prewarm.
+        self.cache.entries.clear();
+        self.static_constant_states.clear();
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
             if safe_to_release {

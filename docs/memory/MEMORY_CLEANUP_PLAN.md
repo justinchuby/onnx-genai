@@ -476,3 +476,9 @@ and transient QMoE payloads retain their separate owned Host grants. Remaining
 work includes idle retained QMoE reservations, actual grants for other legacy
 packed caches, and the CPU Device/Host physical-capacity relationship. No GPU
 execution or throughput claim follows from these changes.
+
+Load-time constant preparation is a provider hook over immutable host operands,
+independent of unresolved activation shapes. Its returned state belongs to the
+executor. CPU transpose warming uses the same prepack policy and memo mechanism
+as concrete kernels, so both static and symbolic graphs retain their load-time
+warm path and release its ownership with the session.

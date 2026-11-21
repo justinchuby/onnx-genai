@@ -759,8 +759,8 @@ mod tests {
     /// Characterizes the limitation the key does **not** remove: one address
     /// holding a *same-shaped* tensor with different contents (a second model
     /// whose mmap lands on a recycled address) still hits the cached entry.
-    /// That is a lifetime problem, and this is why `clear_weight_transpose_caches`
-    /// on `Executor` drop stays load-bearing.
+    /// That is a lifetime problem: production owners must evict their entries
+    /// before source buffers are freed. This raw-store test owns its reset.
     #[test]
     fn same_address_same_shape_is_stale_until_cleared() {
         let cache = cache();

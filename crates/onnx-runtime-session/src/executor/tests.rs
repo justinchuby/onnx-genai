@@ -8543,6 +8543,69 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
     assert!(!first.contains("more unsupported node"));
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn symbolic_cpu_session_prepares_constants_at_load_with_own_retention_policy() {
+    for admitted in [false, true] {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let batch = graph.create_symbol(None);
+        let x = graph.create_named_value(
+            "x",
+            DataType::Float32,
+            vec![Dim::Symbolic(batch), Dim::Static(5)],
+        );
+        let b = graph.create_named_value("b", DataType::Float16, static_shape([5, 7]));
+        let y = graph.create_named_value(
+            "y",
+            DataType::Float32,
+            vec![Dim::Symbolic(batch), Dim::Static(7)],
+        );
+        graph.initializers.insert(
+            b,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Float16,
+                vec![5, 7],
+                [0u8, 0x3c].repeat(35),
+            )),
+        );
+        graph.add_input(x);
+        graph.add_output(y);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(x), Some(b)],
+            vec![y],
+        ));
+        let cpu = CpuExecutionProvider::initialized_with_resources(
+            onnx_runtime_ep_cpu::CpuMemoryResources {
+                cache_retention: onnx_runtime_ep_cpu::CpuCacheRetention::new(admitted),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut executor =
+            Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(cpu), None).unwrap();
+        assert!(executor.has_symbols);
+        assert_eq!(
+            executor.cache.stats().entries,
+            0,
+            "activation specialization must still wait for the request"
+        );
+        assert_eq!(
+            executor.static_constant_states.len(),
+            usize::from(admitted),
+            "constant warming must already obey this provider's verdict at load"
+        );
+        for rows in [1usize, 2, 1] {
+            let input = Tensor::from_f32(&[rows, 5], &vec![1.; rows * 5]).unwrap();
+            let output = executor.run(&[("x", &input)]).unwrap();
+            assert_eq!(output[0].to_vec_f32(), vec![5.; rows * 7]);
+            assert_eq!(executor.static_constant_states.len(), usize::from(admitted));
+        }
+    }
+}
+
 #[test]
 fn configured_cpu_fallback_is_used_and_non_cpu_fallback_is_rejected() {
     let make_graph = || {
@@ -13609,17 +13672,22 @@ fn prepare_workspace_resolves_deepseek_additive_mask_query_axis_exactly() {
 /// Asserted over the source because the failure has no observable signal to
 /// probe for. Reversing the order in `Executor::drop` fails this test.
 #[test]
-fn weight_derived_caches_are_cleared_before_their_buffers_are_freed() {
+fn weight_derived_cache_owners_are_released_before_their_buffers_are_freed() {
     let source = include_str!("mod.rs");
     let drop_body = source
         .split_once("impl Drop for Executor {")
         .expect("Executor has a Drop impl")
         .1;
+    assert!(
+        !drop_body.contains("clear_weight_transpose_caches()"),
+        "dropping one executor must not clear another session's warmed transposes"
+    );
     let free = drop_body
         .find("self.buffers.drain()")
         .expect("the drop body frees the executor's buffers");
     for clear in [
-        "clear_weight_transpose_caches()",
+        "self.cache.entries.clear()",
+        "self.static_constant_states.clear()",
         "clear_mlas_packed_caches()",
     ] {
         let at = drop_body

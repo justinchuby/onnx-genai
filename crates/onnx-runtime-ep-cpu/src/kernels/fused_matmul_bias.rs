@@ -57,15 +57,6 @@ impl KernelFactory for FusedMatMulBiasFactory {
 }
 
 impl Kernel for FusedMatMulBiasKernel {
-    fn prepare_constant_inputs(
-        &mut self,
-        constants: &[Option<onnx_runtime_ep_api::KernelConstantInput<'_>>],
-        _provider: &dyn onnx_runtime_ep_api::ExecutionProvider,
-    ) -> Result<()> {
-        self.prepack.prepare_constants(constants);
-        Ok(())
-    }
-
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         self.prepack.set_constant_inputs(constant_inputs);
     }

@@ -1188,6 +1188,7 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
+            static_constant_states: Vec::new(),
             provider_artifact_readiness: ProviderArtifactReadiness::default(),
             persistent_workspace: None,
             step_workspace: None,
@@ -1195,6 +1196,42 @@ impl Executor {
             inherited_workspace: None,
             workspace_preparation_required: false,
         };
+
+        // Constant preparation depends only on immutable operand metadata.
+        // Providers decide eligibility; unresolved activation shapes do not
+        // postpone load-time preparation to the first request.
+        for node_plan in &exec.plan {
+            let node = exec.graph.node(node_plan.node_id);
+            let constants = node_plan
+                .inputs
+                .iter()
+                .map(|input| {
+                    let value = (*input)?;
+                    let weight = exec.graph.initializers.get(&value)?;
+                    let buffer = exec.buffers.get(&value)?;
+                    if !buffer.device().is_host_accessible() {
+                        return None;
+                    }
+                    let bytes = if buffer.is_empty() {
+                        &[]
+                    } else {
+                        // SAFETY: this is an initialized, host-accessible immutable
+                        // initializer buffer owned by this executor for the call.
+                        unsafe {
+                            std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len())
+                        }
+                    };
+                    Some(KernelConstantInput {
+                        dtype: weight.dtype(),
+                        shape: exec.buffer_shapes.get(&value)?,
+                        bytes,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if let Some(state) = exec.ep.prepare_static_constants(node, &constants)? {
+                exec.static_constant_states.push(state);
+            }
+        }
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
         //    "compiled plan" of kernels), so the first `run` sees only cache
