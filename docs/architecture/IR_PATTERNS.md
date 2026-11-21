@@ -389,8 +389,9 @@ formal-attribute context before copying it into the body.
 
 Resolved tensor metadata is published through `Value::set_tensor_facts`, which
 updates dtype, shape and known-state flags together. Inference writeback and
-immutable dense initializer attachment use this same operation; an unresolved rank remains
-unknown rather than becoming an empty scalar shape. Source `declared_type` is
+immutable dense initializer attachment use this same operation. Attachment fills only
+unknown fields, preserving conflicting known declarations for validation. An unresolved
+rank remains unknown rather than becoming an empty scalar shape. Source `declared_type` is
 retained separately, including container descriptors.
 
 Dense and sparse initializer defaults retain their shared identity with graph

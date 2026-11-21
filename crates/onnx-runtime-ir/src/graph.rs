@@ -450,10 +450,20 @@ impl Graph {
         if self.is_constant_initializer(value) {
             let weight = &self.initializers[&value];
             if let Some(metadata) = self.values.get_mut(value) {
-                metadata.set_tensor_facts(
-                    weight.dtype(),
-                    crate::static_shape(weight.dims().iter().copied()),
-                );
+                // Preserve existing facts so validation can still diagnose a
+                // conflicting declaration rather than laundering it through
+                // the initializer's metadata.
+                let dtype = if metadata.tensor_type_known {
+                    metadata.dtype
+                } else {
+                    weight.dtype()
+                };
+                let shape = if metadata.tensor_shape_known {
+                    metadata.shape.clone()
+                } else {
+                    crate::static_shape(weight.dims().iter().copied())
+                };
+                metadata.set_tensor_facts(dtype, shape);
             }
         }
     }
@@ -1870,6 +1880,24 @@ mod effective_opset_tests {
         assert_eq!(
             graph.value(value).tensor_shape(),
             Some(&crate::static_shape([2]))
+        );
+    }
+    #[test]
+    fn attaching_an_initializer_preserves_conflicting_known_facts_for_validation() {
+        let mut graph = Graph::new();
+        let value = graph.create_value(DataType::Int64, crate::static_shape([3]));
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(crate::TensorData::from_raw(
+                DataType::Float32,
+                vec![2],
+                vec![0; 8],
+            )),
+        );
+        assert_eq!(graph.value(value).tensor_dtype(), Some(DataType::Int64));
+        assert_eq!(
+            graph.value(value).tensor_shape(),
+            Some(&crate::static_shape([3]))
         );
     }
     #[test]
