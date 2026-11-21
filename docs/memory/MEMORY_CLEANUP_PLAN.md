@@ -55,7 +55,7 @@ Completed source work:
 - Corrected current allocator-policy descriptions, separated the two backing
   contracts, and repaired documentation links discovered by strict rustdoc.
 
-Validation on macOS arm64, without CUDA hardware:
+Initial validation on macOS arm64, without CUDA hardware:
 
 | Command | Result |
 |---|---|
@@ -94,7 +94,44 @@ Self-review completed before publication:
   separately. Added compile-fail doctests for both removed governor paths and the
   old reservation-trait name; existing allocation/reservation tests remain.
 - Allocation/adoption, map/unmap, pooling, grants/refunds, eviction, capture and
-  release algorithms are unchanged. Full EP/workspace compile coverage remains
-  incomplete because ORT 1.29.0 is unavailable; publish as a draft PR.
+  release algorithms are unchanged. Full EP/workspace compile coverage was
+  initially incomplete because ORT 1.29.0 was unavailable; see the follow-up
+  verification below for the resolved checks.
 
 No throughput or GPU-runtime correctness claim is made by this cleanup.
+
+
+## Follow-up: PyPI runtime update and full compilation (2026-11-20)
+
+The user authorized upgrading ORT to PyPI's latest stable release. Both
+`onnxruntime` and `onnxruntime-gpu` report 1.32.0. Automatic native bootstrap now
+uses SHA-256-pinned official PyPI wheels and the matching Microsoft C API 32
+headers from NuGet, bundled with license and provenance. GitHub availability no
+longer blocks default bootstrap. Python package floors and the producer CI pin
+are updated to 1.32 as well. See the [bootstrap documentation](../../crates/onnx-genai-ort/ort-sys/README.md).
+
+Full compilation exposed missing imports/visibility for the extracted
+`PIN_PROBE_GRANULE_BYTES`, eviction-order parser and test refill environment name.
+Those are corrected without changing their values or behavior. ORT 1.32's new
+optional factory capacity callback is left null, as permitted by the upstream
+contract: the generic EP cannot report device-global capacity.
+
+| Follow-up command | Result |
+|---|---|
+| `cargo check --offline --workspace --all-targets` | Passed; existing unrelated unused-import/dead-code warnings remain |
+| `cargo check --offline -p onnx-runtime-ep-cuda --all-targets --features gpu-tests` | Passed; compilation only, no CUDA device |
+| `cargo test --offline -p onnx-genai-ort-sys` | Passed: seven bootstrap tests and one real-library C API roundtrip |
+| `cargo test --offline -p onnx-genai-ort --test runtime_upgrade` | Passed: actual CPU Identity inference, without optional external fixtures |
+| `cargo test --offline -p onnx-runtime-ep-plugin --lib` | Passed: 384 tests, none ignored |
+| `cargo test --offline -p onnx-runtime-ep-cuda --lib weight_paging::config::tests::` | Passed: all four named tests, first confirmed with `--list` in the real EP crate |
+| `cargo clippy --offline -p onnx-genai-ort-sys --all-targets -- -D warnings` | Passed |
+
+Network access was enabled for commands whose build scripts needed to populate
+new artifact caches; Cargo dependency resolution remained offline. Source checks
+and CPU execution are now verified; CUDA device behavior remains deferred.
+
+Follow-up self-review matched all five wheel URLs and digests against official
+PyPI metadata, and checked all three bundled headers byte-for-byte against the
+verified Microsoft NuGet package. Bootstrap rejects digest mismatches and unsafe
+archive paths before extraction. The EP capacity callback remains explicitly
+unsupported; no device-global capacity is inferred from a process budget.

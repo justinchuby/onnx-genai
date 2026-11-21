@@ -21,5 +21,9 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 libloading = { workspace = true }
 onnx-genai-runtime-config = { workspace = true }
 
+[dev-dependencies]
+sha2 = "0.10"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
 [lints]
 workspace = true

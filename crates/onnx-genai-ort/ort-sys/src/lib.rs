@@ -11,6 +11,8 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+pub const ORT_VERSION: &str = env!("NXRT_ORT_VERSION");
+
 use std::ffi::{CStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -186,7 +188,7 @@ fn load_onnxruntime() -> LoadState {
              Attempted:\n- {}\n\
              Fix: set ONNX_GENAI_ORT_LIB to the full library path, set ONNX_GENAI_ORT_LIB_DIR \
              to a directory containing {}, activate the conda environment that contains ONNX Runtime, \
-             or rebuild so ort-sys downloads ORT 1.29.0.",
+             or rebuild so ort-sys downloads ORT {ORT_VERSION}.",
             attempts.join("\n- "),
             primary_library_name()
         ),
@@ -268,11 +270,11 @@ fn api_version_mismatch_message(
 ) -> String {
     format!(
         "ONNX Runtime API version mismatch: loaded {} ({reason}), ORT version {}, API {}; \
-         onnx-genai was built against API {} (ORT 1.29.x). \
-         Fix: set ONNX_GENAI_ORT_LIB to the full path of an ORT 1.29 library, \
+         onnx-genai was built against API {} (ORT {ORT_VERSION}). \
+         Fix: set ONNX_GENAI_ORT_LIB to the full path of an ORT {ORT_VERSION} library, \
          set ONNX_GENAI_ORT_LIB_DIR to its containing directory, activate the conda \
-         environment that contains ORT 1.29 and put its library directory first on \
-         PATH/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, or rebuild so ort-sys downloads ORT 1.29.0.",
+         environment that contains ORT {ORT_VERSION} and put its library directory first on \
+         PATH/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, or rebuild so ort-sys downloads ORT {ORT_VERSION}.",
         loaded_path.display(),
         loaded_version,
         loaded_api.map_or_else(|| "unknown".to_owned(), |version| version.to_string()),
@@ -471,13 +473,13 @@ fn library_names_for_dir() -> Vec<&'static str> {
     } else if cfg!(target_os = "macos") {
         vec![
             "libonnxruntime.1.dylib",
-            "libonnxruntime.1.29.0.dylib",
+            concat!("libonnxruntime.", env!("NXRT_ORT_VERSION"), ".dylib"),
             "libonnxruntime.dylib",
         ]
     } else {
         vec![
             "libonnxruntime.so.1",
-            "libonnxruntime.so.1.29.0",
+            concat!("libonnxruntime.so.", env!("NXRT_ORT_VERSION")),
             "libonnxruntime.so",
         ]
     }
