@@ -544,8 +544,80 @@ impl Graph {
         nodes
     }
 
-    /// Topological order of nodes via Kahn's algorithm.
+    /// Names this graph and its nested bodies read from an enclosing lexical scope.
+    /// Formal inputs, dense/sparse initializers and local producers shadow outer names.
+    pub fn required_outer_names(&self) -> HashSet<String> {
+        // Postorder worklist avoids consuming the Rust stack for nested graphs.
+        // Graph addresses are identity keys only; no pointer is dereferenced.
+        let mut work = vec![(self, false)];
+        let mut completed: HashMap<*const Graph, HashSet<String>> = HashMap::new();
+        while let Some((graph, visited)) = work.pop() {
+            if !visited {
+                work.push((graph, true));
+                work.extend(graph.subgraphs.values().map(|body| (body, false)));
+                continue;
+            }
+            let formal: HashSet<ValueId> = graph.inputs.iter().copied().collect();
+            let local_names: HashSet<&str> = graph
+                .values
+                .iter()
+                .filter_map(|(_, value)| value.name.as_deref())
+                .collect();
+            let mut required = HashSet::new();
+            for (id, value) in graph.values.iter() {
+                if value.producer.is_none()
+                    && !formal.contains(&id)
+                    && !graph.is_initializer(id)
+                    && let Some(name) = &value.name
+                {
+                    required.insert(name.clone());
+                }
+            }
+            for body in graph.subgraphs.values() {
+                if let Some(names) = completed.remove(&(body as *const Graph)) {
+                    required.extend(
+                        names
+                            .into_iter()
+                            .filter(|name| !local_names.contains(name.as_str())),
+                    );
+                }
+            }
+            completed.insert(graph as *const Graph, required);
+        }
+        completed
+            .remove(&(self as *const Graph))
+            .unwrap_or_default()
+    }
+
+    /// Implicit lexical dependencies, separate from positional operator inputs.
+    /// Results are deduplicated and ordered by value ID. An ancestor-only name
+    /// is propagated by `required_outer_names`, rather than fabricated locally.
+    pub fn captured_inputs_by_node(&self) -> HashMap<NodeId, Vec<ValueId>> {
+        if self.subgraphs.is_empty() {
+            return HashMap::new();
+        }
+        let names: HashMap<&str, ValueId> = self
+            .values
+            .iter()
+            .filter_map(|(id, value)| value.name.as_deref().map(|name| (name, id)))
+            .collect();
+        let mut captured: HashMap<NodeId, Vec<ValueId>> = HashMap::new();
+        for ((owner, _), body) in &self.subgraphs {
+            for name in body.required_outer_names() {
+                if let Some(&id) = names.get(name.as_str()) {
+                    captured.entry(*owner).or_default().push(id);
+                }
+            }
+        }
+        for values in captured.values_mut() {
+            values.sort_unstable_by_key(|id| id.0);
+            values.dedup();
+        }
+        captured
+    }
+
     ///
+    /// Topological order, including implicit lexical dependencies, via Kahn's algorithm.
     /// Ties are broken by ascending [`NodeId`] for deterministic output.
     /// Returns [`GraphError::CycleDetected`] if the graph has a cycle.
     pub fn topological_order(&self) -> Result<Vec<NodeId>, GraphError> {
@@ -556,8 +628,12 @@ impl Graph {
             in_degree[node.0 as usize] = 0;
         }
 
+        let captures = self.captured_inputs_by_node();
         for (nid, node) in self.nodes.iter() {
-            for v in node.input_values() {
+            for v in node
+                .input_values()
+                .chain(captures.get(&nid).into_iter().flatten().copied())
+            {
                 if let Some(val) = self.values.get(v)
                     && let Some(prod) = val.producer
                     && self.nodes.contains(prod)

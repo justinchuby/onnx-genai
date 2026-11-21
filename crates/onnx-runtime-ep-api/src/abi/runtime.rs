@@ -197,6 +197,7 @@ pub(super) struct PluginKernelShared {
     pub(super) index: usize,
     pub(super) calls: AtomicU64,
     pub(super) device_label: Arc<str>,
+    pub(super) dynamic_output_dtypes: Option<Vec<onnx_runtime_ir::DataType>>,
 }
 
 unsafe impl Send for PluginKernelShared {}
@@ -232,8 +233,8 @@ pub struct PluginCompiledKernel {
     pub(super) shared: Arc<PluginKernelShared>,
 }
 
-impl Kernel for PluginCompiledKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl PluginCompiledKernel {
+    fn compute(&self, mut context: HostKernelContext) -> Result<HostKernelContext> {
         let mut states = self.shared.states.lock().map_err(|_| {
             EpError::KernelFailed(
                 "plugin fused-subgraph state mutex was poisoned; recreate the session".into(),
@@ -279,7 +280,6 @@ impl Kernel for PluginCompiledKernel {
         // subgraph in the process behind one lock, which is the opposite of
         // why the state is per-thread in the first place.
         drop(states);
-        let mut context = HostKernelContext::new(inputs, outputs)?;
         let bytes = context.byte_size();
         let _span = onnx_runtime_tracer::global_context().map(|trace| {
             let span = trace
@@ -312,7 +312,30 @@ impl Kernel for PluginCompiledKernel {
         // failure here is about this call.
         check_compute_status(&self.shared.runtime.path, self.shared.index, status)?;
         self.shared.calls.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(context)
+    }
+}
+
+impl Kernel for PluginCompiledKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.compute(HostKernelContext::new(inputs, outputs)?)
+            .map(|_| ())
+    }
+
+    fn has_kernel_sized_outputs(&self) -> bool {
+        self.shared.dynamic_output_dtypes.is_some()
+    }
+
+    fn execute_kernel_sized(
+        &self,
+        inputs: &[TensorView],
+        requested: &[bool],
+    ) -> Result<Vec<Option<crate::KernelSizedOutput>>> {
+        let dtypes = self.shared.dynamic_output_dtypes.as_ref().ok_or_else(|| {
+            EpError::KernelFailed("plugin kernel was compiled with static output allocation".into())
+        })?;
+        self.compute(HostKernelContext::dynamic(inputs, dtypes, requested)?)?
+            .into_dynamic_outputs()
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {

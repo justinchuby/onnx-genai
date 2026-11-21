@@ -12,6 +12,7 @@ use crate::kernel::{Kernel, KernelMatch};
 use crate::weight::ExecutionProviderCapabilities;
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
+    ValueId,
 };
 use onnx_runtime_memory_api::{
     AllocationIdentity, MemoryRole, OwningAllocation, ProviderContextIdentity,
@@ -1151,6 +1152,52 @@ pub trait HostToDeviceCopier: Send + Sync {
     /// `dst` must point to a live device allocation, on this copier's device,
     /// of at least `src.len()` bytes.
     unsafe fn copy_host_to_device(&self, src: &[u8], dst: *mut c_void) -> Result<()>;
+}
+
+/// Validated graph-local claims from one provider query. Classification is
+/// recomputed after graph rewrites; arena IDs cannot be carried across scopes.
+pub struct GraphKernelClaims(std::collections::HashSet<NodeId>);
+
+impl GraphKernelClaims {
+    pub fn query(provider: &dyn ExecutionProvider, graph: &Graph) -> Result<Self> {
+        let mut nodes = std::collections::HashSet::new();
+        for id in provider.claim_graph(graph)? {
+            if graph.try_node(id).is_none() || !nodes.insert(id) {
+                return Err(EpError::KernelFailed(format!(
+                    "provider '{}' returned an invalid or duplicate whole-graph claim for node #{}; return each live node in this graph at most once",
+                    provider.name(),
+                    id.0,
+                )));
+            }
+        }
+        Ok(Self(nodes))
+    }
+
+    pub fn contains(&self, node: NodeId) -> bool {
+        self.0.contains(&node)
+    }
+}
+
+/// Artifact authority available to a graph compiler. Foreign ORT callbacks
+/// are unscoped; native execution supplies its existing private namespace.
+#[derive(Clone, Copy, Debug)]
+pub enum GraphKernelScope {
+    Unscoped,
+    Executor {
+        provider: ExecutorArtifactProviderId,
+        executor: ExecutorInstanceId,
+        generation: ExecutorArtifactGeneration,
+    },
+}
+
+/// Whole-graph compilation input for an explicitly claimed node.
+/// Positional inputs retain ONNX slots; lexical captures follow them in stable
+/// value-ID order. The graph includes every sibling and recursively nested body.
+pub struct GraphKernelRequest<'a> {
+    pub scope: GraphKernelScope,
+    pub graph: &'a Graph,
+    pub node: &'a Node,
+    pub inputs: &'a [Option<ValueId>],
 }
 
 /// Source-attributed device allocations made outside an EP's allocator seam.
@@ -2385,10 +2432,37 @@ pub trait ExecutionProvider: Send + Sync {
         Vec::new()
     }
 
-    /// Nodes this EP claims unconditionally (bypassing cost-model placement).
-    fn claim_nodes(&self, graph: &Graph) -> Vec<NodeId> {
+    /// Claim graph-backed kernels using the complete owning graph, including
+    /// control-flow bodies and lexical capture metadata. Called before kernel
+    /// planning, and again after structural rewrites. This query must not
+    /// allocate executor artifacts. Every returned ID must be live and unique.
+    ///
+    /// An accepted control-flow node executes the provider's compiled kernel;
+    /// unclaimed control flow retains the runtime's standard implementation.
+    fn claim_graph(&self, graph: &Graph) -> Result<Vec<NodeId>> {
         let _ = graph;
-        Vec::new()
+        Ok(Vec::new())
+    }
+
+    /// Compile a previously accepted graph-backed node under its executor's
+    /// artifact namespace or an explicitly unscoped ORT callback. Providers
+    /// requiring executor-owned artifacts must reject `GraphKernelScope::Unscoped`.
+    /// An accepted claim must compile or report an error;
+    /// compilation failure never silently switches execution semantics.
+    fn get_graph_kernel(
+        &self,
+        request: GraphKernelRequest<'_>,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> Result<Box<dyn Kernel>> {
+        let _ = (shapes, opset);
+        Err(EpError::KernelFailed(format!(
+            "{} claimed graph node #{} ('{}::{}') but provides no graph compiler; implement get_graph_kernel or decline this node in claim_graph",
+            self.name(),
+            request.node.id.0,
+            request.node.domain,
+            request.node.op_type,
+        )))
     }
 
     /// The `EPContext` node `source` key(s) this EP accepts for compiled-context

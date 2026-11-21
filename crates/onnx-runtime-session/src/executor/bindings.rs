@@ -250,6 +250,7 @@ impl Executor {
         if let Some(shape) = self
             .value_shapes
             .get(&value)
+            .and_then(Option::as_ref)
             .and_then(|shape| substitute(shape, symbols))
         {
             return Some(shape);
@@ -489,13 +490,17 @@ impl Executor {
         if let Some(dims) = self.exact_runtime_value_shape(value, symbols, 0) {
             return Ok(PlannedInputShape::Exact(dims));
         }
-        let shape = self.value_shapes.get(&value).ok_or_else(|| {
-            SessionError::Internal(format!(
-                "prepare-only workspace planning has no loader shape for input {index} of \
+        let shape = self
+            .value_shapes
+            .get(&value)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "prepare-only workspace planning has no loader shape for input {index} of \
                  node {} ('{}::{}')",
-                node_id.0, node.domain, node.op_type
-            ))
-        })?;
+                    node_id.0, node.domain, node.op_type
+                ))
+            })?;
         let mut dims = Vec::with_capacity(shape.len());
         let mut applied = Vec::new();
         for (axis, dim) in shape.iter().enumerate() {
@@ -635,6 +640,19 @@ impl Executor {
                 &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
                 graph_tokens,
+                self.plan[pi]
+                    .graph_kernel
+                    .then_some(onnx_runtime_ep_api::GraphKernelRequest {
+                        scope: onnx_runtime_ep_api::GraphKernelScope::Executor {
+                            provider: self.artifact_config.provider(),
+                            executor: self.artifact_config.executor(),
+                            generation: self.artifact_config.generation(),
+                        },
+
+                        graph: &self.graph,
+                        node,
+                        inputs: &self.plan[pi].inputs,
+                    }),
             )?;
             self.kernel_bindings[pi] = Some(key);
             let metadata = input_shapes
@@ -886,7 +904,9 @@ impl Executor {
                 got: format!("{dtype:?}"),
             });
         }
-        let decl = &self.value_shapes[&vid];
+        let Some(decl) = &self.value_shapes[&vid] else {
+            return Ok(());
+        };
         if decl.len() != shape.len() {
             return Err(SessionError::RankMismatch {
                 name: name.to_string(),

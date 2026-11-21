@@ -121,7 +121,8 @@ impl Executor {
         // from `self` and can stay live across the dispatch.
         let (is_control_flow, is_sequence, _span) = {
             let node = self.graph.node(self.plan[pi].node_id);
-            let is_control_flow = is_control_flow_op(&node.op_type, &node.domain);
+            let is_control_flow =
+                !self.plan[pi].graph_kernel && is_control_flow_op(&node.op_type, &node.domain);
             let is_sequence = is_sequence_op(&node.op_type, &node.domain);
             // Open the span only when tracing is live so an untraced decode step
             // never allocates a span name or touches the thread-local span stack.
@@ -512,6 +513,7 @@ impl Executor {
         // disjoint `&mut self.<field>` borrows the compute path takes (the
         // dispatch never goes through a `&mut self` method while they are held).
         let node_id = self.plan[pi].node_id;
+        let graph_kernel = self.plan[pi].graph_kernel;
         // Refill the reusable per-executor input-shape scratch first (before the
         // shared borrows below), so a steady-state decode step allocates no
         // fresh `Vec<Vec<usize>>` for shape lookup -- see `refill_input_shapes`.
@@ -529,16 +531,25 @@ impl Executor {
         // then data-dependent just-in-time sizing, then the Attention present-KV
         // capacity widening. Mutates `resolved`; returns the final shapes.
         let output_shape_scratch = std::mem::take(&mut self.scratch_output_shapes);
-        let output_shapes = self.resolve_node_outputs(
-            output_shape_scratch,
-            node_id,
-            inputs,
-            outputs,
-            input_dtypes,
-            input_shapes,
-            resolved,
-            external,
-        )?;
+        let output_shapes = if graph_kernel {
+            let mut shapes = output_shape_scratch;
+            shapes.clear();
+            if outputs.iter().all(|value| resolved.contains_key(value)) {
+                shapes.extend(outputs.iter().map(|value| resolved[value].clone()));
+            }
+            shapes
+        } else {
+            self.resolve_node_outputs(
+                output_shape_scratch,
+                node_id,
+                inputs,
+                outputs,
+                input_dtypes,
+                input_shapes,
+                resolved,
+                external,
+            )?
+        };
 
         let capabilities = self.ep.capabilities();
         let accepts_lazy_weights = LazyWeightBoundary::matches_any(&node.domain, &node.op_type);
@@ -663,6 +674,17 @@ impl Executor {
                     provider_artifact_readiness,
                     ep.as_ref(),
                     graph_tokens,
+                    graph_kernel.then_some(onnx_runtime_ep_api::GraphKernelRequest {
+                        scope: onnx_runtime_ep_api::GraphKernelScope::Executor {
+                            provider: artifact_config.provider(),
+                            executor: artifact_config.executor(),
+                            generation: artifact_config.generation(),
+                        },
+
+                        graph: ctx.graph,
+                        node,
+                        inputs,
+                    }),
                 )?;
                 kernel_bindings[pi] = Some(key);
             }
@@ -695,6 +717,103 @@ impl Executor {
                 )));
             }
         }
+        // A graph-backed control-flow kernel may discover its output extents
+        // while executing. Keep this opt-in path out of ordinary kernel dispatch.
+        if graph_kernel && kernel.has_kernel_sized_outputs() {
+            use onnx_runtime_ep_api::{
+                KernelSizedOutputPolicy, kernel::validate_kernel_sized_outputs,
+            };
+            if kernel.kernel_sized_output_policy() != KernelSizedOutputPolicy::HostOwned {
+                return Err(EpError::KernelFailed(format!(
+                    "provider '{}' graph node #{} ('{}') requests device-workspace dynamic outputs, which the native graph-kernel adapter cannot prepare; use static device outputs or host-owned dynamic outputs",
+                    ep.name(), node_id.0, node.op_type,
+                )).into());
+            }
+            if in_infos
+                .iter()
+                .any(|info| info.present && !info.device.is_host_accessible())
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "provider '{}' graph node #{} ('{}') requests host-owned dynamic outputs with device-only inputs; implement a device output path before claiming this graph",
+                    ep.name(), node_id.0, node.op_type,
+                )).into());
+            }
+            drop(views);
+            let materialized = materialize_strided_inputs(
+                kernel,
+                &in_infos,
+                node,
+                std::mem::take(&mut self.scratch_materialized_inputs),
+            )?;
+            let views = kernel_input_views(kernel, &in_infos, &materialized, node)?;
+            let requested = node.outputs.iter().map(Option::is_some).collect::<Vec<_>>();
+            let declared = node
+                .outputs
+                .iter()
+                .map(|slot| {
+                    slot.map(|value| {
+                        ctx.graph
+                            .value(value)
+                            .tensor_dtype()
+                            .unwrap_or(DataType::Undefined)
+                    })
+                    .unwrap_or(DataType::Undefined)
+                })
+                .collect::<Vec<_>>();
+            let result = kernel.execute_kernel_sized(&views, &requested)?;
+            validate_kernel_sized_outputs(
+                &result,
+                &requested,
+                &declared,
+                &format!(
+                    "provider '{}' graph node #{} ('{}')",
+                    ep.name(),
+                    node_id.0,
+                    node.op_type
+                ),
+            )
+            .map_err(EpError::KernelFailed)?;
+            let output_ids = node.outputs.clone();
+            for (value, output) in output_ids.iter().zip(&result) {
+                if let (Some(value), Some(output)) = (value, output)
+                    && let Some(binding) = external.outputs.get(value)
+                {
+                    if !binding.accepts_output(
+                        output.dtype,
+                        &output.shape,
+                        output.bytes.len().max(1),
+                    ) {
+                        return Err(EpError::KernelFailed(format!("graph node #{} output value#{} {:?} {:?} ({} bytes) does not fit external binding {:?} {:?} ({} bytes); bind storage matching the runtime output", node_id.0, value.0, output.dtype, output.shape, output.bytes.len(), binding.dtype, binding.shape, binding.len)).into());
+                    }
+                    if binding.strides.as_ref().is_some_and(|strides| {
+                        !onnx_runtime_ir::is_contiguous(&output.shape, strides)
+                    }) {
+                        return Err(EpError::KernelFailed(format!("graph node #{} dynamic output value#{} requires contiguous external storage for shape {:?}; bind a contiguous output instead of strides {:?}", node_id.0, value.0, output.shape, binding.strides)).into());
+                    }
+                }
+            }
+            drop(views);
+            self.scratch_input_infos = in_infos;
+            self.scratch_materialized_inputs = materialized;
+            self.scratch_output_shapes = output_shapes;
+            for (value, output) in output_ids.into_iter().zip(result) {
+                if let (Some(value), Some(output)) = (value, output) {
+                    self.store_output_bytes(
+                        value,
+                        output.dtype,
+                        output.shape,
+                        &output.bytes,
+                        resolved,
+                        external,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        if graph_kernel && output_shapes.len() != outputs.len() {
+            return Err(EpError::KernelFailed(format!("provider '{}' graph node #{} ('{}') has unresolved output shapes; implement kernel-sized outputs or provide static graph output metadata", ep.name(), node_id.0, node.op_type)).into());
+        }
+
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
@@ -768,43 +887,7 @@ impl Executor {
         // Rebuild input views, swapping any materialized slot to its contiguous
         // temp (offset 0, contiguous strides over the fresh buffer).
         drop(views);
-        let mut views: SmallVec<[TensorView; 16]> = SmallVec::new();
-        for (i, info) in in_infos.iter().enumerate() {
-            if !info.present {
-                views.push(TensorView::absent(info.dtype));
-                continue;
-            }
-            match &mat[i] {
-                Some((buf, strides)) => views.push(TensorView::new(
-                    DevicePtr(buf.as_ptr() as *const std::ffi::c_void),
-                    info.dtype,
-                    &info.shape,
-                    strides,
-                    onnx_runtime_ir::DeviceId::cpu(),
-                )),
-                None => views.push(
-                    TensorView::new(
-                        DevicePtr(info.base_ptr as *const std::ffi::c_void),
-                        info.dtype,
-                        &info.shape,
-                        &info.strides,
-                        info.device,
-                    )
-                    .with_byte_offset(info.byte_offset)
-                    .with_backing(info.backing),
-                ),
-            }
-        }
-        for (index, (view, info)) in views.iter_mut().zip(&in_infos).enumerate() {
-            if let Some(sealed) = kernel.constant_input_override(index) {
-                *view = sealed;
-            } else if info.prepared_unresolved {
-                return Err(SessionError::Internal(format!(
-                    "{}:{} kernel did not supply promised immutable override for input {index}",
-                    node.domain, node.op_type
-                )));
-            }
-        }
+        let views = kernel_input_views(kernel, &in_infos, &mat, node)?;
 
         // Take output buffers out so they can be borrowed `&mut` disjointly from
         // the input reads (SSA guarantees outputs are disjoint from inputs).
@@ -1508,6 +1591,53 @@ type OutputBindings<'a> = (SmallVec<[OutBacking; 8]>, SmallVec<[TensorMut<'a>; 8
 /// temp so contiguous-assuming kernels stay correct. Returns, per input slot,
 /// the gathered bytes and their contiguous strides when a temp was needed.
 /// Temps must outlive the views that borrow them.
+fn kernel_input_views<'a>(
+    kernel: &'a dyn Kernel,
+    in_infos: &'a [InInfo],
+    mat: &'a MaterializedInputs,
+    node: &Node,
+) -> Result<SmallVec<[TensorView<'a>; 16]>> {
+    let mut views: SmallVec<[TensorView; 16]> = SmallVec::new();
+    for (i, info) in in_infos.iter().enumerate() {
+        if !info.present {
+            views.push(TensorView::absent(info.dtype));
+            continue;
+        }
+        match &mat[i] {
+            Some((buf, strides)) => views.push(TensorView::new(
+                DevicePtr(buf.as_ptr() as *const std::ffi::c_void),
+                info.dtype,
+                &info.shape,
+                strides,
+                onnx_runtime_ir::DeviceId::cpu(),
+            )),
+            None => views.push(
+                TensorView::new(
+                    DevicePtr(info.base_ptr as *const std::ffi::c_void),
+                    info.dtype,
+                    &info.shape,
+                    &info.strides,
+                    info.device,
+                )
+                .with_byte_offset(info.byte_offset)
+                .with_backing(info.backing),
+            ),
+        }
+    }
+    for (index, (view, info)) in views.iter_mut().zip(in_infos).enumerate() {
+        if let Some(sealed) = kernel.constant_input_override(index) {
+            *view = sealed;
+        } else if info.prepared_unresolved {
+            return Err(SessionError::Internal(format!(
+                "{}:{} kernel did not supply promised immutable override for input {index}",
+                node.domain, node.op_type
+            )));
+        }
+    }
+
+    Ok(views)
+}
+
 fn materialize_strided_inputs(
     kernel: &dyn Kernel,
     in_infos: &[InInfo],

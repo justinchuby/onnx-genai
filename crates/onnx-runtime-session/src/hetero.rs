@@ -671,22 +671,22 @@ fn provider_partitions(
     cache: &GraphViewCache,
     slot: &ProviderPlacement,
     placement: &HashMap<NodeId, EpId>,
-) -> Vec<Partition> {
+) -> Result<Vec<Partition>> {
     let assigned: HashSet<NodeId> = placement
         .iter()
         .filter(|&(_, &ep)| ep == slot.ep)
         .map(|(&node, _)| node)
         .collect();
     if assigned.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let oracle = AssignedOracle {
         inner: slot.provider.as_ref(),
         assigned: &assigned,
     };
     let view = onnx_runtime_ir::GraphView::new(graph, cache);
-    let claims: Vec<SubgraphClaim> = OrtGraphView::new(&view).query_capabilities(&oracle);
-    claims
+    let claims: Vec<SubgraphClaim> = OrtGraphView::new(&view).query_capabilities(&oracle)?;
+    Ok(claims
         .into_iter()
         .map(|claim| {
             let mut nodes = claim.node_ids;
@@ -699,7 +699,7 @@ fn provider_partitions(
                 outputs: claim.output_values,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Kahn topological sort of the partition DAG, deterministic by
@@ -899,7 +899,7 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
 
     let mut partitions = Vec::new();
     for slot in providers {
-        partitions.extend(provider_partitions(graph, &cache, slot, &node_placement));
+        partitions.extend(provider_partitions(graph, &cache, slot, &node_placement)?);
     }
 
     // Map every produced value to its producing partition (pre-ordering ids are

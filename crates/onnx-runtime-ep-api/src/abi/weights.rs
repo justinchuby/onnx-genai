@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use memmap2::Mmap;
 use onnx_runtime_ir::WeightRef;
 
-use super::host::{HostOrtValue, HostOrtValueStorage, HostTensorTypeAndShapeInfo, dtype_to_ort};
+use super::host::{HostOrtValue, HostOrtValueStorage, HostTensorTypeAndShapeInfo};
 
 /// External weight files, mapped once and shared by every tensor in them.
 ///
@@ -66,6 +66,17 @@ fn mapped_weight_file(path: &Path) -> Option<Arc<Mmap>> {
 }
 
 pub(super) fn host_ort_value_for_weight(weight: &WeightRef) -> Option<Box<HostOrtValue>> {
+    if let WeightRef::Inline(tensor) = weight
+        && tensor.dtype == onnx_runtime_ir::DataType::String
+    {
+        if tensor.checked_numel() != Some(tensor.strings.len()) {
+            return None;
+        }
+        return Some(Box::new(HostOrtValue {
+            tensor: HostTensorTypeAndShapeInfo::concrete(tensor.dtype, &tensor.dims).ok()?,
+            storage: HostOrtValueStorage::Strings(tensor.strings.clone()),
+        }));
+    }
     let (dtype, dims, data) = match weight {
         WeightRef::Inline(tensor) => (tensor.dtype, tensor.dims.clone(), tensor.data.clone()),
         WeightRef::External {
@@ -81,10 +92,7 @@ pub(super) fn host_ort_value_for_weight(weight: &WeightRef) -> Option<Box<HostOr
             // to be inside the mapping.
             map.get(*offset..end)?;
             return Some(Box::new(HostOrtValue {
-                tensor: HostTensorTypeAndShapeInfo {
-                    dtype: dtype_to_ort(*dtype),
-                    dims: dims.iter().map(|d| *d as i64).collect(),
-                },
+                tensor: HostTensorTypeAndShapeInfo::concrete(*dtype, dims).ok()?,
                 storage: HostOrtValueStorage::Mapped {
                     map,
                     offset: *offset,
@@ -94,10 +102,7 @@ pub(super) fn host_ort_value_for_weight(weight: &WeightRef) -> Option<Box<HostOr
         }
     };
     Some(Box::new(HostOrtValue {
-        tensor: HostTensorTypeAndShapeInfo {
-            dtype: dtype_to_ort(dtype),
-            dims: dims.into_iter().map(|d| d as i64).collect(),
-        },
+        tensor: HostTensorTypeAndShapeInfo::concrete(dtype, &dims).ok()?,
         storage: HostOrtValueStorage::Owned(data),
     }))
 }

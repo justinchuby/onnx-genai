@@ -24,12 +24,72 @@ pub(super) struct HostStatus {
 #[repr(C)]
 pub(super) struct HostTensorTypeAndShapeInfo {
     pub(super) dtype: ort::ONNXTensorElementDataType,
-    pub(super) dims: Vec<i64>,
+    pub(super) dims: Option<Vec<i64>>,
+    symbols: Vec<CString>,
+}
+
+impl HostTensorTypeAndShapeInfo {
+    pub(super) fn concrete(dtype: DataType, dims: &[usize]) -> std::result::Result<Self, String> {
+        Ok(Self { dtype: dtype_to_ort(dtype), dims: Some(dims.iter().map(|&dim| i64::try_from(dim).map_err(|_| format!("tensor dimension {dim} exceeds ORT's i64 range; reduce the dimensions"))).collect::<std::result::Result<_, _>>()?), symbols: Vec::new() })
+    }
+
+    fn for_value(
+        graph: &Graph,
+        value: &onnx_runtime_ir::Value,
+    ) -> std::result::Result<Self, String> {
+        let shape = value.tensor_shape();
+        let symbols = shape.map(|shape| shape.iter().map(|dim| {
+            let name = match dim {
+                Dim::Symbolic(id) => graph.symbol_constraints.get(id).and_then(|constraint| constraint.name.as_deref()).unwrap_or(""),
+                Dim::Static(_) => "",
+            };
+            CString::new(name).map_err(|_| format!("value {:?} dimension symbol contains an embedded NUL; use native IR compilation for this symbol", value.id))
+        }).collect::<std::result::Result<Vec<_>, _>>()).transpose()?.unwrap_or_default();
+        let dims = shape.map(|shape| shape.iter().map(|dim| match dim {
+            Dim::Static(dim) => i64::try_from(*dim).map_err(|_| format!("value {:?} dimension {dim} exceeds ORT's i64 range; reduce the shape", value.id)),
+            Dim::Symbolic(_) => Ok(-1),
+        }).collect::<std::result::Result<Vec<_>, _>>()).transpose()?;
+        Ok(Self {
+            dtype: dtype_to_ort(value.tensor_dtype().unwrap_or(DataType::Undefined)),
+            dims,
+            symbols,
+        })
+    }
 }
 
 #[repr(C)]
 pub(super) struct HostTypeInfo {
+    kind: ort::ONNXType,
     tensor: HostTensorTypeAndShapeInfo,
+}
+
+impl HostTypeInfo {
+    fn for_value(
+        graph: &Graph,
+        value: &onnx_runtime_ir::Value,
+    ) -> std::result::Result<Self, String> {
+        use onnx_runtime_ir::onnx::type_proto::Value as Type;
+        let kind = match value
+            .declared_type
+            .as_ref()
+            .and_then(|ty| ty.value.as_ref())
+        {
+            Some(Type::SequenceType(_)) => ort::ONNX_TYPE_SEQUENCE,
+            Some(Type::OptionalType(_)) => ort::ONNX_TYPE_OPTIONAL,
+            Some(Type::MapType(_)) => ort::ONNX_TYPE_MAP,
+            Some(Type::SparseTensorType(_)) => ort::ONNX_TYPE_SPARSETENSOR,
+            Some(Type::OpaqueType(_)) => ort::ONNX_TYPE_OPAQUE,
+            Some(Type::TensorType(_)) => ort::ONNX_TYPE_TENSOR,
+            None if value.tensor_dtype().is_some() || value.tensor_shape().is_some() => {
+                ort::ONNX_TYPE_TENSOR
+            }
+            None => ort::ONNX_TYPE_UNKNOWN,
+        };
+        Ok(Self {
+            kind,
+            tensor: HostTensorTypeAndShapeInfo::for_value(graph, value)?,
+        })
+    }
 }
 
 #[repr(C)]
@@ -40,6 +100,7 @@ pub(super) struct HostOrtValue {
 
 pub(super) enum HostOrtValueStorage {
     Owned(Vec<u8>),
+    Strings(Vec<Vec<u8>>),
     Borrowed {
         ptr: *mut c_void,
         len: usize,
@@ -62,6 +123,7 @@ impl HostOrtValue {
     fn data_ptr(&self) -> *const c_void {
         match &self.storage {
             HostOrtValueStorage::Owned(data) => data.as_ptr().cast(),
+            HostOrtValueStorage::Strings(_) => ptr::null(),
             HostOrtValueStorage::Borrowed { ptr, .. } => (*ptr).cast_const(),
             HostOrtValueStorage::Mapped { map, offset, .. } => map[*offset..].as_ptr().cast(),
         }
@@ -70,6 +132,7 @@ impl HostOrtValue {
     fn data_mut_ptr(&mut self) -> *mut c_void {
         match &mut self.storage {
             HostOrtValueStorage::Owned(data) => data.as_mut_ptr().cast(),
+            HostOrtValueStorage::Strings(_) => ptr::null_mut(),
             HostOrtValueStorage::Borrowed { ptr, .. } => *ptr,
             // No mutable pointer exists for a shared, read-only mapping, and
             // aliasing one mutably to satisfy a caller would be worse than
@@ -82,6 +145,7 @@ impl HostOrtValue {
     fn byte_len(&self) -> usize {
         match &self.storage {
             HostOrtValueStorage::Owned(data) => data.len(),
+            HostOrtValueStorage::Strings(data) => data.iter().map(Vec::len).sum(),
             HostOrtValueStorage::Borrowed { len, .. } => *len,
             HostOrtValueStorage::Mapped { len, .. } => *len,
         }
@@ -92,6 +156,7 @@ impl HostOrtValue {
 pub(super) struct HostKernelContext {
     inputs: Vec<Option<HostOrtValue>>,
     outputs: Vec<HostOrtValue>,
+    requested_outputs: Option<Vec<bool>>,
 }
 
 impl HostKernelContext {
@@ -115,10 +180,7 @@ impl HostKernelContext {
                 }
                 let ptr = (input.data.0 as *mut u8).wrapping_add(input.byte_offset).cast::<c_void>();
                 Ok(Some(HostOrtValue {
-                    tensor: HostTensorTypeAndShapeInfo {
-                        dtype: dtype_to_ort(input.dtype),
-                        dims: input.shape.iter().map(|&d| d as i64).collect(),
-                    },
+                    tensor: HostTensorTypeAndShapeInfo::concrete(input.dtype, input.shape).map_err(EpError::KernelFailed)?,
                     storage: HostOrtValueStorage::Borrowed {
                         ptr,
                         len: input.byte_size(),
@@ -141,10 +203,7 @@ impl HostKernelContext {
                     ));
                 }
                 Ok(HostOrtValue {
-                    tensor: HostTensorTypeAndShapeInfo {
-                        dtype: dtype_to_ort(output.dtype),
-                        dims: output.shape.iter().map(|&d| d as i64).collect(),
-                    },
+                    tensor: HostTensorTypeAndShapeInfo::concrete(output.dtype, output.shape).map_err(EpError::KernelFailed)?,
                     storage: HostOrtValueStorage::Borrowed {
                         ptr: output.data.0,
                         len: output.byte_size(),
@@ -152,7 +211,53 @@ impl HostKernelContext {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { inputs, outputs })
+        Ok(Self {
+            inputs,
+            outputs,
+            requested_outputs: None,
+        })
+    }
+
+    pub(super) fn dynamic(
+        inputs: &[TensorView<'_>],
+        dtypes: &[DataType],
+        requested: &[bool],
+    ) -> Result<Self> {
+        if dtypes.len() != requested.len() {
+            return Err(EpError::KernelFailed(format!(
+                "plugin dynamic output count mismatch: {} declared, {} requested",
+                dtypes.len(),
+                requested.len()
+            )));
+        }
+        let mut context = Self::new(inputs, &mut [])?;
+        context.outputs = dtypes
+            .iter()
+            .map(|&dtype| HostOrtValue {
+                tensor: HostTensorTypeAndShapeInfo {
+                    dtype: dtype_to_ort(dtype),
+                    dims: None,
+                    symbols: Vec::new(),
+                },
+                storage: HostOrtValueStorage::Owned(Vec::new()),
+            })
+            .collect();
+        context.requested_outputs = Some(requested.to_vec());
+        Ok(context)
+    }
+
+    pub(super) fn into_dynamic_outputs(self) -> Result<Vec<Option<crate::KernelSizedOutput>>> {
+        let requested = self.requested_outputs.ok_or_else(|| {
+            EpError::KernelFailed("plugin context was not allocated for dynamic outputs".into())
+        })?;
+        self.outputs.into_iter().zip(requested).enumerate().map(|(index, (value, requested))| {
+            if !requested { return Ok(None); }
+            let dims = value.tensor.dims.ok_or_else(|| EpError::KernelFailed(format!("plugin did not allocate requested dynamic output {index}; call KernelContext_GetOutput during Compute")))?;
+            let shape = dims.into_iter().map(|dim| usize::try_from(dim).map_err(|_| EpError::KernelFailed(format!("plugin output {index} has invalid extent {dim}")))).collect::<Result<Vec<_>>>()?;
+            let dtype = DataType::from_onnx(value.tensor.dtype as _).ok_or_else(|| EpError::KernelFailed(format!("plugin output {index} has unknown dtype {}", value.tensor.dtype)))?;
+            let HostOrtValueStorage::Owned(bytes) = value.storage else { return Err(EpError::KernelFailed(format!("plugin dynamic output {index} does not own its payload"))); };
+            Ok(Some(crate::KernelSizedOutput { shape, dtype, bytes }))
+        }).collect()
     }
 
     pub(super) fn byte_size(&self) -> usize {
@@ -172,7 +277,7 @@ pub(super) struct HostValueInfo {
     type_info: HostTypeInfo,
     initializer: Option<Box<HostOrtValue>>,
     producer: Option<*const ort::OrtNode>,
-    is_initializer: bool,
+    is_constant_initializer: bool,
 }
 
 #[repr(C)]
@@ -189,8 +294,10 @@ pub(super) struct HostNode {
     domain: CString,
     since_version: i32,
     inputs: Vec<*const ort::OrtValueInfo>,
+    implicit_inputs: Vec<*const ort::OrtValueInfo>,
     outputs: Vec<*const ort::OrtValueInfo>,
     attrs: Vec<HostOpAttr>,
+    subgraphs: Vec<(CString, Box<HostGraph>)>,
     /// Value infos this node's `inputs`/`outputs` point into.
     ///
     /// Held here rather than leaked. The boxes must outlive the pointers we
@@ -204,6 +311,9 @@ pub(super) struct HostNode {
 
 #[repr(C)]
 pub(super) struct HostGraph {
+    ir_version: i64,
+    opsets: Vec<(CString, i64)>,
+    parent: *const ort::OrtNode,
     values: HashMap<ValueId, Box<HostValueInfo>>,
     // Boxed nodes keep the `OrtNode` pointers handed to the plugin stable even
     // if the vector moves during construction.
@@ -223,6 +333,13 @@ pub(super) struct HostSupportInfo {
 
 impl HostSupportInfo {
     pub(super) fn into_claims(self, graph: &Graph, ep_id: EpId) -> Vec<SubgraphClaim> {
+        let captures = graph.captured_inputs_by_node();
+        let mut capture_users: HashMap<ValueId, Vec<NodeId>> = HashMap::new();
+        for (&owner, values) in &captures {
+            for &value in values {
+                capture_users.entry(value).or_default().push(owner);
+            }
+        }
         self.fused_groups
             .into_iter()
             .map(|node_ids| {
@@ -231,7 +348,10 @@ impl HostSupportInfo {
                 let mut output_values = Vec::new();
                 for &node_id in &node_ids {
                     let node = graph.node(node_id);
-                    for value_id in node.input_values() {
+                    for value_id in node
+                        .input_values()
+                        .chain(captures.get(&node_id).into_iter().flatten().copied())
+                    {
                         let outside = graph
                             .value(value_id)
                             .producer
@@ -247,7 +367,10 @@ impl HostSupportInfo {
                                 .consumers
                                 .nodes()
                                 .iter()
-                                .any(|n| !node_set.contains(n));
+                                .any(|n| !node_set.contains(n))
+                            || capture_users.get(&value_id).is_some_and(|users| {
+                                users.iter().any(|node| !node_set.contains(node))
+                            });
                         if leaves && !output_values.contains(&value_id) {
                             output_values.push(value_id);
                         }
@@ -265,12 +388,30 @@ impl HostSupportInfo {
     }
 }
 
+/// Model metadata and lexical bindings inherited by one projected scope.
+struct HostGraphScope<'a> {
+    opsets: &'a HashMap<String, u64>,
+    values: &'a HashMap<String, *const ort::OrtValueInfo>,
+    ir_version: Option<i64>,
+}
+
 impl HostGraph {
     pub(super) fn new(graph: &Graph) -> std::result::Result<Self, String> {
         let order = graph.topological_order().map_err(|err| {
             format!("cannot expose graph to plugin because topological ordering failed: {err}")
         })?;
-        Self::new_with_order(graph, order, graph.inputs.clone(), graph.outputs.clone())
+        Self::new_with_order(
+            graph,
+            order,
+            graph.inputs.clone(),
+            graph.outputs.clone(),
+            0,
+            HostGraphScope {
+                opsets: &HashMap::new(),
+                values: &HashMap::new(),
+                ir_version: None,
+            },
+        )
     }
 
     pub(super) fn new_for_claim(
@@ -291,6 +432,12 @@ impl HostGraph {
             order,
             claim.input_values.clone(),
             claim.output_values.clone(),
+            0,
+            HostGraphScope {
+                opsets: &HashMap::new(),
+                values: &HashMap::new(),
+                ir_version: None,
+            },
         )
     }
 
@@ -299,7 +446,18 @@ impl HostGraph {
         order: Vec<NodeId>,
         graph_inputs: Vec<ValueId>,
         graph_outputs: Vec<ValueId>,
+        depth: usize,
+        inherited: HostGraphScope<'_>,
     ) -> std::result::Result<Self, String> {
+        if depth > super::MAX_GRAPH_NESTING {
+            return Err(format!(
+                "ORT graph nesting depth {depth} exceeds the supported projection limit {}; reduce nested graph depth",
+                super::MAX_GRAPH_NESTING
+            ));
+        }
+        let ir_version = graph.ir_version.or(inherited.ir_version);
+        let mut scope_opsets = inherited.opsets.clone();
+        scope_opsets.extend(graph.opset_imports.clone());
         let mut values: HashMap<ValueId, Box<HostValueInfo>> = HashMap::new();
         for (value_id, value) in graph.values.iter() {
             let initializer = graph
@@ -313,37 +471,59 @@ impl HostGraph {
                     name: CString::new(value.name.clone().unwrap_or_default()).map_err(|_| {
                         format!("value {value_id:?} name contains an interior NUL byte")
                     })?,
-                    type_info: HostTypeInfo {
-                        tensor: HostTensorTypeAndShapeInfo {
-                            dtype: dtype_to_ort(value.dtype),
-                            dims: shape_to_ort(&value.shape),
-                        },
-                    },
+                    type_info: HostTypeInfo::for_value(graph, value)?,
                     initializer,
                     producer: None,
-                    is_initializer: graph.initializers.contains_key(&value_id),
+                    is_constant_initializer: graph.is_constant_initializer(value_id),
                 }),
             );
         }
 
+        let mut lexical_values = inherited.values.clone();
+        for (id, value) in graph.values.iter() {
+            if let Some(name) = &value.name
+                && (value.producer.is_some()
+                    || graph.inputs.contains(&id)
+                    || graph.is_initializer(id)
+                    || !lexical_values.contains_key(name))
+            {
+                lexical_values.insert(name.clone(), value_ptr(&values[&id]));
+            }
+        }
         let mut nodes = Vec::with_capacity(order.len());
         let mut node_index = HashMap::new();
         for node_id in order {
             let node = graph.node(node_id);
-            let host_node = Box::new(HostNode {
+            let mut host_node = Box::new(HostNode {
                 id: node_id,
                 name: cstring_lossless(&node.name, "node name", node_id)?,
                 op_type: cstring_lossless(&node.op_type, "node op_type", node_id)?,
                 domain: cstring_lossless(&node.domain, "node domain", node_id)?,
-                since_version: since_version(graph, node),
+                since_version: {
+                    let version = since_version(graph, node);
+                    if version > 0 { version } else {
+                        scope_opsets.get(&node.domain)
+                            .and_then(|version| i32::try_from(*version).ok()).unwrap_or(0)
+                    }
+                },
                 inputs: node
                     .inputs
                     .iter()
                     .map(|slot| {
-                        slot.and_then(|v| values.get(&v).map(|value| value_ptr(value)))
-                            .unwrap_or(ptr::null())
+                        slot.and_then(|v| {
+                            graph.value(v).name.as_ref().and_then(|name| lexical_values.get(name).copied())
+                                .or_else(|| values.get(&v).map(|value| value_ptr(value)))
+                        }).unwrap_or(ptr::null())
                     })
                     .collect(),
+                implicit_inputs: {
+                    let mut names = std::collections::BTreeSet::new();
+                    for ((owner, _), body) in &graph.subgraphs {
+                        if *owner == node_id { names.extend(body.required_outer_names()); }
+                    }
+                    names.into_iter().map(|name| lexical_values.get(&name).copied().ok_or_else(|| format!("node {node_id:?} subgraph captures '{name}' but no enclosing graph defines it; bind that value in the lexical scope")))
+                        .collect::<std::result::Result<Vec<_>, String>>()?
+                },
                 outputs: node
                     .outputs
                     .iter()
@@ -363,15 +543,65 @@ impl HostGraph {
                                     "attribute {name:?} on node {node_id:?} contains an interior NUL byte"
                                 )
                             })?,
-                            attr: attr.clone(),
+                            // Graph payloads are projected through Node_GetSubgraphs,
+                            // not cloned recursively into a second ABI-owned tree.
+                            attr: match attr {
+                                Attribute::Graph(_) => Attribute::Graph(Box::default()),
+                                Attribute::Graphs(_) => return Err(format!(
+                                    "node {node_id:?} GRAPH-list attribute '{name}' cannot be represented losslessly by ORT's graph-name API; use native graph compilation"
+                                )),
+                                _ => attr.clone(),
+                            },
                         })
                     })
                     .collect::<std::result::Result<Vec<_>, String>>()?,
                 // Empty: these point into `HostGraph::values`, which outlives the
                 // node, so the node owns nothing of its own here.
                 owned_values: Vec::new(),
+                subgraphs: Vec::new(),
             });
             let node_ptr = (&*host_node as *const HostNode).cast::<ort::OrtNode>();
+            let mut nested = graph
+                .subgraphs
+                .iter()
+                .filter(|((owner, _), _)| *owner == node_id)
+                .collect::<Vec<_>>();
+            nested.sort_by(|((_, lhs), _), ((_, rhs), _)| {
+                (&lhs.name, lhs.index).cmp(&(&rhs.name, rhs.index))
+            });
+            for ((_, attribute), body) in nested {
+                if attribute.index.is_some() {
+                    return Err(format!(
+                        "node {node_id:?} graph-list attribute {attribute} cannot be represented \
+                         losslessly by the ORT Node_GetSubgraphs attribute-name contract; use \
+                         native graph compilation for GRAPH-list patterns"
+                    ));
+                }
+                let body_order = body.topological_order().map_err(|reason| {
+                    format!("node {node_id:?} subgraph {attribute} topological ordering: {reason}")
+                })?;
+                let mut child = Box::new(
+                    Self::new_with_order(
+                        body,
+                        body_order,
+                        body.inputs.clone(),
+                        body.outputs.clone(),
+                        depth + 1,
+                        HostGraphScope {
+                            opsets: &scope_opsets,
+                            values: &lexical_values,
+                            ir_version,
+                        },
+                    )
+                    .map_err(|reason| format!("node {node_id:?} subgraph {attribute}: {reason}"))?,
+                );
+                child.parent = node_ptr;
+                host_node.subgraphs.push((
+                    cstring_lossless(&attribute.name, "graph attribute name", node_id)?,
+                    child,
+                ));
+            }
+
             for output in node.output_values() {
                 if let Some(value) = values.get_mut(&output) {
                     value.producer = Some(node_ptr);
@@ -394,7 +624,22 @@ impl HostGraph {
             .keys()
             .filter_map(|v| values.get(v).map(|value| value_ptr(value)))
             .collect();
+        let mut opsets = scope_opsets
+            .iter()
+            .map(|(domain, version)| {
+                Ok((
+                    CString::new(domain.as_str())
+                        .map_err(|_| format!("opset domain {domain:?} contains NUL"))?,
+                    i64::try_from(*version)
+                        .map_err(|_| format!("opset version {version} exceeds i64"))?,
+                ))
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        opsets.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(Self {
+            ir_version: ir_version.unwrap_or(0),
+            opsets,
+            parent: ptr::null(),
             values,
             nodes,
             node_index,
@@ -445,15 +690,10 @@ impl HostNode {
                         value.id
                     )
                 })?,
-                type_info: HostTypeInfo {
-                    tensor: HostTensorTypeAndShapeInfo {
-                        dtype: dtype_to_ort(value.dtype),
-                        dims: shape_to_ort(&value.shape),
-                    },
-                },
+                type_info: HostTypeInfo::for_value(graph, value)?,
                 initializer: None,
                 producer: None,
-                is_initializer: false,
+                is_constant_initializer: false,
             }));
         }
         for value in owned_values.iter().take(claim.input_values.len()) {
@@ -475,7 +715,9 @@ impl HostNode {
             since_version: 1,
             inputs,
             outputs,
+            implicit_inputs: Vec::new(),
             attrs: Vec::new(),
+            subgraphs: Vec::new(),
             owned_values,
         });
         node.attrs.push(HostOpAttr {
@@ -484,13 +726,6 @@ impl HostNode {
         });
         Ok(node)
     }
-}
-
-pub(super) fn shape_to_ort(shape: &[Dim]) -> Vec<i64> {
-    shape
-        .iter()
-        .map(|dim| dim.as_static().map_or(-1, |d| d as i64))
-        .collect()
 }
 
 pub(super) fn dtype_to_ort(dtype: DataType) -> ort::ONNXTensorElementDataType {
@@ -538,16 +773,29 @@ pub(super) fn ort_api() -> *const ort::OrtApi {
         GetTensorElementType: Some(host_get_tensor_element_type),
         GetDimensionsCount: Some(host_get_dimensions_count),
         GetDimensions: Some(host_get_dimensions),
+        GetSymbolicDimensions: Some(host_get_symbolic_dimensions),
+        TensorTypeAndShape_HasShape: Some(host_has_shape),
         GetTensorShapeElementCount: Some(host_get_tensor_shape_element_count),
         GetTensorTypeAndShape: Some(host_get_tensor_type_and_shape),
         ReleaseTensorTypeAndShapeInfo: Some(host_release_tensor_type_and_shape_info),
         GetTensorData: Some(host_get_tensor_data),
+        GetTensorMemoryInfo: Some(host_get_tensor_memory_info),
+        MemoryInfoGetDeviceType: Some(host_memory_info_device_type),
+        MemoryInfoGetName: Some(host_memory_info_name),
+        MemoryInfoGetId: Some(host_memory_info_id),
+        GetStringTensorDataLength: Some(host_string_tensor_data_length),
+        GetStringTensorContent: Some(host_string_tensor_content),
+        ReleaseValue: Some(host_release_value),
+        OpAttr_GetTensorAttributeAsOrtValue: Some(host_tensor_attribute),
         GetTensorMutableData: Some(host_get_tensor_mutable_data),
         GetValueInfoName: Some(host_get_value_info_name),
         GetValueInfoTypeInfo: Some(host_get_value_info_type_info),
         ValueInfo_GetInitializerValue: Some(host_value_info_get_initializer_value),
         ValueInfo_IsConstantInitializer: Some(host_value_info_is_constant_initializer),
         ValueInfo_GetValueProducer: Some(host_value_info_get_value_producer),
+        Graph_GetOnnxIRVersion: Some(host_graph_ir_version),
+        Graph_GetNumOperatorSets: Some(host_graph_num_opsets),
+        Graph_GetOperatorSets: Some(host_graph_opsets),
         Graph_GetNumInputs: Some(host_graph_get_num_inputs),
         Graph_GetInputs: Some(host_graph_get_inputs),
         Graph_GetNumOutputs: Some(host_graph_get_num_outputs),
@@ -564,6 +812,8 @@ pub(super) fn ort_api() -> *const ort::OrtApi {
         Node_GetSinceVersion: Some(host_node_get_since_version),
         Node_GetNumInputs: Some(host_node_get_num_inputs),
         Node_GetInputs: Some(host_node_get_inputs),
+        Node_GetNumImplicitInputs: Some(host_node_get_num_implicit_inputs),
+        Node_GetImplicitInputs: Some(host_node_get_implicit_inputs),
         Node_GetNumOutputs: Some(host_node_get_num_outputs),
         Node_GetOutputs: Some(host_node_get_outputs),
         Node_GetNumAttributes: Some(host_node_get_num_attributes),
@@ -576,6 +826,8 @@ pub(super) fn ort_api() -> *const ort::OrtApi {
         Node_GetSubgraphs: Some(host_node_get_subgraphs),
         KernelContext_GetInput: Some(host_kernel_context_get_input),
         KernelContext_GetOutput: Some(host_kernel_context_get_output),
+        KernelContext_GetInputCount: Some(host_kernel_context_input_count),
+        KernelContext_GetOutputCount: Some(host_kernel_context_output_count),
         HardwareDevice_Type: Some(host_hardware_device_type),
         ..Default::default()
     })
@@ -672,17 +924,17 @@ pub(super) fn check_status(path: &Path, action: &str, status: *mut ort::OrtStatu
 }
 
 unsafe extern "C" fn host_get_onnx_type_from_type_info(
-    _type_info: *const ort::OrtTypeInfo,
+    type_info: *const ort::OrtTypeInfo,
     out: *mut ort::ONNXType,
 ) -> ort::OrtStatusPtr {
-    if out.is_null() {
+    if type_info.is_null() || out.is_null() {
         return status_error(
             "GetOnnxTypeFromTypeInfo failed: out pointer was null; fix the plugin to pass a valid output pointer",
         );
     }
     // SAFETY: out is checked non-null and points to caller storage.
     unsafe {
-        *out = ort::ONNX_TYPE_TENSOR;
+        *out = type_info_from_ptr(type_info).kind;
     }
     ptr::null_mut()
 }
@@ -699,8 +951,12 @@ unsafe extern "C" fn host_cast_type_info_to_tensor_info(
     let host = type_info_from_ptr(type_info);
     // SAFETY: out is checked non-null and the returned pointer borrows type_info.
     unsafe {
-        *out = (&host.tensor as *const HostTensorTypeAndShapeInfo)
-            .cast::<ort::OrtTensorTypeAndShapeInfo>();
+        *out = if host.kind == ort::ONNX_TYPE_TENSOR {
+            (&host.tensor as *const HostTensorTypeAndShapeInfo)
+                .cast::<ort::OrtTensorTypeAndShapeInfo>()
+        } else {
+            ptr::null()
+        };
     }
     ptr::null_mut()
 }
@@ -721,6 +977,41 @@ unsafe extern "C" fn host_get_tensor_element_type(
     ptr::null_mut()
 }
 
+unsafe extern "C" fn host_has_shape(info: *const ort::OrtTensorTypeAndShapeInfo) -> bool {
+    !info.is_null() && tensor_info_from_ptr(info).dims.is_some()
+}
+unsafe extern "C" fn host_get_symbolic_dimensions(
+    info: *const ort::OrtTensorTypeAndShapeInfo,
+    out: *mut *const c_char,
+    count: usize,
+) -> ort::OrtStatusPtr {
+    if info.is_null() {
+        return status_error(
+            "GetSymbolicDimensions: null tensor descriptor; pass live type metadata",
+        );
+    }
+    let info = tensor_info_from_ptr(info);
+    let Some(dims) = &info.dims else {
+        return status_error(
+            "GetSymbolicDimensions: rank is unknown; query TensorTypeAndShape_HasShape first",
+        );
+    };
+    if count < dims.len() || (!dims.is_empty() && out.is_null()) {
+        return status_error(
+            "GetSymbolicDimensions: output buffer is null or too small; allocate GetDimensionsCount entries",
+        );
+    }
+    for index in 0..dims.len() {
+        unsafe {
+            *out.add(index) = info
+                .symbols
+                .get(index)
+                .map_or(c"".as_ptr(), |name| name.as_ptr());
+        }
+    }
+    ptr::null_mut()
+}
+
 unsafe extern "C" fn host_get_dimensions_count(
     info: *const ort::OrtTensorTypeAndShapeInfo,
     out: *mut usize,
@@ -732,7 +1023,7 @@ unsafe extern "C" fn host_get_dimensions_count(
     }
     // SAFETY: out is checked non-null.
     unsafe {
-        *out = tensor_info_from_ptr(info).dims.len();
+        *out = tensor_info_from_ptr(info).dims.as_ref().map_or(0, Vec::len);
     }
     ptr::null_mut()
 }
@@ -747,7 +1038,11 @@ unsafe extern "C" fn host_get_dimensions(
             "GetDimensions failed: tensor-info pointer was null; fix the plugin to pass valid ORT pointers",
         );
     }
-    let dims = &tensor_info_from_ptr(info).dims;
+    let Some(dims) = &tensor_info_from_ptr(info).dims else {
+        return status_error(
+            "GetDimensions: tensor rank is unknown; query TensorTypeAndShape_HasShape before reading dimensions",
+        );
+    };
     if dim_values_length < dims.len() {
         return status_error(
             "GetDimensions failed: output buffer is smaller than rank; fix by allocating GetDimensionsCount entries",
@@ -760,7 +1055,9 @@ unsafe extern "C" fn host_get_dimensions(
     }
     // SAFETY: buffer length was validated against dims.len().
     unsafe {
-        ptr::copy_nonoverlapping(dims.as_ptr(), dim_values, dims.len());
+        if !dims.is_empty() {
+            ptr::copy_nonoverlapping(dims.as_ptr(), dim_values, dims.len());
+        }
     }
     ptr::null_mut()
 }
@@ -775,7 +1072,12 @@ unsafe extern "C" fn host_get_tensor_shape_element_count(
         );
     }
     let mut count = 1usize;
-    for &dim in &tensor_info_from_ptr(info).dims {
+    let Some(dims) = &tensor_info_from_ptr(info).dims else {
+        return status_error(
+            "GetTensorShapeElementCount: tensor rank is unknown; provide concrete shape metadata before requesting a size",
+        );
+    };
+    for &dim in dims {
         if dim < 0 {
             return status_error(
                 "GetTensorShapeElementCount failed: symbolic dimension has no concrete element count; fix by avoiding constant reads of symbolic tensors",
@@ -809,6 +1111,7 @@ unsafe extern "C" fn host_get_tensor_type_and_shape(
     let cloned = Box::new(HostTensorTypeAndShapeInfo {
         dtype: ort_value_from_ptr(value).tensor.dtype,
         dims: ort_value_from_ptr(value).tensor.dims.clone(),
+        symbols: ort_value_from_ptr(value).tensor.symbols.clone(),
     });
     // SAFETY: out is checked non-null and receives owned allocation released by ReleaseTensorTypeAndShapeInfo.
     unsafe {
@@ -826,6 +1129,191 @@ unsafe extern "C" fn host_release_tensor_type_and_shape_info(
     }
 }
 
+// HostGraph and HostKernelContext project host-accessible values only.
+static HOST_CPU_MEMORY_INFO: u8 = 0;
+unsafe extern "C" fn host_get_tensor_memory_info(
+    value: *const ort::OrtValue,
+    out: *mut *const ort::OrtMemoryInfo,
+) -> ort::OrtStatusPtr {
+    if value.is_null() || out.is_null() {
+        return status_error("GetTensorMemoryInfo: null value/output; pass live tensor storage");
+    }
+    unsafe {
+        *out = (&HOST_CPU_MEMORY_INFO as *const u8).cast();
+    }
+    ptr::null_mut()
+}
+unsafe extern "C" fn host_memory_info_name(
+    info: *const ort::OrtMemoryInfo,
+    out: *mut *const c_char,
+) -> ort::OrtStatusPtr {
+    if info.is_null() || out.is_null() {
+        return status_error("MemoryInfoGetName: null memory info/output pointer");
+    }
+    unsafe {
+        *out = c"Cpu".as_ptr();
+    }
+    ptr::null_mut()
+}
+unsafe extern "C" fn host_memory_info_id(
+    info: *const ort::OrtMemoryInfo,
+    out: *mut i32,
+) -> ort::OrtStatusPtr {
+    if info.is_null() || out.is_null() {
+        return status_error("MemoryInfoGetId: null memory info/output pointer");
+    }
+    unsafe {
+        *out = 0;
+    }
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn host_memory_info_device_type(
+    _info: *const ort::OrtMemoryInfo,
+    out: *mut ort::OrtMemoryInfoDeviceType,
+) {
+    if !out.is_null() {
+        unsafe {
+            *out = ort::OrtMemoryInfoDeviceType_CPU;
+        }
+    }
+}
+unsafe extern "C" fn host_tensor_attribute(
+    attribute: *const ort::OrtOpAttr,
+    out: *mut *mut ort::OrtValue,
+) -> ort::OrtStatusPtr {
+    if attribute.is_null() || out.is_null() {
+        return status_error(
+            "OpAttr_GetTensorAttributeAsOrtValue: null attribute/output; pass live storage",
+        );
+    }
+    unsafe {
+        *out = ptr::null_mut();
+    }
+    let Attribute::Tensor(tensor) = &attr_from_ptr(attribute).attr else {
+        return status_error(
+            "OpAttr_GetTensorAttributeAsOrtValue: attribute is not a TENSOR; query its type first",
+        );
+    };
+    let Some(bytes) = tensor.checked_expected_bytes() else {
+        return status_error(
+            "tensor attribute dimensions or byte length overflow; reduce tensor dimensions",
+        );
+    };
+    let dims = match tensor
+        .dims
+        .iter()
+        .map(|&dim| i64::try_from(dim))
+        .collect::<std::result::Result<Vec<_>, _>>()
+    {
+        Ok(dims) => dims,
+        Err(_) => {
+            return status_error("tensor attribute dimension exceeds i64; reduce its dimensions");
+        }
+    };
+    let storage = if tensor.dtype == DataType::String {
+        if tensor.checked_numel() != Some(tensor.strings.len()) {
+            return status_error(
+                "tensor attribute string count does not match its shape; supply one string per element",
+            );
+        }
+        HostOrtValueStorage::Strings(tensor.strings.clone())
+    } else {
+        if tensor.dtype == DataType::Undefined || bytes != tensor.data.len() {
+            return status_error(
+                "tensor attribute dtype/shape does not match its byte payload; correct the tensor data",
+            );
+        }
+        HostOrtValueStorage::Owned(tensor.data.clone())
+    };
+    let value = Box::new(HostOrtValue {
+        tensor: HostTensorTypeAndShapeInfo {
+            dtype: dtype_to_ort(tensor.dtype),
+            dims: Some(dims),
+            symbols: Vec::new(),
+        },
+        storage,
+    });
+    unsafe {
+        *out = Box::into_raw(value).cast();
+    }
+    ptr::null_mut()
+}
+unsafe extern "C" fn host_release_value(value: *mut ort::OrtValue) {
+    if !value.is_null() {
+        unsafe {
+            drop(Box::from_raw(value.cast::<HostOrtValue>()));
+        }
+    }
+}
+unsafe extern "C" fn host_string_tensor_data_length(
+    value: *const ort::OrtValue,
+    out: *mut usize,
+) -> ort::OrtStatusPtr {
+    if value.is_null() || out.is_null() {
+        return status_error(
+            "GetStringTensorDataLength: null value/output; pass live string tensor storage",
+        );
+    }
+    let HostOrtValueStorage::Strings(strings) = &ort_value_from_ptr(value).storage else {
+        return status_error("GetStringTensorDataLength requires a string tensor; query its dtype");
+    };
+    let Some(length) = strings
+        .iter()
+        .try_fold(0usize, |length, value| length.checked_add(value.len()))
+    else {
+        return status_error("string tensor byte length overflows usize; reduce its payload");
+    };
+    unsafe {
+        *out = length;
+    }
+    ptr::null_mut()
+}
+unsafe extern "C" fn host_string_tensor_content(
+    value: *const ort::OrtValue,
+    data: *mut c_void,
+    bytes: usize,
+    offsets: *mut usize,
+    count: usize,
+) -> ort::OrtStatusPtr {
+    if value.is_null() {
+        return status_error("GetStringTensorContent: null tensor; pass a live string tensor");
+    }
+    let HostOrtValueStorage::Strings(strings) = &ort_value_from_ptr(value).storage else {
+        return status_error("GetStringTensorContent requires a string tensor; query its dtype");
+    };
+    let Some(required) = strings
+        .iter()
+        .try_fold(0usize, |length, value| length.checked_add(value.len()))
+    else {
+        return status_error("string tensor byte length overflows usize; reduce its payload");
+    };
+    if bytes < required
+        || count < strings.len()
+        || (required > 0 && data.is_null())
+        || (!strings.is_empty() && offsets.is_null())
+    {
+        return status_error(
+            "GetStringTensorContent: output buffers are null or too small; query byte and element counts and allocate both buffers",
+        );
+    }
+    let mut offset = 0;
+    for (index, string) in strings.iter().enumerate() {
+        unsafe {
+            *offsets.add(index) = offset;
+            if !string.is_empty() {
+                ptr::copy_nonoverlapping(
+                    string.as_ptr(),
+                    data.cast::<u8>().add(offset),
+                    string.len(),
+                );
+            }
+        }
+        offset += string.len();
+    }
+    ptr::null_mut()
+}
+
 unsafe extern "C" fn host_get_tensor_data(
     value: *const ort::OrtValue,
     out: *mut *const c_void,
@@ -834,6 +1322,12 @@ unsafe extern "C" fn host_get_tensor_data(
         return status_error(
             "GetTensorData failed: null value/output pointer; fix the plugin to pass valid ORT pointers",
         );
+    }
+    if matches!(
+        ort_value_from_ptr(value).storage,
+        HostOrtValueStorage::Strings(_)
+    ) {
+        return status_error("GetTensorData: string tensors require GetStringTensorContent");
     }
     // SAFETY: out is checked non-null and data lives as long as the HostOrtValue.
     unsafe {
@@ -936,7 +1430,7 @@ unsafe extern "C" fn host_value_info_is_constant_initializer(
     }
     // SAFETY: out is checked non-null.
     unsafe {
-        *out = value_from_ptr(value_info).is_initializer;
+        *out = value_from_ptr(value_info).is_constant_initializer;
     }
     ptr::null_mut()
 }
@@ -957,6 +1451,56 @@ unsafe extern "C" fn host_value_info_get_value_producer(
         *producer = value.producer.unwrap_or(ptr::null());
         if !producer_output_index.is_null() {
             *producer_output_index = 0;
+        }
+    }
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn host_graph_ir_version(
+    graph: *const ort::OrtGraph,
+    out: *mut i64,
+) -> ort::OrtStatusPtr {
+    if graph.is_null() || out.is_null() {
+        return status_error("Graph_GetOnnxIRVersion: null graph/output pointer");
+    }
+    unsafe {
+        *out = graph_from_ptr(graph).ir_version;
+    }
+    ptr::null_mut()
+}
+unsafe extern "C" fn host_graph_num_opsets(
+    graph: *const ort::OrtGraph,
+    out: *mut usize,
+) -> ort::OrtStatusPtr {
+    if graph.is_null() || out.is_null() {
+        return status_error("Graph_GetNumOperatorSets: null graph/output pointer");
+    }
+    unsafe {
+        *out = graph_from_ptr(graph).opsets.len();
+    }
+    ptr::null_mut()
+}
+unsafe extern "C" fn host_graph_opsets(
+    graph: *const ort::OrtGraph,
+    domains: *mut *const c_char,
+    versions: *mut i64,
+    count: usize,
+) -> ort::OrtStatusPtr {
+    if graph.is_null() {
+        return status_error("Graph_GetOperatorSets: null graph pointer");
+    }
+    let graph = graph_from_ptr(graph);
+    if count < graph.opsets.len()
+        || (!graph.opsets.is_empty() && (domains.is_null() || versions.is_null()))
+    {
+        return status_error(
+            "Graph_GetOperatorSets: null or undersized storage; query Graph_GetNumOperatorSets first",
+        );
+    }
+    for (index, (domain, version)) in graph.opsets.iter().enumerate() {
+        unsafe {
+            *domains.add(index) = domain.as_ptr();
+            *versions.add(index) = *version;
         }
     }
     ptr::null_mut()
@@ -1100,17 +1644,17 @@ unsafe extern "C" fn host_graph_get_nodes(
 }
 
 unsafe extern "C" fn host_graph_get_parent_node(
-    _graph: *const ort::OrtGraph,
+    graph: *const ort::OrtGraph,
     node: *mut *const ort::OrtNode,
 ) -> ort::OrtStatusPtr {
-    if node.is_null() {
+    if graph.is_null() || node.is_null() {
         return status_error(
             "Graph_GetParentNode failed: output pointer was null; fix the plugin to pass valid storage",
         );
     }
-    // SAFETY: output pointer is checked non-null. Stage 1 only projects top-level graphs.
+    // The parent node is boxed and owns this graph for the whole callback lifetime.
     unsafe {
-        *node = ptr::null();
+        *node = graph_from_ptr(graph).parent;
     }
     ptr::null_mut()
 }
@@ -1202,18 +1746,37 @@ unsafe extern "C" fn host_node_get_num_attributes(
 ) -> ort::OrtStatusPtr {
     node_count(node, out, |n| n.attrs.len(), "Node_GetNumAttributes")
 }
-unsafe extern "C" fn host_node_get_num_subgraphs(
-    _node: *const ort::OrtNode,
+unsafe extern "C" fn host_node_get_num_implicit_inputs(
+    node: *const ort::OrtNode,
     out: *mut usize,
 ) -> ort::OrtStatusPtr {
-    if out.is_null() {
-        status_error(
-            "Node_GetNumSubgraphs failed: output pointer was null; fix the plugin to pass valid storage",
-        )
-    } else {
-        unsafe { *out = 0 };
-        ptr::null_mut()
-    }
+    node_count(
+        node,
+        out,
+        |node| node.implicit_inputs.len(),
+        "Node_GetNumImplicitInputs",
+    )
+}
+
+unsafe extern "C" fn host_node_get_implicit_inputs(
+    node: *const ort::OrtNode,
+    values: *mut *const ort::OrtValueInfo,
+    count: usize,
+) -> ort::OrtStatusPtr {
+    node_values(
+        node,
+        values,
+        count,
+        |node| &node.implicit_inputs,
+        "Node_GetImplicitInputs",
+    )
+}
+
+unsafe extern "C" fn host_node_get_num_subgraphs(
+    node: *const ort::OrtNode,
+    out: *mut usize,
+) -> ort::OrtStatusPtr {
+    node_count(node, out, |n| n.subgraphs.len(), "Node_GetNumSubgraphs")
 }
 
 fn node_count(
@@ -1409,6 +1972,11 @@ unsafe extern "C" fn host_read_op_attr(
         Attribute::Strings(v) => {
             let mut out = Vec::new();
             for s in v {
+                if s.contains(&0) {
+                    return status_error(
+                        "ReadOpAttr: STRINGS contains an embedded NUL that the ORT delimiter format cannot represent losslessly; use native IR compilation for this attribute",
+                    );
+                }
                 out.extend_from_slice(s);
                 out.push(0);
             }
@@ -1440,11 +2008,28 @@ unsafe extern "C" fn host_read_op_attr(
 }
 
 unsafe extern "C" fn host_node_get_subgraphs(
-    _node: *const ort::OrtNode,
-    _graphs: *mut *const ort::OrtGraph,
-    _count: usize,
-    _names: *mut *const c_char,
+    node: *const ort::OrtNode,
+    graphs: *mut *const ort::OrtGraph,
+    count: usize,
+    names: *mut *const c_char,
 ) -> ort::OrtStatusPtr {
+    if node.is_null() {
+        return status_error("Node_GetSubgraphs failed: node pointer is null; pass a live node");
+    }
+    let node = node_from_ptr(node);
+    if count < node.subgraphs.len() || (!node.subgraphs.is_empty() && graphs.is_null()) {
+        return status_error(
+            "Node_GetSubgraphs failed: output storage is null or too small; query Node_GetNumSubgraphs and allocate that many entries",
+        );
+    }
+    for (index, (name, graph)) in node.subgraphs.iter().enumerate() {
+        unsafe {
+            *graphs.add(index) = graph.as_ort_graph();
+            if !names.is_null() {
+                *names.add(index) = name.as_ptr();
+            }
+        }
+    }
     ptr::null_mut()
 }
 
@@ -1472,6 +2057,31 @@ unsafe extern "C" fn host_kernel_context_get_input(
     ptr::null_mut()
 }
 
+unsafe extern "C" fn host_kernel_context_input_count(
+    context: *const ort::OrtKernelContext,
+    out: *mut usize,
+) -> ort::OrtStatusPtr {
+    if context.is_null() || out.is_null() {
+        return status_error("KernelContext_GetInputCount: null context/output pointer");
+    }
+    unsafe {
+        *out = (&*context.cast::<HostKernelContext>()).inputs.len();
+    }
+    ptr::null_mut()
+}
+unsafe extern "C" fn host_kernel_context_output_count(
+    context: *const ort::OrtKernelContext,
+    out: *mut usize,
+) -> ort::OrtStatusPtr {
+    if context.is_null() || out.is_null() {
+        return status_error("KernelContext_GetOutputCount: null context/output pointer");
+    }
+    unsafe {
+        *out = (&*context.cast::<HostKernelContext>()).outputs.len();
+    }
+    ptr::null_mut()
+}
+
 unsafe extern "C" fn host_kernel_context_get_output(
     context: *mut ort::OrtKernelContext,
     index: usize,
@@ -1490,23 +2100,67 @@ unsafe extern "C" fn host_kernel_context_get_output(
             "KernelContext_GetOutput failed: output index is out of range; fix the plugin compiled plan boundary",
         );
     };
-    if dim_count != value.tensor.dims.len() {
-        return status_error(
-            "KernelContext_GetOutput failed: requested output rank differs from the native executor allocation; fix shape inference before plugin dispatch",
-        );
+    if context
+        .requested_outputs
+        .as_ref()
+        .is_some_and(|requested| !requested[index])
+    {
+        unsafe { *out = ptr::null_mut() };
+        return ptr::null_mut();
     }
     if dim_count != 0 && dim_values.is_null() {
         return status_error(
-            "KernelContext_GetOutput failed: dim_values is null for a non-scalar output; fix the plugin output request",
+            "KernelContext_GetOutput failed: null dimensions for a non-scalar output",
         );
     }
-    if dim_count != 0 {
-        let dims = unsafe { std::slice::from_raw_parts(dim_values, dim_count) };
-        if dims != value.tensor.dims.as_slice() {
+    let dims = if dim_count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(dim_values, dim_count) }
+    };
+    if value.tensor.dims.is_none() {
+        let HostOrtValueStorage::Owned(bytes) = &mut value.storage else {
+            return status_error("KernelContext_GetOutput: unresolved output must own its storage");
+        };
+        let shape = match dims
+            .iter()
+            .map(|&dim| usize::try_from(dim))
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(shape) => shape,
+            Err(_) => {
+                return status_error(
+                    "KernelContext_GetOutput: negative output extent; report concrete runtime dimensions",
+                );
+            }
+        };
+        let Some(dtype) = DataType::from_onnx(value.tensor.dtype as _) else {
             return status_error(
-                "KernelContext_GetOutput failed: requested output shape differs from the native executor allocation; fix runtime output shape resolution",
+                "KernelContext_GetOutput: unknown output dtype; declare tensor output types before Compile",
+            );
+        };
+        if matches!(dtype, DataType::String | DataType::Undefined) {
+            return status_error(
+                "KernelContext_GetOutput: dynamic output requires a fixed-width tensor dtype",
             );
         }
+        let Some(size) = onnx_runtime_ir::checked_expected_bytes(dtype, &shape) else {
+            return status_error(
+                "KernelContext_GetOutput: output byte size overflows; reduce output dimensions",
+            );
+        };
+        if bytes.try_reserve_exact(size).is_err() {
+            return status_error(
+                "KernelContext_GetOutput: cannot allocate dynamic output payload; reduce the output size",
+            );
+        }
+        bytes.resize(size, 0);
+        value.tensor.dims = Some(dims.to_vec());
+    }
+    if value.tensor.dims.as_deref() != Some(dims) {
+        return status_error(
+            "KernelContext_GetOutput: requested shape differs from the existing output allocation; resolve output geometry before writing",
+        );
     }
     unsafe {
         *out = (value as *mut HostOrtValue).cast::<ort::OrtValue>();
@@ -1574,6 +2228,247 @@ unsafe extern "C" fn host_ep_graph_support_info_add_nodes_to_fuse(
 mod tests {
     use super::*;
     use onnx_runtime_ir::{Node, static_shape};
+
+    #[test]
+    fn initializer_constness_uses_ir_mutability_semantics() {
+        for (version, expected) in [(Some(3), true), (Some(11), false), (None, false)] {
+            let mut graph = Graph::new();
+            graph.ir_version = version;
+            let value = graph.create_named_value("default", DataType::Float32, static_shape([1]));
+            graph.add_input(value);
+            graph.add_output(value);
+            graph.set_initializer(
+                value,
+                onnx_runtime_ir::WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                    DataType::Float32,
+                    vec![1],
+                    2f32.to_le_bytes().to_vec(),
+                )),
+            );
+            let host = HostGraph::new(&graph).unwrap();
+            let mut constant = !expected;
+            assert!(
+                unsafe {
+                    host_value_info_is_constant_initializer(
+                        value_ptr(&host.values[&value]),
+                        &mut constant,
+                    )
+                }
+                .is_null()
+            );
+            assert_eq!(
+                constant, expected,
+                "IR {version:?} must not turn an overridable default into a cached constant"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_metadata_distinguishes_unknown_rank_scalar_and_named_symbols() {
+        let mut graph = Graph::new();
+        let unknown = graph.create_named_value("unknown", DataType::Float32, vec![]);
+        graph.mark_value_shape_unknown(unknown);
+        let scalar = graph.create_named_value("scalar", DataType::Float32, vec![]);
+        let n = graph.intern_symbol("n");
+        let symbolic = graph.create_named_value(
+            "symbolic",
+            DataType::Float32,
+            vec![Dim::Symbolic(n), Dim::Static(2)],
+        );
+        let unknown = HostTensorTypeAndShapeInfo::for_value(&graph, graph.value(unknown)).unwrap();
+        let scalar = HostTensorTypeAndShapeInfo::for_value(&graph, graph.value(scalar)).unwrap();
+        let symbolic =
+            HostTensorTypeAndShapeInfo::for_value(&graph, graph.value(symbolic)).unwrap();
+        let pointer = |info: &HostTensorTypeAndShapeInfo| {
+            (info as *const HostTensorTypeAndShapeInfo).cast::<ort::OrtTensorTypeAndShapeInfo>()
+        };
+        assert!(!unsafe { host_has_shape(pointer(&unknown)) });
+        assert!(unsafe { host_has_shape(pointer(&scalar)) });
+        let mut count = usize::MAX;
+        assert!(
+            unsafe { host_get_tensor_shape_element_count(pointer(&scalar), &mut count) }.is_null()
+        );
+        assert_eq!(count, 1);
+        let error = unsafe { host_get_tensor_shape_element_count(pointer(&unknown), &mut count) };
+        assert!(!error.is_null());
+        release_status(error);
+        let mut names = [ptr::null(); 2];
+        assert!(
+            unsafe { host_get_symbolic_dimensions(pointer(&symbolic), names.as_mut_ptr(), 2) }
+                .is_null()
+        );
+        assert_eq!(unsafe { CStr::from_ptr(names[0]) }, c"n");
+        assert_eq!(unsafe { CStr::from_ptr(names[1]) }, c"");
+        assert_eq!(symbolic.dims, Some(vec![-1, 2]));
+    }
+
+    #[test]
+    fn dynamic_plugin_outputs_allocate_once_and_reject_shape_changes() {
+        let mut context = HostKernelContext::dynamic(
+            &[],
+            &[DataType::Float32, DataType::Float32],
+            &[true, false],
+        )
+        .unwrap();
+        let context_ptr = (&raw mut context).cast::<ort::OrtKernelContext>();
+        let mut value = ptr::null_mut();
+        assert!(
+            unsafe {
+                host_kernel_context_get_output(context_ptr, 0, [2i64].as_ptr(), 1, &mut value)
+            }
+            .is_null()
+        );
+        assert!(!value.is_null());
+        assert_eq!(context.outputs[0].byte_len(), 8);
+        assert!(
+            unsafe {
+                host_kernel_context_get_output(context_ptr, 0, [2i64].as_ptr(), 1, &mut value)
+            }
+            .is_null()
+        );
+        let error = unsafe {
+            host_kernel_context_get_output(context_ptr, 0, [4i64].as_ptr(), 1, &mut value)
+        };
+        assert!(!error.is_null());
+        release_status(error);
+        assert!(
+            unsafe { host_kernel_context_get_output(context_ptr, 1, ptr::null(), 0, &mut value) }
+                .is_null()
+        );
+        assert!(value.is_null());
+        let outputs = context.into_dynamic_outputs().unwrap();
+        assert_eq!(outputs[0].as_ref().unwrap().shape, [2]);
+        assert!(outputs[1].is_none());
+        let context = HostKernelContext::dynamic(&[], &[DataType::Float32], &[true]).unwrap();
+        assert!(
+            context
+                .into_dynamic_outputs()
+                .unwrap_err()
+                .to_string()
+                .contains("did not allocate")
+        );
+    }
+
+    #[test]
+    fn tensor_attribute_values_own_numeric_and_string_payloads() {
+        for tensor in [
+            onnx_runtime_ir::TensorData::from_raw(
+                DataType::Float32,
+                vec![2],
+                [1f32, 2.].into_iter().flat_map(f32::to_le_bytes).collect(),
+            ),
+            onnx_runtime_ir::TensorData {
+                name: None,
+                dtype: DataType::String,
+                dims: vec![2],
+                data: vec![],
+                strings: vec![b"a\0b".to_vec(), vec![]],
+            },
+        ] {
+            let attr = HostOpAttr {
+                name: c"value".into(),
+                attr: Attribute::Tensor(tensor.clone()),
+            };
+            let mut value = ptr::null_mut();
+            assert!(
+                unsafe { host_tensor_attribute((&raw const attr).cast(), &mut value) }.is_null()
+            );
+            drop(attr);
+            assert_eq!(ort_value_from_ptr(value).tensor.dims, Some(vec![2]));
+            if tensor.dtype == DataType::String {
+                let mut len = 0;
+                assert!(unsafe { host_string_tensor_data_length(value, &mut len) }.is_null());
+                assert_eq!(len, 3);
+                let mut bytes = vec![0u8; len];
+                let mut offsets = [0usize; 2];
+                assert!(
+                    unsafe {
+                        host_string_tensor_content(
+                            value,
+                            bytes.as_mut_ptr().cast(),
+                            len,
+                            offsets.as_mut_ptr(),
+                            2,
+                        )
+                    }
+                    .is_null()
+                );
+                assert_eq!(bytes, b"a\0b");
+                assert_eq!(offsets, [0, 3]);
+            } else {
+                assert_eq!(ort_value_from_ptr(value).byte_len(), 8);
+            }
+            unsafe { host_release_value(value) };
+        }
+    }
+
+    #[test]
+    fn nested_graph_projection_preserves_names_parent_links_and_inherited_opsets() {
+        let mut body = Graph::new();
+        let x = body.create_named_value("captured", DataType::Float32, static_shape([2]));
+        let y = body.create_named_value("result", DataType::Float32, static_shape([2]));
+        body.add_output(y);
+        body.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![y]));
+        let mut graph = Graph::new();
+        graph.ir_version = Some(11);
+        graph.opset_imports.insert(String::new(), 24);
+        let cond = graph.create_named_value("cond", DataType::Bool, vec![]);
+        let result = graph.create_named_value("result", DataType::Float32, static_shape([2]));
+        graph.add_input(cond);
+        let captured = graph.create_named_value("captured", DataType::Float32, static_shape([2]));
+        graph.add_input(captured);
+        graph.add_output(result);
+        let node = graph.insert_node(Node::new(NodeId(0), "If", vec![Some(cond)], vec![result]));
+        graph
+            .subgraphs
+            .insert((node, "then_branch".into()), body.clone());
+        graph.subgraphs.insert((node, "else_branch".into()), body);
+        let host = HostGraph::new(&graph).unwrap();
+        let parent = (&*host.nodes[0] as *const HostNode).cast::<ort::OrtNode>();
+        // Moving the outer owner must not invalidate child or parent pointers.
+        let moved = Box::new(host);
+        let mut count = 0;
+        assert!(unsafe { host_node_get_num_subgraphs(parent, &mut count) }.is_null());
+        assert_eq!(count, 2);
+        let mut graphs = vec![ptr::null(); count];
+        let mut names = vec![ptr::null(); count];
+        assert!(
+            unsafe {
+                host_node_get_subgraphs(parent, graphs.as_mut_ptr(), count, names.as_mut_ptr())
+            }
+            .is_null()
+        );
+        let names = names
+            .iter()
+            .map(|name| unsafe { CStr::from_ptr(*name) }.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["else_branch", "then_branch"]);
+        for body in graphs {
+            let mut ir_version = 0;
+            assert!(unsafe { host_graph_ir_version(body, &mut ir_version) }.is_null());
+            assert_eq!(ir_version, 11, "nested bodies inherit the model IR version");
+            let mut reported_parent = ptr::null();
+            assert!(unsafe { host_graph_get_parent_node(body, &mut reported_parent) }.is_null());
+            assert_eq!(reported_parent, parent);
+            let mut body_nodes = [ptr::null(); 1];
+            assert!(unsafe { host_graph_get_nodes(body, body_nodes.as_mut_ptr(), 1) }.is_null());
+            let mut version = 0;
+            assert!(unsafe { host_node_get_since_version(body_nodes[0], &mut version) }.is_null());
+            assert_eq!(version, 24);
+        }
+        let mut root_parent = parent;
+        assert!(
+            unsafe { host_graph_get_parent_node(moved.as_ort_graph(), &mut root_parent) }.is_null()
+        );
+        assert!(root_parent.is_null());
+        let status =
+            unsafe { host_node_get_subgraphs(parent, ptr::null_mut(), 0, ptr::null_mut()) };
+        assert!(!status.is_null());
+        release_status(status);
+        let status = unsafe { host_node_get_num_subgraphs(ptr::null(), &mut count) };
+        assert!(!status.is_null());
+        release_status(status);
+    }
 
     #[test]
     fn projects_graph_and_records_fused_claim_boundaries() {

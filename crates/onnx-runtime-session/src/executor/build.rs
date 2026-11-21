@@ -346,8 +346,10 @@ pub(super) fn reject_unsupported_operators(
     if ep.device_type() == DeviceType::Cuda {
         return Ok(());
     }
+    let graph_claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep, graph)?;
     for (node_id, node) in graph.nodes.iter() {
-        if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
+        if graph_claims.contains(node_id)
+            || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
             || is_sequence_op(&node.op_type, &node.domain)
         {
@@ -398,26 +400,26 @@ pub(super) fn cuda_fallback_report(
     graph: &Graph,
     ep: &dyn ExecutionProvider,
     artifact_config: ExecutorArtifactConfig,
-) -> Option<ExecutionProviderFallbackReport> {
+) -> Result<Option<ExecutionProviderFallbackReport>> {
     if ep.device_type() != DeviceType::Cuda {
-        return None;
+        return Ok(None);
     }
 
     let mut issues = Vec::new();
-    collect_cuda_coverage_issues(graph, graph, ep, artifact_config, "graph", &mut issues);
+    collect_cuda_coverage_issues(graph, graph, ep, artifact_config, "graph", &mut issues)?;
     if issues.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut assigned_ops = BTreeSet::new();
     let assigned_node_count = collect_executable_ops(graph, &mut assigned_ops);
-    Some(ExecutionProviderFallbackReport {
+    Ok(Some(ExecutionProviderFallbackReport {
         requested_provider: ep.name().to_string(),
         fallback_provider: "cpu_ep".to_string(),
         assigned_node_count,
         assigned_ops: assigned_ops.into_iter().collect(),
         declines: issues,
-    })
+    }))
 }
 
 pub(super) fn collect_executable_ops(graph: &Graph, ops: &mut BTreeSet<String>) -> usize {
@@ -471,9 +473,11 @@ pub(super) fn collect_cuda_coverage_issues(
     artifact_config: ExecutorArtifactConfig,
     scope: &str,
     issues: &mut Vec<ExecutionProviderDecline>,
-) {
+) -> Result<()> {
+    let graph_claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep, graph)?;
     for (node_id, node) in graph.nodes.iter() {
-        if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
+        if graph_claims.contains(node_id)
+            || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
             || is_sequence_op(&node.op_type, &node.domain)
         {
@@ -546,6 +550,9 @@ pub(super) fn collect_cuda_coverage_issues(
     }
 
     for ((node_id, attribute), subgraph) in &graph.subgraphs {
+        if graph_claims.contains(*node_id) {
+            continue;
+        }
         let sub_scope = format!("{scope}/node#{}/{}", node_id.0, attribute);
         collect_cuda_coverage_issues(
             subgraph,
@@ -554,8 +561,9 @@ pub(super) fn collect_cuda_coverage_issues(
             artifact_config,
             &sub_scope,
             issues,
-        );
+        )?;
     }
+    Ok(())
 }
 
 pub(super) fn canonical_domain(node: &Node) -> String {
@@ -1015,6 +1023,7 @@ impl Executor {
         )?;
         // Topological order up front: also validates the selected graph is a DAG.
         let order = graph.topological_order()?;
+        let graph_claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep.as_ref(), &graph)?;
         let (weight_handles, expert_region_candidates) = {
             let mut span = trace_span("session.lazy_weight_handles", "session");
             let (handles, candidates) =
@@ -1074,7 +1083,8 @@ impl Executor {
             has_symbols,
             &weight_handles,
             &capabilities,
-        );
+            &graph_claims,
+        )?;
 
         // 4) name → value id and the set of caller-required inputs.
         let (input_index, required_inputs, name_index) = Self::build_name_indexes(&graph);
@@ -1101,6 +1111,7 @@ impl Executor {
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
             buffers,
             buffer_shapes,
+            has_unknown_rank: value_shapes.values().any(Option::is_none),
             value_shapes,
             value_dtypes,
             plan,
@@ -1209,7 +1220,7 @@ impl Executor {
                 if node_plan.input_dtypes.get(1) != Some(&DataType::Float16) {
                     continue;
                 }
-                let Some(shape) = exec.value_shapes.get(&b_vid) else {
+                let Some(shape) = exec.value_shapes.get(&b_vid).and_then(Option::as_ref) else {
                     continue;
                 };
                 if shape.len() != 2 {
@@ -1261,7 +1272,7 @@ impl Executor {
                 if node_plan.input_dtypes.get(1) != Some(&DataType::Float32) {
                     continue;
                 }
-                let Some(shape) = exec.value_shapes.get(&b_vid) else {
+                let Some(shape) = exec.value_shapes.get(&b_vid).and_then(Option::as_ref) else {
                     continue;
                 };
                 if shape.len() != 2 {
@@ -1446,7 +1457,7 @@ impl Executor {
         let ep_pass_nodes_after = graph.num_nodes();
         rewrite_kv_capacity_appends(graph, ep.as_ref());
         let mut execution_provider_fallback_report =
-            cuda_fallback_report(graph, ep.as_ref(), artifact_transaction.config());
+            cuda_fallback_report(graph, ep.as_ref(), artifact_transaction.config())?;
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
             .map_or(0, |report| report.declines.len());
@@ -1529,12 +1540,12 @@ impl Executor {
         ep: &dyn ExecutionProvider,
         weight_handles: &HashMap<ValueId, WeightHandle>,
     ) -> Result<(
-        HashMap<ValueId, Shape>,
+        HashMap<ValueId, Option<Shape>>,
         HashMap<ValueId, DataType>,
         HashMap<ValueId, DeviceBuffer>,
         HashMap<ValueId, Vec<usize>>,
     )> {
-        let mut value_shapes: HashMap<ValueId, Shape> = HashMap::new();
+        let mut value_shapes: HashMap<ValueId, Option<Shape>> = HashMap::new();
         let mut value_dtypes: HashMap<ValueId, DataType> = HashMap::new();
         let mut buffers: HashMap<ValueId, DeviceBuffer> = HashMap::new();
         let mut buffer_shapes: HashMap<ValueId, Vec<usize>> = HashMap::new();
@@ -1551,7 +1562,7 @@ impl Executor {
             let dtype = weight.dtype();
             let dims = weight.dims().to_vec();
             value_dtypes.insert(vid, dtype);
-            value_shapes.insert(vid, dims.iter().map(|&d| Dim::Static(d)).collect());
+            value_shapes.insert(vid, Some(dims.iter().map(|&d| Dim::Static(d)).collect()));
             let value = graph.value(vid);
             let prepared_only = !value.is_graph_output
                 && !value.consumers.is_empty()
@@ -1646,25 +1657,29 @@ impl Executor {
     fn collect_value_metadata(
         graph: &Graph,
         order: &[NodeId],
-        value_shapes: &mut HashMap<ValueId, Shape>,
+        value_shapes: &mut HashMap<ValueId, Option<Shape>>,
         value_dtypes: &mut HashMap<ValueId, DataType>,
     ) -> bool {
         for &vid in &graph.inputs {
             value_shapes
                 .entry(vid)
-                .or_insert_with(|| graph.value(vid).shape.clone());
+                .or_insert_with(|| graph.value(vid).tensor_shape().cloned());
             value_dtypes.entry(vid).or_insert(graph.value(vid).dtype);
         }
         for &nid in order {
             for out in graph.node(nid).output_values() {
                 value_shapes
                     .entry(out)
-                    .or_insert_with(|| graph.value(out).shape.clone());
+                    .or_insert_with(|| graph.value(out).tensor_shape().cloned());
                 value_dtypes.entry(out).or_insert(graph.value(out).dtype);
             }
         }
 
-        value_shapes.values().any(|s| as_static_shape(s).is_none())
+        value_shapes.values().any(|shape| {
+            shape
+                .as_ref()
+                .is_none_or(|shape| as_static_shape(shape).is_none())
+        })
     }
 
     /// Classify values that need special buffer-sizing treatment: those produced
@@ -1710,10 +1725,12 @@ impl Executor {
         has_symbols: bool,
         weight_handles: &HashMap<ValueId, WeightHandle>,
         capabilities: &onnx_runtime_ep_api::ExecutionProviderCapabilities,
-    ) -> Vec<NodePlan> {
+        graph_claims: &onnx_runtime_ep_api::GraphKernelClaims,
+    ) -> Result<Vec<NodePlan>> {
         let mut plan_span = trace_span("session.execution_plan", "session");
         let mut plan = Vec::with_capacity(order.len());
         let mut skipped_epcontext = 0_u64;
+        let captures_by_node = graph.captured_inputs_by_node();
         for &nid in order {
             let node = graph.node(nid);
             // EPContext nodes are pre-compiled: they bypass placement and were
@@ -1732,19 +1749,37 @@ impl Executor {
             // omitted one, but trim trailing `None`s (a trailing omitted
             // optional just lowers the arity, matching ONNX semantics).
             let mut slots: Vec<Option<ValueId>> = node.inputs.clone();
-            while matches!(slots.last(), Some(None)) {
-                slots.pop();
+            let graph_kernel = graph_claims.contains(nid);
+            if graph_kernel {
+                slots = node.inputs_with_captures(
+                    captures_by_node.get(&nid).into_iter().flatten().copied(),
+                );
+            } else {
+                while matches!(slots.last(), Some(None)) {
+                    slots.pop();
+                }
             }
             let inputs = slots;
             let outputs: Vec<ValueId> = node.output_values().collect();
-            let input_dtypes: Vec<DataType> = inputs
+            let dtype = |vid: ValueId| -> Result<DataType> {
+                let dtype = value_dtypes.get(&vid).copied().ok_or_else(|| SessionError::Ep(EpError::KernelFailed(format!("graph node #{} ('{}') references value #{} without dtype metadata; declare its tensor type before claiming the graph", nid.0, node.op_type, vid.0))))?;
+                if graph_kernel && graph.value(vid).tensor_dtype().is_none() {
+                    return Err(SessionError::Ep(EpError::KernelFailed(format!(
+                        "graph kernel node #{} ('{}') boundary value #{} is not a tensor with a known element type; graph kernels currently require typed tensor boundaries",
+                        nid.0, node.op_type, vid.0
+                    ))));
+                }
+                Ok(dtype)
+            };
+            let input_dtypes = inputs
                 .iter()
-                .map(|v| {
-                    v.map(|vid| value_dtypes[&vid])
-                        .unwrap_or(DataType::Undefined)
-                })
-                .collect();
-            let output_dtypes: Vec<DataType> = outputs.iter().map(|v| value_dtypes[v]).collect();
+                .map(|value| value.map_or(Ok(DataType::Undefined), &dtype))
+                .collect::<Result<Vec<_>>>()?;
+            let output_dtypes = outputs
+                .iter()
+                .copied()
+                .map(dtype)
+                .collect::<Result<Vec<_>>>()?;
             let mut lazy_weight_inputs = Vec::new();
             // Dense (`MatMul`/`MatMulNBits`) and `BlockQuantizedMoE` weights may
             // all be look-ahead prefetched: each boundary's EP-side
@@ -1771,6 +1806,7 @@ impl Executor {
             }
             plan.push(NodePlan {
                 node_id: nid,
+                graph_kernel,
                 inputs,
                 outputs,
                 input_dtypes,
@@ -1786,7 +1822,7 @@ impl Executor {
         // appear in any plan node's formal `inputs`, so liveness must treat the
         // capturing node as a use site — otherwise an earlier in-place alias
         // could free a buffer an If/Loop/Scan body still reads at runtime.
-        let captures_by_node = Self::control_flow_captures_by_node(graph);
+        let captures_by_node = graph.captured_inputs_by_node();
         let mut last_use = HashMap::new();
         for (pi, node) in plan.iter().enumerate() {
             for vid in node.inputs.iter().flatten() {
@@ -1844,35 +1880,7 @@ impl Executor {
                     .with("has_symbols", has_symbols),
             );
         }
-        plan
-    }
-
-    /// Map each control-flow node to the outer [`ValueId`]s its subgraph bodies
-    /// implicitly capture by name. If/Loop/Scan bodies reference free variables
-    /// from the enclosing scope (resolved at runtime by `prepare_subgraph` via
-    /// [`required_outer_names`] and the name index); those captures never appear
-    /// in the node's formal `inputs`, so callers that reason about value
-    /// liveness must consult this map to avoid freeing a still-captured buffer.
-    fn control_flow_captures_by_node(graph: &Graph) -> HashMap<NodeId, HashSet<ValueId>> {
-        let mut captures_by_node: HashMap<NodeId, HashSet<ValueId>> = HashMap::new();
-        if graph.subgraphs.is_empty() {
-            return captures_by_node;
-        }
-        let name_index: HashMap<&str, ValueId> = graph
-            .values
-            .iter()
-            .filter_map(|(vid, value)| value.name.as_deref().map(|name| (name, vid)))
-            .collect();
-        for ((owner, _attr_key), body) in graph.subgraphs.iter() {
-            let entry = captures_by_node.entry(*owner).or_default();
-            for name in required_outer_names(body) {
-                if let Some(&vid) = name_index.get(name.as_str()) {
-                    entry.insert(vid);
-                }
-            }
-        }
-        captures_by_node.retain(|_, values| !values.is_empty());
-        captures_by_node
+        Ok(plan)
     }
 
     /// required_inputs, name_index)`: the caller-input name map and the set of
@@ -1948,7 +1956,7 @@ impl Executor {
             if self.sequence_values.contains(&vid) {
                 continue;
             }
-            match substitute(shape, bindings) {
+            match shape.as_ref().and_then(|shape| substitute(shape, bindings)) {
                 Some(dims) => {
                     resolved.insert(vid, dims);
                 }
@@ -1979,7 +1987,7 @@ impl Executor {
     ) -> HashMap<ValueId, Vec<usize>> {
         let mut resolved = HashMap::with_capacity(self.value_shapes.len());
         for (&vid, shape) in &self.value_shapes {
-            if let Some(dims) = substitute(shape, bindings) {
+            if let Some(dims) = shape.as_ref().and_then(|shape| substitute(shape, bindings)) {
                 resolved.insert(vid, dims);
             }
         }
@@ -1995,6 +2003,10 @@ impl Executor {
     ) -> HashMap<ValueId, Vec<usize>> {
         resolved.retain(|vid, _| self.value_shapes.contains_key(vid));
         for (&vid, shape) in &self.value_shapes {
+            let Some(shape) = shape else {
+                resolved.remove(&vid);
+                continue;
+            };
             let mut remove = false;
             match resolved.entry(vid) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -2059,7 +2071,9 @@ impl Executor {
             }
             // Re-substitute only the variant tail, reusing each `Vec`'s capacity.
             for &vid in &memo.variant_values {
-                let shape = &self.value_shapes[&vid];
+                let shape = self.value_shapes[&vid]
+                    .as_ref()
+                    .expect("decode memo requires known ranks");
                 match resolved.get_mut(&vid) {
                     Some(slot) => {
                         if !substitute_into(shape, bindings, slot) {
@@ -2120,7 +2134,12 @@ impl Executor {
                 let mut canonical = HashSet::with_capacity(resolved.len());
                 for (&vid, dims) in &resolved {
                     canonical.insert(vid);
-                    if shape_references_any(&self.value_shapes[&vid], &decode_varying) {
+                    if shape_references_any(
+                        self.value_shapes[&vid]
+                            .as_ref()
+                            .expect("decode memo requires known ranks"),
+                        &decode_varying,
+                    ) {
                         variant_values.push(vid);
                     } else {
                         invariant_shapes.insert(vid, dims.clone());
@@ -2471,7 +2490,7 @@ impl Executor {
             // Control-flow ops (If/Loop/Scan) are not leaf kernels — they execute
             // nested subgraphs through the executor's own path, so they have no
             // entry in the EP kernel registry and must not be compiled here.
-            if is_control_flow_op(&node.op_type, &node.domain) {
+            if !self.plan[i].graph_kernel && is_control_flow_op(&node.op_type, &node.domain) {
                 if span.is_some() {
                     skipped_control_flow += 1;
                 }
@@ -2544,6 +2563,19 @@ impl Executor {
                 &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
                 graph_tokens,
+                self.plan[i]
+                    .graph_kernel
+                    .then_some(onnx_runtime_ep_api::GraphKernelRequest {
+                        scope: onnx_runtime_ep_api::GraphKernelScope::Executor {
+                            provider: self.artifact_config.provider(),
+                            executor: self.artifact_config.executor(),
+                            generation: self.artifact_config.generation(),
+                        },
+
+                        graph: &self.graph,
+                        node,
+                        inputs: &self.plan[i].inputs,
+                    }),
             )?;
             // Pre-populate the kernel binding so the first decode step already
             // hits the zero-alloc fast path for static-shape graphs.

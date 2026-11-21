@@ -1223,3 +1223,287 @@ fn only_the_nodes_that_receive_a_workspace_query_placement() {
         check_status(api, status, "UnregisterExecutionProviderLibrary");
     }
 }
+
+/// Runs the complete native -> C graph projection -> outbound graph reader ->
+/// structural EP claim -> Compile -> Compute -> dynamic native output path.
+#[test]
+fn whole_graph_control_flow_crosses_the_plugin_bridge_and_executes() {
+    use onnx_runtime_ep_api::{DevicePtr, Kernel, PluginExecutionPlan, TensorView};
+    use onnx_runtime_ir::{Attribute, DataType, DeviceId, Dim, Graph, Node, NodeId, static_shape};
+    let _serial = lock_ort_ep();
+    let Some(f) = Fixture::acquire("whole graph control flow") else {
+        return;
+    };
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 24);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([2]));
+    let captured = graph.create_named_value("captured", DataType::Float32, static_shape([2]));
+    let cond = graph.create_named_value("condition", DataType::Bool, vec![]);
+    let selected = graph.create_named_value("selected", DataType::Float32, vec![]);
+    let output = graph.create_named_value("output", DataType::Float32, vec![]);
+    graph.mark_value_shape_unknown(selected);
+    graph.mark_value_shape_unknown(output);
+    graph.set_inputs(vec![x, cond]);
+    graph.set_outputs(vec![output]);
+    let owner = graph.insert_node(Node::new(NodeId(0), "If", vec![Some(cond)], vec![selected]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(x)],
+        vec![captured],
+    ));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Mul",
+        vec![Some(selected), Some(selected)],
+        vec![output],
+    ));
+    for (name, op) in [("then_branch", "Identity"), ("else_branch", "Concat")] {
+        let mut body = Graph::new();
+        let captured = body.create_named_value("captured", DataType::Float32, vec![Dim::Static(2)]);
+        let value = body.create_named_value("branch_output", DataType::Float32, vec![]);
+        body.mark_value_shape_unknown(value);
+        body.set_outputs(vec![value]);
+        let mut node = Node::new(
+            NodeId(0),
+            op,
+            if op == "Identity" {
+                vec![Some(captured)]
+            } else {
+                vec![Some(captured), Some(captured)]
+            },
+            vec![value],
+        );
+        if op == "Concat" {
+            node.attributes.insert("axis".into(), Attribute::Int(0));
+        }
+        body.insert_node(node);
+        graph
+            .node_mut(owner)
+            .attributes
+            .insert(name.into(), Attribute::Graph(Box::new(body.clone())));
+        graph.subgraphs.insert((owner, name.into()), body);
+    }
+    let (claims, plan) =
+        PluginExecutionPlan::compile(&graph, &f.plugin_path, Some(c"nxrt_mock_compile_only"))
+            .unwrap();
+    assert_eq!(
+        claims.len(),
+        1,
+        "the plugin must fuse If with its supported Mul consumer"
+    );
+    assert_eq!(claims[0].node_ids, [owner, NodeId(2)]);
+    assert_eq!(
+        claims[0].input_values.len(),
+        2,
+        "condition and implicit capture must cross the fused boundary"
+    );
+    let kernel = plan.kernel(0).unwrap();
+    assert!(kernel.has_kernel_sized_outputs());
+    for condition in [1u8, 0, 1] {
+        let values = [3f32, -2.];
+        let views = claims[0]
+            .input_values
+            .iter()
+            .map(|&id| {
+                if id == cond {
+                    TensorView::new(
+                        DevicePtr((&condition as *const u8).cast()),
+                        DataType::Bool,
+                        &[],
+                        &[],
+                        DeviceId::cpu(),
+                    )
+                } else {
+                    assert_eq!(id, captured);
+                    TensorView::new(
+                        DevicePtr(values.as_ptr().cast()),
+                        DataType::Float32,
+                        &[2],
+                        &[1],
+                        DeviceId::cpu(),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut result = kernel.execute_kernel_sized(&views, &[true]).unwrap();
+        let result = result.remove(0).unwrap();
+        let expected = if condition != 0 {
+            vec![9., 4.]
+        } else {
+            vec![9., 4., 9., 4.]
+        };
+        assert_eq!(result.shape, [expected.len()]);
+        let decoded = result
+            .bytes
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, expected);
+    }
+    assert_eq!(plan.compute_calls(), 3);
+}
+
+#[test]
+fn whole_graph_control_flow_executes_on_the_ep_in_real_ort() {
+    let _serial = lock_ort_ep();
+    let Some(f) = Fixture::acquire("real ORT control flow") else {
+        return;
+    };
+    let api = f.api;
+    let model =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/control_flow.onnx.textproto");
+    unsafe {
+        let env = register_plugin(api, c"nxrt_mock_compile_only", &f.plugin_path);
+        let device = find_our_ep_device(api, env);
+        let (session, options) = create_session_on_our_ep(api, env, device, &model);
+        let before = f.counter("nxrt_mock_shared_ep_control_flow_executed");
+        let mut memory = ptr::null_mut();
+        check_status(
+            api,
+            ((*api).CreateCpuMemoryInfo.unwrap())(
+                ort::OrtDeviceAllocator,
+                ort::OrtMemTypeDefault,
+                &mut memory,
+            ),
+            "CPU memory info",
+        );
+        for mut condition in [1u8, 0, 1] {
+            let mut x = [3f32, -2.];
+            let mut x_value = ptr::null_mut();
+            let mut cond_value = ptr::null_mut();
+            check_status(
+                api,
+                ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+                    memory,
+                    x.as_mut_ptr().cast(),
+                    8,
+                    [2i64].as_ptr(),
+                    1,
+                    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                    &mut x_value,
+                ),
+                "x tensor",
+            );
+            check_status(
+                api,
+                ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+                    memory,
+                    (&raw mut condition).cast(),
+                    1,
+                    ptr::null(),
+                    0,
+                    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL,
+                    &mut cond_value,
+                ),
+                "condition tensor",
+            );
+            let mut output = ptr::null_mut();
+            check_status(
+                api,
+                ((*api).Run.unwrap())(
+                    session,
+                    ptr::null(),
+                    [c"x".as_ptr(), c"condition".as_ptr()].as_ptr(),
+                    [x_value.cast_const(), cond_value.cast_const()].as_ptr(),
+                    2,
+                    [c"output".as_ptr()].as_ptr(),
+                    1,
+                    &mut output,
+                ),
+                "control flow Run",
+            );
+            let mut shape = ptr::null_mut();
+            check_status(
+                api,
+                ((*api).GetTensorTypeAndShape.unwrap())(output, &mut shape),
+                "output shape",
+            );
+            let mut count = 0;
+            check_status(
+                api,
+                ((*api).GetTensorShapeElementCount.unwrap())(shape, &mut count),
+                "output size",
+            );
+            let expected = if condition != 0 {
+                vec![3., 0.]
+            } else {
+                vec![3., 0., 3., 0.]
+            };
+            assert_eq!(count, expected.len());
+            let mut data = ptr::null_mut();
+            check_status(
+                api,
+                ((*api).GetTensorMutableData.unwrap())(output, &mut data),
+                "output data",
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(data.cast::<f32>(), count),
+                expected
+            );
+            ((*api).ReleaseTensorTypeAndShapeInfo.unwrap())(shape);
+            for value in [output, x_value, cond_value] {
+                ((*api).ReleaseValue.unwrap())(value);
+            }
+        }
+        assert_eq!(
+            f.counter("nxrt_mock_shared_ep_control_flow_executed") - before,
+            3,
+            "correct values alone cannot prove EP execution; host If fallback must not satisfy this test"
+        );
+        ((*api).ReleaseMemoryInfo.unwrap())(memory);
+        ((*api).ReleaseSession.unwrap())(session);
+        ((*api).ReleaseSessionOptions.unwrap())(options);
+        check_status(
+            api,
+            ((*api).UnregisterExecutionProviderLibrary.unwrap())(
+                env,
+                c"nxrt_mock_compile_only".as_ptr(),
+            ),
+            "unregister control flow EP",
+        );
+    }
+}
+
+#[test]
+fn whole_graph_control_flow_executes_through_native_plugin_session() {
+    use onnx_runtime_ir::DataType;
+    use onnx_runtime_session::{InferenceSession, PluginExecutionProvider, Tensor};
+    use std::sync::Arc;
+    let _serial = lock_ort_ep();
+    let Some(f) = Fixture::acquire("native plugin control flow session") else {
+        return;
+    };
+    let provider = PluginExecutionProvider::new(
+        f.plugin_path.clone(),
+        Some("nxrt_mock_compile_only".into()),
+        "nxrt_shared_mock_ep",
+        "cpu",
+    )
+    .unwrap();
+    let bytes =
+        onnx_std::textproto::to_binary(include_str!("fixtures/control_flow.onnx.textproto"))
+            .unwrap();
+    let before = f.counter("nxrt_mock_shared_ep_control_flow_executed");
+    let mut session = InferenceSession::builder()
+        .model_bytes(&bytes)
+        .execution_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+    for condition in [1u8, 0, 1] {
+        let x = Tensor::from_f32(&[2], &[3., -2.]).unwrap();
+        let cond = Tensor::from_raw(DataType::Bool, vec![], &[condition]).unwrap();
+        let actual = session.run(&[("x", &x), ("condition", &cond)]).unwrap();
+        let expected = if condition != 0 {
+            vec![3., 0.]
+        } else {
+            vec![3., 0., 3., 0.]
+        };
+        assert_eq!(actual[0].shape, [expected.len()]);
+        assert_eq!(actual[0].to_vec_f32(), expected);
+    }
+    assert_eq!(
+        f.counter("nxrt_mock_shared_ep_control_flow_executed") - before,
+        3
+    );
+}

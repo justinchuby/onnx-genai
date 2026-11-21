@@ -121,7 +121,7 @@ fn capability_parity_supported_ops_with_known_shapes() {
 
         // Path B (C ABI simulation): query_capabilities should claim the node
         let ort_view = OrtGraphView::new(&view);
-        let claims = ort_view.query_capabilities(&ep);
+        let claims = ort_view.query_capabilities(&ep).unwrap();
         assert!(
             !claims.is_empty(),
             "C ABI path must claim {op_type} (trait supports + shape inference not declined)"
@@ -218,7 +218,7 @@ fn capability_parity_unsupported_ops() {
 
         // Path B: C ABI must also produce no claims
         let ort_view = OrtGraphView::new(&view);
-        let claims = ort_view.query_capabilities(&ep);
+        let claims = ort_view.query_capabilities(&ep).unwrap();
         assert!(
             claims.is_empty(),
             "C ABI must NOT claim unsupported {domain}/{op_type}"
@@ -313,7 +313,7 @@ fn error_parity_declined_shape_inference_is_cabi_only() {
     // Step 1 — Trait path claims Unsqueeze (it is in the kernel registry).
     // This is the "first half" that OrtGraphView::query_capabilities covers.
     let ort_view = OrtGraphView::new(&view);
-    let trait_claims = ort_view.query_capabilities(&ep);
+    let trait_claims = ort_view.query_capabilities(&ep).unwrap();
     assert!(
         !trait_claims.is_empty(),
         "Trait (query_capabilities) must claim Unsqueeze — it is a registered kernel"
@@ -370,7 +370,7 @@ fn error_parity_unknown_op_declined_by_both() {
 
     // C ABI declines
     let ort_view = OrtGraphView::new(&view);
-    let claims = ort_view.query_capabilities(&ep);
+    let claims = ort_view.query_capabilities(&ep).unwrap();
     assert!(claims.is_empty(), "C ABI must decline unknown op");
 }
 
@@ -442,7 +442,7 @@ fn capability_parity_mixed_graph() {
 
     // C ABI: should claim only the Add node
     let ort_view = OrtGraphView::new(&view);
-    let claims = ort_view.query_capabilities(&ep);
+    let claims = ort_view.query_capabilities(&ep).unwrap();
     assert_eq!(
         claims.len(),
         1,
@@ -471,7 +471,7 @@ fn capability_parity_com_microsoft_domain() {
     let trait_result = ep.supports_node(&view, node_idx, 1);
     // Both paths must agree on decline
     let ort_view = OrtGraphView::new(&view);
-    let claims = ort_view.query_capabilities(&ep);
+    let claims = ort_view.query_capabilities(&ep).unwrap();
 
     if !trait_result.is_supported() {
         assert!(

@@ -29,3 +29,51 @@ fn pinned_runtime_loads_and_its_c_api_status_roundtrips() {
         assert_eq!(message.as_bytes(), b"nxrt API status roundtrip");
     }
 }
+
+#[test]
+fn string_attribute_read_preserves_embedded_and_trailing_nuls() {
+    use onnx_genai_ort_sys as ort;
+    // SAFETY: process-lifetime ORT API; the attribute is owned and released.
+    unsafe {
+        let base = ort::OrtGetApiBase();
+        assert!(!base.is_null());
+        let api = &*((*base).GetApi.unwrap()(ort::ORT_API_VERSION));
+        for data in [b"nearest".as_slice(), b"a\0b\0".as_slice()] {
+            let mut attribute = std::ptr::null_mut();
+            assert!(
+                api.CreateOpAttr.unwrap()(
+                    c"mode".as_ptr(),
+                    data.as_ptr().cast(),
+                    data.len() as i32,
+                    ort::ORT_OP_ATTR_STRING,
+                    &mut attribute
+                )
+                .is_null()
+            );
+            let mut required = 0;
+            let status = api.ReadOpAttr.unwrap()(
+                attribute,
+                ort::ORT_OP_ATTR_STRING,
+                std::ptr::null_mut(),
+                0,
+                &mut required,
+            );
+            if !status.is_null() {
+                api.ReleaseStatus.unwrap()(status);
+            }
+            let mut bytes = vec![0; required];
+            let mut written = 0;
+            let status = api.ReadOpAttr.unwrap()(
+                attribute,
+                ort::ORT_OP_ATTR_STRING,
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                &mut written,
+            );
+            api.ReleaseOpAttr.unwrap()(attribute);
+            assert!(status.is_null());
+            bytes.truncate(written);
+            assert_eq!(bytes, data);
+        }
+    }
+}

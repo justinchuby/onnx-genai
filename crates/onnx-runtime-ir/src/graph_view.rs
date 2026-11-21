@@ -1,5 +1,6 @@
 //! Immutable, cached structural lens over a finalized [`Graph`].
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::{Graph, IrError, Node, NodeId, Value, ValueId};
@@ -48,6 +49,8 @@ pub struct GraphViewCache {
     value_consumer_uses: Vec<Range<usize>>,
     consumer_uses: Vec<ConsumerUse>,
     initializer_bits: Vec<bool>,
+    captures: HashMap<NodeIndex, Vec<ValueIndex>>,
+    capture_users: HashMap<ValueIndex, Vec<NodeIndex>>,
 }
 
 impl GraphViewCache {
@@ -162,6 +165,29 @@ impl GraphViewCache {
             .map(|id| graph.is_initializer(*id))
             .collect();
 
+        let mut captures = HashMap::new();
+        let mut capture_users: HashMap<ValueIndex, Vec<NodeIndex>> = HashMap::new();
+        for (id, values) in graph.captured_inputs_by_node() {
+            let node = node_index_by_raw_id
+                .get(id.0 as usize)
+                .copied()
+                .flatten()
+                .ok_or(IrError::UnknownNode(id))?;
+            let formal = &graph.node(id).inputs;
+            let values = values
+                .into_iter()
+                .filter(|value| !formal.contains(&Some(*value)))
+                .map(|value| value_index_by_raw_id[value.0 as usize].expect("capture must be live"))
+                .collect::<Vec<_>>();
+            for value in &values {
+                capture_users.entry(*value).or_default().push(node);
+            }
+            captures.insert(node, values);
+        }
+        for nodes in capture_users.values_mut() {
+            nodes.sort_unstable();
+            nodes.dedup();
+        }
         Ok(Self {
             topo_nodes,
             live_values,
@@ -175,6 +201,8 @@ impl GraphViewCache {
             value_consumer_uses,
             consumer_uses,
             initializer_bits,
+            captures,
+            capture_users,
         })
     }
 }
@@ -207,6 +235,31 @@ impl<'a> GraphView<'a> {
     pub fn values(self) -> impl ExactSizeIterator<Item = ValueIndex> {
         (0..self.cache.live_values.len())
             .map(|index| ValueIndex(u32::try_from(index).expect("value count exceeds u32")))
+    }
+
+    /// All data dependencies, including lexical captures, without changing the
+    /// positional ONNX input slots returned by `node_inputs`.
+    pub fn node_dependencies(self, node: NodeIndex) -> impl Iterator<Item = ValueIndex> + 'a {
+        self.node_inputs(node).iter().flatten().copied().chain(
+            self.cache
+                .captures
+                .get(&node)
+                .into_iter()
+                .flatten()
+                .copied(),
+        )
+    }
+
+    /// Consumers through either formal operands or nested-graph captures.
+    pub fn dependent_nodes(self, value: ValueIndex) -> impl Iterator<Item = NodeIndex> + 'a {
+        self.consumers(value).iter().map(|use_| use_.node).chain(
+            self.cache
+                .capture_users
+                .get(&value)
+                .into_iter()
+                .flatten()
+                .copied(),
+        )
     }
 
     pub fn node_index(self, id: NodeId) -> Option<NodeIndex> {

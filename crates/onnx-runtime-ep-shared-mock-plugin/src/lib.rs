@@ -52,6 +52,8 @@
 //! integration test — which reaches this library through ORT's `dlopen` — can
 //! read the same statics ORT's copy mutates.
 
+mod control_flow;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -229,6 +231,12 @@ pub extern "C" fn nxrt_mock_shared_ep_set_persistent_workspace(on: usize) {
     PERSISTENT_WORKSPACE.store(on != 0, Ordering::SeqCst);
 }
 
+/// Number of control-flow kernels actually executed through the EP.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_mock_shared_ep_control_flow_executed() -> usize {
+    control_flow::EXECUTIONS.load(Ordering::SeqCst)
+}
+
 /// Reset every counter. Tests call this before each scenario.
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_mock_shared_ep_reset_counters() {
@@ -330,6 +338,21 @@ impl ExecutionProvider for SharedMockEp {
             required_input_layouts: None,
             output_layouts: vec![TensorLayout::contiguous()],
         }
+    }
+
+    fn claim_graph(
+        &self,
+        graph: &onnx_runtime_ir::Graph,
+    ) -> EpResult<Vec<onnx_runtime_ir::NodeId>> {
+        control_flow::claim(graph)
+    }
+    fn get_graph_kernel(
+        &self,
+        request: onnx_runtime_ep_api::GraphKernelRequest<'_>,
+        _: &[Vec<usize>],
+        _: u64,
+    ) -> EpResult<Box<dyn Kernel>> {
+        control_flow::compile(request)
     }
 
     fn get_kernel(
@@ -641,7 +664,7 @@ pub fn kernel_registry_entries() -> Vec<KernelRegistryEntry> {
 /// ORT would be undefined behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn CreateEpFactories(
-    _registration_name: *const std::ffi::c_char,
+    registration_name: *const std::ffi::c_char,
     api_base: *const onnx_runtime_ep_plugin::onnx_genai_ort_sys::OrtApiBase,
     _logger: *const onnx_runtime_ep_plugin::onnx_genai_ort_sys::OrtLogger,
     out_factories: *mut *mut onnx_runtime_ep_plugin::onnx_genai_ort_sys::OrtEpFactory,
@@ -651,6 +674,11 @@ pub unsafe extern "C" fn CreateEpFactories(
     let out_factories_raw = out_factories;
     let out_num_raw = out_num;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Explicit conformance mode for hosts that use only graph Compile,
+        // without ORT's optional leaf-kernel registry API.
+        let compile_only = !registration_name.is_null()
+            && unsafe { std::ffi::CStr::from_ptr(registration_name) }.to_bytes()
+                == b"nxrt_mock_compile_only";
         let ep: Box<dyn ExecutionProvider + Send> = Box::new(SharedMockEp::new());
         let shared = Arc::new(Mutex::new(ep));
         unsafe {
@@ -661,7 +689,11 @@ pub unsafe extern "C" fn CreateEpFactories(
                 out_num_raw,
                 "nxrt_shared_mock_ep",
                 shared,
-                kernel_registry_entries(),
+                if compile_only {
+                    Vec::new()
+                } else {
+                    kernel_registry_entries()
+                },
                 DeviceSupport::cpu_only(),
                 std::ptr::null_mut(),
             )

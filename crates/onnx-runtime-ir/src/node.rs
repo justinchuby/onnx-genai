@@ -102,6 +102,21 @@ impl Node {
         }
     }
 
+    /// Tensor-kernel boundary: original ONNX slots followed by distinct lexical
+    /// captures. The capture iterator uses `Graph::captured_inputs_by_node` order.
+    pub fn inputs_with_captures(
+        &self,
+        captures: impl IntoIterator<Item = ValueId>,
+    ) -> Vec<Option<ValueId>> {
+        let mut inputs = self.inputs.clone();
+        for value in captures {
+            if !inputs.contains(&Some(value)) {
+                inputs.push(Some(value));
+            }
+        }
+        inputs
+    }
+
     /// Iterate over the present (non-skipped) input value ids.
     pub fn input_values(&self) -> impl Iterator<Item = ValueId> + '_ {
         self.inputs.iter().filter_map(|slot| *slot)

@@ -4188,7 +4188,9 @@ mod tests {
                 support.is_supported(),
                 "{dtype:?} Einsum must be reachable through normal provider placement: {support:?}"
             );
-            let claims = OrtGraphView::new(&view).query_capabilities(&provider);
+            let claims = OrtGraphView::new(&view)
+                .query_capabilities(&provider)
+                .unwrap();
             assert_eq!(
                 claims.len(),
                 1,
@@ -4235,6 +4237,7 @@ mod tests {
         assert!(
             OrtGraphView::new(&view)
                 .query_capabilities(&provider)
+                .unwrap()
                 .is_empty(),
             "BFloat16 Einsum must not reach compilation through provider placement"
         );
@@ -4252,7 +4255,10 @@ mod tests {
             "mixed-case Einsum must be claimable: {support:?}"
         );
         assert_eq!(
-            OrtGraphView::new(&view).query_capabilities(&provider).len(),
+            OrtGraphView::new(&view)
+                .query_capabilities(&provider)
+                .unwrap()
+                .len(),
             1
         );
         let kernel = provider

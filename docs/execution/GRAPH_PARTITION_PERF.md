@@ -2,6 +2,11 @@
 
 Audit date: 2026-07-17
 
+This is a historical performance snapshot. The unused `claim_nodes` hook described
+below has since been replaced by executable whole-graph claims; see
+[EP control-flow execution](../architecture/EP_CONTROL_FLOW.md). Its measurements
+do not describe the current claim/compiler architecture.
+
 ## Verdict
 
 **No — the pipeline as a whole is not yet reliably performant for very large

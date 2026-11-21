@@ -550,7 +550,7 @@ pub trait ExecutionProvider: Send + Sync {
     /// EP can claim specific nodes it wants to handle.
     /// Claimed nodes bypass cost-model placement and go directly to this EP.
     /// Use for EPs that know better than the cost model (e.g. entire subgraph offload).
-    fn claim_nodes(&self, graph: &Graph) -> Vec<NodeId> { vec![] }
+    fn claim_graph(&self, graph: &Graph) -> Result<Vec<NodeId>> { Ok(vec![]) }
 
     /// Save EP-compiled context (TensorRT engines, QNN graphs, etc.).
     /// Serialized into the compilation cache (§41) so subsequent loads
@@ -7755,7 +7755,7 @@ Key loader rules:
   the model's `value_info` / graph outputs, not from op-specific inference.
 
 **Dispatch & execution (`onnx-runtime-session` + `onnx-runtime-ep-api`).** During
-placement, an `EPContext` node bypasses the cost model (like `claim_nodes`, §4.1):
+placement, an `EPContext` node bypasses the cost model (like `claim_graph`, §4.1):
 it is handed to the EP whose declared `source` key matches the node's `source`
 attribute, via a **`source`-keyed registry** (§57.6). That EP turns the on-disk
 node into the internal runtime form and restores it:
