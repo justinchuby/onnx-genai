@@ -532,20 +532,26 @@ grouped kernel is required.
 **Status: PARTIALLY IMPLEMENTED — CPU COMPLETE; CUDA tracked separately**
 
 The CPU EP routes the complete token batch first, groups routed rows by expert,
-and invokes one expert computation per active expert. Multi-row expert groups use
-the CPU EP's shared GEMM backend; decode groups of one use the scalar GEMV path
-without issuing a per-token GEMM. `QMoE` and `BlockQuantizedMoE` dequantize only
-active experts, one expert at a time, then consume all rows routed to that expert.
-`BlockQuantizedMoE` stores constant routed expert dense expansions in a
-kernel-local bounded cached-dense LRU shared by that kernel's FC1/FC2/FC3 entries
-(`ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES`, default 256 MiB), so hot experts do
-not re-expand every token. The ceiling applies independently to every compiled
-MoE kernel instance; it is not a model-wide cap, and aggregate retained dense
-memory can approach all hot dequantized expert projections across the model.
-Accounting covers resident f32 payloads rather than metadata or in-flight
-post-eviction `Arc` leases. This is not direct quantized-domain expert compute,
-and dispatch evidence labels it cached-dense. The kernel hashes/dequantizes only
-selected expert slices and never materializes a full all-expert dense buffer.
+and invokes one expert computation per active expert. Float `MoE` and dense
+block-MoE groups share the CPU GEMM backend, including single-row groups.
+`QMoE` and `BlockQuantizedMoE` process active experts one at a time.
+
+`BlockQuantizedMoE` admits a complete expert's FC1/FC2/optional-FC3 f32 set only
+when it fits `ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES` (default 256 MiB). Constant
+projections use the existing kernel-local dense LRU. If the complete set does
+not fit, the kernel decodes one weight row per worker shard and reuses it for
+all tokens in the group. Budget zero selects this streamed path without
+hashing identities or creating full f32 expansions. Dispatch tracing records
+`block_moe.dense_resident_set` or `block_moe.streamed_rows` and their byte-budget
+reason. Both paths use f32 compute, not quantized-domain dot products.
+
+The cache ceiling applies independently to every compiled MoE kernel instance;
+it is not a model-wide cap. Resident f32 payload accounting excludes metadata
+and in-flight post-eviction `Arc` leases. Streamed decoded-weight scratch is
+bounded per projection/call, while grouped activations, outputs and compressed
+strided copies still consume memory. Contiguous compressed weights are borrowed;
+strided inputs copy only selected expert slices. No full all-expert dense buffer
+is created. See [CPU measurements and memory limits](../benchmarks/CPU_BLOCK_MOE_ROW_STREAMING.md).
 
 CPU differential coverage:
 

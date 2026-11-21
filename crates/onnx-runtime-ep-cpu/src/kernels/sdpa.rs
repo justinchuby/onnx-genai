@@ -1709,7 +1709,7 @@ fn sdpa_f32_fast(
             let logits: &mut [f32] = logits.as_mut_slice();
             mlas_sys::sgemm(
                 false, true, q_seq, kv_seq, head_size, alpha, q_tile, head_size, k_tile, head_size,
-                0.0, logits, kv_seq,
+                0.0, logits, kv_seq, true,
             );
 
             // Per-row epilogue: softcap → bias → mask → causal → softmax, on
@@ -1772,6 +1772,7 @@ fn sdpa_f32_fast(
                 0.0,
                 y_tile,
                 v_head_size,
+                true,
             );
         });
 }

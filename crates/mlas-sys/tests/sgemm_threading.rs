@@ -11,7 +11,7 @@
 //! A separate file is compiled into a separate binary, so the calls below are
 //! the only MLAS work in this process and the delta is unambiguous.
 
-use mlas_sys::{mlas_threading_degree, mlas_threading_stats, sgemm_nn};
+use mlas_sys::{mlas_threading_degree, mlas_threading_stats, sgemm, sgemm_nn};
 
 fn seq(n: usize, seed: f32) -> Vec<f32> {
     (0..n)
@@ -61,4 +61,42 @@ fn sgemm_nn_drives_the_registered_parallel_backend() {
          calls); MlasGemmBatch was likely handed a null MLAS_THREADPOOL, which \
          forces MLAS's serial fallback"
     );
+
+    // An outer-sharded caller must be able to suppress this backend even for
+    // geometry large enough that the unchanged parallel arm used it above.
+    let b_ref = &b;
+    let bt = (0..n)
+        .flat_map(|j| (0..k).map(move |i| b_ref[i * n + j]))
+        .collect::<Vec<_>>();
+    for (trans_b, weights, ldb) in [(false, b.as_slice(), n), (true, bt.as_slice(), k)] {
+        let mut serial = vec![f32::NAN; m * n];
+        let before = mlas_threading_stats().parallel_for_calls;
+        sgemm(
+            false,
+            trans_b,
+            m,
+            n,
+            k,
+            1.0,
+            &a,
+            k,
+            weights,
+            ldb,
+            0.0,
+            &mut serial,
+            n,
+            false,
+        );
+        assert_eq!(
+            mlas_threading_stats().parallel_for_calls,
+            before,
+            "serial SGEMM must not dispatch work to the MLAS pool"
+        );
+        for (got, expected) in serial.into_iter().zip(&c) {
+            assert!(
+                (got - expected).abs() <= 1e-4 + 1e-4 * expected.abs(),
+                "serial SGEMM (trans_b={trans_b}): {got} vs {expected}"
+            );
+        }
+    }
 }

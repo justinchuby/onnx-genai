@@ -291,6 +291,15 @@ The ascending-expert reduction rule for this op is specified separately in §4.
 
 ## 3. Block-format decode reuse
 
+Current CPU implementation: selected experts retain token grouping. A complete
+expert's f32 projection set must fit the existing dense-cache budget to use the
+dense path. Larger sets, including zero-budget execution, use canonical block
+decoders one row per explicit worker shard and reuse that row across grouped
+tokens. Gating and activations are shared through `ExpertProjection`. This is
+f32 math with bounded decoded-weight scratch, not an integer-domain dot kernel.
+See [CPU evidence and limits](../benchmarks/CPU_BLOCK_MOE_ROW_STREAMING.md).
+The proposal details below describe the original decode-reuse design.
+
 Every format maps to the shared `BlockQuantizedMatMul` decoder surface. This
 slice extends that surface with the required GGML K-quants and Q8_0. The kernel
 calls `BlockFormat::parse` then

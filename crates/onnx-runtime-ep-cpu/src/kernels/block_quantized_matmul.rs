@@ -629,12 +629,16 @@ impl DenseWeightCache {
         }
     }
 
+    pub(super) fn byte_limit(&self) -> usize {
+        self.max_bytes.unwrap_or_else(dense_weight_cache_bytes)
+    }
+
     pub(super) fn get_or_insert_with(
         &self,
         key: &DenseWeightCacheKey,
         build: impl FnOnce() -> Result<Vec<f32>>,
     ) -> Result<(Arc<Vec<f32>>, DenseWeightCacheStatus)> {
-        let max_bytes = self.max_bytes.unwrap_or_else(dense_weight_cache_bytes);
+        let max_bytes = self.byte_limit();
         self.get_or_insert_with_limit(key, max_bytes, build)
     }
 
@@ -815,6 +819,80 @@ pub(super) fn dequantize_weight_kn(
             }
         });
     Ok(weight_kn)
+}
+
+/// Apply canonical compressed rows without materializing the full f32 weight
+/// matrix. At most one decoded weight row per explicit worker shard is live;
+/// all tokens in the expert group reuse that row before it is overwritten.
+pub(super) fn linear_packed_grouped(
+    format: BlockFormat,
+    packed: &[u8],
+    input: &[f32],
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    bias: Option<&[f32]>,
+) -> Result<Vec<f32>> {
+    let blocks = in_features.div_ceil(format.qk());
+    let packed_stride = blocks
+        .checked_mul(format.block_bytes())
+        .ok_or_else(|| error("streamed packed row byte count overflow"))?;
+    let expected = out_features
+        .checked_mul(packed_stride)
+        .ok_or_else(|| error("streamed packed projection byte count overflow"))?;
+    if packed.len() != expected
+        || rows.checked_mul(in_features) != Some(input.len())
+        || bias.is_some_and(|bias| bias.len() != out_features)
+    {
+        return Err(error(format!(
+            "streamed projection geometry mismatch: packed={} (expected {expected}), input={} for [{rows},{in_features}], bias={:?} for {out_features} outputs",
+            packed.len(),
+            input.len(),
+            bias.map(<[f32]>::len)
+        )));
+    }
+    let elements = rows
+        .checked_mul(out_features)
+        .ok_or_else(|| error("streamed projection output size overflow"))?;
+    if elements == 0 {
+        return Ok(Vec::new());
+    }
+    // The number of shards is bounded by the pool size. No nested Rayon work
+    // occurs inside a shard, so suspended tasks cannot retain extra weight rows.
+    let columns_per_shard = out_features.div_ceil(rayon::current_num_threads().max(1));
+    let mut column_major = vec![0.0f32; elements];
+    let decoder = format.decoder();
+    column_major
+        .par_chunks_mut(columns_per_shard * rows)
+        .enumerate()
+        .try_for_each(|(shard, columns)| -> Result<()> {
+            let mut weight_row = vec![0.0f32; in_features];
+            let mut block = [0.0f32; IQ_SUPER_QK];
+            for (column, output) in columns.chunks_exact_mut(rows).enumerate() {
+                let feature = shard * columns_per_shard + column;
+                let packed_row = &packed[feature * packed_stride..(feature + 1) * packed_stride];
+                for (index, bytes) in packed_row.chunks_exact(format.block_bytes()).enumerate() {
+                    decoder(bytes, &mut block[..format.qk()]);
+                    let start = index * format.qk();
+                    let count = format.qk().min(in_features - start);
+                    weight_row[start..start + count].copy_from_slice(&block[..count]);
+                }
+                super::matmul::gemm_bt_serial(input, &weight_row, output, rows, in_features, 1)?;
+                if let Some(bias) = bias {
+                    for value in output {
+                        *value += bias[feature];
+                    }
+                }
+            }
+            Ok(())
+        })?;
+    let mut output = vec![0.0; elements];
+    for (row, target) in output.chunks_exact_mut(out_features).enumerate() {
+        for (column, value) in target.iter_mut().enumerate() {
+            *value = column_major[column * rows + row];
+        }
+    }
+    Ok(output)
 }
 
 fn decode_mxfp4_block(block: &[u8], output: &mut [f32]) {
@@ -2093,6 +2171,77 @@ mod tests {
             }
         }
         (k, packed)
+    }
+
+    #[test]
+    fn streamed_rows_match_dense_projection_oracle_for_all_formats_and_tails() {
+        for format in [
+            BlockFormat::Mxfp4,
+            BlockFormat::Iq4Nl,
+            BlockFormat::Iq4Xs,
+            BlockFormat::Iq3S,
+            BlockFormat::Iq3Xxs,
+            BlockFormat::Iq2S,
+            BlockFormat::Iq2Xs,
+            BlockFormat::Iq2Xxs,
+            BlockFormat::Iq1S,
+            BlockFormat::Iq1M,
+            BlockFormat::Q2K,
+            BlockFormat::Q3K,
+            BlockFormat::Q5K,
+            BlockFormat::Q6K,
+            BlockFormat::Q8_0,
+        ] {
+            let n = 5;
+            let (width, packed) = packed_smoke_matrix(format, n);
+            for k in [width, width - 3] {
+                let dense_kn = dequantize_weight_kn(format, k, n, &packed).unwrap();
+                for rows in [0, 1, 7] {
+                    let input = (0..rows * k)
+                        .map(|index| ((index * 7 % 29) as f32 - 14.) / 16.)
+                        .collect::<Vec<_>>();
+                    let bias = (0..n).map(|i| i as f32 / 8.).collect::<Vec<_>>();
+                    let actual =
+                        linear_packed_grouped(format, &packed, &input, rows, k, n, Some(&bias))
+                            .unwrap();
+                    for row in 0..rows {
+                        for column in 0..n {
+                            let expected = (0..k)
+                                .map(|i| {
+                                    input[row * k + i] as f64 * dense_kn[i * n + column] as f64
+                                })
+                                .sum::<f64>()
+                                + bias[column] as f64;
+                            let delta = (actual[row * n + column] as f64 - expected).abs();
+                            assert!(
+                                delta <= 1e-5 + 1e-4 * expected.abs(),
+                                "{format:?} rows={rows} k={k}, [{row},{column}]: {} vs {expected}",
+                                actual[row * n + column]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_rows_reject_invalid_extents_before_computation() {
+        let (_, packed) = packed_smoke_matrix(BlockFormat::Mxfp4, 1);
+        for (bytes, input, bias) in [
+            (&packed[..16], vec![0.; 32], None),
+            (&packed[..], vec![0.; 31], None),
+            (&packed[..], vec![0.; 32], Some(vec![0.; 2])),
+        ] {
+            let error =
+                linear_packed_grouped(BlockFormat::Mxfp4, bytes, &input, 1, 32, 1, bias.as_deref())
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("geometry mismatch"), "{error}");
+        }
+        assert!(
+            linear_packed_grouped(BlockFormat::Mxfp4, &[], &[], usize::MAX, 1, 2, None).is_err()
+        );
     }
 
     #[test]
